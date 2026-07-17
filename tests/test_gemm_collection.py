@@ -22,7 +22,6 @@ BF16 = torch.bfloat16
         pytest.param(ayla.loop_4x4_matmul_4096, F32, id="loop_4x4_matmul_4096"),
         pytest.param(ayla.loop_8x8_matmul_4096, F32, id="loop_8x8_matmul_4096"),
         pytest.param(ayla.tma_matmul_4096, F32, id="tma_matmul_4096"),
-        # pytest.param(ayla.tiled_mma_matmul_4096, BF16, id="tiled_mma_matmul_4096"), # TODO: reenable when mma lowering fixed
         pytest.param(ayla.pranjalssh_4096, BF16, id="pranjalssh_4096"),
         pytest.param(ayla.pranjalssh_4096_pipelined, BF16, id="pranjalssh_4096_pipelined"),
         pytest.param(ayla.auto_matmul_4096, BF16, id="auto_matmul_4096"),

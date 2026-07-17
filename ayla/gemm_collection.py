@@ -192,92 +192,6 @@ def _register_loop_8x8_matmul_4096() -> None:
 
 
 
-
-
-# # ---------------------------------------------------------------------------
-# # V2c: 64×64 block tile, 4 warps, register-tiled 2×2 per warp (32×32).
-# # Each warp does 4 ldmatrix + 4 matmul (= 8 mma.sync) per k-iteration.
-# # Fully structured — no ptx_templates.
-# # Grid: 64×64 (4096/64), Block: 128, K-tile: 16, smem: 4KB.
-# #
-# # TODO: this needs a correct wrmem layout. we need to define these uniquely and they must match between load and gemm
-# # ---------------------------------------------------------------------------
-# def tiled_mma_matmul_4096_module():
-#     module_str = textwrap.dedent("""\
-#         module {
-#           kernel @tiled_mma_matmul_4096(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[64, 64, 1] block_dim=[128, 1, 1] {
-#             %bx: index, %by: index, %bz: index = block_ids()
-#             %tx: index, %ty: index, %tz: index = thread_ids()
-#             %c32w: index = index_constant() attrs={value: 32}
-#             %wid: index = index_div(%tx: index, %c32w: index)
-#             %c2: index = index_constant() attrs={value: 2}
-#             %warp_row: index = index_div(%wid: index, %c2: index)
-#             %warp_col: index = index_mod(%wid: index, %c2: index)
-#             %smem_a: smem_tensor<64x16xbf16> = alloc()
-#             %smem_b: smem_tensor<64x16xbf16> = alloc()
-#             %warp_a: smem_tensor<32x16xbf16 strides=[16, 1]> = tile(%smem_a: smem_tensor<64x16xbf16>, %warp_row: index, 0)
-#             %warp_b: smem_tensor<32x16xbf16 strides=[16, 1]> = tile(%smem_b: smem_tensor<64x16xbf16>, %warp_col: index, 0)
-#             %warp_a_top: smem_tensor<16x16xbf16 strides=[16, 1]> = tile(%warp_a: smem_tensor<32x16xbf16 strides=[16, 1]>, 0, 0)
-#             %warp_a_bot: smem_tensor<16x16xbf16 strides=[16, 1]> = tile(%warp_a: smem_tensor<32x16xbf16 strides=[16, 1]>, 1, 0)
-#             %warp_b_left: smem_tensor<16x16xbf16 strides=[16, 1]> = tile(%warp_b: smem_tensor<32x16xbf16 strides=[16, 1]>, 0, 0)
-#             %warp_b_right: smem_tensor<16x16xbf16 strides=[16, 1]> = tile(%warp_b: smem_tensor<32x16xbf16 strides=[16, 1]>, 1, 0)
-#             %a_block: gmem_tensor<64x4096xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<4096x4096xbf16>, %by: index, 0)
-#             %b_block: gmem_tensor<64x4096xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
-#             %c_00: wrmem_tensor<16x16xf32 warps=1 layout="mma"> = alloc() attrs={init: 0.0}
-#             %c_01: wrmem_tensor<16x16xf32 warps=1 layout="mma"> = alloc() attrs={init: 0.0}
-#             %c_10: wrmem_tensor<16x16xf32 warps=1 layout="mma"> = alloc() attrs={init: 0.0}
-#             %c_11: wrmem_tensor<16x16xf32 warps=1 layout="mma"> = alloc() attrs={init: 0.0}
-#             for (%k: index = 0 to 256) {
-#               %a_tile: gmem_tensor<64x16xbf16 strides=[4096, 1]> = tile(%a_block: gmem_tensor<64x4096xbf16 strides=[4096, 1]>, 0, %k: index)
-#               %b_tile: gmem_tensor<64x16xbf16 strides=[4096, 1]> = tile(%b_block: gmem_tensor<64x4096xbf16 strides=[4096, 1]>, 0, %k: index)
-#               move(%smem_a: smem_tensor<64x16xbf16>, %a_tile: gmem_tensor<64x16xbf16 strides=[4096, 1]>) attrs={tma: true}
-#               move(%smem_b: smem_tensor<64x16xbf16>, %b_tile: gmem_tensor<64x16xbf16 strides=[4096, 1]>) attrs={tma: true}
-#               %a_top: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#               move(%a_top: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %warp_a_top: smem_tensor<16x16xbf16 strides=[16, 1]>)
-#               %a_bot: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#               move(%a_bot: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %warp_a_bot: smem_tensor<16x16xbf16 strides=[16, 1]>)
-#               %b_left: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#               move(%b_left: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %warp_b_left: smem_tensor<16x16xbf16 strides=[16, 1]>) attrs={trans: true}
-#               %b_right: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#               move(%b_right: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %warp_b_right: smem_tensor<16x16xbf16 strides=[16, 1]>) attrs={trans: true}
-#               matmul(%a_top: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %b_left: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_00: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#               matmul(%a_top: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %b_right: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_01: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#               matmul(%a_bot: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %b_left: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_10: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#               matmul(%a_bot: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %b_right: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_11: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#             }
-#             %smem_c: smem_tensor<64x64xbf16> = alloc()
-#             %store_warp: smem_tensor<32x32xbf16 strides=[64, 1]> = tile(%smem_c: smem_tensor<64x64xbf16>, %warp_row: index, %warp_col: index)
-#             %store_00: smem_tensor<16x16xbf16 strides=[64, 1]> = tile(%store_warp: smem_tensor<32x32xbf16 strides=[64, 1]>, 0, 0)
-#             %store_01: smem_tensor<16x16xbf16 strides=[64, 1]> = tile(%store_warp: smem_tensor<32x32xbf16 strides=[64, 1]>, 0, 1)
-#             %store_10: smem_tensor<16x16xbf16 strides=[64, 1]> = tile(%store_warp: smem_tensor<32x32xbf16 strides=[64, 1]>, 1, 0)
-#             %store_11: smem_tensor<16x16xbf16 strides=[64, 1]> = tile(%store_warp: smem_tensor<32x32xbf16 strides=[64, 1]>, 1, 1)
-#             %c_00_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#             convert(%c_00_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_00: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#             move(%store_00: smem_tensor<16x16xbf16 strides=[64, 1]>, %c_00_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">)
-#             %c_01_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#             convert(%c_01_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_01: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#             move(%store_01: smem_tensor<16x16xbf16 strides=[64, 1]>, %c_01_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">)
-#             %c_10_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#             convert(%c_10_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_10: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#             move(%store_10: smem_tensor<16x16xbf16 strides=[64, 1]>, %c_10_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">)
-#             %c_11_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma"> = alloc()
-#             convert(%c_11_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">, %c_11: wrmem_tensor<16x16xf32 warps=1 layout="mma">)
-#             move(%store_11: smem_tensor<16x16xbf16 strides=[64, 1]>, %c_11_bf: wrmem_tensor<16x16xbf16 warps=1 layout="mma">)
-#             %c_block: gmem_tensor<64x64xbf16 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xbf16>, %by: index, %bx: index)
-#             move(%c_block: gmem_tensor<64x64xbf16 strides=[4096, 1]>, %smem_c: smem_tensor<64x64xbf16>) attrs={tma: true}
-#           }
-#         }""")  # noqa: E501
-#     return gpu_dialect.parse(module_str)
-
-
-# def _register_tiled_mma_matmul_4096() -> None:
-#     module = tiled_mma_matmul_4096_module()
-#     kernel = make_ptx_kernel(module)
-#     launcher = make_ptx_launcher(kernel)
-#     make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-
 # Based on https://github.com/pranjalssh/fast.cu/blob/main/examples/matmul/matmul_3.cuh
 # BM=128, BN=128, BK=64, 128 threads.
 def pranjalssh_4096_module():
@@ -489,90 +403,6 @@ def _register_auto_matmul_4096() -> None:
     make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
 
 
-
-
-def auto_matmul_4096_wgmma256_sequential_module():
-    # Persistent-kernel style: 128 blocks (just under 132 SMs on H100).
-    # Each block handles 512x256 of output, sequentially iterating over
-    # 4 M-tiles of 128 rows each.
-    module_str = textwrap.dedent("""\
-        module {
-          kernel @auto_matmul_4096_wgmma256_sequential(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[8, 16, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
-          }
-        }""")
-    module = gpu_dialect.parse(module_str)
-    module = tile_matmul(
-        module,
-        tile_dims=["M", "N", "M", "M"], tile_sizes=[512, 256, 128, 64],
-        tile_levels=["block.x", "block.y", "for", "for"], tile_labels=[None, None, "m", "mm"],
-        label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="wrmem", operands=["dst"],
-        swizzle=None, layout="wgmma_layout_0", warps=4,
-        tma=False, nc=False, target_dtype="f32", label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
-        tile_dims=["K"], tile_sizes=[64],
-        tile_levels=["for"], tile_labels=["k"],
-        label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="smem", operands=["lhs", "rhs"],
-        swizzle="128B", layout=None, warps=None,
-        tma=True, nc=True, label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
-        tile_dims=["K"], tile_sizes=[16],
-        tile_levels=["for"], tile_labels=["kk"],
-        label_filter="mm",
-    )
-    module = unroll_loop(module, unroll_factor=4, label_filter=r"kk")
-    module = unroll_loop(module, unroll_factor=2, label_filter="k")
-    for i in range(4):
-      module = licm(module)
-      module = canonicalize(module)
-
-    module = lower_to_async(module)
-    module = fuse_async(module)
-    for i in range(4):
-      module = licm(module)
-      module = canonicalize(module)
-
-
-    module = pipeline_loop(module, label_filter_loop="k", label_filter_op="mm_(lhs|rhs)_smem_iter0(_await)?", pipelining_offset=1)
-    module = pipeline_loop(module, label_filter_loop="mm", label_filter_op="mm_(lhs|rhs)_smem_iter0(_await)?", pipelining_offset=1)
-    module = pipeline_loop(module, label_filter_loop="m", label_filter_op="mm_(lhs|rhs)_smem_iter0(_await)?", pipelining_offset=1)
-
-    for i in range(4):
-      module = licm(module)
-      module = canonicalize(module)
-
-    module = schedule_async(module)
-    module = schedule_async(module)
-    module = schedule_async(module)
-
-    for i in range(4):
-      module = licm(module)
-      module = canonicalize(module)
-
-    module = schedule_async(module)
-    module = schedule_async(module)
-    module = schedule_async(module)
-
-    return module
-
-
-def _register_auto_matmul_4096_wgmma256_sequential() -> None:
-    module = auto_matmul_4096_wgmma256_sequential_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
 def auto_matmul_4096_wgmma256_wg_module():
     module_str = textwrap.dedent("""\
         module {
@@ -720,7 +550,6 @@ def register_all() -> None:
     _register_loop_4x4_matmul_4096()
     _register_loop_8x8_matmul_4096()
     _register_tma_matmul_4096()
-    # _register_tiled_mma_matmul_4096()
     _register_pranjalssh_4096()
     _register_pranjalssh_4096_pipelined()
     _register_auto_matmul_4096()
