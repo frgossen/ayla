@@ -1,9 +1,12 @@
 """A small collection of pre-built GEMM (matrix multiply) kernels.
 
 Each entry exposes:
-- a `*_TEMPLATE` PTX-template string for the inner-most ptx_template op,
 - a `*_module()` builder returning a parsed `ModuleOp` ready for codegen,
-- a `*_torch_op()` builder returning a registered ``torch.ops`` overload.
+- a `_register_*()` helper that codegens the kernel and registers it as a
+  ``torch.ops.ayla.*`` overload (all wired up by `register_all()` on import).
+
+Some entries also define a `*_TEMPLATE` PTX-template string for the
+inner-most ptx_template op.
 
 The intended use:
 
