@@ -32,7 +32,6 @@ from .unroll_loop import unroll_loop
 from ._fastcu_matmul_5_1_ptx import FASTCU_MATMUL_5_1_TEMPLATE
 
 
-
 # ---------------------------------------------------------------------------
 # V0b: Same naive 4096x4096 f32 matmul as V0, but written in high-level IR
 # (tile/alloc/load/matmul/store + sequential K-loop) rather than as one
@@ -191,7 +190,6 @@ def _register_loop_8x8_matmul_4096() -> None:
         launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
 
 
-
 # Based on https://github.com/pranjalssh/fast.cu/blob/main/examples/matmul/matmul_3.cuh
 # BM=128, BN=128, BK=64, 128 threads.
 def pranjalssh_4096_module():
@@ -320,11 +318,6 @@ def _register_pranjalssh_4096_pipelined() -> None:
     make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
 
 
-
-
-
-
-
 def auto_matmul_4096_module():
     """4096x4096 bf16 matmul built from high-level tiling passes (wgmma m64n128k16).
 
@@ -392,8 +385,6 @@ def auto_matmul_4096_module():
     module = schedule_async(module)
     module = canonicalize(module)
     return module
-
-
 
 
 def _register_auto_matmul_4096() -> None:
@@ -466,11 +457,8 @@ def auto_matmul_4096_wgmma256_wg_module():
       module = canonicalize(module)
 
 
-
     module = schedule_async(module)
     module = canonicalize(module)
-
-    print(module)
 
     return module
 

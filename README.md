@@ -6,24 +6,14 @@ async scheduling, and lowering to NVIDIA hardware primitives — using **deep pi
 specialization**. The aim is a compact toolbox that agents can use to generate SOTA GEMM kernels,
 and aspirationally to fuse GEMM epilogues.
 
-## Build
+## Getting started
 
 ```bash
-git submodule update --init   # fetch the fast.cu reference submodule
-pip install -e ".[dev]"       # editable install + pytest
+git submodule update --init                 # fetch the fast.cu reference submodule
+pip install -e ".[dev]"                     # install (editable) + pytest
+pytest                                      # run the tests
+python benchmarks/bench_gemm_collection.py  # benchmark
 ```
 
-## Test
-
-```bash
-pytest
-```
-
-## Benchmark
-
-```bash
-python benchmarks/bench_gemm_collection.py
-```
-
-Prints the generated IR and a comparison table (median/mean latency, TFLOP/s, and % of peak)
-of the ayla kernels against `torch.mm` for a bf16 4096×4096 GEMM.
+The benchmark prints a comparison table (median/mean latency, TFLOP/s, and % of peak) of the
+ayla kernels against `torch.mm` for a bf16 4096×4096 GEMM.
