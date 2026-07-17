@@ -9,7 +9,8 @@ and aspirationally to fuse GEMM epilogues.
 ## Build
 
 ```bash
-pip install -e ".[dev]"     # editable install + pytest
+git submodule update --init   # fetch the fast.cu reference submodule
+pip install -e ".[dev]"       # editable install + pytest
 ```
 
 ## Test
