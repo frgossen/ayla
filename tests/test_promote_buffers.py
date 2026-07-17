@@ -1,0 +1,138 @@
+"""Tests for the promote_buffers pass."""
+import textwrap
+
+from ayla.gpu_dialect import gpu_dialect
+from ayla.promote_buffers import promote_buffers
+
+
+def test_promote_gmem_matmul_operands_to_smem():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) attrs={init: 0.0}
+          }
+        }""")
+
+    module = gpu_dialect.parse(module_str)
+    module = promote_buffers(module, target_type="smem", operands=["lhs", "rhs", "dst"], swizzle="128B", tma=True)
+    text = repr(module)
+
+    expected = textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            move(%0: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+            %1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            move(%1: smem_tensor<128x64xbf16 swizzle="128B">, %b: gmem_tensor<128x64xbf16>) attrs={tma: True}
+            %2: smem_tensor<128x128xf32 swizzle="128B"> = alloc() attrs={init: 0.0}
+            matmul(%0: smem_tensor<128x64xbf16 swizzle="128B">, %1: smem_tensor<128x64xbf16 swizzle="128B">, %2: smem_tensor<128x128xf32 swizzle="128B">)
+            move(%c: rmem_tensor<128x128xf32>, %2: smem_tensor<128x128xf32 swizzle="128B">) attrs={tma: True}
+          }
+        }""")
+    assert text == expected
+
+
+def test_promote_lhs_rhs_preserves_init_on_matmul():
+    """When dst is NOT promoted, init stays on the matmul."""
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) attrs={init: 0.0}
+          }
+        }""")
+
+    module = gpu_dialect.parse(module_str)
+    module = promote_buffers(module, target_type="smem", operands=["lhs", "rhs"], swizzle="128B", tma=True)
+    text = repr(module)
+
+    expected = textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            move(%0: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+            %1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            move(%1: smem_tensor<128x64xbf16 swizzle="128B">, %b: gmem_tensor<128x64xbf16>) attrs={tma: True}
+            matmul(%0: smem_tensor<128x64xbf16 swizzle="128B">, %1: smem_tensor<128x64xbf16 swizzle="128B">, %c: rmem_tensor<128x128xf32>) attrs={init: 0.0}
+          }
+        }""")
+    assert text == expected
+
+
+def test_promote_smem_with_warp_group_dependent_lhs():
+    """Promote lhs/rhs to smem when the lhs tile depends on warp_group_id.
+
+    The lhs gmem tile (%6) is wg.x-dependent (via %3 = tile(%0, %wgx, 0)),
+    so each warp group loads different rows. The promote pass must allocate
+    smem large enough for all warp groups (128x64, not 64x64) and tile it
+    by %wgx so each warp group reads its own portion.
+
+    The rhs gmem tile (%7) is wg.x-independent, so the 256x64 smem is
+    shared across warp groups — no issue there.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %0: gmem_tensor<128x4096xbf16> = tile(%a: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
+            %1: gmem_tensor<256x4096xbf16> = tile(%b: gmem_tensor<4096x4096xbf16>, %by: index, 0)
+            %2: gmem_tensor<128x256xbf16 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xbf16>, %bx: index, %by: index)
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %3: gmem_tensor<64x4096xbf16> = tile(%0: gmem_tensor<128x4096xbf16>, %wgx: index, 0)
+            %4: gmem_tensor<64x256xbf16 strides=[4096, 1]> = tile(%2: gmem_tensor<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
+            %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            for (%k: index = 0 to 64) attrs={label: "k"} {
+              %6: gmem_tensor<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem_tensor<64x4096xbf16>, 0, %k: index)
+              %7: gmem_tensor<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem_tensor<256x4096xbf16>, 0, %k: index)
+              matmul(%6: gmem_tensor<64x64xbf16 strides=[4096, 1]>, %7: gmem_tensor<256x64xbf16 strides=[4096, 1]>, %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
+            }
+            %8: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            convert(%8: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            move(%4: gmem_tensor<64x256xbf16 strides=[4096, 1]>, %8: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+          }
+        }""")
+
+    module = gpu_dialect.parse(module_str)
+    module = promote_buffers(
+        module, target_type="smem", operands=["lhs", "rhs"],
+        swizzle="128B", layout=None, warps=None,
+        tma=True, nc=True, label_filter="mm",
+    )
+    text = repr(module)
+
+    # The pass must detect that lhs (%6) depends on %wgx (via %3) and:
+    #  1. Walk up to find the block-collective supertile (%0, 128x4096)
+    #  2. Allocate smem for the full block tile (128x64, not 64x64)
+    #  3. Load the block-collective gmem tile into smem via TMA
+    #  4. Tile the smem by %wgx to produce the per-wg view (64x64)
+    #  5. Use the per-wg smem view in the matmul
+    #
+    # The rhs (%7) does not depend on %wgx, so it's promoted directly
+    # as 256x64 smem — no supertile needed.
+    expected = textwrap.dedent("""\
+        module {
+          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %0: gmem_tensor<128x4096xbf16> = tile(%a: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
+            %1: gmem_tensor<256x4096xbf16> = tile(%b: gmem_tensor<4096x4096xbf16>, %by: index, 0)
+            %2: gmem_tensor<128x256xbf16 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xbf16>, %bx: index, %by: index)
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %3: gmem_tensor<64x4096xbf16> = tile(%0: gmem_tensor<128x4096xbf16>, %wgx: index, 0)
+            %4: gmem_tensor<64x256xbf16 strides=[4096, 1]> = tile(%2: gmem_tensor<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
+            %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            for (%k: index = 0 to 64) attrs={label: "k"} {
+              %6: gmem_tensor<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem_tensor<64x4096xbf16>, 0, %k: index)
+              %7: gmem_tensor<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem_tensor<256x4096xbf16>, 0, %k: index)
+              %8: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%0: gmem_tensor<128x4096xbf16>, 0, %k: index)
+              %9: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+              move(%9: smem_tensor<128x64xbf16 swizzle="128B">, %8: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_lhs_smem", nc: True, tma: True}
+              %10: smem_tensor<64x64xbf16 swizzle="128B"> = tile(%9: smem_tensor<128x64xbf16 swizzle="128B">, %wgx: index, 0)
+              %11: smem_tensor<256x64xbf16 swizzle="128B"> = alloc()
+              move(%11: smem_tensor<256x64xbf16 swizzle="128B">, %7: gmem_tensor<256x64xbf16 strides=[4096, 1]>) attrs={label: "mm_rhs_smem", nc: True, tma: True}
+              matmul(%10: smem_tensor<64x64xbf16 swizzle="128B">, %11: smem_tensor<256x64xbf16 swizzle="128B">, %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
+            }
+            %12: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            convert(%12: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            move(%4: gmem_tensor<64x256xbf16 strides=[4096, 1]>, %12: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+          }
+        }""")
+    assert text == expected

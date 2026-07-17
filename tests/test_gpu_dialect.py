@@ -1,0 +1,190 @@
+import textwrap
+
+from ayla import (
+    Block,
+    GmemTensorType,
+    KernelOp,
+    MatmulOp,
+    ModuleOp,
+    Op,
+    PTXTemplateOp,
+    Region,
+    Value,
+)
+from ayla.gpu_dialect import (
+    AddrMemTensorType,
+    AsyncOp,
+    F32Type,
+    ForOp,
+    LockType,
+    MoveOp,
+    SmemTensorType,
+    gpu_dialect,
+)
+
+
+def assert_print_and_roundtrip(op, expected):
+    text = repr(op)
+    assert text == expected
+    assert repr(gpu_dialect.parse(text)) == text
+
+
+def test_matmul_program():
+    m, k, n = 64, 128, 32
+    a_type = GmemTensorType.build((m, k), F32Type())
+    b_type = GmemTensorType.build((k, n), F32Type())
+    c_type = GmemTensorType.build((m, n), F32Type())
+
+    a = Value(name="a", type=a_type)
+    b = Value(name="b", type=b_type)
+    c = Value(name="c", type=c_type)
+    matmul = MatmulOp.build(a, b, c, attrs={"library": "cublas"})
+    block = Block(arguments=[a, b, c], ops=[matmul])
+    program = Op(operands=[], results=[], regions=[Region(blocks=[block])])
+
+    expected = textwrap.dedent("""\
+        generic() {
+        ^bb0(%a: gmem_tensor<64x128xf32>, %b: gmem_tensor<128x32xf32>, %c: gmem_tensor<64x32xf32>):
+          matmul(%a: gmem_tensor<64x128xf32>, %b: gmem_tensor<128x32xf32>, %c: gmem_tensor<64x32xf32>) attrs={library: "cublas"}
+        }""")  # noqa: E501
+    assert_print_and_roundtrip(program, expected)
+
+
+def test_kernel_op():
+    n = 1 << 20
+    buf_type = GmemTensorType.build((n,), F32Type())
+
+    lhs = Value(name="lhs", type=buf_type)
+    rhs = Value(name="rhs", type=buf_type)
+    dst = Value(name="dst", type=buf_type)
+    template = "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\n"
+    entry_block = Block(arguments=[lhs, rhs, dst], ops=[
+        PTXTemplateOp.build([lhs, rhs, dst], [buf_type], template=template),
+    ])
+    second_block = Block(ops=[Op(operands=[], results=[])])
+    body = Region(blocks=[entry_block, second_block])
+    kernel = KernelOp.build(
+        "cwise_add", body, attrs={"version": 1},
+    )
+    module = ModuleOp.build(
+        Region(blocks=[Block(ops=[kernel])]),
+        attrs={"target": "sm_80"},
+    )
+
+    expected = textwrap.dedent("""\
+        module attrs={target: "sm_80"} {
+          kernel @cwise_add(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) attrs={version: 1} {
+            %0: gmem_tensor<1048576xf32> = ptx_template(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) attrs={template: "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\\n"}
+          ^bb0:
+            generic()
+          }
+        }""")  # noqa: E501
+    assert_print_and_roundtrip(module, expected)
+
+
+def test_for_loop():
+    op = ForOp.build(0, 64, 4)
+    op.body.entry_block.append(Op(operands=[op.iv], results=[]))
+    expected = textwrap.dedent("""\
+        for (%0: index = 0 to 64 step 4) {
+          generic(%0: index)
+        }""")
+    assert_print_and_roundtrip(op, expected)
+
+
+def test_async_op():
+    t = GmemTensorType.build((64, 64), F32Type())
+    lhs0 = Value(name="lhs0", type=t)
+    rhs0 = Value(name="rhs0", type=t)
+    lhs1 = Value(name="lhs1", type=t)
+    rhs1 = Value(name="rhs1", type=t)
+    dst = Value(name="dst", type=t)
+    lock = Value(name="lock", type=LockType.build(kind="wgmma"))
+    body = Region(blocks=[Block(ops=[
+        MatmulOp.build(lhs0, rhs0, dst),
+        MatmulOp.build(lhs1, rhs1, dst),
+    ])])
+    op = AsyncOp.build(lock, body=body)
+    expected = textwrap.dedent("""\
+        async(%lock: lock<wgmma>) {
+          matmul(%lhs0: gmem_tensor<64x64xf32>, %rhs0: gmem_tensor<64x64xf32>, %dst: gmem_tensor<64x64xf32>)
+          matmul(%lhs1: gmem_tensor<64x64xf32>, %rhs1: gmem_tensor<64x64xf32>, %dst: gmem_tensor<64x64xf32>)
+        }""")  # noqa: E501
+    assert_print_and_roundtrip(op, expected)
+
+
+def test_async_op_single_move():
+    t = GmemTensorType.build((64, 64), F32Type())
+    dst = Value(name="dst", type=t)
+    src = Value(name="src", type=t)
+    lock = Value(name="lock", type=LockType.build(kind="bulk"))
+    body = Region(blocks=[Block(ops=[MoveOp.build(dst, src)])])
+    op = AsyncOp.build(lock, body=body)
+    expected = "async(%lock: lock<bulk>) move(%dst: gmem_tensor<64x64xf32>, %src: gmem_tensor<64x64xf32>)"  # noqa: E501
+    assert_print_and_roundtrip(op, expected)
+
+
+def test_for_loop_default_step():
+    op = ForOp.build(0, 4096)
+    op.body.entry_block.append(Op(operands=[op.iv], results=[]))
+    expected = textwrap.dedent("""\
+        for (%0: index = 0 to 4096) {
+          generic(%0: index)
+        }""")
+    assert_print_and_roundtrip(op, expected)
+
+
+
+
+
+
+
+
+
+def test_canonical_strides():
+    assert AddrMemTensorType.canonical_strides([4096, 4096]) == [4096, 1]
+    assert AddrMemTensorType.canonical_strides([128, 64]) == [64, 1]
+    assert AddrMemTensorType.canonical_strides([64, 128]) == [128, 1]
+    assert AddrMemTensorType.canonical_strides([16]) == [1]
+    assert AddrMemTensorType.canonical_strides([4, 3, 2]) == [6, 2, 1]
+
+    t = GmemTensorType.build([128, 64], F32Type())
+    assert list(t.strides) == [64, 1]
+    assert list(t.strides) == AddrMemTensorType.canonical_strides([128, 64])
+
+    t_strided = GmemTensorType.build([64, 64], F32Type(), strides=[4096, 1])
+    assert list(t_strided.strides) == [4096, 1]
+    assert list(t_strided.strides) != AddrMemTensorType.canonical_strides([64, 64])
+
+    t_smem = SmemTensorType.build([128, 64], F32Type())
+    assert list(t_smem.strides) == [64, 1]
+
+
+def test_naive_matmul_4096_module():
+    module_str = textwrap.dedent(f"""\
+        module {{
+          kernel @naive_matmul_4096(%a: gmem_tensor<4096x4096xf32>, %b: gmem_tensor<4096x4096xf32>, %c: gmem_tensor<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {{
+            %cx: index, %cy: index, %cz: index = block_ids()
+            %tx: index, %ty: index, %tz: index = thread_ids()
+            %a_block: gmem_tensor<64x4096xf32> = tile(%a: gmem_tensor<4096x4096xf32>, %cx: index, 0)
+            %b_block: gmem_tensor<4096x64xf32 strides=[4096, 1]> = tile(%b: gmem_tensor<4096x4096xf32>, 0, %cy: index)
+            %c_block: gmem_tensor<64x64xf32 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xf32>, %cx: index, %cy: index)
+            %a_thread: gmem_tensor<2x4096xf32> = tile(%a_block: gmem_tensor<64x4096xf32>, %tx: index, 0)
+            %b_thread: gmem_tensor<4096x2xf32 strides=[4096, 1]> = tile(%b_block: gmem_tensor<4096x64xf32 strides=[4096, 1]>, 0, %ty: index)
+            %c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem_tensor<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
+            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={{init: 0.0}}
+            for (%k: index = 0 to 4096) {{
+              %a_sloop: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
+              %b_sloop: gmem_tensor<1x2xf32 strides=[4096, 1]> = tile(%b_thread: gmem_tensor<4096x2xf32 strides=[4096, 1]>, %k: index, 0)
+              %a_sloop_rmem: rmem_tensor<2x1xf32> = alloc()
+              move(%a_sloop_rmem: rmem_tensor<2x1xf32>, %a_sloop: gmem_tensor<2x1xf32 strides=[4096, 1]>)
+              %b_sloop_rmem: rmem_tensor<1x2xf32> = alloc()
+              move(%b_sloop_rmem: rmem_tensor<1x2xf32>, %b_sloop: gmem_tensor<1x2xf32 strides=[4096, 1]>)
+              matmul(%a_sloop_rmem: rmem_tensor<2x1xf32>, %b_sloop_rmem: rmem_tensor<1x2xf32>, %c_thread_rmem: rmem_tensor<2x2xf32>)
+            }}
+            move(%c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem_tensor<2x2xf32>)
+          }}
+        }}""")  # noqa: E501
+    module = gpu_dialect.parse(module_str)
+
+    assert_print_and_roundtrip(module, module_str)

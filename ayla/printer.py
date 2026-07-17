@@ -1,0 +1,202 @@
+"""Pretty-printer with indentation, anchors, and unique-name minting."""
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Iterable
+from contextlib import contextmanager
+
+from . import pytree
+
+
+class Printer:
+    def __init__(self, indent_str: str = "  ") -> None:
+        self._lines: list[str] = []
+        self._cur: str = ""
+        self._level: int = 0
+        self._indent_str = indent_str
+        self._assigned_names: dict[tuple[str, object], str | tuple] = {}
+        self._used_names: dict[str, set[str]] = defaultdict(set)
+        self._suffix_counters: dict[tuple[str, str], int] = defaultdict(int)
+
+    def unique_names(
+        self,
+        obj: object,
+        basenames: str | tuple,
+        namespace: str = "default",
+        always_suffix: bool = False,
+    ) -> str | tuple:
+        key = (namespace, obj)
+        if key in self._assigned_names:
+            return self._assigned_names[key]
+        result = pytree.map(
+            lambda b: self._mint_name(b, namespace, always_suffix),
+            basenames,
+        )
+        self._assigned_names[key] = result
+        return result
+
+    def _mint_name(
+        self, base: str, namespace: str, always_suffix: bool,
+    ) -> str:
+        used = self._used_names[namespace]
+        sep = "_" if base and base[-1].isdigit() else ""
+        suffix = self._suffix_counters[(namespace, base)]
+        candidate = (
+            f"{base}{sep}{suffix}"
+            if always_suffix or suffix > 0
+            else base
+        )
+        while candidate in used:
+            suffix += 1
+            candidate = f"{base}{sep}{suffix}"
+        self._suffix_counters[(namespace, base)] = suffix + 1
+        used.add(candidate)
+        return candidate
+
+    def name_count(self, basename: str, namespace: str = "default") -> int:
+        """Number of names minted with `basename` in `namespace`. For
+        `always_suffix` names this is also the next suffix index.
+        """
+        return self._suffix_counters.get((namespace, basename), 0)
+
+    def write(self, s: str) -> None:
+        if not self._cur:
+            self._cur = self._indent_str * self._level
+        self._cur += s
+
+    def write_attr(self, v: object) -> None:
+        if isinstance(v, str):
+            self.write_str_attr(v)
+            return
+        if isinstance(v, list):
+            self.write_list_attr(v)
+            return
+        if isinstance(v, dict):
+            self.write_dict_attr(v)
+            return
+        self.write_literal_attr(v)  # type: ignore[arg-type]
+
+    def write_literal_attr(
+        self, v: int | float | bool | None,
+    ) -> None:
+        """Write an atomic literal: int / float / bool / None."""
+        assert v is None or isinstance(v, (bool, int, float)), (
+            f"write_literal_attr: expected int/float/bool/None, got "
+            f"{type(v).__name__}: {v!r}"
+        )
+        self.write(repr(v))
+
+    def write_str_attr(self, v: str) -> None:
+        """Write a quoted string literal, escaping `\\\\`, `\\"`, `\\n`,
+        `\\t`.
+        """
+        s = (
+            v.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\t", "\\t")
+        )
+        self.write(f'"{s}"')
+
+    def write_shape(self, sizes: list[int] | tuple[int, ...], dtype=None) -> None:
+        """Write `NxMx...` or `NxMx...xDTYPE` if dtype is given."""
+        self.write("x".join(str(s) for s in sizes))
+        if dtype is not None:
+            self.write("x")
+            dtype.print(self)
+
+    def write_list_attr(self, v: list, brackets: bool = True) -> None:
+        """Write `[v, ...]`."""
+        if brackets:
+            self.write("[")
+        for i, x in enumerate(v):
+            if i:
+                self.write(", ")
+            self.write_attr(x)
+        if brackets:
+            self.write("]")
+
+    def write_dict_attr(self, v: dict, braces: bool = True) -> None:
+        """Write `{k: v, ...}` with identifier-like keys (asserted)."""
+        if braces:
+            self.write("{")
+        for i, (k, x) in enumerate(sorted(v.items())):
+            if i:
+                self.write(", ")
+            assert isinstance(k, str) and k.isidentifier(), (
+                f"write_dict_attr: key must be an identifier-like str, "
+                f"got {k!r}"
+            )
+            self.write(k)
+            self.write(": ")
+            self.write_attr(x)
+        if braces:
+            self.write("}")
+
+    def write_extra_attrs(
+        self, attrs: dict, skip_keys: Iterable[str] = (),
+    ) -> None:
+        """Write ` attrs={...}` for the entries of `attrs` not in
+        `skip_keys`. Writes nothing if no entries remain.
+        """
+        skip = set(skip_keys)
+        filtered = {k: v for k, v in attrs.items() if k not in skip}
+        if not filtered:
+            return
+        self.write(" attrs=")
+        self.write_attr(filtered)
+
+    def write_newline(self) -> None:
+        self._lines.append(self._cur)
+        self._cur = ""
+
+    def write_newline_once(self) -> None:
+        """Write a blank line only if the last line isn't already blank."""
+        if self._lines and self._lines[-1].strip() == "" and self._cur == "":
+            return
+        self.write_newline()
+
+    def write_line(self, s: str) -> None:
+        if s:
+            self.write(s)
+        self.write_newline()
+
+    @contextmanager
+    def indented(self):
+        self._level += 1
+        try:
+            yield
+        finally:
+            self._level -= 1
+
+    def mark(self) -> tuple[int, int]:
+        """Capture the current line index + indent level for later
+        insertion via `insert_at`.
+        """
+        return (len(self._lines), self._level)
+
+    @contextmanager
+    def insert_at(self, mark: tuple[int, int]):
+        """Temporarily redirect the printer so writes accumulate into a
+        buffer that is spliced into the line list at `mark` on exit.
+        Indent is restored to the mark's level.
+        """
+        idx, level = mark
+        saved_lines, saved_level = self._lines, self._level
+        buffer: list[str] = []
+        self._lines, self._level = buffer, level
+        try:
+            yield
+        finally:
+            # Flush any pending in-progress line to the buffer.
+            if self._cur:
+                buffer.append(self._cur)
+                self._cur = ""
+            self._lines, self._level = saved_lines, saved_level
+            saved_lines[idx:idx] = buffer
+
+    def render(self) -> str:
+        if self._cur:
+            self._lines.append(self._cur)
+            self._cur = ""
+        return "\n".join(self._lines)

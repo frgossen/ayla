@@ -1,0 +1,3 @@
+[submodule "cuda_experiments/fast.cu"]
+	path = cuda_experiments/fast.cu
+	url = https://github.com/pranjalssh/fast.cu.git
