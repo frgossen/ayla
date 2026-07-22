@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.unroll_loop import unroll_loop
+from ayla.passes.unroll_loop import unroll_loop
 
 
 def test_unroll_by_2():

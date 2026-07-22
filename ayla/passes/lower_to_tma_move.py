@@ -14,7 +14,7 @@ returns to a single op. This keeps the pass order-independent w.r.t.
 """
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -26,8 +26,8 @@ from .gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
 )
-from .ir import Block, Op, Value
-from .lowering_pass import LoweringPass
+from ..ir import Block, Op, Value
+from ..lowering_pass import LoweringPass
 
 
 class LowerToTmaMove(LoweringPass):

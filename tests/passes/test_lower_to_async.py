@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.lower_to_async import lower_to_async
+from ayla.passes.lower_to_async import lower_to_async
 
 
 def test_sync_move_stays_as_move():

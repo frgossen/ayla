@@ -13,7 +13,7 @@ import textwrap
 
 from dataclasses import dataclass
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
     AsyncOp,
@@ -44,8 +44,8 @@ from .gpu_dialect import (
     ToPtrOp,
     WrmemTensorType,
 )
-from .ir import Op, Value
-from .lowering_pass import LoweringPass
+from ..ir import Op, Value
+from ..lowering_pass import LoweringPass
 
 
 class LowerToPtxTemplate(LoweringPass):

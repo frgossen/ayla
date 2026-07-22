@@ -19,7 +19,7 @@ Example — promote lhs/rhs to smem::
 
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
     BF16Type,
@@ -45,8 +45,8 @@ from .gpu_dialect import (
     WarpGroupIdOp,
     WrmemTensorType,
 )
-from .ir import Block, Op, Value, clone_type
-from .lowering_pass import LoweringPass
+from ..ir import Block, Op, Value, clone_type
+from ..lowering_pass import LoweringPass
 
 
 def _target_level(target_type: str) -> str:

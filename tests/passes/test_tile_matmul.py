@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.tile_matmul import tile_matmul
+from ayla.passes.tile_matmul import tile_matmul
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
