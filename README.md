@@ -17,3 +17,13 @@ python benchmarks/bench_gemm_collection.py  # benchmark
 
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, and % of peak) of the
 ayla kernels against `torch.mm` for a bf16 4096×4096 GEMM.
+
+### Using pixi
+
+If you don't already have pixi installed, get it with curl:
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | bash
+```
+
+Then set up the environment with [pixi](https://pixi.sh): `pixi run install` provisions Python 3.12 with ayla (editable) plus the CUDA 12.8 (cu128) PyTorch build, then `pixi run test` runs the tests and `pixi run bench` runs the benchmark.
