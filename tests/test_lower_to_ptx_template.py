@@ -31,6 +31,9 @@ def test_lower_move_gmem_to_smem():
 
     assert_contains_in_order(
         template,
+        # Sync upfront (before the cooperative loop): prior readers finish
+        # before this load overwrites the smem tile.
+        "bar.sync 0;\n",
         textwrap.dedent(
             """\
             mov.u32 ${b32:co_idx}, %tid.x;
@@ -56,7 +59,6 @@ def test_lower_move_gmem_to_smem():
             add.u32 ${b32:co_idx}, ${b32:co_idx}, ${b32:co_ntid};
             bra ${label:co_idx_loop};
             ${label:co_end}:
-            bar.sync 0;
             """
         ),
     )

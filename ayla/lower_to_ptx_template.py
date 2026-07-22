@@ -668,18 +668,13 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_wgmma(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
-        # wait_group drains the commit group; the bar.sync then closes the
-        # buffer-reuse WAR it alone does not — thread-0's TMA reload vs the
-        # warpgroup-wide wgmma reads of those smem buffers. A plain full-CTA
-        # bar.sync is used deliberately: it cannot lap under any schedule, so
-        # correctness needs no scheduling invariant (a cheaper asymmetric
-        # named-barrier or an mbarrier gate both rely on a lapping bound that
-        # isn't encoded and can silently deadlock — see git history). It is the
-        # read side of the WAR, so it's emitted only where reads occurred (the
-        # prologue prefill, with no preceding reads, gets none).
+        # wait_group drains the commit group so the warpgroup's wgmma reads of
+        # the smem operands have retired. The buffer-reuse WAR (thread-0's TMA
+        # reload vs those reads) is now closed on the *write* side, by the
+        # upfront bar.sync at the start of _lower_async_tma_loads — so no barrier
+        # is needed here.
         template = textwrap.dedent(r"""
             wgmma.wait_group.sync.aligned 0;
-            bar.sync 0;
         """)
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -769,8 +764,12 @@ class LowerToPtxTemplate(LoweringPass):
         All threads participate: each handles a strided subset of b32
         elements. The flat smem index is decomposed into (row, col) to
         compute the gmem address using the gmem strides.
-        Load: bar.sync after (ensure smem filled before consumers read).
-        Store: bar.sync before (ensure smem ready before writing to gmem).
+
+        Syncs upfront (before touching the buffer), consistent with the rule
+        that every op guards its own hazards against *prior* accesses:
+        Load: prior readers of the smem tile finish before we overwrite it.
+        Store: prior writers of the smem tile finish before we read it out.
+        A consumer of the loaded tile issues its own bar.sync before reading.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -845,9 +844,6 @@ class LowerToPtxTemplate(LoweringPass):
             bra ${{label:co_idx_loop}};
             ${{label:co_end}}:
         """)
-
-        if is_load:
-            template += "bar.sync 0;\n"
 
         new_op = PTXTemplateOp.build(
             operands=operands, result_types=[], template=template,
@@ -1108,6 +1104,11 @@ class LowerToPtxTemplate(LoweringPass):
 
         Each thread independently reads/writes its own elements via
         ld.shared / st.shared with 32-bit smem addressing.
+
+        Syncs upfront, per the rule that every op guards its own hazards against
+        prior accesses: load (smem->rmem) waits for prior writers of the tile;
+        store (rmem->smem) waits for prior readers. (When the producer is a TMA
+        load, its await already orders this, so the barrier is redundant there.)
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -1124,7 +1125,7 @@ class LowerToPtxTemplate(LoweringPass):
         operands: list[Value] = [dst_value, src_value]
         operand_names: list[str] = ["dst", "src"]
 
-        template = ""
+        template = "bar.sync 0;\n"
         base_reg = f"${{b32:operand.{smem_label}.ptr}}"
 
         for flat_idx, idx in enumerate(
@@ -1166,7 +1167,11 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
         # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
+        # bar.sync before issuing: all threads rendezvous so the smem tile is
+        # fully written before thread 0 reads it into the gmem store (RAW). Must
+        # precede the thread-0 election so every thread executes the barrier.
         template = textwrap.dedent(f"""\
+            bar.sync 0;
             mov.u32 ${{b32:st_tid}}, %tid.x;
             mov.u32 ${{b32:st_tidy}}, %tid.y;
             or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidy}};
@@ -1242,12 +1247,12 @@ class LowerToPtxTemplate(LoweringPass):
         # the byte count are interpolated, so we avoid f-string/dedent brace and
         # multi-line-indent pitfalls by joining a line list.
         #
-        # NOTE: the buffer-reuse WAR barrier (thread-0 reload vs warpgroup wgmma
-        # reads) is emitted on the *read* side, at the wgmma await — not here on
-        # the write side — so it lands only where reads actually occurred (the
-        # prologue prefill loads, with no preceding reads, need none). See
-        # ``_lower_await_wgmma``.
+        # bar.sync before issuing: all threads rendezvous so thread 0's TMA
+        # reload cannot overwrite an smem buffer still being read by prior
+        # consumers (the buffer-reuse WAR). Must precede the thread-0 election
+        # so every thread executes the barrier.
         lines = [
+            "bar.sync 0;",
             "mov.u32 ${b32:tid_x}, %tid.x;",
             "mov.u32 ${b32:tid_y}, %tid.y;",
             "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
