@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect, IndexConstantOp
-from ayla.ir import find_ops
+from ayla.base.ir import find_ops
 from ayla.passes.cse import cse
 
 

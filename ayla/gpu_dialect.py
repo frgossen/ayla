@@ -4,8 +4,8 @@ from __future__ import annotations
 import math
 import string
 
-from .ir import Block, Dialect, Op, Region, Type, Value
-from .printer import Printer
+from .base.ir import Block, Dialect, Op, Region, Type, Value
+from .base.printer import Printer
 
 gpu_dialect = Dialect("gpu")
 
