@@ -6,7 +6,7 @@ eliminates trivial operations like `x * 1`, `x + 0`, `0 * n`,
 """
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     ForOp,
     IndexAddOp,
     IndexConstantOp,
@@ -17,8 +17,8 @@ from .gpu_dialect import (
     PtrAddOp,
     TileOp,
 )
-from .ir import Op, Value, clone_op
-from .lowering_pass import LoweringPass
+from ..ir import Op, Value, clone_op
+from ..lowering_pass import LoweringPass
 
 
 class Folding(LoweringPass):

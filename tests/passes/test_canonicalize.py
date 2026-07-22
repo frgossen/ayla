@@ -1,7 +1,7 @@
 """Tests for the canonicalize pass (folding + CSE + DCE)."""
 import textwrap
 
-from ayla.canonicalize import canonicalize
+from ayla.passes.canonicalize import canonicalize
 from ayla.gpu_dialect import gpu_dialect
 
 

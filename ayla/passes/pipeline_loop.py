@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     ForOp,
     IndexAddOp,
     IndexConstantOp,
@@ -34,8 +34,8 @@ from .gpu_dialect import (
     memory_effects,
     root_buffer,
 )
-from .ir import Block, Op, Region, Value, clone_op
-from .lowering_pass import LoweringPass
+from ..ir import Block, Op, Region, Value, clone_op
+from ..lowering_pass import LoweringPass
 
 
 class PipelineLoop(LoweringPass):

@@ -18,20 +18,20 @@ import textwrap
 
 import torch
 
-from .canonicalize import canonicalize
-from .fuse_async import fuse_async
+from .passes.canonicalize import canonicalize
+from .passes.fuse_async import fuse_async
 from .gpu_dialect import gpu_dialect, PTXTemplateOp, TmaDescType
 from .ir import Value
-from .licm import licm
-from .lower_to_async import lower_to_async
-from .pipeline_loop import pipeline_loop
-from .promote_buffers import promote_buffers
+from .passes.licm import licm
+from .passes.lower_to_async import lower_to_async
+from .passes.pipeline_loop import pipeline_loop
+from .passes.promote_buffers import promote_buffers
 from .ptx_codegen import make_ptx_kernel
 from .ptx_runtime import make_ptx_launcher
-from .schedule_async import schedule_async
-from .tile_matmul import tile_matmul
+from .passes.schedule_async import schedule_async
+from .passes.tile_matmul import tile_matmul
 from .torch_custom_call import OperandKind, make_torch_custom_call
-from .unroll_loop import unroll_loop
+from .passes.unroll_loop import unroll_loop
 from ._fastcu_matmul_5_1_ptx import FASTCU_MATMUL_5_1_TEMPLATE
 
 
