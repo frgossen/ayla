@@ -14,8 +14,8 @@ from ..gpu_dialect import (
     ModuleOp,
     is_value_identical,
 )
-from ..ir import Block, Op, Region, Type, Value
-from ..pipeline import Pass
+from ..base.ir import Block, Op, Region, Type, Value
+from ..base.pipeline import Pass
 
 
 class CSE(Pass):

@@ -6,7 +6,7 @@ from .gpu_dialect import (
     ModuleOp,
     PTXTemplateOp,
 )
-from .ir import (
+from .base.ir import (
     Block,
     Op,
     Printer,

@@ -17,8 +17,8 @@ from ..gpu_dialect import (
     PtrAddOp,
     TileOp,
 )
-from ..ir import Op, Value, clone_op
-from ..lowering_pass import LoweringPass
+from ..base.ir import Op, Value, clone_op
+from ..base.lowering_pass import LoweringPass
 
 
 class Folding(LoweringPass):

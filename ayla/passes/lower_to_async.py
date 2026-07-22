@@ -24,8 +24,8 @@ from ..gpu_dialect import (
     TmaMoveOp,
     WrmemTensorType,
 )
-from ..ir import Block, Op, Region, Value
-from ..lowering_pass import LoweringPass
+from ..base.ir import Block, Op, Region, Value
+from ..base.lowering_pass import LoweringPass
 
 
 def _tma_lock_kind(dst: Value) -> str:

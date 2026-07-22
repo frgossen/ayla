@@ -17,8 +17,8 @@ from ..gpu_dialect import (
     IndexType,
     ModuleOp,
 )
-from ..ir import Block, Op, Region, Value, clone_op, iter_ops
-from ..lowering_pass import LoweringPass
+from ..base.ir import Block, Op, Region, Value, clone_op, iter_ops
+from ..base.lowering_pass import LoweringPass
 
 
 class UnrollLoop(LoweringPass):
