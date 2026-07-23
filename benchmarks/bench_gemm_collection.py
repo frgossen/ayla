@@ -256,6 +256,14 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
+            label="ayla.quick_experiment (frozen wgmma256 wg IR)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.quick_experiment,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,
             n=4096,
