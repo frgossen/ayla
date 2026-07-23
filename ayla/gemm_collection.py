@@ -21,7 +21,7 @@ import torch
 from .passes.canonicalize import canonicalize
 from .passes.fuse_async import fuse_async
 from .gpu_dialect import gpu_dialect, PTXTemplateOp, TmaDescType
-from .ir import Value
+from .base.ir import Value
 from .passes.licm import licm
 from .passes.lower_to_async import lower_to_async
 from .passes.pipeline_loop import pipeline_loop

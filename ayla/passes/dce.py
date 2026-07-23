@@ -9,8 +9,8 @@ pending async ops is a no-op.
 from __future__ import annotations
 
 from ..gpu_dialect import ModuleOp, is_side_effect_free
-from ..ir import Block, Op, Region
-from ..pipeline import Pass
+from ..base.ir import Block, Op, Region
+from ..base.pipeline import Pass
 
 
 class DCE(Pass):

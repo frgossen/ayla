@@ -1,7 +1,7 @@
 """Base class for IR passes."""
 from __future__ import annotations
 
-from .gpu_dialect import ModuleOp
+from ..gpu_dialect import ModuleOp
 from .ir import Block, Op, Region
 
 

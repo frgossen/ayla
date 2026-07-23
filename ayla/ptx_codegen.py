@@ -33,7 +33,7 @@ from .gpu_dialect import (
     WarpGroupIdOp,
     WrmemTensorType,
 )
-from .ir import Op, Printer, Value
+from .base.ir import Op, Printer, Value
 from .passes.folding import Folding
 from .passes.cse import CSE
 from .passes.dce import DCE
@@ -41,7 +41,7 @@ from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
 from .passes.licm import LICM
-from .pipeline import Pipeline
+from .base.pipeline import Pipeline
 
 
 class PtxLoweringPipeline(Pipeline):
