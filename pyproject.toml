@@ -37,13 +37,13 @@ platforms = ["linux-64"]
 [tool.pixi.dependencies]
 python = "3.12.*"
 pip = "*"
+ninja = "*"
+numpy = "*"
 
 [tool.pixi.environments]
 default = ["dev"]
 
 [tool.pixi.tasks]
-# torch's CUDA (cu128) wheel isn't on PyPI's default index, so it can't be a
-# plain [project] dependency — install it explicitly here.
-install = "pip install torch --index-url https://download.pytorch.org/whl/cu128"
+install = { cmd = "pip install torch --index-url https://download.pytorch.org/whl/cu128 && pip install -e ." }
 test = "pytest"
 bench = "python benchmarks/bench_gemm_collection.py"
