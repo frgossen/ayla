@@ -4,8 +4,8 @@ import textwrap
 
 from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
 from ayla.ir import find_ops
-from ayla.lower_to_async import lower_to_async
-from ayla.lower_to_ptx_template import lower_to_ptx_template
+from ayla.passes.lower_to_async import lower_to_async
+from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from ayla.testing import assert_contains_in_order
 
 

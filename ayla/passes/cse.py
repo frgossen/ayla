@@ -10,12 +10,12 @@ duplicate is removed.
 """
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     ModuleOp,
     is_value_identical,
 )
-from .ir import Block, Op, Region, Type, Value
-from .pipeline import Pass
+from ..ir import Block, Op, Region, Type, Value
+from ..pipeline import Pass
 
 
 class CSE(Pass):

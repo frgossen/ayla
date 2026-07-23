@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.licm import licm
+from ayla.passes.licm import licm
 
 
 

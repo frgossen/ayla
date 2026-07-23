@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     BlockIdsOp,
     ForOp,
     IndexType,
@@ -11,8 +11,8 @@ from .gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
 )
-from .ir import Block, Op, Region, Value, clone_type
-from .lowering_pass import LoweringPass
+from ..ir import Block, Op, Region, Value, clone_type
+from ..lowering_pass import LoweringPass
 
 
 class TileMatmul(LoweringPass):
