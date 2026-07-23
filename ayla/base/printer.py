@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import contextmanager
 
-from . import pytree
+from .. import pytree
 
 
 class Printer:

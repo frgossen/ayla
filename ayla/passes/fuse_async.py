@@ -41,8 +41,8 @@ from ..gpu_dialect import (
     SmemTensorType,
     is_side_effect_free,
 )
-from ..ir import Block, Op, Region
-from ..pipeline import Pass
+from ..base.ir import Block, Op, Region
+from ..base.pipeline import Pass
 
 
 def _fusion_kind(op: Op) -> str | None:

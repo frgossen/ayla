@@ -26,8 +26,8 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
 )
-from ..ir import Block, Op, Value
-from ..lowering_pass import LoweringPass
+from ..base.ir import Block, Op, Value
+from ..base.lowering_pass import LoweringPass
 
 
 class LowerToTmaMove(LoweringPass):

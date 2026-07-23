@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .ir import Block, Op, Region, Value
-from .gpu_dialect import ModuleOp
+from ..gpu_dialect import ModuleOp
 from .pipeline import Pass
 
 

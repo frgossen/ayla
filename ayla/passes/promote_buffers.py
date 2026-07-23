@@ -45,8 +45,8 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     WrmemTensorType,
 )
-from ..ir import Block, Op, Value, clone_type
-from ..lowering_pass import LoweringPass
+from ..base.ir import Block, Op, Value, clone_type
+from ..base.lowering_pass import LoweringPass
 
 
 def _target_level(target_type: str) -> str:

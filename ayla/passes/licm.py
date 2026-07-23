@@ -19,8 +19,8 @@ from ..gpu_dialect import (
     effective_operands,
     is_side_effect_free,
 )
-from ..ir import Op, Value
-from ..lowering_pass import LoweringPass
+from ..base.ir import Op, Value
+from ..base.lowering_pass import LoweringPass
 
 
 class LICM(LoweringPass):
