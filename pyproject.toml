@@ -5,8 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ayla"
 version = "0.0.0"
-description = "TBD"
-requires-python = ">=3.9"
+description = "A highly experimental compiler toolkit for generating PTX code for SOTA GEMM kernels on NVIDIA GPUs"
+requires-python = ">=3.12"
+dependencies = [
+    "ninja",
+    "numpy",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
