@@ -66,12 +66,25 @@ class Value:
     type: Type
     definition: Op | Block = field(init=False)
     result_index: int = field(init=False)
+    uses: dict[tuple[Op, int], None] = field(
+        default_factory=dict, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         assert self.name is None or not self.name.isdigit(), (
             f"value name {self.name!r} must not be all digits "
             "(reserved for anonymous ids)"
         )
+
+    def users(self) -> list[Op]:
+        """Ops consuming this value, in block order, deduplicated."""
+        seen: set[int] = set()
+        out: list[Op] = []
+        for op, _ in self.uses:
+            if id(op) not in seen:
+                seen.add(id(op))
+                out.append(op)
+        return out
 
     def print(self, p: Printer) -> None:
         basename = f"%{self.name}" if self.name is not None else "%"
@@ -118,6 +131,36 @@ class Op:
         for i, v in enumerate(self.results):
             v.definition = self
             v.result_index = i
+        self._register_operands()
+
+    def _register_operands(self) -> None:
+        for i, v in enumerate(self.operands):
+            v.uses[(self, i)] = None
+
+    def _deregister_operands(self) -> None:
+        for i, v in enumerate(self.operands):
+            v.uses.pop((self, i), None)
+
+    def set_operands(self, values: list[Value]) -> None:
+        # Deregister old then register new: they are different lists (and may
+        # differ in length), so the two passes cannot be merged into one.
+        self._deregister_operands()
+        self.operands = list(values)
+        self._register_operands()
+
+    def set_operand(self, i: int, value: Value) -> None:
+        self.operands[i].uses.pop((self, i), None)
+        self.operands[i] = value
+        value.uses[(self, i)] = None
+
+    def drop_uses(self) -> None:
+        # Ops are deleted by being dropped from a block; tell operands they lost
+        # a user, recursing into nested regions.
+        self._deregister_operands()
+        for region in self.regions:
+            for block in region.blocks:
+                for op in block.ops:
+                    op.drop_uses()
 
     def operand(self, i: int = 0) -> Value:
         return self.operands[i]
