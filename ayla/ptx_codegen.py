@@ -34,13 +34,13 @@ from .gpu_dialect import (
     WrmemTensorType,
 )
 from .ir import Op, Printer, Value
-from .folding import Folding
-from .cse import CSE
-from .dce import DCE
-from .lower_to_async import LowerToAsync
-from .lower_to_tma_move import LowerToTmaMove
-from .lower_to_ptx_template import LowerToPtxTemplate
-from .licm import LICM
+from .passes.folding import Folding
+from .passes.cse import CSE
+from .passes.dce import DCE
+from .passes.lower_to_async import LowerToAsync
+from .passes.lower_to_tma_move import LowerToTmaMove
+from .passes.lower_to_ptx_template import LowerToPtxTemplate
+from .passes.licm import LICM
 from .pipeline import Pipeline
 
 

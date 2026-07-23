@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.folding import folding
+from ayla.passes.folding import folding
 
 
 def test_fold_constants():

@@ -14,7 +14,7 @@ the ops that define its operands.
 
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     AsyncOp,
     TmaMoveOp,
     AwaitOp,
@@ -24,8 +24,8 @@ from .gpu_dialect import (
     ModuleOp,
     MoveOp,
 )
-from .ir import Block, Op, Value
-from .pipeline import Pass
+from ..ir import Block, Op, Value
+from ..pipeline import Pass
 
 
 def _is_async_op(op: Op) -> bool:

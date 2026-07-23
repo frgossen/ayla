@@ -12,7 +12,7 @@ overlap data movement with compute.
 """
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
     AwaitOp,
@@ -24,8 +24,8 @@ from .gpu_dialect import (
     TmaMoveOp,
     WrmemTensorType,
 )
-from .ir import Block, Op, Region, Value
-from .lowering_pass import LoweringPass
+from ..ir import Block, Op, Region, Value
+from ..lowering_pass import LoweringPass
 
 
 def _tma_lock_kind(dst: Value) -> str:

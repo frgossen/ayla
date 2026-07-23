@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.fuse_async import fuse_async
+from ayla.passes.fuse_async import fuse_async
 
 
 def test_fuse_same_accumulator():

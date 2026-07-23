@@ -12,15 +12,15 @@ hoisted out of their loop.
 """
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     AsyncOp,
     ForOp,
     ModuleOp,
     effective_operands,
     is_side_effect_free,
 )
-from .ir import Op, Value
-from .lowering_pass import LoweringPass
+from ..ir import Op, Value
+from ..lowering_pass import LoweringPass
 
 
 class LICM(LoweringPass):

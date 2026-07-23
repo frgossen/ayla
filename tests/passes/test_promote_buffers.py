@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.promote_buffers import promote_buffers
+from ayla.passes.promote_buffers import promote_buffers
 
 
 def test_promote_gmem_matmul_operands_to_smem():

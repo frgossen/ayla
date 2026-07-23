@@ -5,15 +5,15 @@ import textwrap
 import pytest
 import torch
 
-from ayla.canonicalize import canonicalize
+from ayla.passes.canonicalize import canonicalize
 from ayla.gpu_dialect import gpu_dialect
-from ayla.licm import licm
-from ayla.pipeline_loop import pipeline_loop
-from ayla.promote_buffers import promote_buffers
+from ayla.passes.licm import licm
+from ayla.passes.pipeline_loop import pipeline_loop
+from ayla.passes.promote_buffers import promote_buffers
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
-from ayla.tile_matmul import tile_matmul
-from ayla.unroll_loop import unroll_loop
+from ayla.passes.tile_matmul import tile_matmul
+from ayla.passes.unroll_loop import unroll_loop
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="no CUDA"

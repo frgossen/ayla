@@ -3,7 +3,7 @@ import textwrap
 
 from ayla.gpu_dialect import gpu_dialect, IndexConstantOp
 from ayla.ir import find_ops
-from ayla.cse import cse
+from ayla.passes.cse import cse
 
 
 def test_cse_deduplicates_index_constants():
