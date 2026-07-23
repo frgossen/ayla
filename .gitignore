@@ -56,3 +56,5 @@ Thumbs.db
 # Generated / temporary
 tmp/
 *.log
+
+pixi.lock
