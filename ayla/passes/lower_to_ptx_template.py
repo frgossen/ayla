@@ -668,14 +668,24 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_wgmma(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
-        # wait_group drains the commit group so the warpgroup's wgmma reads of
+        # wait_group drains the commit group so this warpgroup's wgmma reads of
         # the smem operands have retired. The buffer-reuse WAR (thread-0's TMA
-        # reload vs those reads) is now closed on the *write* side, by the
-        # upfront bar.sync at the start of _lower_async_tma_loads — so no barrier
-        # is needed here.
-        template = textwrap.dedent(r"""
-            wgmma.wait_group.sync.aligned 0;
-        """)
+        # reload vs those reads) is closed on the *write* side by the reload's
+        # own bar.sync in _lower_async_tma_loads.
+        #
+        # ``arrive: N`` (experimental): announce reads-done on named barrier N
+        # so the reload can wait asymmetrically. Warps 1-7 (tid >= 32) arrive;
+        # warp 0 accounts for itself via the reload's bar.sync. Participation is
+        # warp-convergent (whole warps arrive or don't). 224 arrives + warp-0's
+        # 32 syncs = 256 (full CTA). See _lower_async_tma_loads.
+        template = "wgmma.wait_group.sync.aligned 0;\n"
+        arrive = op.attrs.get("arrive")
+        if arrive is not None:
+            template += textwrap.dedent(f"""\
+                mov.u32 ${{b32:aw_tid}}, %tid.x;
+                setp.ge.u32 ${{pred:aw_arrive}}, ${{b32:aw_tid}}, 32;
+                @${{pred:aw_arrive}} bar.arrive {arrive}, 256;
+                """)
         new_op = PTXTemplateOp.build(
             operands=[],
             result_types=[],
@@ -1247,12 +1257,45 @@ class LowerToPtxTemplate(LoweringPass):
         # the byte count are interpolated, so we avoid f-string/dedent brace and
         # multi-line-indent pitfalls by joining a line list.
         #
-        # bar.sync before issuing: all threads rendezvous so thread 0's TMA
-        # reload cannot overwrite an smem buffer still being read by prior
-        # consumers (the buffer-reuse WAR). Must precede the thread-0 election
-        # so every thread executes the barrier.
-        lines = [
-            "bar.sync 0;",
+        # Sync before issuing the TMA load — guards the buffer-reuse WAR
+        # (thread-0's reload vs prior reads of the smem buffer). The async op's
+        # ``sync`` attr selects the flavor; default is a full-CTA barrier:
+        # Sync before overwriting the smem tile (buffer-reuse WAR). The async
+        # op's ``sync`` attr picks the flavor; default is a full-CTA barrier:
+        #   "block" (default) -> bar.sync 0     (all threads, before election)
+        #   "named"           -> asymmetric: only thread-0 waits, inside the
+        #                        election, on named barrier ``bar`` (default 1).
+        #                        Consumers announce reads-done via bar.arrive on
+        #                        the same barrier at their wgmma-await (see
+        #                        _lower_await_wgmma). 255 arrives + this 1 sync =
+        #                        256 (num_warp_groups*128), so no rendezvous.
+        #   "none"            -> no sync        (e.g. a prologue prefill)
+        sync = op.attrs.get("sync", "block")
+        bar = op.attrs.get("bar", 1)
+        pre = []   # all threads, before the thread-0 election
+        if sync == "block":
+            pre.append("bar.sync 0;")
+        elif sync == "named":
+            # Asymmetric empty handshake. Warp 0 (the TMA-issuing warp) waits on
+            # named barrier ``bar``; warps 1-7 skip. Participation is *warp*-
+            # convergent (all 32 threads of warp 0 hit the bar.sync together) —
+            # a single-thread bar.sync in divergent code hangs. Consumers arrive
+            # on the same barrier at their wgmma-await (tid >= 32, see
+            # _lower_await_wgmma): 224 arrives + warp-0's 32 syncs = 256 (full
+            # CTA), so warps 1-7 never rendezvous at the reload.
+            pre += [
+                "mov.u32 ${b32:w0_tid}, %tid.x;",
+                "setp.ge.u32 ${pred:w0_skip}, ${b32:w0_tid}, 32;",
+                "@${pred:w0_skip} bra ${label:after_empty};",
+                f"bar.sync {bar}, 256;",
+                "${label:after_empty}:",
+            ]
+        elif sync != "none":
+            raise ValueError(
+                f"_lower_async_tma_loads: unknown sync {sync!r} "
+                f"(expected 'block', 'named', or 'none')"
+            )
+        lines = pre + [
             "mov.u32 ${b32:tid_x}, %tid.x;",
             "mov.u32 ${b32:tid_y}, %tid.y;",
             "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",

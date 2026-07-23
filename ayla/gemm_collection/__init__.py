@@ -17,5 +17,6 @@ from . import (  # noqa: F401  (each import registers its op)
     naive_matmul_4096_loop,
     pranjalssh_4096,
     pranjalssh_4096_pipelined,
+    quick_experiment,
     tma_matmul_4096,
 )
