@@ -32,7 +32,7 @@ call ``fuse_async(module)``; the single-op + same-kind gating does the rest.
 """
 from __future__ import annotations
 
-from .gpu_dialect import (
+from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
     MatmulOp,
@@ -41,8 +41,8 @@ from .gpu_dialect import (
     SmemTensorType,
     is_side_effect_free,
 )
-from .ir import Block, Op, Region
-from .pipeline import Pass
+from ..ir import Block, Op, Region
+from ..pipeline import Pass
 
 
 def _fusion_kind(op: Op) -> str | None:

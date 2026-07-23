@@ -4,7 +4,7 @@ from __future__ import annotations
 from .cse import cse
 from .dce import dce
 from .folding import folding
-from .gpu_dialect import ModuleOp
+from ..gpu_dialect import ModuleOp
 
 
 def canonicalize(module: ModuleOp) -> ModuleOp:

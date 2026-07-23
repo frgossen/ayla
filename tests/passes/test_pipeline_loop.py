@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.pipeline_loop import pipeline_loop
+from ayla.passes.pipeline_loop import pipeline_loop
 
 
 def test_pipeline_reorders_across_inner_loop():

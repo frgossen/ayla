@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.dce import dce
+from ayla.passes.dce import dce
 
 
 def test_dce_removes_unused_index_ops():
