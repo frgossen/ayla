@@ -561,7 +561,7 @@ class AwaitOp(Op):
 
     @lock.setter
     def lock(self, value: Value) -> None:
-        self.operands[0] = value
+        self.set_operand(0, value)
 
 
 @gpu_dialect.register_op("async")
@@ -600,7 +600,7 @@ class AsyncOp(Op):
 
     @lock.setter
     def lock(self, value: Value) -> None:
-        self.operands[0] = value
+        self.set_operand(0, value)
 
     @property
     def body(self) -> Region:
@@ -1547,7 +1547,20 @@ def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
         return [("R", root_buffer(op.lhs)), ("R", root_buffer(op.rhs)),
                 ("R", dst), ("W", dst)]
     if isinstance(op, AwaitOp):
-        return []
+        # An await's effects are the union of its async peers' — the async starts
+        # sharing its lock — found directly via the lock's use-list, no scan.
+        peers = [
+            u for u in op.lock.users() if isinstance(u, (AsyncOp, TmaMoveOp))
+        ]
+        if not peers:
+            return None
+        effects = []
+        for peer in peers:
+            peer_effects = memory_effects(peer)
+            if peer_effects is None:
+                return None
+            effects.extend(peer_effects)
+        return effects
     if isinstance(op, AllocOp):
         return [("W", op.result())]
     if isinstance(op, (ForOp, AsyncOp)):

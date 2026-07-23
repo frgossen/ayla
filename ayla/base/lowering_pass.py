@@ -88,7 +88,7 @@ class LoweringPass(Pass):
                 f"pytree ({replacement!r}); register a custom lowering"
             )
             new_operands.append(replacement)
-        op.operands = new_operands
+        op.set_operands(new_operands)
         for r in op.regions:
             self.lower_region(r)
         return [op], list(op.results)

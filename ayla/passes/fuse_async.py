@@ -114,8 +114,10 @@ class FuseAsync(Pass):
                     group_attrs = dict(op.attrs) if op.attrs else None
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.entry_block.ops)
+                op.drop_uses(recurse=False)  # wrapper dropped; inner ops kept
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:
                 in_flight_locks.discard(op.lock)  # member's await; group covers it
+                op.drop_uses(recurse=False)  # dropped; group's await covers it
             elif is_side_effect_free(op):
                 # Transparent: safe to emit before the merged region since its
                 # operands are defined outside the (single-kind) group.

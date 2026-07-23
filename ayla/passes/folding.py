@@ -43,6 +43,7 @@ class Folding(LoweringPass):
         iv_const = IndexConstantOp.build(value=op.lb)
         vmap: dict[Value, Value] = {op.iv: iv_const.result()}
         cloned = [clone_op(body_op, vmap) for body_op in op.body.entry_block.ops]
+        op.drop_uses()  # original loop + body discarded, replaced by clones
         return [iv_const, *cloned], []
 
     def _const_val(self, value: Value) -> int | None:

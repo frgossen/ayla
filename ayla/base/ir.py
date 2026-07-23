@@ -153,14 +153,16 @@ class Op:
         self.operands[i] = value
         value.uses[(self, i)] = None
 
-    def drop_uses(self) -> None:
+    def drop_uses(self, recurse: bool = True) -> None:
         # Ops are deleted by being dropped from a block; tell operands they lost
-        # a user, recursing into nested regions.
+        # a user. Pass recurse=False when the body ops are transplanted elsewhere
+        # (still live) rather than deleted with this op.
         self._deregister_operands()
-        for region in self.regions:
-            for block in region.blocks:
-                for op in block.ops:
-                    op.drop_uses()
+        if recurse:
+            for region in self.regions:
+                for block in region.blocks:
+                    for op in block.ops:
+                        op.drop_uses()
 
     def operand(self, i: int = 0) -> Value:
         return self.operands[i]

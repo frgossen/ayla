@@ -72,6 +72,7 @@ class UnrollLoop(LoweringPass):
         new_body = Region(blocks=[Block(arguments=[new_iv], ops=new_entry_block_ops)])
         extra_attrs = {k: v for k, v in op.attrs.items() if k not in ("lb", "ub", "step")}
         new_for = ForOp.build(lb=lb, ub=ub, step=new_step, body=new_body, attrs=extra_attrs)
+        op.drop_uses()  # original loop + body discarded, replaced by clones
         return [new_for], []
 
 
