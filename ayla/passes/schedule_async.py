@@ -24,8 +24,8 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
 )
-from ..ir import Block, Op, Value
-from ..pipeline import Pass
+from ..base.ir import Block, Op, Value
+from ..base.pipeline import Pass
 
 
 def _is_async_op(op: Op) -> bool:

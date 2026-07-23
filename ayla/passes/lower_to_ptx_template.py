@@ -44,8 +44,8 @@ from ..gpu_dialect import (
     ToPtrOp,
     WrmemTensorType,
 )
-from ..ir import Op, Value
-from ..lowering_pass import LoweringPass
+from ..base.ir import Op, Value
+from ..base.lowering_pass import LoweringPass
 
 
 class LowerToPtxTemplate(LoweringPass):

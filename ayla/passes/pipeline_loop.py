@@ -34,8 +34,8 @@ from ..gpu_dialect import (
     memory_effects,
     root_buffer,
 )
-from ..ir import Block, Op, Region, Value, clone_op
-from ..lowering_pass import LoweringPass
+from ..base.ir import Block, Op, Region, Value, clone_op
+from ..base.lowering_pass import LoweringPass
 
 
 class PipelineLoop(LoweringPass):

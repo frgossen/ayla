@@ -11,8 +11,8 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
 )
-from ..ir import Block, Op, Region, Value, clone_type
-from ..lowering_pass import LoweringPass
+from ..base.ir import Block, Op, Region, Value, clone_type
+from ..base.lowering_pass import LoweringPass
 
 
 class TileMatmul(LoweringPass):
