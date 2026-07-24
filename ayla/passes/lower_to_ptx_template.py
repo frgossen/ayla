@@ -18,8 +18,10 @@ from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
     AwaitOp,
+    BarrierOp,
     BF16Type,
     ConvertOp,
+    EXPLICIT_BARRIERS_ATTR,
     F16Type,
     F32Type,
     GmemTensorType,
@@ -28,6 +30,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    KernelOp,
     LockType,
     MatmulOp,
     ModuleOp,
@@ -44,7 +47,7 @@ from ..gpu_dialect import (
     ToPtrOp,
     WrmemTensorType,
 )
-from ..base.ir import Op, Value
+from ..base.ir import Op, Value, find_op
 from ..base.lowering_pass import LoweringPass
 
 
@@ -58,8 +61,21 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(MatmulOp, type(self).lower_matmul)
         self.register(AsyncOp, type(self).lower_async)
         self.register(AwaitOp, type(self).lower_await)
+        self.register(BarrierOp, type(self).lower_barrier)
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        # A kernel migrated to explicit ``barrier`` ops (via insert_syncs)
+        # carries its own cross-thread ordering, so codegen must NOT also emit
+        # the implicit upfront bar.sync in the TMA-load lowering — that would
+        # double-barrier. See ``_lower_async_tma_loads``.
+        self._explicit_barriers = find_op(
+            module,
+            lambda o: isinstance(o, KernelOp)
+            and o.attrs.get(EXPLICIT_BARRIERS_ATTR),
+        ) is not None
+        return super().run(module)
 
 
     def lower_tile(
@@ -640,6 +656,27 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_await_bulk(op)
         raise NotImplementedError(
             f"lower_await: unsupported lock kind {kind!r}"
+        )
+
+    def lower_barrier(
+        self, op: BarrierOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower a cross-thread ordering fence to a full-CTA ``bar.sync``."""
+        scope = op.attrs.get("scope")
+        if scope == "thread":
+            return [], []  # per-thread ordering is implicit in program order
+        if scope == "block":
+            new_op = PTXTemplateOp.build(
+                operands=[],
+                result_types=[],
+                template="bar.sync 0;\n",
+                operand_names=[],
+                result_names=[],
+                description=str(op),
+            )
+            return [new_op], []
+        raise NotImplementedError(
+            f"lower_barrier: unsupported barrier scope {scope!r}"
         )
 
     def _lower_await_mbar(
@@ -1250,9 +1287,12 @@ class LowerToPtxTemplate(LoweringPass):
         # bar.sync before issuing: all threads rendezvous so thread 0's TMA
         # reload cannot overwrite an smem buffer still being read by prior
         # consumers (the buffer-reuse WAR). Must precede the thread-0 election
-        # so every thread executes the barrier.
-        lines = [
-            "bar.sync 0;",
+        # so every thread executes the barrier. Skipped when the kernel is
+        # ``explicit_barriers`` (insert_syncs placed the WAR barriers itself).
+        lines = []
+        if not getattr(self, "_explicit_barriers", False):
+            lines.append("bar.sync 0;")
+        lines += [
             "mov.u32 ${b32:tid_x}, %tid.x;",
             "mov.u32 ${b32:tid_y}, %tid.y;",
             "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
