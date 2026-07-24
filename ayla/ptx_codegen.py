@@ -7,7 +7,6 @@ from enum import Enum
 
 from . import pytree
 from .gpu_dialect import (
-    AsyncOp,
     BlockIdsOp,
     GmemTensorType,
     IndexAddOp,
@@ -40,7 +39,6 @@ from .passes.dce import DCE
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
-from .passes.licm import LICM
 from .base.pipeline import Pipeline
 
 
@@ -50,11 +48,6 @@ class PtxLoweringPipeline(Pipeline):
     def __init__(self) -> None:
         super().__init__()
         self.add_pass(LowerToTmaMove())
-        # Lifts the index arithmetic LowerToTmaMove materializes inside an
-        # ``async { … }`` body back out, restoring a single-op async body.
-        # Async-only: loop bodies here hold per-iteration lock allocs that are
-        # side-effect-free but must not be hoisted out of their loop.
-        self.add_pass(LICM(region_ops=(AsyncOp,)))
         self.add_pass(LowerToAsync())
         self.add_pass(Folding())
         self.add_pass(CSE())
