@@ -2,11 +2,64 @@
 
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
-from ayla.base.ir import find_ops
+import pytest
+
+from ayla.gpu_dialect import (
+    gpu_dialect, PTXTemplateOp, KernelOp, EXPLICIT_BARRIERS_ATTR,
+)
+from ayla.base.ir import find_op, find_ops
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from ayla.testing import assert_contains_in_order
+
+
+@pytest.mark.parametrize("explicit_barriers", [False, True])
+def test_explicit_barriers_gates_upfront_tma_bar_sync(explicit_barriers):
+    """Codegen emits an upfront bar.sync before a TMA load (the smem-reuse WAR),
+    unless the kernel is marked ``explicit_barriers`` — then insert_syncs owns
+    the barriers and codegen must not double up.
+
+    Input is a post-``lower_to_async``/``lower_to_tma_move`` async TMA load, so
+    this exercises ``lower_to_ptx_template`` in isolation."""
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%a: gmem_tensor<128x64xbf16>, %a_desc: tma_desc<arg_idx=0 gmem_tensor<128x64xbf16> tile=128x64 swizzle="128B">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %sa: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %c0: index = index_constant() attrs={value: 0}
+            %0: lock<mbar> = alloc()
+            async(%0: lock<mbar>) tma_move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %a_desc: tma_desc<arg_idx=0 gmem_tensor<128x64xbf16> tile=128x64 swizzle="128B">, %c0: index, %c0: index) attrs={tma: True}
+            await(%0: lock<mbar>)
+          }
+        }"""))  # noqa: E501
+    if explicit_barriers:
+        find_op(module, lambda o: isinstance(o, KernelOp)).attrs[EXPLICIT_BARRIERS_ATTR] = True
+
+    lowered = lower_to_ptx_template(module)
+    [tma] = [
+        t.attrs["template"]
+        for t in find_ops(lowered, lambda o: isinstance(o, PTXTemplateOp))
+        if "cp.async.bulk.tensor" in t.attrs["template"]
+    ]
+
+    # Elect thread 0, issue the bulk-tensor copy, arrive on the mbarrier.
+    expected = textwrap.dedent("""\
+        mov.u32 ${b32:tid_x}, %tid.x;
+        mov.u32 ${b32:tid_y}, %tid.y;
+        or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
+        mov.u32 ${b32:tid_z}, %tid.z;
+        or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
+        setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
+        @${pred:not_t0} bra ${label:after_load};
+        cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [${b32:operand.dst0.ptr}], [${b64:operand.desc0.ptr}, {${b32:operand.idx0_1.val}, ${b32:operand.idx0_0.val}}], [${b32:operand.lock.val}];
+        mov.u32 ${b32:exp_bytes}, 16384;
+        mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [${b32:operand.lock.val}], ${b32:exp_bytes};
+        ${label:after_load}:
+        """)  # noqa: E501
+    if not explicit_barriers:
+        # Codegen owns the smem-reuse WAR: bar.sync before issuing the load.
+        expected = "bar.sync 0;\n" + expected
+
+    assert tma == expected
 
 
 def test_lower_move_gmem_to_smem():

@@ -564,6 +564,32 @@ class AwaitOp(Op):
         self.operands[0] = value
 
 
+# Marks a kernel as carrying its cross-thread ordering explicitly as ``barrier``
+# ops (placed by the insert_syncs pass) rather than via codegen's implicit syncs.
+EXPLICIT_BARRIERS_ATTR = "explicit_barriers"
+
+
+@gpu_dialect.register_op("barrier")
+class BarrierOp(Op):
+    """A cross-thread rendezvous / ordering fence (a CTA-wide ``bar.sync``).
+
+    Carries no data and has no lock — it only establishes a happens-before
+    spanning threads. The sync-insertion pass places one on each cross-thread
+    buffer-reuse (write-after-read) edge the async ``await``s do not already
+    order, and codegen lowers it to ``bar.sync 0``. It is *not* side-effect-free
+    (so it survives DCE).
+
+    ``attrs`` may carry a ``scope`` string (e.g. ``"block"`` / ``"grid"``)
+    recording the participant set the sync must span, so codegen can later pick a
+    cheaper form (e.g. an asymmetric named barrier); today it always lowers to a
+    full-CTA ``bar.sync 0``.
+    """
+
+    @classmethod
+    def build(cls, attrs: dict[str, object] | None = None) -> "BarrierOp":
+        return cls(operands=[], results=[], attrs=dict(attrs or {}))
+
+
 @gpu_dialect.register_op("async")
 class AsyncOp(Op):
     """A group of async work issued together and completed by one ``await``.
