@@ -12,7 +12,16 @@ from ayla import (
     Value,
     make_ptx_kernel,
 )
-from ayla.gpu_dialect import gpu_dialect, BlockIdsOp, ThreadIdsOp, F32Type
+from ayla.gpu_dialect import (
+    gpu_dialect,
+    BlockIdsOp,
+    PtrType,
+    ThreadIdsOp,
+    F32Type,
+    WgmmaDescOp,
+    WgmmaDescType,
+)
+from ayla.ptx_codegen import PtxPrinter, _emit_wgmma_desc
 
 
 def test_codegen_cwise_add():
@@ -134,30 +143,31 @@ def test_codegen_naive_matmul_4096():
           mov.u32 %r6, 64;              // 64
           mov.u32 %r7, 1048576;         // 1048576
           shl.b32 %r8, %r0, 20;         // %r0 * 1048576
+          mov.u32 %r9, 4;               // 4
           cvt.u64.u32 %rd5, %r8;
           add.u64 %rd4, %rd3, %rd5;     // to_ptr(%rd0) + %r0 * 1048576
           mov.u64 %rd6, %rd1;           // to_ptr(%rd1)
-          shl.b32 %r9, %r1, 20;         // %r1 * 1048576
-          cvt.u64.u32 %rd8, %r9;
+          shl.b32 %r10, %r1, 20;        // %r1 * 1048576
+          cvt.u64.u32 %rd8, %r10;
           add.u64 %rd7, %rd6, %rd8;     // to_ptr(%rd1) + %r1 * 1048576
           mov.u64 %rd9, %rd2;           // to_ptr(%rd2)
-          mov.u32 %r10, 256;            // 256
-          shl.b32 %r11, %r1, 8;         // %r1 * 256
-          add.s32 %r12, %r8, %r11;      // %r0 * 1048576 + %r1 * 256
-          cvt.u64.u32 %rd11, %r12;
+          mov.u32 %r11, 256;            // 256
+          shl.b32 %r12, %r1, 8;         // %r1 * 256
+          add.s32 %r13, %r8, %r12;      // %r0 * 1048576 + %r1 * 256
+          cvt.u64.u32 %rd11, %r13;
           add.u64 %rd10, %rd9, %rd11;   // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256
-          mov.u32 %r13, 2;              // 2
-          mov.u32 %r14, 32768;          // 32768
-          shl.b32 %r15, %r3, 15;        // %r3 * 32768
-          cvt.u64.u32 %rd13, %r15;
+          mov.u32 %r14, 2;              // 2
+          mov.u32 %r15, 32768;          // 32768
+          shl.b32 %r16, %r3, 15;        // %r3 * 32768
+          cvt.u64.u32 %rd13, %r16;
           add.u64 %rd12, %rd4, %rd13;   // to_ptr(%rd0) + %r0 * 1048576 + %r3 * 32768
-          shl.b32 %r16, %r4, 15;        // %r4 * 32768
-          cvt.u64.u32 %rd15, %r16;
+          shl.b32 %r17, %r4, 15;        // %r4 * 32768
+          cvt.u64.u32 %rd15, %r17;
           add.u64 %rd14, %rd7, %rd15;   // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768
-          mov.u32 %r17, 8;              // 8
-          shl.b32 %r18, %r4, 3;         // %r4 * 8
-          add.s32 %r19, %r15, %r18;     // %r3 * 32768 + %r4 * 8
-          cvt.u64.u32 %rd17, %r19;
+          mov.u32 %r18, 8;              // 8
+          shl.b32 %r19, %r4, 3;         // %r4 * 8
+          add.s32 %r20, %r16, %r19;     // %r3 * 32768 + %r4 * 8
+          cvt.u64.u32 %rd17, %r20;
           add.u64 %rd16, %rd10, %rd17;  // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + %r3 * 32768 + %r4 * 8
 
           // PTX template `%c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={init: 0.0}`
@@ -167,15 +177,14 @@ def test_codegen_naive_matmul_4096():
           mov.f32 %f3, 0f00000000;
 
           // BEGIN: `for (%k: index = 0 to 4096) {...`
-          mov.b32 %r20, 0;
+          mov.b32 %r21, 0;
           $L0:
 
-          mov.u32 %r21, 4;              // 4
-          shl.b32 %r22, %r20, 2;        // %r20 * 4
+          shl.b32 %r22, %r21, 2;        // %r21 * 4
           cvt.u64.u32 %rd19, %r22;
-          add.u64 %rd18, %rd12, %rd19;  // to_ptr(%rd0) + %r0 * 1048576 + %r3 * 32768 + %r20 * 4
+          add.u64 %rd18, %rd12, %rd19;  // to_ptr(%rd0) + %r0 * 1048576 + %r3 * 32768 + %r21 * 4
           cvt.u64.u32 %rd21, %r22;
-          add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768 + %r20 * 4
+          add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768 + %r21 * 4
 
           // PTX template `%a_k_rmem: rmem_tensor<2x1xf32> = alloc()`
 
@@ -196,8 +205,8 @@ def test_codegen_naive_matmul_4096():
           fma.rn.f32 %f3, %f5, %f7, %f3;
 
           // END: `for (%k: index = 0 to 4096) {...`
-          add.s32 %r20, %r20, 1;
-          setp.lt.s32 %p0, %r20, 4096;
+          add.s32 %r21, %r21, 1;
+          setp.lt.s32 %p0, %r21, 4096;
           @%p0 bra $L0;
 
           // PTX template `move(%c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem_ten...`
@@ -233,3 +242,33 @@ def test_codegen_tma_load():
     assert "mbarrier.init.shared::cta.b64" in kernel.ptx
     assert "cp.async.bulk.tensor.2d" in kernel.ptx
     assert "mbarrier.try_wait.parity" in kernel.ptx
+
+
+def test_codegen_wgmma_desc():
+    """WgmmaDescOp emits the shr/cvt/or descriptor build (add when offset)."""
+    desc_const = 4611686293305360384
+
+    # No byte offset: shift the smem ptr directly.
+    src = Value(name="smem", type=PtrType.build("smem"))
+    op = WgmmaDescOp.build(src, desc_const=desc_const)
+    assert isinstance(op.result().type, WgmmaDescType)
+    p = PtxPrinter()
+    src_reg = p.unique_ptx_names_for_value(src)
+    _emit_wgmma_desc(p, op)
+    out = p.render()
+    assert f"shr.b32 %r1, {src_reg}, 4;" in out
+    assert "add.u32" not in out
+    assert "cvt.u64.u32 %rd0, %r1;" in out
+    assert f"or.b64 %rd0, %rd0, {desc_const};" in out
+
+    # Nonzero byte offset: add before shifting.
+    src2 = Value(name="smem2", type=PtrType.build("smem"))
+    op2 = WgmmaDescOp.build(src2, desc_const=desc_const, byte_offset=8192)
+    p2 = PtxPrinter()
+    src2_reg = p2.unique_ptx_names_for_value(src2)
+    _emit_wgmma_desc(p2, op2)
+    out2 = p2.render()
+    assert f"add.u32 %r1, {src2_reg}, 8192;" in out2
+    assert "shr.b32 %r1, %r1, 4;" in out2
+    assert "cvt.u64.u32 %rd0, %r1;" in out2
+    assert f"or.b64 %rd0, %rd0, {desc_const};" in out2

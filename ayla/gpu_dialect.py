@@ -999,6 +999,74 @@ class PtrAddOp(Op):
         return s
 
 
+@gpu_dialect.register_type("wgmma_desc")
+class WgmmaDescType(Type):
+    """Opaque 64-bit wgmma matrix descriptor.
+
+    Encodes an smem tile address as ``(base >> 4) | desc_const``. Produced
+    by ``wgmma_desc`` and consumed as a b64 operand of the wgmma template.
+    """
+
+    @classmethod
+    def build(cls) -> "WgmmaDescType":
+        return cls(attrs={})
+
+    def print(self, p: Printer) -> None:
+        p.write("wgmma_desc")
+
+    @classmethod
+    def parse(cls, prefix: str, p) -> "WgmmaDescType":
+        assert prefix == "wgmma_desc"
+        return cls.build()
+
+
+@gpu_dialect.register_op("wgmma_desc")
+class WgmmaDescOp(Op):
+    """Build a wgmma matrix descriptor from an smem tensor.
+
+    The descriptor encodes only the smem tile *address*
+    (``(base + byte_offset) >> 4 | desc_const``), not the tile contents, so
+    it is value-identical and side-effect-free even though the smem is
+    TMA-reloaded each loop trip. That lets CSE dedupe identical descriptors
+    and LICM hoist them out of the k loop.
+    """
+
+    @classmethod
+    def build(
+        cls, src: Value, desc_const: int, byte_offset: int = 0,
+    ) -> "WgmmaDescOp":
+        assert (
+            isinstance(src.type, SmemTensorType)
+            or (isinstance(src.type, PtrType) and src.type.space == "smem")
+        ), (
+            f"WgmmaDescOp: expected an smem tensor or smem pointer src; "
+            f"got {src.type}"
+        )
+        result = Value(name=None, type=WgmmaDescType.build())
+        return cls(
+            operands=[src],
+            results=[result],
+            attrs={"desc_const": desc_const, "byte_offset": byte_offset},
+        )
+
+    @property
+    def src(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def desc_const(self) -> int:
+        return self.attrs["desc_const"]
+
+    @property
+    def byte_offset(self) -> int:
+        return self.attrs["byte_offset"]
+
+    def expr_str(self, prec=0, val_str=None) -> str:
+        s = _resolve_val_str(self.src, 1, val_str)
+        off = f" + {self.byte_offset}" if self.byte_offset else ""
+        return f"wgmma_desc(({s}{off}) >> 4 | {self.desc_const})"
+
+
 @gpu_dialect.register_type("tma_desc")
 class TmaDescType(Type):
     """TMA tensor map descriptor for bulk async copies (Hopper+).
@@ -1578,6 +1646,7 @@ def is_value_identical(op: Op) -> bool:
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,
+        WgmmaDescOp,
     ))
 
 

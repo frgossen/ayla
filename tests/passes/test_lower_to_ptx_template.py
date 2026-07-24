@@ -2,7 +2,7 @@
 
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
+from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp, WgmmaDescOp
 from ayla.base.ir import find_ops
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
@@ -63,3 +63,46 @@ def test_lower_move_gmem_to_smem():
         ),
     )
     assert template.count("ld.global.b16") == 64, "64 rows unrolled"
+
+
+def test_lower_async_matmul_wgmma_emits_desc_ops():
+    """wgmma lowering builds descriptors as WgmmaDescOp IR ops (not template
+    text) and wires their results in as b64 template operands."""
+    module_str = textwrap.dedent(
+        """\
+        module {
+          kernel @mm(%a: smem_tensor<128x16xbf16 swizzle="128B">, %b: smem_tensor<128x16xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %l0: lock<wgmma> = alloc()
+            async(%l0: lock<wgmma>) matmul(%a: smem_tensor<128x16xbf16 swizzle="128B">, %b: smem_tensor<128x16xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            await(%l0: lock<wgmma>)
+          }
+        }"""
+    )  # noqa: E501
+
+    module = gpu_dialect.parse(module_str)
+    lowered = lower_to_ptx_template(module)
+
+    # m=128 -> 2 lhs m-iterations, plus one rhs descriptor.
+    descs = find_ops(lowered, lambda op: isinstance(op, WgmmaDescOp))
+    assert len(descs) == 3
+    # The lhs m-iter 1 descriptor carries a nonzero byte offset.
+    assert sorted(d.byte_offset for d in descs) == [0, 0, 2048]
+
+    templates = find_ops(lowered, lambda op: isinstance(op, PTXTemplateOp))
+    mma_templates = [
+        t.attrs["template"] for t in templates
+        if "wgmma.mma_async" in t.attrs["template"]
+    ]
+    assert len(mma_templates) == 1
+    template = mma_templates[0]
+
+    # Descriptor arithmetic is no longer inlined into the template string.
+    assert "shr.b32" not in template
+    assert "cvt.u64.u32" not in template
+    assert "or.b64" not in template
+    # The wgmma reads the descriptors as b64 template operands.
+    assert "wgmma.fence.sync.aligned;" in template
+    assert "${b64:operand.desc_lhs0_0.val}" in template
+    assert "${b64:operand.desc_lhs0_1.val}" in template
+    assert "${b64:operand.desc_rhs0.val}" in template
+    assert "wgmma.commit_group.sync.aligned;" in template

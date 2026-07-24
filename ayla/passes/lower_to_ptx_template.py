@@ -42,6 +42,7 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     ToPtrOp,
+    WgmmaDescOp,
     WrmemTensorType,
 )
 from ..base.ir import Op, Value
@@ -471,18 +472,6 @@ class LowerToPtxTemplate(LoweringPass):
         def _build_static_desc(lbo, sbo, swizzle):
             return (lbo >> 4) << 16 | (sbo >> 4) << 32 | swizzle << 62
 
-        # TODO: Building the descrptor should be hoisted out of the loop.
-        def _build_desc(name, ptr_reg, desc_const, offset=None):
-            t = ""
-            if offset is not None:
-                t += f"add.u32 ${{b32:{name}_addr}}, ${{b32:{ptr_reg}}}, {offset};\n"
-                t += f"shr.b32 ${{b32:{name}_addr}}, ${{b32:{name}_addr}}, 4;\n"
-            else:
-                t += f"shr.b32 ${{b32:{name}_addr}}, ${{b32:{ptr_reg}}}, 4;\n"
-            t += f"cvt.u64.u32 ${{b64:{name}}}, ${{b32:{name}_addr}};\n"
-            t += f"or.b64 ${{b64:{name}}}, ${{b64:{name}}}, {desc_const};\n"
-            return t
-
         # Each distinct operand value gets a single unique placeholder name —
         # matmuls accumulating into the same dst share that operand/register set.
         operands: list[Value] = []
@@ -498,7 +487,7 @@ class LowerToPtxTemplate(LoweringPass):
             operand_names.append(name)
             return name
 
-        desc_template = ""
+        desc_ops: list[Op] = []
         mma_template = ""
         for j, mm in enumerate(mms):
             lhs_type = mm.lhs.type
@@ -553,21 +542,28 @@ class LowerToPtxTemplate(LoweringPass):
             desc_const_rhs = _build_static_desc(
                 lead_dim, rhs_row_stride_bytes * 8, _swizzle_to_bits[rhs_type.swizzle])
 
-            lhs_name = _operand(self.value_map[mm.lhs], "lhs")
-            rhs_name = _operand(self.value_map[mm.rhs], "rhs")
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
+            # Build the wgmma matrix descriptors as real IR ops so CSE/LICM can
+            # dedupe and hoist them; wire their results in as template operands.
+            desc_rhs_op = WgmmaDescOp.build(self.value_map[mm.rhs], desc_const_rhs)
+            desc_ops.append(desc_rhs_op)
             desc_rhs = f"desc_rhs{j}"
-            desc_template += _build_desc(desc_rhs, f"operand.{rhs_name}.ptr", desc_const_rhs)
-            for m_it in range(m_iters):
-                lhs_offset = m_it * 64 * lhs_row_stride_bytes
-                desc_template += _build_desc(
-                    f"desc_lhs{j}_{m_it}", f"operand.{lhs_name}.ptr", desc_const_lhs,
-                    offset=lhs_offset if m_it > 0 else None,
-                )
+            operands.append(desc_rhs_op.result())
+            operand_names.append(desc_rhs)
 
             reg_offset = 0
             for m_it in range(m_iters):
+                lhs_offset = m_it * 64 * lhs_row_stride_bytes
+                desc_lhs_op = WgmmaDescOp.build(
+                    self.value_map[mm.lhs], desc_const_lhs,
+                    byte_offset=lhs_offset if m_it > 0 else 0,
+                )
+                desc_ops.append(desc_lhs_op)
+                desc_lhs = f"desc_lhs{j}_{m_it}"
+                operands.append(desc_lhs_op.result())
+                operand_names.append(desc_lhs)
+
                 regs = ", ".join(
                     f"${{f32:operand.{dst_name}.r{reg_offset + i}}}"
                     for i in range(num_regs_per_wgmma)
@@ -575,8 +571,8 @@ class LowerToPtxTemplate(LoweringPass):
                 mma_template += textwrap.dedent(f"""\
                     wgmma.mma_async.sync.aligned.m64n{n_dim}k16.f32.bf16.bf16
                       {{{regs}}},
-                      ${{b64:desc_lhs{j}_{m_it}}},
-                      ${{b64:{desc_rhs}}},
+                      ${{b64:operand.{desc_lhs}.val}},
+                      ${{b64:operand.{desc_rhs}.val}},
                       1, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
@@ -588,7 +584,6 @@ class LowerToPtxTemplate(LoweringPass):
         # warpgroup-wide wgmma reads).
         template = (
             "wgmma.fence.sync.aligned;\n"
-            + desc_template
             + mma_template
             + "wgmma.commit_group.sync.aligned;\n"
         )
@@ -601,7 +596,7 @@ class LowerToPtxTemplate(LoweringPass):
             result_names=[],
             description=str(op),
         )
-        return [new_op], []
+        return desc_ops + [new_op], []
 
     def lower_move(
         self, op: MoveOp,

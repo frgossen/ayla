@@ -30,12 +30,15 @@ from .gpu_dialect import (
     ToPtrOp,
     LaneIdOp,
     WarpGroupIdOp,
+    WgmmaDescOp,
+    WgmmaDescType,
     WrmemTensorType,
 )
 from .base.ir import Op, Printer, Value
 from .passes.folding import Folding
 from .passes.cse import CSE
 from .passes.dce import DCE
+from .passes.licm import LICM
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
@@ -53,6 +56,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(CSE())
         self.add_pass(DCE())
         self.add_pass(LowerToPtxTemplate())
+        self.add_pass(LICM())
         self.add_pass(Folding())
         self.add_pass(CSE())
         self.add_pass(DCE())
@@ -183,6 +187,11 @@ def map_type_to_registers(type):
     if isinstance(type, TokenType):
         return TypeRegisterMapping(
             member_register_types=PtxType.B32,
+            member_names="val",
+        )
+    if isinstance(type, WgmmaDescType):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.B64,
             member_names="val",
         )
     if isinstance(type, LockType):
@@ -322,6 +331,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_to_ptr(p, op)
     elif isinstance(op, PtrAddOp):
         _emit_ptr_add(p, op)
+    elif isinstance(op, WgmmaDescOp):
+        _emit_wgmma_desc(p, op)
     else:
         raise NotImplementedError(f"make_ptx_kernel: not implemented for {op.op_id}")
 
@@ -603,6 +614,19 @@ def _emit_ptr_add(p: PtxPrinter, op: PtrAddOp) -> None:
         else:
             offset = p.unique_ptx_names_for_value(op.byte_offset)
             _write_with_comment(p, f"add.u32 {dst}, {ptr}, {offset};", op)
+
+
+def _emit_wgmma_desc(p: PtxPrinter, op: WgmmaDescOp) -> None:
+    dst = p.unique_ptx_names_for_value(op.result())
+    src = p.unique_ptx_names_for_value(op.src)
+    addr = p.unique_ptx_names((op, "addr"), PtxType.B32)
+    if op.byte_offset:
+        p.write_line(f"add.u32 {addr}, {src}, {op.byte_offset};")
+        p.write_line(f"shr.b32 {addr}, {addr}, 4;")
+    else:
+        p.write_line(f"shr.b32 {addr}, {src}, 4;")
+    p.write_line(f"cvt.u64.u32 {dst}, {addr};")
+    _write_with_comment(p, f"or.b64 {dst}, {dst}, {op.desc_const};", op)
 
 
 def _op_description(p: PtxPrinter, op: Op, max_len: int = 80) -> str:
