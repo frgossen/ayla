@@ -1,19 +1,11 @@
 """Loop-invariant code motion.
 
-Hoists side-effect-free ops out of a region — a ``for`` loop body or an
-``async`` body — when all their operands are defined outside that region.
-
-Which region ops to hoist out of is configurable. The default handles both;
-the codegen pipeline runs it ``AsyncOp``-only, to lift the index arithmetic
-``lower_to_tma_move`` materializes inside an ``async { … }`` back out (restoring
-a single-op async body) without disturbing loops — at that point loop bodies
-hold per-iteration lock allocs, which are side-effect-free but must not be
-hoisted out of their loop.
+Hoists side-effect-free ops out of a ``for`` loop body when all their operands
+are defined outside the loop.
 """
 from __future__ import annotations
 
 from ..gpu_dialect import (
-    AsyncOp,
     ForOp,
     ModuleOp,
     effective_operands,
@@ -25,17 +17,16 @@ from ..base.lowering_pass import LoweringPass
 
 class LICM(LoweringPass):
 
-    def __init__(self, region_ops: tuple[type, ...] = (ForOp, AsyncOp)) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        for op_type in region_ops:
-            self.register(op_type, type(self).lower_region_op)
+        self.register(ForOp, type(self).lower_region_op)
 
     def lower_region_op(
         self, op: Op,
     ) -> tuple[list[Op], list[object]]:
         assert len(op.body.blocks) == 1
         body = op.body.entry_block
-        # Defined inside the region: block arguments (e.g. a loop's iv) plus the
+        # Defined inside the loop: block arguments (e.g. the iv) plus the
         # results of the body ops we keep.
         region_defined: set[Value] = set(body.arguments)
         hoisted: list[Op] = []

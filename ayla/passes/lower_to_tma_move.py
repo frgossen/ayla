@@ -6,15 +6,17 @@ followed by a sync ``tma_move``::
 
 - ``move`` (tma) → ``index ops…``, ``tma_move``
 
-A move wrapped in ``async { move (tma) }`` is lowered in place by the generic
-region recursion, leaving ``async { index ops…; tma_move }``. A later ``licm``
-pass hoists the (side-effect-free) index ops back out of the region so the body
-returns to a single op. This keeps the pass order-independent w.r.t.
-``lower_to_async``. Non-tma moves and other ops are left untouched.
+A move wrapped in ``async { move (tma) }`` is lowered so the coordinate index
+arithmetic lands *before* the enclosing ``async`` op and only the ``tma_move``
+stays in the body, leaving ``index ops…; async { tma_move }``. The index math is
+plain, side-effect-free arithmetic with no reason to sit inside the mbarrier
+region, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
+``tma_move`` body it expects. Non-tma moves and other ops are left untouched.
 """
 from __future__ import annotations
 
 from ..gpu_dialect import (
+    AsyncOp,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -25,6 +27,7 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
+    is_side_effect_free,
 )
 from ..base.ir import Block, Op, Value
 from ..base.lowering_pass import LoweringPass
@@ -35,6 +38,7 @@ class LowerToTmaMove(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.register(MoveOp, type(self).lower_move)
+        self.register(AsyncOp, type(self).lower_async)
 
     def lower_move(
         self, op: MoveOp,
@@ -43,6 +47,24 @@ class LowerToTmaMove(LoweringPass):
             return None
         index_ops, tma_op = self._materialize(op)
         return index_ops + [tma_op], []
+
+    def lower_async(
+        self, op: AsyncOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower the async body, hoisting materialized index ops before it.
+
+        Lowering a body tma ``move`` yields coordinate index arithmetic plus a
+        ``tma_move``. That arithmetic is side-effect-free and has no reason to
+        sit inside the mbarrier region, so it moves ahead of the async op,
+        leaving the body as just the ``tma_move``(s) that ``lower_async`` (PTX
+        lowering) expects.
+        """
+        op.operands = [self.value_map[v] for v in op.operands]
+        body = op.body.entry_block
+        self.lower_block(body)
+        hoisted = [o for o in body.ops if is_side_effect_free(o)]
+        body.ops = [o for o in body.ops if not is_side_effect_free(o)]
+        return hoisted + [op], list(op.results)
 
     def _materialize(self, move: MoveOp) -> tuple[list[Op], TmaMoveOp]:
         """Build the descriptor + index ops and a sync ``tma_move`` for ``move``."""
