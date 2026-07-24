@@ -561,7 +561,7 @@ class AwaitOp(Op):
 
     @lock.setter
     def lock(self, value: Value) -> None:
-        self.set_operand(0, value)
+        self.operands[0] = value
 
 
 @gpu_dialect.register_op("async")
@@ -600,7 +600,7 @@ class AsyncOp(Op):
 
     @lock.setter
     def lock(self, value: Value) -> None:
-        self.set_operand(0, value)
+        self.operands[0] = value
 
     @property
     def body(self) -> Region:

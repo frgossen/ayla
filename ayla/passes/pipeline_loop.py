@@ -323,7 +323,6 @@ class PipelineLoop(LoweringPass):
                 clone_op(body_op, vmap) for body_op in shared + unlabeled
             )
 
-        op.drop_uses()  # original loop + body discarded, replaced by clones
         return [*prologue_ops, new_for, *epilogue_ops], []
 
 

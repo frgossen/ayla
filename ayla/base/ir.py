@@ -9,6 +9,92 @@ from .parser import Parser
 from .printer import Printer  # noqa: F401
 
 
+# Observable containers that keep the use-list self-maintaining.
+#
+# The invariant: ``value.uses`` contains ``(op, i)`` iff ``op.operands[i] is
+# value`` and ``op`` is anchored (held by a block, directly or nested inside an
+# anchored op's regions). Two list subclasses capture the only two mutation
+# channels so no pass registers/deregisters by hand:
+#
+# - ``_OperandList`` wraps an op's ``operands`` — writes rewire its uses.
+# - ``_OpList`` wraps a block's ``ops`` — ops entering/leaving anchor/unanchor
+#   (which cascades into their regions).
+#
+# Both react the same way: snapshot, run the real list method, reconcile via
+# ``_sync(old)``. Every mutator is generated from that one pattern below.
+# Whole-list reassignment (``op.operands = [...]`` / ``block.ops = [...]``) is
+# handled by ``Op``/``Block`` ``__setattr__``, which re-wraps into these types.
+
+
+class _ObservableList(list):
+    """A ``list`` that calls ``self._sync(old)`` after any in-place mutation,
+    where ``old`` is the pre-mutation snapshot. Subclasses implement ``_sync``.
+    """
+
+    __slots__ = ()
+
+    def _sync(self, old: list) -> None:
+        raise NotImplementedError
+
+
+def _observed(name: str):
+    real = getattr(list, name)
+
+    def method(self, *args, **kwargs):
+        old = list(self)
+        result = real(self, *args, **kwargs)
+        self._sync(old)
+        return result
+
+    method.__name__ = name
+    return method
+
+
+for _name in (
+    "__setitem__", "__delitem__", "__iadd__", "__imul__", "append", "extend",
+    "insert", "pop", "remove", "clear", "sort", "reverse",
+):
+    setattr(_ObservableList, _name, _observed(_name))
+
+
+class _OperandList(_ObservableList):
+    """An op's ``operands``; rewires its values' ``uses`` when anchored."""
+
+    __slots__ = ("_op",)
+
+    def __init__(self, iterable=(), *, op: "Op | None" = None) -> None:
+        super().__init__(iterable)
+        self._op = op
+
+    def _sync(self, old: list) -> None:
+        op = self._op
+        if op is None or not op._anchored:
+            return
+        for i, v in enumerate(old):
+            v.uses.discard((op, i))
+        for i, v in enumerate(self):
+            v.uses.add((op, i))
+
+
+class _OpList(_ObservableList):
+    """A block's ``ops``; anchors/unanchors ops as they enter/leave. Stateless:
+    ``_sync`` reconciles purely from the element ops."""
+
+    __slots__ = ()
+
+    def _sync(self, old: list) -> None:
+        # Unanchor removed ops before anchoring added ones so transplanted ops
+        # (in both old and new) stay anchored.
+        new_ids = {id(op) for op in self}
+        old_ids = {id(op) for op in old}
+        for op in old:
+            if id(op) not in new_ids:
+                op._unanchor()
+        for op in self:
+            if id(op) not in old_ids:
+                op._anchor()
+
+
 # Generic IR
 
 
@@ -66,8 +152,8 @@ class Value:
     type: Type
     definition: Op | Block = field(init=False)
     result_index: int = field(init=False)
-    uses: dict[tuple[Op, int], None] = field(
-        default_factory=dict, init=False, repr=False,
+    uses: set[tuple[Op, int]] = field(
+        default_factory=set, init=False, repr=False,
     )
 
     def __post_init__(self) -> None:
@@ -77,7 +163,9 @@ class Value:
         )
 
     def users(self) -> list[Op]:
-        """Ops consuming this value, in block order, deduplicated."""
+        """
+        Ops consuming this value.
+        """
         seen: set[int] = set()
         out: list[Op] = []
         for op, _ in self.uses:
@@ -126,43 +214,53 @@ class Op:
     # Set by `Dialect.register_op` on each subclass.
     OP_ID: ClassVar[str] = "generic"
 
+    # Whether this op is currently held by a block (directly, or nested inside
+    # an anchored op). Only anchored ops contribute to `Value.uses`. Class-level
+    # default so it always resolves, even mid-construction before __post_init__.
+    _anchored = False
+
     def __post_init__(self) -> None:
         self.op_id = type(self).OP_ID
         for i, v in enumerate(self.results):
             v.definition = self
             v.result_index = i
-        self._register_operands()
 
-    def _register_operands(self) -> None:
+    def __setattr__(self, name: str, value: object) -> None:
+        # `operands` is a plain dataclass field, so `op.operands = [...]` would
+        # bypass _OperandList. Re-wrap it and run the same reconcile as an
+        # in-place mutation.
+        if name == "operands":
+            old = self.__dict__.get("operands", [])
+            new_list = _OperandList(value, op=self)
+            super().__setattr__(name, new_list)
+            new_list._sync(old)
+        else:
+            super().__setattr__(name, value)
+
+    def _anchor(self) -> None:
+        """Mark this op (and its whole subtree) as held by a block, registering
+        operand uses. Idempotent: set-keyed and guarded by ``_anchored``."""
+        if self._anchored:
+            return
+        self._anchored = True
         for i, v in enumerate(self.operands):
-            v.uses[(self, i)] = None
+            v.uses.add((self, i))
+        for region in self.regions:
+            for block in region.blocks:
+                for op in block.ops:
+                    op._anchor()
 
-    def _deregister_operands(self) -> None:
+    def _unanchor(self) -> None:
+        """Inverse of ``_anchor``: deregister this op's subtree's operand uses."""
+        if not self._anchored:
+            return
+        self._anchored = False
         for i, v in enumerate(self.operands):
-            v.uses.pop((self, i), None)
-
-    def set_operands(self, values: list[Value]) -> None:
-        # Deregister old then register new: they are different lists (and may
-        # differ in length), so the two passes cannot be merged into one.
-        self._deregister_operands()
-        self.operands = list(values)
-        self._register_operands()
-
-    def set_operand(self, i: int, value: Value) -> None:
-        self.operands[i].uses.pop((self, i), None)
-        self.operands[i] = value
-        value.uses[(self, i)] = None
-
-    def drop_uses(self, recurse: bool = True) -> None:
-        # Ops are deleted by being dropped from a block; tell operands they lost
-        # a user. Pass recurse=False when the body ops are transplanted elsewhere
-        # (still live) rather than deleted with this op.
-        self._deregister_operands()
-        if recurse:
-            for region in self.regions:
-                for block in region.blocks:
-                    for op in block.ops:
-                        op.drop_uses()
+            v.uses.discard((self, i))
+        for region in self.regions:
+            for block in region.blocks:
+                for op in block.ops:
+                    op._unanchor()
 
     def operand(self, i: int = 0) -> Value:
         return self.operands[i]
@@ -286,6 +384,17 @@ class Block:
         for i, v in enumerate(self.arguments):
             v.definition = self
             v.result_index = i
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # `ops` is a plain dataclass field, so `block.ops = [...]` would bypass
+        # _OpList. Re-wrap it and run the same reconcile as an in-place mutation.
+        if name == "ops":
+            old = self.__dict__.get("ops", [])
+            new_list = _OpList(value)
+            super().__setattr__(name, new_list)
+            new_list._sync(old)
+        else:
+            super().__setattr__(name, value)
 
     def append(self, op: Op) -> Op:
         self.ops.append(op)

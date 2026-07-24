@@ -35,9 +35,9 @@ class CSE(Pass):
         new_ops: list[Op] = []
 
         for op in block.ops:
-            op.set_operands(
-                [canonical_value.get(id(v), v) for v in op.operands]
-            )
+            op.operands = [
+                canonical_value.get(id(v), v) for v in op.operands
+            ]
 
             for region in op.regions:
                 self.run_region(region, canonical_value)
