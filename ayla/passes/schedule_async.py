@@ -28,11 +28,6 @@ from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
-def _is_async_op(op: Op) -> bool:
-    """An async start: issues work completed later by an ``await`` on its lock."""
-    return isinstance(op, (AsyncOp, TmaMoveOp))
-
-
 def _is_async_move(op: Op) -> bool:
     """The hoistable subset of async starts: data movement, not compute.
 
@@ -50,67 +45,16 @@ def _is_await(op: Op) -> bool:
     return isinstance(op, AwaitOp)
 
 
-def _lock_to_asyncs(ops: list[Op]) -> dict[Value, list[Op]]:
-    """Map each lock to the async starts sharing it (its peers), in block order.
-
-    Built once per block and threaded through hoisting and await-sinking:
-    peer-union effect resolution needs every peer of every lock, and reordering
-    ops never invalidates the map (it holds op identities, not positions).
-    """
-    lock_to_asyncs: dict[Value, list[Op]] = {}
-    for op in ops:
-        if _is_async_op(op):
-            lock_to_asyncs.setdefault(op.lock, []).append(op)
-    return lock_to_asyncs
-
-
-def await_aware_memory_effects(
-    op: Op,
-    lock_to_asyncs: dict[Value, list[Op]],
-) -> list[tuple[str, Value]] | None:
-    """``memory_effects`` extended to resolve lock synchronization.
-
-    Delegates to the dialect's per-op ``memory_effects`` for ordinary ops, but
-    resolves any lock-bearing op — an async start or an ``await`` — to the
-    union of the effects of *all* same-block async starts sharing its lock
-    (its "peers"). A wgmma group is many single-matmul ``async`` ops on one
-    lock plus a single ``await``: every one must be treated as reading the
-    whole group's operands, since those operands stay live until the await.
-    Collapsing the peers to a single start (last-writer-wins) is exactly the
-    bug that let a prefetch ``async_move`` hoist into an in-flight group.
-
-    Returns ``None`` (worst-case conflict) for an unmodelled peer, or for a
-    lock-bearing op with no registered peers.
-    """
-    lock = op.lock if (_is_await(op) or _is_async_op(op)) else None
-    if lock is None:
-        return memory_effects(op)
-    peers = lock_to_asyncs.get(lock)
-    if not peers:
-        return None
-    effects: list[tuple[str, Value]] = []
-    for peer in peers:
-        peer_effs = memory_effects(peer)
-        if peer_effs is None:
-            return None
-        effects.extend(peer_effs)
-    return effects
-
-
-def _can_swap(
-    upper: Op,
-    lower: Op,
-    lock_to_asyncs: dict[Value, list[Op]],
-) -> bool:
+def _can_swap(upper: Op, lower: Op) -> bool:
 
     # SSA dependency: lower consumes a result of upper.
     upper_results = set(upper.results)
     if any(v in upper_results for v in effective_operands(lower)):
         return False
 
-    # Memory effects (lock-bearing ops union over their lock peers).
-    upper_effs = await_aware_memory_effects(upper, lock_to_asyncs)
-    lower_effs = await_aware_memory_effects(lower, lock_to_asyncs)
+    # Memory effects (an await resolves to its lock peers via memory_effects).
+    upper_effs = memory_effects(upper)
+    lower_effs = memory_effects(lower)
     if upper_effs is None or lower_effs is None:
         return False
 
@@ -153,7 +97,6 @@ def _side_effect_free_operand_closure(seeds: list[Op], ops: list[Op]) -> list[Op
 def _bubble(
     ops: list[Op],
     targets: list[Op],
-    lock_to_asyncs: dict[Value, list[Op]],
     *,
     step: int,
 ) -> None:
@@ -172,34 +115,33 @@ def _bubble(
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
             lo, hi = sorted((j, j + step))
-            if not _can_swap(ops[lo], ops[hi], lock_to_asyncs):
+            if not _can_swap(ops[lo], ops[hi]):
                 break
             ops[j], ops[j + step] = ops[j + step], ops[j]
             j += step
 
 
-def _hoist_async_moves(ops: list[Op], lock_to_asyncs: dict[Value, list[Op]]) -> None:
+def _hoist_async_moves(ops: list[Op]) -> None:
     # Targets: the async moves (matmuls are tracked as lock peers but never
     # moved) plus the side-effect-free dependency cone feeding each. Then hoist
     # each up.
     targets = _side_effect_free_operand_closure(
         [op for op in ops if _is_async_move(op)], ops
     )
-    _bubble(ops, targets, lock_to_asyncs, step=-1)
+    _bubble(ops, targets, step=-1)
 
 
-def _sink_awaits(ops: list[Op], lock_to_asyncs: dict[Value, list[Op]]) -> None:
+def _sink_awaits(ops: list[Op]) -> None:
     # Targets: the awaits; then sink each toward its first consumer.
     targets = [op for op in ops if _is_await(op)]
-    _bubble(ops, targets, lock_to_asyncs, step=+1)
+    _bubble(ops, targets, step=+1)
 
 
 class ScheduleAsync(Pass):
 
     def run_block(self, block: Block) -> None:
-        lock_to_asyncs = _lock_to_asyncs(block.ops)
-        _hoist_async_moves(block.ops, lock_to_asyncs)
-        _sink_awaits(block.ops, lock_to_asyncs)
+        _hoist_async_moves(block.ops)
+        _sink_awaits(block.ops)
         super().run_block(block)
 
 

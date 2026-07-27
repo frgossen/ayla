@@ -2,7 +2,7 @@
 
 import textwrap
 
-from ayla.base.ir import Block, Dialect, Op, Region, Type, Value
+from ayla.base.ir import Block, Dialect, Op, Region, Type, Value, clone_op
 
 
 def assert_print_and_roundtrip(op: Op, expected: str) -> None:
@@ -137,3 +137,200 @@ def test_nested_ops():
         }"""
     )
     assert_print_and_roundtrip(op, expected)
+
+
+# ---------------------------------------------------------------------------
+# Use-list invariant.
+#
+#   value.uses contains (op, i) iff op.operands[i] is value and op is anchored
+#   (held by a block, directly or nested inside an anchored op's regions).
+#
+# These drive mutations the *plain* way — no helper methods — to prove the
+# invariant is self-maintaining through the two observable containers.
+# ---------------------------------------------------------------------------
+
+
+def test_operand_item_assignment_moves_use():
+    t = Type()
+    a = Value(name="a", type=t)
+    b = Value(name="b", type=t)
+    op = Op(operands=[a], results=[])
+    Block(ops=[op])  # anchors op
+
+    assert a.uses == {(op, 0)}
+
+    op.operands[0] = b
+    assert a.uses == set()
+    assert b.uses == {(op, 0)}
+
+
+def test_operand_list_reassignment_reorder_and_grow():
+    t = Type()
+    a = Value(name="a", type=t)
+    b = Value(name="b", type=t)
+    c = Value(name="c", type=t)
+    op = Op(operands=[a, b], results=[])
+    Block(ops=[op])
+
+    assert a.uses == {(op, 0)}
+    assert b.uses == {(op, 1)}
+
+    # reorder + grow
+    op.operands = [b, a, c]
+    assert b.uses == {(op, 0)}
+    assert a.uses == {(op, 1)}
+    assert c.uses == {(op, 2)}
+
+    # shrink
+    op.operands = [c]
+    assert a.uses == set()
+    assert b.uses == set()
+    assert c.uses == {(op, 0)}
+
+
+def test_free_floating_op_reassignment_does_not_register():
+    t = Type()
+    a = Value(name="a", type=t)
+    op = Op(operands=[], results=[])  # never placed in a block
+    op.operands = [a]
+    assert a.uses == set()
+
+
+def test_block_ops_inplace_mutations():
+    t = Type()
+    a = Value(name="a", type=t)
+    op1 = Op(operands=[a], results=[])
+    op2 = Op(operands=[a], results=[])
+    block = Block(ops=[])
+
+    # free-floating ops are not registered
+    assert a.uses == set()
+
+    block.ops.append(op1)
+    assert (op1, 0) in a.uses
+
+    block.ops.insert(0, op2)
+    assert (op2, 0) in a.uses
+
+    assert block.ops.pop() is op1
+    assert (op1, 0) not in a.uses
+    assert (op2, 0) in a.uses
+
+    block.ops.remove(op2)
+    assert a.uses == set()
+
+    op3 = Op(operands=[a], results=[])
+    block.ops.append(op3)
+    assert (op3, 0) in a.uses
+    del block.ops[0]
+    assert a.uses == set()
+
+
+def test_block_ops_reassignment_diffs():
+    t = Type()
+    a = Value(name="a", type=t)
+    op1 = Op(operands=[a], results=[])
+    op2 = Op(operands=[a], results=[])
+    block = Block(ops=[op1])
+
+    assert a.uses == {(op1, 0)}
+
+    block.ops = [op2]  # dropped op1, added op2
+    assert a.uses == {(op2, 0)}
+
+
+def test_removing_region_op_clears_nested_uses():
+    t = Type()
+    a = Value(name="a", type=t)
+    inner = Op(operands=[a], results=[])
+    outer = Op(
+        operands=[],
+        results=[],
+        regions=[Region(blocks=[Block(ops=[inner])])],
+    )
+    root = Block(ops=[outer])
+
+    assert (inner, 0) in a.uses
+
+    root.ops = []  # cascade: dropping outer clears inner's uses too
+    assert a.uses == set()
+
+
+def test_transplant_keeps_use_removes_before_adds():
+    t = Type()
+    a = Value(name="a", type=t)
+    inner = Op(operands=[a], results=[])
+    wrapper = Op(
+        operands=[],
+        results=[],
+        regions=[Region(blocks=[Block(ops=[inner])])],
+    )
+    root = Block(ops=[wrapper])
+
+    assert (inner, 0) in a.uses
+
+    # Move the inner op into a fresh group, then drop the old wrapper by
+    # reassigning root.ops. Removes-before-adds must keep inner anchored.
+    new_group = Block(ops=[inner])
+    new_wrapper = Op(
+        operands=[],
+        results=[],
+        regions=[Region(blocks=[new_group])],
+    )
+    root.ops = [new_wrapper]
+
+    assert (inner, 0) in a.uses
+
+
+def test_build_is_free_floating_until_placed():
+    t = Type()
+    a = Value(name="a", type=t)
+    op = Op.build(operands=[a])
+    assert a.uses == set()
+
+    Block(ops=[op])
+    assert a.uses == {(op, 0)}
+
+
+def test_clone_subtree_no_double_count():
+    t = Type()
+    a = Value(name="a", type=t)
+    inner = Op(operands=[a], results=[])
+    outer = Op(
+        operands=[a],
+        results=[],
+        regions=[Region(blocks=[Block(ops=[inner])])],
+    )
+    Block(ops=[outer])
+
+    cloned = clone_op(outer, {})
+    Block(ops=[cloned])
+
+    # a is used once by each of: outer, inner, cloned outer, cloned inner.
+    assert len(a.uses) == 4
+    assert len(a.users()) == 4
+
+
+def test_users_dedupes_repeated_operand():
+    t = Type()
+    a = Value(name="a", type=t)
+    op = Op(operands=[a, a], results=[])
+    Block(ops=[op])
+
+    assert a.uses == {(op, 0), (op, 1)}
+    assert a.users() == [op]
+
+
+def test_parsed_ir_registers_uses():
+    src = textwrap.dedent(
+        """\
+        generic() {
+        ^entry(%a: generic):
+          generic(%a: generic)
+        }"""
+    )
+    op = Dialect.empty().parse(src)
+    block = op.regions[0].blocks[0]
+    a = block.arguments[0]
+    inner = block.ops[0]
+    assert a.uses == {(inner, 0)}
