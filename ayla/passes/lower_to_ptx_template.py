@@ -651,7 +651,10 @@ class LowerToPtxTemplate(LoweringPass):
         scope = op.attrs.get("scope")
         if scope == "thread":
             return [], []  # per-thread ordering is implicit in program order
-        if scope == "block":
+        # TODO: "block_leader" (one leader thread on block-shared data) can lower
+        # to a cheaper asymmetric named barrier; a full bar.sync is correct but
+        # over-syncs, so use it until the named-barrier form lands.
+        if scope in ("block", "block_leader"):
             new_op = PTXTemplateOp.build(
                 operands=[],
                 result_types=[],
