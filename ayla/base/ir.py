@@ -36,7 +36,6 @@ class _ObservableList(list):
     def _sync(self, old: list) -> None:
         raise NotImplementedError
 
-
 def _observed(name: str):
     real = getattr(list, name)
 
@@ -217,6 +216,11 @@ class Op:
     # Whether this op is currently held by a block (directly, or nested inside
     # an anchored op). Only anchored ops contribute to `Value.uses`. Class-level
     # default so it always resolves, even mid-construction before __post_init__.
+
+    # TODO: anchoring triggers on entering any blocks ops, including free-floating
+    # blocks not reachable from the root, so their ops wrongly contribute to Value.uses.
+    # region.blocks / op.regions are plain lists, so attachment doesn't propagate anchoring
+    # upward. Fix by making those lists observable as well or by collapsing regions into blocks.
     _anchored = False
 
     def __post_init__(self) -> None:
