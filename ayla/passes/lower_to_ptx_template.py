@@ -18,6 +18,7 @@ from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
     AwaitOp,
+    BarrierOp,
     BF16Type,
     ConvertOp,
     F16Type,
@@ -58,6 +59,7 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(MatmulOp, type(self).lower_matmul)
         self.register(AsyncOp, type(self).lower_async)
         self.register(AwaitOp, type(self).lower_await)
+        self.register(BarrierOp, type(self).lower_barrier)
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
 
@@ -640,6 +642,27 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_await_bulk(op)
         raise NotImplementedError(
             f"lower_await: unsupported lock kind {kind!r}"
+        )
+
+    def lower_barrier(
+        self, op: BarrierOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower a cross-thread ordering fence to a full-CTA ``bar.sync``."""
+        scope = op.attrs.get("scope")
+        if scope == "thread":
+            return [], []  # per-thread ordering is implicit in program order
+        if scope == "block":
+            new_op = PTXTemplateOp.build(
+                operands=[],
+                result_types=[],
+                template="bar.sync 0;\n",
+                operand_names=[],
+                result_names=[],
+                description=str(op),
+            )
+            return [new_op], []
+        raise NotImplementedError(
+            f"lower_barrier: unsupported barrier scope {scope!r}"
         )
 
     def _lower_await_mbar(
