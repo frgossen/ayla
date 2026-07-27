@@ -21,7 +21,7 @@ from ..gpu_dialect import (
     is_side_effect_free,
     root_buffer,
 )
-from ..base.ir import Block, Op, Type, find_op
+from ..base.ir import Block, Op, Type, Value, find_op
 from ..base.pipeline import Pass
 
 
@@ -35,10 +35,12 @@ class CollectiveScope(enum.IntEnum):
     GRID = 4
 
 
-# The dataflow state: outstanding concurrent memory effects per root buffer,
-# each a (kind, root_buffer, scope) triple.
+# The dataflow state: outstanding concurrent memory effects per root buffer, each
+# a (kind, root_buffer, scope, region) tuple. ``region`` is the lock of the open
+# async completion region the effect belongs to (its ``await`` will close it), or
+# ``None`` for synchronous effects.
 ConcurrentMemoryEffectsType = dict[
-    object, set[tuple[str, object, "CollectiveScope"]]
+    object, set[tuple[str, object, "CollectiveScope", object]]
 ]
 
 # The analysis result: each effect-bearing op mapped to the coarsest scope its
@@ -58,6 +60,16 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
     raise NotImplementedError(
         f"_type_collective_scope: unmodeled buffer type {type(t).__name__}"
     )
+
+
+def _await_collective_scope(lock: Value) -> CollectiveScope:
+    """The collective scope an ``await`` on ``lock`` synchronizes."""
+    kind = lock.type.kind
+    if kind == "wgmma":
+        return CollectiveScope.WARPGROUP
+    if kind == "mbar":
+        return CollectiveScope.BLOCK
+    raise NotImplementedError(f"_await_collective_scope: unmodeled lock kind {kind!r}")
 
 
 def _memory_effects_with_collective_scope(
@@ -133,8 +145,15 @@ def _transfer(
         if is_side_effect_free(op):
             continue
         if isinstance(op, AwaitOp):
-            # TODO: an await completes its async's outstanding effects and should
-            # resolve them against live state; we don't model that yet, so skip.
+            # Close the async's region: clear the effects up to the await's
+            # collective scope, settle (drop the region tag from) the rest.
+            scope = _await_collective_scope(op.lock)
+            for buf in live:
+                live[buf] = {
+                    (k, b, s, None) if region == op.lock else (k, b, s, region)
+                    for (k, b, s, region) in live[buf]
+                    if not (region == op.lock and s <= scope)
+                }
             continue
         effects = _memory_effects_with_collective_scope(op)
         if effects is None:
@@ -143,15 +162,23 @@ def _transfer(
             )
         barrier_scope: CollectiveScope = CollectiveScope.THREAD
         for kind_y, buf, scope_y in effects:
-            for kind_x, _buf_x, scope_x in live.get(buf, ()):
+            for kind_x, _buf_x, scope_x, _region_x in live.get(buf, ()):
                 # A hazard needs a write (RAR is safe).
                 if kind_x == "W" or kind_y == "W":
                     barrier_scope = max(barrier_scope, scope_x, scope_y)
         targets[op] = barrier_scope
+        # A barrier orders settled accesses it covers; pending (in-region) effects
+        # survive — only their await completes them.
         for buf in live:
-            live[buf] = {(k, b, s) for (k, b, s) in live[buf] if s > barrier_scope}
-        for effect in effects:
-            live.setdefault(effect[1], set()).add(effect)
+            live[buf] = {
+                (k, b, s, region) for (k, b, s, region) in live[buf]
+                if region is not None or s > barrier_scope
+            }
+        # The async's effects join a completion region keyed by its lock; every
+        # other effect-bearing op is synchronous (region = None).
+        region = op.lock if isinstance(op, AsyncOp) else None
+        for (k, b, s) in effects:
+            live.setdefault(b, set()).add((k, b, s, region))
     return live
 
 
