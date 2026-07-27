@@ -564,6 +564,30 @@ class AwaitOp(Op):
         self.operands[0] = value
 
 
+@gpu_dialect.register_op("barrier")
+class BarrierOp(Op):
+    """A rendezvous / synchronization point across a set of threads.
+
+    Carries no data and has no lock — it only establishes a happens-before
+    across its participating threads.
+
+    The ``scope`` attribute records the participant set the sync spans, one of:
+    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``, ``grid``.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        scope: str = "block",
+        attrs: dict[str, object] | None = None,
+    ) -> "BarrierOp":
+        return cls(operands=[], results=[], attrs={"scope": scope, **(attrs or {})})
+
+    @property
+    def scope(self) -> str:
+        return self.attrs["scope"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("async")
 class AsyncOp(Op):
     """A group of async work issued together and completed by one ``await``.
