@@ -2,11 +2,43 @@
 
 import textwrap
 
+import pytest
+
 from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
 from ayla.base.ir import find_ops
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from ayla.testing import assert_contains_in_order
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ("thread", ""),                # program order, no barrier
+    ("block", "bar.sync 0;\n"),    # full-CTA barrier
+])
+def test_lower_barrier(scope, expected):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            barrier() attrs={{scope: "{scope}"}}
+          }}
+        }}"""))
+    lowered = lower_to_ptx_template(module)
+    ptx = "".join(
+        t.attrs["template"]
+        for t in find_ops(lowered, lambda o: isinstance(o, PTXTemplateOp))
+    )
+    assert ptx == expected
+
+
+def test_lower_barrier_unsupported_scope_raises():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            barrier() attrs={scope: "grid"}
+          }
+        }"""))
+    with pytest.raises(NotImplementedError):
+        lower_to_ptx_template(module)
 
 
 def test_lower_move_gmem_to_smem():
