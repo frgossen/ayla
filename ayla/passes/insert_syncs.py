@@ -15,8 +15,10 @@ from ..gpu_dialect import (
     MatmulOp,
     ModuleOp,
     MoveOp,
+    PTXTemplateOp,
     RmemTensorType,
     SmemTensorType,
+    TmaMoveOp,
     WrmemTensorType,
     is_side_effect_free,
     root_buffer,
@@ -175,6 +177,13 @@ def _memory_effects_with_collective_scope(
             ("W", root_buffer(op.dst), dst_scope),
             ("R", root_buffer(op.src), src_scope),
         }
+    if isinstance(op, TmaMoveOp):
+        # Leader-issued (t0): the smem side is BLOCK_LEADER (dst on a load, src on
+        # a store).
+        smem_is_dst = isinstance(op.dst.type, SmemTensorType)
+        smem = op.dst if smem_is_dst else op.src
+        kind = "W" if smem_is_dst else "R"
+        return {(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)}
     if isinstance(op, AllocOp):
         buf = op.results[0]
         scope = (
@@ -191,6 +200,11 @@ def _memory_effects_with_collective_scope(
                 return None
             out |= inner_effects
         return out
+    if isinstance(op, PTXTemplateOp):
+        # Raw PTX is opaque; model it as effect-free so hand-written kernels pass.
+        # TODO: wrong in general (a template may touch memory) -- gate on a kernel
+        # attribute marking the IR hazard-free or already synced instead.
+        return set()
     return None
 
 
