@@ -11,11 +11,8 @@ from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from ayla.testing import assert_contains_in_order
 
 
-@pytest.mark.parametrize("scope, expected", [
-    ("thread", ""),                # program order, no barrier
-    ("block", "bar.sync 0;\n"),    # full-CTA barrier
-])
-def test_lower_barrier(scope, expected):
+def _lower_barrier(scope: str) -> str:
+    """Lower a single ``barrier`` op of the given scope and return its PTX."""
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
@@ -23,22 +20,35 @@ def test_lower_barrier(scope, expected):
           }}
         }}"""))
     lowered = lower_to_ptx_template(module)
-    ptx = "".join(
+    return "".join(
         t.attrs["template"]
         for t in find_ops(lowered, lambda o: isinstance(o, PTXTemplateOp))
     )
-    assert ptx == expected
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ("thread", ""),                # program order, no barrier
+    ("block", "bar.sync 0;\n"),    # full-CTA barrier
+])
+def test_lower_barrier(scope, expected):
+    assert _lower_barrier(scope) == expected
+
+
+def test_lower_barrier_block_leader_is_named_barrier():
+    # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
+    assert _lower_barrier("block_leader") == textwrap.dedent("""\
+        mov.u32 ${b32:bl_tid}, %tid.x;
+        mov.u32 ${b32:bl_ntid}, %ntid.x;
+        setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
+        setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
+        @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
+        @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+        """)
 
 
 def test_lower_barrier_unsupported_scope_raises():
-    module = gpu_dialect.parse(textwrap.dedent("""\
-        module {
-          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            barrier() attrs={scope: "grid"}
-          }
-        }"""))
     with pytest.raises(NotImplementedError):
-        lower_to_ptx_template(module)
+        _lower_barrier("grid")
 
 
 def test_lower_move_gmem_to_smem():

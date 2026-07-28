@@ -647,26 +647,37 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_barrier(
         self, op: BarrierOp,
     ) -> tuple[list[Op], list[object]]:
-        """Lower a cross-thread ordering fence to a full-CTA ``bar.sync``."""
+        """Lower a cross-thread ordering fence."""
         scope = op.attrs.get("scope")
         if scope == "thread":
             return [], []  # per-thread ordering is implicit in program order
-        # TODO: "block_leader" (one leader thread on block-shared data) can lower
-        # to a cheaper asymmetric named barrier; a full bar.sync is correct but
-        # over-syncs, so use it until the named-barrier form lands.
-        if scope in ("block", "block_leader"):
-            new_op = PTXTemplateOp.build(
-                operands=[],
-                result_types=[],
-                template="bar.sync 0;\n",
-                operand_names=[],
-                result_names=[],
-                description=str(op),
+        if scope == "block":
+            template = "bar.sync 0;\n"
+        elif scope == "block_leader":
+            # Warp 0 (t0) waits, others arrive.
+            # TODO: id 1 is hardcoded and reused with no barrier-id analysis; safe
+            # only under the pipeline's mbar/t0 gating (see insert_syncs).
+            template = textwrap.dedent("""\
+                mov.u32 ${b32:bl_tid}, %tid.x;
+                mov.u32 ${b32:bl_ntid}, %ntid.x;
+                setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
+                setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
+                @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
+                @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+                """)
+        else:
+            raise NotImplementedError(
+                f"lower_barrier: unsupported barrier scope {scope!r}"
             )
-            return [new_op], []
-        raise NotImplementedError(
-            f"lower_barrier: unsupported barrier scope {scope!r}"
+        new_op = PTXTemplateOp.build(
+            operands=[],
+            result_types=[],
+            template=template,
+            operand_names=[],
+            result_names=[],
+            description=str(op),
         )
+        return [new_op], []
 
     def _lower_await_mbar(
         self, op: AwaitOp, lock: Value,
