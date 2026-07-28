@@ -18,6 +18,7 @@ from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
     AwaitOp,
+    BarrierOp,
     BF16Type,
     ConvertOp,
     F16Type,
@@ -58,6 +59,7 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(MatmulOp, type(self).lower_matmul)
         self.register(AsyncOp, type(self).lower_async)
         self.register(AwaitOp, type(self).lower_await)
+        self.register(BarrierOp, type(self).lower_barrier)
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
 
@@ -642,6 +644,41 @@ class LowerToPtxTemplate(LoweringPass):
             f"lower_await: unsupported lock kind {kind!r}"
         )
 
+    def lower_barrier(
+        self, op: BarrierOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower a cross-thread ordering fence."""
+        scope = op.attrs.get("scope")
+        if scope == "thread":
+            return [], []  # per-thread ordering is implicit in program order
+        if scope == "block":
+            template = "bar.sync 0;\n"
+        elif scope == "block_leader":
+            # Warp 0 (t0) waits, others arrive.
+            # TODO: id 1 is hardcoded and reused with no barrier-id analysis; safe
+            # only under the pipeline's mbar/t0 gating (see insert_syncs).
+            template = textwrap.dedent("""\
+                mov.u32 ${b32:bl_tid}, %tid.x;
+                mov.u32 ${b32:bl_ntid}, %ntid.x;
+                setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
+                setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
+                @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
+                @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+                """)
+        else:
+            raise NotImplementedError(
+                f"lower_barrier: unsupported barrier scope {scope!r}"
+            )
+        new_op = PTXTemplateOp.build(
+            operands=[],
+            result_types=[],
+            template=template,
+            operand_names=[],
+            result_names=[],
+            description=str(op),
+        )
+        return [new_op], []
+
     def _lower_await_mbar(
         self, op: AwaitOp, lock: Value,
     ) -> tuple[list[Op], list[object]]:
@@ -670,9 +707,8 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         # wait_group drains the commit group so the warpgroup's wgmma reads of
         # the smem operands have retired. The buffer-reuse WAR (thread-0's TMA
-        # reload vs those reads) is now closed on the *write* side, by the
-        # upfront bar.sync at the start of _lower_async_tma_loads — so no barrier
-        # is needed here.
+        # reload vs those reads) is handled by insert_syncs, which emits a barrier
+        # before the reload — so no barrier is needed here.
         template = textwrap.dedent(r"""
             wgmma.wait_group.sync.aligned 0;
         """)
@@ -765,11 +801,8 @@ class LowerToPtxTemplate(LoweringPass):
         elements. The flat smem index is decomposed into (row, col) to
         compute the gmem address using the gmem strides.
 
-        Syncs upfront (before touching the buffer), consistent with the rule
-        that every op guards its own hazards against *prior* accesses:
-        Load: prior readers of the smem tile finish before we overwrite it.
-        Store: prior writers of the smem tile finish before we read it out.
-        A consumer of the loaded tile issues its own bar.sync before reading.
+        The smem WAR/RAW hazards (prior readers/writers of the tile) are handled
+        by insert_syncs, which emits a barrier before this move when needed.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -803,9 +836,6 @@ class LowerToPtxTemplate(LoweringPass):
             st_inst = f"st.global.{suffix}"
             ld_addr = "${b32:co_saddr}"
             st_addr = "${b64:co_gaddr}"
-
-        template += "bar.sync 0;\n"
-
 
         co_dim = smem_type.rank - 1
         co_size = smem_type.sizes[co_dim]
@@ -1105,10 +1135,8 @@ class LowerToPtxTemplate(LoweringPass):
         Each thread independently reads/writes its own elements via
         ld.shared / st.shared with 32-bit smem addressing.
 
-        Syncs upfront, per the rule that every op guards its own hazards against
-        prior accesses: load (smem->rmem) waits for prior writers of the tile;
-        store (rmem->smem) waits for prior readers. (When the producer is a TMA
-        load, its await already orders this, so the barrier is redundant there.)
+        The smem RAW/WAR hazards (prior writers/readers of the tile) are handled
+        by insert_syncs; when the producer is a TMA load, its await orders this.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -1125,7 +1153,7 @@ class LowerToPtxTemplate(LoweringPass):
         operands: list[Value] = [dst_value, src_value]
         operand_names: list[str] = ["dst", "src"]
 
-        template = "bar.sync 0;\n"
+        template = ""
         base_reg = f"${{b32:operand.{smem_label}.ptr}}"
 
         for flat_idx, idx in enumerate(
@@ -1167,11 +1195,9 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
         # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
-        # bar.sync before issuing: all threads rendezvous so the smem tile is
-        # fully written before thread 0 reads it into the gmem store (RAW). Must
-        # precede the thread-0 election so every thread executes the barrier.
+        # The RAW (all threads finish writing the smem tile before t0 stores it) is
+        # handled by insert_syncs, which emits a barrier before this async.
         template = textwrap.dedent(f"""\
-            bar.sync 0;
             mov.u32 ${{b32:st_tid}}, %tid.x;
             mov.u32 ${{b32:st_tidy}}, %tid.y;
             or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidy}};
@@ -1247,12 +1273,9 @@ class LowerToPtxTemplate(LoweringPass):
         # the byte count are interpolated, so we avoid f-string/dedent brace and
         # multi-line-indent pitfalls by joining a line list.
         #
-        # bar.sync before issuing: all threads rendezvous so thread 0's TMA
-        # reload cannot overwrite an smem buffer still being read by prior
-        # consumers (the buffer-reuse WAR). Must precede the thread-0 election
-        # so every thread executes the barrier.
+        # The buffer-reuse WAR (t0's reload vs prior readers of the smem tile) is
+        # handled by insert_syncs, which emits a barrier before this async.
         lines = [
-            "bar.sync 0;",
             "mov.u32 ${b32:tid_x}, %tid.x;",
             "mov.u32 ${b32:tid_y}, %tid.y;",
             "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
