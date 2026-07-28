@@ -5,7 +5,6 @@ import pytest
 import torch
 from torch.ops import ayla
 
-
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 
 F32 = torch.float32
@@ -26,6 +25,7 @@ BF16 = torch.bfloat16
         pytest.param(ayla.pranjalssh_4096_pipelined, BF16, id="pranjalssh_4096_pipelined"),
         pytest.param(ayla.auto_matmul_4096, BF16, id="auto_matmul_4096"),
         pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, id="auto_matmul_4096_wgmma256_wg"),
+        pytest.param(ayla.auto_matmul_4096_wgmma256_wg_storepipe, BF16, id="auto_matmul_4096_wgmma256_wg_storepipe"),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],
 )

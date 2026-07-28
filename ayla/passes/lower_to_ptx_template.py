@@ -622,6 +622,8 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_move_wrmem_mma_to_smem(op)
         if isinstance(dst_type, GmemTensorType) and isinstance(src_type, WrmemTensorType) and src_type.layout == "wgmma_layout_0":
             return self._lower_move_wrmem_wgmma_to_gmem(op)
+        if isinstance(dst_type, SmemTensorType) and isinstance(src_type, WrmemTensorType) and src_type.layout == "wgmma_layout_0":
+            return self._lower_move_wrmem_wgmma_to_smem(op)
         raise NotImplementedError(
             f"lower_move: unsupported; got "
             f"{type(dst_type).__name__} <- {type(src_type).__name__}"
@@ -689,8 +691,12 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_bulk(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
+        # Only thread 0 issues/commits the TMA store, so wait_group drains the
+        # store only on that lane. The CTA barrier makes every producer wait
+        # for thread 0 before any lane can overwrite the shared source tile.
         template = textwrap.dedent(r"""
             cp.async.bulk.wait_group 0;
+            bar.sync 0;
         """)
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -1028,6 +1034,89 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops.append(new_op)
         return new_ops, []
 
+    def _lower_move_wrmem_wgmma_to_smem(
+        self, op: MoveOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower wgmma_layout_0 wrmem → smem store (per-thread st.shared.b32).
+
+        Mirrors ``_lower_move_wrmem_wgmma_to_gmem`` but stages the
+        accumulator fragment into a shared-memory tile using 32-bit smem
+        addressing. The staging tile must be **non-swizzled** so the
+        row/col byte offsets computed from ``wgmma_layout_0`` land at the
+        plain row-major addresses a subsequent TMA bulk store expects.
+        """
+        dst_value = self.value_map[op.dst]
+        src_value = self.value_map[op.src]
+        smem_type = op.dst.type
+        wrmem_type = op.src.type
+        assert isinstance(smem_type, SmemTensorType)
+        assert isinstance(wrmem_type, WrmemTensorType)
+        assert wrmem_type.layout == "wgmma_layout_0"
+        assert wrmem_type.rank == 2 and smem_type.rank == 2
+        assert isinstance(wrmem_type.dtype, (BF16Type, F16Type)), (
+            f"_lower_move_wrmem_wgmma_to_smem: expected bf16/f16; "
+            f"got {wrmem_type.dtype}. Use convert first for f32 accumulators."
+        )
+        assert smem_type.dtype == wrmem_type.dtype, (
+            f"_lower_move_wrmem_wgmma_to_smem: dtype mismatch; "
+            f"smem {smem_type.dtype} vs wrmem {wrmem_type.dtype}"
+        )
+        assert smem_type.swizzle is None, (
+            f"_lower_move_wrmem_wgmma_to_smem: staging tile must be "
+            f"non-swizzled; got swizzle={smem_type.swizzle!r}"
+        )
+
+        m_dim, n_dim = wrmem_type.sizes
+        dst_m, dst_n = smem_type.sizes
+        n_offset = int(op.attrs.get("wgmma_n_offset", 0))
+        assert dst_m == m_dim, (
+            f"_lower_move_wrmem_wgmma_to_smem: m mismatch; "
+            f"src {m_dim}, dst {dst_m}"
+        )
+        assert 0 <= n_offset and n_offset + dst_n <= n_dim, (
+            f"_lower_move_wrmem_wgmma_to_smem: invalid N slice "
+            f"[{n_offset}, {n_offset + dst_n}) for source N={n_dim}"
+        )
+        assert m_dim % 64 == 0, (
+            f"_lower_move_wrmem_wgmma_to_smem: m must be a multiple of 64; got {m_dim}"
+        )
+        assert n_dim % 16 == 0 and 8 <= n_dim <= 256, (
+            f"_lower_move_wrmem_wgmma_to_smem: n must be a multiple of 16 in [8, 256]; got {n_dim}"
+        )
+        dtype_bytes = smem_type.dtype.byte_size
+        row_stride_bytes = smem_type.strides[0] * dtype_bytes
+
+        # Emit index ops for the per-thread dynamic byte offset (same
+        # wgmma_layout_0 math as the gmem path, just against the smem row
+        # stride).
+        new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
+            row_stride_bytes, dtype_bytes,
+        )
+
+        # Compute the per-thread base as a 32-bit smem address and emit the
+        # static per-register stores.
+        template = textwrap.dedent(r"""
+            add.u32 ${b32:base}, ${b32:operand.dst.ptr}, ${b32:operand.offset.val};
+        """)
+        num_registers = wrmem_type.num_elements_per_thread // 2
+        for reg in range(num_registers):
+            di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
+            if not (n_offset <= dj < n_offset + dst_n):
+                continue
+            offset = di * row_stride_bytes + (dj - n_offset) * dtype_bytes
+            template += textwrap.dedent(f"""\
+                st.shared.b32 [${{b32:base}}+{offset}], ${{b32:operand.src.r{reg}}};
+            """)
+
+        new_op = PTXTemplateOp.build(
+            operands=[dst_value, src_value, byte_offset],
+            result_types=[], template=template,
+            operand_names=["dst", "src", "offset"], result_names=[],
+            description=str(op),
+        )
+        new_ops.append(new_op)
+        return new_ops, []
+
     def _lower_move_smem_to_wrmem_mma(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
@@ -1152,15 +1241,19 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower smem → gmem TMA bulk store (block-collective).
 
-        Thread 0 issues cp.async.bulk.tensor.2d, commits, and waits.
-        All threads sync before and after via bar.sync.
+        Thread 0 issues and commits cp.async.bulk.tensor.2d. The matching bulk
+        await performs the completion wait followed by the after-barrier.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
         idx_values = [self.value_map[v] for v in op.indices]
 
-        operands = [dst_value, src_value, lock_value] + idx_values
-        operand_names = ["dst", "src", "lock"] + [f"idx{i}" for i in range(len(idx_values))]
+        # Bulk-store completion is tracked by the hardware commit group, not
+        # by an addressable lock value (unlike an mbarrier load).  Non-mbar
+        # lock allocs intentionally lower to no PTX value, so do not thread the
+        # placeholder through this template.
+        operands = [dst_value, src_value] + idx_values
+        operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
         indices = ", ".join(
             f"${{b32:operand.idx{i}.val}}"
             for i in reversed(range(len(idx_values)))

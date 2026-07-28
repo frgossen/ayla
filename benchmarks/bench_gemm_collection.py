@@ -176,8 +176,9 @@ def _is_str_field(f) -> bool:
     return f.type is str or f.type == "str"
 
 
-# Label column width; fits "ayla.X (...) (4096x4096 @ 4096x4096)".
-_LABEL_WIDTH = 66
+# Label column width; fits the longest collection label plus the rendered
+# ``(MxK @ KxN)`` suffix without shifting the numeric columns.
+_LABEL_WIDTH = 72
 
 
 def _width(f) -> int:
@@ -253,6 +254,14 @@ def main() -> None:
             n=4096,
             k=4096,
             op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
+            label="ayla.wgmma256_store_pipeline (Rm=2, Rn=1, K2)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_storepipe,
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
