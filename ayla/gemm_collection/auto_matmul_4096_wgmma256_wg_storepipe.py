@@ -23,9 +23,9 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 
 def auto_matmul_4096_wgmma256_wg_storepipe_module(
-    reduction_factor: int = 1,
-    reduction_m: int = 2,
-    k_stages: int = 2,
+    reduction_factor: int = 2,
+    reduction_m: int = 1,
+    k_stages: int = 3,
     kernel_name: str = "auto_matmul_4096_wgmma256_wg_storepipe",
 ):
     """Build a two-dimensional sequentially tiled, store-pipelined GEMM.
@@ -48,12 +48,10 @@ def auto_matmul_4096_wgmma256_wg_storepipe_module(
         raise ValueError(f"reduction_factor must divide 16; got {Rn}")
     if 32 % Rm != 0:
         raise ValueError(f"reduction_m must divide 32; got {Rm}")
-    if 64 % k_stages != 0:
-        raise ValueError(f"k_stages must divide 64; got {k_stages}")
+    if k_stages not in (1, 2, 3):
+        raise ValueError(f"k_stages must be 1, 2, or 3; got {k_stages}")
     if Rm * Rn <= 1:
         raise ValueError("store pipelining requires more than one output tile per block")
-    if k_stages > 2:
-        raise ValueError("store pipelining requires k_stages <= 2 (smem budget)")
 
     module_str = textwrap.dedent(f"""\
         module {{

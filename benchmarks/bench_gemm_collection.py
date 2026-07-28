@@ -257,7 +257,7 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
-            label="ayla.wgmma256_store_pipeline (Rm=2, Rn=1, K2)",
+            label="ayla.wgmma256_store_pipeline (Rm=1, Rn=2, K3)",
             m=4096,
             n=4096,
             k=4096,
