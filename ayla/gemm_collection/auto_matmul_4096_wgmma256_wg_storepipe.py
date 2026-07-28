@@ -26,6 +26,7 @@ def auto_matmul_4096_wgmma256_wg_storepipe_module(
     reduction_factor: int = 1,
     reduction_m: int = 2,
     k_stages: int = 2,
+    output_buffers: int = 1,
     kernel_name: str = "auto_matmul_4096_wgmma256_wg_storepipe",
 ):
     """Build a two-dimensional sequentially tiled, store-pipelined GEMM.
@@ -39,8 +40,8 @@ def auto_matmul_4096_wgmma256_wg_storepipe_module(
             ``32 / Rm``. Must divide 32. Each block computes ``Rm * Rn``
             output tiles; total blocks = ``(32/Rm) * (16/Rn)``.
         k_stages: operand-buffer depth = number of pipelined K-stages (the
-            ``"k"`` unroll factor). At most two stages fit alongside the
-            64 KB output staging buffers on H100.
+            ``"k"`` unroll factor).
+        output_buffers: one or two round-robin 64 KB output staging banks.
     """
     Rn = reduction_factor
     Rm = reduction_m
@@ -54,6 +55,8 @@ def auto_matmul_4096_wgmma256_wg_storepipe_module(
         raise ValueError("store pipelining requires more than one output tile per block")
     if k_stages > 2:
         raise ValueError("store pipelining requires k_stages <= 2 (smem budget)")
+    if output_buffers not in (1, 2):
+        raise ValueError(f"output_buffers must be 1 or 2; got {output_buffers}")
 
     module_str = textwrap.dedent(f"""\
         module {{
@@ -141,7 +144,7 @@ def auto_matmul_4096_wgmma256_wg_storepipe_module(
     module = pipeline_store(
         module,
         label_filter=r"mm_dst_wrmem(?:_iter\d+)+",
-        stripe_width=64,
+        num_buffers=output_buffers,
     )
 
     return module

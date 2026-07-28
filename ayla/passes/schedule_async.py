@@ -52,6 +52,21 @@ def _can_swap(upper: Op, lower: Op) -> bool:
     if any(v in upper_results for v in effective_operands(lower)):
         return False
 
+    # A bulk-store completion wait may pass a later bulk-store launch.  This
+    # does not reorder either transfer: both launches retain their order and
+    # the later wait still drains the hardware bulk group.  Reuse of the
+    # earlier store's shared source remains protected because the intervening
+    # synchronous write conflicts with the await and stops it before reuse.
+    # Without this rule, root-buffer aliasing conservatively makes stores to
+    # distinct output tiles appear as a gmem WAW conflict.
+    if (
+        isinstance(upper, AwaitOp)
+        and upper.lock.type.kind == "bulk"
+        and isinstance(lower, AsyncOp)
+        and lower.lock.type.kind == "bulk"
+    ):
+        return True
+
     # Memory effects (an await resolves to its lock peers via memory_effects).
     upper_effs = memory_effects(upper)
     lower_effs = memory_effects(lower)

@@ -13,8 +13,7 @@ single ``await``. The kind is decided by the op *inside* the async (see
 - **TMA gmem→smem loads** — share one mbarrier (one combined ``arrive.expect_tx``
   over their summed bytes), awaited once, instead of one mbarrier per load. Safe
   because the loads target distinct smem buffers and are all consumed after the
-  single await (fastcu's single-``full``-barrier idea). TMA *stores* are not
-  fused (no fused-store codegen, and unvalidated).
+  single await (fastcu's single-``full``-barrier idea).
 
 Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
 the run. An already-fused (multi-op) async returns ``None`` and is left
@@ -58,8 +57,8 @@ def _fusion_kind(op: Op) -> str | None:
         return "wgmma"  # matmuls → one wgmma commit group
     if (isinstance(inner, MoveOp)
             and inner.attrs.get("tma")
-            and isinstance(inner.dst.type, SmemTensorType)):  # dst smem ⇒ load
-        return "tma_load"  # gmem→smem loads → one mbarrier
+            and isinstance(inner.dst.type, SmemTensorType)):
+        return "tma_load"
     return None
 
 

@@ -1,38 +1,39 @@
-"""Pipeline WGMMA output stores across sequential output tiles.
+"""Stage WGMMA output stores through a software-pipelined TMA path.
 
-Rewrites labeled per-warpgroup ``wrmem -> gmem`` moves into compact shared
-memory stripes followed by asynchronous TMA stores. A single set of staging
-buffers is reused, and each tile's store waits are delayed across the next
-tile's compute but remain before that tile overwrites the buffers.
+The store-specific rewrite only introduces a compact shared-memory output tile
+and an ordinary TMA ``move``. The generic async passes then form the async op
+and schedule its wait immediately before a staging bank is reused.
 """
 from __future__ import annotations
 
 import re
 
-from ..base.ir import Block, Region
-from ..base.pipeline import Pass
+from ..base.ir import Block
+from ..base.pipeline import Pass, Pipeline
 from ..gpu_dialect import (
     AllocOp,
-    AsyncOp,
-    AwaitOp,
-    GmemTensorType,
-    LockType,
     ModuleOp,
     MoveOp,
     SmemTensorType,
     TileOp,
 )
+from .fuse_async import FuseAsync
+from .lower_to_async import LowerToAsync
+from .schedule_async import ScheduleAsync
 
 
-class PipelineStore(Pass):
-    def __init__(self, label_filter: str, stripe_width: int = 64) -> None:
+class StageStore(Pass):
+    """Rewrite matching wrmem-to-gmem stores as smem-striped TMA moves."""
+
+    def __init__(
+        self, label_filter: str, num_buffers: int,
+    ) -> None:
+        if num_buffers < 1:
+            raise ValueError("pipeline_store: num_buffers must be positive")
         self.label_filter = re.compile(label_filter)
-        self.stripe_width = stripe_width
+        self.num_buffers = num_buffers
 
     def run_block(self, block: Block) -> None:
-        # Transform inner blocks first; output-loop unrolling usually leaves
-        # the epilogues together in one block, but recursion keeps this pass
-        # independent of that canonical form.
         super().run_block(block)
         stores = [
             op for op in block.ops
@@ -46,93 +47,67 @@ class PipelineStore(Pass):
         if not isinstance(first_dst_tile, TileOp):
             raise ValueError("pipeline_store: expected a WG-tiled gmem destination")
         full_dst = first_dst_tile.arg
-        tile_n = full_dst.type.sizes[1]
-        if tile_n % self.stripe_width:
-            raise ValueError(
-                f"pipeline_store: N={tile_n} is not divisible by "
-                f"stripe_width={self.stripe_width}"
-            )
-
-        stripe_type = SmemTensorType.build(
-            sizes=[full_dst.type.sizes[0], self.stripe_width],
+        stage_type = SmemTensorType.build(
+            sizes=list(full_dst.type.sizes),
             dtype=stores[0].src.type.dtype,
             swizzle=None,
         )
-        stage_allocs = [
-            AllocOp.build(stripe_type)
-            for _ in range(tile_n // self.stripe_width)
+        stage_buffers = [
+            AllocOp.build(stage_type)
+            for _ in range(self.num_buffers)
         ]
         first_pos = min(block.ops.index(op) for op in stores)
-        block.ops[first_pos:first_pos] = stage_allocs
+        block.ops[first_pos:first_pos] = stage_buffers
 
-        records: list[tuple[MoveOp, AwaitOp]] = []
         for ordinal, store in enumerate(stores):
             dst_tile = store.dst.definition
-            assert isinstance(dst_tile, TileOp)
+            if not isinstance(dst_tile, TileOp):
+                raise ValueError("pipeline_store: expected a WG-tiled gmem destination")
             label = str(store.attrs.get("label", f"store_{ordinal}"))
-            lock = AllocOp.build(LockType.build(kind="bulk"))
-            replacement = [lock]
-            first_stage = None
-            for stripe, stage_alloc in enumerate(stage_allocs):
-                stage_wg_type = SmemTensorType.build(
-                    sizes=[store.dst.type.sizes[0], self.stripe_width],
-                    dtype=store.src.type.dtype,
-                    swizzle=None,
-                )
-                stage_wg = TileOp.build(
-                    stage_alloc.result(),
-                    indices=list(dst_tile.indices),
-                    type=stage_wg_type,
-                )
-                stage = MoveOp.build(
-                    dst=stage_wg.result(),
-                    src=store.src,
-                    attrs={
-                        "label": f"{label}_stage_s{stripe}",
-                        "wgmma_n_offset": stripe * self.stripe_width,
-                    },
-                )
-                if stripe == 0:
-                    first_stage = stage
-                gmem_stripe_type = GmemTensorType.build(
-                    sizes=[dst_tile.arg.type.sizes[0], self.stripe_width],
-                    dtype=dst_tile.arg.type.dtype,
-                    strides=list(dst_tile.arg.type.strides),
-                )
-                gmem_stripe = TileOp.build(
-                    dst_tile.arg,
-                    indices=[0, stripe],
-                    type=gmem_stripe_type,
-                )
-                tma_store = MoveOp.build(
-                    dst=gmem_stripe.result(),
-                    src=stage_alloc.result(),
-                    attrs={"label": f"{label}_tma_s{stripe}", "tma": True},
-                )
-                async_store = AsyncOp.build(
-                    lock.result(),
-                    body=Region(blocks=[Block(ops=[tma_store])]),
-                    attrs={"label": f"{label}_tma_s{stripe}_async"},
-                )
-                replacement.extend([
-                    stage_wg, stage, gmem_stripe, async_store,
-                ])
-            wait = AwaitOp.build(lock.result())
-            replacement.append(wait)
-            assert first_stage is not None
-            pos = block.ops.index(store)
-            block.ops[pos:pos + 1] = replacement
-            records.append((first_stage, wait))
+            stage_alloc = stage_buffers[ordinal % self.num_buffers]
+            stage_wg_type = SmemTensorType.build(
+                sizes=list(store.dst.type.sizes),
+                dtype=store.src.type.dtype,
+                swizzle=None,
+            )
+            stage_wg = TileOp.build(
+                stage_alloc.result(),
+                indices=list(dst_tile.indices),
+                type=stage_wg_type,
+            )
+            stage = MoveOp.build(
+                dst=stage_wg.result(),
+                src=store.src,
+                attrs={"label": f"{label}_stage"},
+            )
+            tma_store = MoveOp.build(
+                dst=dst_tile.arg,
+                src=stage_alloc.result(),
+                attrs={"label": f"{label}_tma", "tma": True},
+            )
 
-        for (_, wait), (next_stage, _) in zip(records, records[1:]):
-            block.ops.remove(wait)
-            pos = block.ops.index(next_stage)
-            block.ops.insert(pos, wait)
+            pos = block.ops.index(store)
+            block.ops[pos:pos + 1] = [stage_wg, stage, tma_store]
+
+
+class PipelineStore(Pipeline):
+    """Compose store staging with the compiler's generic async framework."""
+
+    def __init__(
+        self,
+        label_filter: str,
+        num_buffers: int = 1,
+    ) -> None:
+        super().__init__()
+        self.add_pass(StageStore(label_filter, num_buffers))
+        self.add_pass(LowerToAsync())
+        self.add_pass(FuseAsync())
+        self.add_pass(ScheduleAsync())
 
 
 def pipeline_store(
     module: ModuleOp,
     label_filter: str,
-    stripe_width: int = 64,
+    num_buffers: int = 1,
 ) -> ModuleOp:
-    return PipelineStore(label_filter, stripe_width).run(module)
+    return PipelineStore(label_filter, num_buffers).run(module)
