@@ -73,9 +73,8 @@ def test_lower_move_gmem_to_smem():
 
     assert_contains_in_order(
         template,
-        # Sync upfront (before the cooperative loop): prior readers finish
-        # before this load overwrites the smem tile.
-        "bar.sync 0;\n",
+        # No bar.sync in the move itself: insert_syncs emits any needed barrier
+        # before this op (the smem WAR/RAW is modeled there).
         textwrap.dedent(
             """\
             mov.u32 ${b32:co_idx}, %tid.x;

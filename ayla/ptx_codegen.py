@@ -36,6 +36,7 @@ from .base.ir import Op, Printer, Value
 from .passes.folding import Folding
 from .passes.cse import CSE
 from .passes.dce import DCE
+from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
@@ -52,6 +53,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(Folding())
         self.add_pass(CSE())
         self.add_pass(DCE())
+        self.add_pass(InsertSyncs())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(Folding())
         self.add_pass(CSE())
