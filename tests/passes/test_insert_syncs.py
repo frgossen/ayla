@@ -30,9 +30,11 @@ def test_war_on_shared_buffer_gets_barrier():
 
     insert_syncs(module)
 
-    # One block-scoped barrier, before the TMA loads: the WAR on %sa/%sb vs. the
-    # prior iteration's matmul reads. The matmul's own RAW on the freshly loaded
-    # %sa/%sb needs no barrier — the load's mbar await already syncs the block.
+    # One named (block_leader) barrier, before the TMA loads: the WAR on %sa/%sb
+    # vs. the prior iteration's matmul reads. It's block_leader, not block,
+    # because the TMA write is issued by a single leader thread (all-arrive /
+    # t0-wait suffices). The matmul's own RAW on the freshly loaded %sa/%sb needs
+    # no barrier — the load's mbar await already covers it.
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<128x4096xbf16>, %b: gmem_tensor<128x4096xbf16>, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
@@ -42,7 +44,7 @@ def test_war_on_shared_buffer_gets_barrier():
               %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc()
-              barrier() attrs={scope: "block"}
+              barrier() attrs={scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -254,19 +256,21 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
         }"""))  # noqa: E501
     insert_syncs(module)
 
-    # One block barrier per stage reload (WAR: the next TMA load overwrites the
-    # smem stage the just-awaited matmul read), in rotating-stage order.
+    # One named (block_leader) barrier per stage reload (WAR: the next TMA load
+    # overwrites the smem stage the just-awaited matmul read), in rotating-stage
+    # order. It's block_leader, not block, because the TMA write is issued by a
+    # single leader thread.
     text = repr(module)
     assert text.count("barrier()") == 4
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
-            barrier() attrs={scope: "block"}
+            barrier() attrs={scope: "block_leader"}
             async(%10: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
-            barrier() attrs={scope: "block"}
+            barrier() attrs={scope: "block_leader"}
             async(%7: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
-            barrier() attrs={scope: "block"}
+            barrier() attrs={scope: "block_leader"}
             async(%4: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
-            barrier() attrs={scope: "block"}
+            barrier() attrs={scope: "block_leader"}
             async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
     )
