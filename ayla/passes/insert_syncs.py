@@ -185,6 +185,9 @@ def _memory_effects_with_collective_scope(
         kind = "W" if smem_is_dst else "R"
         return {(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)}
     if isinstance(op, AllocOp):
+        # An uninitialized alloc just reserves memory; only ``init`` writes it.
+        if op.init is None:
+            return set()
         buf = op.results[0]
         scope = (
             CollectiveScope.THREAD
