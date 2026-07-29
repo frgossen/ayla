@@ -1,6 +1,8 @@
 """Insert cross-thread synchronization barriers on shared-buffer hazards."""
 from __future__ import annotations
 
+import enum
+
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
@@ -51,19 +53,74 @@ def _leq_collective_scope(a: CollectiveScope, b: CollectiveScope) -> bool:
     return _join_collective_scope(a, b) == b
 
 
-def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> CollectiveScope:
-    """The barrier scope needed to order a r/w hazard from ``prior`` to ``current``.
+class BarrierScope(enum.IntEnum):
+    r"""The cross-thread barrier to emit for a hazard.
 
-    TODO: the result is really a *barrier* scope (which sync to emit), a separate
-    but similar lattice from the collective scope (how the effect executes), even
-    though both reuse CollectiveScope. Notably the barrier scopes are asymmetric --
-    the named leader barrier orders only one direction -- which the collective
-    lattice doesn't capture. Consider a distinct lattice for barrier scopes."""
+    Mirrors CollectiveScope, but where that names the granularity at which an
+    access *executes*, this names the *sync* between those granularities. The two
+    correspond one-to-one except for the asymmetric block leader syncs,
+    BLOCK_TO_LEADER and LEADER_TO_BLOCK::
+
+             GRID
+              |
+            BLOCK
+            /   \
+    WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
+           |     |
+         WARP    |
+            \   /
+            THREAD
+    """
+    THREAD = 0
+    WARP = 1
+    WARPGROUP = 2
+    BLOCK_TO_LEADER = 3
+    LEADER_TO_BLOCK = 4
+    BLOCK = 5
+    GRID = 6
+
+
+def _join_barrier_scope(a: BarrierScope, b: BarrierScope) -> BarrierScope:
+    """The join (least upper bound) on the BarrierScope lattice."""
+    if a == b:
+        return a
+    if a == BarrierScope.THREAD:
+        return b
+    if b == BarrierScope.THREAD:
+        return a
+    if a == BarrierScope.GRID or b == BarrierScope.GRID:
+        return BarrierScope.GRID
+    if a == BarrierScope.BLOCK or b == BarrierScope.BLOCK:
+        return BarrierScope.BLOCK
+    if {a, b} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
+        return BarrierScope.WARPGROUP
+    return BarrierScope.BLOCK
+
+
+def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
+    """The barrier scope needed to order a r/w hazard from ``prior`` to ``current``."""
     if prior == current == CollectiveScope.BLOCK_LEADER:
-        return CollectiveScope.THREAD
-    if prior == CollectiveScope.BLOCK and current == CollectiveScope.BLOCK_LEADER:
-        return CollectiveScope.BLOCK_LEADER
-    return _join_collective_scope(prior, current)
+        return BarrierScope.THREAD
+    if current == CollectiveScope.BLOCK_LEADER:
+        return BarrierScope.BLOCK_TO_LEADER
+    if prior == CollectiveScope.BLOCK_LEADER:
+        return BarrierScope.LEADER_TO_BLOCK
+    return BarrierScope[_join_collective_scope(prior, current).name]
+
+
+def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
+    """Whether ``barrier`` orders a prior effect at collective ``scope`` -- i.e.
+    the effect is discharged from the live set once the barrier is placed."""
+    if barrier == BarrierScope.BLOCK_TO_LEADER:
+        # Gather (block -> t0): only t0 waits, so nothing is ordered cross-thread.
+        return scope == CollectiveScope.THREAD
+    if barrier == BarrierScope.LEADER_TO_BLOCK:
+        # Broadcast (t0 -> block): t0's prior (BLOCK_LEADER) work becomes visible
+        # to all; an all-thread BLOCK effect is not (threads don't wait on each
+        # other).
+        return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
+    # A symmetric barrier names a CollectiveScope and covers it and below.
+    return _leq_collective_scope(scope, CollectiveScope[barrier.name])
 
 
 # The dataflow state: outstanding concurrent memory effects per root buffer, each
@@ -74,9 +131,9 @@ ConcurrentMemoryEffectsType = dict[
     object, set[tuple[str, object, "CollectiveScope", object]]
 ]
 
-# The analysis result: each effect-bearing op mapped to the coarsest scope its
-# accesses must be synced at.
-BarrierTargetsType = dict["Op", "CollectiveScope"]
+# The analysis result: each effect-bearing op mapped to the barrier it needs
+# before it (THREAD if none).
+BarrierTargetsType = dict["Op", "BarrierScope"]
 
 
 def _await_collective_scope(lock: Value) -> CollectiveScope:
@@ -141,25 +198,25 @@ def _transfer(
             raise NotImplementedError(
                 f"unmodelled effect-bearing op: {type(op).__name__}"
             )
-        # The barrier this op needs, as the lattice join over its hazards. Each
-        # hazard resolves per-pair (:func:`_barrier_scope`) — e.g. an all-thread
-        # read vs a t0 (BLOCK_LEADER) write needs only a named barrier. THREAD is
-        # the join-identity, so it stays THREAD iff no hazard was found.
-        barrier_scope: CollectiveScope = CollectiveScope.THREAD
+        # The barrier this op needs, as the join over its hazards. Each hazard
+        # resolves per-pair (:func:`_barrier_scope`) — e.g. an all-thread read vs
+        # a t0 (BLOCK_LEADER) write needs only a named barrier. THREAD is the join
+        # identity, so it stays THREAD iff no hazard was found.
+        barrier: BarrierScope = BarrierScope.THREAD
         for kind_y, buf, scope_y in effects:
             for kind_x, _buf_x, scope_x, _region_x in live.get(buf, ()):
                 # A hazard needs a write (RAR is safe).
                 if kind_x == "W" or kind_y == "W":
-                    barrier_scope = _join_collective_scope(
-                        barrier_scope, _barrier_scope(scope_x, scope_y)
+                    barrier = _join_barrier_scope(
+                        barrier, _barrier_scope(scope_x, scope_y)
                     )
-        targets[op] = barrier_scope
+        targets[op] = barrier
         # A barrier orders settled accesses it covers; pending (in-region) effects
         # survive — only their await completes them.
         for buf in live:
             live[buf] = {
                 (k, b, s, region) for (k, b, s, region) in live[buf]
-                if region is not None or not _leq_collective_scope(s, barrier_scope)
+                if region is not None or not _barrier_covers(barrier, s)
             }
         # The async's effects join a completion region keyed by its lock; every
         # other effect-bearing op is synchronous (region = None).
@@ -183,14 +240,24 @@ def _transfer_loop(
         live_in = joined
 
 
+# BarrierScope -> the BarrierOp ``scope`` attr lower_to_ptx_template lowers. Only
+# the barriers we actually emit are mapped; the rest (warp/warpgroup, the fan-out
+# leader barrier, grid) have no lowering yet.
+_BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
+    BarrierScope.BLOCK_TO_LEADER: "block_leader",
+    BarrierScope.BLOCK: "block",
+}
+
+
 def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
-    """Insert a ``barrier`` before every op that needs a cross-thread sync
-    (scope above THREAD)."""
+    """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
-        scope = targets.get(op, CollectiveScope.THREAD)
-        if scope != CollectiveScope.THREAD:
-            new_ops.append(BarrierOp.build(scope=scope.name.lower()))
+        barrier = targets.get(op, BarrierScope.THREAD)
+        if barrier != BarrierScope.THREAD:
+            if barrier not in _BARRIER_OP_SCOPE:
+                raise NotImplementedError(f"no lowering for barrier {barrier.name}")
+            new_ops.append(BarrierOp.build(scope=_BARRIER_OP_SCOPE[barrier]))
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:
