@@ -15,7 +15,7 @@ from ..gpu_dialect import (
     is_side_effect_free,
     memory_effects,
 )
-from ..base.ir import Block, Op, Value, find_op
+from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
@@ -185,12 +185,25 @@ def _transfer(
 ) -> ConcurrentMemoryEffectsType:
     """Thread the concurrent-effect map through a straight-line ``ops`` sequence,
     recording into ``targets`` the barrier scope each op needs; return the
-    live-out. Pure w.r.t. ``live_in``. A ``for`` op recurses via
-    :func:`_transfer_loop`."""
+    live-out. Pure w.r.t. ``live_in``. Container ops (module/kernel/for) recurse
+    into their bodies; a ``for`` is iterated to a fixpoint over its header."""
     live = _join(live_in, {})
     for op in ops:
+        if isinstance(op, (ModuleOp, KernelOp)):
+            live = _transfer(list(op.body.entry_block.ops), live, targets)
+            continue
         if isinstance(op, ForOp):
-            live = _transfer_loop(op, live, targets)
+            # Analyze the body to a fixpoint over its header (the loop-carried
+            # state at the top of the body); ``live`` becomes the loop's live-out.
+            body = op.body.entry_block.ops
+            header = live
+            while True:
+                live_out = _transfer(body, header, targets)  # one iteration
+                joined = _join(header, live_out)              # fold the back edge
+                if joined == header:
+                    break
+                header = joined
+            live = live_out
             continue
         if is_side_effect_free(op):
             continue
@@ -244,20 +257,6 @@ def _transfer(
     return live
 
 
-def _transfer_loop(
-    loop: ForOp, live_in: ConcurrentMemoryEffectsType, targets: BarrierTargetsType,
-) -> ConcurrentMemoryEffectsType:
-    """Analyze a ``for`` body to a fixpoint over its header (the loop-carried
-    state at the top of the body), then return the loop's live-out."""
-    body = loop.body.entry_block.ops
-    while True:
-        live_out = _transfer(body, live_in, targets)  # state after one iteration
-        joined = _join(live_in, live_out)             # fold the back edge back in
-        if joined == live_in:
-            return live_out
-        live_in = joined
-
-
 # BarrierScope -> the BarrierOp ``scope`` attr.
 _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
     BarrierScope.BLOCK_TO_LEADER: "block_leader",
@@ -281,21 +280,12 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
     block.ops = new_ops
 
 
-def _analyze(module: ModuleOp) -> BarrierTargetsType:
-    """Analyze ``module`` and return the barrier scope each op needs before it
-    (the analysis; the dataflow lives in :func:`_transfer`)."""
-    kernel = find_op(module, lambda o: isinstance(o, KernelOp))
-    targets: BarrierTargetsType = {}
-    _transfer(list(kernel.body.entry_block.ops), {}, targets)
-    return targets
-
-
 class InsertSyncs(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
-        kernel = find_op(module, lambda o: isinstance(o, KernelOp))
-        targets = _analyze(module)      # analysis: where do barriers go
-        _insert_barriers(kernel.body.entry_block, targets)  # transform: insert them
+        targets: BarrierTargetsType = {}
+        _transfer([module], {}, targets)  # analysis: where do barriers go
+        _insert_barriers(module.body.entry_block, targets)  # transform: insert them
         return module
 
 
