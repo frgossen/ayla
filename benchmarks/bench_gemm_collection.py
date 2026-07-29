@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -26,14 +27,6 @@ _PEAK_DENSE_TC_TFLOPS = {
     ("NVIDIA H100", torch.float8_e4m3fn): 1979.0,  # spec says 3958 w/ sparsity
     ("NVIDIA H100", torch.float8_e5m2): 1979.0,  # spec says 3958 w/ sparsity
 }
-
-
-def peak_dense_tc_tflops(
-    dtype: torch.dtype,
-    device_idx: int = 0,
-) -> float | None:
-    name = torch.cuda.get_device_name(device_idx)
-    return _PEAK_DENSE_TC_TFLOPS.get((name, dtype))
 
 
 @dataclass
@@ -169,8 +162,9 @@ def _populate_percentages(
         ),
         None,
     )
+    device_name = torch.cuda.get_device_name(0)
     for cfg, result in zip(configs, results):
-        peak = peak_dense_tc_tflops(cfg.dtype)
+        peak = _PEAK_DENSE_TC_TFLOPS.get((device_name, cfg.dtype))
         result.peak_pct = result.tflops / peak * 100 if peak else None
         if torch_mm_tflops is not None:
             result.torch_mm_pct = result.tflops / torch_mm_tflops * 100
@@ -286,8 +280,9 @@ def main() -> None:
     if args.reverse:
         configs = configs[::-1]
     results = []
-    for cfg in configs:
+    for i, cfg in enumerate(configs, 1):
         results.append(_bench(cfg))
+        print(f"[{i}/{len(configs)}] {cfg.label}", file=sys.stderr, flush=True)
 
     _populate_percentages(configs, results)
 
