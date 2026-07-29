@@ -1,6 +1,7 @@
 """Concrete IR ops and types for the Ayla dialect."""
 from __future__ import annotations
 
+import enum
 import math
 import string
 
@@ -1551,25 +1552,89 @@ def root_buffer(value: Value) -> Value:
     return value
 
 
-def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
+class CollectiveScope(enum.IntEnum):
+    r"""The granularity at which an effect is completely independent of concurrent
+    operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
+    scope but performed exclusively by thread 0, e.g. a TMA::
+
+             GRID
+              |
+            BLOCK
+            /   \
+    WARPGROUP   BLOCK_LEADER
+           |     |
+         WARP    |
+            \   /
+            THREAD
+    """
+    THREAD = 0
+    WARP = 1
+    WARPGROUP = 2
+    BLOCK_LEADER = 3
+    BLOCK = 4
+    GRID = 5
+
+
+def _type_collective_scope(t: Type) -> CollectiveScope:
+    if isinstance(t, RmemTensorType):
+        return CollectiveScope.THREAD
+    if isinstance(t, WrmemTensorType):
+        return CollectiveScope.WARPGROUP
+    if isinstance(t, SmemTensorType):
+        return CollectiveScope.BLOCK
+    if isinstance(t, GmemTensorType):
+        return CollectiveScope.GRID
+    raise NotImplementedError(
+        f"_type_collective_scope: unmodeled buffer type {type(t).__name__}"
+    )
+
+
+def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     """Best-effort memory effect summary for ``op``.
 
-    Returns a list of ``(kind, root)`` tuples where ``kind`` is
-    ``"R"`` or ``"W"`` and ``root`` is the underlying alloc/arg
-    (after stripping tile views via ``root_buffer``).
+    Returns a list of ``(kind, root, scope)`` tuples where ``kind`` is ``"R"`` or
+    ``"W"``, ``root`` is the underlying alloc/arg (after stripping tile views via
+    ``root_buffer``), and ``scope`` is the :class:`CollectiveScope` at which the
+    access is independent of concurrent threads.
 
-    Returns ``None`` for ops we don't know how to model; callers must
-    treat that as a worst-case conflict. Side-effect-free ops return
-    an empty list.
+    Returns ``None`` for ops we don't know how to model; callers must treat that
+    as a worst-case conflict.
     """
     if is_side_effect_free(op):
         return []
     if isinstance(op, MoveOp):
-        return [("W", root_buffer(op.dst)), ("R", root_buffer(op.src))]
+        # A TMA move is issued by the leader thread (t0), so its smem write is
+        # BLOCK_LEADER; a cooperative move writes at the buffer's own scope. A
+        # wrmem source is per-thread.
+        src_scope = (
+            CollectiveScope.THREAD
+            if isinstance(op.src.type, WrmemTensorType)
+            else _type_collective_scope(op.src.type)
+        )
+        dst_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
+            else _type_collective_scope(op.dst.type)
+        )
+        return [("W", root_buffer(op.dst), dst_scope),
+                ("R", root_buffer(op.src), src_scope)]
+    if isinstance(op, TmaMoveOp):
+        # Leader-issued (t0): the smem side is BLOCK_LEADER (dst on a load, src on
+        # a store).
+        smem_is_dst = isinstance(op.dst.type, SmemTensorType)
+        smem = op.dst if smem_is_dst else op.src
+        kind = "W" if smem_is_dst else "R"
+        return [(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)]
     if isinstance(op, MatmulOp):
+        # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         dst = root_buffer(op.dst)
-        return [("R", root_buffer(op.lhs)), ("R", root_buffer(op.rhs)),
-                ("R", dst), ("W", dst)]
+        return [("R", root_buffer(op.lhs), _type_collective_scope(op.lhs.type)),
+                ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
+                ("R", dst, CollectiveScope.THREAD),
+                ("W", dst, CollectiveScope.THREAD)]
+    if isinstance(op, ConvertOp):
+        return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
+                ("R", root_buffer(op.src), CollectiveScope.THREAD)]
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
@@ -1586,9 +1651,17 @@ def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
             effects.extend(peer_effects)
         return effects
     if isinstance(op, AllocOp):
-        return [("W", op.result())]
+        # Only an initialized alloc writes (fills the buffer); an uninitialized
+        # one is side-effect-free, handled above. A wrmem accumulator is per-thread.
+        buf = op.result()
+        scope = (
+            CollectiveScope.THREAD
+            if isinstance(buf.type, WrmemTensorType)
+            else _type_collective_scope(buf.type)
+        )
+        return [("W", root_buffer(buf), scope)]
     if isinstance(op, (ForOp, AsyncOp)):
-        effects: list[tuple[str, Value]] = []
+        effects: list[tuple[str, Value, CollectiveScope]] = []
         for region in op.regions:
             for block in region.blocks:
                 for body_op in block.ops:
