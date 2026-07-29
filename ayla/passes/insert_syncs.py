@@ -1,53 +1,20 @@
 """Insert cross-thread synchronization barriers on shared-buffer hazards."""
 from __future__ import annotations
 
-import enum
-
 from ..gpu_dialect import (
-    AllocOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
-    ConvertOp,
+    CollectiveScope,
     ForOp,
-    GmemTensorType,
     KernelOp,
-    MatmulOp,
     ModuleOp,
-    MoveOp,
     PTXTemplateOp,
-    RmemTensorType,
-    SmemTensorType,
-    TmaMoveOp,
-    WrmemTensorType,
     is_side_effect_free,
-    root_buffer,
+    memory_effects,
 )
-from ..base.ir import Block, Op, Type, Value, find_op
+from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
-
-
-class CollectiveScope(enum.IntEnum):
-    r"""The granularity at which an effect is completely independent of concurrent
-    operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
-    scope but performed exclusively by thread 0, e.g. a TMA::
-
-             GRID
-              |
-            BLOCK
-            /   \
-    WARPGROUP   BLOCK_LEADER
-           |     |
-         WARP    |
-            \   /
-            THREAD
-    """
-    THREAD = 0
-    WARP = 1
-    WARPGROUP = 2
-    BLOCK_LEADER = 3
-    BLOCK = 4
-    GRID = 5
 
 
 def _join_collective_scope(a: CollectiveScope, b: CollectiveScope) -> CollectiveScope:
@@ -112,20 +79,6 @@ ConcurrentMemoryEffectsType = dict[
 BarrierTargetsType = dict["Op", "CollectiveScope"]
 
 
-def _type_collective_scope(t: Type) -> CollectiveScope:
-    if isinstance(t, RmemTensorType):
-        return CollectiveScope.THREAD
-    if isinstance(t, WrmemTensorType):
-        return CollectiveScope.WARPGROUP
-    if isinstance(t, SmemTensorType):
-        return CollectiveScope.BLOCK
-    if isinstance(t, GmemTensorType):
-        return CollectiveScope.GRID
-    raise NotImplementedError(
-        f"_type_collective_scope: unmodeled buffer type {type(t).__name__}"
-    )
-
-
 def _await_collective_scope(lock: Value) -> CollectiveScope:
     """The collective scope an ``await`` on ``lock`` synchronizes."""
     kind = lock.type.kind
@@ -137,70 +90,6 @@ def _await_collective_scope(lock: Value) -> CollectiveScope:
         # write) but not a full-block all-thread effect.
         return CollectiveScope.BLOCK_LEADER
     raise NotImplementedError(f"_await_collective_scope: unmodeled lock kind {kind!r}")
-
-
-def _memory_effects_with_collective_scope(
-    op: Op,
-) -> set[tuple[str, object, CollectiveScope]] | None:
-    """Like ``memory_effects(op)``, but tags each effect with the collective
-    scope it is independent at; ``None`` if unmodeled.
-
-    TODO: fold this into the general ``memory_effects``, enriching it to carry the
-    collective scope rather than duplicating the effect model here."""
-    if isinstance(op, MatmulOp):
-        dst = root_buffer(op.dst)
-        return {
-            ("R", root_buffer(op.lhs), _type_collective_scope(op.lhs.type)),
-            ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
-            ("R", dst, CollectiveScope.THREAD),
-            ("W", dst, CollectiveScope.THREAD),
-        }
-    if isinstance(op, ConvertOp):
-        return {
-            ("W", root_buffer(op.dst), CollectiveScope.THREAD),
-            ("R", root_buffer(op.src), CollectiveScope.THREAD),
-        }
-    if isinstance(op, MoveOp):
-        src_scope = (
-            CollectiveScope.THREAD
-            if isinstance(op.src.type, WrmemTensorType)
-            else _type_collective_scope(op.src.type)
-        )
-        # A TMA move is issued by the leader thread (t0), so its smem write is
-        # BLOCK_LEADER; a cooperative move writes at the buffer's own scope.
-        dst_scope = (
-            CollectiveScope.BLOCK_LEADER
-            if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
-            else _type_collective_scope(op.dst.type)
-        )
-        return {
-            ("W", root_buffer(op.dst), dst_scope),
-            ("R", root_buffer(op.src), src_scope),
-        }
-    if isinstance(op, TmaMoveOp):
-        # Leader-issued (t0): the smem side is BLOCK_LEADER (dst on a load, src on
-        # a store).
-        smem_is_dst = isinstance(op.dst.type, SmemTensorType)
-        smem = op.dst if smem_is_dst else op.src
-        kind = "W" if smem_is_dst else "R"
-        return {(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)}
-    if isinstance(op, AllocOp):
-        buf = op.results[0]
-        scope = (
-            CollectiveScope.THREAD
-            if isinstance(buf.type, WrmemTensorType)
-            else _type_collective_scope(buf.type)
-        )
-        return {("W", root_buffer(buf), scope)}
-    if isinstance(op, AsyncOp):
-        out: set[tuple[str, object, CollectiveScope]] = set()
-        for inner in op.body.entry_block.ops:
-            inner_effects = _memory_effects_with_collective_scope(inner)
-            if inner_effects is None:
-                return None
-            out |= inner_effects
-        return out
-    return None
 
 
 def _join(
@@ -247,7 +136,7 @@ def _transfer(
                     if not (region == op.lock and _leq_collective_scope(s, scope))
                 }
             continue
-        effects = _memory_effects_with_collective_scope(op)
+        effects = memory_effects(op)
         if effects is None:
             raise NotImplementedError(
                 f"unmodelled effect-bearing op: {type(op).__name__}"
