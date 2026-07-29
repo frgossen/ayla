@@ -200,11 +200,6 @@ def _memory_effects_with_collective_scope(
                 return None
             out |= inner_effects
         return out
-    if isinstance(op, PTXTemplateOp):
-        # Raw PTX is opaque; model it as effect-free so hand-written kernels pass.
-        # TODO: wrong in general (a template may touch memory) -- gate on a kernel
-        # attribute marking the IR hazard-free or already synced instead.
-        return set()
     return None
 
 
@@ -232,6 +227,14 @@ def _transfer(
             live = _transfer_loop(op, live, targets)
             continue
         if is_side_effect_free(op):
+            continue
+        if isinstance(op, PTXTemplateOp):
+            # Raw PTX is opaque, so we can't compute its effects. Skip it. This is
+            # unsound in general (a template may read/write memory), but it lets
+            # hand-written PTX kernels (e.g. fastcu) through on the assumption they
+            # self-manage their sync.
+            # TODO: gate on a kernel attribute marking the IR hazard-free or
+            # already synced instead.
             continue
         if isinstance(op, AwaitOp):
             # Close the async's region: clear the effects up to the await's
