@@ -1,6 +1,8 @@
 """Insert cross-thread synchronization barriers on shared-buffer hazards."""
 from __future__ import annotations
 
+import enum
+
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
@@ -13,7 +15,7 @@ from ..gpu_dialect import (
     is_side_effect_free,
     memory_effects,
 )
-from ..base.ir import Block, Op, Value, find_op
+from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
@@ -51,19 +53,94 @@ def _leq_collective_scope(a: CollectiveScope, b: CollectiveScope) -> bool:
     return _join_collective_scope(a, b) == b
 
 
-def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> CollectiveScope:
-    """The barrier scope needed to order a r/w hazard from ``prior`` to ``current``.
+class BarrierScope(enum.IntEnum):
+    r"""The cross-thread barrier to emit for a hazard.
 
-    TODO: the result is really a *barrier* scope (which sync to emit), a separate
-    but similar lattice from the collective scope (how the effect executes), even
-    though both reuse CollectiveScope. Notably the barrier scopes are asymmetric --
-    the named leader barrier orders only one direction -- which the collective
-    lattice doesn't capture. Consider a distinct lattice for barrier scopes."""
+    Mirrors CollectiveScope, but where that names the granularity at which an
+    access *executes*, this names the *sync* between those granularities. The two
+    correspond one-to-one except for the asymmetric block leader syncs,
+    BLOCK_TO_LEADER and LEADER_TO_BLOCK::
+
+             GRID
+              |
+            BLOCK
+            /   \
+    WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
+           |     |
+         WARP    |
+            \   /
+            THREAD
+    """
+    THREAD = 0
+    WARP = 1
+    WARPGROUP = 2
+    BLOCK_TO_LEADER = 3
+    LEADER_TO_BLOCK = 4
+    BLOCK = 5
+    GRID = 6
+
+
+def _join_barrier_scope(a: BarrierScope, b: BarrierScope) -> BarrierScope:
+    """The join (least upper bound) on the BarrierScope lattice."""
+    if a == b:
+        return a
+    if a == BarrierScope.THREAD:
+        return b
+    if b == BarrierScope.THREAD:
+        return a
+    if a == BarrierScope.GRID or b == BarrierScope.GRID:
+        return BarrierScope.GRID
+    if a == BarrierScope.BLOCK or b == BarrierScope.BLOCK:
+        return BarrierScope.BLOCK
+    if {a, b} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
+        return BarrierScope.WARPGROUP
+    return BarrierScope.BLOCK
+
+
+def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
+    """The barrier scope needed to order a r/w hazard from ``prior`` to ``current``."""
     if prior == current == CollectiveScope.BLOCK_LEADER:
-        return CollectiveScope.THREAD
-    if prior == CollectiveScope.BLOCK and current == CollectiveScope.BLOCK_LEADER:
-        return CollectiveScope.BLOCK_LEADER
-    return _join_collective_scope(prior, current)
+        return BarrierScope.THREAD
+    if current == CollectiveScope.BLOCK_LEADER:
+        return BarrierScope.BLOCK_TO_LEADER
+    if prior == CollectiveScope.BLOCK_LEADER:
+        return BarrierScope.LEADER_TO_BLOCK
+    # Neither side is a leader: the symmetric barrier for the coarser scope.
+    joined = _join_collective_scope(prior, current)
+    if joined == CollectiveScope.THREAD:
+        return BarrierScope.THREAD
+    if joined == CollectiveScope.WARP:
+        return BarrierScope.WARP
+    if joined == CollectiveScope.WARPGROUP:
+        return BarrierScope.WARPGROUP
+    if joined == CollectiveScope.BLOCK:
+        return BarrierScope.BLOCK
+    if joined == CollectiveScope.GRID:
+        return BarrierScope.GRID
+    raise NotImplementedError(f"_barrier_scope: unhandled join {joined!r}")
+
+
+def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
+    """Whether ``barrier`` orders a prior effect at collective ``scope`` -- i.e.
+    the effect is discharged from the live set once the barrier is placed."""
+    if barrier == BarrierScope.THREAD:
+        return scope == CollectiveScope.THREAD
+    if barrier == BarrierScope.WARP:
+        return scope in (CollectiveScope.THREAD, CollectiveScope.WARP)
+    if barrier == BarrierScope.WARPGROUP:
+        return scope in (
+            CollectiveScope.THREAD, CollectiveScope.WARP, CollectiveScope.WARPGROUP
+        )
+    if barrier == BarrierScope.BLOCK_TO_LEADER:
+        return scope == CollectiveScope.THREAD  # gather: nothing cross-thread
+    if barrier == BarrierScope.LEADER_TO_BLOCK:
+        # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
+        return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
+    if barrier == BarrierScope.BLOCK:
+        return scope != CollectiveScope.GRID
+    if barrier == BarrierScope.GRID:
+        return True
+    raise NotImplementedError(f"_barrier_covers: unhandled barrier {barrier!r}")
 
 
 # The dataflow state: outstanding concurrent memory effects per root buffer, each
@@ -74,9 +151,9 @@ ConcurrentMemoryEffectsType = dict[
     object, set[tuple[str, object, "CollectiveScope", object]]
 ]
 
-# The analysis result: each effect-bearing op mapped to the coarsest scope its
-# accesses must be synced at.
-BarrierTargetsType = dict["Op", "CollectiveScope"]
+# The analysis result: each effect-bearing op mapped to the barrier it needs
+# before it (THREAD if none).
+BarrierTargetsType = dict["Op", "BarrierScope"]
 
 
 def _await_collective_scope(lock: Value) -> CollectiveScope:
@@ -108,12 +185,25 @@ def _transfer(
 ) -> ConcurrentMemoryEffectsType:
     """Thread the concurrent-effect map through a straight-line ``ops`` sequence,
     recording into ``targets`` the barrier scope each op needs; return the
-    live-out. Pure w.r.t. ``live_in``. A ``for`` op recurses via
-    :func:`_transfer_loop`."""
+    live-out. Pure w.r.t. ``live_in``. Container ops (module/kernel/for) recurse
+    into their bodies; a ``for`` is iterated to a fixpoint over its header."""
     live = _join(live_in, {})
     for op in ops:
+        if isinstance(op, (ModuleOp, KernelOp)):
+            live = _transfer(list(op.body.entry_block.ops), live, targets)
+            continue
         if isinstance(op, ForOp):
-            live = _transfer_loop(op, live, targets)
+            # Analyze the body to a fixpoint over its header (the loop-carried
+            # state at the top of the body); ``live`` becomes the loop's live-out.
+            body = op.body.entry_block.ops
+            header = live
+            while True:
+                live_out = _transfer(body, header, targets)  # one iteration
+                joined = _join(header, live_out)              # fold the back edge
+                if joined == header:
+                    break
+                header = joined
+            live = live_out
             continue
         if is_side_effect_free(op):
             continue
@@ -141,16 +231,14 @@ def _transfer(
             raise NotImplementedError(
                 f"unmodelled effect-bearing op: {type(op).__name__}"
             )
-        # The barrier this op needs, as the lattice join over its hazards. Each
-        # hazard resolves per-pair (:func:`_barrier_scope`) — e.g. an all-thread
-        # read vs a t0 (BLOCK_LEADER) write needs only a named barrier. THREAD is
-        # the join-identity, so it stays THREAD iff no hazard was found.
-        barrier_scope: CollectiveScope = CollectiveScope.THREAD
+        # The barrier this op needs, as the join over its hazards. Each hazard
+        # resolves per-pair (:func:`_barrier_scope`).
+        barrier_scope: BarrierScope = BarrierScope.THREAD
         for kind_y, buf, scope_y in effects:
             for kind_x, _buf_x, scope_x, _region_x in live.get(buf, ()):
                 # A hazard needs a write (RAR is safe).
                 if kind_x == "W" or kind_y == "W":
-                    barrier_scope = _join_collective_scope(
+                    barrier_scope = _join_barrier_scope(
                         barrier_scope, _barrier_scope(scope_x, scope_y)
                     )
         targets[op] = barrier_scope
@@ -159,7 +247,7 @@ def _transfer(
         for buf in live:
             live[buf] = {
                 (k, b, s, region) for (k, b, s, region) in live[buf]
-                if region is not None or not _leq_collective_scope(s, barrier_scope)
+                if region is not None or not _barrier_covers(barrier_scope, s)
             }
         # The async's effects join a completion region keyed by its lock; every
         # other effect-bearing op is synchronous (region = None).
@@ -169,28 +257,22 @@ def _transfer(
     return live
 
 
-def _transfer_loop(
-    loop: ForOp, live_in: ConcurrentMemoryEffectsType, targets: BarrierTargetsType,
-) -> ConcurrentMemoryEffectsType:
-    """Analyze a ``for`` body to a fixpoint over its header (the loop-carried
-    state at the top of the body), then return the loop's live-out."""
-    body = loop.body.entry_block.ops
-    while True:
-        live_out = _transfer(body, live_in, targets)  # state after one iteration
-        joined = _join(live_in, live_out)             # fold the back edge back in
-        if joined == live_in:
-            return live_out
-        live_in = joined
+# BarrierScope -> the BarrierOp ``scope`` attr.
+_BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
+    BarrierScope.BLOCK_TO_LEADER: "block_leader",
+    BarrierScope.BLOCK: "block",
+}
 
 
 def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
-    """Insert a ``barrier`` before every op that needs a cross-thread sync
-    (scope above THREAD)."""
+    """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
-        scope = targets.get(op, CollectiveScope.THREAD)
-        if scope != CollectiveScope.THREAD:
-            new_ops.append(BarrierOp.build(scope=scope.name.lower()))
+        barrier = targets.get(op, BarrierScope.THREAD)
+        if barrier != BarrierScope.THREAD:
+            if barrier not in _BARRIER_OP_SCOPE:
+                raise NotImplementedError(f"no lowering for barrier {barrier.name}")
+            new_ops.append(BarrierOp.build(scope=_BARRIER_OP_SCOPE[barrier]))
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:
@@ -198,21 +280,12 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
     block.ops = new_ops
 
 
-def _analyze(module: ModuleOp) -> BarrierTargetsType:
-    """Analyze ``module`` and return the barrier scope each op needs before it
-    (the analysis; the dataflow lives in :func:`_transfer`)."""
-    kernel = find_op(module, lambda o: isinstance(o, KernelOp))
-    targets: BarrierTargetsType = {}
-    _transfer(list(kernel.body.entry_block.ops), {}, targets)
-    return targets
-
-
 class InsertSyncs(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
-        kernel = find_op(module, lambda o: isinstance(o, KernelOp))
-        targets = _analyze(module)      # analysis: where do barriers go
-        _insert_barriers(kernel.body.entry_block, targets)  # transform: insert them
+        targets: BarrierTargetsType = {}
+        _transfer([module], {}, targets)  # analysis: where do barriers go
+        _insert_barriers(module.body.entry_block, targets)  # transform: insert them
         return module
 
 
