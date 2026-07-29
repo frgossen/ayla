@@ -72,9 +72,11 @@ class UnrollLoop(LoweringPass):
                 )
                 new_entry_block_ops.extend(cloned)
                 if i == 0:
-                    reusable_allocs = _uninitialized_alloc_map(
-                        op, iteration_vmap,
-                    )
+                    reusable_allocs = {
+                        body_op.result(): iteration_vmap[body_op.result()]
+                        for body_op in op.body.entry_block.ops
+                        if isinstance(body_op, AllocOp) and body_op.init is None
+                    }
 
         extra_attrs = {k: v for k, v in op.attrs.items() if k not in ("lb", "ub", "step")}
         new_ub = lb + main_trip_count * step
@@ -113,9 +115,11 @@ class UnrollLoop(LoweringPass):
             )
             tail_ops.extend(cloned)
             if not reusable_allocs:
-                reusable_allocs = _uninitialized_alloc_map(
-                    op, iteration_vmap,
-                )
+                reusable_allocs = {
+                    body_op.result(): iteration_vmap[body_op.result()]
+                    for body_op in op.body.entry_block.ops
+                    if isinstance(body_op, AllocOp) and body_op.init is None
+                }
 
         main_ops = [new_for] if new_for is not None else []
         return hoisted + main_ops + tail_ops, []
@@ -141,17 +145,6 @@ def _clone_iteration(
     ]
     _suffix_labels(cloned, label_suffix)
     return cloned, vmap
-
-
-def _uninitialized_alloc_map(
-    op: ForOp,
-    vmap: dict[Value, Value],
-) -> dict[Value, Value]:
-    return {
-        body_op.result(): vmap[body_op.result()]
-        for body_op in op.body.entry_block.ops
-        if isinstance(body_op, AllocOp) and body_op.init is None
-    }
 
 
 def _suffix_labels(ops: list[Op], suffix: str) -> None:
