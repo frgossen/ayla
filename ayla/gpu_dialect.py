@@ -1540,7 +1540,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
     """
     if is_side_effect_free(op):
         return []
-    if isinstance(op, MoveOp):
+    if isinstance(op, (MoveOp, ConvertOp)):
         return [("W", root_buffer(op.dst)), ("R", root_buffer(op.src))]
     if isinstance(op, MatmulOp):
         dst = root_buffer(op.dst)

@@ -10,6 +10,11 @@ side-effect-free ops (alloc, index arithmetic, tile ops) up with it,
 so the async op rises as far as memory effects and external
 (side-effecting) dependencies allow, rather than getting stuck behind
 the ops that define its operands.
+
+Hoisting suits loads but not stores: a store hoisted early strands its
+staging copy ahead of the next compute. So async *stores* are instead sunk
+into the following compute window (before that compute's await), letting the
+compute latency hide the store.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ from ..gpu_dialect import (
     memory_effects,
     ModuleOp,
     MoveOp,
+    GmemTensorType,
+    root_buffer,
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
@@ -114,6 +121,7 @@ def _bubble(
     targets: list[Op],
     *,
     step: int,
+    barrier=None,
 ) -> None:
     """Bubble each target through its neighbours as far as `_can_swap` allows.
 
@@ -123,12 +131,15 @@ def _bubble(
     swapped above its producer, since that swap would require
     ``_can_swap(producer, consumer)``, which the SSA check rejects. Valid SSA
     input therefore stays valid, and producers settle before the consumers
-    stacked on them.
+    stacked on them. ``barrier``, if given, is a predicate on the neighbour a
+    target is about to cross; the target stops before any op it matches.
     """
     assert step in (-1, 1), f"step must be -1 or +1; got {step}"
     for op in targets:
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
+            if barrier is not None and barrier(ops[j + step]):
+                break
             lo, hi = sorted((j, j + step))
             if not _can_swap(ops[lo], ops[hi]):
                 break
@@ -138,10 +149,11 @@ def _bubble(
 
 def _hoist_async_moves(ops: list[Op]) -> None:
     # Targets: the async moves (matmuls are tracked as lock peers but never
-    # moved) plus the side-effect-free dependency cone feeding each. Then hoist
-    # each up.
+    # moved, and stores are handled by `_sink_stores`) plus the side-effect-free
+    # dependency cone feeding each. Then hoist each up.
     targets = _side_effect_free_operand_closure(
-        [op for op in ops if _is_async_move(op)], ops
+        [op for op in ops if _is_async_move(op) and not _is_async_store(op)],
+        ops,
     )
     _bubble(ops, targets, step=-1)
 
@@ -152,11 +164,51 @@ def _sink_awaits(ops: list[Op]) -> None:
     _bubble(ops, targets, step=+1)
 
 
+def _is_async_store(op: Op) -> bool:
+    """A data-movement async whose transfer writes global memory.
+
+    Loads and stores are both async moves; loads hoist early, stores defer so
+    compute overlaps them. The inner move's destination space tells them apart.
+    """
+    return isinstance(op, AsyncOp) and _is_async_move(op) and any(
+        isinstance(inner, MoveOp) and isinstance(inner.dst.type, GmemTensorType)
+        for inner in op.body.entry_block.ops
+    )
+
+
+def _sink_stores(ops: list[Op]) -> None:
+    """Sink each async store, then its staging producer, into the next compute
+    window — up to but not past that compute's await — so compute hides the
+    store. A store with no following compute await is left where hoisting put
+    it. Motion is the same `_bubble`/`_can_swap` swap used for awaits.
+    """
+    def compute_await(op: Op) -> bool:
+        return isinstance(op, AwaitOp) and op.lock.type.kind == "wgmma"
+
+    stores, producers = [], []
+    for store in [op for op in ops if _is_async_store(op)]:
+        i = ops.index(store)
+        if not any(compute_await(op) for op in ops[i + 1:]):
+            continue
+        reads = {r for kind, r in (memory_effects(store) or []) if kind == "R"}
+        producer = next((
+            op for op in reversed(ops[:i])
+            if isinstance(op, MoveOp) and root_buffer(op.dst) in reads
+        ), None)
+        stores.append(store)
+        if producer is not None:
+            producers.append(producer)
+
+    _bubble(ops, stores, step=+1, barrier=compute_await)
+    _bubble(ops, producers, step=+1, barrier=compute_await)
+
+
 class ScheduleAsync(Pass):
 
     def run_block(self, block: Block) -> None:
         _hoist_async_moves(block.ops)
         _sink_awaits(block.ops)
+        _sink_stores(block.ops)
         super().run_block(block)
 
 

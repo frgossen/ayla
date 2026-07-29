@@ -152,6 +152,7 @@ def auto_matmul_4096_wgmma256_wg_storepipe_module(
 
 def _register() -> None:
     module = auto_matmul_4096_wgmma256_wg_storepipe_module(
+        output_buffers=2,
         kernel_name="auto_matmul_4096_wgmma256_wg_storepipe",
     )
     kernel = make_ptx_kernel(module)
