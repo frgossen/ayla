@@ -62,8 +62,8 @@ class BenchResult:
     min_ms: float
     max_ms: float
     tflops: float
-    peak_pct: float | None  # None if peak unspecified
-    vs_torch_mm_pct: float | None = None
+    peak_pct: float | None = None  # None if peak unspecified
+    torch_mm_pct: float | None = None
 
 
 # CUDA-event timing config (GPU-only, cudaEvent-based like matmul.cu).
@@ -145,8 +145,6 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
     # Throughput / peak% from the fastest round (best-case steady clock, least
     # contaminated by clock dips or scheduling noise), not the median.
     tflops = cfg.flops / (min_ms / 1e3) / 1e12
-    peak = peak_dense_tc_tflops(cfg.dtype)
-    pct = (tflops / peak * 100) if peak else None
     return BenchResult(
         label=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})",
         rounds=n,
@@ -157,8 +155,25 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
         min_ms=min_ms,
         max_ms=max(times_ms),
         tflops=tflops,
-        peak_pct=pct,
     )
+
+
+def _populate_percentages(
+    configs: list[BenchGemmConfig], results: list[BenchResult]
+) -> None:
+    torch_mm_tflops = next(
+        (
+            result.tflops
+            for cfg, result in zip(configs, results)
+            if cfg.op is torch.mm
+        ),
+        None,
+    )
+    for cfg, result in zip(configs, results):
+        peak = peak_dense_tc_tflops(cfg.dtype)
+        result.peak_pct = result.tflops / peak * 100 if peak else None
+        if torch_mm_tflops is not None:
+            result.torch_mm_pct = result.tflops / torch_mm_tflops * 100
 
 
 def _format_value(value, name: str) -> str:
@@ -271,19 +286,10 @@ def main() -> None:
     if args.reverse:
         configs = configs[::-1]
     results = []
-    torch_mm_tflops = None
     for cfg in configs:
-        result = _bench(cfg)
-        results.append(result)
-        if cfg.op is torch.mm:
-            torch_mm_tflops = result.tflops
+        results.append(_bench(cfg))
 
-    if torch_mm_tflops is not None:
-        for result in results:
-            # Positive values mean faster than torch.mm; negative means slower.
-            result.vs_torch_mm_pct = (
-                result.tflops / torch_mm_tflops - 1
-            ) * 100
+    _populate_percentages(configs, results)
 
     for i, result in enumerate(results):
         _print(result, with_header=(i == 0))
