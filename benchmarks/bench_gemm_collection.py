@@ -63,6 +63,7 @@ class BenchResult:
     max_ms: float
     tflops: float
     peak_pct: float | None  # None if peak unspecified
+    vs_torch_mm_pct: float | None = None
 
 
 # CUDA-event timing config (GPU-only, cudaEvent-based like matmul.cu).
@@ -269,8 +270,23 @@ def main() -> None:
         configs = [c for c in configs if pattern.search(c.label)]
     if args.reverse:
         configs = configs[::-1]
-    for i, cfg in enumerate(configs):
-        _print(_bench(cfg), with_header=(i == 0))
+    results = []
+    torch_mm_tflops = None
+    for cfg in configs:
+        result = _bench(cfg)
+        results.append(result)
+        if cfg.op is torch.mm:
+            torch_mm_tflops = result.tflops
+
+    if torch_mm_tflops is not None:
+        for result in results:
+            # Positive values mean faster than torch.mm; negative means slower.
+            result.vs_torch_mm_pct = (
+                result.tflops / torch_mm_tflops - 1
+            ) * 100
+
+    for i, result in enumerate(results):
+        _print(result, with_header=(i == 0))
 
 
 if __name__ == "__main__":
