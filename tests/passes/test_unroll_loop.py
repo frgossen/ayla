@@ -2,7 +2,6 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.passes.licm import licm
 from ayla.passes.unroll_loop import unroll_loop
 from ayla.testing import assert_contains_in_order
 
@@ -86,7 +85,7 @@ def test_unroll_factor_greater_than_trip_count_fully_unrolls():
     )
 
 
-def test_unroll_remainder_does_not_hoist_allocations():
+def test_unroll_remainder_reuses_first_alloc():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
@@ -98,30 +97,28 @@ def test_unroll_remainder_does_not_hoist_allocations():
           }
         }"""))
     text = repr(unroll_loop(module, unroll_factor=3, label_filter="k"))
-    # Unrolling is only a cloning transform: three main copies and one tail
-    # copy each retain the allocation from the original body.
-    assert text.count("smem_tensor<4x1xf32> = alloc()") == 4
+    # Three main copies allocate; the single tail iteration reuses the first.
+    assert text.count("smem_tensor<4x1xf32> = alloc()") == 3
     assert_contains_in_order(
         text,
-        'for (%k: index = 0 to 3 step 3) attrs={label: "k"} {',
         "%smem: smem_tensor<4x1xf32> = alloc()",
+        'for (%k: index = 0 to 3 step 3) attrs={label: "k"} {',
         "%c3: index = index_constant() attrs={value: 3}",
     )
     assert text.count("move(") == 4
 
 
-def test_licm_before_unroll_reuses_loop_invariant_allocation():
+def test_unroll_remainder_does_not_hoist_initialized_allocations():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
-            for (%k: index = 0 to 4) attrs={label: "k"} {
-              %smem: smem_tensor<4x1xf32> = alloc()
-              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
-              move(%smem: smem_tensor<4x1xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
+          kernel @test() {
+            for (%k: index = 0 to 5) attrs={label: "k"} {
+              %r: rmem_tensor<1xf32> = alloc() attrs={init: 0.0}
             }
           }
         }"""))
-    text = repr(unroll_loop(licm(module), unroll_factor=3, label_filter="k"))
-    assert text.count("smem_tensor<4x1xf32> = alloc()") == 1
-    assert text.index("smem_tensor<4x1xf32> = alloc()") < text.index("for (")
-    assert text.count("move(") == 4
+    text = repr(unroll_loop(module, unroll_factor=3, label_filter="k"))
+    assert text.count("rmem_tensor<1xf32> = alloc() attrs={init: 0.0}") == 5
+    loop_start = text.index("for (%k: index = 0 to 3 step 3)")
+    first_alloc = text.index("rmem_tensor<1xf32> = alloc()", loop_start)
+    assert first_alloc > loop_start
