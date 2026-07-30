@@ -729,8 +729,13 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_bulk(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
+        # Bulk groups are thread-private, and only t0 issued the store. Broadcast
+        # its completion before other lanes can enter another asymmetric named
+        # barrier phase. This full CTA sync can be removed once BLOCK_LEADER
+        # barriers receive conflict-free IDs instead of all reusing ID 1.
         template = textwrap.dedent(r"""
             cp.async.bulk.wait_group 0;
+            bar.sync 0;
         """)
         new_op = PTXTemplateOp.build(
             operands=[],
