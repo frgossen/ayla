@@ -1,6 +1,7 @@
 """Insert cross-thread synchronization barriers on shared-buffer hazards."""
 from __future__ import annotations
 
+import dataclasses
 import enum
 
 from ..gpu_dialect import (
@@ -17,40 +18,6 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
-
-
-def _join_collective_scope(a: CollectiveScope, b: CollectiveScope) -> CollectiveScope:
-    """The join (least upper bound) on the CollectiveScope lattice."""
-    if a == CollectiveScope.GRID:
-        return a
-    if a == CollectiveScope.THREAD:
-        return b
-    if a == CollectiveScope.BLOCK:
-        return b if b == CollectiveScope.GRID else a
-    if a == CollectiveScope.BLOCK_LEADER:
-        if b in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
-            return a
-        if b in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
-            return b
-        return CollectiveScope.BLOCK  # b is WARP or WARPGROUP
-    if a == CollectiveScope.WARPGROUP:
-        if b in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
-            return b
-        if b == CollectiveScope.BLOCK_LEADER:
-            return CollectiveScope.BLOCK
-        return a  # b is THREAD, WARP, or WARPGROUP
-    if a == CollectiveScope.WARP:
-        if b in {CollectiveScope.WARP, CollectiveScope.THREAD}:
-            return a
-        if b == CollectiveScope.BLOCK_LEADER:
-            return CollectiveScope.BLOCK
-        return b  # b is WARPGROUP, BLOCK, or GRID
-    raise NotImplementedError(f"_join_collective_scope: unhandled pair {a!r}, {b!r}")
-
-
-def _leq_collective_scope(a: CollectiveScope, b: CollectiveScope) -> bool:
-    """The partial order (<=) of the CollectiveScope lattice."""
-    return _join_collective_scope(a, b) == b
 
 
 class BarrierScope(enum.IntEnum):
@@ -79,22 +46,25 @@ class BarrierScope(enum.IntEnum):
     BLOCK = 5
     GRID = 6
 
-
-def _join_barrier_scope(a: BarrierScope, b: BarrierScope) -> BarrierScope:
-    """The join (least upper bound) on the BarrierScope lattice."""
-    if a == b:
-        return a
-    if a == BarrierScope.THREAD:
-        return b
-    if b == BarrierScope.THREAD:
-        return a
-    if a == BarrierScope.GRID or b == BarrierScope.GRID:
-        return BarrierScope.GRID
-    if a == BarrierScope.BLOCK or b == BarrierScope.BLOCK:
+    def join(self, other: BarrierScope) -> BarrierScope:
+        """The join (least upper bound) on the BarrierScope lattice."""
+        if self == other:
+            return self
+        if self == BarrierScope.THREAD:
+            return other
+        if other == BarrierScope.THREAD:
+            return self
+        if self == BarrierScope.GRID or other == BarrierScope.GRID:
+            return BarrierScope.GRID
+        if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
+            return BarrierScope.BLOCK
+        if {self, other} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
+            return BarrierScope.WARPGROUP
         return BarrierScope.BLOCK
-    if {a, b} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
-        return BarrierScope.WARPGROUP
-    return BarrierScope.BLOCK
+
+    def leq(self, other: BarrierScope) -> bool:
+        """The partial order (<=) of the BarrierScope lattice."""
+        return self.join(other) == other
 
 
 def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
@@ -106,7 +76,7 @@ def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierS
     if prior == CollectiveScope.BLOCK_LEADER:
         return BarrierScope.LEADER_TO_BLOCK
     # Neither side is a leader: the symmetric barrier for the coarser scope.
-    joined = _join_collective_scope(prior, current)
+    joined = prior.join(current)
     if joined == CollectiveScope.THREAD:
         return BarrierScope.THREAD
     if joined == CollectiveScope.WARP:
@@ -143,21 +113,58 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     raise NotImplementedError(f"_barrier_covers: unhandled barrier {barrier!r}")
 
 
-# The dataflow state: outstanding concurrent memory effects per root buffer (the
-# dict key), each a (kind, scope, region) tuple. ``region`` is the lock of the
-# open async completion region the effect belongs to (its ``await`` will close
-# it), or ``None`` for synchronous effects.
-ConcurrentMemoryEffectsType = dict[
-    object, set[tuple[str, "CollectiveScope", object]]
-]
-
-# The analysis result: each effect-bearing op mapped to the barrier it needs
-# before it (THREAD if none).
-BarrierTargetsType = dict["Op", "BarrierScope"]
+@dataclasses.dataclass(frozen=True)
+class ConcurrentMemoryEffect:
+    """One outstanding concurrent memory effect on a buffer: an "R"/"W" ``kind``
+    at collective ``scope``, with a ``pending_await`` on the lock that clears it
+    (``None`` if it's already live for barriers to order)."""
+    kind: str
+    scope: CollectiveScope
+    pending_await: Value | None
 
 
-def _await_collective_scope(lock: Value) -> CollectiveScope:
-    """The collective scope an ``await`` on ``lock`` synchronizes."""
+@dataclasses.dataclass
+class DataflowState:
+    """The forward analysis state: outstanding concurrent memory effects keyed by
+    root buffer, and the hardware named-barrier ids currently in use (so a fresh
+    block-leader barrier picks a non-conflicting one)."""
+    concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    named_barrier_ids: set[int] = dataclasses.field(default_factory=set)
+
+    def clone(self) -> DataflowState:
+        """A copy with fresh sets, safe for in-place per-op mutation."""
+        return self.join(DataflowState())  # union with empty -> fresh sets
+
+    def join(self, other: DataflowState) -> DataflowState:
+        """The dataflow join: per-buffer union of effects, union of barrier ids."""
+        a, b = self.concurrent_memory_effects, other.concurrent_memory_effects
+        return DataflowState(
+            {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
+            self.named_barrier_ids | other.named_barrier_ids,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BarrierTarget:
+    """The barrier before an op: its ``scope`` and, for a block-leader barrier,
+    the named-barrier ``named_id`` to lower to (``None`` otherwise)."""
+    scope: BarrierScope
+    named_id: int | None = None
+
+
+# The analysis result: each effect-bearing op mapped to the barrier before it.
+BarrierTargetsType = dict["Op", "BarrierTarget"]
+
+
+# PTX exposes 16 barrier resources per CTA. ID 0 is reserved for the full-block
+# ``bar.sync 0`` emitted by the lowering, leaving IDs 1..15 for named barriers.
+_MAX_BARRIER_IDS = 16
+
+
+def _async_collective_scope(lock: Value) -> CollectiveScope:
+    """The collective scope an async op on ``lock`` synchronizes when awaited."""
     kind = lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
@@ -172,39 +179,28 @@ def _await_collective_scope(lock: Value) -> CollectiveScope:
         # leader-owned read of shared memory. This is the completed memory
         # effect's collective scope, not the execution width of wait_group.
         return CollectiveScope.BLOCK_LEADER
-    raise NotImplementedError(f"_await_collective_scope: unmodeled lock kind {kind!r}")
-
-
-def _join(
-    a: ConcurrentMemoryEffectsType, b: ConcurrentMemoryEffectsType,
-) -> ConcurrentMemoryEffectsType:
-    """The join of this (standard forward) dataflow analysis: the per-buffer
-    union of the concurrent-effect-map state."""
-    return {
-        buf: a.get(buf, set()) | b.get(buf, set())
-        for buf in a.keys() | b.keys()
-    }
+    raise NotImplementedError(f"_async_collective_scope: unmodeled lock kind {kind!r}")
 
 
 def _analyze_block(
-    ops: list[Op], live_in: ConcurrentMemoryEffectsType, targets: BarrierTargetsType,
-) -> ConcurrentMemoryEffectsType:
-    live = _join(live_in, {})
+    ops: list[Op], live_in: DataflowState, targets: BarrierTargetsType,
+) -> DataflowState:
+    live = live_in.clone()
     for op in ops:
         live = _analyze(op, live, targets)
     return live
 
 
 def _analyze(
-    op: Op, live: ConcurrentMemoryEffectsType, targets: BarrierTargetsType,
-) -> ConcurrentMemoryEffectsType:
+    op: Op, live: DataflowState, targets: BarrierTargetsType,
+) -> DataflowState:
     """Transfer the concurrent-effect map across one ``op``, recording the barrier
     it needs in ``targets``; return the live-out. Container ops recurse into their
     body; a ``for`` is iterated to a fixpoint over its header."""
     if isinstance(op, (ModuleOp, KernelOp)):
         # A module/kernel body is a fresh scope -- no live effects flow in, and
         # its internal effects don't escape to the enclosing scope.
-        _analyze_block(list(op.body.entry_block.ops), {}, targets)
+        _analyze_block(list(op.body.entry_block.ops), DataflowState(), targets)
         return live
     if isinstance(op, ForOp):
         # Analyze the body to a fixpoint over its header (the loop-carried state
@@ -212,7 +208,7 @@ def _analyze(
         header = live
         while True:
             live_out = _analyze_block(op.body.entry_block.ops, header, targets)
-            joined = _join(header, live_out)  # fold the back edge
+            joined = header.join(live_out)  # fold the back edge
             if joined == header:
                 return live_out
             header = joined
@@ -227,14 +223,12 @@ def _analyze(
         # already synced instead.
         return live
     if isinstance(op, AwaitOp):
-        # Close the async's region: clear the effects up to the await's collective
-        # scope, settle (drop the region tag from) the rest.
-        scope = _await_collective_scope(op.lock)
-        for buf in live:
-            live[buf] = {
-                (k, s, None) if region == op.lock else (k, s, region)
-                for (k, s, region) in live[buf]
-                if not (region == op.lock and _leq_collective_scope(s, scope))
+        # Clear every effect pending on this lock -- only the ones this await fully
+        # orders were made pending on it (see the async handling below). Effects it
+        # only partially orders were never pending and stay live for a barrier.
+        for buf, effs in live.concurrent_memory_effects.items():
+            live.concurrent_memory_effects[buf] = {
+                e for e in effs if e.pending_await != op.lock
             }
         return live
     effects = memory_effects(op)
@@ -246,25 +240,49 @@ def _analyze(
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
     for kind_y, buf, scope_y in effects:
-        for kind_x, scope_x, _region_x in live.get(buf, ()):
+        for e in live.concurrent_memory_effects.get(buf, ()):
             # A hazard needs a write (RAR is safe).
-            if kind_x == "W" or kind_y == "W":
-                barrier_scope = _join_barrier_scope(
-                    barrier_scope, _barrier_scope(scope_x, scope_y)
-                )
-    targets[op] = barrier_scope
+            if e.kind == "W" or kind_y == "W":
+                barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
+    # A block-leader barrier is a named barrier: give it a fresh id (reusing this
+    # op's recorded one keeps it stable across fixpoint revisits). A full block
+    # sync frees every named-barrier id.
+    named_id = None
+    if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
+        recorded = targets.get(op)
+        named_id = (
+            recorded.named_id if recorded is not None and recorded.named_id is not None
+            else max(live.named_barrier_ids, default=0) + 1
+        )
+        # TODO: Reuse IDs once the analysis tracks when each named barrier is no
+        # longer live; until then, fail instead of emitting an invalid PTX ID.
+        assert named_id < _MAX_BARRIER_IDS, (
+            "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
+            "reserved for full-block barriers"
+        )
+        live.named_barrier_ids = live.named_barrier_ids | {named_id}
+    elif barrier_scope == BarrierScope.BLOCK:
+        live.named_barrier_ids = set()
+    targets[op] = BarrierTarget(barrier_scope, named_id)
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.
-    for buf in live:
-        live[buf] = {
-            (k, s, region) for (k, s, region) in live[buf]
-            if region is not None or not _barrier_covers(barrier_scope, s)
+    for buf, effs in live.concurrent_memory_effects.items():
+        live.concurrent_memory_effects[buf] = {
+            e for e in effs
+            if e.pending_await is not None
+            or not _barrier_covers(barrier_scope, e.scope)
         }
-    # The async's effects join a completion region keyed by its lock; every other
-    # effect-bearing op is synchronous (region = None).
-    region = op.lock if isinstance(op, AsyncOp) else None
+    # An async op's effects that its await fully orders wait pending on the lock
+    # (the await will clear them). A coarser effect the await only partially
+    # orders -- and every synchronous op's effect -- is live immediately, left for
+    # a later barrier to order.
+    async_scope = (
+        _async_collective_scope(op.lock) if isinstance(op, AsyncOp) else None
+    )
     for (k, b, s) in effects:
-        live.setdefault(b, set()).add((k, s, region))
+        pending = op.lock if async_scope is not None and s.leq(async_scope) else None
+        effect = ConcurrentMemoryEffect(k, s, pending)
+        live.concurrent_memory_effects.setdefault(b, set()).add(effect)
     return live
 
 
@@ -279,11 +297,16 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
-        barrier = targets.get(op, BarrierScope.THREAD)
-        if barrier != BarrierScope.THREAD:
-            if barrier not in _BARRIER_OP_SCOPE:
-                raise NotImplementedError(f"no lowering for barrier {barrier.name}")
-            new_ops.append(BarrierOp.build(scope=_BARRIER_OP_SCOPE[barrier]))
+        target = targets.get(op)
+        if target is not None and target.scope != BarrierScope.THREAD:
+            if target.scope not in _BARRIER_OP_SCOPE:
+                raise NotImplementedError(
+                    f"no lowering for barrier {target.scope.name}"
+                )
+            attrs = {} if target.named_id is None else {"id": target.named_id}
+            new_ops.append(
+                BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
+            )
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:
@@ -295,7 +318,7 @@ class InsertSyncs(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
         targets: BarrierTargetsType = {}
-        _analyze(module, {}, targets)  # analysis: where do barriers go
+        _analyze(module, DataflowState(), targets)  # analysis: where do barriers go
         _insert_barriers(module.body.entry_block, targets)  # transform: insert them
         return module
 

@@ -34,7 +34,12 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     assert kernel.grid_dim == (16, 16, 1)
     assert len(stores) == len(waits) == 2
     assert second_tile_mmas
-    assert any(
+    assert all(
+        any("bar.sync " in line and "bar.sync 0" not in line
+            for line in lines[max(0, store - 20):store])
+        for store in stores
+    )
+    assert not any(
         "bar.sync 0" in line
         for line in lines[stores[0]:second_tile_mmas[0]]
     )
