@@ -1201,7 +1201,8 @@ class LowerToPtxTemplate(LoweringPass):
         """Lower smem → gmem TMA bulk store (block-collective).
 
         Thread 0 issues cp.async.bulk.tensor.2d, commits, and waits.
-        All threads sync before and after via bar.sync.
+        The barrier inserted before the async orders all threads' shared-memory
+        writes before thread 0 starts the store.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -1220,12 +1221,6 @@ class LowerToPtxTemplate(LoweringPass):
         # The RAW (all threads finish writing the smem tile before t0 stores it) is
         # handled by insert_syncs, which emits a barrier before this async.
 
-        # TODO: Remove the full-block handoff after insert_syncs tracks named
-        # barriers that may still be in flight. BLOCK_LEADER barriers currently
-        # all lower to ID 1; non-waiting warps use bar.arrive and may reach the
-        # next barrier while that ID is still active. The pass should propagate
-        # in-flight IDs, assign a conflict-free ID to each inserted barrier, and
-        # make IDs reusable only once their previous phase is known complete.
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:st_tid}}, %tid.x;
             mov.u32 ${{b32:st_tidy}}, %tid.y;
@@ -1238,7 +1233,6 @@ class LowerToPtxTemplate(LoweringPass):
             cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
-            bar.sync 0;
         """)
 
         new_op = PTXTemplateOp.build(
