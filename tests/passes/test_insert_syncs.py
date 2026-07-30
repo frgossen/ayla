@@ -44,7 +44,7 @@ def test_war_on_shared_buffer_gets_barrier():
               %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc()
-              barrier() attrs={scope: "block_leader"}
+              barrier() attrs={id: 1, scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -265,12 +265,58 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 1, scope: "block_leader"}
             async(%10: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 2, scope: "block_leader"}
             async(%7: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 3, scope: "block_leader"}
             async(%4: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 4, scope: "block_leader"}
             async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
+    )
+
+
+def test_sequential_block_leader_barriers_get_distinct_ids():
+    # Two back-to-back reload cycles on the same smem stages, no full block sync
+    # between them: each reload's WAR gets its own named barrier, so the two
+    # block_leader barriers must use distinct ids (1 then 2).
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @two_named_barriers(%a: gmem_tensor<128x4096xbf16>, %b: gmem_tensor<128x4096xbf16>, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %sa: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %sb: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, 0)
+            %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, 0)
+            %lw0: lock<wgmma> = alloc()
+            async(%lw0: lock<wgmma>) matmul(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %sb: smem_tensor<128x64xbf16 swizzle="128B">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            await(%lw0: lock<wgmma>)
+            %lm0: lock<mbar> = alloc()
+            async(%lm0: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+              move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+            }
+            await(%lm0: lock<mbar>)
+            %lw1: lock<wgmma> = alloc()
+            async(%lw1: lock<wgmma>) matmul(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %sb: smem_tensor<128x64xbf16 swizzle="128B">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            await(%lw1: lock<wgmma>)
+            %lm1: lock<mbar> = alloc()
+            async(%lm1: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+              move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+            }
+            await(%lm1: lock<mbar>)
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    text = repr(module)
+    assert text.count("barrier()") == 2
+    assert_contains_in_order(
+        text,
+        textwrap.dedent("""\
+            barrier() attrs={id: 1, scope: "block_leader"}
+            async(%lm0: lock<mbar>) {
+            barrier() attrs={id: 2, scope: "block_leader"}
+            async(%lm1: lock<mbar>) {"""),
     )

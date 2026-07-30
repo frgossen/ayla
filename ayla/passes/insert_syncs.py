@@ -125,29 +125,37 @@ class ConcurrentMemoryEffect:
 
 @dataclasses.dataclass
 class DataflowState:
-    """The forward analysis state: outstanding concurrent memory effects, keyed
-    by root buffer."""
+    """The forward analysis state: outstanding concurrent memory effects keyed by
+    root buffer, and the hardware named-barrier ids currently in use (so a fresh
+    block-leader barrier picks a non-conflicting one)."""
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
+    named_barrier_ids: set[int] = dataclasses.field(default_factory=set)
 
     def clone(self) -> DataflowState:
-        """A copy with fresh effect sets, safe for in-place per-op mutation."""
+        """A copy with fresh sets, safe for in-place per-op mutation."""
         return self.join(DataflowState())  # union with empty -> fresh sets
 
     def join(self, other: DataflowState) -> DataflowState:
-        """The dataflow join: the per-buffer union of concurrent effects."""
+        """The dataflow join: per-buffer union of effects, union of barrier ids."""
         a, b = self.concurrent_memory_effects, other.concurrent_memory_effects
-        return DataflowState({
-            buf: a.get(buf, set()) | b.get(buf, set())
-            for buf in a.keys() | b.keys()
-        })
+        return DataflowState(
+            {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
+            self.named_barrier_ids | other.named_barrier_ids,
+        )
 
 
-# The analysis result: each effect-bearing op mapped to the barrier it needs
-# before it (THREAD if none).
-BarrierTargetsType = dict["Op", "BarrierScope"]
+@dataclasses.dataclass(frozen=True)
+class BarrierTarget:
+    """The barrier before an op: its ``scope`` and, for a block-leader barrier,
+    the named-barrier ``named_id`` to lower to (``None`` otherwise)."""
+    scope: BarrierScope
+    named_id: int | None = None
 
+
+# The analysis result: each effect-bearing op mapped to the barrier before it.
+BarrierTargetsType = dict["Op", "BarrierTarget"]
 
 def _async_collective_scope(lock: Value) -> CollectiveScope:
     """The collective scope an async op on ``lock`` synchronizes when awaited."""
@@ -224,7 +232,20 @@ def _analyze(
             # A hazard needs a write (RAR is safe).
             if e.kind == "W" or kind_y == "W":
                 barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
-    targets[op] = barrier_scope
+    # A block-leader barrier is a named barrier: give it a fresh id (reusing this
+    # op's recorded one keeps it stable across fixpoint revisits). A full block
+    # sync frees every named-barrier id.
+    named_id = None
+    if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
+        recorded = targets.get(op)
+        named_id = (
+            recorded.named_id if recorded is not None and recorded.named_id is not None
+            else max(live.named_barrier_ids, default=0) + 1
+        )
+        live.named_barrier_ids = live.named_barrier_ids | {named_id}
+    elif barrier_scope == BarrierScope.BLOCK:
+        live.named_barrier_ids = set()
+    targets[op] = BarrierTarget(barrier_scope, named_id)
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.
     for buf, effs in live.concurrent_memory_effects.items():
@@ -258,11 +279,16 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
-        barrier = targets.get(op, BarrierScope.THREAD)
-        if barrier != BarrierScope.THREAD:
-            if barrier not in _BARRIER_OP_SCOPE:
-                raise NotImplementedError(f"no lowering for barrier {barrier.name}")
-            new_ops.append(BarrierOp.build(scope=_BARRIER_OP_SCOPE[barrier]))
+        target = targets.get(op)
+        if target is not None and target.scope != BarrierScope.THREAD:
+            if target.scope not in _BARRIER_OP_SCOPE:
+                raise NotImplementedError(
+                    f"no lowering for barrier {target.scope.name}"
+                )
+            attrs = {} if target.named_id is None else {"id": target.named_id}
+            new_ops.append(
+                BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
+            )
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:

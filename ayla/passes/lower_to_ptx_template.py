@@ -654,16 +654,16 @@ class LowerToPtxTemplate(LoweringPass):
         if scope == "block":
             template = "bar.sync 0;\n"
         elif scope == "block_leader":
-            # Warp 0 (t0) waits, others arrive.
-            # TODO: id 1 is hardcoded and reused with no barrier-id analysis; safe
-            # only under the pipeline's mbar/t0 gating (see insert_syncs).
-            template = textwrap.dedent("""\
-                mov.u32 ${b32:bl_tid}, %tid.x;
-                mov.u32 ${b32:bl_ntid}, %ntid.x;
-                setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-                setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
-                @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
-                @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+            # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
+            # insert_syncs (unique among concurrently-live block-leader barriers).
+            bar_id = op.attrs.get("id", 1)
+            template = textwrap.dedent(f"""\
+                mov.u32 ${{b32:bl_tid}}, %tid.x;
+                mov.u32 ${{b32:bl_ntid}}, %ntid.x;
+                setp.lt.u32 ${{pred:bl_w0}}, ${{b32:bl_tid}}, 32;
+                setp.ge.u32 ${{pred:bl_nw0}}, ${{b32:bl_tid}}, 32;
+                @${{pred:bl_w0}} bar.sync {bar_id}, ${{b32:bl_ntid}};
+                @${{pred:bl_nw0}} bar.arrive {bar_id}, ${{b32:bl_ntid}};
                 """)
         else:
             raise NotImplementedError(
