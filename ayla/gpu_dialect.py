@@ -1574,6 +1574,40 @@ class CollectiveScope(enum.IntEnum):
     BLOCK = 4
     GRID = 5
 
+    def join(self, other: CollectiveScope) -> CollectiveScope:
+        """The join (least upper bound) on the CollectiveScope lattice."""
+        if self == CollectiveScope.GRID:
+            return self
+        if self == CollectiveScope.THREAD:
+            return other
+        if self == CollectiveScope.BLOCK:
+            return other if other == CollectiveScope.GRID else self
+        if self == CollectiveScope.BLOCK_LEADER:
+            if other in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
+                return self
+            if other in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
+                return other
+            return CollectiveScope.BLOCK  # other is WARP or WARPGROUP
+        if self == CollectiveScope.WARPGROUP:
+            if other in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
+                return other
+            if other == CollectiveScope.BLOCK_LEADER:
+                return CollectiveScope.BLOCK
+            return self  # other is THREAD, WARP, or WARPGROUP
+        if self == CollectiveScope.WARP:
+            if other in {CollectiveScope.WARP, CollectiveScope.THREAD}:
+                return self
+            if other == CollectiveScope.BLOCK_LEADER:
+                return CollectiveScope.BLOCK
+            return other  # other is WARPGROUP, BLOCK, or GRID
+        raise NotImplementedError(
+            f"CollectiveScope.join: unhandled pair {self!r}, {other!r}"
+        )
+
+    def leq(self, other: CollectiveScope) -> bool:
+        """The partial order (<=) of the CollectiveScope lattice."""
+        return self.join(other) == other
+
 
 def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, RmemTensorType):
