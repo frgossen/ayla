@@ -256,6 +256,14 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,
             n=4096,

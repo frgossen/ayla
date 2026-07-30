@@ -26,6 +26,11 @@ BF16 = torch.bfloat16
         pytest.param(ayla.pranjalssh_4096_pipelined, BF16, id="pranjalssh_4096_pipelined"),
         pytest.param(ayla.auto_matmul_4096, BF16, id="auto_matmul_4096"),
         pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, id="auto_matmul_4096_wgmma256_wg"),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3",
+        ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],
 )
