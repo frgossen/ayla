@@ -82,6 +82,18 @@ def test_k2_two_arena_grid_8x8_ptx_layout():
 
 
 @pytest.mark.parametrize("output_buffers", [1, 2])
+def test_k2_grid_16x8_ptx_layout(output_buffers):
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        input_stages=2, output_tiles_n_per_cta=2,
+        output_buffers=output_buffers,
+    ))
+    assert kernel.grid_dim == (16, 8, 1)
+    assert kernel.ptx.count("cp.async.bulk.tensor.2d.global.shared") == 2
+    assert kernel.ptx.count("cp.async.bulk.wait_group 0") == 2
+    assert kernel.ptx.count("[65536];") == output_buffers
+
+
+@pytest.mark.parametrize("output_buffers", [1, 2])
 def test_k2_grid_8x16_ptx_layout(output_buffers):
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
         input_stages=2, output_tiles_per_cta=4, output_buffers=output_buffers,
@@ -125,6 +137,16 @@ def test_k2_grid_8x16_ptx_layout(output_buffers):
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles_2arenas,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles_2arenas",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_1x2tiles,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_1x2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_1x2tiles_2arenas,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_1x2tiles_2arenas",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_4x1tiles,

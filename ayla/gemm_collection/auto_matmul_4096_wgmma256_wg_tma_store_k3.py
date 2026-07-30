@@ -186,6 +186,28 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
         k2_two_arena_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     )
 
+    grid_16x8_one_arena_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            input_stages=2, output_tiles_n_per_cta=2,
+        )
+    )
+    grid_16x8_one_arena_launcher = make_ptx_launcher(grid_16x8_one_arena_kernel)
+    make_torch_custom_call(
+        grid_16x8_one_arena_launcher,
+        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
+    )
+
+    grid_16x8_two_arena_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            input_stages=2, output_tiles_n_per_cta=2, output_buffers=2,
+        )
+    )
+    grid_16x8_two_arena_launcher = make_ptx_launcher(grid_16x8_two_arena_kernel)
+    make_torch_custom_call(
+        grid_16x8_two_arena_launcher,
+        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
+    )
+
     grid_8x16_one_arena_kernel = make_ptx_kernel(
         auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
             input_stages=2, output_tiles_per_cta=4,
