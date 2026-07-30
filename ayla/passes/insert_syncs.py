@@ -20,40 +20,6 @@ from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
-def _join_collective_scope(a: CollectiveScope, b: CollectiveScope) -> CollectiveScope:
-    """The join (least upper bound) on the CollectiveScope lattice."""
-    if a == CollectiveScope.GRID:
-        return a
-    if a == CollectiveScope.THREAD:
-        return b
-    if a == CollectiveScope.BLOCK:
-        return b if b == CollectiveScope.GRID else a
-    if a == CollectiveScope.BLOCK_LEADER:
-        if b in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
-            return a
-        if b in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
-            return b
-        return CollectiveScope.BLOCK  # b is WARP or WARPGROUP
-    if a == CollectiveScope.WARPGROUP:
-        if b in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
-            return b
-        if b == CollectiveScope.BLOCK_LEADER:
-            return CollectiveScope.BLOCK
-        return a  # b is THREAD, WARP, or WARPGROUP
-    if a == CollectiveScope.WARP:
-        if b in {CollectiveScope.WARP, CollectiveScope.THREAD}:
-            return a
-        if b == CollectiveScope.BLOCK_LEADER:
-            return CollectiveScope.BLOCK
-        return b  # b is WARPGROUP, BLOCK, or GRID
-    raise NotImplementedError(f"_join_collective_scope: unhandled pair {a!r}, {b!r}")
-
-
-def _leq_collective_scope(a: CollectiveScope, b: CollectiveScope) -> bool:
-    """The partial order (<=) of the CollectiveScope lattice."""
-    return _join_collective_scope(a, b) == b
-
-
 class BarrierScope(enum.IntEnum):
     r"""The cross-thread barrier to emit for a hazard.
 
@@ -80,22 +46,25 @@ class BarrierScope(enum.IntEnum):
     BLOCK = 5
     GRID = 6
 
-
-def _join_barrier_scope(a: BarrierScope, b: BarrierScope) -> BarrierScope:
-    """The join (least upper bound) on the BarrierScope lattice."""
-    if a == b:
-        return a
-    if a == BarrierScope.THREAD:
-        return b
-    if b == BarrierScope.THREAD:
-        return a
-    if a == BarrierScope.GRID or b == BarrierScope.GRID:
-        return BarrierScope.GRID
-    if a == BarrierScope.BLOCK or b == BarrierScope.BLOCK:
+    def join(self, other: BarrierScope) -> BarrierScope:
+        """The join (least upper bound) on the BarrierScope lattice."""
+        if self == other:
+            return self
+        if self == BarrierScope.THREAD:
+            return other
+        if other == BarrierScope.THREAD:
+            return self
+        if self == BarrierScope.GRID or other == BarrierScope.GRID:
+            return BarrierScope.GRID
+        if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
+            return BarrierScope.BLOCK
+        if {self, other} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
+            return BarrierScope.WARPGROUP
         return BarrierScope.BLOCK
-    if {a, b} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
-        return BarrierScope.WARPGROUP
-    return BarrierScope.BLOCK
+
+    def leq(self, other: BarrierScope) -> bool:
+        """The partial order (<=) of the BarrierScope lattice."""
+        return self.join(other) == other
 
 
 def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
@@ -107,7 +76,7 @@ def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierS
     if prior == CollectiveScope.BLOCK_LEADER:
         return BarrierScope.LEADER_TO_BLOCK
     # Neither side is a leader: the symmetric barrier for the coarser scope.
-    joined = _join_collective_scope(prior, current)
+    joined = prior.join(current)
     if joined == CollectiveScope.THREAD:
         return BarrierScope.THREAD
     if joined == CollectiveScope.WARP:
@@ -242,8 +211,7 @@ def _analyze(
                 dataclasses.replace(e, pending_await=None)
                 if e.pending_await == op.lock else e
                 for e in effs
-                if not (e.pending_await == op.lock
-                        and _leq_collective_scope(e.scope, scope))
+                if not (e.pending_await == op.lock and e.scope.leq(scope))
             }
         return live
     effects = memory_effects(op)
@@ -258,9 +226,7 @@ def _analyze(
         for e in live.concurrent_memory_effects.get(buf, ()):
             # A hazard needs a write (RAR is safe).
             if e.kind == "W" or kind_y == "W":
-                barrier_scope = _join_barrier_scope(
-                    barrier_scope, _barrier_scope(e.scope, scope_y)
-                )
+                barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
     targets[op] = barrier_scope
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.
