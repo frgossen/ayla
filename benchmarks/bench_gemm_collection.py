@@ -186,27 +186,29 @@ def _is_str_field(f) -> bool:
     return f.type is str or f.type == "str"
 
 
-# Label column width; fits "ayla.X (...) (4096x4096 @ 4096x4096)".
-_LABEL_WIDTH = 66
-
-
-def _width(f) -> int:
-    return _LABEL_WIDTH if _is_str_field(f) else 12
+def _width(f, label_width: int) -> int:
+    return label_width if _is_str_field(f) else 12
 
 
 def _align(f) -> str:
     return "<" if _is_str_field(f) else ">"
 
 
-def _print(r: BenchResult, with_header: bool = False) -> None:
+def _format_field(r: BenchResult, f, label_width: int) -> str:
+    value = _format_value(getattr(r, f.name), f.name)
+    return f"{value:{_align(f)}{_width(f, label_width)}s}"
+
+
+def _print(r: BenchResult, label_width: int, with_header: bool = False) -> None:
     fields = dataclasses.fields(r)
     if with_header:
-        print("  ".join(f"{f.name:{_align(f)}{_width(f)}s}" for f in fields))
-    print(
-        "  ".join(
-            f"{_format_value(getattr(r, f.name), f.name):{_align(f)}{_width(f)}s}"
-            for f in fields
+        print(
+            "  ".join(
+                f"{f.name:{_align(f)}{_width(f, label_width)}s}" for f in fields
+            )
         )
+    print(
+        "  ".join(_format_field(r, f, label_width) for f in fields)
     )
 
 
@@ -302,8 +304,11 @@ def main() -> None:
 
     _populate_percentages(configs, results)
 
+    label_width = max(
+        (len(result.label) for result in results), default=len("label")
+    )
     for i, result in enumerate(results):
-        _print(result, with_header=(i == 0))
+        _print(result, label_width, with_header=(i == 0))
 
 
 if __name__ == "__main__":
