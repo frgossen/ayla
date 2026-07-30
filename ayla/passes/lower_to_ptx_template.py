@@ -1219,6 +1219,13 @@ class LowerToPtxTemplate(LoweringPass):
         # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
         # The RAW (all threads finish writing the smem tile before t0 stores it) is
         # handled by insert_syncs, which emits a barrier before this async.
+
+        # TODO: Remove the full-block handoff after insert_syncs tracks named
+        # barriers that may still be in flight. BLOCK_LEADER barriers currently
+        # all lower to ID 1; non-waiting warps use bar.arrive and may reach the
+        # next barrier while that ID is still active. The pass should propagate
+        # in-flight IDs, assign a conflict-free ID to each inserted barrier, and
+        # make IDs reusable only once their previous phase is known complete.
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:st_tid}}, %tid.x;
             mov.u32 ${{b32:st_tidy}}, %tid.y;
