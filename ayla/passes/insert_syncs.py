@@ -166,6 +166,12 @@ def _await_collective_scope(lock: Value) -> CollectiveScope:
         # threads wait the mbarrier for it. So it closes BLOCK_LEADER (the leader
         # write) but not a full-block all-thread effect.
         return CollectiveScope.BLOCK_LEADER
+    if kind == "bulk":
+        # Bulk async-groups are per issuing thread, not warp-group-wide. TMA
+        # stores are issued and committed by t0, so t0's wait completes the
+        # leader-owned read of shared memory. This is the completed memory
+        # effect's collective scope, not the execution width of wait_group.
+        return CollectiveScope.BLOCK_LEADER
     raise NotImplementedError(f"_await_collective_scope: unmodeled lock kind {kind!r}")
 
 

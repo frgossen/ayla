@@ -181,7 +181,8 @@ class PromoteBuffers(LoweringPass):
     warps : int or None
         Wrmem warp count (``1``, ``4``).
     tma : bool
-        Use TMA for the move.
+        Use TMA for the move. A WRMEM destination is written back through a
+        block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
         Non-coherent cache hint for gmem→rmem loads.
     """
@@ -309,6 +310,46 @@ class PromoteBuffers(LoweringPass):
 
         return new_ops, [result]
 
+    def _build_tma_writeback(
+        self, dst: Value, src: Value, matmul_label: str | None,
+    ) -> list[Op]:
+        """Stage a narrow distributed value for one block-wide TMA store.
+
+        The block-wide SMEM tile is allocated whole (the bulk store transfers it
+        in one copy), then tiled back down to the writer's collective level so
+        the gather move matches ``src``'s shape -- mirroring how
+        ``_build_operand_promotion`` replays narrow tiles on a promoted buffer,
+        which keeps the warp-group row placement in the IR rather than the
+        lowering.
+        """
+        block_dst = dst
+        narrow_tiles: list[TileOp] = []
+        while isinstance(block_dst.definition, TileOp):
+            tile = block_dst.definition
+            if not _introduces_narrow(tile, "block"):
+                break
+            narrow_tiles.append(tile)
+            block_dst = tile.arg
+        assert isinstance(block_dst.type, GmemTensorType)
+        smem = AllocOp.build(SmemTensorType.build(
+            list(block_dst.type.sizes), block_dst.type.dtype, swizzle=None,
+        ))
+        new_ops: list[Op] = [smem]
+        gather_dst = smem.result()
+        for tile in reversed(narrow_tiles):
+            ops, [gather_dst] = _apply_tile(tile, gather_dst)
+            new_ops.extend(ops)
+        gather = MoveOp.build(
+            dst=gather_dst, src=src,
+            attrs={"label": f"{matmul_label}_dst_smem"},
+        )
+        store = MoveOp.build(
+            dst=block_dst, src=smem.result(),
+            attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
+        )
+        new_ops.extend([gather, store])
+        return new_ops
+
     def _build_operand_writeback(
         self, dst: Value, src: Value, operand_name: str, matmul_label: str | None = None
     ) -> tuple[list[Op], list[Value]]:
@@ -326,6 +367,9 @@ class PromoteBuffers(LoweringPass):
             cvt = ConvertOp.build(dst=tmp_alloc.result(), src=src)
             new_ops.extend([tmp_alloc, cvt])
             src = tmp_alloc.result()
+        if self.tma and self.target_type == "wrmem":
+            new_ops.extend(self._build_tma_writeback(dst, src, matmul_label))
+            return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         move = MoveOp.build(dst=dst, src=src, attrs=attrs)
         new_ops.append(move)

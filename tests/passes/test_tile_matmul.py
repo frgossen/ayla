@@ -34,3 +34,23 @@ def test_tiles_gmem_matmul_along_m_and_k():
           }
         }""")
     assert text == expected
+
+
+def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<4096x16xbf16>, %b: gmem_tensor<256x16xbf16>, %c: gmem_tensor<4096x256xbf16>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem_tensor<4096x16xbf16>, %b: gmem_tensor<256x16xbf16>, %c: gmem_tensor<4096x256xbf16>) attrs={label: "mm"}
+          }
+        }"""))
+    module = tile_matmul(
+        module,
+        tile_dims=["M", "M"], tile_sizes=[2048, 128],
+        tile_levels=["for", "block.x"], tile_labels=["outm", None],
+        label_filter="mm",
+    )
+    text = repr(module)
+    assert "grid_dim=[16, 1, 1]" in text
+    assert 'for (%outm: index = 0 to 2) attrs={label: "outm"}' in text
+    assert "tile(%a: gmem_tensor<4096x16xbf16>, %outm: index, 0)" in text
+    assert "tile(%0: gmem_tensor<2048x16xbf16>, %bx: index, 0)" in text

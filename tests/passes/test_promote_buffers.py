@@ -5,6 +5,30 @@ from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.promote_buffers import promote_buffers
 
 
+def test_wrmem_tma_writeback_stages_block_tile_in_smem():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c: gmem_tensor<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem_tensor<64x256xbf16 strides=[256, 1]> = tile(%c: gmem_tensor<128x256xbf16>, %wgx: index, 0)
+            matmul(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c_wg: gmem_tensor<64x256xbf16 strides=[256, 1]>) attrs={init: 0.0, label: "mm"}
+          }
+        }"""))
+    module = promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+    )
+    text = repr(module)
+    assert "smem_tensor<128x256xbf16> = alloc()" in text
+    # SMEM is tiled by warp-group id, so the gather move matches the fragment
+    # shape (64x256 <- 64x256) instead of a size-mismatched 128x256 <- 64x256.
+    assert "smem_tensor<64x256xbf16> = tile(" in text
+    assert "smem_tensor<128x256xbf16>, %wgx: index, 0)" in text
+    assert "move(%3: smem_tensor<64x256xbf16>, %1: wrmem_tensor<64x256xbf16" in text
+    assert "move(%c: gmem_tensor<128x256xbf16>" in text
+    assert 'attrs={label: "mm_dst_tma", tma: True}' in text
+
+
 def test_promote_gmem_matmul_operands_to_smem():
     module_str = textwrap.dedent("""\
         module {
