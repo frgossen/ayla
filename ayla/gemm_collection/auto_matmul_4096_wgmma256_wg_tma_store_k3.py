@@ -16,18 +16,34 @@ from ..ptx_runtime import make_ptx_launcher
 from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 
-def auto_matmul_4096_wgmma256_wg_tma_store_k3_module():
-    module = gpu_dialect.parse(textwrap.dedent("""\
-        module {
-          kernel @auto_matmul_4096_wgmma256_wg_tma_store_k3(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
-          }
-        }"""))
-    module = tile_matmul(
-        module, tile_dims=["M", "N"], tile_sizes=[128, 256],
-        tile_levels=["block.x", "block.y"], tile_labels=[None, None],
-        label_filter="mm",
-    )
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+    *, output_tiles_per_cta: int = 1,
+):
+    if output_tiles_per_cta not in (1, 2):
+        raise ValueError("output_tiles_per_cta must be 1 or 2")
+    name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
+    if output_tiles_per_cta == 2:
+        name += "_2tiles"
+    grid_x = 32 // output_tiles_per_cta
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] block_dim=[128, 1, 1] {{
+            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
+          }}
+        }}"""))
+    if output_tiles_per_cta == 1:
+        module = tile_matmul(
+            module, tile_dims=["M", "N"], tile_sizes=[128, 256],
+            tile_levels=["block.x", "block.y"], tile_labels=[None, None],
+            label_filter="mm",
+        )
+    else:
+        module = tile_matmul(
+            module, tile_dims=["M", "M", "N"],
+            tile_sizes=[2048, 128, 256],
+            tile_levels=["for", "block.x", "block.y"],
+            tile_labels=["outm", None, None], label_filter="mm",
+        )
     module = tile_matmul(
         module, tile_dims=["M"], tile_sizes=[64],
         tile_levels=["wg.x"], tile_labels=[None], label_filter="mm",
@@ -70,6 +86,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module():
         module = licm(module)
         module = canonicalize(module)
 
+    if output_tiles_per_cta == 2:
+        module = unroll_loop(
+            module, unroll_factor=2, label_filter="outm"
+        )
     module = schedule_async(module)
     return canonicalize(module)
 
@@ -81,6 +101,16 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     launcher = make_ptx_launcher(kernel)
     make_torch_custom_call(
         launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    )
+
+    two_tile_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            output_tiles_per_cta=2
+        )
+    )
+    two_tile_launcher = make_ptx_launcher(two_tile_kernel)
+    make_torch_custom_call(
+        two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     )
 
 
