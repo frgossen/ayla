@@ -116,8 +116,8 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
 @dataclasses.dataclass(frozen=True)
 class ConcurrentMemoryEffect:
     """One outstanding concurrent memory effect on a buffer: an "R"/"W" ``kind``
-    at collective ``scope``, with a ``pending_await`` on the lock that settles it
-    (``None`` if synchronous)."""
+    at collective ``scope``, with a ``pending_await`` on the lock that clears it
+    (``None`` if it's already live for barriers to order)."""
     kind: str
     scope: CollectiveScope
     pending_await: Value | None
@@ -149,8 +149,8 @@ class DataflowState:
 BarrierTargetsType = dict["Op", "BarrierScope"]
 
 
-def _await_collective_scope(lock: Value) -> CollectiveScope:
-    """The collective scope an ``await`` on ``lock`` synchronizes."""
+def _async_collective_scope(lock: Value) -> CollectiveScope:
+    """The collective scope an async op on ``lock`` synchronizes when awaited."""
     kind = lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
@@ -165,7 +165,7 @@ def _await_collective_scope(lock: Value) -> CollectiveScope:
         # leader-owned read of shared memory. This is the completed memory
         # effect's collective scope, not the execution width of wait_group.
         return CollectiveScope.BLOCK_LEADER
-    raise NotImplementedError(f"_await_collective_scope: unmodeled lock kind {kind!r}")
+    raise NotImplementedError(f"_async_collective_scope: unmodeled lock kind {kind!r}")
 
 
 def _analyze_block(
@@ -209,15 +209,12 @@ def _analyze(
         # already synced instead.
         return live
     if isinstance(op, AwaitOp):
-        # Close the async's region: clear the effects up to the await's collective
-        # scope, settle (drop the region tag from) the rest.
-        scope = _await_collective_scope(op.lock)
+        # Clear every effect pending on this lock -- only the ones this await fully
+        # orders were made pending on it (see the async handling below). Effects it
+        # only partially orders were never pending and stay live for a barrier.
         for buf, effs in live.concurrent_memory_effects.items():
             live.concurrent_memory_effects[buf] = {
-                dataclasses.replace(e, pending_await=None)
-                if e.pending_await == op.lock else e
-                for e in effs
-                if not (e.pending_await == op.lock and e.scope.leq(scope))
+                e for e in effs if e.pending_await != op.lock
             }
         return live
     effects = memory_effects(op)
@@ -242,11 +239,16 @@ def _analyze(
             if e.pending_await is not None
             or not _barrier_covers(barrier_scope, e.scope)
         }
-    # An async op's effects stay pending on its lock (settled by the matching
-    # await); every other effect-bearing op is synchronous (pending_await = None).
-    pending_await = op.lock if isinstance(op, AsyncOp) else None
+    # An async op's effects that its await fully orders wait pending on the lock
+    # (the await will clear them). A coarser effect the await only partially
+    # orders -- and every synchronous op's effect -- is live immediately, left for
+    # a later barrier to order.
+    async_scope = (
+        _async_collective_scope(op.lock) if isinstance(op, AsyncOp) else None
+    )
     for (k, b, s) in effects:
-        effect = ConcurrentMemoryEffect(k, s, pending_await)
+        pending = op.lock if async_scope is not None and s.leq(async_scope) else None
+        effect = ConcurrentMemoryEffect(k, s, pending)
         live.concurrent_memory_effects.setdefault(b, set()).add(effect)
     return live
 
