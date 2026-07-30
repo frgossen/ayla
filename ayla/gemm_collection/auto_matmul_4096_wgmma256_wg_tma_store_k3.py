@@ -1,4 +1,4 @@
-"""Three-stage wgmma256 GEMM with TMA output stores."""
+"""Three-stage wgmma256 GEMM with pipelined TMA output stores."""
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
