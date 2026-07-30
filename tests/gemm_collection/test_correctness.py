@@ -70,6 +70,17 @@ def test_k2_two_arena_ptx_layout_and_overlap():
     )
 
 
+def test_k2_two_arena_grid_8x8_ptx_layout():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        input_stages=2, output_tiles_per_cta=4,
+        output_tiles_n_per_cta=2, output_buffers=2,
+    ))
+    assert kernel.grid_dim == (8, 8, 1)
+    assert kernel.ptx.count("cp.async.bulk.tensor.2d.global.shared") == 8
+    assert kernel.ptx.count("cp.async.bulk.wait_group 0") == 8
+    assert kernel.ptx.count("[65536];") == 2
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -103,6 +114,11 @@ def test_k2_two_arena_ptx_layout_and_overlap():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles_2arenas,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles_2arenas",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_4x2tiles_2arenas,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_4x2tiles_2arenas",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],
