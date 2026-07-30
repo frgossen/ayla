@@ -300,6 +300,22 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=2, 8x16 grid, 1 arena)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_4x1tiles,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=2, 8x16 grid, 2 arenas)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_4x1tiles_2arenas,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
             label="ayla.auto_matmul (wgmma256 wg, TMA store K=2, 8x8 grid, 2 arenas)",
             m=4096,
             n=4096,
