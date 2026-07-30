@@ -41,6 +41,15 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     assert waits[0] < gathers[64] < stores[1] < waits[1]
 
 
+def test_k2_one_arena_static_smem_layout():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        input_stages=2, output_tiles_per_cta=2,
+    ))
+    assert kernel.ptx.count("[65536];") == 1
+    assert kernel.ptx.count("[32768];") == 2
+    assert kernel.ptx.count("[16384];") == 2
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -64,6 +73,11 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],

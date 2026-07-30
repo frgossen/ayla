@@ -17,11 +17,13 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
-    *, output_tiles_per_cta: int = 1,
+    *, input_stages: int = 3, output_tiles_per_cta: int = 1,
 ):
+    if input_stages not in (2, 3):
+        raise ValueError("input_stages must be 2 or 3")
     if output_tiles_per_cta not in (1, 2):
         raise ValueError("output_tiles_per_cta must be 1 or 2")
-    name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
+    name = f"auto_matmul_4096_wgmma256_wg_tma_store_k{input_stages}"
     if output_tiles_per_cta == 2:
         name += "_2tiles"
     grid_x = 32 // output_tiles_per_cta
@@ -66,7 +68,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
         module, tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["kk"], label_filter="mm",
     )
-    module = unroll_loop(module, unroll_factor=3, label_filter="k")
+    module = unroll_loop(module, unroll_factor=input_stages, label_filter="k")
     module = lower_to_async(module)
     module = fuse_async(module)
     for _ in range(4):
@@ -111,6 +113,16 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     two_tile_launcher = make_ptx_launcher(two_tile_kernel)
     make_torch_custom_call(
         two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    )
+
+    k2_two_tile_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            input_stages=2, output_tiles_per_cta=2
+        )
+    )
+    k2_two_tile_launcher = make_ptx_launcher(k2_two_tile_kernel)
+    make_torch_custom_call(
+        k2_two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     )
 
 
