@@ -143,12 +143,12 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     raise NotImplementedError(f"_barrier_covers: unhandled barrier {barrier!r}")
 
 
-# The dataflow state: outstanding concurrent memory effects per root buffer, each
-# a (kind, root_buffer, scope, region) tuple. ``region`` is the lock of the open
-# async completion region the effect belongs to (its ``await`` will close it), or
-# ``None`` for synchronous effects.
+# The dataflow state: outstanding concurrent memory effects per root buffer (the
+# dict key), each a (kind, scope, region) tuple. ``region`` is the lock of the
+# open async completion region the effect belongs to (its ``await`` will close
+# it), or ``None`` for synchronous effects.
 ConcurrentMemoryEffectsType = dict[
-    object, set[tuple[str, object, "CollectiveScope", object]]
+    object, set[tuple[str, "CollectiveScope", object]]
 ]
 
 # The analysis result: each effect-bearing op mapped to the barrier it needs
@@ -226,8 +226,8 @@ def _analyze(
         scope = _await_collective_scope(op.lock)
         for buf in live:
             live[buf] = {
-                (k, b, s, None) if region == op.lock else (k, b, s, region)
-                for (k, b, s, region) in live[buf]
+                (k, s, None) if region == op.lock else (k, s, region)
+                for (k, s, region) in live[buf]
                 if not (region == op.lock and _leq_collective_scope(s, scope))
             }
         return live
@@ -240,7 +240,7 @@ def _analyze(
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
     for kind_y, buf, scope_y in effects:
-        for kind_x, _buf_x, scope_x, _region_x in live.get(buf, ()):
+        for kind_x, scope_x, _region_x in live.get(buf, ()):
             # A hazard needs a write (RAR is safe).
             if kind_x == "W" or kind_y == "W":
                 barrier_scope = _join_barrier_scope(
@@ -251,14 +251,14 @@ def _analyze(
     # survive — only their await completes them.
     for buf in live:
         live[buf] = {
-            (k, b, s, region) for (k, b, s, region) in live[buf]
+            (k, s, region) for (k, s, region) in live[buf]
             if region is not None or not _barrier_covers(barrier_scope, s)
         }
     # The async's effects join a completion region keyed by its lock; every other
     # effect-bearing op is synchronous (region = None).
     region = op.lock if isinstance(op, AsyncOp) else None
     for (k, b, s) in effects:
-        live.setdefault(b, set()).add((k, b, s, region))
+        live.setdefault(b, set()).add((k, s, region))
     return live
 
 
