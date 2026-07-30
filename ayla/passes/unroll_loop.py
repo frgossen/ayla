@@ -57,6 +57,7 @@ class UnrollLoop(LoweringPass):
 
         new_iv = Value(name=op.iv.name, type=IndexType())
         main_body_ops: list[Op] = []
+        #TODO remove 0-case by adjusting the PTX loop lowering to canonicalize the case
         num_main_copies = self.unroll_factor if main_trip_count else 0
         for i in range(num_main_copies):
             iteration_iv = new_iv
