@@ -6,9 +6,11 @@ from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
+from ..passes.lower_to_tma_move import lower_to_tma_move
 from ..passes.pipeline_loop import pipeline_loop
 from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
+from ..passes.stage_store import stage_store
 from ..passes.tile_matmul import tile_matmul
 from ..passes.unroll_loop import unroll_loop
 from ..ptx_codegen import make_ptx_kernel
@@ -18,14 +20,21 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     *, input_stages: int = 3, output_tiles_per_cta: int = 1,
+    output_buffers: int = 1,
 ):
     if input_stages not in (2, 3):
         raise ValueError("input_stages must be 2 or 3")
     if output_tiles_per_cta not in (1, 2):
         raise ValueError("output_tiles_per_cta must be 1 or 2")
+    if output_buffers not in (1, 2):
+        raise ValueError("output_buffers must be 1 or 2")
+    if output_buffers > output_tiles_per_cta:
+        raise ValueError("output_buffers cannot exceed output_tiles_per_cta")
     name = f"auto_matmul_4096_wgmma256_wg_tma_store_k{input_stages}"
     if output_tiles_per_cta == 2:
         name += "_2tiles"
+    if output_buffers == 2:
+        name += "_2arenas"
     grid_x = 32 // output_tiles_per_cta
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
@@ -52,7 +61,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     )
     module = promote_buffers(
         module, target_type="wrmem", operands=["dst"], swizzle=None,
-        layout="wgmma_layout_0", warps=4, tma=True, nc=False,
+        layout="wgmma_layout_0", warps=4, tma=output_buffers == 1, nc=False,
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(
@@ -92,6 +101,13 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
         module = unroll_loop(
             module, unroll_factor=2, label_filter="outm"
         )
+    if output_buffers > 1:
+        module = stage_store(
+            module, label_filter=r"mm_dst_wrmem_iter\d+",
+            num_buffers=output_buffers,
+        )
+        module = lower_to_async(module)
+        module = lower_to_tma_move(module)
     module = schedule_async(module)
     return canonicalize(module)
 
@@ -123,6 +139,16 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     k2_two_tile_launcher = make_ptx_launcher(k2_two_tile_kernel)
     make_torch_custom_call(
         k2_two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    )
+
+    k2_two_arena_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            input_stages=2, output_tiles_per_cta=2, output_buffers=2,
+        )
+    )
+    k2_two_arena_launcher = make_ptx_launcher(k2_two_arena_kernel)
+    make_torch_custom_call(
+        k2_two_arena_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     )
 
 

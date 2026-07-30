@@ -50,6 +50,26 @@ def test_k2_one_arena_static_smem_layout():
     assert kernel.ptx.count("[16384];") == 2
 
 
+def test_k2_two_arena_ptx_layout_and_overlap():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        input_stages=2, output_tiles_per_cta=2, output_buffers=2,
+    ))
+    lines = kernel.ptx.splitlines()
+    stores = [i for i, line in enumerate(lines)
+              if "cp.async.bulk.tensor.2d.global.shared" in line]
+    waits = [i for i, line in enumerate(lines)
+             if "cp.async.bulk.wait_group 0" in line]
+    assert kernel.ptx.count("[65536];") == 2
+    assert kernel.ptx.count("[32768];") == 2
+    assert kernel.ptx.count("[16384];") == 2
+    assert len(stores) == len(waits) == 2
+    assert stores[1] < waits[0]
+    assert any(
+        "wgmma.mma_async" in line
+        for line in lines[stores[0]:stores[1]]
+    )
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -78,6 +98,11 @@ def test_k2_one_arena_static_smem_layout():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles_2arenas,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_2tiles_2arenas",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],
