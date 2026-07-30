@@ -44,7 +44,7 @@ def test_war_on_shared_buffer_gets_barrier():
               %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc()
-              barrier() attrs={scope: "block_leader"}
+              barrier() attrs={id: 1, scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -265,12 +265,12 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 1, scope: "block_leader"}
             async(%10: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 2, scope: "block_leader"}
             async(%7: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 3, scope: "block_leader"}
             async(%4: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 4, scope: "block_leader"}
             async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
     )
