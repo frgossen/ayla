@@ -157,6 +157,12 @@ class BarrierTarget:
 # The analysis result: each effect-bearing op mapped to the barrier before it.
 BarrierTargetsType = dict["Op", "BarrierTarget"]
 
+
+# PTX exposes 16 barrier resources per CTA. ID 0 is reserved for the full-block
+# ``bar.sync 0`` emitted by the lowering, leaving IDs 1..15 for named barriers.
+_MAX_BARRIER_IDS = 16
+
+
 def _async_collective_scope(lock: Value) -> CollectiveScope:
     """The collective scope an async op on ``lock`` synchronizes when awaited."""
     kind = lock.type.kind
@@ -247,6 +253,12 @@ def _analyze(
         named_id = (
             recorded.named_id if recorded is not None and recorded.named_id is not None
             else max(live.named_barrier_ids, default=0) + 1
+        )
+        # TODO: Reuse IDs once the analysis tracks when each named barrier is no
+        # longer live; until then, fail instead of emitting an invalid PTX ID.
+        assert named_id < _MAX_BARRIER_IDS, (
+            "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
+            "reserved for full-block barriers"
         )
         live.named_barrier_ids = live.named_barrier_ids | {named_id}
     elif barrier_scope == BarrierScope.BLOCK:
