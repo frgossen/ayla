@@ -432,15 +432,15 @@ class LowerToPtxTemplate(LoweringPass):
         body_ops = op.body.entry_block.ops
         if body_ops and all(isinstance(o, TmaMoveOp) for o in body_ops):
             kind = op.lock.type.kind
-            lock_value = self.value_map[op.lock]
             if kind == "mbar":  # one or more gmem→smem loads sharing the mbar
+                lock_value = self.value_map[op.lock]
                 return self._lower_async_tma_loads(op, body_ops, lock_value)
             if kind == "bulk":  # smem→gmem store (single)
                 assert len(body_ops) == 1, (
                     f"lower_async: bulk TMA store group must be a single move; "
                     f"got {len(body_ops)}"
                 )
-                return self._lower_async_tma_store(body_ops[0], lock_value)
+                return self._lower_async_tma_store(body_ops[0])
             raise NotImplementedError(
                 f"lower_async: tma_move with lock kind {kind!r}"
             )
@@ -622,8 +622,12 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_move_smem_to_wrmem_mma(op)
         if isinstance(dst_type, SmemTensorType) and isinstance(src_type, WrmemTensorType) and src_type.layout == "mma":
             return self._lower_move_wrmem_mma_to_smem(op)
-        if isinstance(dst_type, GmemTensorType) and isinstance(src_type, WrmemTensorType) and src_type.layout == "wgmma_layout_0":
-            return self._lower_move_wrmem_wgmma_to_gmem(op)
+        if (
+            isinstance(dst_type, (SmemTensorType, GmemTensorType))
+            and isinstance(src_type, WrmemTensorType)
+            and src_type.layout == "wgmma_layout_0"
+        ):
+            return self._lower_move_wrmem_wgmma_to_addrmem(op)
         raise NotImplementedError(
             f"lower_move: unsupported; got "
             f"{type(dst_type).__name__} <- {type(src_type).__name__}"
@@ -995,59 +999,75 @@ class LowerToPtxTemplate(LoweringPass):
 
 
 
-    def _lower_move_wrmem_wgmma_to_gmem(
+    def _lower_move_wrmem_wgmma_to_addrmem(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
-        """Lower wgmma_layout_0 wrmem → gmem store (direct scalar stores).
+        """Store a wgmma fragment to shared or global address memory.
 
-        Emits index ops for the per-thread dynamic offset, then a
-        ByteoffTileOp to compute the base address, then a PTX template
-        for the static per-register stores.
+        The register layout and static element offsets are identical for both
+        destinations; only the address width and PTX memory space differ. The
+        destination is the writer warp group's own tile, so its shape matches
+        the fragment -- the block-wide SMEM staging tile is tiled by warp-group
+        id upstream (see promote_buffers._build_tma_writeback), so the row offset
+        is already folded into the destination pointer.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
-        gmem_type = op.dst.type
+        dst_type = op.dst.type
         wrmem_type = op.src.type
-        assert isinstance(gmem_type, GmemTensorType)
+        assert isinstance(dst_type, (GmemTensorType, SmemTensorType))
         assert isinstance(wrmem_type, WrmemTensorType)
         assert wrmem_type.layout == "wgmma_layout_0"
-        assert wrmem_type.rank == 2 and gmem_type.rank == 2
+        assert wrmem_type.rank == 2 and dst_type.rank == 2
         assert isinstance(wrmem_type.dtype, (BF16Type, F16Type)), (
-            f"_lower_move_wrmem_wgmma_to_gmem: expected bf16/f16; "
+            f"wgmma store: expected bf16/f16; "
             f"got {wrmem_type.dtype}. Use convert first for f32 accumulators."
         )
-        assert gmem_type.dtype == wrmem_type.dtype, (
-            f"_lower_move_wrmem_wgmma_to_gmem: dtype mismatch; "
-            f"gmem {gmem_type.dtype} vs wrmem {wrmem_type.dtype}"
+        assert dst_type.dtype == wrmem_type.dtype, (
+            f"wgmma store: dtype mismatch; "
+            f"destination {dst_type.dtype} vs wrmem {wrmem_type.dtype}"
         )
 
         m_dim, n_dim = wrmem_type.sizes
+        assert list(dst_type.sizes) == [m_dim, n_dim], (
+            f"wgmma store: destination shape {list(dst_type.sizes)} must match "
+            f"the fragment {[m_dim, n_dim]}"
+        )
         assert m_dim % 64 == 0, (
-            f"_lower_move_wrmem_wgmma_to_gmem: m must be a multiple of 64; got {m_dim}"
+            f"wgmma store: m must be a multiple of 64; got {m_dim}"
         )
         assert n_dim % 16 == 0 and 8 <= n_dim <= 256, (
-            f"_lower_move_wrmem_wgmma_to_gmem: n must be a multiple of 16 in [8, 256]; got {n_dim}"
+            f"wgmma store: n must be a multiple of 16 in [8, 256]; got {n_dim}"
         )
-        dtype_bytes = gmem_type.dtype.byte_size
-        row_stride_bytes = gmem_type.strides[0] * dtype_bytes
+        dtype_bytes = dst_type.dtype.byte_size
+        row_stride_bytes = dst_type.strides[0] * dtype_bytes
 
-        # Emit index ops for the per-thread dynamic byte offset.
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes, dtype_bytes,
         )
+        if isinstance(dst_type, GmemTensorType):
+            template = textwrap.dedent(r"""
+                cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
+                add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
+            """)
+            address = "${b64:base}"
+            instruction = "st.global.b32"
+        else:
+            template = (
+                "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
+                "${b32:operand.offset.val};\n"
+            )
+            address = "${b32:base}"
+            instruction = "st.shared.b32"
 
-        # Compute base address and emit static per-register stores.
-        template = textwrap.dedent(r"""
-            cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
-            add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
-        """)
         num_registers = wrmem_type.num_elements_per_thread // 2
         for reg in range(num_registers):
             di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
             offset = di * row_stride_bytes + dj * dtype_bytes
-            template += textwrap.dedent(f"""\
-                st.global.b32 [${{b64:base}}+{offset}], ${{b32:operand.src.r{reg}}};
-            """)
+            template += (
+                f"{instruction} [{address}+{offset}], "
+                f"${{b32:operand.src.r{reg}}};\n"
+            )
 
         new_op = PTXTemplateOp.build(
             operands=[dst_value, src_value, byte_offset],
@@ -1176,7 +1196,7 @@ class LowerToPtxTemplate(LoweringPass):
         return [new_op], []
 
     def _lower_async_tma_store(
-        self, op: TmaMoveOp, lock_value: Value,
+        self, op: TmaMoveOp,
     ) -> tuple[list[Op], list[object]]:
         """Lower smem → gmem TMA bulk store (block-collective).
 
@@ -1187,8 +1207,10 @@ class LowerToPtxTemplate(LoweringPass):
         src_value = self.value_map[op.src]
         idx_values = [self.value_map[v] for v in op.indices]
 
-        operands = [dst_value, src_value, lock_value] + idx_values
-        operand_names = ["dst", "src", "lock"] + [f"idx{i}" for i in range(len(idx_values))]
+        # Bulk groups have no addressable lock object; completion is tracked by
+        # commit_group/wait_group.
+        operands = [dst_value, src_value] + idx_values
+        operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
         indices = ", ".join(
             f"${{b32:operand.idx{i}.val}}"
             for i in reversed(range(len(idx_values)))
