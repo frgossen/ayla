@@ -1,6 +1,7 @@
 """Insert cross-thread synchronization barriers on shared-buffer hazards."""
 from __future__ import annotations
 
+import dataclasses
 import enum
 
 from ..gpu_dialect import (
@@ -143,13 +144,36 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     raise NotImplementedError(f"_barrier_covers: unhandled barrier {barrier!r}")
 
 
-# The dataflow state: outstanding concurrent memory effects per root buffer (the
-# dict key), each a (kind, scope, region) tuple. ``region`` is the lock of the
-# open async completion region the effect belongs to (its ``await`` will close
-# it), or ``None`` for synchronous effects.
-ConcurrentMemoryEffectsType = dict[
-    object, set[tuple[str, "CollectiveScope", object]]
-]
+@dataclasses.dataclass(frozen=True)
+class ConcurrentMemoryEffect:
+    """One outstanding concurrent memory effect on a buffer: an "R"/"W" ``kind``
+    at collective ``scope``, with a ``pending_await`` on the lock that settles it
+    (``None`` if synchronous)."""
+    kind: str
+    scope: CollectiveScope
+    pending_await: Value | None
+
+
+@dataclasses.dataclass
+class DataflowState:
+    """The forward analysis state: outstanding concurrent memory effects, keyed
+    by root buffer."""
+    concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
+        dataclasses.field(default_factory=dict)
+    )
+
+    def clone(self) -> DataflowState:
+        """A copy with fresh effect sets, safe for in-place per-op mutation."""
+        return self.join(DataflowState())  # union with empty -> fresh sets
+
+    def join(self, other: DataflowState) -> DataflowState:
+        """The dataflow join: the per-buffer union of concurrent effects."""
+        a, b = self.concurrent_memory_effects, other.concurrent_memory_effects
+        return DataflowState({
+            buf: a.get(buf, set()) | b.get(buf, set())
+            for buf in a.keys() | b.keys()
+        })
+
 
 # The analysis result: each effect-bearing op mapped to the barrier it needs
 # before it (THREAD if none).
@@ -169,36 +193,25 @@ def _await_collective_scope(lock: Value) -> CollectiveScope:
     raise NotImplementedError(f"_await_collective_scope: unmodeled lock kind {kind!r}")
 
 
-def _join(
-    a: ConcurrentMemoryEffectsType, b: ConcurrentMemoryEffectsType,
-) -> ConcurrentMemoryEffectsType:
-    """The join of this (standard forward) dataflow analysis: the per-buffer
-    union of the concurrent-effect-map state."""
-    return {
-        buf: a.get(buf, set()) | b.get(buf, set())
-        for buf in a.keys() | b.keys()
-    }
-
-
 def _analyze_block(
-    ops: list[Op], live_in: ConcurrentMemoryEffectsType, targets: BarrierTargetsType,
-) -> ConcurrentMemoryEffectsType:
-    live = _join(live_in, {})
+    ops: list[Op], live_in: DataflowState, targets: BarrierTargetsType,
+) -> DataflowState:
+    live = live_in.clone()
     for op in ops:
         live = _analyze(op, live, targets)
     return live
 
 
 def _analyze(
-    op: Op, live: ConcurrentMemoryEffectsType, targets: BarrierTargetsType,
-) -> ConcurrentMemoryEffectsType:
+    op: Op, live: DataflowState, targets: BarrierTargetsType,
+) -> DataflowState:
     """Transfer the concurrent-effect map across one ``op``, recording the barrier
     it needs in ``targets``; return the live-out. Container ops recurse into their
     body; a ``for`` is iterated to a fixpoint over its header."""
     if isinstance(op, (ModuleOp, KernelOp)):
         # A module/kernel body is a fresh scope -- no live effects flow in, and
         # its internal effects don't escape to the enclosing scope.
-        _analyze_block(list(op.body.entry_block.ops), {}, targets)
+        _analyze_block(list(op.body.entry_block.ops), DataflowState(), targets)
         return live
     if isinstance(op, ForOp):
         # Analyze the body to a fixpoint over its header (the loop-carried state
@@ -206,7 +219,7 @@ def _analyze(
         header = live
         while True:
             live_out = _analyze_block(op.body.entry_block.ops, header, targets)
-            joined = _join(header, live_out)  # fold the back edge
+            joined = header.join(live_out)  # fold the back edge
             if joined == header:
                 return live_out
             header = joined
@@ -224,11 +237,13 @@ def _analyze(
         # Close the async's region: clear the effects up to the await's collective
         # scope, settle (drop the region tag from) the rest.
         scope = _await_collective_scope(op.lock)
-        for buf in live:
-            live[buf] = {
-                (k, s, None) if region == op.lock else (k, s, region)
-                for (k, s, region) in live[buf]
-                if not (region == op.lock and _leq_collective_scope(s, scope))
+        for buf, effs in live.concurrent_memory_effects.items():
+            live.concurrent_memory_effects[buf] = {
+                dataclasses.replace(e, pending_await=None)
+                if e.pending_await == op.lock else e
+                for e in effs
+                if not (e.pending_await == op.lock
+                        and _leq_collective_scope(e.scope, scope))
             }
         return live
     effects = memory_effects(op)
@@ -240,25 +255,27 @@ def _analyze(
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
     for kind_y, buf, scope_y in effects:
-        for kind_x, scope_x, _region_x in live.get(buf, ()):
+        for e in live.concurrent_memory_effects.get(buf, ()):
             # A hazard needs a write (RAR is safe).
-            if kind_x == "W" or kind_y == "W":
+            if e.kind == "W" or kind_y == "W":
                 barrier_scope = _join_barrier_scope(
-                    barrier_scope, _barrier_scope(scope_x, scope_y)
+                    barrier_scope, _barrier_scope(e.scope, scope_y)
                 )
     targets[op] = barrier_scope
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.
-    for buf in live:
-        live[buf] = {
-            (k, s, region) for (k, s, region) in live[buf]
-            if region is not None or not _barrier_covers(barrier_scope, s)
+    for buf, effs in live.concurrent_memory_effects.items():
+        live.concurrent_memory_effects[buf] = {
+            e for e in effs
+            if e.pending_await is not None
+            or not _barrier_covers(barrier_scope, e.scope)
         }
-    # The async's effects join a completion region keyed by its lock; every other
-    # effect-bearing op is synchronous (region = None).
-    region = op.lock if isinstance(op, AsyncOp) else None
+    # An async op's effects stay pending on its lock (settled by the matching
+    # await); every other effect-bearing op is synchronous (pending_await = None).
+    pending_await = op.lock if isinstance(op, AsyncOp) else None
     for (k, b, s) in effects:
-        live.setdefault(b, set()).add((k, s, region))
+        effect = ConcurrentMemoryEffect(k, s, pending_await)
+        live.concurrent_memory_effects.setdefault(b, set()).add(effect)
     return live
 
 
@@ -289,7 +306,7 @@ class InsertSyncs(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
         targets: BarrierTargetsType = {}
-        _analyze(module, {}, targets)  # analysis: where do barriers go
+        _analyze(module, DataflowState(), targets)  # analysis: where do barriers go
         _insert_barriers(module.body.entry_block, targets)  # transform: insert them
         return module
 
