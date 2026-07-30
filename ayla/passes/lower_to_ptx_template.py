@@ -1231,6 +1231,7 @@ class LowerToPtxTemplate(LoweringPass):
             cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
+            bar.sync 0;
         """)
 
         new_op = PTXTemplateOp.build(
