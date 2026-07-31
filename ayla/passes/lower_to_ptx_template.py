@@ -1042,10 +1042,10 @@ class LowerToPtxTemplate(LoweringPass):
         dtype_bytes = dst_type.dtype.byte_size
         row_stride_bytes = dst_type.strides[0] * dtype_bytes
 
-        new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
-            row_stride_bytes, dtype_bytes,
-        )
         if isinstance(dst_type, GmemTensorType):
+            new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
+                row_stride_bytes, dtype_bytes,
+            )
             template = textwrap.dedent(r"""
                 cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
                 add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
@@ -1053,26 +1053,53 @@ class LowerToPtxTemplate(LoweringPass):
             address = "${b64:base}"
             instruction = "st.global.b32"
         else:
-            template = (
-                "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
-                "${b32:operand.offset.val};\n"
-            )
-            address = "${b32:base}"
-            instruction = "st.shared.b32"
+            # A group of four packed WGMMA accumulator registers is exactly
+            # the lane layout consumed by stmatrix.m8n8.x4.  Each group stores
+            # one 16x16 output tile without scalar shared-memory bank conflicts.
+            new_ops = []
+            byte_offset = None
+            template = textwrap.dedent(f"""\
+                mov.u32 ${{b32:st_lane}}, %laneid;
+                mov.u32 ${{b32:st_tid}}, %tid.x;
+                rem.u32 ${{b32:st_tid}}, ${{b32:st_tid}}, 128;
+                shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
+                and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 15;
+                mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
+                shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 4;
+                shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
+                mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, {dst_type.strides[0]}, ${{b32:st_col}};
+                shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
+                add.u32 ${{b32:base}}, ${{b32:operand.dst.ptr}}, ${{b32:st_off}};
+            """)
 
         num_registers = wrmem_type.num_elements_per_thread // 2
-        for reg in range(num_registers):
+        register_step = 1 if isinstance(dst_type, GmemTensorType) else 4
+        for reg in range(0, num_registers, register_step):
             di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
             offset = di * row_stride_bytes + dj * dtype_bytes
-            template += (
-                f"{instruction} [{address}+{offset}], "
-                f"${{b32:operand.src.r{reg}}};\n"
-            )
+            if isinstance(dst_type, GmemTensorType):
+                template += (
+                    f"{instruction} [{address}+{offset}], "
+                    f"${{b32:operand.src.r{reg}}};\n"
+                )
+            else:
+                regs = ", ".join(
+                    f"${{b32:operand.src.r{i}}}" for i in range(reg, reg + 4)
+                )
+                template += (
+                    "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
+                    f"[${{b32:base}}+{offset}], {{{regs}}};\n"
+                )
 
+        operands = [dst_value, src_value]
+        operand_names = ["dst", "src"]
+        if byte_offset is not None:
+            operands.append(byte_offset)
+            operand_names.append("offset")
         new_op = PTXTemplateOp.build(
-            operands=[dst_value, src_value, byte_offset],
+            operands=operands,
             result_types=[], template=template,
-            operand_names=["dst", "src", "offset"], result_names=[],
+            operand_names=operand_names, result_names=[],
             description=str(op),
         )
         new_ops.append(new_op)

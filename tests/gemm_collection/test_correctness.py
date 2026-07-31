@@ -26,7 +26,7 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
               if "cp.async.bulk.tensor.2d.global.shared" in line]
     waits = [i for i, line in enumerate(lines)
              if "cp.async.bulk.wait_group 0" in line]
-    gathers = [i for i, line in enumerate(lines) if "st.shared.b32" in line]
+    gathers = [i for i, line in enumerate(lines) if "stmatrix." in line]
     second_tile_mmas = [
         i for i, line in enumerate(lines)
         if "wgmma.mma_async" in line and stores[0] < i < waits[0]
@@ -43,7 +43,8 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
         "bar.sync 0" in line
         for line in lines[stores[0]:second_tile_mmas[0]]
     )
-    assert waits[0] < gathers[64] < stores[1] < waits[1]
+    assert len(gathers) == 32
+    assert waits[0] < gathers[len(gathers) // 2] < stores[1] < waits[1]
 
 
 @requires_cuda
