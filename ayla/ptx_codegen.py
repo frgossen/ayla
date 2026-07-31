@@ -37,6 +37,7 @@ from .passes.folding import Folding
 from .passes.cse import CSE
 from .passes.dce import DCE
 from .passes.insert_syncs import InsertSyncs
+from .passes.infer_tma_multicast import InferTmaMulticast
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
@@ -48,6 +49,7 @@ class PtxLoweringPipeline(Pipeline):
 
     def __init__(self) -> None:
         super().__init__()
+        self.add_pass(InferTmaMulticast())
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Folding())
@@ -263,6 +265,7 @@ class PtxKernel:
     signature: list
     grid_dim: tuple[int, int, int]
     block_dim: tuple[int, int, int]
+    cluster_dim: tuple[int, int, int] = (1, 1, 1)
     shared_mem_bytes: int = 0
 
 
@@ -282,6 +285,11 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     block_dim = tuple(d if d is not None else 1 for d in kernel.block_dim)
     if kernel.num_warp_groups is not None and kernel.num_warp_groups > 0:
         block_dim = (kernel.num_warp_groups * 128, block_dim[1], block_dim[2])
+    cluster_dim = kernel.cluster_dim
+    if any(g % c != 0 for g, c in zip(grid_dim, cluster_dim)):
+        raise ValueError(
+            f"grid_dim {grid_dim} must be divisible by cluster_dim {cluster_dim}"
+        )
     p = PtxPrinter()
     _emit_op(p, module)
     return PtxKernel(
@@ -290,6 +298,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         signature=kernel.signature,
         grid_dim=grid_dim,
         block_dim=block_dim,
+        cluster_dim=cluster_dim,
     )
 
 

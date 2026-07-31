@@ -46,6 +46,31 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     assert waits[0] < gathers[64] < stores[1] < waits[1]
 
 
+@pytest.mark.parametrize(
+    "cluster_shape", [(2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8)]
+)
+def test_cluster_multicasts_one_tma_operand(cluster_shape):
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        output_tiles_per_cta=2,
+        cluster_shape=cluster_shape,
+    ))
+    ptx = kernel.ptx
+    cluster_size = cluster_shape[0] * cluster_shape[1]
+
+    assert kernel.cluster_dim == (*cluster_shape, 1)
+    assert ptx.count("barrier.cluster.arrive;") == 1
+    assert ptx.count("barrier.cluster.wait;") == 1
+    # InsertSyncs derives these from actual shared-buffer WAR hazards.  In
+    # particular, the tail load aliases a previously-read staging allocation
+    # even though it is the tail lock's first use, so it correctly synchronizes.
+    assert ptx.count("mapa.shared::cluster.u32") == 11
+    assert "mbarrier.try_wait.parity.acquire.cluster" in ptx
+    assert ptx.count(
+        "mbarrier::complete_tx::bytes.multicast::cluster"
+    ) == 14
+    assert f"], {(1 << cluster_size) - 1};" in ptx
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -69,6 +94,11 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_cluster1x2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_cluster1x2",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],

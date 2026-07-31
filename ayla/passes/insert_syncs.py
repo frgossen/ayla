@@ -5,18 +5,21 @@ import dataclasses
 import enum
 
 from ..gpu_dialect import (
+    AllocOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
     CollectiveScope,
     ForOp,
     KernelOp,
+    LockType,
     ModuleOp,
     PTXTemplateOp,
     is_side_effect_free,
     memory_effects,
+    multicast_count_for_lock,
 )
-from ..base.ir import Block, Op, Value
+from ..base.ir import Block, Op, Value, find_ops
 from ..base.pipeline import Pass
 
 
@@ -248,7 +251,10 @@ def _analyze(
     # op's recorded one keeps it stable across fixpoint revisits). A full block
     # sync frees every named-barrier id.
     named_id = None
-    if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
+    if (
+        barrier_scope == BarrierScope.BLOCK_TO_LEADER
+        and _multicast_count(op) is None
+    ):
         recorded = targets.get(op)
         named_id = (
             recorded.named_id if recorded is not None and recorded.named_id is not None
@@ -293,6 +299,48 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
 }
 
 
+def _multicast_count(op: Op) -> int | None:
+    if not isinstance(op, AsyncOp):
+        return None
+    return multicast_count_for_lock(op.lock)
+
+
+def _insert_cluster_init_barriers(block: Block) -> None:
+    """Rendezvous after multicast barrier initialization, coalescing allocs.
+
+    A remote mbarrier cannot be addressed until its initializing CTA has
+    published it to the cluster.  Accumulate multicast-lock allocs in program
+    order and insert one cluster barrier immediately before the first use of
+    any pending lock.  Thus LICM-hoisted stage locks share one rendezvous, while
+    a lock allocated inside a loop remains correctly synchronized there.
+    """
+    pending: set[Value] = set()
+    new_ops: list[Op] = []
+    for op in block.ops:
+        if (
+            isinstance(op, AllocOp)
+            and isinstance(op.result().type, LockType)
+            and multicast_count_for_lock(op.result()) is not None
+        ):
+            pending.add(op.result())
+
+        uses_pending = pending and any(
+            isinstance(inner, AsyncOp)
+            and inner.lock in pending
+            and _multicast_count(inner) is not None
+            for inner in find_ops(op, lambda x: isinstance(x, AsyncOp))
+        )
+        if uses_pending:
+            new_ops.append(BarrierOp.build(scope="cluster"))
+            pending.clear()
+
+        new_ops.append(op)
+        for region in op.regions:
+            for inner_block in region.blocks:
+                _insert_cluster_init_barriers(inner_block)
+    block.ops = new_ops
+
+
 def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
@@ -304,9 +352,18 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
                     f"no lowering for barrier {target.scope.name}"
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
-            new_ops.append(
-                BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
-            )
+            scope = _BARRIER_OP_SCOPE[target.scope]
+            if scope == "block_leader" and _multicast_count(op) is not None:
+                # A multicast write lands in every participating CTA, so its
+                # buffer-reuse WAR spans the cluster: the leader must wait for
+                # all CTAs to release the buffer. Emit a leader handshake on the
+                # async's lock in place of the block-local named barrier.
+                assert isinstance(op, AsyncOp)
+                new_ops.append(
+                    BarrierOp.build(scope="cluster_leader", lock=op.lock)
+                )
+            else:
+                new_ops.append(BarrierOp.build(scope=scope, attrs=attrs))
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:
@@ -319,6 +376,7 @@ class InsertSyncs(Pass):
     def run(self, module: ModuleOp) -> ModuleOp:
         targets: BarrierTargetsType = {}
         _analyze(module, DataflowState(), targets)  # analysis: where do barriers go
+        _insert_cluster_init_barriers(module.body.entry_block)
         _insert_barriers(module.body.entry_block, targets)  # transform: insert them
         return module
 

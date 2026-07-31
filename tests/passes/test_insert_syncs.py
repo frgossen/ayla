@@ -6,6 +6,35 @@ from ayla.passes.insert_syncs import insert_syncs
 from ayla.testing import assert_contains_in_order
 
 
+def test_multicast_reuse_gets_pass_derived_cluster_barriers():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<64x64xbf16>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %smem: smem_tensor<64x64xbf16> = alloc()
+            %acc: wrmem_tensor<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc()
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) move(%smem: smem_tensor<64x64xbf16>, %a: gmem_tensor<64x64xbf16>) attrs={multicast_count: 2, tma: True}
+            await(%lock: lock<mbar>)
+            matmul(%smem: smem_tensor<64x64xbf16>, %smem: smem_tensor<64x64xbf16>, %acc: wrmem_tensor<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            async(%lock: lock<mbar>) move(%smem: smem_tensor<64x64xbf16>, %a: gmem_tensor<64x64xbf16>) attrs={multicast_count: 2, tma: True}
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+    insert_syncs(module)
+    text = repr(module)
+
+    assert text.count('scope: "cluster"') == 1
+    assert text.count('scope: "cluster_leader"') == 1
+    assert_contains_in_order(
+        text,
+        'barrier() attrs={scope: "cluster"}',
+        'async(%lock: lock<mbar>) move(%smem: smem_tensor<64x64xbf16>, %a: gmem_tensor<64x64xbf16>) attrs={multicast_count: 2, tma: True}',
+        'matmul(%smem: smem_tensor<64x64xbf16>, %smem: smem_tensor<64x64xbf16>, %acc: wrmem_tensor<64x64xf32 warps=4 layout="wgmma_layout_0">)',
+        'barrier(%lock: lock<mbar>) attrs={scope: "cluster_leader"}',
+        'async(%lock: lock<mbar>) move(%smem: smem_tensor<64x64xbf16>, %a: gmem_tensor<64x64xbf16>) attrs={multicast_count: 2, tma: True}',
+    )
+
+
 def test_war_on_shared_buffer_gets_barrier():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

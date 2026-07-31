@@ -64,7 +64,7 @@ def test_kernel_op():
     second_block = Block(ops=[Op(operands=[], results=[])])
     body = Region(blocks=[entry_block, second_block])
     kernel = KernelOp.build(
-        "cwise_add", body, attrs={"version": 1},
+        "cwise_add", body, cluster_dim=(2, 1, 1), attrs={"version": 1},
     )
     module = ModuleOp.build(
         Region(blocks=[Block(ops=[kernel])]),
@@ -73,7 +73,7 @@ def test_kernel_op():
 
     expected = textwrap.dedent("""\
         module attrs={target: "sm_80"} {
-          kernel @cwise_add(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) attrs={version: 1} {
+          kernel @cwise_add(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) cluster_dim=[2, 1, 1] attrs={version: 1} {
             %0: gmem_tensor<1048576xf32> = ptx_template(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) attrs={template: "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\\n"}
           ^bb0:
             generic()

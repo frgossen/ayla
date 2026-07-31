@@ -18,16 +18,32 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     *, output_tiles_per_cta: int = 1,
+    cluster_shape: tuple[int, int] = (1, 1),
 ):
     if output_tiles_per_cta not in (1, 2):
         raise ValueError("output_tiles_per_cta must be 1 or 2")
+    cluster_x, cluster_y = cluster_shape
+    if cluster_x not in (1, 2, 4, 8) or cluster_y not in (1, 2, 4, 8):
+        raise ValueError("cluster dimensions must be 1, 2, 4, or 8")
+    if cluster_x > 1 and cluster_y > 1:
+        raise ValueError("only one cluster dimension may exceed 1")
+    cluster_size = cluster_x * cluster_y
     name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
     if output_tiles_per_cta == 2:
         name += "_2tiles"
+    if cluster_size > 1:
+        name += (
+            f"_cluster{cluster_x}"
+            if cluster_y == 1 else f"_cluster{cluster_x}x{cluster_y}"
+        )
     grid_x = 32 // output_tiles_per_cta
+    cluster_attr = (
+        f" cluster_dim=[{cluster_x}, {cluster_y}, 1]"
+        if cluster_size > 1 else ""
+    )
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] block_dim=[128, 1, 1] {{
+          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] block_dim=[128, 1, 1]{cluster_attr} {{
             matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
@@ -111,6 +127,19 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     two_tile_launcher = make_ptx_launcher(two_tile_kernel)
     make_torch_custom_call(
         two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    )
+
+    # Of the two size-2 orientations, (1, 2) is faster for this tile shape.
+    # Shape legality and multicast selection remain generic in the IR pass.
+    cluster_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            output_tiles_per_cta=2, cluster_shape=(1, 2),
+        )
+    )
+    cluster_launcher = make_ptx_launcher(cluster_kernel)
+    make_torch_custom_call(
+        cluster_launcher,
+        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
     )
 
 
