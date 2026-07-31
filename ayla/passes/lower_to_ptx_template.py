@@ -229,7 +229,7 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_bytes = smem_type.num_elements * smem_type.dtype.byte_size
+        n_bytes = smem_type.storage_num_elements * smem_type.dtype.byte_size
         template = textwrap.dedent(f"""\
             .shared .align 128 .b8 ${{smem:sym}}[{n_bytes}];
             mov.u32 ${{b32:result.dst.ptr}}, ${{smem:sym}};
@@ -1042,16 +1042,28 @@ class LowerToPtxTemplate(LoweringPass):
         dtype_bytes = dst_type.dtype.byte_size
         row_stride_bytes = dst_type.strides[0] * dtype_bytes
 
-        if isinstance(dst_type, GmemTensorType):
+        use_stmatrix = (
+            isinstance(dst_type, SmemTensorType)
+            and bool(op.attrs.get("stmatrix", True))
+        )
+        if not use_stmatrix:
             new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
                 row_stride_bytes, dtype_bytes,
             )
-            template = textwrap.dedent(r"""
-                cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
-                add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
-            """)
-            address = "${b64:base}"
-            instruction = "st.global.b32"
+            if isinstance(dst_type, GmemTensorType):
+                template = textwrap.dedent(r"""
+                    cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
+                    add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
+                """)
+                address = "${b64:base}"
+                instruction = "st.global.b32"
+            else:
+                template = (
+                    "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
+                    "${b32:operand.offset.val};\n"
+                )
+                address = "${b32:base}"
+                instruction = "st.shared.b32"
         else:
             # A group of four packed WGMMA accumulator registers is exactly
             # the lane layout consumed by stmatrix.m8n8.x4.  Each group stores
@@ -1073,11 +1085,19 @@ class LowerToPtxTemplate(LoweringPass):
             """)
 
         num_registers = wrmem_type.num_elements_per_thread // 2
-        register_step = 1 if isinstance(dst_type, GmemTensorType) else 4
+        register_step = 4 if use_stmatrix else 1
         for reg in range(0, num_registers, register_step):
             di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
-            offset = di * row_stride_bytes + dj * dtype_bytes
-            if isinstance(dst_type, GmemTensorType):
+            physical_dj = dj
+            inner = (
+                dst_type.tma_inner_size
+                if isinstance(dst_type, SmemTensorType) else None
+            )
+            if inner is not None:
+                padding = dst_type.tma_inner_padding
+                physical_dj = (dj // inner) * (inner + padding) + dj % inner
+            offset = di * row_stride_bytes + physical_dj * dtype_bytes
+            if not use_stmatrix:
                 template += (
                     f"{instruction} [{address}+{offset}], "
                     f"${{b32:operand.src.r{reg}}};\n"
@@ -1234,21 +1254,38 @@ class LowerToPtxTemplate(LoweringPass):
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
         idx_values = [self.value_map[v] for v in op.indices]
+        desc_type = dst_value.type
+        assert isinstance(desc_type, TmaDescType)
 
         # Bulk groups have no addressable lock object; completion is tracked by
         # commit_group/wait_group.
         operands = [dst_value, src_value] + idx_values
         operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
-        indices = ", ".join(
-            f"${{b32:operand.idx{i}.val}}"
-            for i in reversed(range(len(idx_values)))
-        )
+        index_setup = ""
+        tensor_rank = 2
+        if desc_type.tma_inner_size is None:
+            indices = ", ".join(
+                f"${{b32:operand.idx{i}.val}}"
+                for i in reversed(range(len(idx_values)))
+            )
+        else:
+            assert len(idx_values) == 2
+            inner = desc_type.tma_inner_size
+            index_setup = textwrap.dedent(f"""\
+                rem.u32 ${{b32:st_inner}}, ${{b32:operand.idx1.val}}, {inner};
+                div.u32 ${{b32:st_chunk}}, ${{b32:operand.idx1.val}}, {inner};
+            """)
+            indices = (
+                "${b32:st_inner}, ${b32:st_chunk}, "
+                "${b32:operand.idx0.val}"
+            )
+            tensor_rank = 3
 
         # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
         # The RAW (all threads finish writing the smem tile before t0 stores it) is
         # handled by insert_syncs, which emits a barrier before this async.
 
-        template = textwrap.dedent(f"""\
+        template = index_setup + textwrap.dedent(f"""\
             mov.u32 ${{b32:st_tid}}, %tid.x;
             mov.u32 ${{b32:st_tidy}}, %tid.y;
             or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidy}};
@@ -1257,7 +1294,7 @@ class LowerToPtxTemplate(LoweringPass):
             setp.ne.s32 ${{pred:st_not_t0}}, ${{b32:st_tid}}, 0;
             @${{pred:st_not_t0}} bra ${{label:st_done}};
             fence.proxy.async.shared::cta;
-            cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
+            cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
         """)

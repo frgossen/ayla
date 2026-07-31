@@ -902,6 +902,23 @@ class SmemTensorType(AddrMemTensorType):
     def swizzle(self) -> str | None:
         return self.attrs["swizzle"]
 
+    @property
+    def tma_inner_size(self) -> int | None:
+        value = self.attrs.get("tma_inner_size")
+        return int(value) if value is not None else None
+
+    @property
+    def tma_inner_padding(self) -> int:
+        return int(self.attrs.get("tma_inner_padding", 0))
+
+    @property
+    def storage_num_elements(self) -> int:
+        """Physical allocation size, including TMA-only row padding."""
+        if self.tma_inner_size is not None:
+            assert self.rank == 2
+            return self.sizes[0] * self.strides[0]
+        return self.num_elements
+
     def print(self, p: Printer) -> None:
         p.write(self.name)
         p.write("<")
@@ -1069,6 +1086,15 @@ class TmaDescType(Type):
     @property
     def tile_num_elements(self) -> int:
         return math.prod(self.tile_sizes)
+
+    @property
+    def tma_inner_size(self) -> int | None:
+        value = self.attrs.get("tma_inner_size")
+        return int(value) if value is not None else None
+
+    @property
+    def tma_inner_padding(self) -> int:
+        return int(self.attrs.get("tma_inner_padding", 0))
 
     @property
     def swizzle(self) -> str | None:

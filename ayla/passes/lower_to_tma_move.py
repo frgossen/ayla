@@ -90,6 +90,11 @@ class LowerToTmaMove(LoweringPass):
             gmem_type=root.type,
             tile_shape=list(smem.type.sizes),
             swizzle=smem.type.swizzle,
+            attrs={
+                key: smem.type.attrs[key]
+                for key in ("tma_inner_size", "tma_inner_padding")
+                if key in smem.type.attrs
+            },
         )
         desc_value = Value(
             name=f"{root.name}_desc" if root.name else None,

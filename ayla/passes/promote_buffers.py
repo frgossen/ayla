@@ -185,6 +185,10 @@ class PromoteBuffers(LoweringPass):
         block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
         Non-coherent cache hint for gmem→rmem loads.
+    tma_inner_size, tma_inner_padding : int or None
+        Optionally reshape the innermost dimension into fixed-size TMA blocks
+        and append shared-memory-only padding to every block.  This preserves
+        the logical tensor while changing its physical shared-memory layout.
     """
 
     def __init__(
@@ -198,6 +202,9 @@ class PromoteBuffers(LoweringPass):
         warps: int | None = None,
         tma: bool = False,
         nc: bool = False,
+        tma_inner_size: int | None = None,
+        tma_inner_padding: int = 0,
+        stmatrix: bool = True,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -210,6 +217,9 @@ class PromoteBuffers(LoweringPass):
         self.warps = warps
         self.tma = tma
         self.nc = nc
+        self.tma_inner_size = tma_inner_size
+        self.tma_inner_padding = tma_inner_padding
+        self.stmatrix = stmatrix
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_target_type(self, base_type, dtype=None):
@@ -331,8 +341,34 @@ class PromoteBuffers(LoweringPass):
             narrow_tiles.append(tile)
             block_dst = tile.arg
         assert isinstance(block_dst.type, GmemTensorType)
+        smem_sizes = list(block_dst.type.sizes)
+        smem_attrs: dict[str, object] = {}
+        smem_strides = None
+        if self.tma_inner_size is not None:
+            inner = self.tma_inner_size
+            if len(smem_sizes) != 2 or smem_sizes[-1] % inner != 0:
+                raise ValueError(
+                    "TMA inner blocking requires a rank-2 tile whose inner "
+                    "size is divisible by tma_inner_size"
+                )
+            if self.tma_inner_padding < 0:
+                raise ValueError("tma_inner_padding must be non-negative")
+            padded_inner = inner + self.tma_inner_padding
+            if padded_inner > 256:
+                raise ValueError("padded TMA inner box cannot exceed 256 elements")
+            if padded_inner * block_dst.type.dtype.byte_size % 16:
+                raise ValueError("padded TMA inner box must occupy a multiple of 16 bytes")
+            smem_strides = [
+                (smem_sizes[-1] // inner) * padded_inner,
+                1,
+            ]
+            smem_attrs = {
+                "tma_inner_size": inner,
+                "tma_inner_padding": self.tma_inner_padding,
+            }
         smem = AllocOp.build(SmemTensorType.build(
-            list(block_dst.type.sizes), block_dst.type.dtype, swizzle=None,
+            smem_sizes, block_dst.type.dtype, strides=smem_strides,
+            swizzle=None, attrs=smem_attrs,
         ))
         new_ops: list[Op] = [smem]
         gather_dst = smem.result()
@@ -341,7 +377,10 @@ class PromoteBuffers(LoweringPass):
             new_ops.extend(ops)
         gather = MoveOp.build(
             dst=gather_dst, src=src,
-            attrs={"label": f"{matmul_label}_dst_smem"},
+            attrs={
+                "label": f"{matmul_label}_dst_smem",
+                "stmatrix": self.stmatrix,
+            },
         )
         store = MoveOp.build(
             dst=block_dst, src=smem.result(),
@@ -421,6 +460,9 @@ def promote_buffers(
     warps: int | None = None,
     tma: bool = False,
     nc: bool = False,
+    tma_inner_size: int | None = None,
+    tma_inner_padding: int = 0,
+    stmatrix: bool = True,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -433,5 +475,8 @@ def promote_buffers(
         warps=warps,
         tma=tma,
         nc=nc,
+        tma_inner_size=tma_inner_size,
+        tma_inner_padding=tma_inner_padding,
+        stmatrix=stmatrix,
         label_filter=label_filter,
     ).run(module)
