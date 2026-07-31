@@ -187,6 +187,9 @@ class PromoteBuffers(LoweringPass):
         Non-coherent cache hint for gmem→rmem loads.
     physical_layout : dict or None
         Optional physical shared-memory layout used for output staging.
+    writeback_slices : int
+        Split a TMA output writeback into this many column slices, reusing one
+        smaller shared-memory staging arena for each store.
     """
 
     def __init__(
@@ -201,6 +204,7 @@ class PromoteBuffers(LoweringPass):
         tma: bool = False,
         nc: bool = False,
         physical_layout: dict[str, object] | None = None,
+        writeback_slices: int = 1,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -214,6 +218,9 @@ class PromoteBuffers(LoweringPass):
         self.tma = tma
         self.nc = nc
         self.physical_layout = physical_layout
+        self.writeback_slices = writeback_slices
+        if writeback_slices < 1:
+            raise ValueError("writeback_slices must be positive")
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_target_type(self, base_type, dtype=None):
@@ -336,6 +343,9 @@ class PromoteBuffers(LoweringPass):
             block_dst = tile.arg
         assert isinstance(block_dst.type, GmemTensorType)
         smem_sizes = list(block_dst.type.sizes)
+        if smem_sizes[-1] % self.writeback_slices:
+            raise ValueError("output columns must divide evenly into writeback_slices")
+        smem_sizes[-1] //= self.writeback_slices
         smem_attrs: dict[str, object] = {}
         smem_strides = None
         if self.physical_layout is not None:
@@ -367,19 +377,35 @@ class PromoteBuffers(LoweringPass):
             swizzle=None, attrs=smem_attrs,
         ))
         new_ops: list[Op] = [smem]
-        gather_dst = smem.result()
-        for tile in reversed(narrow_tiles):
-            ops, [gather_dst] = _apply_tile(tile, gather_dst)
-            new_ops.extend(ops)
-        gather = MoveOp.build(
-            dst=gather_dst, src=src,
-            attrs={"label": f"{matmul_label}_dst_smem"},
-        )
-        store = MoveOp.build(
-            dst=block_dst, src=smem.result(),
-            attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
-        )
-        new_ops.extend([gather, store])
+        slice_cols = smem_sizes[-1]
+        for slice_idx in range(self.writeback_slices):
+            gather_dst = smem.result()
+            for tile in reversed(narrow_tiles):
+                ops, [gather_dst] = _apply_tile(tile, gather_dst)
+                new_ops.extend(ops)
+            gather_attrs = {
+                "label": f"{matmul_label}_dst_smem",
+            }
+            if self.writeback_slices > 1:
+                gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
+            gather = MoveOp.build(dst=gather_dst, src=src, attrs=gather_attrs)
+            store_dst = None
+            store_dst_value = block_dst
+            if self.writeback_slices > 1:
+                store_dst_type = clone_type(block_dst.type)
+                store_dst_type.sizes[-1] = slice_cols
+                store_dst = TileOp.build(
+                    block_dst, [0, slice_idx], store_dst_type,
+                )
+                store_dst_value = store_dst.result()
+            store = MoveOp.build(
+                dst=store_dst_value, src=smem.result(),
+                attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
+            )
+            new_ops.append(gather)
+            if store_dst is not None:
+                new_ops.append(store_dst)
+            new_ops.append(store)
         return new_ops
 
     def _build_operand_writeback(
@@ -454,6 +480,7 @@ def promote_buffers(
     tma: bool = False,
     nc: bool = False,
     physical_layout: dict[str, object] | None = None,
+    writeback_slices: int = 1,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -467,5 +494,6 @@ def promote_buffers(
         tma=tma,
         nc=nc,
         physical_layout=physical_layout,
+        writeback_slices=writeback_slices,
         label_filter=label_filter,
     ).run(module)

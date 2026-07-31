@@ -18,6 +18,8 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     *, output_tiles_per_cta: int = 1,
+    operand_stages: int = 3,
+    output_slices: int = 1,
     # Split each 256-column output row into two 128-element TMA dimensions.
     # Eight shared-only elements of padding per dimension make the physical
     # row stride 272 BF16s, reducing STMatrix's bank expansion from 8x to 2x.
@@ -35,6 +37,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
     if output_tiles_per_cta == 2:
         name += "_2tiles"
+    if (operand_stages, output_slices) != (3, 1):
+        name += f"_k{operand_stages}_split{output_slices}"
     if output_store == "scalar":
         name += "_pre_stsm"
     grid_x = 32 // output_tiles_per_cta
@@ -69,6 +73,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
              "padding": output_tma_inner_padding}
             if output_tma_inner_size is not None else None
         ),
+        writeback_slices=output_slices,
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(
@@ -84,7 +89,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
         module, tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["kk"], label_filter="mm",
     )
-    module = unroll_loop(module, unroll_factor=3, label_filter="k")
+    module = unroll_loop(module, unroll_factor=operand_stages, label_filter="k")
     module = lower_to_async(module)
     module = fuse_async(module)
     for _ in range(4):
@@ -129,6 +134,16 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     two_tile_launcher = make_ptx_launcher(two_tile_kernel)
     make_torch_custom_call(
         two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    )
+
+    k4_split2_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            output_tiles_per_cta=2, operand_stages=4, output_slices=2,
+        )
+    )
+    k4_split2_launcher = make_ptx_launcher(k4_split2_kernel)
+    make_torch_custom_call(
+        k4_split2_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     )
 
     pre_stsm_kernel = make_ptx_kernel(

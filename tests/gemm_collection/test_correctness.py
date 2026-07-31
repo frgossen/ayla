@@ -69,6 +69,18 @@ def test_pre_stsm_variant_uses_scalar_shared_stores():
     assert "cp.async.bulk.tensor.2d.global.shared" in kernel.ptx
 
 
+def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        output_tiles_per_cta=2, operand_stages=4, output_slices=2,
+    ))
+    assert kernel.name.endswith("_2tiles_k4_split2")
+    assert kernel.ptx.count("[16384]") == 4
+    assert kernel.ptx.count("[32768]") == 4
+    assert kernel.ptx.count("[34816]") == 1
+    assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 4
+    assert kernel.ptx.count("stmatrix.") == 32
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -97,6 +109,11 @@ def test_pre_stsm_variant_uses_scalar_shared_stores():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_k4_split2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_k4_split2",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],

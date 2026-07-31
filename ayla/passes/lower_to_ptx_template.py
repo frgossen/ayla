@@ -1035,10 +1035,13 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
         m_dim, n_dim = wrmem_type.sizes
-        assert list(dst_type.sizes) == [m_dim, n_dim], (
-            f"wgmma store: destination shape {list(dst_type.sizes)} must match "
-            f"the fragment {[m_dim, n_dim]}"
+        col_start = int(op.attrs.get("wgmma_col_start", 0))
+        dst_m, dst_n = dst_type.sizes
+        assert dst_m == m_dim and 0 <= col_start < n_dim, (
+            f"wgmma store: invalid destination shape {list(dst_type.sizes)} "
+            f"and column start {col_start} for fragment {[m_dim, n_dim]}"
         )
+        assert col_start + dst_n <= n_dim
         assert m_dim % 64 == 0, (
             f"wgmma store: m must be a multiple of 64; got {m_dim}"
         )
@@ -1069,7 +1072,9 @@ class LowerToPtxTemplate(LoweringPass):
         num_registers = wrmem_type.num_elements_per_thread // 2
         for reg in range(num_registers):
             di, dj = wgmma_layout_0_static_offsets(reg, n_dim)
-            offset = di * row_stride_bytes + dj * dtype_bytes
+            if not col_start <= dj < col_start + dst_n:
+                continue
+            offset = di * row_stride_bytes + (dj - col_start) * dtype_bytes
             template += (
                 f"{instruction} [{address}+{offset}], "
                 f"${{b32:operand.src.r{reg}}};\n"
@@ -1105,8 +1110,7 @@ class LowerToPtxTemplate(LoweringPass):
             shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
             add.u32 ${{b32:base}}, ${{b32:operand.dst.ptr}}, ${{b32:st_off}};
         """)
-        for group, offset in enumerate(op.offsets):
-            first = group * 4
+        for first, offset in zip(op.register_starts, op.offsets):
             regs = ", ".join(
                 f"${{b32:operand.src.r{i}}}" for i in range(first, first + 4)
             )

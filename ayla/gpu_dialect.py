@@ -439,19 +439,23 @@ class StMatrixStoreOp(Op):
     """Target-level grouped store from a distributed fragment to SMEM.
 
     Instruction selection has already proven layout compatibility and
-    captured the distributed-to-physical layout mapping. ``offsets`` are
-    compile-time byte offsets for consecutive groups of four packed fragment
-    registers; lowering only realizes this target op's fixed lane mapping.
+    captured the distributed-to-physical layout mapping. ``register_starts``
+    and ``offsets`` identify groups of four packed fragment registers and their
+    compile-time destination byte offsets.
     """
 
     @classmethod
     def build(
-        cls, dst: Value, src: Value, offsets: list[int],
+        cls, dst: Value, src: Value, register_starts: list[int], offsets: list[int],
         attrs: dict[str, object] | None = None,
     ) -> "StMatrixStoreOp":
         return cls(
             operands=[dst, src], results=[],
-            attrs={"offsets": list(offsets), **(attrs or {})},
+            attrs={
+                "register_starts": list(register_starts),
+                "offsets": list(offsets),
+                **(attrs or {}),
+            },
         )
 
     @property
@@ -465,6 +469,10 @@ class StMatrixStoreOp(Op):
     @property
     def offsets(self) -> list[int]:
         return self.attrs["offsets"]  # type: ignore[return-value]
+
+    @property
+    def register_starts(self) -> list[int]:
+        return self.attrs["register_starts"]  # type: ignore[return-value]
 
 
 @gpu_dialect.register_op("tma_move")
