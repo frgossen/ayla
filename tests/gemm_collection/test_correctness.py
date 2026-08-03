@@ -5,8 +5,8 @@ import pytest
 import torch
 from torch.ops import ayla
 
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store_k3 import (
-    auto_matmul_4096_wgmma256_wg_tma_store_k3_module,
+from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
+    auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.gpu_dialect import TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
@@ -19,7 +19,7 @@ BF16 = torch.bfloat16
 
 
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=2,
     ))
     lines = kernel.ptx.splitlines()
@@ -60,7 +60,7 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
 
 
 def test_pre_stsm_variant_uses_scalar_shared_stores():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=2, output_store="scalar",
     ))
     assert kernel.name.endswith("_2tiles_pre_stsm")
@@ -70,10 +70,10 @@ def test_pre_stsm_variant_uses_scalar_shared_stores():
 
 
 def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=2, operand_stages=4, output_slices=2,
     ))
-    assert kernel.name.endswith("_2tiles_k4_split2")
+    assert kernel.name.endswith("_k4_2tiles_split2")
     assert kernel.ptx.count("[16384]") == 4
     assert kernel.ptx.count("[32768]") == 4
     assert kernel.ptx.count("[34816]") == 1
@@ -111,9 +111,9 @@ def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
         ),
         pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_k4_split2,
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2,
             BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_k4_split2",
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],

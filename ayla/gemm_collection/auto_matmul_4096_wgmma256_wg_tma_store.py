@@ -1,4 +1,4 @@
-"""Three-stage wgmma256 GEMM with pipelined TMA output stores."""
+"""Configurable wgmma256 GEMM with pipelined TMA output stores."""
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
@@ -16,7 +16,7 @@ from ..ptx_runtime import make_ptx_launcher
 from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 
-def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+def auto_matmul_4096_wgmma256_wg_tma_store_module(
     *, output_tiles_per_cta: int = 1,
     operand_stages: int = 3,
     output_slices: int = 1,
@@ -34,11 +34,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     if output_store == "scalar":
         output_tma_inner_size = None
         output_tma_inner_padding = 0
-    name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
+    name = f"auto_matmul_4096_wgmma256_wg_tma_store_k{operand_stages}"
     if output_tiles_per_cta == 2:
         name += "_2tiles"
-    if (operand_stages, output_slices) != (3, 1):
-        name += f"_k{operand_stages}_split{output_slices}"
+    if output_slices != 1:
+        name += f"_split{output_slices}"
     if output_store == "scalar":
         name += "_pre_stsm"
     grid_x = 32 // output_tiles_per_cta
@@ -117,9 +117,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     return canonicalize(module)
 
 
-def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
+def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
     kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_module()
+        auto_matmul_4096_wgmma256_wg_tma_store_module()
     )
     launcher = make_ptx_launcher(kernel)
     make_torch_custom_call(
@@ -127,7 +127,7 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     )
 
     two_tile_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
             output_tiles_per_cta=2
         )
     )
@@ -137,7 +137,7 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     )
 
     k4_split2_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
             output_tiles_per_cta=2, operand_stages=4, output_slices=2,
         )
     )
@@ -147,7 +147,7 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     )
 
     pre_stsm_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
             output_tiles_per_cta=2, output_store="scalar",
         )
     )
@@ -157,4 +157,4 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     )
 
 
-_register_auto_matmul_4096_wgmma256_wg_tma_store_k3()
+_register_auto_matmul_4096_wgmma256_wg_tma_store()

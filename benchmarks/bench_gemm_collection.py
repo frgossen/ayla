@@ -296,7 +296,7 @@ def main() -> None:
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_k4_split2,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2,
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
