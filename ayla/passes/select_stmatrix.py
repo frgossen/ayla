@@ -45,19 +45,20 @@ class SelectStMatrix(LoweringPass):
         num_registers = src_type.num_elements_per_thread // 2
         if num_registers % 4:
             return None
+        block = int(layout["block"])
+        padding = int(layout["padding"])
         offsets = []
         for reg in range(0, num_registers, 4):
             di, dj = wgmma_layout_0_static_offsets(reg, n_dim)
-            physical_dj = dst_type.physical_last_index(dj)
+            physical_dj = (dj // block) * (block + padding) + dj % block
             offsets.append(
                 (di * dst_type.strides[0] + physical_dj)
                 * dst_type.dtype.byte_size
             )
-        store = StMatrixStoreOp.build(
+        return [StMatrixStoreOp.build(
             self.value_map[op.dst], self.value_map[op.src], offsets,
             attrs=dict(op.attrs),
-        )
-        return [store], []
+        )], []
 
 
 def select_stmatrix(module: ModuleOp) -> ModuleOp:

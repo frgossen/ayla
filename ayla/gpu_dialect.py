@@ -865,35 +865,6 @@ class AddrMemTensorType(MemTensorType):
         value = self.attrs.get("physical_layout")
         return value if isinstance(value, dict) else None
 
-    def physical_last_index(self, index: int) -> int:
-        layout = self.physical_layout
-        if layout is None:
-            return index
-        if layout.get("kind") != "blocked_padding":
-            raise NotImplementedError(f"unsupported physical layout {layout!r}")
-        block = int(layout["block"])
-        padding = int(layout["padding"])
-        return (index // block) * (block + padding) + index % block
-
-    @property
-    def storage_num_elements(self) -> int:
-        """Physical allocation span, including stride gaps and padding."""
-        layout = self.physical_layout
-        if layout is not None:
-            if layout.get("kind") != "blocked_padding" or self.rank != 2:
-                raise NotImplementedError(
-                    f"unsupported physical layout for allocation: {layout!r}"
-                )
-            block = int(layout["block"])
-            padding = int(layout["padding"])
-            blocks = (self.sizes[-1] + block - 1) // block
-            return self.sizes[0] * blocks * (block + padding)
-        if not self.sizes or any(size == 0 for size in self.sizes):
-            return 0
-        return 1 + sum(
-            (size - 1) * stride for size, stride in zip(self.sizes, self.strides)
-        )
-
     def write_strides(self, p: Printer) -> None:
         if not self.is_canonical_strides:
             p.write(" strides=")
@@ -1148,10 +1119,6 @@ class TmaDescType(Type):
     def physical_layout(self) -> dict[str, object] | None:
         value = self.attrs.get("physical_layout")
         return value if isinstance(value, dict) else None
-
-    @property
-    def tensor_rank(self) -> int:
-        return 3 if self.physical_layout is not None else len(self.tile_sizes)
 
     @property
     def swizzle(self) -> str | None:

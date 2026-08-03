@@ -232,7 +232,10 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_bytes = smem_type.storage_num_elements * smem_type.dtype.byte_size
+        n_elements = smem_type.num_elements
+        if smem_type.physical_layout is not None:
+            n_elements = smem_type.sizes[0] * smem_type.strides[0]
+        n_bytes = n_elements * smem_type.dtype.byte_size
         template = textwrap.dedent(f"""\
             .shared .align 128 .b8 ${{smem:sym}}[{n_bytes}];
             mov.u32 ${{b32:result.dst.ptr}}, ${{smem:sym}};
@@ -1072,12 +1075,10 @@ class LowerToPtxTemplate(LoweringPass):
                 f"${{b32:operand.src.r{reg}}};\n"
             )
 
-        operands = [dst_value, src_value, byte_offset]
-        operand_names = ["dst", "src", "offset"]
         new_op = PTXTemplateOp.build(
-            operands=operands,
+            operands=[dst_value, src_value, byte_offset],
             result_types=[], template=template,
-            operand_names=operand_names, result_names=[],
+            operand_names=["dst", "src", "offset"], result_names=[],
             description=str(op),
         )
         new_ops.append(new_op)

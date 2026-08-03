@@ -160,20 +160,6 @@ def test_canonical_strides():
     assert list(t_smem.strides) == [64, 1]
 
 
-def test_physical_layout_controls_mapping_and_allocation_span():
-    layout = {"kind": "blocked_padding", "block": 128, "padding": 8}
-    t = SmemTensorType.build(
-        [128, 256], F32Type(), strides=[272, 1],
-        attrs={"physical_layout": layout},
-    )
-    assert t.physical_last_index(127) == 127
-    assert t.physical_last_index(128) == 136
-    assert t.storage_num_elements == 128 * 272
-
-    strided = SmemTensorType.build([2, 3], F32Type(), strides=[8, 2])
-    assert strided.storage_num_elements == 13
-
-
 def test_naive_matmul_4096_module():
     module_str = textwrap.dedent(f"""\
         module {{

@@ -106,6 +106,8 @@ class LowerToTmaMove(LoweringPass):
             tma_op = TmaMoveOp.build(
                 dst=desc_value, src=smem, indices=indices, attrs=dict(move.attrs))
         return index_ops, tma_op
+
+
 def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value]]:
     """Walk up nested tile ops to find the root tensor and per-dim indices.
 
