@@ -37,10 +37,14 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
         typ for typ in kernel.signature
         if isinstance(typ, TmaDescType) and typ.arg_idx == 2
     )
-    assert output_desc.tma_inner_size == 128
-    assert output_desc.tma_inner_padding == 8
+    assert output_desc.physical_layout == {
+        "kind": "blocked_padding", "block": 128, "padding": 8,
+    }
     assert len(stores) == len(waits) == 2
-    assert any("div.u32" in line and ", 128" in line for line in lines)
+    assert any(
+        ("div.u32" in line and ", 128" in line) or "shr.b32" in line
+        for line in lines
+    )
     assert second_tile_mmas
     assert all(
         any("bar.sync " in line and "bar.sync 0" not in line

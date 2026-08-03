@@ -85,16 +85,13 @@ class LowerToTmaMove(LoweringPass):
         entry_block = root.definition
         assert isinstance(entry_block, Block)
 
+        layout = smem.type.physical_layout
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=root.type,
             tile_shape=list(smem.type.sizes),
             swizzle=smem.type.swizzle,
-            attrs={
-                key: smem.type.attrs[key]
-                for key in ("tma_inner_size", "tma_inner_padding")
-                if key in smem.type.attrs
-            },
+            attrs={"physical_layout": layout} if layout is not None else None,
         )
         desc_value = Value(
             name=f"{root.name}_desc" if root.name else None,
@@ -109,8 +106,6 @@ class LowerToTmaMove(LoweringPass):
             tma_op = TmaMoveOp.build(
                 dst=desc_value, src=smem, indices=indices, attrs=dict(move.attrs))
         return index_ops, tma_op
-
-
 def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value]]:
     """Walk up nested tile ops to find the root tensor and per-dim indices.
 

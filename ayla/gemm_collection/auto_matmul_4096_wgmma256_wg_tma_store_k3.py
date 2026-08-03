@@ -64,9 +64,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     module = promote_buffers(
         module, target_type="wrmem", operands=["dst"], swizzle=None,
         layout="wgmma_layout_0", warps=4, tma=True, nc=False,
-        tma_inner_size=output_tma_inner_size,
-        tma_inner_padding=output_tma_inner_padding,
-        stmatrix=output_store == "stmatrix",
+        physical_layout=(
+            {"kind": "blocked_padding", "block": output_tma_inner_size,
+             "padding": output_tma_inner_padding}
+            if output_tma_inner_size is not None else None
+        ),
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(

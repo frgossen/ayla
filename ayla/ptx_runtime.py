@@ -324,12 +324,13 @@ class PtxLauncher:
             if isinstance(typ, GmemTensorType):
                 params.append(tensors[self._arg_to_tensor[i]])
             elif isinstance(typ, TmaDescType):
+                layout = typ.physical_layout or {}
                 params.append((
                     tensors[self._arg_to_tensor[typ.arg_idx]],
                     list(typ.tile_sizes),
                     typ.swizzle or "",
-                    typ.tma_inner_size or 0,
-                    typ.tma_inner_padding,
+                    int(layout.get("block", 0)),
+                    int(layout.get("padding", 0)),
                 ))
         return params
 
