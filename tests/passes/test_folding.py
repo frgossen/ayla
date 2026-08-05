@@ -1,7 +1,8 @@
 """Tests for the `folding` pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import IndexConstantOp, IndexMulOp, gpu_dialect
 from ayla.passes.folding import folding
 
 
@@ -40,3 +41,20 @@ def test_fold_constants():
             %cx_offset: index = index_mul(%cx: index, %c64: index)
           }
         }""")
+
+
+def test_distribute_constant_multiply_over_affine_offset():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test() {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c3: index = index_constant() attrs={value: 3}
+            %offset: index = index_add(%bx: index, %c3: index)
+            %c64: index = index_constant() attrs={value: 64}
+            %coordinate: index = index_mul(%offset: index, %c64: index)
+          }
+        }"""))
+    folding(module)
+    assert len(find_ops(module, lambda op: isinstance(op, IndexMulOp))) == 1
+    constants = find_ops(module, lambda op: isinstance(op, IndexConstantOp))
+    assert 192 in [op.value for op in constants]

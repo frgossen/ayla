@@ -38,11 +38,9 @@ def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
         mov.u32 ${b32:bl_tid}, %tid.x;
-        mov.u32 ${b32:bl_ntid}, %ntid.x;
         setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-        setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
-        @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
-        @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+        @${pred:bl_w0} bar.sync 1, 128;
+        @!${pred:bl_w0} bar.arrive 1, 128;
         """)
 
 

@@ -204,12 +204,14 @@ class MatmulOp(Op):
         dst: Value,
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
+        scale_d: Value | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if init is not None:
             a["init"] = init
         return cls(
-            operands=[lhs, rhs, dst], results=[], attrs=a,
+            operands=[lhs, rhs, dst] + ([scale_d] if scale_d is not None else []),
+            results=[], attrs=a,
         )
 
     @property
@@ -223,6 +225,11 @@ class MatmulOp(Op):
     @property
     def dst(self) -> Value:
         return self.operands[2]
+
+    @property
+    def scale_d(self) -> Value | None:
+        """Optional uniform condition controlling accumulation into ``dst``."""
+        return self.operands[3] if len(self.operands) == 4 else None
 
     @property
     def init(self) -> float | int | None:
@@ -480,7 +487,8 @@ class TmaMoveOp(Op):
     """TMA bulk transfer between smem and gmem (block-collective), sync form.
 
     One operand is a TMA descriptor (gmem side), the other is smem. Indices are
-    per-dim element coordinates for the TMA engine. Direction (load/store) is
+    physical per-dimension coordinates for the TMA engine; a physical layout
+    may therefore add dimensions relative to the logical tensor. Direction is
     determined by which side is smem vs tma_desc. Completion tracking is the
     surrounding ``async { ... }`` wrapper's job (it owns the lock), so this op
     carries no lock itself — mirroring ``move`` and ``matmul``.
@@ -865,10 +873,12 @@ class AddrMemTensorType(MemTensorType):
     def physical_layout(self) -> dict[str, object] | None:
         """Optional non-affine physical layout of the logical tensor.
 
-        Strides describe the outer affine layout.  ``blocked_padding`` splits
-        the last logical dimension into fixed-size blocks and appends padding
-        to every physical block.  Keeping this on the memory type makes the
-        mapping available to allocation, instruction selection and transfers.
+        Strides describe the affine layout within a physical block.
+        ``blocked_padding`` splits the last logical dimension into fixed-size
+        blocks and appends padding to every block.  Its optional ``order`` is
+        ``row_major`` (blocks within each row) or ``block_major`` (all rows of
+        one block together). Keeping this on the memory type makes the mapping
+        available to allocation, instruction selection and transfers.
         """
         value = self.attrs.get("physical_layout")
         return value if isinstance(value, dict) else None

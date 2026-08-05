@@ -132,6 +132,29 @@ class Folding(LoweringPass):
     def lower_mul(
         self, op: IndexMulOp,
     ) -> tuple[list[Op], list[object]] | None:
+        # Distribute a constant factor over a normalized ``x + c``.  Besides
+        # folding ``c * factor`` at compile time, this exposes the shared
+        # ``x * factor`` term to CSE across sibling affine coordinates.
+        lhs = self.value_map.get(op.lhs, op.lhs)
+        rhs = self.value_map.get(op.rhs, op.rhs)
+        lhs_factor = self._const_val(op.lhs)
+        rhs_factor = self._const_val(op.rhs)
+        add_value, factor = (
+            (rhs, lhs_factor) if lhs_factor is not None
+            else (lhs, rhs_factor)
+        )
+        if factor is not None and isinstance(add_value.definition, IndexAddOp):
+            add = add_value.definition
+            add_const = self._const_val(add.rhs)
+            if add_const is not None:
+                factor_op = IndexConstantOp.build(factor)
+                product = IndexMulOp.build(
+                    self.value_map.get(add.lhs, add.lhs), factor_op.result(),
+                )
+                offset = IndexConstantOp.build(add_const * factor)
+                result = IndexAddOp.build(product.result(), offset.result())
+                return [factor_op, product, offset, result], [result.result()]
+
         lhs_non_const, lhs_const = self._decompose_mul(op.lhs)
         rhs_non_const, rhs_const = self._decompose_mul(op.rhs)
         const_prod = lhs_const * rhs_const

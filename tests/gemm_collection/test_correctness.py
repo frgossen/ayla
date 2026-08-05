@@ -1,5 +1,7 @@
 """Correctness tests for all GEMM kernels in the collection."""
 
+import re
+
 import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
 import pytest
 import torch
@@ -26,7 +28,7 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     stores = [i for i, line in enumerate(lines)
               if "cp.async.bulk.tensor.3d.global.shared" in line]
     waits = [i for i, line in enumerate(lines)
-             if "cp.async.bulk.wait_group 0" in line]
+              if "cp.async.bulk.wait_group" in line]
     gathers = [i for i, line in enumerate(lines) if "stmatrix." in line]
     second_tile_mmas = [
         i for i, line in enumerate(lines)
@@ -37,14 +39,28 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
         typ for typ in kernel.signature
         if isinstance(typ, TmaDescType) and typ.arg_idx == 2
     )
+    assert sum(isinstance(typ, TmaDescType) for typ in kernel.signature) == 3
     assert output_desc.physical_layout == {
         "kind": "blocked_padding", "block": 128, "padding": 8,
     }
     assert len(stores) == len(waits) == 2
-    assert any(
-        ("div.u32" in line and ", 128" in line) or "shr.b32" in line
-        for line in lines
-    )
+    store_templates = [
+        section for section in kernel.ptx.split("// PTX template")
+        if "tma_move" in section
+        and "cp.async.bulk.tensor.3d.global.shared" in section
+    ]
+    assert store_templates
+    assert all("div.u32" not in section and "rem.u32" not in section
+               for section in store_templates)
+    assert "%tid.y" not in kernel.ptx and "%tid.z" not in kernel.ptx
+    assert "%ntid.x" not in kernel.ptx
+    assert "bar.sync 1, 256" in kernel.ptx
+    gather_templates = [
+        section for section in kernel.ptx.split("// PTX template")
+        if "stmatrix." in section
+    ]
+    assert gather_templates
+    assert all("rem.u32" not in section for section in gather_templates)
     assert second_tile_mmas
     assert all(
         any("bar.sync " in line and "bar.sync 0" not in line
@@ -79,6 +95,75 @@ def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
     assert kernel.ptx.count("[34816]") == 1
     assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 4
     assert kernel.ptx.count("stmatrix.") == 32
+    assert kernel.ptx.count("cvt.rn.bf16x2.f32") == 128
+    assert "cvt.rn.bf16.f32" not in kernel.ptx
+
+
+def test_k128_operand_tile_uses_block_major_3d_tma():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=2, operand_stages=2, operand_k_tile=128,
+        output_slices=2,
+    ))
+    assert kernel.name.endswith("_k2_ktile128_2tiles_split2")
+    input_descs = [
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    ]
+    assert len(input_descs) == 2
+    assert all(desc.tile_sizes[-1] == 128 for desc in input_descs)
+    assert all(desc.physical_layout["order"] == "block_major"
+               for desc in input_descs)
+    assert kernel.ptx.count("tensor.3d.shared::cluster.global") == 16
+    assert "tensor.2d.shared::cluster.global" not in kernel.ptx
+    assert kernel.ptx.count("[32768]") == 2
+    assert kernel.ptx.count("[65536]") == 2
+
+
+def test_k3_keeps_warpgroup_descriptor_arithmetic_uniform():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=2, operand_stages=3, output_slices=2,
+        output_tma_inner_padding=16,
+    ))
+    warpgroup_id = re.search(
+        r"mov\.u32 (%r\d+), %tid\.x;\n"
+        r"\s+shfl\.sync\.idx\.b32 \1, \1, 0, 0x1f, 0xffffffff;\n"
+        r"\s+shr\.u32 \1, \1, 7;",
+        kernel.ptx,
+    )
+    derived_descriptors = re.findall(
+        r"add\.u64 %rd\d+, %rd\d+, [246];", kernel.ptx,
+    )
+    assert warpgroup_id is not None
+    assert len(derived_descriptors) == 72
+
+
+def test_n384_split3_uses_three_warpgroups_and_sliced_tma():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_n_tile=384, operand_stages=2, output_slices=3,
+    ))
+    assert kernel.name.endswith("_k2_n384_split3")
+    assert kernel.grid_dim == (32, 11, 1)
+    assert kernel.block_dim == (384, 1, 1)
+    assert "setp.eq.u32" in kernel.ptx
+    assert kernel.ptx.count("[34816]") == 1
+    rhs_descs = [
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx == 1
+    ]
+    assert rhs_descs
+    assert all(typ.tile_sizes == (128, 64) for typ in rhs_descs)
+
+
+def test_m192_split2_uses_three_warpgroups_and_partial_m_tile():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_m_tile=192, operand_stages=3, output_slices=2,
+    ))
+    assert kernel.name.endswith("_k3_m192_split2")
+    assert kernel.grid_dim == (22, 16, 1)
+    assert kernel.block_dim == (384, 1, 1)
+    assert kernel.ptx.count("[24576]") == 3
+    assert kernel.ptx.count("[32768]") == 3
+    assert kernel.ptx.count("[52224]") == 1
 
 
 @requires_cuda
@@ -109,6 +194,26 @@ def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2,

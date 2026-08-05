@@ -36,6 +36,7 @@ from .base.ir import Op, Printer, Value
 from .passes.folding import Folding
 from .passes.cse import CSE
 from .passes.dce import DCE
+from .passes.fold_accumulator_init import FoldAccumulatorInit
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
@@ -54,6 +55,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(Folding())
         self.add_pass(CSE())
         self.add_pass(DCE())
+        self.add_pass(FoldAccumulatorInit())
         self.add_pass(InsertSyncs())
         self.add_pass(SelectStMatrix())
         self.add_pass(LowerToPtxTemplate())
@@ -479,13 +481,18 @@ def _emit_block_ids(p: PtxPrinter, op: BlockIdsOp) -> None:
     p.write_newline_once()
 
 
-# TODO: Emit S index computations instead.
 def _emit_warp_group_id(p: PtxPrinter, op: WarpGroupIdOp) -> None:
     rx = p.unique_ptx_names_for_value(op.x)
     ry = p.unique_ptx_names_for_value(op.y)
     rz = p.unique_ptx_names_for_value(op.z)
     p.write_newline_once()
+    # Broadcast the logical warp's lane-0 thread id before extracting its
+    # warpgroup.  The shuffle makes warp uniformity explicit to ptxas without
+    # relying on the volatile physical `%warpid` special register.
     p.write_line(f"mov.u32 {rx}, %tid.x;")
+    p.write_line(
+        f"shfl.sync.idx.b32 {rx}, {rx}, 0, 0x1f, 0xffffffff;"
+    )
     p.write_line(f"shr.u32 {rx}, {rx}, 7;")
     p.write_line(f"mov.u32 {ry}, 0;")
     p.write_line(f"mov.u32 {rz}, 0;")
