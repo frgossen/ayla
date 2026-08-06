@@ -226,6 +226,11 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
+    def ayla_bf16(label: str, op: str) -> BenchGemmConfig:
+        return BenchGemmConfig(
+            label, 4096, 4096, 4096, getattr(torch.ops.ayla, op), torch.bfloat16,
+        )
+
     configs = [
         BenchGemmConfig(
             label="torch.mm.bf16",
@@ -290,6 +295,30 @@ def main() -> None:
             k=4096,
             op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             dtype=torch.bfloat16,
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 2 tiles/CTA)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, 3D input TMA K-tile=128, split output, 2 tiles/CTA)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=4, split output, 2 tiles/CTA)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (128x384 CTA, three N=128 warpgroups, TMA store K=2)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (192x256 CTA, three M=64 warpgroups, TMA store K=3)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
         ),
         BenchGemmConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
