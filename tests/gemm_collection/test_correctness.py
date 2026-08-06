@@ -20,6 +20,10 @@ F32 = torch.float32
 BF16 = torch.bfloat16
 
 
+def _bf16_op(name: str):
+    return pytest.param(getattr(ayla, name), BF16, id=name)
+
+
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=2,
@@ -89,7 +93,7 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=4, operand_stages=3, output_slices=2,
         output_tma_inner_padding=16, output_store_buffers=2,
-        lhs_l2_cache_hint="evict_first",
+        operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"}},
     ))
     assert kernel.name.endswith("_k3_4tiles_split2_dbuf2")
     assert kernel.grid_dim == (8, 16, 1)
@@ -211,36 +215,14 @@ def test_m192_split2_uses_three_warpgroups_and_partial_m_tile():
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
         ),
-        pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3,
-            BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3",
-        ),
-        pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2,
-            BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
-        ),
-        pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2,
-            BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
-        ),
-        pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
-            BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
-        ),
-        pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2,
-            BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2",
-        ),
-        pytest.param(
-            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2,
-            BF16,
-            id="auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2",
-        ),
+        *(_bf16_op(name) for name in (
+            "auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2",
+        )),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],
 )

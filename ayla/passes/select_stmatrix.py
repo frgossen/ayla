@@ -35,8 +35,7 @@ class SelectStMatrix(LoweringPass):
         ):
             return None
 
-        layout = dst_type.physical_layout
-        assert layout is not None and layout.get("kind") == "blocked_padding"
+        assert dst_type.blocked_layout is not None
         m_dim, n_dim = src_type.sizes
         col_start = int(op.attrs.get("wgmma_col_start", 0))
         dst_m, dst_n = dst_type.sizes
@@ -48,8 +47,6 @@ class SelectStMatrix(LoweringPass):
         num_registers = src_type.num_elements_per_thread // 2
         if num_registers % 4:
             return None
-        block = int(layout["block"])
-        padding = int(layout["padding"])
         register_starts = []
         offsets = []
         for reg in range(0, num_registers, 4):
@@ -57,13 +54,9 @@ class SelectStMatrix(LoweringPass):
             if not col_start <= dj < col_start + dst_n:
                 continue
             logical_dj = dj - col_start
-            physical_dj = (
-                (logical_dj // block) * (block + padding) + logical_dj % block
-            )
             register_starts.append(reg)
             offsets.append(
-                (di * dst_type.strides[0] + physical_dj)
-                * dst_type.dtype.byte_size
+                dst_type.element_offset([di, logical_dj]) * dst_type.dtype.byte_size
             )
         return [StMatrixStoreOp.build(
             self.value_map[op.dst], self.value_map[op.src],

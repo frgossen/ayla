@@ -1,9 +1,7 @@
 """Configurable wgmma256 GEMM with pipelined TMA output stores."""
 import textwrap
 
-from ..base.ir import find_ops
 from ..gpu_dialect import gpu_dialect
-from ..gpu_dialect import MoveOp
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
@@ -34,7 +32,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_tma_inner_size: int | None = 128,
     output_tma_inner_padding: int = 8,
     output_store: str = "stmatrix",
-    lhs_l2_cache_hint: str | None = None,
+    operand_move_attrs: dict[str, dict[str, object]] | None = None,
 ):
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
@@ -52,8 +50,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix"):
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
-    if lhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
-        raise ValueError("unsupported lhs_l2_cache_hint")
     if output_store == "scalar":
         output_tma_inner_size = None
         output_tma_inner_padding = 0
@@ -135,6 +131,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             {"rhs": output_n_tile // warpgroup_n_tile}
             if output_n_tile == 384 else None
         ),
+        move_attrs=operand_move_attrs,
         label_filter="mm",
     )
     module = tile_matmul(
@@ -168,113 +165,33 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             label_filter="outm",
         )
     module = schedule_async(module)
-    if lhs_l2_cache_hint is not None:
-        lhs_tma_loads = find_ops(
-            module,
-            lambda op: isinstance(op, MoveOp)
-            and "_lhs_smem" in str(op.attrs.get("label", "")),
-        )
-        if not lhs_tma_loads:
-            raise RuntimeError("expected at least one lhs TMA load")
-        for load in lhs_tma_loads:
-            load.attrs["l2_cache_hint"] = lhs_l2_cache_hint
     return canonicalize(module)
 
 
 def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
-    kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module()
-    )
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(
-        launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
-
-    two_tile_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_tiles_per_cta=2
+    configs = [
+        {},
+        {"output_tiles_per_cta": 2},
+        {"output_tiles_per_cta": 2, "operand_stages": 3, "output_slices": 2,
+         "output_tma_inner_padding": 16, "output_store_buffers": 2},
+        {"output_tiles_per_cta": 4, "operand_stages": 3, "output_slices": 2,
+         "output_tma_inner_padding": 16, "output_store_buffers": 2,
+         "operand_move_attrs": {"lhs": {"l2_cache_hint": "evict_first"}}},
+        {"output_tiles_per_cta": 2, "operand_stages": 2,
+         "operand_k_tile": 128, "output_slices": 2},
+        {"output_tiles_per_cta": 2, "operand_stages": 4, "output_slices": 2},
+        {"output_n_tile": 384, "operand_stages": 2, "output_slices": 3},
+        {"output_m_tile": 192, "operand_stages": 3, "output_slices": 2},
+        {"output_tiles_per_cta": 2, "output_store": "scalar"},
+    ]
+    for config in configs:
+        kernel = make_ptx_kernel(
+            auto_matmul_4096_wgmma256_wg_tma_store_module(**config)
         )
-    )
-    two_tile_launcher = make_ptx_launcher(two_tile_kernel)
-    make_torch_custom_call(
-        two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
-
-    k3_split2_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_tiles_per_cta=2, operand_stages=3, output_slices=2,
-            output_tma_inner_padding=16, output_store_buffers=2,
+        make_torch_custom_call(
+            make_ptx_launcher(kernel),
+            [OperandKind.R, OperandKind.R, OperandKind.RESULT],
         )
-    )
-    make_torch_custom_call(
-        make_ptx_launcher(k3_split2_kernel),
-        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
-    )
-
-    k3_split2_four_tile_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_tiles_per_cta=4, operand_stages=3, output_slices=2,
-            output_tma_inner_padding=16, output_store_buffers=2,
-            lhs_l2_cache_hint="evict_first",
-        )
-    )
-    make_torch_custom_call(
-        make_ptx_launcher(k3_split2_four_tile_kernel),
-        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
-    )
-
-    k128_split2_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_tiles_per_cta=2, operand_stages=2, operand_k_tile=128,
-            output_slices=2,
-        )
-    )
-    make_torch_custom_call(
-        make_ptx_launcher(k128_split2_kernel),
-        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
-    )
-
-    k4_split2_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_tiles_per_cta=2, operand_stages=4, output_slices=2,
-        )
-    )
-    k4_split2_launcher = make_ptx_launcher(k4_split2_kernel)
-    make_torch_custom_call(
-        k4_split2_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
-
-    n384_k2_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_n_tile=384, operand_stages=2,
-            output_slices=3,
-        )
-    )
-    n384_k2_launcher = make_ptx_launcher(n384_k2_kernel)
-    make_torch_custom_call(
-        n384_k2_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
-
-    m192_k3_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_m_tile=192, operand_stages=3, output_slices=2,
-        )
-    )
-    m192_k3_launcher = make_ptx_launcher(m192_k3_kernel)
-    make_torch_custom_call(
-        m192_k3_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
-
-
-    pre_stsm_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_module(
-            output_tiles_per_cta=2, output_store="scalar",
-        )
-    )
-    pre_stsm_launcher = make_ptx_launcher(pre_stsm_kernel)
-    make_torch_custom_call(
-        pre_stsm_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
 
 
 _register_auto_matmul_4096_wgmma256_wg_tma_store()

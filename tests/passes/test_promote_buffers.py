@@ -83,10 +83,12 @@ def test_promote_can_slice_tma_operand_loads():
     promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", tma=True, tma_load_slices={"rhs": 3},
+        move_attrs={"rhs": {"l2_cache_hint": "evict_last"}},
         label_filter="mm",
     )
     text = repr(module)
     assert text.count('label: "mm_rhs_smem"') == 3
+    assert text.count('l2_cache_hint: "evict_last"') == 3
     assert text.count("gmem_tensor<128x64xbf16> = tile(%b") == 3
     assert text.count("smem_tensor<128x64xbf16") >= 3
 

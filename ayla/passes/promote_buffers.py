@@ -49,44 +49,6 @@ from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass
 
 
-def _smem_physical_layout(
-    sizes: list[int], dtype, physical_layout: dict[str, object] | None,
-) -> tuple[list[int] | None, dict[str, object]]:
-    if physical_layout is None:
-        return None, {}
-    if physical_layout.get("kind") != "blocked_padding":
-        raise NotImplementedError(
-            f"unsupported physical layout {physical_layout!r}"
-        )
-    block = int(physical_layout["block"])
-    padding = int(physical_layout["padding"])
-    order = physical_layout.get("order", "row_major")
-    if order not in ("row_major", "block_major"):
-        raise ValueError(f"unsupported blocked layout order {order!r}")
-    if len(sizes) != 2 or sizes[-1] % block:
-        raise ValueError(
-            "blocked padding requires a rank-2 tile whose inner size "
-            "is divisible by the layout block size"
-        )
-    if padding < 0:
-        raise ValueError("physical layout padding must be non-negative")
-    padded_inner = block + padding
-    if padded_inner > 256:
-        raise ValueError("padded TMA inner box cannot exceed 256 elements")
-    if padded_inner * dtype.byte_size % 16:
-        raise ValueError("padded TMA inner box must occupy a multiple of 16 bytes")
-    normalized_layout = dict(physical_layout)
-    if order == "block_major":
-        # Non-affine K-block offsets depend on the allocation's full outer
-        # extent, which narrow tile views must continue to carry.
-        normalized_layout["outer_size"] = sizes[0]
-    row_stride = (
-        (sizes[-1] // block) * padded_inner
-        if order == "row_major" else padded_inner
-    )
-    return [row_stride, 1], {"physical_layout": normalized_layout}
-
-
 def _target_level(target_type: str) -> str:
     if target_type == "smem":
         return "block"
@@ -235,6 +197,8 @@ class PromoteBuffers(LoweringPass):
         Split selected operand loads along their leading dimension. This keeps
         each TMA box within hardware limits while retaining one logical SMEM
         allocation for downstream tiling.
+    move_attrs : dict[str, dict[str, object]] or None
+        Extra attributes for each promoted operand's move operations.
     """
 
     def __init__(
@@ -252,6 +216,7 @@ class PromoteBuffers(LoweringPass):
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
         tma_load_slices: dict[str, int] | None = None,
+        move_attrs: dict[str, dict[str, object]] | None = None,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -268,6 +233,9 @@ class PromoteBuffers(LoweringPass):
         self.writeback_slices = writeback_slices
         self.writeback_buffers = writeback_buffers
         self.tma_load_slices = dict(tma_load_slices or {})
+        self.move_attrs = {
+            operand: dict(attrs) for operand, attrs in (move_attrs or {}).items()
+        }
         if writeback_slices < 1:
             raise ValueError("writeback_slices must be positive")
         if writeback_buffers not in (1, writeback_slices):
@@ -288,11 +256,8 @@ class PromoteBuffers(LoweringPass):
         if tensor_cls is GmemTensorType:
             return GmemTensorType.build(sizes, dtype)
         if tensor_cls is SmemTensorType:
-            strides, attrs = _smem_physical_layout(
-                sizes, dtype, self.physical_layout,
-            )
-            return SmemTensorType.build(
-                sizes, dtype, strides=strides, swizzle=self.swizzle, attrs=attrs,
+            return SmemTensorType.build_physical(
+                sizes, dtype, self.swizzle, self.physical_layout,
             )
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
@@ -310,6 +275,7 @@ class PromoteBuffers(LoweringPass):
             attrs["tma"] = True
         if self.nc and allow_nc:
             attrs["nc"] = True
+        attrs.update(self.move_attrs.get(operand_name, {}))
         return attrs
 
     def _build_operand_promotion(
@@ -430,13 +396,9 @@ class PromoteBuffers(LoweringPass):
         if smem_sizes[-1] % self.writeback_slices:
             raise ValueError("output columns must divide evenly into writeback_slices")
         smem_sizes[-1] //= self.writeback_slices
-        smem_strides, smem_attrs = _smem_physical_layout(
-            smem_sizes, block_dst.type.dtype, self.physical_layout,
-        )
         smems = [
-            AllocOp.build(SmemTensorType.build(
-                smem_sizes, block_dst.type.dtype, strides=smem_strides,
-                swizzle=None, attrs=smem_attrs,
+            AllocOp.build(SmemTensorType.build_physical(
+                smem_sizes, block_dst.type.dtype, None, self.physical_layout,
             ))
             for _ in range(self.writeback_buffers)
         ]
@@ -562,6 +524,7 @@ def promote_buffers(
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
     tma_load_slices: dict[str, int] | None = None,
+    move_attrs: dict[str, dict[str, object]] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -578,5 +541,6 @@ def promote_buffers(
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
         tma_load_slices=tma_load_slices,
+        move_attrs=move_attrs,
         label_filter=label_filter,
     ).run(module)

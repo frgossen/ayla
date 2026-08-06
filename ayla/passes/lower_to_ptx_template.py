@@ -52,60 +52,6 @@ from ..base.ir import Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass
 
 
-def _constant_tile_byte_delta(value: Value, base: Value) -> int | None:
-    """Return a proven constant byte offset between sibling tile views."""
-    value_def, base_def = value.definition, base.definition
-    if not (
-        isinstance(value_def, TileOp)
-        and isinstance(base_def, TileOp)
-        and value_def.arg is base_def.arg
-        and value.type == base.type
-    ):
-        return None
-
-    def constant(index: Value | int) -> int | None:
-        if isinstance(index, int):
-            return index
-        if isinstance(index.definition, IndexConstantOp):
-            return index.definition.value
-        return None
-
-    indices = [constant(index) for index in value_def.indices]
-    base_indices = [constant(index) for index in base_def.indices]
-    if any(index is None for index in indices + base_indices):
-        return None
-    layout = value.type.physical_layout
-
-    def element_offset(tile_indices: list[int | None]) -> int:
-        offset = 0
-        for dim, (index, size, stride) in enumerate(zip(
-            tile_indices, value.type.sizes, value.type.strides,
-        )):
-            assert index is not None
-            logical = index * size
-            if layout is not None and dim == value.type.rank - 1:
-                block = int(layout["block"])
-                padded = block + int(layout["padding"])
-                chunk, inner = divmod(logical, block)
-                order = layout.get("order", "row_major")
-                if order == "row_major":
-                    logical = chunk * padded + inner
-                elif order == "block_major":
-                    logical = (
-                        chunk * int(layout["outer_size"]) * padded + inner
-                    )
-                else:
-                    raise ValueError(
-                        f"unsupported blocked layout order {order!r}"
-                    )
-            offset += logical * stride
-        return offset
-
-    return (
-        element_offset(indices) - element_offset(base_indices)
-    ) * value.type.dtype.byte_size
-
-
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -115,6 +61,7 @@ class LowerToPtxTemplate(LoweringPass):
             None, None, None,
         )
         self.cache_policy_values: dict[str, Value] = {}
+        self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
         self.register(StMatrixStoreOp, type(self).lower_stmatrix_store)
@@ -125,50 +72,38 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
 
-    def lower_op(self, op: Op) -> tuple[list[Op], list[object]]:
-        if not isinstance(op, KernelOp):
-            return super().lower_op(op)
-        previous = self.block_dim
-        previous_policies = self.cache_policy_values
+    def lower_kernel(
+        self, op: KernelOp,
+    ) -> tuple[list[Op], list[object]]:
         block_dim = list(op.block_dim)
         if op.num_warp_groups is not None and op.num_warp_groups > 0:
             block_dim[0] = op.num_warp_groups * 128
         self.block_dim = tuple(block_dim)
-        try:
-            cache_hints = sorted({
-                str(tma.attrs["l2_cache_hint"])
-                for tma in find_ops(op, lambda candidate: isinstance(
-                    candidate, TmaMoveOp,
-                ))
-                if "l2_cache_hint" in tma.attrs
-            })
-            if any(hint not in ("evict_first", "evict_last")
-                   for hint in cache_hints):
-                raise ValueError(f"unsupported TMA L2 cache hints {cache_hints!r}")
-            if cache_hints:
-                policy_names = [f"policy{i}" for i in range(len(cache_hints))]
-                lines = list(
+        cache_hints = sorted({
+            hint
+            for tma in find_ops(op, lambda candidate: isinstance(
+                candidate, TmaMoveOp,
+            ))
+            if (hint := tma.l2_cache_hint) is not None
+        })
+        self.cache_policy_values = {}
+        if cache_hints:
+            names = [f"policy{i}" for i in range(len(cache_hints))]
+            policy_op = PTXTemplateOp.build(
+                operands=[],
+                result_types=[PtrType.build("gmem") for _ in cache_hints],
+                template="\n".join(
                     f"createpolicy.fractional.L2::{hint}.b64 "
                     f"${{b64:result.{name}.ptr}}, 1.0;"
-                    for hint, name in zip(cache_hints, policy_names)
-                )
-                policy_op = PTXTemplateOp.build(
-                    operands=[],
-                    result_types=[PtrType.build("gmem") for _ in cache_hints],
-                    template="\n".join(lines) + "\n",
-                    result_names=policy_names,
-                    description="create TMA L2 cache policies",
-                )
-                op.body.entry_block.ops.insert(0, policy_op)
-                self.cache_policy_values = dict(zip(
-                    cache_hints, policy_op.results,
-                ))
-            else:
-                self.cache_policy_values = {}
-            return super().lower_op(op)
-        finally:
-            self.block_dim = previous
-            self.cache_policy_values = previous_policies
+                    for hint, name in zip(cache_hints, names)
+                ) + "\n",
+                result_names=names,
+                description="create TMA L2 cache policies",
+            )
+            op.body.entry_block.ops.insert(0, policy_op)
+            self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
+        self.lower_region(op.body)
+        return [op], []
 
     def _thread_zero_guard(self, prefix: str, done: str) -> list[str]:
         """Branch nonzero threads away, omitting statically singleton axes."""
@@ -243,27 +178,24 @@ class LowerToPtxTemplate(LoweringPass):
             elem_off = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(elem_off)
 
-            layout = root_type.physical_layout
+            layout = root_type.blocked_layout
             if layout is not None and dim == root_type.rank - 1:
-                assert layout.get("kind") == "blocked_padding"
-                block = int(layout["block"])
-                padding = int(layout["padding"])
-                order = layout.get("order", "row_major")
-                block_op = IndexConstantOp.build(block)
+                block_op = IndexConstantOp.build(layout.block)
                 chunk = IndexDivOp.build(elem_off.result(), block_op.result())
                 inner = IndexModOp.build(elem_off.result(), block_op.result())
-                padded_op = IndexConstantOp.build(block + padding)
-                if order == "row_major":
+                padded_op = IndexConstantOp.build(
+                    layout.block + layout.padding
+                )
+                if layout.order == "row_major":
                     chunk_stride = padded_op.result()
-                elif order == "block_major":
-                    rows_op = IndexConstantOp.build(int(layout["outer_size"]))
+                else:
+                    assert layout.outer_size is not None
+                    rows_op = IndexConstantOp.build(layout.outer_size)
                     chunk_stride_op = IndexMulOp.build(
                         rows_op.result(), padded_op.result(),
                     )
                     new_ops.extend([rows_op, chunk_stride_op])
                     chunk_stride = chunk_stride_op.result()
-                else:
-                    raise ValueError(f"unsupported blocked layout order {order!r}")
                 chunk_off = IndexMulOp.build(chunk.result(), chunk_stride)
                 physical_off = IndexAddOp.build(
                     chunk_off.result(), inner.result(),
@@ -385,17 +317,7 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_elements = smem_type.num_elements
-        if smem_type.physical_layout is not None:
-            layout = smem_type.physical_layout
-            assert layout.get("kind") == "blocked_padding"
-            block = int(layout["block"])
-            padding = int(layout["padding"])
-            n_elements = (
-                smem_type.sizes[0]
-                * (smem_type.sizes[-1] // block)
-                * (block + padding)
-            )
+        n_elements = smem_type.storage_num_elements
         n_bytes = n_elements * smem_type.dtype.byte_size
         template = textwrap.dedent(f"""\
             .shared .align 128 .b8 ${{smem:sym}}[{n_bytes}];
@@ -647,6 +569,20 @@ class LowerToPtxTemplate(LoweringPass):
             t += f"or.b64 ${{b64:{name}}}, ${{b64:{name}}}, {desc_const};\n"
             return t
 
+        def _tile_delta(value: Value, base: Value, group: int) -> int | None:
+            if group == 0 or not (
+                isinstance(value.definition, TileOp)
+                and isinstance(base.definition, TileOp)
+            ):
+                return None
+            delta = value.definition.constant_byte_delta(base.definition)
+            return delta if delta is not None and delta >= 0 and delta % 16 == 0 else None
+
+        def _desc(name, base, delta, ptr, const, offset=None):
+            if delta is not None:
+                return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
+            return _build_desc(name, ptr, const, offset)
+
         # Each distinct operand value gets a single unique placeholder name —
         # matmuls accumulating into the same dst share that operand/register set.
         operands: list[Value] = []
@@ -718,43 +654,25 @@ class LowerToPtxTemplate(LoweringPass):
             desc_const_rhs = _build_static_desc(
                 lead_dim, rhs_row_stride_bytes * 8, _swizzle_to_bits[rhs_type.swizzle])
 
-            lhs_delta = _constant_tile_byte_delta(mm.lhs, mms[0].lhs)
-            rhs_delta = _constant_tile_byte_delta(mm.rhs, mms[0].rhs)
-            derive_lhs = (
-                j > 0 and lhs_delta is not None
-                and lhs_delta >= 0 and lhs_delta % 16 == 0
-            )
-            derive_rhs = (
-                j > 0 and rhs_delta is not None
-                and rhs_delta >= 0 and rhs_delta % 16 == 0
-            )
-            lhs_name = None if derive_lhs else _operand(self.value_map[mm.lhs], "lhs")
-            rhs_name = None if derive_rhs else _operand(self.value_map[mm.rhs], "rhs")
+            lhs_delta = _tile_delta(mm.lhs, mms[0].lhs, j)
+            rhs_delta = _tile_delta(mm.rhs, mms[0].rhs, j)
+            lhs_name = None if lhs_delta is not None else _operand(self.value_map[mm.lhs], "lhs")
+            rhs_name = None if rhs_delta is not None else _operand(self.value_map[mm.rhs], "rhs")
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
             desc_rhs = f"desc_rhs{j}"
-            if derive_rhs:
-                desc_template += (
-                    f"add.u64 ${{b64:{desc_rhs}}}, ${{b64:desc_rhs0}}, "
-                    f"{rhs_delta // 16};\n"
-                )
-            else:
-                desc_template += _build_desc(
-                    desc_rhs, f"operand.{rhs_name}.ptr", desc_const_rhs,
-                )
+            desc_template += _desc(
+                desc_rhs, "desc_rhs0", rhs_delta,
+                f"operand.{rhs_name}.ptr", desc_const_rhs,
+            )
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
                 desc_lhs = f"desc_lhs{j}_{m_it}"
-                if derive_lhs:
-                    desc_template += (
-                        f"add.u64 ${{b64:{desc_lhs}}}, "
-                        f"${{b64:desc_lhs0_{m_it}}}, {lhs_delta // 16};\n"
-                    )
-                else:
-                    desc_template += _build_desc(
-                        desc_lhs, f"operand.{lhs_name}.ptr", desc_const_lhs,
-                        offset=lhs_offset if m_it > 0 else None,
-                    )
+                desc_template += _desc(
+                    desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
+                    f"operand.{lhs_name}.ptr", desc_const_lhs,
+                    lhs_offset if m_it > 0 else None,
+                )
 
             if mm.scale_d is None:
                 scale_d = "1"
@@ -1473,9 +1391,7 @@ class LowerToPtxTemplate(LoweringPass):
         operands = [dst_value, src_value] + idx_values
         operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
         tensor_rank = len(idx_values)
-        layout = desc_type.physical_layout
-        if layout is not None:
-            assert layout.get("kind") == "blocked_padding"
+        if desc_type.physical_layout is not None:
             assert tensor_rank == desc_type.gmem_type.rank + 1
         else:
             assert tensor_rank == desc_type.gmem_type.rank
@@ -1484,9 +1400,7 @@ class LowerToPtxTemplate(LoweringPass):
             for i in reversed(range(len(idx_values)))
         )
 
-        cache_hint = op.attrs.get("l2_cache_hint")
-        if cache_hint not in (None, "evict_first", "evict_last"):
-            raise ValueError(f"unsupported TMA L2 cache hint {cache_hint!r}")
+        cache_hint = op.l2_cache_hint
         cache_suffix = ".L2::cache_hint" if cache_hint is not None else ""
         cache_operand = ""
         if cache_hint is not None:
@@ -1553,9 +1467,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"${{b32:operand.{idx_names[j]}.val}}"
                 for j in reversed(range(len(idx_values)))
             )
-            cache_hint = tma.attrs.get("l2_cache_hint")
-            if cache_hint not in (None, "evict_first", "evict_last"):
-                raise ValueError(f"unsupported TMA L2 cache hint {cache_hint!r}")
+            cache_hint = tma.l2_cache_hint
             if cache_hint is not None:
                 policy_name = f"cache_policy{i}"
                 operands.append(self.cache_policy_values[cache_hint])

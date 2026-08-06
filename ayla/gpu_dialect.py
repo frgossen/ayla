@@ -4,11 +4,67 @@ from __future__ import annotations
 import enum
 import math
 import string
+from dataclasses import dataclass
 
 from .base.ir import Block, Dialect, Op, Region, Type, Value
 from .base.printer import Printer
 
 gpu_dialect = Dialect("gpu")
+
+
+@dataclass(frozen=True)
+class BlockedLayout:
+    """Validated view of a ``blocked_padding`` physical-layout attribute."""
+
+    block: int
+    padding: int
+    order: str = "row_major"
+    outer_size: int | None = None
+
+    @classmethod
+    def parse(cls, attrs: dict[str, object] | None) -> "BlockedLayout | None":
+        if attrs is None:
+            return None
+        if attrs.get("kind") != "blocked_padding":
+            raise NotImplementedError(f"unsupported physical layout {attrs!r}")
+        order = str(attrs.get("order", "row_major"))
+        if order not in ("row_major", "block_major"):
+            raise ValueError(f"unsupported blocked layout order {order!r}")
+        outer = attrs.get("outer_size")
+        return cls(
+            int(attrs["block"]), int(attrs["padding"]), order,
+            int(outer) if outer is not None else None,
+        )
+
+    def physical_inner(self, logical: int) -> int:
+        chunk, inner = divmod(logical, self.block)
+        stride = self.block + self.padding
+        if self.order == "block_major":
+            if self.outer_size is None:
+                raise ValueError("block-major layout requires outer_size")
+            stride *= self.outer_size
+        return chunk * stride + inner
+
+    def tensor_storage(
+        self, sizes: list[int], dtype: Type,
+    ) -> tuple[list[int], dict[str, object]]:
+        if len(sizes) != 2 or sizes[-1] % self.block:
+            raise ValueError("blocked padding requires a divisible rank-2 tile")
+        padded = self.block + self.padding
+        if self.padding < 0 or padded > 256 or padded * dtype.byte_size % 16:
+            raise ValueError("invalid padded TMA inner box")
+        outer = sizes[0] if self.order == "block_major" else None
+        attrs: dict[str, object] = {
+            "kind": "blocked_padding", "block": self.block,
+            "padding": self.padding,
+        }
+        if self.order != "row_major":
+            attrs.update(order=self.order, outer_size=outer)
+        row_stride = (
+            sizes[-1] // self.block * padded
+            if self.order == "row_major" else padded
+        )
+        return [row_stride, 1], attrs
 
 
 # TODO: Rename types : gmem_tensor --> gmem etc.
@@ -314,6 +370,32 @@ class TileOp(Op):
                 f"match arg strides {list(arg_type.strides)}"
             )
 
+    def constant_byte_delta(self, base: "TileOp") -> int | None:
+        """Return the proven constant byte offset from a sibling tile."""
+        if self.arg is not base.arg or self.result().type != base.result().type:
+            return None
+
+        def constant(index: Value | int) -> int | None:
+            if isinstance(index, int):
+                return index
+            if isinstance(index.definition, IndexConstantOp):
+                return index.definition.value
+            return None
+
+        indices = [constant(index) for index in self.indices]
+        base_indices = [constant(index) for index in base.indices]
+        if any(index is None for index in indices + base_indices):
+            return None
+        typ = self.result().type
+        assert isinstance(typ, AddrMemTensorType)
+        offsets = [
+            typ.element_offset([
+                int(index) * size for index, size in zip(tile_indices, typ.sizes)
+            ])
+            for tile_indices in (indices, base_indices)
+        ]
+        return (offsets[0] - offsets[1]) * typ.dtype.byte_size
+
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):
             if i:
@@ -526,6 +608,13 @@ class TmaMoveOp(Op):
     @property
     def indices(self) -> list[Value]:
         return self.operands[2:]
+
+    @property
+    def l2_cache_hint(self) -> str | None:
+        hint = self.attrs.get("l2_cache_hint")
+        if hint not in (None, "evict_first", "evict_last"):
+            raise ValueError(f"unsupported TMA L2 cache hint {hint!r}")
+        return hint  # type: ignore[return-value]
 
 
 @gpu_dialect.register_type("token")
@@ -883,6 +972,31 @@ class AddrMemTensorType(MemTensorType):
         value = self.attrs.get("physical_layout")
         return value if isinstance(value, dict) else None
 
+    @property
+    def blocked_layout(self) -> BlockedLayout | None:
+        return BlockedLayout.parse(self.physical_layout)
+
+    def element_offset(self, indices: list[int]) -> int:
+        """Map logical element coordinates to a physical element offset."""
+        if len(indices) != self.rank:
+            raise ValueError(f"expected {self.rank} indices, got {len(indices)}")
+        layout = self.blocked_layout
+        offset = 0
+        for dim, (index, stride) in enumerate(zip(indices, self.strides)):
+            if layout is not None and dim == self.rank - 1:
+                index = layout.physical_inner(index)
+            offset += index * stride
+        return offset
+
+    @property
+    def storage_num_elements(self) -> int:
+        layout = self.blocked_layout
+        if layout is None:
+            return self.num_elements
+        return self.num_elements // layout.block * (
+            layout.block + layout.padding
+        )
+
     def write_strides(self, p: Printer) -> None:
         if not self.is_canonical_strides:
             p.write(" strides=")
@@ -960,6 +1074,20 @@ class SmemTensorType(AddrMemTensorType):
             "swizzle": swizzle,
             **(attrs or {}),
         })
+
+    @classmethod
+    def build_physical(
+        cls, sizes: list[int], dtype: Type, swizzle: str | None,
+        physical_layout: dict[str, object] | None,
+    ) -> "SmemTensorType":
+        layout = BlockedLayout.parse(physical_layout)
+        if layout is None:
+            return cls.build(sizes, dtype, swizzle=swizzle)
+        strides, normalized = layout.tensor_storage(sizes, dtype)
+        return cls.build(
+            sizes, dtype, strides, swizzle,
+            attrs={"physical_layout": normalized},
+        )
 
     @property
     def swizzle(self) -> str | None:

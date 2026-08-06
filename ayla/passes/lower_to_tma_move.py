@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from ..gpu_dialect import (
     AsyncOp,
+    BlockedLayout,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -136,17 +137,9 @@ def _build_tile_chain_indices(
     root = v
 
     ndims = root.type.rank
-    block = None
-    if physical_layout is not None:
-        if physical_layout.get("kind") != "blocked_padding":
-            raise NotImplementedError(
-                f"unsupported physical layout {physical_layout!r}"
-            )
-        block = int(physical_layout["block"])
-        order = physical_layout.get("order", "row_major")
-        if order not in ("row_major", "block_major"):
-            raise ValueError(f"unsupported blocked layout order {order!r}")
-        if any(tile.result().type.sizes[-1] % block for tile in tiles):
+    layout = BlockedLayout.parse(physical_layout)
+    if layout is not None:
+        if any(tile.result().type.sizes[-1] % layout.block for tile in tiles):
             raise ValueError(
                 "blocked-padding TMA coordinates must start on block boundaries"
             )
@@ -163,9 +156,8 @@ def _build_tile_chain_indices(
                 idx = const_op.result()
 
             tile_size = result_sizes[dim]
-            if physical_layout is not None and dim == ndims - 1:
-                assert block is not None
-                tile_size //= block
+            if layout is not None and dim == ndims - 1:
+                tile_size //= layout.block
             tile_size_op = IndexConstantOp.build(tile_size)
             new_ops.append(tile_size_op)
             mul_op = IndexMulOp.build(idx, tile_size_op.result())
@@ -174,12 +166,12 @@ def _build_tile_chain_indices(
             new_ops.append(add_op)
             indices[dim] = add_op.result()
 
-    if physical_layout is not None:
+    if layout is not None:
         # Every tiled offset starts at a physical block boundary.  Express that
         # proof in the IR: the last coordinate counts blocks and the inner
         # coordinate is zero.
         indices.append(zero.result())
-        if physical_layout.get("order", "row_major") == "block_major":
+        if layout.order == "block_major":
             # Physical order is [inner blocks, outer dimensions..., inner].
             # PTX reverses this list into fastest-dimension-first order.
             indices = [indices[-2], *indices[:-2], indices[-1]]
