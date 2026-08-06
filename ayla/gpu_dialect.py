@@ -490,12 +490,54 @@ class MoveOp(Op):
         return self.operands[2:]
 
 
+@gpu_dialect.register_op("stmatrix_store")
+class StMatrixStoreOp(Op):
+    """Target-level grouped store from a distributed fragment to SMEM.
+
+    Instruction selection has already proven layout compatibility and
+    captured the distributed-to-physical layout mapping. ``register_starts``
+    and ``offsets`` identify groups of four packed fragment registers and their
+    compile-time destination byte offsets.
+    """
+
+    @classmethod
+    def build(
+        cls, dst: Value, src: Value, register_starts: list[int], offsets: list[int],
+        attrs: dict[str, object] | None = None,
+    ) -> "StMatrixStoreOp":
+        return cls(
+            operands=[dst, src], results=[],
+            attrs={
+                "register_starts": list(register_starts),
+                "offsets": list(offsets),
+                **(attrs or {}),
+            },
+        )
+
+    @property
+    def dst(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def src(self) -> Value:
+        return self.operands[1]
+
+    @property
+    def offsets(self) -> list[int]:
+        return self.attrs["offsets"]  # type: ignore[return-value]
+
+    @property
+    def register_starts(self) -> list[int]:
+        return self.attrs["register_starts"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("tma_move")
 class TmaMoveOp(Op):
     """TMA bulk transfer between smem and gmem (block-collective), sync form.
 
     One operand is a TMA descriptor (gmem side), the other is smem. Indices are
-    per-dim element coordinates for the TMA engine. Direction (load/store) is
+    physical per-dimension coordinates for the TMA engine; a physical layout
+    may therefore add dimensions relative to the logical tensor. Direction is
     determined by which side is smem vs tma_desc. Completion tracking is the
     surrounding ``async { ... }`` wrapper's job (it owns the lock), so this op
     carries no lock itself — mirroring ``move`` and ``matmul``.
@@ -1666,6 +1708,14 @@ def root_buffer(value: Value) -> Value:
     return value
 
 
+def wgmma_layout_0_static_offsets(reg: int, n_dim: int) -> tuple[int, int]:
+    """Logical (row, column) of a packed WGMMA accumulator register."""
+    n_groups = n_dim // 16
+    m, w = divmod(reg // 4, n_groups)
+    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][reg % 4]
+    return (m * 64 + di, w * 16 + dj)
+
+
 class CollectiveScope(enum.IntEnum):
     r"""The granularity at which an effect is completely independent of concurrent
     operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
@@ -1750,7 +1800,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     """
     if is_side_effect_free(op):
         return []
-    if isinstance(op, MoveOp):
+    if isinstance(op, (MoveOp, StMatrixStoreOp)):
         # A TMA move is issued by the leader thread (t0), so its smem write is
         # BLOCK_LEADER; a cooperative move writes at the buffer's own scope.
         src_scope = (
@@ -1760,7 +1810,8 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         )
         dst_scope = (
             CollectiveScope.BLOCK_LEADER
-            if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
+            if isinstance(op, MoveOp)
+            and op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
             else _type_collective_scope(op.dst.type)
         )
         return [("W", root_buffer(op.dst), dst_scope),

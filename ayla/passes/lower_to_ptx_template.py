@@ -38,12 +38,14 @@ from ..gpu_dialect import (
     PtrType,
     RmemTensorType,
     SmemTensorType,
+    StMatrixStoreOp,
     ThreadIdsOp,
     TileOp,
     TmaDescType,
     TmaMoveOp,
     ToPtrOp,
     WrmemTensorType,
+    wgmma_layout_0_static_offsets,
 )
 from ..base.ir import Op, Value
 from ..base.lowering_pass import LoweringPass
@@ -56,6 +58,7 @@ class LowerToPtxTemplate(LoweringPass):
         super().__init__()
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
+        self.register(StMatrixStoreOp, type(self).lower_stmatrix_store)
         self.register(MatmulOp, type(self).lower_matmul)
         self.register(AsyncOp, type(self).lower_async)
         self.register(AwaitOp, type(self).lower_await)
@@ -1105,6 +1108,42 @@ class LowerToPtxTemplate(LoweringPass):
         )
         new_ops.append(new_op)
         return new_ops, []
+
+    def lower_stmatrix_store(
+        self, op: StMatrixStoreOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Print an already-selected grouped store; all address policy is IR."""
+        dst = self.value_map[op.dst]
+        src = self.value_map[op.src]
+        dst_type = op.dst.type
+        assert isinstance(dst_type, SmemTensorType)
+        template = textwrap.dedent(f"""\
+            mov.u32 ${{b32:st_lane}}, %laneid;
+            mov.u32 ${{b32:st_tid}}, %tid.x;
+            and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
+            shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
+            and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 15;
+            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
+            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 4;
+            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
+            mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, {dst_type.strides[0]}, ${{b32:st_col}};
+            shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
+            add.u32 ${{b32:base}}, ${{b32:operand.dst.ptr}}, ${{b32:st_off}};
+        """)
+        for first, offset in zip(op.register_starts, op.offsets):
+            regs = ", ".join(
+                f"${{b32:operand.src.r{i}}}" for i in range(first, first + 4)
+            )
+            template += (
+                "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
+                f"[${{b32:base}}+{offset}], {{{regs}}};\n"
+            )
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[],
+            description=str(op),
+        )
+        return [lowered], []
 
     def _lower_move_smem_to_wrmem_mma(
         self, op: MoveOp,
