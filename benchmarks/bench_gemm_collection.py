@@ -300,6 +300,14 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
             label="ayla.auto_matmul (wgmma256 wg, 3D input TMA K-tile=128, split output, 2 tiles/CTA)",
             m=4096,
             n=4096,

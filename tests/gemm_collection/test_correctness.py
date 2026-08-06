@@ -85,6 +85,22 @@ def test_pre_stsm_variant_uses_scalar_shared_stores():
     assert "cp.async.bulk.tensor.2d.global.shared" in kernel.ptx
 
 
+def test_four_output_tiles_reuse_the_existing_pipeline_resources():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4, operand_stages=3, output_slices=2,
+        output_tma_inner_padding=16, output_store_buffers=2,
+        lhs_l2_cache_hint="evict_first",
+    ))
+    assert kernel.name.endswith("_k3_4tiles_split2_dbuf2")
+    assert kernel.grid_dim == (8, 16, 1)
+    assert kernel.block_dim == (256, 1, 1)
+    assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 8
+    assert kernel.ptx.count("cp.async.bulk.wait_group") == 8
+    assert kernel.ptx.count("stmatrix.") == 64
+    assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
+    assert kernel.ptx.count("bytes.L2::cache_hint") == 28
+
+
 def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=2, operand_stages=4, output_slices=2,
@@ -209,6 +225,11 @@ def test_m192_split2_uses_three_warpgroups_and_partial_m_tile():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2,

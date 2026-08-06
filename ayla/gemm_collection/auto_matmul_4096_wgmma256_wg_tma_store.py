@@ -1,7 +1,9 @@
 """Configurable wgmma256 GEMM with pipelined TMA output stores."""
 import textwrap
 
+from ..base.ir import find_ops
 from ..gpu_dialect import gpu_dialect
+from ..gpu_dialect import MoveOp
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
@@ -32,9 +34,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_tma_inner_size: int | None = 128,
     output_tma_inner_padding: int = 8,
     output_store: str = "stmatrix",
+    lhs_l2_cache_hint: str | None = None,
 ):
-    if output_tiles_per_cta not in (1, 2):
-        raise ValueError("output_tiles_per_cta must be 1 or 2")
+    if output_tiles_per_cta not in (1, 2, 4):
+        raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
     if output_m_tile not in (128, 192):
         raise ValueError("output_m_tile must be 128 or 192")
     if output_m_tile == 192 and output_tiles_per_cta != 1:
@@ -49,6 +52,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix"):
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
+    if lhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
+        raise ValueError("unsupported lhs_l2_cache_hint")
     if output_store == "scalar":
         output_tma_inner_size = None
         output_tma_inner_padding = 0
@@ -61,8 +66,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_n{output_n_tile}"
     if warpgroup_n_tile not in (128, 256):
         name += f"_wg{warpgroup_n_tile}"
-    if output_tiles_per_cta == 2:
-        name += "_2tiles"
+    if output_tiles_per_cta != 1:
+        name += f"_{output_tiles_per_cta}tiles"
     if output_slices != 1:
         name += f"_split{output_slices}"
     if output_store_buffers != 1:
@@ -157,12 +162,22 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         module = licm(module)
         module = canonicalize(module)
 
-    if output_tiles_per_cta == 2:
+    if output_tiles_per_cta != 1:
         module = unroll_loop(
-            module, unroll_factor=2,
+            module, unroll_factor=output_tiles_per_cta,
             label_filter="outm",
         )
     module = schedule_async(module)
+    if lhs_l2_cache_hint is not None:
+        lhs_tma_loads = find_ops(
+            module,
+            lambda op: isinstance(op, MoveOp)
+            and "_lhs_smem" in str(op.attrs.get("label", "")),
+        )
+        if not lhs_tma_loads:
+            raise RuntimeError("expected at least one lhs TMA load")
+        for load in lhs_tma_loads:
+            load.attrs["l2_cache_hint"] = lhs_l2_cache_hint
     return canonicalize(module)
 
 
@@ -193,6 +208,18 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
     )
     make_torch_custom_call(
         make_ptx_launcher(k3_split2_kernel),
+        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
+    )
+
+    k3_split2_four_tile_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_tiles_per_cta=4, operand_stages=3, output_slices=2,
+            output_tma_inner_padding=16, output_store_buffers=2,
+            lhs_l2_cache_hint="evict_first",
+        )
+    )
+    make_torch_custom_call(
+        make_ptx_launcher(k3_split2_four_tile_kernel),
         [OperandKind.R, OperandKind.R, OperandKind.RESULT],
     )
 
