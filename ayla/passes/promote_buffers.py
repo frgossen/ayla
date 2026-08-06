@@ -164,6 +164,22 @@ def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
     return TileOp.build(value, indices, typ)
 
 
+def _sliced_moves(
+    dst: Value, src: Value, count: int, dim: int, attrs: dict[str, object],
+) -> list[Op]:
+    if count == 1:
+        return [MoveOp.build(dst, src, attrs=attrs)]
+    size, remainder = divmod(src.type.sizes[dim], count)
+    if remainder:
+        raise ValueError("move extent must divide evenly into slices")
+    ops: list[Op] = []
+    for index in range(count):
+        src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
+        move = MoveOp.build(dst_tile.result(), src_tile.result(), attrs=attrs)
+        ops.extend([src_tile, dst_tile, move])
+    return ops
+
+
 class PromoteBuffers(LoweringPass):
     """Promote matmul operands to *target_type* memory space.
 
@@ -198,6 +214,8 @@ class PromoteBuffers(LoweringPass):
         Optional physical shared-memory layout used for output staging.
     writeback_slices, writeback_buffers : int
         Number of TMA output slices and SMEM staging arenas.
+    tma_load_slices : dict[str, int] or None
+        Leading-dimension TMA load slices by operand.
     move_attrs : dict[str, dict[str, object]] or None
         Extra move attributes by operand.
     """
@@ -216,6 +234,7 @@ class PromoteBuffers(LoweringPass):
         physical_layout: dict[str, object] | None = None,
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
+        tma_load_slices: dict[str, int] | None = None,
         move_attrs: dict[str, dict[str, object]] | None = None,
         label_filter: str | None = None,
     ) -> None:
@@ -232,8 +251,9 @@ class PromoteBuffers(LoweringPass):
         self.physical_layout = physical_layout
         self.writeback_slices = writeback_slices
         self.writeback_buffers = writeback_buffers
+        self.tma_load_slices = dict(tma_load_slices or {})
         self.move_attrs = dict(move_attrs or {})
-        if writeback_slices < 1:
+        if writeback_slices < 1 or any(n < 1 for n in self.tma_load_slices.values()):
             raise ValueError("slice counts must be positive")
         if writeback_buffers not in (1, writeback_slices):
             raise ValueError("writeback_buffers must be 1 or equal writeback_slices")
@@ -323,8 +343,11 @@ class PromoteBuffers(LoweringPass):
         else:
             attrs = self._build_move_attrs(matmul_label, operand_name)
             alloc = AllocOp.build(self._build_target_type(chain_root.type, dtype=chain_root.type.dtype))
-            move = MoveOp.build(dst=alloc.result(), src=chain_root, attrs=attrs)
-            new_ops.extend([alloc, move])
+            new_ops.append(alloc)
+            new_ops.extend(_sliced_moves(
+                alloc.result(), chain_root,
+                self.tma_load_slices.get(operand_name, 1), 0, attrs,
+            ))
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build(target_type)
                 cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
@@ -478,6 +501,7 @@ def promote_buffers(
     physical_layout: dict[str, object] | None = None,
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
+    tma_load_slices: dict[str, int] | None = None,
     move_attrs: dict[str, dict[str, object]] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
@@ -494,6 +518,7 @@ def promote_buffers(
         physical_layout=physical_layout,
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
+        tma_load_slices=tma_load_slices,
         move_attrs=move_attrs,
         label_filter=label_filter,
     ).run(module)
