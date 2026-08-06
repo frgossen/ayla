@@ -185,6 +185,8 @@ class PromoteBuffers(LoweringPass):
         block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
         Non-coherent cache hint for gmem→rmem loads.
+    physical_layout : dict or None
+        Optional physical shared-memory layout used for output staging.
     """
 
     def __init__(
@@ -198,6 +200,7 @@ class PromoteBuffers(LoweringPass):
         warps: int | None = None,
         tma: bool = False,
         nc: bool = False,
+        physical_layout: dict[str, object] | None = None,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -210,6 +213,7 @@ class PromoteBuffers(LoweringPass):
         self.warps = warps
         self.tma = tma
         self.nc = nc
+        self.physical_layout = physical_layout
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_target_type(self, base_type, dtype=None):
@@ -222,7 +226,9 @@ class PromoteBuffers(LoweringPass):
         if tensor_cls is GmemTensorType:
             return GmemTensorType.build(sizes, dtype)
         if tensor_cls is SmemTensorType:
-            return SmemTensorType.build(sizes, dtype, swizzle=self.swizzle)
+            return SmemTensorType.build_physical(
+                sizes, dtype, self.swizzle, self.physical_layout,
+            )
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WrmemTensorType:
@@ -331,8 +337,9 @@ class PromoteBuffers(LoweringPass):
             narrow_tiles.append(tile)
             block_dst = tile.arg
         assert isinstance(block_dst.type, GmemTensorType)
-        smem = AllocOp.build(SmemTensorType.build(
-            list(block_dst.type.sizes), block_dst.type.dtype, swizzle=None,
+        smem_sizes = list(block_dst.type.sizes)
+        smem = AllocOp.build(SmemTensorType.build_physical(
+            smem_sizes, block_dst.type.dtype, None, self.physical_layout,
         ))
         new_ops: list[Op] = [smem]
         gather_dst = smem.result()
@@ -421,6 +428,7 @@ def promote_buffers(
     warps: int | None = None,
     tma: bool = False,
     nc: bool = False,
+    physical_layout: dict[str, object] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -433,5 +441,6 @@ def promote_buffers(
         warps=warps,
         tma=tma,
         nc=nc,
+        physical_layout=physical_layout,
         label_filter=label_filter,
     ).run(module)

@@ -18,12 +18,25 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     *, output_tiles_per_cta: int = 1,
+    # Split each 256-column output row into two 128-element TMA dimensions.
+    # Eight shared-only elements of padding per dimension make the physical
+    # row stride 272 BF16s, reducing STMatrix's bank expansion from 8x to 2x.
+    output_tma_inner_size: int | None = 128,
+    output_tma_inner_padding: int = 8,
+    output_store: str = "stmatrix",
 ):
     if output_tiles_per_cta not in (1, 2):
         raise ValueError("output_tiles_per_cta must be 1 or 2")
+    if output_store not in ("scalar", "stmatrix"):
+        raise ValueError("output_store must be 'scalar' or 'stmatrix'")
+    if output_store == "scalar":
+        output_tma_inner_size = None
+        output_tma_inner_padding = 0
     name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
     if output_tiles_per_cta == 2:
         name += "_2tiles"
+    if output_store == "scalar":
+        name += "_pre_stsm"
     grid_x = 32 // output_tiles_per_cta
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
@@ -51,6 +64,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     module = promote_buffers(
         module, target_type="wrmem", operands=["dst"], swizzle=None,
         layout="wgmma_layout_0", warps=4, tma=True, nc=False,
+        physical_layout=(
+            {"kind": "blocked_padding", "block": output_tma_inner_size,
+             "padding": output_tma_inner_padding}
+            if output_tma_inner_size is not None else None
+        ),
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(
@@ -111,6 +129,16 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
     two_tile_launcher = make_ptx_launcher(two_tile_kernel)
     make_torch_custom_call(
         two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    )
+
+    pre_stsm_kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
+            output_tiles_per_cta=2, output_store="scalar",
+        )
+    )
+    pre_stsm_launcher = make_ptx_launcher(pre_stsm_kernel)
+    make_torch_custom_call(
+        pre_stsm_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     )
 
 
