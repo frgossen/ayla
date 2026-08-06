@@ -111,6 +111,33 @@ class LowerToPtxTemplate(LoweringPass):
             elem_off = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(elem_off)
 
+            layout = root_type.blocked_layout
+            if layout is not None and dim == root_type.rank - 1:
+                block_op = IndexConstantOp.build(layout.block)
+                chunk = IndexDivOp.build(elem_off.result(), block_op.result())
+                inner = IndexModOp.build(elem_off.result(), block_op.result())
+                padded_op = IndexConstantOp.build(
+                    layout.block + layout.padding
+                )
+                if layout.order == "row_major":
+                    chunk_stride = padded_op.result()
+                else:
+                    assert layout.outer_size is not None
+                    rows_op = IndexConstantOp.build(layout.outer_size)
+                    chunk_stride_op = IndexMulOp.build(
+                        rows_op.result(), padded_op.result(),
+                    )
+                    new_ops.extend([rows_op, chunk_stride_op])
+                    chunk_stride = chunk_stride_op.result()
+                chunk_off = IndexMulOp.build(chunk.result(), chunk_stride)
+                physical_off = IndexAddOp.build(
+                    chunk_off.result(), inner.result(),
+                )
+                new_ops.extend([
+                    block_op, chunk, inner, padded_op, chunk_off, physical_off,
+                ])
+                elem_off = physical_off
+
             stride_bytes = root_type.strides[dim] * dtype_bytes
             stride_op = IndexConstantOp.build(stride_bytes)
             new_ops.append(stride_op)
@@ -229,7 +256,8 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_bytes = smem_type.num_elements * smem_type.dtype.byte_size
+        n_elements = smem_type.storage_num_elements
+        n_bytes = n_elements * smem_type.dtype.byte_size
         template = textwrap.dedent(f"""\
             .shared .align 128 .b8 ${{smem:sym}}[{n_bytes}];
             mov.u32 ${{b32:result.dst.ptr}}, ${{smem:sym}};
@@ -1207,11 +1235,18 @@ class LowerToPtxTemplate(LoweringPass):
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
         idx_values = [self.value_map[v] for v in op.indices]
+        desc_type = dst_value.type
+        assert isinstance(desc_type, TmaDescType)
 
         # Bulk groups have no addressable lock object; completion is tracked by
         # commit_group/wait_group.
         operands = [dst_value, src_value] + idx_values
         operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
+        tensor_rank = len(idx_values)
+        if desc_type.physical_layout is not None:
+            assert tensor_rank == desc_type.gmem_type.rank + 1
+        else:
+            assert tensor_rank == desc_type.gmem_type.rank
         indices = ", ".join(
             f"${{b32:operand.idx{i}.val}}"
             for i in reversed(range(len(idx_values)))
@@ -1230,7 +1265,7 @@ class LowerToPtxTemplate(LoweringPass):
             setp.ne.s32 ${{pred:st_not_t0}}, ${{b32:st_tid}}, 0;
             @${{pred:st_not_t0}} bra ${{label:st_done}};
             fence.proxy.async.shared::cta;
-            cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
+            cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
         """)
@@ -1287,8 +1322,9 @@ class LowerToPtxTemplate(LoweringPass):
                 for j in reversed(range(len(idx_values)))
             )
             load_lines.append(
-                f"cp.async.bulk.tensor.2d.shared::cluster.global."
-                f"mbarrier::complete_tx::bytes [${{b32:operand.{dn}.ptr}}], "
+                f"cp.async.bulk.tensor.{len(idx_values)}d.shared::cluster.global."
+                f"mbarrier::complete_tx::bytes "
+                f"[${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
                 f"[${{b32:operand.lock.val}}];"
             )
