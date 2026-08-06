@@ -566,6 +566,7 @@ class LowerToPtxTemplate(LoweringPass):
             return name
 
         desc_template = ""
+        scale_template = ""
         mma_template = ""
         for j, mm in enumerate(mms):
             lhs_type = mm.lhs.type
@@ -633,6 +634,16 @@ class LowerToPtxTemplate(LoweringPass):
                     offset=lhs_offset if m_it > 0 else None,
                 )
 
+            if mm.scale_d is None:
+                scale_d = "1"
+            else:
+                scale_name = _operand(self.value_map[mm.scale_d], "scale_d")
+                scale_pred = f"scale_d{j}"
+                scale_template += (
+                    f"setp.ne.u32 ${{pred:{scale_pred}}}, "
+                    f"${{b32:operand.{scale_name}.val}}, 0;\n"
+                )
+                scale_d = f"${{pred:{scale_pred}}}"
             reg_offset = 0
             for m_it in range(m_iters):
                 regs = ", ".join(
@@ -644,7 +655,7 @@ class LowerToPtxTemplate(LoweringPass):
                       {{{regs}}},
                       ${{b64:desc_lhs{j}_{m_it}}},
                       ${{b64:{desc_rhs}}},
-                      1, 1, 1, 0, 0;
+                      {scale_d}, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
 
@@ -655,6 +666,7 @@ class LowerToPtxTemplate(LoweringPass):
         # warpgroup-wide wgmma reads).
         template = (
             "wgmma.fence.sync.aligned;\n"
+            + scale_template
             + desc_template
             + mma_template
             + "wgmma.commit_group.sync.aligned;\n"

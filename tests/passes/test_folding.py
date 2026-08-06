@@ -1,8 +1,11 @@
 """Tests for the `folding` pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
-from ayla.passes.folding import folding
+import pytest
+
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import AllocOp, MatmulOp, gpu_dialect
+from ayla.passes.folding import Folding, folding
 
 
 def test_fold_constants():
@@ -40,3 +43,30 @@ def test_fold_constants():
             %cx_offset: index = index_mul(%cx: index, %c64: index)
           }
         }""")
+
+
+@pytest.mark.parametrize("nested,folds", [(False, True), (True, False)])
+def test_fold_accumulator_init(nested, folds):
+    matmul = (
+        "matmul(%a: smem_tensor<64x16xbf16>, "
+        "%b: smem_tensor<256x16xbf16>, "
+        "%acc: wrmem_tensor<64x256xf32 warps=4 "
+        "layout=\"wgmma_layout_0\">)"
+    )
+    body = f"for (%kk: index = 0 to 4) {{ {matmul} }}" if nested else matmul
+    module = gpu_dialect.parse(f"""
+        module {{
+          kernel @k() {{
+            %a: smem_tensor<64x16xbf16> = alloc()
+            %b: smem_tensor<256x16xbf16> = alloc()
+            %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{init: 0.0}}
+            for (%k: index = 0 to 4) {{ {body} }}
+          }}
+        }}
+    """)
+    Folding(fold_accumulator_init=True).run(module)
+    [alloc] = find_ops(module, lambda op: isinstance(op, AllocOp)
+                       and op.result().type.name == "wrmem_tensor")
+    [matmul] = find_ops(module, lambda op: isinstance(op, MatmulOp))
+    assert (alloc.init is None) is folds
+    assert (matmul.scale_d is not None) is folds

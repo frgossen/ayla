@@ -7,24 +7,63 @@ eliminates trivial operations like `x * 1`, `x + 0`, `0 * n`,
 from __future__ import annotations
 
 from ..gpu_dialect import (
+    AllocOp,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    MatmulOp,
     ModuleOp,
     PtrAddOp,
     TileOp,
+    WrmemTensorType,
 )
-from ..base.ir import Op, Value, clone_op
+from ..base.ir import Block, Op, Value, clone_op, iter_ops
 from ..base.lowering_pass import LoweringPass
+
+
+def _first_matmul(ops: list[Op], dst: Value) -> MatmulOp | None:
+    for op in ops:
+        if isinstance(op, MatmulOp) and op.dst is dst:
+            return op
+        if isinstance(op, ForOp):
+            continue
+        for region in op.regions:
+            for block in region.blocks:
+                if found := _first_matmul(block.ops, dst):
+                    return found
+    return None
+
+
+def _fold_accumulator_init(block: Block) -> None:
+    """Replace a zero-filled WGMMA accumulator with first-iteration scale-d."""
+    for index, alloc in enumerate(block.ops):
+        if not (isinstance(alloc, AllocOp)
+                and isinstance(alloc.result().type, WrmemTensorType)
+                and alloc.init == 0):
+            continue
+        accumulator = alloc.result()
+        users = {id(op) for op in accumulator.users()}
+        first_user = next((
+            op for op in block.ops[index + 1:]
+            if any(id(nested) in users for nested in iter_ops(op))
+        ), None)
+        if not (isinstance(first_user, ForOp)
+                and first_user.lb == 0 and first_user.trip_count > 0):
+            continue
+        matmul = _first_matmul(first_user.body.entry_block.ops, accumulator)
+        if matmul is not None and matmul.scale_d is None:
+            matmul.operands.append(first_user.iv)
+            alloc.attrs.pop("init")
 
 
 class Folding(LoweringPass):
 
-    def __init__(self) -> None:
+    def __init__(self, *, fold_accumulator_init: bool = False) -> None:
         super().__init__()
+        self.fold_accumulator_init = fold_accumulator_init
         self.register(ForOp, type(self).lower_for)
         self.register(IndexAddOp, type(self).lower_add)
         self.register(IndexMulOp, type(self).lower_mul)
@@ -32,6 +71,11 @@ class Folding(LoweringPass):
         self.register(IndexModOp, type(self).lower_mod)
         self.register(PtrAddOp, type(self).lower_ptr_add)
         self.register(TileOp, type(self).lower_tile)
+
+    def lower_block(self, block: Block) -> None:
+        if self.fold_accumulator_init:
+            _fold_accumulator_init(block)
+        super().lower_block(block)
 
     def lower_for(
         self, op: ForOp,

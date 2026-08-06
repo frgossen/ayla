@@ -97,6 +97,9 @@ class LowerToAsync(LoweringPass):
         lhs = self.value_map[op.lhs]
         rhs = self.value_map[op.rhs]
         dst = self.value_map[op.dst]
+        scale_d = (
+            self.value_map[op.scale_d] if op.scale_d is not None else None
+        )
         # Only wgmma matmuls (smem×smem→wrmem, 4 warps) are async; plain FMA
         # matmuls stay synchronous. Same idea as ``lower_move``'s tma gate.
         # TODO: lower *all* matmuls as async (FMA ones too), wrapping every
@@ -108,7 +111,9 @@ class LowerToAsync(LoweringPass):
                 and isinstance(dst.type, WrmemTensorType)
                 and dst.type.warps == 4):
             return None
-        matmul = MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs)
+        matmul = MatmulOp.build(
+            lhs=lhs, rhs=rhs, dst=dst, scale_d=scale_d, attrs=op.attrs,
+        )
         return self._wrap(matmul, "wgmma", op.attrs)
 
 

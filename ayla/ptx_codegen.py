@@ -54,6 +54,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(Folding())
         self.add_pass(CSE())
         self.add_pass(DCE())
+        self.add_pass(Folding(fold_accumulator_init=True))
         self.add_pass(InsertSyncs())
         self.add_pass(SelectStMatrix())
         self.add_pass(LowerToPtxTemplate())
