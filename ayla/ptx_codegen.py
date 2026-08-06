@@ -480,13 +480,18 @@ def _emit_block_ids(p: PtxPrinter, op: BlockIdsOp) -> None:
     p.write_newline_once()
 
 
-# TODO: Emit S index computations instead.
 def _emit_warp_group_id(p: PtxPrinter, op: WarpGroupIdOp) -> None:
     rx = p.unique_ptx_names_for_value(op.x)
     ry = p.unique_ptx_names_for_value(op.y)
     rz = p.unique_ptx_names_for_value(op.z)
     p.write_newline_once()
+    # Broadcast the logical warp's lane-0 thread id before extracting its
+    # warpgroup.  The shuffle makes warp uniformity explicit to ptxas without
+    # relying on the volatile physical `%warpid` special register.
     p.write_line(f"mov.u32 {rx}, %tid.x;")
+    p.write_line(
+        f"shfl.sync.idx.b32 {rx}, {rx}, 0, 0x1f, 0xffffffff;"
+    )
     p.write_line(f"shr.u32 {rx}, {rx}, 7;")
     p.write_line(f"mov.u32 {ry}, 0;")
     p.write_line(f"mov.u32 {rz}, 0;")

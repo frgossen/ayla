@@ -4,7 +4,9 @@ import textwrap
 import pytest
 
 from ayla.base.ir import find_ops
-from ayla.gpu_dialect import AllocOp, MatmulOp, gpu_dialect
+from ayla.gpu_dialect import (
+    AllocOp, IndexConstantOp, IndexMulOp, MatmulOp, gpu_dialect,
+)
 from ayla.passes.folding import Folding, folding
 
 
@@ -43,6 +45,23 @@ def test_fold_constants():
             %cx_offset: index = index_mul(%cx: index, %c64: index)
           }
         }""")
+
+
+def test_distribute_constant_multiply_over_affine_offset():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test() {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c3: index = index_constant() attrs={value: 3}
+            %offset: index = index_add(%bx: index, %c3: index)
+            %c64: index = index_constant() attrs={value: 64}
+            %coordinate: index = index_mul(%offset: index, %c64: index)
+          }
+        }"""))
+    folding(module)
+    assert len(find_ops(module, lambda op: isinstance(op, IndexMulOp))) == 1
+    constants = find_ops(module, lambda op: isinstance(op, IndexConstantOp))
+    assert 192 in [op.value for op in constants]
 
 
 @pytest.mark.parametrize("nested,folds", [(False, True), (True, False)])

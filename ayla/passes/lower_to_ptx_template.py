@@ -532,7 +532,8 @@ class LowerToPtxTemplate(LoweringPass):
         def _build_static_desc(lbo, sbo, swizzle):
             return (lbo >> 4) << 16 | (sbo >> 4) << 32 | swizzle << 62
 
-        # TODO: Building the descrptor should be hoisted out of the loop.
+        # Descriptors are deliberately rematerialized near each WGMMA group:
+        # keeping them live across the loop raises register pressure.
         def _build_desc(name, ptr_reg, desc_const, offset=None):
             t = ""
             if offset is not None:
@@ -543,6 +544,20 @@ class LowerToPtxTemplate(LoweringPass):
             t += f"cvt.u64.u32 ${{b64:{name}}}, ${{b32:{name}_addr}};\n"
             t += f"or.b64 ${{b64:{name}}}, ${{b64:{name}}}, {desc_const};\n"
             return t
+
+        def _tile_delta(value: Value, base: Value, group: int) -> int | None:
+            if group == 0 or not (
+                isinstance(value.definition, TileOp)
+                and isinstance(base.definition, TileOp)
+            ):
+                return None
+            delta = value.definition.constant_byte_delta(base.definition)
+            return delta if delta is not None and delta >= 0 and delta % 16 == 0 else None
+
+        def _desc(name, base, delta, ptr, const, offset=None):
+            if delta is not None:
+                return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
+            return _build_desc(name, ptr, const, offset)
 
         # Each distinct operand value gets a single unique placeholder name —
         # matmuls accumulating into the same dst share that operand/register set.
@@ -615,17 +630,24 @@ class LowerToPtxTemplate(LoweringPass):
             desc_const_rhs = _build_static_desc(
                 lead_dim, rhs_row_stride_bytes * 8, _swizzle_to_bits[rhs_type.swizzle])
 
-            lhs_name = _operand(self.value_map[mm.lhs], "lhs")
-            rhs_name = _operand(self.value_map[mm.rhs], "rhs")
+            lhs_delta = _tile_delta(mm.lhs, mms[0].lhs, j)
+            rhs_delta = _tile_delta(mm.rhs, mms[0].rhs, j)
+            lhs_name = None if lhs_delta is not None else _operand(self.value_map[mm.lhs], "lhs")
+            rhs_name = None if rhs_delta is not None else _operand(self.value_map[mm.rhs], "rhs")
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
             desc_rhs = f"desc_rhs{j}"
-            desc_template += _build_desc(desc_rhs, f"operand.{rhs_name}.ptr", desc_const_rhs)
+            desc_template += _desc(
+                desc_rhs, "desc_rhs0", rhs_delta,
+                f"operand.{rhs_name}.ptr", desc_const_rhs,
+            )
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
-                desc_template += _build_desc(
-                    f"desc_lhs{j}_{m_it}", f"operand.{lhs_name}.ptr", desc_const_lhs,
-                    offset=lhs_offset if m_it > 0 else None,
+                desc_lhs = f"desc_lhs{j}_{m_it}"
+                desc_template += _desc(
+                    desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
+                    f"operand.{lhs_name}.ptr", desc_const_lhs,
+                    lhs_offset if m_it > 0 else None,
                 )
 
             if mm.scale_d is None:

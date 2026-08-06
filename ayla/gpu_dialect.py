@@ -370,6 +370,32 @@ class TileOp(Op):
                 f"match arg strides {list(arg_type.strides)}"
             )
 
+    def constant_byte_delta(self, base: "TileOp") -> int | None:
+        """Return the proven constant byte offset from a sibling tile."""
+        if self.arg is not base.arg or self.result().type != base.result().type:
+            return None
+
+        def constant(index: Value | int) -> int | None:
+            if isinstance(index, int):
+                return index
+            if isinstance(index.definition, IndexConstantOp):
+                return index.definition.value
+            return None
+
+        indices = [constant(index) for index in self.indices]
+        base_indices = [constant(index) for index in base.indices]
+        if any(index is None for index in indices + base_indices):
+            return None
+        typ = self.result().type
+        assert isinstance(typ, AddrMemTensorType)
+        offsets = [
+            typ.element_offset([
+                int(index) * size for index, size in zip(tile_indices, typ.sizes)
+            ])
+            for tile_indices in (indices, base_indices)
+        ]
+        return (offsets[0] - offsets[1]) * typ.dtype.byte_size
+
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):
             if i:
