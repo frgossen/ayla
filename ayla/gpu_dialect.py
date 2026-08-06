@@ -510,6 +510,13 @@ class TmaMoveOp(Op):
     def indices(self) -> list[Value]:
         return self.operands[2:]
 
+    @property
+    def l2_cache_hint(self) -> str | None:
+        hint = self.attrs.get("l2_cache_hint")
+        if hint not in (None, "evict_first", "evict_last"):
+            raise ValueError(f"unsupported TMA L2 cache hint {hint!r}")
+        return hint  # type: ignore[return-value]
+
 
 @gpu_dialect.register_type("token")
 class TokenType(Type):

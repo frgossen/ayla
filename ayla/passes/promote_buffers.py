@@ -187,6 +187,8 @@ class PromoteBuffers(LoweringPass):
         Non-coherent cache hint for gmem→rmem loads.
     physical_layout : dict or None
         Physical layout attrs for promoted shared-memory buffers.
+    move_attrs : dict[str, dict[str, object]] or None
+        Extra move attributes by operand.
     """
 
     def __init__(
@@ -201,6 +203,7 @@ class PromoteBuffers(LoweringPass):
         tma: bool = False,
         nc: bool = False,
         physical_layout: dict[str, object] | None = None,
+        move_attrs: dict[str, dict[str, object]] | None = None,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -214,6 +217,7 @@ class PromoteBuffers(LoweringPass):
         self.tma = tma
         self.nc = nc
         self.physical_layout = physical_layout
+        self.move_attrs = dict(move_attrs or {})
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_smem_type(self, sizes, dtype):
@@ -261,6 +265,7 @@ class PromoteBuffers(LoweringPass):
             attrs["tma"] = True
         if self.nc and allow_nc:
             attrs["nc"] = True
+        attrs.update(self.move_attrs.get(operand_name, {}))
         return attrs
 
     def _build_operand_promotion(
@@ -455,6 +460,7 @@ def promote_buffers(
     tma: bool = False,
     nc: bool = False,
     physical_layout: dict[str, object] | None = None,
+    move_attrs: dict[str, dict[str, object]] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -468,5 +474,6 @@ def promote_buffers(
         tma=tma,
         nc=nc,
         physical_layout=physical_layout,
+        move_attrs=move_attrs,
         label_filter=label_filter,
     ).run(module)

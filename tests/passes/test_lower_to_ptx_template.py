@@ -50,6 +50,44 @@ def test_lower_barrier_unsupported_scope_raises():
         _lower_barrier("grid")
 
 
+def test_lower_tma_load_with_l2_cache_hint():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @load(%desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %x: index, %y: index, %z: index = block_ids()
+            %smem: smem_tensor<64x64xf32> = alloc()
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) tma_move(%smem: smem_tensor<64x64xf32>, %desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>, %x: index, %y: index) attrs={l2_cache_hint: "evict_last"}
+          }
+        }"""))
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
+    assert "mbarrier::complete_tx::bytes.L2::cache_hint" in ptx
+
+
+def test_lower_tma_store_with_l2_cache_hint():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @store(%desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %x: index, %y: index, %z: index = block_ids()
+            %smem: smem_tensor<64x64xf32> = alloc()
+            %lock: lock<bulk> = alloc()
+            async(%lock: lock<bulk>) tma_move(%desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>, %smem: smem_tensor<64x64xf32>, %x: index, %y: index) attrs={l2_cache_hint: "evict_first"}
+          }
+        }"""))
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    assert ptx.count("createpolicy.fractional.L2::evict_first") == 1
+    assert "global.shared::cta.bulk_group.L2::cache_hint" in ptx
+
+
 def test_lower_move_gmem_to_smem():
     """Cooperative load: move(smem, gmem) lowers to a cooperative loop."""
     module_str = textwrap.dedent(
