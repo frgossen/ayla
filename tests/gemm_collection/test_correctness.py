@@ -26,7 +26,7 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     stores = [i for i, line in enumerate(lines)
               if "cp.async.bulk.tensor.3d.global.shared" in line]
     waits = [i for i, line in enumerate(lines)
-             if "cp.async.bulk.wait_group 0" in line]
+             if "cp.async.bulk.wait_group" in line]
     gathers = [i for i, line in enumerate(lines) if "stmatrix." in line]
     second_tile_mmas = [
         i for i, line in enumerate(lines)

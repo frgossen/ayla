@@ -767,14 +767,14 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_mbar(
         self, op: AwaitOp, lock: Value,
     ) -> tuple[list[Op], list[object]]:
-        # TODO: Tune ticks parameter for optimal spin-wait behavior.
+        # Materializing the optional hint in a virtual register lets ptxas
+        # select the compact fused wait; an immediate or test_wait expands
+        # into substantially more phase-check, sleep, or yield instructions.
         template = textwrap.dedent(r"""
             mov.u32 ${b32:ticks}, 0x989680;
             ${label:wait}:
             mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity}, ${b32:ticks};
-            @${pred:mbar_done} bra ${label:wait_done};
-            bra ${label:wait};
-            ${label:wait_done}:
+            @!${pred:mbar_done} bra ${label:wait};
             xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;
         """)
         new_op = PTXTemplateOp.build(
@@ -811,7 +811,7 @@ class LowerToPtxTemplate(LoweringPass):
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
         template = textwrap.dedent(r"""
-            cp.async.bulk.wait_group 0;
+            cp.async.bulk.wait_group.read 0;
         """)
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -1317,7 +1317,7 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower smem → gmem TMA bulk store (block-collective).
 
-        Thread 0 issues cp.async.bulk.tensor.2d, commits, and waits.
+        Thread 0 issues cp.async.bulk.tensor.2d and commits the group.
         The barrier inserted before the async orders all threads' shared-memory
         writes before thread 0 starts the store.
         """
@@ -1327,8 +1327,6 @@ class LowerToPtxTemplate(LoweringPass):
         desc_type = dst_value.type
         assert isinstance(desc_type, TmaDescType)
 
-        # Bulk groups have no addressable lock object; completion is tracked by
-        # commit_group/wait_group.
         operands = [dst_value, src_value] + idx_values
         operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
         tensor_rank = len(idx_values)
