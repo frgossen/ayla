@@ -96,11 +96,19 @@ class LowerToTmaMove(LoweringPass):
                 if layout is not None else None
             ),
         )
-        desc_value = Value(
-            name=f"{root.name}_desc" if root.name else None,
-            type=tma_type,
+        desc_value = next(
+            (
+                arg for arg in entry_block.arguments
+                if isinstance(arg.type, TmaDescType) and arg.type == tma_type
+            ),
+            None,
         )
-        entry_block.append_argument(desc_value)
+        if desc_value is None:
+            desc_value = Value(
+                name=f"{root.name}_desc" if root.name else None,
+                type=tma_type,
+            )
+            entry_block.append_argument(desc_value)
 
         if is_load:
             tma_op = TmaMoveOp.build(
