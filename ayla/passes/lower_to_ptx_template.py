@@ -627,6 +627,11 @@ class LowerToPtxTemplate(LoweringPass):
             and isinstance(src_type, WrmemTensorType)
             and src_type.layout == "wgmma_layout_0"
         ):
+            register_starts = _stmatrix_register_starts(op)
+            if register_starts is not None:
+                return self._lower_move_wrmem_wgmma_to_stmatrix(
+                    op, register_starts,
+                )
             return self._lower_move_wrmem_wgmma_to_addrmem(op)
         raise NotImplementedError(
             f"lower_move: unsupported; got "
@@ -1078,6 +1083,78 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops.append(new_op)
         return new_ops, []
 
+    def _lower_move_wrmem_wgmma_to_stmatrix(
+        self, op: MoveOp, register_starts: list[int],
+    ) -> tuple[list[Op], list[object]]:
+        dst = self.value_map[op.dst]
+        src = self.value_map[op.src]
+        dst_type = op.dst.type
+        src_type = op.src.type
+        assert isinstance(dst_type, SmemTensorType)
+        assert isinstance(src_type, WrmemTensorType)
+        assert dst_type.swizzle == "128B"
+        assert dst_type.dtype.byte_size == 2
+        col_start = int(op.attrs.get("wgmma_col_start", 0))
+        n_dim = src_type.sizes[1]
+        dst_m, _ = dst_type.sizes
+        template = textwrap.dedent(f"""\
+            mov.u32 ${{b32:st_lane}}, %laneid;
+            mov.u32 ${{b32:st_tid}}, %tid.x;
+            and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
+            shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
+            and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 7;
+            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
+            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 3;
+            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
+            mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, 64, ${{b32:st_col}};
+            shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
+        """)
+        groups: list[tuple[list[int], int]] = []
+        # Regroup adjacent fragments into 64-column blocks so all three low
+        # row bits participate in the 128-byte swizzle.
+        for i in range(0, len(register_starts), 2):
+            first0 = register_starts[i]
+            first1 = register_starts[i + 1]
+            di, dj = _get_wgmma_layout_0_static_offsets(first0, n_dim)
+            next_di, next_dj = _get_wgmma_layout_0_static_offsets(
+                first1, n_dim,
+            )
+            assert next_di == di and next_dj == dj + 16
+            relative_col = dj - col_start
+            assert relative_col >= 0 and relative_col % 32 == 0
+            block_offset = relative_col // 64 * dst_m * 64
+            base_offset = block_offset + di * 64 + relative_col % 64
+            groups.extend([
+                ([first0, first0 + 2, first1, first1 + 2], base_offset * 2),
+                (
+                    [first0 + 1, first0 + 3, first1 + 1, first1 + 3],
+                    (base_offset + 8 * 64) * 2,
+                ),
+            ])
+        for registers, physical_offset in groups:
+            regs = ", ".join(
+                f"${{b32:operand.src.r{i}}}" for i in registers
+            )
+            template += textwrap.dedent(f"""\
+                add.u32 ${{b32:st_addr_off}}, ${{b32:st_off}}, {physical_offset};
+                and.b32 ${{b32:st_swizzle_mask}}, ${{b32:st_addr_off}}, 896;
+                shr.u32 ${{b32:st_swizzle_mask}}, ${{b32:st_swizzle_mask}}, 3;
+                xor.b32 ${{b32:st_addr_off}}, ${{b32:st_addr_off}},
+                    ${{b32:st_swizzle_mask}};
+                add.u32 ${{b32:st_addr}}, ${{b32:operand.dst.ptr}},
+                    ${{b32:st_addr_off}};
+            """)
+            template += (
+                "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
+                f"[${{b32:st_addr}}], {{{regs}}};\n"
+            )
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[],
+            description=str(op),
+        )
+        return [lowered], []
+
     def _lower_move_smem_to_wrmem_mma(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
@@ -1402,6 +1479,45 @@ def _get_wgmma_layout_0_static_offsets(reg: int, n_dim: int = 128) -> tuple[int,
     m, w = divmod(reg // 4, n_groups)
     di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][reg % 4]
     return (m * 64 + di, w * 16 + dj)
+
+
+def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
+    dst_type = op.dst.type
+    src_type = op.src.type
+    if not (
+        isinstance(dst_type, SmemTensorType)
+        and isinstance(src_type, WrmemTensorType)
+        and src_type.layout == "wgmma_layout_0"
+        and isinstance(src_type.dtype, (BF16Type, F16Type))
+        and dst_type.dtype == src_type.dtype
+        and dst_type.rank == 2
+        and dst_type.strides[-1] == 1
+        and dst_type.swizzle == "128B"
+    ):
+        return None
+
+    m_dim, n_dim = src_type.sizes
+    col_start = int(op.attrs.get("wgmma_col_start", 0))
+    dst_m, dst_n = dst_type.sizes
+    if dst_m != m_dim or col_start < 0 or col_start + dst_n > n_dim:
+        return None
+    if (
+        m_dim % 64
+        or n_dim % 16
+        or dst_n % 64
+        or not (8 <= n_dim <= 256)
+    ):
+        return None
+
+    num_registers = src_type.num_elements_per_thread // 2
+    if num_registers % 4:
+        return None
+    register_starts = []
+    for reg in range(0, num_registers, 4):
+        _, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
+        if col_start <= dj < col_start + dst_n:
+            register_starts.append(reg)
+    return register_starts if len(register_starts) % 2 == 0 else None
 
 
 def _ptx_suffix(dtype) -> str:
