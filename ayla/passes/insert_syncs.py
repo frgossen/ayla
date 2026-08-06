@@ -132,6 +132,9 @@ class DataflowState:
         dataclasses.field(default_factory=dict)
     )
     named_barrier_ids: set[int] = dataclasses.field(default_factory=set)
+    named_barrier_ids_by_buffers: dict[frozenset[object], int] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def clone(self) -> DataflowState:
         """A copy with fresh sets, safe for in-place per-op mutation."""
@@ -140,9 +143,14 @@ class DataflowState:
     def join(self, other: DataflowState) -> DataflowState:
         """The dataflow join: per-buffer union of effects, union of barrier ids."""
         a, b = self.concurrent_memory_effects, other.concurrent_memory_effects
+        ids_by_buffers = dict(self.named_barrier_ids_by_buffers)
+        for buffers, barrier_id in other.named_barrier_ids_by_buffers.items():
+            prior_id = ids_by_buffers.setdefault(buffers, barrier_id)
+            assert prior_id == barrier_id
         return DataflowState(
             {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
             self.named_barrier_ids | other.named_barrier_ids,
+            ids_by_buffers,
         )
 
 
@@ -239,30 +247,34 @@ def _analyze(
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
+    hazard_buffers: set[object] = set()
     for kind_y, buf, scope_y in effects:
         for e in live.concurrent_memory_effects.get(buf, ()):
             # A hazard needs a write (RAR is safe).
             if e.kind == "W" or kind_y == "W":
                 barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
-    # A block-leader barrier is a named barrier: give it a fresh id (reusing this
-    # op's recorded one keeps it stable across fixpoint revisits). A full block
-    # sync frees every named-barrier id.
+                hazard_buffers.add(buf)
+    # A block-leader barrier is named. Repeated handoffs on the same buffer set
+    # reuse its id: the intervening access and hazard ordering ensure the prior
+    # barrier phase is complete. A full-block sync frees every assignment.
     named_id = None
     if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
         recorded = targets.get(op)
-        named_id = (
-            recorded.named_id if recorded is not None and recorded.named_id is not None
-            else max(live.named_barrier_ids, default=0) + 1
-        )
-        # TODO: Reuse IDs once the analysis tracks when each named barrier is no
-        # longer live; until then, fail instead of emitting an invalid PTX ID.
+        buffer_key = frozenset(hazard_buffers)
+        named_id = live.named_barrier_ids_by_buffers.get(buffer_key)
+        if named_id is None and recorded is not None:
+            named_id = recorded.named_id
+        if named_id is None:
+            named_id = max(live.named_barrier_ids, default=0) + 1
         assert named_id < _MAX_BARRIER_IDS, (
             "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
             "reserved for full-block barriers"
         )
         live.named_barrier_ids = live.named_barrier_ids | {named_id}
+        live.named_barrier_ids_by_buffers[buffer_key] = named_id
     elif barrier_scope == BarrierScope.BLOCK:
         live.named_barrier_ids = set()
+        live.named_barrier_ids_by_buffers = {}
     targets[op] = BarrierTarget(barrier_scope, named_id)
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.

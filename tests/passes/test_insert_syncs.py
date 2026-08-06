@@ -274,3 +274,43 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             barrier() attrs={id: 4, scope: "block_leader"}
             async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
     )
+
+
+def test_named_barrier_id_is_reused_for_the_same_buffers():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<256x64xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %sa: smem_tensor<128x64xbf16> = alloc()
+            %sb: smem_tensor<256x64xbf16> = alloc()
+            %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %l0: lock<mbar> = alloc()
+            async(%l0: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={tma: True}
+            }
+            await(%l0: lock<mbar>)
+            matmul(%sa: smem_tensor<128x64xbf16>, %sb: smem_tensor<256x64xbf16>, %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            %l1: lock<mbar> = alloc()
+            async(%l1: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={tma: True}
+            }
+            await(%l1: lock<mbar>)
+            matmul(%sa: smem_tensor<128x64xbf16>, %sb: smem_tensor<256x64xbf16>, %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            %l2: lock<mbar> = alloc()
+            async(%l2: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={tma: True}
+            }
+          }
+        }"""))
+
+    insert_syncs(module)
+    barriers = [
+        line.strip() for line in repr(module).splitlines()
+        if 'scope: "block_leader"' in line
+    ]
+    assert barriers == [
+        'barrier() attrs={id: 1, scope: "block_leader"}',
+        'barrier() attrs={id: 1, scope: "block_leader"}',
+    ]
