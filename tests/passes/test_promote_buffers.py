@@ -29,6 +29,23 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
     assert 'attrs={label: "mm_dst_tma", tma: True}' in text
 
 
+def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c: gmem_tensor<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c: gmem_tensor<64x256xbf16>) attrs={init: 0.0, label: "mm"}
+          }
+        }"""))
+    module = promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True,
+        writeback_slices=2, writeback_buffers=2, label_filter="mm",
+    )
+    text = repr(module)
+    assert text.count("smem_tensor<64x128xbf16> = alloc()") == 2
+    assert text.count('attrs={label: "mm_dst_tma", tma: True}') == 2
+
+
 def test_promote_gmem_matmul_operands_to_smem():
     module_str = textwrap.dedent("""\
         module {
