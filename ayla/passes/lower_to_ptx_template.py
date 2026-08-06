@@ -48,7 +48,7 @@ from ..gpu_dialect import (
     WrmemTensorType,
     wgmma_layout_0_static_offsets,
 )
-from ..base.ir import Op, Value
+from ..base.ir import Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass
 
 
@@ -60,6 +60,7 @@ class LowerToPtxTemplate(LoweringPass):
         self.block_dim: tuple[int | None, int | None, int | None] = (
             None, None, None,
         )
+        self.cache_policy_values: dict[str, Value] = {}
         self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
@@ -78,6 +79,29 @@ class LowerToPtxTemplate(LoweringPass):
         if op.num_warp_groups is not None and op.num_warp_groups > 0:
             block_dim[0] = op.num_warp_groups * 128
         self.block_dim = tuple(block_dim)
+        cache_hints = sorted({
+            hint
+            for tma in find_ops(op, lambda candidate: isinstance(
+                candidate, TmaMoveOp,
+            ))
+            if (hint := tma.l2_cache_hint) is not None
+        })
+        self.cache_policy_values = {}
+        if cache_hints:
+            names = [f"policy{i}" for i in range(len(cache_hints))]
+            policy_op = PTXTemplateOp.build(
+                operands=[],
+                result_types=[PtrType.build("gmem") for _ in cache_hints],
+                template="\n".join(
+                    f"createpolicy.fractional.L2::{hint}.b64 "
+                    f"${{b64:result.{name}.ptr}}, 1.0;"
+                    for hint, name in zip(cache_hints, names)
+                ) + "\n",
+                result_names=names,
+                description="create TMA L2 cache policies",
+            )
+            op.body.entry_block.ops.insert(0, policy_op)
+            self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
         self.lower_region(op.body)
         return [op], []
 
@@ -1361,10 +1385,18 @@ class LowerToPtxTemplate(LoweringPass):
             for i in reversed(range(len(idx_values)))
         )
 
+        cache_hint = op.l2_cache_hint
+        cache_suffix = ".L2::cache_hint" if cache_hint is not None else ""
+        cache_operand = ""
+        if cache_hint is not None:
+            operands.append(self.cache_policy_values[cache_hint])
+            operand_names.append("cache_policy")
+            cache_operand = ", ${b64:operand.cache_policy.ptr}"
+
         guard = "\n".join(self._thread_zero_guard("st", "st_done"))
         template = (guard + "\n" if guard else "") + textwrap.dedent(f"""\
             fence.proxy.async.shared::cta;
-            cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
+            cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group{cache_suffix} [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}]{cache_operand};
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
         """)
@@ -1420,12 +1452,22 @@ class LowerToPtxTemplate(LoweringPass):
                 f"${{b32:operand.{idx_names[j]}.val}}"
                 for j in reversed(range(len(idx_values)))
             )
+            cache_hint = tma.l2_cache_hint
+            if cache_hint is not None:
+                policy_name = f"cache_policy{i}"
+                operands.append(self.cache_policy_values[cache_hint])
+                operand_names.append(policy_name)
+            cache_suffix = ".L2::cache_hint" if cache_hint is not None else ""
+            cache_operand = (
+                f", ${{b64:operand.{policy_name}.ptr}}"
+                if cache_hint is not None else ""
+            )
             load_lines.append(
                 f"cp.async.bulk.tensor.{len(idx_values)}d.shared::cluster.global."
-                f"mbarrier::complete_tx::bytes "
+                f"mbarrier::complete_tx::bytes{cache_suffix} "
                 f"[${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
-                f"[${{b32:operand.lock.val}}];"
+                f"[${{b32:operand.lock.val}}]{cache_operand};"
             )
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
