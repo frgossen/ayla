@@ -31,6 +31,7 @@ from ..gpu_dialect import (
     IndexMulOp,
     LockType,
     MatmulOp,
+    KernelOp,
     ModuleOp,
     MoveOp,
     PTXTemplateOp,
@@ -56,6 +57,10 @@ class LowerToPtxTemplate(LoweringPass):
 
     def __init__(self) -> None:
         super().__init__()
+        self.block_dim: tuple[int | None, int | None, int | None] = (
+            None, None, None,
+        )
+        self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
         self.register(StMatrixStoreOp, type(self).lower_stmatrix_store)
@@ -65,6 +70,41 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(BarrierOp, type(self).lower_barrier)
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
+
+    def lower_kernel(
+        self, op: KernelOp,
+    ) -> tuple[list[Op], list[object]]:
+        block_dim = list(op.block_dim)
+        if op.num_warp_groups is not None and op.num_warp_groups > 0:
+            block_dim[0] = op.num_warp_groups * 128
+        self.block_dim = tuple(block_dim)
+        self.lower_region(op.body)
+        return [op], []
+
+    def _thread_zero_guard(self, prefix: str, done: str) -> list[str]:
+        """Branch nonzero threads away, omitting statically singleton axes."""
+        axes = [
+            axis for axis, extent in zip("xyz", self.block_dim)
+            if extent != 1
+        ]
+        if not axes:
+            return []
+        accumulator = f"{prefix}_tid"
+        lines = [f"mov.u32 ${{b32:{accumulator}}}, %tid.{axes[0]};"]
+        for axis in axes[1:]:
+            component = f"{prefix}_tid_{axis}"
+            lines.extend([
+                f"mov.u32 ${{b32:{component}}}, %tid.{axis};",
+                f"or.b32 ${{b32:{accumulator}}}, "
+                f"${{b32:{accumulator}}}, ${{b32:{component}}};",
+            ])
+        predicate = f"{prefix}_not_t0"
+        lines.extend([
+            f"setp.ne.s32 ${{pred:{predicate}}}, "
+            f"${{b32:{accumulator}}}, 0;",
+            f"@${{pred:{predicate}}} bra ${{label:{done}}};",
+        ])
+        return lines
 
 
     def lower_tile(
@@ -177,23 +217,17 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(lock_type, LockType)
         if lock_type.kind != "mbar":
             return [], [None]
-        template = textwrap.dedent("""\
-            .shared .align 8 .b64 ${smem:bar}[1];
-            mov.u32 ${b32:result.dst.val}, ${smem:bar};
-            mov.u32 ${b32:result.dst.parity}, 0;
-            mov.u32 ${b32:tid_x}, %tid.x;
-            mov.u32 ${b32:tid_y}, %tid.y;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
-            mov.u32 ${b32:tid_z}, %tid.z;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
-            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
-            @${pred:not_t0} bra ${label:after_init};
-            mov.u32 ${b32:cnt}, 1;
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], ${b32:cnt};
-            fence.mbarrier_init.release.cluster;
-            ${label:after_init}:
-            bar.sync 0;
-        """)
+        lines = [
+            ".shared .align 8 .b64 ${smem:bar}[1];",
+            "mov.u32 ${b32:result.dst.val}, ${smem:bar};",
+            "mov.u32 ${b32:result.dst.parity}, 0;",
+            *self._thread_zero_guard("init", "after_init"),
+            "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;",
+            "fence.mbarrier_init.release.cluster;",
+            "${label:after_init}:",
+            "bar.sync 0;",
+        ]
+        template = "\n".join(lines) + "\n"
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
             operand_names=[], result_names=["dst"],
@@ -692,14 +726,24 @@ class LowerToPtxTemplate(LoweringPass):
             # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
             # insert_syncs (unique among concurrently-live block-leader barriers).
             bar_id = op.attrs.get("id", 1)
-            template = textwrap.dedent(f"""\
-                mov.u32 ${{b32:bl_tid}}, %tid.x;
-                mov.u32 ${{b32:bl_ntid}}, %ntid.x;
-                setp.lt.u32 ${{pred:bl_w0}}, ${{b32:bl_tid}}, 32;
-                setp.ge.u32 ${{pred:bl_nw0}}, ${{b32:bl_tid}}, 32;
-                @${{pred:bl_w0}} bar.sync {bar_id}, ${{b32:bl_ntid}};
-                @${{pred:bl_nw0}} bar.arrive {bar_id}, ${{b32:bl_ntid}};
-                """)
+            block_threads = (
+                math.prod(self.block_dim)
+                if all(dim is not None for dim in self.block_dim)
+                else None
+            )
+            count = (
+                str(block_threads) if block_threads is not None
+                else "${b32:bl_ntid}"
+            )
+            lines = ["mov.u32 ${b32:bl_tid}, %tid.x;"]
+            if block_threads is None:
+                lines.append("mov.u32 ${b32:bl_ntid}, %ntid.x;")
+            lines.extend([
+                "setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;",
+                f"@${{pred:bl_w0}} bar.sync {bar_id}, {count};",
+                f"@!${{pred:bl_w0}} bar.arrive {bar_id}, {count};",
+            ])
+            template = "\n".join(lines) + "\n"
         else:
             raise NotImplementedError(
                 f"lower_barrier: unsupported barrier scope {scope!r}"
@@ -1291,18 +1335,8 @@ class LowerToPtxTemplate(LoweringPass):
             for i in reversed(range(len(idx_values)))
         )
 
-        # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
-        # The RAW (all threads finish writing the smem tile before t0 stores it) is
-        # handled by insert_syncs, which emits a barrier before this async.
-
-        template = textwrap.dedent(f"""\
-            mov.u32 ${{b32:st_tid}}, %tid.x;
-            mov.u32 ${{b32:st_tidy}}, %tid.y;
-            or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidy}};
-            mov.u32 ${{b32:st_tidz}}, %tid.z;
-            or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidz}};
-            setp.ne.s32 ${{pred:st_not_t0}}, ${{b32:st_tid}}, 0;
-            @${{pred:st_not_t0}} bra ${{label:st_done}};
+        guard = "\n".join(self._thread_zero_guard("st", "st_done"))
+        template = (guard + "\n" if guard else "") + textwrap.dedent(f"""\
             fence.proxy.async.shared::cta;
             cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
             cp.async.bulk.commit_group;
@@ -1375,17 +1409,10 @@ class LowerToPtxTemplate(LoweringPass):
         # The buffer-reuse WAR (t0's reload vs prior readers of the smem tile) is
         # handled by insert_syncs, which emits a barrier before this async.
         lines = [
-            "mov.u32 ${b32:tid_x}, %tid.x;",
-            "mov.u32 ${b32:tid_y}, %tid.y;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
-            "mov.u32 ${b32:tid_z}, %tid.z;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};",
-            "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
-            "@${pred:not_t0} bra ${label:after_load};",
+            *self._thread_zero_guard("load", "after_load"),
             *load_lines,
-            f"mov.u32 ${{b32:exp_bytes}}, {total_bytes};",
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
-            "[${b32:operand.lock.val}], ${b32:exp_bytes};",
+            f"[${{b32:operand.lock.val}}], {total_bytes};",
             "${label:after_load}:",
         ]
         template = "\n".join(lines) + "\n"
