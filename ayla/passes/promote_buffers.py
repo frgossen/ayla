@@ -167,6 +167,22 @@ def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
     return TileOp.build(value, indices, typ)
 
 
+def _sliced_moves(
+    dst: Value, src: Value, count: int, dim: int, attrs: dict[str, object],
+) -> list[Op]:
+    if count == 1:
+        return [MoveOp.build(dst, src, attrs=attrs)]
+    size, remainder = divmod(src.type.sizes[dim], count)
+    if remainder:
+        raise ValueError("move extent must divide evenly into slices")
+    ops: list[Op] = []
+    for index in range(count):
+        src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
+        move = MoveOp.build(dst_tile.result(), src_tile.result(), attrs=attrs)
+        ops.extend([src_tile, dst_tile, move])
+    return ops
+
+
 class PromoteBuffers(LoweringPass):
     """Promote matmul operands to *target_type* memory space.
 
@@ -203,6 +219,8 @@ class PromoteBuffers(LoweringPass):
         Extra move attributes by operand, such as a TMA ``l2_cache_hint``.
     writeback_slices, writeback_buffers : int
         Number of TMA output slices and SMEM staging arenas.
+    tma_load_slices : dict[str, int] or None
+        Leading-dimension TMA load slices by operand.
     """
 
     def __init__(
@@ -220,6 +238,7 @@ class PromoteBuffers(LoweringPass):
         move_attrs: dict[str, dict[str, object]] | None = None,
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
+        tma_load_slices: dict[str, int] | None = None,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -236,9 +255,13 @@ class PromoteBuffers(LoweringPass):
         self.move_attrs = dict(move_attrs or {})
         self.writeback_slices = writeback_slices
         self.writeback_buffers = writeback_buffers
+        self.tma_load_slices = dict(tma_load_slices or {})
         assert writeback_slices >= 1, "writeback_slices must be positive"
         assert writeback_buffers in (1, writeback_slices), (
             "writeback_buffers must be 1 or equal writeback_slices"
+        )
+        assert all(n >= 1 for n in self.tma_load_slices.values()), (
+            "TMA load slice counts must be positive"
         )
         self.register(MatmulOp, type(self).lower_matmul)
 
@@ -351,8 +374,11 @@ class PromoteBuffers(LoweringPass):
                 self._build_target_type(chain_root.type, dtype=chain_root.type.dtype),
                 attrs=buffer_attrs,
             )
-            move = MoveOp.build(dst=alloc.result(), src=chain_root, attrs=attrs)
-            new_ops.extend([alloc, move])
+            new_ops.append(alloc)
+            new_ops.extend(_sliced_moves(
+                alloc.result(), chain_root,
+                self.tma_load_slices.get(operand_name, 1), 0, attrs,
+            ))
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
                 cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
@@ -512,6 +538,7 @@ def promote_buffers(
     move_attrs: dict[str, dict[str, object]] | None = None,
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
+    tma_load_slices: dict[str, int] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -528,5 +555,6 @@ def promote_buffers(
         move_attrs=move_attrs,
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
+        tma_load_slices=tma_load_slices,
         label_filter=label_filter,
     ).run(module)
