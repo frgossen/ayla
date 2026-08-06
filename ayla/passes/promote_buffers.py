@@ -155,6 +155,15 @@ def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
     return [new_tile], [new_tile.result()]
 
 
+def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
+    typ = clone_type(value.type)
+    dim %= typ.rank
+    typ.sizes[dim] = size
+    indices = [0] * typ.rank
+    indices[dim] = index
+    return TileOp.build(value, indices, typ)
+
+
 class PromoteBuffers(LoweringPass):
     """Promote matmul operands to *target_type* memory space.
 
@@ -187,6 +196,8 @@ class PromoteBuffers(LoweringPass):
         Non-coherent cache hint for gmem→rmem loads.
     physical_layout : dict or None
         Optional physical shared-memory layout used for output staging.
+    writeback_slices, writeback_buffers : int
+        Number of TMA output slices and SMEM staging arenas.
     move_attrs : dict[str, dict[str, object]] or None
         Extra move attributes by operand.
     """
@@ -203,6 +214,8 @@ class PromoteBuffers(LoweringPass):
         tma: bool = False,
         nc: bool = False,
         physical_layout: dict[str, object] | None = None,
+        writeback_slices: int = 1,
+        writeback_buffers: int = 1,
         move_attrs: dict[str, dict[str, object]] | None = None,
         label_filter: str | None = None,
     ) -> None:
@@ -217,7 +230,13 @@ class PromoteBuffers(LoweringPass):
         self.tma = tma
         self.nc = nc
         self.physical_layout = physical_layout
+        self.writeback_slices = writeback_slices
+        self.writeback_buffers = writeback_buffers
         self.move_attrs = dict(move_attrs or {})
+        if writeback_slices < 1:
+            raise ValueError("slice counts must be positive")
+        if writeback_buffers not in (1, writeback_slices):
+            raise ValueError("writeback_buffers must be 1 or equal writeback_slices")
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_target_type(self, base_type, dtype=None):
@@ -343,23 +362,46 @@ class PromoteBuffers(LoweringPass):
             block_dst = tile.arg
         assert isinstance(block_dst.type, GmemTensorType)
         smem_sizes = list(block_dst.type.sizes)
-        smem = AllocOp.build(SmemTensorType.build_physical(
+        if smem_sizes[-1] % self.writeback_slices:
+            raise ValueError("output columns must divide evenly into writeback_slices")
+        smem_sizes[-1] //= self.writeback_slices
+        smem_type = SmemTensorType.build_physical(
             smem_sizes, block_dst.type.dtype, None, self.physical_layout,
-        ))
-        new_ops: list[Op] = [smem]
-        gather_dst = smem.result()
-        for tile in reversed(narrow_tiles):
-            ops, [gather_dst] = _apply_tile(tile, gather_dst)
-            new_ops.extend(ops)
-        gather = MoveOp.build(
-            dst=gather_dst, src=src,
-            attrs={"label": f"{matmul_label}_dst_smem"},
         )
-        store = MoveOp.build(
-            dst=block_dst, src=smem.result(),
-            attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
-        )
-        new_ops.extend([gather, store])
+        smems = [AllocOp.build(smem_type) for _ in range(self.writeback_buffers)]
+        new_ops: list[Op] = list(smems)
+        slice_cols = smem_sizes[-1]
+        wg_column_tile = next((
+            tile for tile in narrow_tiles
+            if tile.result().type.sizes[-1] != tile.arg.type.sizes[-1]
+        ), None)
+        expected_slices = block_dst.type.sizes[-1] // src.type.sizes[-1]
+        if wg_column_tile is not None and self.writeback_slices != expected_slices:
+            raise ValueError("warpgroup-column writeback needs one slice per warpgroup")
+        for slice_idx in range(self.writeback_slices):
+            smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
+            gather_dst = smem.result()
+            for tile in reversed(narrow_tiles):
+                if tile is wg_column_tile:
+                    continue
+                ops, [gather_dst] = _apply_tile(tile, gather_dst)
+                new_ops.extend(ops)
+            gather_attrs = {"label": f"{matmul_label}_dst_smem"}
+            if wg_column_tile is not None:
+                gather_attrs["writer_wg"] = slice_idx
+            elif self.writeback_slices > 1:
+                gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
+            gather = MoveOp.build(dst=gather_dst, src=src, attrs=gather_attrs)
+            store_tiles = (
+                [_slice_tile(block_dst, -1, slice_idx, slice_cols)]
+                if self.writeback_slices > 1 else []
+            )
+            store_dst_value = store_tiles[0].result() if store_tiles else block_dst
+            store = MoveOp.build(
+                dst=store_dst_value, src=smem.result(),
+                attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
+            )
+            new_ops.extend([gather, *store_tiles, store])
         return new_ops
 
     def _build_operand_writeback(
@@ -434,6 +476,8 @@ def promote_buffers(
     tma: bool = False,
     nc: bool = False,
     physical_layout: dict[str, object] | None = None,
+    writeback_slices: int = 1,
+    writeback_buffers: int = 1,
     move_attrs: dict[str, dict[str, object]] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
@@ -448,6 +492,8 @@ def promote_buffers(
         tma=tma,
         nc=nc,
         physical_layout=physical_layout,
+        writeback_slices=writeback_slices,
+        writeback_buffers=writeback_buffers,
         move_attrs=move_attrs,
         label_filter=label_filter,
     ).run(module)
