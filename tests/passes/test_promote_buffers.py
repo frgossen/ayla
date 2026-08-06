@@ -73,6 +73,27 @@ def test_promote_gmem_matmul_operands_to_smem():
     assert text == expected
 
 
+def test_promote_can_slice_tma_operand_loads():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<384x64xbf16>, %c: rmem_tensor<128x384xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<384x64xbf16>, %c: rmem_tensor<128x384xf32>) attrs={label: "mm"}
+          }
+        }"""))
+    promote_buffers(
+        module, target_type="smem", operands=["lhs", "rhs"],
+        swizzle="128B", tma=True, tma_load_slices={"rhs": 3},
+        move_attrs={"rhs": {"l2_cache_hint": "evict_last"}},
+        label_filter="mm",
+    )
+    text = repr(module)
+    # One label belongs to the allocation; the other three are sliced moves.
+    assert text.count('label: "mm_rhs_smem"') == 4
+    assert text.count('l2_cache_hint: "evict_last"') == 3
+    assert text.count("gmem_tensor<128x64xbf16> = tile(%b") == 3
+    assert text.count("smem_tensor<128x64xbf16") >= 3
+
+
 def test_promote_lhs_rhs_preserves_init_on_matmul():
     """When dst is NOT promoted, init stays on the matmul."""
     module_str = textwrap.dedent("""\
