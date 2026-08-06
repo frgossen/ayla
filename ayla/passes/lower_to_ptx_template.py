@@ -1161,10 +1161,13 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
         m_dim, n_dim = wrmem_type.sizes
-        assert list(dst_type.sizes) == [m_dim, n_dim], (
-            f"wgmma store: destination shape {list(dst_type.sizes)} must match "
-            f"the fragment {[m_dim, n_dim]}"
+        col_start = int(op.attrs.get("wgmma_col_start", 0))
+        dst_m, dst_n = dst_type.sizes
+        assert dst_m == m_dim and 0 <= col_start < n_dim, (
+            f"wgmma store: invalid destination shape {list(dst_type.sizes)} "
+            f"and column start {col_start} for fragment {[m_dim, n_dim]}"
         )
+        assert col_start + dst_n <= n_dim
         assert m_dim % 64 == 0, (
             f"wgmma store: m must be a multiple of 64; got {m_dim}"
         )
@@ -1195,7 +1198,9 @@ class LowerToPtxTemplate(LoweringPass):
         num_registers = wrmem_type.num_elements_per_thread // 2
         for reg in range(num_registers):
             di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
-            offset = di * row_stride_bytes + dj * dtype_bytes
+            if not col_start <= dj < col_start + dst_n:
+                continue
+            offset = di * row_stride_bytes + (dj - col_start) * dtype_bytes
             template += (
                 f"{instruction} [{address}+{offset}], "
                 f"${{b32:operand.src.r{reg}}};\n"
@@ -1224,7 +1229,20 @@ class LowerToPtxTemplate(LoweringPass):
         root_type = root_buffer(op.dst).type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = root_type.sizes
-        template = textwrap.dedent(f"""\
+        # TODO: Model writer ownership as a warpgroup-uniform IR condition so
+        # loop peeling/unrolling can specialize each slice and lower the whole
+        # gather to one branch instead of predicating every stmatrix.
+        writer_wg = op.attrs.get("writer_wg")
+        predicate = ""
+        writer_setup = ""
+        if writer_wg is not None:
+            predicate = "@${pred:st_writer} "
+            writer_setup = textwrap.dedent(f"""\
+                mov.u32 ${{b32:st_full_tid}}, %tid.x;
+                shr.u32 ${{b32:st_wg}}, ${{b32:st_full_tid}}, 7;
+                setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
+            """)
+        template = writer_setup + textwrap.dedent(f"""\
             mov.u32 ${{b32:st_lane}}, %laneid;
             mov.u32 ${{b32:st_tid}}, %tid.x;
             and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
@@ -1272,7 +1290,7 @@ class LowerToPtxTemplate(LoweringPass):
                     ${{b32:st_addr_off}};
             """)
             template += (
-                "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
+                f"{predicate}stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
                 f"[${{b32:st_addr}}], {{{regs}}};\n"
             )
         lowered = PTXTemplateOp.build(
