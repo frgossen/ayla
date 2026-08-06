@@ -341,8 +341,8 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower element-wise dtype conversion on wrmem tensors.
 
-        For f32 → bf16/f16: converts each f32 register to a 16-bit value,
-        then packs consecutive pairs into b32 registers.
+        For f32 → bf16/f16, converts consecutive pairs directly into packed
+        b32 registers with the PTX ``*x2`` conversion form.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -358,8 +358,6 @@ class LowerToPtxTemplate(LoweringPass):
         assert src_type.warps == dst_type.warps
 
         src_n = src_type.num_elements_per_thread
-        dst_suffix = _ptx_suffix(dst_type.dtype)
-
         if not (isinstance(src_type.dtype, F32Type)
                 and isinstance(dst_type.dtype, (BF16Type, F16Type))):
             raise NotImplementedError(
@@ -367,17 +365,13 @@ class LowerToPtxTemplate(LoweringPass):
             )
 
         template = ""
-        for i in range(src_n):
-            template += (
-                f"cvt.rn.{dst_type.dtype.name}.f32 "
-                f"${{{dst_suffix}:cvt_{i}}}, "
-                f"${{f32:operand.src.r{i}}};\n"
-            )
         for i in range(0, src_n, 2):
             dst_reg = i // 2
             template += (
-                f"mov.b32 ${{b32:operand.dst.r{dst_reg}}}, "
-                f"{{${{{dst_suffix}:cvt_{i}}}, ${{{dst_suffix}:cvt_{i + 1}}}}};\n"
+                f"cvt.rn.{dst_type.dtype.name}x2.f32 "
+                f"${{b32:operand.dst.r{dst_reg}}}, "
+                f"${{f32:operand.src.r{i + 1}}}, "
+                f"${{f32:operand.src.r{i}}};\n"
             )
 
         new_op = PTXTemplateOp.build(
