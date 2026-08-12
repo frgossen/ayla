@@ -18,6 +18,27 @@ python benchmarks/bench_gemm_collection.py  # benchmark
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, % of peak, and
 throughput as a percentage of `torch.mm`) for a bf16 4096×4096 GEMM.
 
+### Generate readable PTX
+
+Run the PTX lifter as a package module from the repository root:
+
+```bash
+python -m ayla.ptx_python_codegen
+```
+
+This regenerates
+`generated_ptx/auto_matmul_k3_4tiles_readable_ptx.py`. To convert an existing
+raw PTX file instead, pass its path; the generated Python is written to stdout
+unless `-o` is supplied:
+
+```bash
+python -m ayla.ptx_python_codegen kernel.ptx -o generated_ptx/kernel.py
+```
+
+The generated module retains every PTX directive and instruction. Calling its
+`PTX_PROGRAM()` function expands the parameterized blocks and compact schedule
+into complete PTX source; comments are omitted and blank lines are normalized.
+
 ### Using pixi
 
 If you don't already have pixi installed, get it with curl:

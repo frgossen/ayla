@@ -62,7 +62,6 @@ def bench(run) -> dict[str, float | int]:
         "median_ms": statistics.median(samples),
         "mean_ms": statistics.mean(samples),
         "stdev_ms": statistics.stdev(samples),
-        "min_ms": min(samples), "max_ms": max(samples),
     }
 
 
@@ -85,8 +84,8 @@ def worker(rm: int, rn: int) -> dict:
     if not torch.isfinite(c).all() or max_err > 2.0:
         raise RuntimeError(f"incorrect result: max_err={max_err}")
     timing = bench(lambda: launcher(a, b, c))
-    min_ms = float(timing["min_ms"])
-    tflops = FLOPS / (min_ms / 1e3) / 1e12
+    median_ms = float(timing["median_ms"])
+    tflops = FLOPS / (median_ms / 1e3) / 1e12
     return {
         "rm": rm, "rn": rn, "tiles_per_block": rm * rn,
         "grid_x": 32 // rm, "grid_y": 16 // rn,
@@ -118,7 +117,7 @@ def main() -> None:
             results.append(row)
             if row["status"] == "ok":
                 print(f"Rm={rm:2} Rn={rn:2} grid={row['grid_x']:2}x{row['grid_y']:2} "
-                      f"median={row['median_ms']:.3f} min={row['min_ms']:.3f}ms "
+                      f"median={row['median_ms']:.3f}ms "
                       f"peak={row['peak_pct']:.1f}% err={row['max_err']:.3f}", flush=True)
             else:
                 print(f"Rm={rm:2} Rn={rn:2} FAILED", flush=True)
@@ -128,7 +127,7 @@ def main() -> None:
     print("\nRanked by median:")
     for r in sorted(valid, key=lambda x: x["median_ms"])[:10]:
         print(f"Rm={r['rm']:2} Rn={r['rn']:2} grid={r['grid_x']:2}x{r['grid_y']:2} "
-              f"median={r['median_ms']:.3f}ms min={r['min_ms']:.3f}ms")
+              f"median={r['median_ms']:.3f}ms")
 
 
 if __name__ == "__main__":

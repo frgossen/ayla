@@ -38,6 +38,7 @@ class BenchGemmConfig:
     op: Callable  # the GEMM to time, called as op(a, b)
     dtype: torch.dtype
     allow_tf32: bool = True
+    is_reference: bool = False
 
     @property
     def flops(self) -> int:
@@ -47,55 +48,79 @@ class BenchGemmConfig:
 @dataclass
 class BenchResult:
     label: str
-    rounds: int   # timed event-pairs (the sample count for median/stdev/min/max)
+    rounds: int   # timed event-pairs (the sample count for median/mean/stdev)
     iters: int    # launches averaged within each round
     median_ms: float
     mean_ms: float
     stdev_ms: float
-    min_ms: float
-    max_ms: float
     tflops: float
     peak_pct: float | None = None  # None if peak unspecified
-    torch_mm_pct: float | None = None
+    cublas_median_ms: float | None = None
+    cublas_pct: float | None = None
 
 
 # CUDA-event timing config (GPU-only, cudaEvent-based like matmul.cu).
 _WARMUP_S = 0.5        # clock-ramp warmup budget...
 _WARMUP_ITERS = 100    # ...capped at this many launches (survive slow kernels)
 _TARGET_ROUND_MS = 50  # aim for ~this much GPU work per timed round
-_MIN_RUN_TIME_S = 0.5   # total timing budget across all rounds (>1 round so
-                        # min/median/max/stdev are meaningful, not one sample)
+_MIN_RUN_TIME_S = 0.5   # total timing budget across all rounds
 # Idle pause before each config so every kernel starts from the same thermal
 # state — removes cross-config ordering/throttling bias (matmul.cu sleeps 5s).
 _COOLDOWN_S = 1.0
 
 
-def _bench(cfg: BenchGemmConfig) -> BenchResult:
-    # Cool down first so every config starts from the same thermal state —
-    # removes cross-config ordering/throttling bias (matmul.cu sleeps 5s).
-    time.sleep(_COOLDOWN_S)
-    torch.backends.cuda.matmul.allow_tf32 = cfg.allow_tf32
+def _inputs(cfg: BenchGemmConfig) -> tuple[torch.Tensor, torch.Tensor]:
     a = torch.randn(cfg.m, cfg.k, dtype=cfg.dtype, device="cuda")
-    b = torch.randn(cfg.k, cfg.n, dtype=cfg.dtype, device="cuda")
-    op = cfg.op
+    # Ayla GEMMs consume B in row-major [N, K] form and compute A @ B.T.
+    # Keep the reference operand in that same physical layout so both kernels
+    # execute the identical mathematical operation and cuBLAS transpose path.
+    b = torch.randn(cfg.n, cfg.k, dtype=cfg.dtype, device="cuda")
+    return a, b
 
-    def run():
-        return op(a, b)
 
-    result = run()
-    assert result.dtype == cfg.dtype
-
+def _one_launch_ms(run: Callable[[], torch.Tensor]) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-
-    # Rough single-launch estimate (clocks not yet ramped, but enough to size
-    # the loop counts — and to keep them bounded for a very slow kernel).
     torch.cuda.synchronize()
     start.record()
     run()
     end.record()
     torch.cuda.synchronize()
-    one_ms = max(start.elapsed_time(end), 1e-3)
+    return max(start.elapsed_time(end), 1e-3)
+
+
+def _result(
+    cfg: BenchGemmConfig, times_ms: list[float], iters: int,
+) -> BenchResult:
+    n = len(times_ms)
+    median_ms = statistics.median(times_ms)
+    # Median is the comparison statistic: it represents a typical sustained
+    # round while rejecting isolated clock/scheduling excursions.  A minimum
+    # selects the luckiest transient; a mean is more easily skewed by them.
+    tflops = cfg.flops / (median_ms / 1e3) / 1e12
+    return BenchResult(
+        label=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.n}x{cfg.k}.T)",
+        rounds=n,
+        iters=iters,
+        median_ms=median_ms,
+        mean_ms=statistics.mean(times_ms),
+        stdev_ms=statistics.stdev(times_ms) if n > 1 else 0.0,
+        tflops=tflops,
+    )
+
+
+def _bench(cfg: BenchGemmConfig) -> BenchResult:
+    """Standalone timing for a config with no comparison reference."""
+    time.sleep(_COOLDOWN_S)
+    torch.backends.cuda.matmul.allow_tf32 = cfg.allow_tf32
+    a, b = _inputs(cfg)
+
+    def run():
+        return cfg.op(a, b)
+
+    result = run()
+    assert result.dtype == cfg.dtype
+    one_ms = _one_launch_ms(run)
 
     # Inner launches per timed round (~_TARGET_ROUND_MS of GPU work) and rounds
     # to cover ~_MIN_RUN_TIME_S of timing. Both clamp to >=1 (and `rounds` keys
@@ -133,41 +158,87 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
     torch.cuda.synchronize()
     times_ms = [s.elapsed_time(e) / iters for s, e in pairs]
 
-    n = len(times_ms)
-    min_ms = min(times_ms)
-    # Throughput / peak% from the fastest round (best-case steady clock, least
-    # contaminated by clock dips or scheduling noise), not the median.
-    tflops = cfg.flops / (min_ms / 1e3) / 1e12
-    return BenchResult(
-        label=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})",
-        rounds=n,
-        iters=iters,
-        median_ms=statistics.median(times_ms),
-        mean_ms=statistics.mean(times_ms),
-        stdev_ms=statistics.stdev(times_ms) if n > 1 else 0.0,
-        min_ms=min_ms,
-        max_ms=max(times_ms),
-        tflops=tflops,
+    return _result(cfg, times_ms, iters)
+
+
+def _bench_pair(
+    reference: BenchGemmConfig, candidate: BenchGemmConfig,
+) -> tuple[BenchResult, BenchResult]:
+    """Time a candidate and cuBLAS in balanced alternating blocks.
+
+    Both use the same input tensors.  Even rounds run reference then candidate;
+    odd rounds reverse that order.  This balances the power/clock advantage of
+    running first, which a sequential whole-kernel benchmark cannot remove by
+    taking a median afterward.
+    """
+    assert (candidate.m, candidate.n, candidate.k, candidate.dtype) == (
+        reference.m, reference.n, reference.k, reference.dtype
     )
+    time.sleep(_COOLDOWN_S)
+    torch.backends.cuda.matmul.allow_tf32 = candidate.allow_tf32
+    a, b = _inputs(candidate)
+
+    runs = {
+        "reference": lambda: reference.op(a, b),
+        "candidate": lambda: candidate.op(a, b),
+    }
+    for name, run in runs.items():
+        result = run()
+        assert result.dtype == candidate.dtype, name
+
+    one_ms = max(_one_launch_ms(run) for run in runs.values())
+    iters = max(1, round(_TARGET_ROUND_MS / one_ms))
+    round_ms = iters * one_ms
+    # At least two rounds are required so AB and BA both occur.
+    rounds = max(2, round(_MIN_RUN_TIME_S * 1e3 / round_ms))
+    if rounds % 2:
+        rounds += 1
+    warmup_iters = max(1, min(_WARMUP_ITERS, round(_WARMUP_S * 1e3 / one_ms)))
+    for i in range(warmup_iters):
+        order = ("reference", "candidate") if i % 2 == 0 else (
+            "candidate", "reference"
+        )
+        for name in order:
+            runs[name]()
+    torch.cuda.synchronize()
+
+    events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+        name: [] for name in runs
+    }
+    for i in range(rounds):
+        order = ("reference", "candidate") if i % 2 == 0 else (
+            "candidate", "reference"
+        )
+        for name in order:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                runs[name]()
+            end.record()
+            events[name].append((start, end))
+    torch.cuda.synchronize()
+
+    samples = {
+        name: [start.elapsed_time(end) / iters for start, end in pairs]
+        for name, pairs in events.items()
+    }
+    reference_result = _result(reference, samples["reference"], iters)
+    candidate_result = _result(candidate, samples["candidate"], iters)
+    candidate_result.cublas_median_ms = reference_result.median_ms
+    candidate_result.cublas_pct = (
+        candidate_result.tflops / reference_result.tflops * 100
+    )
+    return reference_result, candidate_result
 
 
-def _populate_percentages(
+def _populate_peak_percentages(
     configs: list[BenchGemmConfig], results: list[BenchResult]
 ) -> None:
-    torch_mm_tflops = next(
-        (
-            result.tflops
-            for cfg, result in zip(configs, results)
-            if cfg.op is torch.mm
-        ),
-        None,
-    )
     device_name = torch.cuda.get_device_name(0)
     for cfg, result in zip(configs, results):
         peak = _PEAK_DENSE_TC_TFLOPS.get((device_name, cfg.dtype))
         result.peak_pct = result.tflops / peak * 100 if peak else None
-        if torch_mm_tflops is not None:
-            result.torch_mm_pct = result.tflops / torch_mm_tflops * 100
 
 
 def _format_value(value, name: str) -> str:
@@ -231,14 +302,15 @@ def main() -> None:
             label, 4096, 4096, 4096, getattr(torch.ops.ayla, op), torch.bfloat16,
         )
 
-    configs = [
+    all_configs = [
         BenchGemmConfig(
-            label="torch.mm.bf16",
+            label="cuBLAS torch.mm(A, B.T).bf16",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.mm,
+            op=lambda a, b: torch.mm(a, b.t()),
             dtype=torch.bfloat16,
+            is_reference=True,
         ),
         BenchGemmConfig(
             label="ayla.pranjalssh",
@@ -301,7 +373,7 @@ def main() -> None:
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
         ),
         ayla_bf16(
-            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A+C evict-first)",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
         ayla_bf16(
@@ -329,17 +401,33 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
     ]
+    configs = all_configs
     if args.filter:
         pattern = re.compile(args.filter)
         configs = [c for c in configs if pattern.search(c.label)]
     if args.reverse:
         configs = configs[::-1]
-    results = []
-    for i, cfg in enumerate(configs, 1):
-        results.append(_bench(cfg))
-        print(f"[{i}/{len(configs)}] {cfg.label}", file=sys.stderr, flush=True)
 
-    _populate_percentages(configs, results)
+    reference = next((c for c in all_configs if c.is_reference), None)
+    candidates = [c for c in configs if not c.is_reference]
+    results = []
+    result_configs = []
+    if reference is not None and candidates:
+        for i, cfg in enumerate(candidates, 1):
+            _, result = _bench_pair(reference, cfg)
+            results.append(result)
+            result_configs.append(cfg)
+            print(
+                f"[{i}/{len(candidates)}] {cfg.label} vs matched cuBLAS",
+                file=sys.stderr, flush=True,
+            )
+    else:
+        for i, cfg in enumerate(configs, 1):
+            results.append(_bench(cfg))
+            result_configs.append(cfg)
+            print(f"[{i}/{len(configs)}] {cfg.label}", file=sys.stderr, flush=True)
+
+    _populate_peak_percentages(result_configs, results)
 
     label_width = max(
         (len(result.label) for result in results), default=len("label")

@@ -1,0 +1,4 @@
+implementation,duration_us,profiler_clock_mhz,sm_cycles,tensor_active_pct,tensor_active_cycles,instructions,inst_per_cycle_per_sm_partition,dram_mb,l2_gb,registers_per_thread,threads_per_cta,shared_kb,waves_per_sm
+Ayla k3 4-tile,243.200,1187.906,288912.742,87.985,254200.243,13458816,0.08823,106.701,1.030,154,256,222.360,0.97
+cuBLAS,244.512,1161.684,284029.515,89.498,254200.241,16575269,0.11053,175.381,0.999,168,384,214.212,1.00
+CUTLASS CuTe DSL,257.088,1102.190,283349.621,89.713,254200.241,15706508,0.10498,202.961,1.231,168,384,231.424,1.00

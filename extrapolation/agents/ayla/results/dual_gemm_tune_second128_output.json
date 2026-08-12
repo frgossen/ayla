@@ -1,0 +1,173 @@
+{
+  "arms": {
+    "ayla_dual_k3_second128_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_second128_k3.py",
+      "obuf": 2,
+      "second_k_tile": 128,
+      "stages": 3
+    },
+    "ayla_dual_k4_second128_obuf1": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_second128_o1.py",
+      "obuf": 1,
+      "second_k_tile": 128,
+      "stages": 4
+    },
+    "ayla_dual_k4_second128_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_second128.py",
+      "obuf": 2,
+      "second_k_tile": 128,
+      "second_stages": 1,
+      "stages": 4
+    },
+    "ayla_dual_k4_second128_os1": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_second128_os1.py",
+      "output_slices": 1,
+      "output_store_buffers": 1,
+      "second_k_tile": 128,
+      "stages": 4
+    },
+    "torch_two_cublas_gemms": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_dual_gemm.py"
+    }
+  },
+  "baseline": "torch_two_cublas_gemms",
+  "command": [
+    "../../benchmark/run.py",
+    "--problem",
+    "dual_gemm",
+    "--baseline",
+    "../../references/torch_dual_gemm.py",
+    "--candidate",
+    "submissions/dual_gemm_second128.py",
+    "--candidate",
+    "submissions/dual_gemm_second128_k3.py",
+    "--candidate",
+    "submissions/dual_gemm_second128_o1.py",
+    "--candidate",
+    "submissions/dual_gemm_second128_os1.py",
+    "--gpu",
+    "4",
+    "--warmup",
+    "100",
+    "--batch",
+    "20",
+    "--pairs",
+    "10",
+    "--bootstrap",
+    "500",
+    "--output",
+    "results/dual_gemm_tune_second128_output.json"
+  ],
+  "comparisons": {
+    "ayla_dual_k3_second128_obuf2": {
+      "baseline_median_us": 44.598399102687836,
+      "baseline_tflops": 192.6063438335908,
+      "candidate_median_us": 50.7423996925354,
+      "candidate_tflops": 169.28514701805966,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        10.494339968352055,
+        15.369813698940833
+      ],
+      "paired_median_delta_pct": 14.127972137141679,
+      "pairs": 10
+    },
+    "ayla_dual_k4_second128_obuf1": {
+      "baseline_median_us": 44.46239918470383,
+      "baseline_tflops": 193.19548088973013,
+      "candidate_median_us": 49.21199977397919,
+      "candidate_tflops": 174.5495942341673,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        8.60112133963526,
+        13.402739121649152
+      ],
+      "paired_median_delta_pct": 10.351253295734757,
+      "pairs": 10
+    },
+    "ayla_dual_k4_second128_obuf2": {
+      "baseline_median_us": 44.72079873085022,
+      "baseline_tflops": 192.07918542998462,
+      "candidate_median_us": 48.57679903507233,
+      "candidate_tflops": 176.83204251062506,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        7.465649020131937,
+        12.383616584373026
+      ],
+      "paired_median_delta_pct": 9.816696944822041,
+      "pairs": 10
+    },
+    "ayla_dual_k4_second128_os1": {
+      "baseline_median_us": 44.623200595378876,
+      "baseline_tflops": 192.49929358248596,
+      "candidate_median_us": 52.02320218086243,
+      "candidate_tflops": 165.11737516918836,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        14.769571398919092,
+        19.543891276837144
+      ],
+      "paired_median_delta_pct": 16.666703679237106,
+      "pairs": 10
+    }
+  },
+  "correctness": {
+    "ayla_dual_k3_second128_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k4_second128_obuf1": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k4_second128_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k4_second128_os1": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_two_cublas_gemms": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1935",
+    "memory.used": "1293",
+    "name": "NVIDIA H100",
+    "power.draw": "176.90",
+    "power.limit": "500.00",
+    "temperature.gpu": "50",
+    "utilization.gpu": "81",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "125",
+    "name": "NVIDIA H100",
+    "power.draw": "74.66",
+    "power.limit": "500.00",
+    "temperature.gpu": "45",
+    "utilization.gpu": "0",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "physical_gpu": 4,
+  "problem": "dual_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786476938.0814877,
+  "torch_version": "2.13.0+cu130"
+}

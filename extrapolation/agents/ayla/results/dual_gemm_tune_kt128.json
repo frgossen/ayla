@@ -1,0 +1,91 @@
+{
+  "arms": {
+    "ayla_dual_kt128_k2_second2_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_kt128.py",
+      "first_k_tile": 128,
+      "obuf": 2,
+      "second_stages": 2,
+      "stages": 2
+    },
+    "torch_two_cublas_gemms": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_dual_gemm.py"
+    }
+  },
+  "baseline": "torch_two_cublas_gemms",
+  "command": [
+    "../../benchmark/run.py",
+    "--problem",
+    "dual_gemm",
+    "--baseline",
+    "../../references/torch_dual_gemm.py",
+    "--candidate",
+    "submissions/dual_gemm_kt128.py",
+    "--gpu",
+    "4",
+    "--warmup",
+    "100",
+    "--batch",
+    "20",
+    "--pairs",
+    "10",
+    "--bootstrap",
+    "500",
+    "--output",
+    "results/dual_gemm_tune_kt128.json"
+  ],
+  "comparisons": {
+    "ayla_dual_kt128_k2_second2_obuf2": {
+      "baseline_median_us": 44.66559886932373,
+      "baseline_tflops": 192.31656598025725,
+      "candidate_median_us": 52.264800667762756,
+      "candidate_tflops": 164.3541060570489,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        14.795199860800084,
+        20.906848250266222
+      ],
+      "paired_median_delta_pct": 16.406944186770062,
+      "pairs": 10
+    }
+  },
+  "correctness": {
+    "ayla_dual_kt128_k2_second2_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_two_cublas_gemms": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1980",
+    "memory.used": "1231",
+    "name": "NVIDIA H100",
+    "power.draw": "151.37",
+    "power.limit": "500.00",
+    "temperature.gpu": "50",
+    "utilization.gpu": "0",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "127",
+    "name": "NVIDIA H100",
+    "power.draw": "74.76",
+    "power.limit": "500.00",
+    "temperature.gpu": "45",
+    "utilization.gpu": "0",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "physical_gpu": 4,
+  "problem": "dual_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786476434.4923346,
+  "torch_version": "2.13.0+cu130"
+}

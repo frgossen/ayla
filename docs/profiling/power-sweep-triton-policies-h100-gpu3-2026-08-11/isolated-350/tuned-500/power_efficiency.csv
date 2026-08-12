@@ -1,0 +1,2 @@
+power_limit_w,implementation,median_ms,mean_ms,stdev_ms,tflops,mean_power_w,median_power_w,power_stdev_w,tflops_per_watt,joules_per_gemm,median_sm_clock_mhz,max_temperature_c,power_capped_fraction,timing_batches,power_samples
+350,Triton tuned @ 500 W,0.40644287109375,0.4080633942009605,0.012302893477447098,338.1507297745133,349.0422033898305,349.14,0.7724860623597274,0.9687961125917116,0.14186571527865136,690.0,61.0,1.0,977,59

@@ -49,9 +49,42 @@ Thumbs.db
 
 # Profiler reports
 *.ncu-rep
+*.cubin
+*.sass
+*.so
+*.a
+*.o
+*.png
 
 # Generated PTX
 *.ptx
+/generated_ptx/
+
+# Extrapolation keeps runnable harnesses, submissions, and lightweight results,
+# but upstream library clones and the duplicated Ayla source snapshot stay local.
+/extrapolation/agents/ayla/*
+!/extrapolation/agents/ayla/README.md
+!/extrapolation/agents/ayla/submissions/
+!/extrapolation/agents/ayla/submissions/**
+!/extrapolation/agents/ayla/results/
+!/extrapolation/agents/ayla/results/**
+!/extrapolation/agents/ayla/tools/
+/extrapolation/agents/ayla/tools/*
+!/extrapolation/agents/ayla/tools/build_dual_gemm_artifacts.py
+/extrapolation/agents/triton/*
+!/extrapolation/agents/triton/AGENTS.md
+!/extrapolation/agents/triton/submissions/
+!/extrapolation/agents/triton/submissions/**
+!/extrapolation/agents/triton/results/
+!/extrapolation/agents/triton/results/**
+/extrapolation/agents/cutlass/*
+!/extrapolation/agents/cutlass/submissions/
+!/extrapolation/agents/cutlass/submissions/**
+!/extrapolation/agents/cutlass/results/
+!/extrapolation/agents/cutlass/results/**
+/extrapolation/agents/triton-upstream/
+/extrapolation/agents/cutlass-upstream/
+/extrapolation/**/__pycache__/
 
 # Generated / temporary
 tmp/

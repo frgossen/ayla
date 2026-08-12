@@ -1,0 +1,229 @@
+{
+  "arms": {
+    "ayla_dual_k2_part2_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_k2.py",
+      "obuf": 2,
+      "partitions": 2,
+      "stages": 2
+    },
+    "ayla_dual_k3_part1_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_part1.py",
+      "obuf": 2,
+      "partitions": 1,
+      "stages": 3
+    },
+    "ayla_dual_k3_part2_obuf1": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_obuf1.py",
+      "obuf": 1,
+      "partitions": 2,
+      "stages": 3
+    },
+    "ayla_dual_k3_part4_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_part4.py",
+      "obuf": 2,
+      "partitions": 4,
+      "stages": 3
+    },
+    "ayla_dual_k4_part2_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_k4.py",
+      "obuf": 2,
+      "partitions": 2,
+      "stages": 4
+    },
+    "ayla_fused_dual_gemm_k3_npart2": {
+      "backend": "Ayla PTX",
+      "column_partitions": 2,
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm.py",
+      "first_gemm_stages": 3,
+      "fused": true,
+      "intermediate": "BF16 shared memory",
+      "m_tile": 64,
+      "n_tile": 256,
+      "output_store_buffers": 2
+    },
+    "torch_two_cublas_gemms": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_dual_gemm.py"
+    }
+  },
+  "baseline": "torch_two_cublas_gemms",
+  "command": [
+    "../../benchmark/run.py",
+    "--problem",
+    "dual_gemm",
+    "--baseline",
+    "../../references/torch_dual_gemm.py",
+    "--candidate",
+    "submissions/dual_gemm.py",
+    "--candidate",
+    "submissions/dual_gemm_k2.py",
+    "--candidate",
+    "submissions/dual_gemm_k4.py",
+    "--candidate",
+    "submissions/dual_gemm_obuf1.py",
+    "--candidate",
+    "submissions/dual_gemm_part1.py",
+    "--candidate",
+    "submissions/dual_gemm_part4.py",
+    "--gpu",
+    "4",
+    "--warmup",
+    "100",
+    "--batch",
+    "20",
+    "--pairs",
+    "10",
+    "--bootstrap",
+    "500",
+    "--output",
+    "results/dual_gemm_tune_sweep.json"
+  ],
+  "comparisons": {
+    "ayla_dual_k2_part2_obuf2": {
+      "baseline_median_us": 44.330400228500366,
+      "baseline_tflops": 193.77074305044204,
+      "candidate_median_us": 60.971200466156006,
+      "candidate_tflops": 140.8851150432591,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        34.08938104047668,
+        40.28728795943972
+      ],
+      "paired_median_delta_pct": 37.87962652144681,
+      "pairs": 10
+    },
+    "ayla_dual_k3_part1_obuf2": {
+      "baseline_median_us": 44.20799911022186,
+      "baseline_tflops": 194.30724676281082,
+      "candidate_median_us": 74.96080100536346,
+      "candidate_tflops": 114.5923532938954,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        65.71849577002887,
+        71.74652785919056
+      ],
+      "paired_median_delta_pct": 68.38001880290386,
+      "pairs": 10
+    },
+    "ayla_dual_k3_part2_obuf1": {
+      "baseline_median_us": 44.27440017461777,
+      "baseline_tflops": 194.01583213146625,
+      "candidate_median_us": 57.56320059299469,
+      "candidate_tflops": 149.2261462793884,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        27.525237236467504,
+        32.866820844282955
+      ],
+      "paired_median_delta_pct": 30.30728669137155,
+      "pairs": 10
+    },
+    "ayla_dual_k3_part4_obuf2": {
+      "baseline_median_us": 44.4472000002861,
+      "baseline_tflops": 193.26154610289757,
+      "candidate_median_us": 79.77199852466583,
+      "candidate_tflops": 107.68107545085456,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        77.55993812475216,
+        83.41442446205842
+      ],
+      "paired_median_delta_pct": 79.62424831907532,
+      "pairs": 10
+    },
+    "ayla_dual_k4_part2_obuf2": {
+      "baseline_median_us": 44.146399199962616,
+      "baseline_tflops": 194.5783744013096,
+      "candidate_median_us": 53.79280149936676,
+      "candidate_tflops": 159.68557785749678,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        20.123168411190278,
+        23.34001703804318
+      ],
+      "paired_median_delta_pct": 21.47763554239762,
+      "pairs": 10
+    },
+    "ayla_fused_dual_gemm_k3_npart2": {
+      "baseline_median_us": 44.35679912567139,
+      "baseline_tflops": 193.65542061912663,
+      "candidate_median_us": 56.39199912548065,
+      "candidate_tflops": 152.32541362625057,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        25.77650215278477,
+        29.73390588538539
+      ],
+      "paired_median_delta_pct": 27.292819151766217,
+      "pairs": 10
+    }
+  },
+  "correctness": {
+    "ayla_dual_k2_part2_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k3_part1_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k3_part2_obuf1": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k3_part4_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k4_part2_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_fused_dual_gemm_k3_npart2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_two_cublas_gemms": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1950",
+    "memory.used": "1361",
+    "name": "NVIDIA H100",
+    "power.draw": "207.32",
+    "power.limit": "500.00",
+    "temperature.gpu": "54",
+    "utilization.gpu": "96",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "129",
+    "name": "NVIDIA H100",
+    "power.draw": "75.08",
+    "power.limit": "500.00",
+    "temperature.gpu": "45",
+    "utilization.gpu": "0",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "physical_gpu": 4,
+  "problem": "dual_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786476293.2126462,
+  "torch_version": "2.13.0+cu130"
+}

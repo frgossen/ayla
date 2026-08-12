@@ -8,7 +8,8 @@ to profile only the post-warmup launches.
 
     op=wgmma256 -> torch.ops.ayla.auto_matmul_4096_wgmma256_wg (best ayla WGMMA)
     op=auto     -> torch.ops.ayla.auto_matmul_4096  (wgmma128 ayla kernel)
-    op=torch    -> torch.mm                         (cuBLAS baseline)
+    op=torch    -> torch.mm(a, b.T)                 (matched cuBLAS baseline)
+    op=tma-store-k3-4tiles-split2 -> current 4-tile Ayla kernel
 
 Usage (run under ncu, see the commands printed by this repo's docs):
     python tools/ncu_profile.py --op auto --warmup 5 --profile 1
@@ -27,11 +28,6 @@ if _BINDIR and _BINDIR not in os.environ.get("PATH", "").split(os.pathsep):
 import torch
 
 import ayla.gemm_collection  # noqa: F401 — registers torch.ops.ayla.*
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_storepipe import (
-    auto_matmul_4096_wgmma256_wg_storepipe_module,
-)
-from ayla.ptx_codegen import make_ptx_kernel
-from ayla.ptx_runtime import make_ptx_launcher
 
 M = N = K = 4096
 DTYPE = torch.bfloat16
@@ -40,24 +36,32 @@ DTYPE = torch.bfloat16
 def get_op(name: str):
     if name == "wgmma256":
         return lambda a, b: torch.ops.ayla.auto_matmul_4096_wgmma256_wg(a, b)
-    if name == "storepipe":
-        return lambda a, b: torch.ops.ayla.auto_matmul_4096_wgmma256_wg_storepipe(a, b)
+    if name == "tma-store-k3-2tiles":
+        return lambda a, b: torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles(a, b)
+    if name == "tma-store-k3-4tiles-split2":
+        return lambda a, b: torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2(a, b)
+    if name == "tma-store-k4-split2-2tiles":
+        return lambda a, b: torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2(a, b)
+    if name == "tma-store-k3-cluster1x2":
+        return lambda a, b: torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_cluster1x2(a, b)
     if name == "auto":
         return lambda a, b: torch.ops.ayla.auto_matmul_4096(a, b)
     if name == "torch":
-        return torch.mm
+        return lambda a, b: torch.mm(a, b.t())
     raise SystemExit(f"unknown op: {name!r}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--op", choices=["wgmma256", "storepipe", "auto", "torch", "storepipe-sweep"], required=True)
+    p.add_argument("--op", choices=[
+        "wgmma256", "tma-store-k3-2tiles", "tma-store-k3-4tiles-split2",
+        "tma-store-k4-split2-2tiles", "tma-store-k3-cluster1x2",
+        "auto", "torch",
+    ], required=True)
     p.add_argument("--warmup", type=int, default=5,
                    help="launches before the profiled region (ncu --launch-skip)")
     p.add_argument("--profile", type=int, default=1,
                    help="launches to profile (ncu --launch-count)")
-    p.add_argument("--shapes", type=str, default="1x1,1x2,1x4,2x2",
-                   help="storepipe-sweep: comma list of RmxRn (e.g. 1x1,1x2,2x2)")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -65,32 +69,8 @@ def main() -> None:
 
     torch.manual_seed(0)
     a = torch.randn(M, K, dtype=DTYPE, device="cuda")
-    b = torch.randn(K, N, dtype=DTYPE, device="cuda")  # torch.mm wants KxN
-
-    if args.op == "storepipe-sweep":
-        # Build one launcher per RmxRn shape, warm all, then fire each once.
-        # Run ncu with -k regex:auto_matmul so only these launches count toward
-        # -s/-c: -s (warmup * n_shapes) -c n_shapes profiles one steady launch
-        # of each. Identify shapes in ncu output by grid dim [32/Rm, 16/Rn, 1].
-        c = torch.empty(M, N, dtype=DTYPE, device="cuda")
-        shapes = [
-            tuple(int(x) for x in tok.lower().split("x"))
-            for tok in args.shapes.split(",")
-        ]
-        launchers = [
-            (rm, rn, make_ptx_launcher(make_ptx_kernel(
-                auto_matmul_4096_wgmma256_wg_storepipe_module(
-                    reduction_factor=rn, reduction_m=rm))))
-            for rm, rn in shapes
-        ]
-        for _ in range(args.warmup):
-            for _, _, L in launchers:
-                L(a, b, c)
-        torch.cuda.synchronize()
-        for rm, rn, L in launchers:
-            L(a, b, c)  # one profiled launch each; grid=[32/rm,16/rn,1]
-        torch.cuda.synchronize()
-        return
+    # Every op consumes the same row-major [N, K] B and computes A @ B.T.
+    b = torch.randn(N, K, dtype=DTYPE, device="cuda")
 
     op = get_op(args.op)
 

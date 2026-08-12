@@ -1,0 +1,2 @@
+power_limit_w,implementation,median_ms,mean_ms,stdev_ms,tflops,mean_power_w,median_power_w,power_stdev_w,tflops_per_watt,joules_per_gemm,median_sm_clock_mhz,max_temperature_c,power_capped_fraction,timing_batches,power_samples
+350,cuBLAS torch.mm,0.3948223876953125,0.37931769522568026,0.034750205533449645,348.1032427625728,349.245593220339,349.45,1.3131460921251628,0.9967290912757616,0.1378899790073201,720.0,61.0,1.0,1051,59

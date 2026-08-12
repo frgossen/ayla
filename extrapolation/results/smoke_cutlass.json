@@ -1,0 +1,77 @@
+{
+  "baseline": "torch_cublas_bf16",
+  "command": [
+    "benchmark/run.py",
+    "--problem",
+    "bf16_gemm",
+    "--baseline",
+    "references/torch_bf16_gemm.py",
+    "--candidate",
+    "references/cutlass_bf16_gemm.py",
+    "--gpu",
+    "3",
+    "--warmup",
+    "3",
+    "--batch",
+    "2",
+    "--pairs",
+    "2",
+    "--bootstrap",
+    "100",
+    "--output",
+    "results/smoke_cutlass.json"
+  ],
+  "comparisons": {
+    "cutlass_cute_persistent_bf16": {
+      "baseline_median_us": 215.16799926757812,
+      "candidate_median_us": 210.63999831676483,
+      "candidate_tflops": 652.4826935543192,
+      "candidate_wins": 2,
+      "paired_delta_95ci_pct": [
+        -3.9988357108653894,
+        -0.13644384157293551
+      ],
+      "paired_median_delta_pct": -2.0676397762191625,
+      "pairs": 2
+    }
+  },
+  "correctness": {
+    "cutlass_cute_persistent_bf16": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_cublas_bf16": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1980",
+    "memory.used": "1138",
+    "name": "NVIDIA H100",
+    "power.draw": "123.71",
+    "power.limit": "500.00",
+    "temperature.gpu": "42",
+    "utilization.gpu": "0",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "5",
+    "name": "NVIDIA H100",
+    "power.draw": "71.22",
+    "power.limit": "500.00",
+    "temperature.gpu": "41",
+    "utilization.gpu": "0",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c"
+  },
+  "physical_gpu": 3,
+  "problem": "bf16_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786404421.518148,
+  "torch_version": "2.13.0+cu130"
+}

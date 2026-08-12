@@ -30,20 +30,31 @@ from ayla.gemm_collection.auto_matmul_4096 import auto_matmul_4096_module
 from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg import (
     auto_matmul_4096_wgmma256_wg_module,
 )
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_storepipe import (
-    auto_matmul_4096_wgmma256_wg_storepipe_module,
+from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
+    auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 
 KERNELS = {
     "auto_matmul_4096": auto_matmul_4096_module,
     "auto_matmul_4096_wgmma256_wg": auto_matmul_4096_wgmma256_wg_module,
-    # Store-pipelining variant at a few reduction factors.
-    "auto_matmul_4096_wgmma256_wg_storepipe_R1": (
-        lambda: auto_matmul_4096_wgmma256_wg_storepipe_module(reduction_factor=1)
+    "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles": (
+        lambda: auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_tiles_per_cta=2
+        )
     ),
-    "auto_matmul_4096_wgmma256_wg_storepipe_R4": (
-        lambda: auto_matmul_4096_wgmma256_wg_storepipe_module(reduction_factor=4)
+    "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2": (
+        lambda: auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_tiles_per_cta=4,
+            operand_stages=3,
+            output_slices=2,
+            output_tma_inner_padding=16,
+            output_store_buffers=2,
+            operand_move_attrs={
+                "lhs": {"l2_cache_hint": "evict_first"},
+                "dst": {"l2_cache_hint": "evict_first"},
+            },
+        )
     ),
 }
 

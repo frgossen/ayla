@@ -1,0 +1,2 @@
+power_limit_w,implementation,median_ms,mean_ms,stdev_ms,tflops,mean_power_w,median_power_w,power_stdev_w,tflops_per_watt,joules_per_gemm,median_sm_clock_mhz,max_temperature_c,power_capped_fraction,timing_batches,power_samples
+350,CUTLASS CuTe DSL,0.3854950332641602,0.38068240911707835,0.012593851046459771,356.52587351967276,349.51355932203387,349.48,0.6102903851273105,1.0200630676853881,0.13473574117712248,735.0,63.0,1.0,1047,59

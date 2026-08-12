@@ -1,0 +1,118 @@
+{
+  "arms": {
+    "ayla_dual_k4_second128_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_second128.py",
+      "obuf": 2,
+      "second_k_tile": 128,
+      "second_stages": 1,
+      "stages": 4
+    },
+    "ayla_dual_k4_second2_obuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/dual_gemm_k4_s2_o2.py",
+      "obuf": 2,
+      "second_stages": 2,
+      "stages": 4
+    },
+    "torch_two_cublas_gemms": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_dual_gemm.py"
+    }
+  },
+  "baseline": "torch_two_cublas_gemms",
+  "command": [
+    "../../benchmark/run.py",
+    "--problem",
+    "dual_gemm",
+    "--baseline",
+    "../../references/torch_dual_gemm.py",
+    "--candidate",
+    "submissions/dual_gemm_k4_s2_o2.py",
+    "--candidate",
+    "submissions/dual_gemm_second128.py",
+    "--gpu",
+    "4",
+    "--warmup",
+    "100",
+    "--batch",
+    "20",
+    "--pairs",
+    "10",
+    "--bootstrap",
+    "500",
+    "--output",
+    "results/dual_gemm_tune_second128.json"
+  ],
+  "comparisons": {
+    "ayla_dual_k4_second128_obuf2": {
+      "baseline_median_us": 44.0991997718811,
+      "baseline_tflops": 194.78663187619074,
+      "candidate_median_us": 47.6952001452446,
+      "candidate_tflops": 180.1006089887737,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        6.401742917051553,
+        10.14492587316125
+      ],
+      "paired_median_delta_pct": 8.00427393961001,
+      "pairs": 10
+    },
+    "ayla_dual_k4_second2_obuf2": {
+      "baseline_median_us": 44.48879957199097,
+      "baseline_tflops": 193.08083550557313,
+      "candidate_median_us": 49.84800070524216,
+      "candidate_tflops": 172.3225499612998,
+      "candidate_wins": 0,
+      "paired_delta_95ci_pct": [
+        10.067657127655657,
+        13.421851766078756
+      ],
+      "paired_median_delta_pct": 11.606913016449381,
+      "pairs": 10
+    }
+  },
+  "correctness": {
+    "ayla_dual_k4_second128_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "ayla_dual_k4_second2_obuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_two_cublas_gemms": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1980",
+    "memory.used": "1229",
+    "name": "NVIDIA H100",
+    "power.draw": "158.88",
+    "power.limit": "500.00",
+    "temperature.gpu": "48",
+    "utilization.gpu": "51",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "125",
+    "name": "NVIDIA H100",
+    "power.draw": "74.68",
+    "power.limit": "500.00",
+    "temperature.gpu": "45",
+    "utilization.gpu": "0",
+    "uuid": "GPU-bd0735b9-3e55-c270-9e87-f23fe71ae7de"
+  },
+  "physical_gpu": 4,
+  "problem": "dual_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786476898.245409,
+  "torch_version": "2.13.0+cu130"
+}

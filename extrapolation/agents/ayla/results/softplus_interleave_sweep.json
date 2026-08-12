@@ -1,0 +1,227 @@
+{
+  "arms": {
+    "ayla_fused_softplus_i1": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/softplus_i1.py",
+      "fused": true,
+      "softplus_interleave": 1
+    },
+    "ayla_fused_softplus_i16": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/softplus_i16.py",
+      "fused": true,
+      "softplus_interleave": 16
+    },
+    "ayla_fused_softplus_i2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/softplus_i2.py",
+      "fused": true,
+      "softplus_interleave": 2
+    },
+    "ayla_fused_softplus_i32": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/softplus_i32.py",
+      "fused": true,
+      "softplus_interleave": 32
+    },
+    "ayla_fused_softplus_i4": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/softplus_i4.py",
+      "fused": true,
+      "softplus_interleave": 4
+    },
+    "ayla_fused_softplus_i8": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/agents/ayla/submissions/softplus.py",
+      "fused": true,
+      "intermediate_hbm_bytes": 0,
+      "operand_stages": 3,
+      "output_slices": 2,
+      "output_store_buffers": 2,
+      "output_tiles_per_cta": 4,
+      "output_tma_inner_padding": 16,
+      "softplus_interleave": 8,
+      "softplus_math": "predicated ex2.approx + lg2.approx in FP32",
+      "stable_softplus": true
+    },
+    "torch_cublas_then_softplus": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_softplus.py"
+    }
+  },
+  "baseline": "torch_cublas_then_softplus",
+  "command": [
+    "benchmark/run.py",
+    "--problem",
+    "softplus",
+    "--baseline",
+    "references/torch_softplus.py",
+    "--candidate",
+    "agents/ayla/submissions/softplus_i1.py",
+    "--candidate",
+    "agents/ayla/submissions/softplus_i2.py",
+    "--candidate",
+    "agents/ayla/submissions/softplus_i4.py",
+    "--candidate",
+    "agents/ayla/submissions/softplus.py",
+    "--candidate",
+    "agents/ayla/submissions/softplus_i16.py",
+    "--candidate",
+    "agents/ayla/submissions/softplus_i32.py",
+    "--gpu",
+    "0",
+    "--warmup",
+    "40",
+    "--batch",
+    "10",
+    "--pairs",
+    "15",
+    "--bootstrap",
+    "1000",
+    "--output",
+    "agents/ayla/results/softplus_interleave_sweep.json"
+  ],
+  "comparisons": {
+    "ayla_fused_softplus_i1": {
+      "baseline_median_us": 446.69761657714844,
+      "baseline_tflops": 307.67783030752554,
+      "candidate_median_us": 217.80478954315186,
+      "candidate_tflops": 631.0189677659515,
+      "candidate_wins": 15,
+      "paired_delta_95ci_pct": [
+        -51.52284295384809,
+        -50.18459007741957
+      ],
+      "paired_median_delta_pct": -51.08230037666217,
+      "pairs": 15
+    },
+    "ayla_fused_softplus_i16": {
+      "baseline_median_us": 445.67999839782715,
+      "baseline_tflops": 308.38034905330875,
+      "candidate_median_us": 217.54560470581055,
+      "candidate_tflops": 631.7707666760738,
+      "candidate_wins": 15,
+      "paired_delta_95ci_pct": [
+        -51.51462774593549,
+        -50.19414102192666
+      ],
+      "paired_median_delta_pct": -51.01375285761025,
+      "pairs": 15
+    },
+    "ayla_fused_softplus_i2": {
+      "baseline_median_us": 446.4384078979492,
+      "baseline_tflops": 307.8564725627661,
+      "candidate_median_us": 219.34399604797363,
+      "candidate_tflops": 626.5909071973877,
+      "candidate_wins": 15,
+      "paired_delta_95ci_pct": [
+        -51.64888046336813,
+        -50.75188859421955
+      ],
+      "paired_median_delta_pct": -51.2676877309352,
+      "pairs": 15
+    },
+    "ayla_fused_softplus_i32": {
+      "baseline_median_us": 446.7360019683838,
+      "baseline_tflops": 307.65139336526266,
+      "candidate_median_us": 218.7488079071045,
+      "candidate_tflops": 628.2957826694346,
+      "candidate_wins": 15,
+      "paired_delta_95ci_pct": [
+        -51.47190156979428,
+        -50.38931091322594
+      ],
+      "paired_median_delta_pct": -51.26531157122191,
+      "pairs": 15
+    },
+    "ayla_fused_softplus_i4": {
+      "baseline_median_us": 445.79200744628906,
+      "baseline_tflops": 308.30286585736786,
+      "candidate_median_us": 215.97120761871338,
+      "candidate_tflops": 636.3762789836401,
+      "candidate_wins": 15,
+      "paired_delta_95ci_pct": [
+        -51.49467519329632,
+        -50.79032523059308
+      ],
+      "paired_median_delta_pct": -51.134601992914455,
+      "pairs": 15
+    },
+    "ayla_fused_softplus_i8": {
+      "baseline_median_us": 442.252779006958,
+      "baseline_tflops": 310.77012965437507,
+      "candidate_median_us": 217.3311948776245,
+      "candidate_tflops": 632.3940451778657,
+      "candidate_wins": 15,
+      "paired_delta_95ci_pct": [
+        -51.78096370800159,
+        -50.786580608936724
+      ],
+      "paired_median_delta_pct": -51.20907784424165,
+      "pairs": 15
+    }
+  },
+  "correctness": {
+    "ayla_fused_softplus_i1": {
+      "exact_fraction": 0.5877150297164917,
+      "max_abs": 0.0625,
+      "mean_abs": 0.00017614272655919194
+    },
+    "ayla_fused_softplus_i16": {
+      "exact_fraction": 0.5877150297164917,
+      "max_abs": 0.0625,
+      "mean_abs": 0.00017614272655919194
+    },
+    "ayla_fused_softplus_i2": {
+      "exact_fraction": 0.5877150297164917,
+      "max_abs": 0.0625,
+      "mean_abs": 0.00017614272655919194
+    },
+    "ayla_fused_softplus_i32": {
+      "exact_fraction": 0.5877150297164917,
+      "max_abs": 0.0625,
+      "mean_abs": 0.00017614272655919194
+    },
+    "ayla_fused_softplus_i4": {
+      "exact_fraction": 0.5877150297164917,
+      "max_abs": 0.0625,
+      "mean_abs": 0.00017614272655919194
+    },
+    "ayla_fused_softplus_i8": {
+      "exact_fraction": 0.5877150297164917,
+      "max_abs": 0.0625,
+      "mean_abs": 0.00017614272655919194
+    },
+    "torch_cublas_then_softplus": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1575",
+    "memory.used": "1345",
+    "name": "NVIDIA H100",
+    "power.draw": "389.21",
+    "power.limit": "500.00",
+    "temperature.gpu": "53",
+    "utilization.gpu": "98",
+    "uuid": "GPU-b5bfbe88-381d-7372-8d02-3ee98bcc2afe"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "83",
+    "name": "NVIDIA H100",
+    "power.draw": "68.66",
+    "power.limit": "500.00",
+    "temperature.gpu": "41",
+    "utilization.gpu": "0",
+    "uuid": "GPU-b5bfbe88-381d-7372-8d02-3ee98bcc2afe"
+  },
+  "physical_gpu": 0,
+  "problem": "softplus",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786480131.305806,
+  "torch_version": "2.13.0+cu130"
+}

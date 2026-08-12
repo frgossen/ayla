@@ -1,0 +1,155 @@
+{
+  "arms": {
+    "ayla_k3_4tiles_split2_dbuf2": {
+      "backend": "Ayla PTX",
+      "file": "/home/arseniivanov/extrapolation/references/ayla_bf16_gemm.py",
+      "operand_stages": 3,
+      "output_slices": 2,
+      "output_store_buffers": 2,
+      "output_tiles_per_cta": 4,
+      "output_tma_inner_padding": 16
+    },
+    "cutlass_cute_persistent_bf16": {
+      "backend": "CUTLASS 4.7 CuTe DSL persistent GEMM",
+      "cluster": [
+        1,
+        1
+      ],
+      "file": "/home/arseniivanov/extrapolation/references/cutlass_bf16_gemm.py",
+      "raster": "m",
+      "swizzle": 1,
+      "tile_m": 128,
+      "tile_n": 256
+    },
+    "torch_cublas_bf16": {
+      "backend": "PyTorch torch.mm / cuBLAS",
+      "file": "/home/arseniivanov/extrapolation/references/torch_bf16_gemm.py"
+    },
+    "triton_tma_persistent_bf16": {
+      "backend": "Triton TMA persistent",
+      "block_k": 64,
+      "block_m": 128,
+      "block_n": 256,
+      "file": "/home/arseniivanov/extrapolation/references/triton_bf16_gemm.py",
+      "group_m": 8,
+      "num_stages": 3,
+      "num_warps": 8
+    }
+  },
+  "baseline": "torch_cublas_bf16",
+  "command": [
+    "/home/arseniivanov/extrapolation/benchmark/run.py",
+    "--problem",
+    "bf16_gemm",
+    "--baseline",
+    "/home/arseniivanov/extrapolation/references/torch_bf16_gemm.py",
+    "--candidate",
+    "/home/arseniivanov/extrapolation/references/ayla_bf16_gemm.py",
+    "--candidate",
+    "/home/arseniivanov/extrapolation/references/triton_bf16_gemm.py",
+    "--candidate",
+    "/home/arseniivanov/extrapolation/references/cutlass_bf16_gemm.py",
+    "--gpu",
+    "3",
+    "--warmup",
+    "300",
+    "--batch",
+    "20",
+    "--pairs",
+    "60",
+    "--bootstrap",
+    "4000",
+    "--output",
+    "docs/profiling/power-sweep-h100-gpu3-2026-08-10/power-350w-interleaved-paired.json"
+  ],
+  "comparisons": {
+    "ayla_k3_4tiles_split2_dbuf2": {
+      "baseline_median_us": 280.2440047264099,
+      "baseline_tflops": 490.4260257277429,
+      "candidate_median_us": 282.09279775619507,
+      "candidate_tflops": 487.2118486016246,
+      "candidate_wins": 10,
+      "paired_delta_95ci_pct": [
+        0.8998981080002642,
+        1.4901301852067759
+      ],
+      "paired_median_delta_pct": 1.1567236325688137,
+      "pairs": 60
+    },
+    "cutlass_cute_persistent_bf16": {
+      "baseline_median_us": 270.3511953353882,
+      "baseline_tflops": 508.37190973577196,
+      "candidate_median_us": 268.77440214157104,
+      "candidate_tflops": 511.3543268142293,
+      "candidate_wins": 32,
+      "paired_delta_95ci_pct": [
+        -1.0204321317296925,
+        0.16994683589772056
+      ],
+      "paired_median_delta_pct": -0.09095132055807606,
+      "pairs": 60
+    },
+    "triton_tma_persistent_bf16": {
+      "baseline_median_us": 270.6599950790405,
+      "baseline_tflops": 507.79190117055856,
+      "candidate_median_us": 279.87520694732666,
+      "candidate_tflops": 491.0722709992187,
+      "candidate_wins": 3,
+      "paired_delta_95ci_pct": [
+        1.1978931042538585,
+        2.024216137737424
+      ],
+      "paired_median_delta_pct": 1.5321318382087914,
+      "pairs": 60
+    }
+  },
+  "correctness": {
+    "ayla_k3_4tiles_split2_dbuf2": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "cutlass_cute_persistent_bf16": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_cublas_bf16": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "triton_tma_persistent_bf16": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1260",
+    "memory.used": "1202",
+    "name": "NVIDIA H100",
+    "power.draw": "338.85",
+    "power.limit": "350.00",
+    "temperature.gpu": "50",
+    "utilization.gpu": "98",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "5",
+    "name": "NVIDIA H100",
+    "power.draw": "72.61",
+    "power.limit": "350.00",
+    "temperature.gpu": "43",
+    "utilization.gpu": "0",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c"
+  },
+  "physical_gpu": 3,
+  "problem": "bf16_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786406173.5294085,
+  "torch_version": "2.13.0+cu130"
+}

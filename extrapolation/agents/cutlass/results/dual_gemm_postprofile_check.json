@@ -1,0 +1,101 @@
+{
+  "arms": {
+    "cutlass_cute_dual_gemm": {
+      "backend": "CUTLASS 4.7 CuTe DSL Hopper WGMMA",
+      "cluster": [
+        1,
+        1
+      ],
+      "cuda_graph": true,
+      "file": "/home/arseniivanov/extrapolation/agents/cutlass/submissions/dual_gemm_cute.py",
+      "gemm0_tile": [
+        64,
+        128
+      ],
+      "gemm1_tile": [
+        128,
+        256
+      ],
+      "implementation": "back-to-back persistent GEMM"
+    },
+    "torch_two_cublas_gemms": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_dual_gemm.py"
+    }
+  },
+  "baseline": "torch_two_cublas_gemms",
+  "command": [
+    "benchmark/run.py",
+    "--problem",
+    "dual_gemm",
+    "--baseline",
+    "references/torch_dual_gemm.py",
+    "--candidate",
+    "agents/cutlass/submissions/dual_gemm_cute.py",
+    "--gpu",
+    "6",
+    "--warmup",
+    "20",
+    "--batch",
+    "10",
+    "--pairs",
+    "10",
+    "--bootstrap",
+    "200",
+    "--output",
+    "agents/cutlass/results/dual_gemm_postprofile_check.json"
+  ],
+  "comparisons": {
+    "cutlass_cute_dual_gemm": {
+      "baseline_median_us": 43.81919950246811,
+      "baseline_tflops": 196.0312988263552,
+      "candidate_median_us": 41.230399906635284,
+      "candidate_tflops": 208.33983205235916,
+      "candidate_wins": 10,
+      "paired_delta_95ci_pct": [
+        -7.113368233137058,
+        -4.80224126542981
+      ],
+      "paired_median_delta_pct": -5.708521663214276,
+      "pairs": 10
+    }
+  },
+  "correctness": {
+    "cutlass_cute_dual_gemm": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "torch_two_cublas_gemms": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1980",
+    "memory.used": "1181",
+    "name": "NVIDIA H100",
+    "power.draw": "124.85",
+    "power.limit": "500.00",
+    "temperature.gpu": "39",
+    "utilization.gpu": "0",
+    "uuid": "GPU-0af16d25-e7fc-2ae4-b40d-eb5c4e87483f"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "5",
+    "name": "NVIDIA H100",
+    "power.draw": "70.62",
+    "power.limit": "500.00",
+    "temperature.gpu": "37",
+    "utilization.gpu": "0",
+    "uuid": "GPU-0af16d25-e7fc-2ae4-b40d-eb5c4e87483f"
+  },
+  "physical_gpu": 6,
+  "problem": "dual_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786475691.9103405,
+  "torch_version": "2.13.0+cu130"
+}

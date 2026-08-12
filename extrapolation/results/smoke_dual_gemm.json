@@ -1,0 +1,62 @@
+{
+  "arms": {
+    "torch_two_cublas_gemms": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_dual_gemm.py"
+    }
+  },
+  "baseline": "torch_two_cublas_gemms",
+  "command": [
+    "benchmark/run.py",
+    "--problem",
+    "dual_gemm",
+    "--baseline",
+    "references/torch_dual_gemm.py",
+    "--gpu",
+    "3",
+    "--warmup",
+    "2",
+    "--batch",
+    "1",
+    "--pairs",
+    "1",
+    "--bootstrap",
+    "20",
+    "--output",
+    "results/smoke_dual_gemm.json"
+  ],
+  "comparisons": {},
+  "correctness": {
+    "torch_two_cublas_gemms": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1980",
+    "memory.used": "1044",
+    "name": "NVIDIA H100",
+    "power.draw": "106.49",
+    "power.limit": "500.00",
+    "temperature.gpu": "42",
+    "utilization.gpu": "1",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "5",
+    "name": "NVIDIA H100",
+    "power.draw": "71.18",
+    "power.limit": "500.00",
+    "temperature.gpu": "41",
+    "utilization.gpu": "0",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c"
+  },
+  "physical_gpu": 3,
+  "problem": "dual_gemm",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786404762.054799,
+  "torch_version": "2.13.0+cu130"
+}

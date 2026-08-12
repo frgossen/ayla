@@ -10,9 +10,8 @@ Phase B (``--phase-b``): literal ON/OFF timing at ``k_stages=2``. OFF uses the
 original scalar register→global epilogue; ON uses compact smem staging plus TMA
 stores whose waits are delayed across the following output tile's compute.
 
-Timing reuses the CUDA-event, min-of-rounds method from
-``benchmarks/bench_gemm_collection._bench`` (fastest round = steady boost
-clock, least noise).
+Timing reuses the CUDA-event, median-of-rounds method from
+``benchmarks/bench_gemm_collection._bench``.
 
 Usage:
     python tools/measure_store_pipeline.py                # R in {1,2,4,8}
@@ -45,7 +44,7 @@ _COOLDOWN_S = 1.0
 
 
 def _bench_launcher(run) -> tuple[float, float, int, int]:
-    """Return (min_ms, stdev_ms, iters, rounds) for a no-arg ``run`` closure."""
+    """Return (median_ms, stdev_ms, iters, rounds) for ``run``."""
     time.sleep(_COOLDOWN_S)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -78,7 +77,7 @@ def _bench_launcher(run) -> tuple[float, float, int, int]:
     torch.cuda.synchronize()
     times_ms = [s.elapsed_time(e) / iters for s, e in pairs]
     stdev = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
-    return min(times_ms), stdev, iters, len(times_ms)
+    return statistics.median(times_ms), stdev, iters, len(times_ms)
 
 
 def _build_launcher(

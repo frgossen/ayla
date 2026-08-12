@@ -1,0 +1,4 @@
+implementation,median_ms,tflops,mean_power_w,joules_per_gemm,median_sm_clock_mhz
+Ayla k3 4-tile,0.2658198357,517.03799,380.8110,0.10122712,1050
+cuBLAS,0.2700185585,508.99817,406.7153,0.10982069,1050
+CUTLASS CuTe DSL,0.2684121513,512.04445,429.8420,0.11537482,1050

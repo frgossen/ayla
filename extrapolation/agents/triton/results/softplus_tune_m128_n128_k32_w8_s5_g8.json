@@ -1,0 +1,94 @@
+{
+  "arms": {
+    "torch_cublas_then_softplus": {
+      "file": "/home/arseniivanov/extrapolation/references/torch_softplus.py"
+    },
+    "triton_tma_persistent_softplus": {
+      "backend": "Triton TMA persistent, fused stable Softplus",
+      "block_k": 32,
+      "block_m": 128,
+      "block_n": 128,
+      "epilogue": "tau*log(1+exp(min(x/tau,20))); select x above threshold",
+      "file": "/home/arseniivanov/extrapolation/agents/triton/submissions/softplus_fused.py",
+      "group_m": 8,
+      "num_stages": 5,
+      "num_warps": 8
+    }
+  },
+  "baseline": "torch_cublas_then_softplus",
+  "command": [
+    "benchmark/run.py",
+    "--problem",
+    "softplus",
+    "--baseline",
+    "references/torch_softplus.py",
+    "--candidate",
+    "agents/triton/submissions/softplus_fused.py",
+    "--gpu",
+    "6",
+    "--warmup",
+    "30",
+    "--batch",
+    "10",
+    "--pairs",
+    "10",
+    "--bootstrap",
+    "200",
+    "--output",
+    "agents/triton/results/softplus_tune_m128_n128_k32_w8_s5_g8.json"
+  ],
+  "comparisons": {
+    "triton_tma_persistent_softplus": {
+      "baseline_median_us": 438.5727882385254,
+      "baseline_tflops": 313.37774973227806,
+      "candidate_median_us": 307.47199058532715,
+      "candidate_tflops": 446.9966620711068,
+      "candidate_wins": 10,
+      "paired_delta_95ci_pct": [
+        -30.646075697005664,
+        -25.706596836638145
+      ],
+      "paired_median_delta_pct": -29.58814728128054,
+      "pairs": 10
+    }
+  },
+  "correctness": {
+    "torch_cublas_then_softplus": {
+      "exact_fraction": 1.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "triton_tma_persistent_softplus": {
+      "exact_fraction": 0.5876861214637756,
+      "max_abs": 0.0625,
+      "mean_abs": 0.000176161527633667
+    }
+  },
+  "cuda_version": "13.0",
+  "gpu_after": {
+    "clocks.sm": "1560",
+    "memory.used": "1139",
+    "name": "NVIDIA H100",
+    "power.draw": "169.71",
+    "power.limit": "500.00",
+    "temperature.gpu": "49",
+    "utilization.gpu": "0",
+    "uuid": "GPU-0af16d25-e7fc-2ae4-b40d-eb5c4e87483f"
+  },
+  "gpu_before": {
+    "clocks.sm": "345",
+    "memory.used": "5",
+    "name": "NVIDIA H100",
+    "power.draw": "70.49",
+    "power.limit": "500.00",
+    "temperature.gpu": "41",
+    "utilization.gpu": "0",
+    "uuid": "GPU-0af16d25-e7fc-2ae4-b40d-eb5c4e87483f"
+  },
+  "physical_gpu": 6,
+  "problem": "softplus",
+  "schema_version": 1,
+  "seed": 42,
+  "timestamp_unix": 1786480152.8187647,
+  "torch_version": "2.13.0+cu130"
+}

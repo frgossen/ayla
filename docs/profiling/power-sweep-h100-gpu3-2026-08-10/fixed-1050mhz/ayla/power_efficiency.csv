@@ -1,0 +1,2 @@
+power_limit_w,implementation,median_ms,mean_ms,stdev_ms,tflops,mean_power_w,median_power_w,power_stdev_w,tflops_per_watt,joules_per_gemm,median_sm_clock_mhz,max_temperature_c,power_capped_fraction,timing_batches,power_samples
+500,Ayla best,0.26581983566284184,0.26669570086474087,0.0016392020531485008,517.0379897695956,380.811,382.28,3.484550483055961,1.3577286101756398,0.10122711743860247,1050.0,58.0,0.0,748,30

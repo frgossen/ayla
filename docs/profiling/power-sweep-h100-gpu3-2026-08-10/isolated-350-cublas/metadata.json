@@ -1,0 +1,43 @@
+{
+  "started_at_utc": "2026-08-10T19:17:12.297236+00:00",
+  "hostname": "devgpu008.eag2.facebook.com",
+  "git_revision": "e8ea5203aa5b434509ff83f34ad87d057382cdd2",
+  "gpu": {
+    "index": "3",
+    "uuid": "GPU-b1239341-1830-45e1-822e-9142ffa94b9c",
+    "name": "NVIDIA H100",
+    "utilization.gpu": "0",
+    "utilization.memory": "0",
+    "memory.used": "5",
+    "temperature.gpu": "45",
+    "power.draw": "72.87",
+    "power.limit": "500.00",
+    "power.min_limit": "200.00",
+    "power.max_limit": "700.00"
+  },
+  "physical_gpu_index": 3,
+  "original_power_limit_w": 500.0,
+  "requested_power_limits_w": [
+    350
+  ],
+  "seconds_per_measurement": 20.0,
+  "ramp_seconds": 5.0,
+  "cooldown_seconds": 5.0,
+  "sample_interval_seconds": 0.2,
+  "launches_per_timing_batch": 50,
+  "seed": 0,
+  "shape": [
+    4096,
+    4096,
+    4096
+  ],
+  "dtype": "bfloat16",
+  "flops_per_gemm": 137438953472,
+  "ayla_op": "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
+  "torch_version": "2.13.0+cu130",
+  "cuda_version": "13.0",
+  "driver_version": "580.82.07",
+  "correctness_max_abs_error_vs_cublas_bf16": 0.0,
+  "finished_at_utc": "2026-08-10T19:17:42.878598+00:00",
+  "restored_power_limit_w": 500.0
+}
