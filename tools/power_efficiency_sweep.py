@@ -25,7 +25,8 @@ from typing import Callable
 
 FLOPS = 2 * 4096**3
 AYLA_OP = "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2"
-EXTRAPOLATION_ROOT = Path("/home/arseniivanov/extrapolation")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+EXTRAPOLATION_ROOT = REPOSITORY_ROOT / "extrapolation"
 REFERENCE_FILES = {
     "Ayla best": EXTRAPOLATION_ROOT / "references/ayla_bf16_gemm.py",
     "Triton TMA persistent": EXTRAPOLATION_ROOT / "references/triton_bf16_gemm.py",
