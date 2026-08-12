@@ -58,6 +58,34 @@ def test_war_on_shared_buffer_gets_barrier():
         }""")  # noqa: E501
 
 
+def test_bulk_wait_completion_is_broadcast_before_shared_arena_reuse():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%out: tma_desc<arg_idx=0 gmem_tensor<4x4xf32> tile=4x4>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %s: smem_tensor<4x4xf32> = alloc()
+            %r: rmem_tensor<4x4xf32> = alloc()
+            %c0: index = index_constant() attrs={value: 0}
+            %lock: lock<bulk> = alloc()
+            async(%lock: lock<bulk>) tma_move(%out: tma_desc<arg_idx=0 gmem_tensor<4x4xf32> tile=4x4>, %s: smem_tensor<4x4xf32>, %c0: index, %c0: index)
+            await(%lock: lock<bulk>)
+            move(%s: smem_tensor<4x4xf32>, %r: rmem_tensor<4x4xf32>)
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    # cp.async.bulk.wait_group is per issuing thread.  The full CTA barrier
+    # after the logical await keeps consumer threads from refilling %s before
+    # thread 0 has observed completion of the TMA read from %s.
+    assert_contains_in_order(
+        repr(module),
+        textwrap.dedent("""\
+            await(%lock: lock<bulk>)
+            barrier() attrs={scope: "block"}
+            move(%s: smem_tensor<4x4xf32>, %r: rmem_tensor<4x4xf32>)"""),
+    )
+
+
 
 def test_wgmma256_wg_pipeline_inserts_barriers():
     module = gpu_dialect.parse(textwrap.dedent("""\

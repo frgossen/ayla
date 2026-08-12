@@ -217,7 +217,8 @@ class PromoteBuffers(LoweringPass):
     tma_load_slices : dict[str, int] or None
         Leading-dimension TMA load slices by operand.
     move_attrs : dict[str, dict[str, object]] or None
-        Extra move attributes by operand.
+        Extra move attributes by operand. ``"dst"`` also reaches the TMA
+        writeback store, so an output-only L2 policy can be set there.
     """
 
     def __init__(
@@ -420,9 +421,10 @@ class PromoteBuffers(LoweringPass):
                 if self.writeback_slices > 1 else []
             )
             store_dst_value = store_tiles[0].result() if store_tiles else block_dst
+            store_attrs = {"label": f"{matmul_label}_dst_tma", "tma": True}
+            store_attrs.update(self.move_attrs.get("dst", {}))
             store = MoveOp.build(
-                dst=store_dst_value, src=smem.result(),
-                attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
+                dst=store_dst_value, src=smem.result(), attrs=store_attrs,
             )
             new_ops.extend([gather, *store_tiles, store])
         return new_ops

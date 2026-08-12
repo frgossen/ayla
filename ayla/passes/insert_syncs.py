@@ -231,13 +231,19 @@ def _analyze(
         # already synced instead.
         return live
     if isinstance(op, AwaitOp):
-        # Clear every effect pending on this lock -- only the ones this await fully
-        # orders were made pending on it (see the async handling below). Effects it
-        # only partially orders were never pending and stay live for a barrier.
+        # Clear every effect completed collectively by this await.  A bulk-group
+        # wait is different: async-group state is per issuing thread, so only the
+        # TMA-store leader has actually waited.  Keep that completed leader effect
+        # live until a later full-block barrier broadcasts completion to all
+        # threads before they overwrite the shared source arena.
+        retain_bulk_completion = op.lock.type.kind == "bulk"
         for buf, effs in live.concurrent_memory_effects.items():
-            live.concurrent_memory_effects[buf] = {
-                e for e in effs if e.pending_await != op.lock
-            }
+            completed = {e for e in effs if e.pending_await == op.lock}
+            remaining = {e for e in effs if e.pending_await != op.lock}
+            if retain_bulk_completion:
+                remaining.update(dataclasses.replace(e, pending_await=None)
+                                 for e in completed)
+            live.concurrent_memory_effects[buf] = remaining
         return live
     effects = memory_effects(op)
     if effects is None:
@@ -301,6 +307,10 @@ def _analyze(
 # BarrierScope -> the BarrierOp ``scope`` attr.
 _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
     BarrierScope.BLOCK_TO_LEADER: "block_leader",
+    # A leader-to-block handoff must hold every consumer until the leader's
+    # preceding completion wait has finished; a one-way named barrier lets the
+    # arriving consumer warps continue too early.
+    BarrierScope.LEADER_TO_BLOCK: "block",
     BarrierScope.BLOCK: "block",
 }
 

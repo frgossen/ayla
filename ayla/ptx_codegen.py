@@ -9,18 +9,12 @@ from . import pytree
 from .gpu_dialect import (
     BlockIdsOp,
     GmemTensorType,
-    IndexAddOp,
-    IndexConstantOp,
-    IndexDivOp,
-    IndexModOp,
-    IndexMulOp,
     IndexType,
     KernelOp,
     ForOp,
     LockType,
     ModuleOp,
     PTXTemplateOp,
-    PtrAddOp,
     PtrType,
     RmemTensorType,
     SmemTensorType,
@@ -29,7 +23,6 @@ from .gpu_dialect import (
     TokenType,
     ToPtrOp,
     LaneIdOp,
-    WarpGroupIdOp,
     WrmemTensorType,
 )
 from .base.ir import Op, Printer, Value
@@ -40,7 +33,10 @@ from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.select_stmatrix import SelectStMatrix
-from .passes.lower_to_ptx_template import LowerToPtxTemplate
+from .passes.lower_to_ptx_template import (
+    LowerScalarToPtxTemplate,
+    LowerToPtxTemplate,
+)
 from .base.pipeline import Pipeline
 
 
@@ -59,6 +55,12 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(SelectStMatrix())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(Folding())
+        self.add_pass(CSE())
+        self.add_pass(DCE())
+        # Scalar lowering runs after folding so constants embedded as PTX
+        # immediates cease to be SSA operands; ordinary DCE then removes their
+        # pure definitions before PTX register allocation.
+        self.add_pass(LowerScalarToPtxTemplate())
         self.add_pass(CSE())
         self.add_pass(DCE())
 
@@ -309,24 +311,10 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_thread_ids(p, op)
     elif isinstance(op, BlockIdsOp):
         _emit_block_ids(p, op)
-    elif isinstance(op, IndexConstantOp):
-        _emit_index_constant(p, op)
-    elif isinstance(op, IndexAddOp):
-        _emit_index_add(p, op)
-    elif isinstance(op, IndexMulOp):
-        _emit_index_mul(p, op)
-    elif isinstance(op, IndexDivOp):
-        _emit_index_div(p, op)
-    elif isinstance(op, IndexModOp):
-        _emit_index_mod(p, op)
-    elif isinstance(op, WarpGroupIdOp):
-        _emit_warp_group_id(p, op)
     elif isinstance(op, LaneIdOp):
         _emit_lane_id(p, op)
     elif isinstance(op, ToPtrOp):
         _emit_to_ptr(p, op)
-    elif isinstance(op, PtrAddOp):
-        _emit_ptr_add(p, op)
     else:
         raise NotImplementedError(f"make_ptx_kernel: not implemented for {op.op_id}")
 
@@ -437,8 +425,15 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
                     key = base if mname == "" else f"{base}.{mname}"
                     placeholder_values[key] = rname
 
-    bind_values("operand", op.operands, op.operand_names)
-    bind_values("result", op.results, op.result_names)
+    inline = op.attrs.get("inline") is True
+    if inline:
+        # Scalar lowering historically named the destination before sources.
+        # Keep that stable while the operation is represented as a template.
+        bind_values("result", op.results, op.result_names)
+        bind_values("operand", op.operands, op.operand_names)
+    else:
+        bind_values("operand", op.operands, op.operand_names)
+        bind_values("result", op.results, op.result_names)
 
     def repl(m: re.Match) -> str:
         ty, name = m.group("ty"), m.group("name")
@@ -450,6 +445,11 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
         return placeholder_values[name]
 
     expanded = re.sub(PLACEHOLDER_RE, repl, op.template)
+
+    if inline:
+        for line in expanded.splitlines():
+            p.write_line(line.strip())
+        return
 
     p.write_newline_once()
     p.write_line(f"// PTX template `{_op_description(p, op)}`")
@@ -480,103 +480,11 @@ def _emit_block_ids(p: PtxPrinter, op: BlockIdsOp) -> None:
     p.write_newline_once()
 
 
-def _emit_warp_group_id(p: PtxPrinter, op: WarpGroupIdOp) -> None:
-    rx = p.unique_ptx_names_for_value(op.x)
-    ry = p.unique_ptx_names_for_value(op.y)
-    rz = p.unique_ptx_names_for_value(op.z)
-    p.write_newline_once()
-    # Broadcast the logical warp's lane-0 thread id before extracting its
-    # warpgroup.  The shuffle makes warp uniformity explicit to ptxas without
-    # relying on the volatile physical `%warpid` special register.
-    p.write_line(f"mov.u32 {rx}, %tid.x;")
-    p.write_line(
-        f"shfl.sync.idx.b32 {rx}, {rx}, 0, 0x1f, 0xffffffff;"
-    )
-    p.write_line(f"shr.u32 {rx}, {rx}, 7;")
-    p.write_line(f"mov.u32 {ry}, 0;")
-    p.write_line(f"mov.u32 {rz}, 0;")
-    p.write_newline_once()
-
-
 def _write_with_comment(p: PtxPrinter, instr: str, op: Op, col: int = 30) -> None:
     """Write an instruction with an aligned trailing comment."""
     comment = _op_description(p, op)
     padding = max(1, col - len(instr))
     p.write_line(f"{instr}{' ' * padding}// {comment}")
-
-
-def _const_val(v: Value) -> int | None:
-    if isinstance(v.definition, IndexConstantOp):
-        return v.definition.value
-    return None
-
-
-def _is_power_of_2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def _emit_index_constant(p: PtxPrinter, op: IndexConstantOp) -> None:
-    reg = p.unique_ptx_names_for_value(op.result())
-    _write_with_comment(p, f"mov.u32 {reg}, {op.value};", op)
-
-
-def _emit_index_add(p: PtxPrinter, op: IndexAddOp) -> None:
-    dst = p.unique_ptx_names_for_value(op.result())
-    lhs = p.unique_ptx_names_for_value(op.lhs)
-    rhs_val = _const_val(op.rhs)
-    if rhs_val is not None:
-        _write_with_comment(p, f"add.s32 {dst}, {lhs}, {rhs_val};", op)
-    else:
-        rhs = p.unique_ptx_names_for_value(op.rhs)
-        _write_with_comment(p, f"add.s32 {dst}, {lhs}, {rhs};", op)
-
-
-def _emit_index_mul(p: PtxPrinter, op: IndexMulOp) -> None:
-    # TODO: Raise power-of-2 shift optimization to the IR level (IndexShlOp).
-    dst = p.unique_ptx_names_for_value(op.result())
-    lhs = p.unique_ptx_names_for_value(op.lhs)
-    rhs_val = _const_val(op.rhs)
-    lhs_val = _const_val(op.lhs)
-    if rhs_val is not None and _is_power_of_2(rhs_val):
-        shift = rhs_val.bit_length() - 1
-        _write_with_comment(p, f"shl.b32 {dst}, {lhs}, {shift};", op)
-    elif lhs_val is not None and _is_power_of_2(lhs_val):
-        rhs = p.unique_ptx_names_for_value(op.rhs)
-        shift = lhs_val.bit_length() - 1
-        _write_with_comment(p, f"shl.b32 {dst}, {rhs}, {shift};", op)
-    elif rhs_val is not None:
-        _write_with_comment(p, f"mul.lo.s32 {dst}, {lhs}, {rhs_val};", op)
-    else:
-        rhs = p.unique_ptx_names_for_value(op.rhs)
-        _write_with_comment(p, f"mul.lo.s32 {dst}, {lhs}, {rhs};", op)
-
-
-def _emit_index_div(p: PtxPrinter, op: IndexDivOp) -> None:
-    dst = p.unique_ptx_names_for_value(op.result())
-    lhs = p.unique_ptx_names_for_value(op.lhs)
-    rhs_val = _const_val(op.rhs)
-    if rhs_val is not None and _is_power_of_2(rhs_val):
-        shift = rhs_val.bit_length() - 1
-        _write_with_comment(p, f"shr.b32 {dst}, {lhs}, {shift};", op)
-    elif rhs_val is not None:
-        _write_with_comment(p, f"div.u32 {dst}, {lhs}, {rhs_val};", op)
-    else:
-        rhs = p.unique_ptx_names_for_value(op.rhs)
-        _write_with_comment(p, f"div.u32 {dst}, {lhs}, {rhs};", op)
-
-
-def _emit_index_mod(p: PtxPrinter, op: IndexModOp) -> None:
-    dst = p.unique_ptx_names_for_value(op.result())
-    lhs = p.unique_ptx_names_for_value(op.lhs)
-    rhs_val = _const_val(op.rhs)
-    if rhs_val is not None and _is_power_of_2(rhs_val):
-        mask = rhs_val - 1
-        _write_with_comment(p, f"and.b32 {dst}, {lhs}, {mask};", op)
-    elif rhs_val is not None:
-        _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs_val};", op)
-    else:
-        rhs = p.unique_ptx_names_for_value(op.rhs)
-        _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs};", op)
 
 
 def _emit_lane_id(p: PtxPrinter, op: LaneIdOp) -> None:
@@ -592,27 +500,6 @@ def _emit_to_ptr(p: PtxPrinter, op: ToPtrOp) -> None:
         _write_with_comment(p, f"mov.u64 {dst}, {src};", op)
     else:
         _write_with_comment(p, f"mov.u32 {dst}, {src};", op)
-
-
-def _emit_ptr_add(p: PtxPrinter, op: PtrAddOp) -> None:
-    dst = p.unique_ptx_names_for_value(op.result())
-    ptr = p.unique_ptx_names_for_value(op.ptr)
-    offset_val = _const_val(op.byte_offset)
-    ptr_type = op.result().type
-    if ptr_type.space == "gmem":
-        if offset_val is not None:
-            _write_with_comment(p, f"add.u64 {dst}, {ptr}, {offset_val};", op)
-        else:
-            offset = p.unique_ptx_names_for_value(op.byte_offset)
-            tmp = p.unique_ptx_names((op, "off64"), PtxType.B64)
-            p.write_line(f"cvt.u64.u32 {tmp}, {offset};")
-            _write_with_comment(p, f"add.u64 {dst}, {ptr}, {tmp};", op)
-    else:
-        if offset_val is not None:
-            _write_with_comment(p, f"add.u32 {dst}, {ptr}, {offset_val};", op)
-        else:
-            offset = p.unique_ptx_names_for_value(op.byte_offset)
-            _write_with_comment(p, f"add.u32 {dst}, {ptr}, {offset};", op)
 
 
 def _op_description(p: PtxPrinter, op: Op, max_len: int = 80) -> str:

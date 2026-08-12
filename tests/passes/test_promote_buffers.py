@@ -16,7 +16,9 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
         }"""))
     module = promote_buffers(
         module, target_type="wrmem", target_dtype="f32", operands=["dst"],
-        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+        layout="wgmma_layout_0", warps=4, tma=True,
+        move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+        label_filter="mm",
     )
     text = repr(module)
     assert "smem_tensor<128x256xbf16> = alloc()" in text
@@ -26,7 +28,10 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
     assert "smem_tensor<128x256xbf16>, %wgx: index, 0)" in text
     assert "move(%3: smem_tensor<64x256xbf16>, %1: wrmem_tensor<64x256xbf16" in text
     assert "move(%c: gmem_tensor<128x256xbf16>" in text
-    assert 'attrs={label: "mm_dst_tma", tma: True}' in text
+    assert (
+        'attrs={l2_cache_hint: "evict_first", label: "mm_dst_tma", tma: True}'
+        in text
+    )
 
 
 def test_wrmem_tma_writeback_can_use_one_arena_per_slice():

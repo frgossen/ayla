@@ -1913,6 +1913,8 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
 
 def is_value_identical(op: Op) -> bool:
     """Same operands and attrs always produce identical results."""
+    if isinstance(op, PTXTemplateOp):
+        return op.attrs.get("pure") is True
     return isinstance(op, (
         BlockIdsOp,
         IndexAddOp,

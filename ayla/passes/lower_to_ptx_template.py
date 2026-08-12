@@ -29,6 +29,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    IndexType,
     LockType,
     MatmulOp,
     KernelOp,
@@ -45,10 +46,11 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     ToPtrOp,
+    WarpGroupIdOp,
     WrmemTensorType,
     wgmma_layout_0_static_offsets,
 )
-from ..base.ir import Op, Value, find_ops
+from ..base.ir import Block, Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass
 
 
@@ -61,6 +63,10 @@ class LowerToPtxTemplate(LoweringPass):
             None, None, None,
         )
         self.cache_policy_values: dict[str, Value] = {}
+        # STMatrix's lane/warp-to-row offset is identical for stores with the
+        # same row stride.  Keep the first calculation as an SSA value and
+        # reuse it for later stores in the same block.
+        self.stmatrix_offsets: dict[int, Value] = {}
         self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
@@ -71,6 +77,16 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(BarrierOp, type(self).lower_barrier)
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
+        self.register(WarpGroupIdOp, type(self).lower_warp_group_id)
+
+    def lower_block(self, block: Block) -> None:
+        """Scope reusable STMatrix offsets to one block for SSA dominance."""
+        outer_offsets = self.stmatrix_offsets
+        self.stmatrix_offsets = {}
+        try:
+            super().lower_block(block)
+        finally:
+            self.stmatrix_offsets = outer_offsets
 
     def lower_kernel(
         self, op: KernelOp,
@@ -103,7 +119,67 @@ class LowerToPtxTemplate(LoweringPass):
             op.body.entry_block.ops.insert(0, policy_op)
             self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
         self.lower_region(op.body)
+        self._share_thread_x(op)
         return [op], []
+
+    @staticmethod
+    def _share_thread_x(kernel: KernelOp) -> None:
+        """Represent repeated ``%tid.x`` reads as one kernel-scoped SSA value."""
+        templates = find_ops(kernel, lambda candidate: (
+            isinstance(candidate, PTXTemplateOp)
+            and "%tid.x" in candidate.template
+        ))
+        if not templates:
+            return
+
+        entry = kernel.body.entry_block
+        read = PTXTemplateOp.build(
+            operands=[],
+            result_types=[IndexType()],
+            template="mov.u32 ${b32:result.tid_x.val}, %tid.x;\n",
+            operand_names=[],
+            result_names=["tid_x"],
+            description="read %tid.x once",
+            attrs={"pure": True, "inline": True},
+        )
+        tid_x = read.result()
+        for template_op in templates:
+            operand_index = len(template_op.operands)
+            template_op.operands.append(tid_x)
+            names = template_op.operand_names
+            if names is None:
+                operand = f"operand[{operand_index}]"
+            else:
+                name = "shared_tid_x"
+                assert name not in names
+                names.append(name)
+                operand = f"operand.{name}"
+            template_op.attrs["template"] = template_op.template.replace(
+                "%tid.x", f"${{b32:{operand}.val}}",
+            )
+        entry.ops.insert(0, read)
+
+    def lower_warp_group_id(
+        self, op: WarpGroupIdOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower through a template so its thread-id read participates in SSA."""
+        template = textwrap.dedent("""\
+            mov.u32 ${b32:result.x.val}, %tid.x;
+            shfl.sync.idx.b32 ${b32:result.x.val}, ${b32:result.x.val}, 0, 0x1f, 0xffffffff;
+            shr.u32 ${b32:result.x.val}, ${b32:result.x.val}, 7;
+            mov.u32 ${b32:result.y.val}, 0;
+            mov.u32 ${b32:result.z.val}, 0;
+        """)
+        lowered = PTXTemplateOp.build(
+            operands=[],
+            result_types=[result.type for result in op.results],
+            template=template,
+            operand_names=[],
+            result_names=["x", "y", "z"],
+            description=str(op),
+            attrs={"pure": True, "inline": True},
+        )
+        return [lowered], list(lowered.results)
 
     def _thread_zero_guard(self, prefix: str, done: str) -> list[str]:
         """Branch nonzero threads away, omitting statically singleton axes."""
@@ -598,10 +674,31 @@ class LowerToPtxTemplate(LoweringPass):
             operand_names.append(name)
             return name
 
-        desc_template = ""
+        # Emit derived descriptors next to their consumers.  When consecutive
+        # tiles advance monotonically from the first tile, update the two base
+        # descriptors in place instead of naming six one-use temporaries.
+        wgmma_template = ""
         scale_template = ""
-        mma_template = ""
+        lhs_tile_deltas = [
+            0 if j == 0 else _tile_delta(mm.lhs, mms[0].lhs, j)
+            for j, mm in enumerate(mms)
+        ]
+        rhs_tile_deltas = [
+            0 if j == 0 else _tile_delta(mm.rhs, mms[0].rhs, j)
+            for j, mm in enumerate(mms)
+        ]
+
+        def _can_update_in_place(deltas: list[int | None]) -> bool:
+            return all(delta is not None for delta in deltas) and all(
+                previous <= current
+                for previous, current in zip(deltas, deltas[1:])
+            )
+
+        update_lhs_in_place = _can_update_in_place(lhs_tile_deltas)
+        update_rhs_in_place = _can_update_in_place(rhs_tile_deltas)
         for j, mm in enumerate(mms):
+            desc_template = ""
+            mma_template = ""
             lhs_type = mm.lhs.type
             rhs_type = mm.rhs.type
             dst_type = mm.dst.type
@@ -654,25 +751,51 @@ class LowerToPtxTemplate(LoweringPass):
             desc_const_rhs = _build_static_desc(
                 lead_dim, rhs_row_stride_bytes * 8, _swizzle_to_bits[rhs_type.swizzle])
 
-            lhs_delta = _tile_delta(mm.lhs, mms[0].lhs, j)
-            rhs_delta = _tile_delta(mm.rhs, mms[0].rhs, j)
+            lhs_delta = None if j == 0 else lhs_tile_deltas[j]
+            rhs_delta = None if j == 0 else rhs_tile_deltas[j]
             lhs_name = None if lhs_delta is not None else _operand(self.value_map[mm.lhs], "lhs")
             rhs_name = None if rhs_delta is not None else _operand(self.value_map[mm.rhs], "rhs")
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
             desc_rhs = f"desc_rhs{j}"
-            desc_template += _desc(
-                desc_rhs, "desc_rhs0", rhs_delta,
-                f"operand.{rhs_name}.ptr", desc_const_rhs,
-            )
+            if j > 0 and update_rhs_in_place:
+                desc_rhs = "desc_rhs0"
+                assert rhs_delta is not None
+                previous_delta = rhs_tile_deltas[j - 1]
+                assert previous_delta is not None
+                increment = (rhs_delta - previous_delta) // 16
+                if increment:
+                    desc_template += (
+                        f"add.u64 ${{b64:{desc_rhs}}}, "
+                        f"${{b64:{desc_rhs}}}, {increment};\n"
+                    )
+            else:
+                desc_template += _desc(
+                    desc_rhs, "desc_rhs0", rhs_delta,
+                    f"operand.{rhs_name}.ptr", desc_const_rhs,
+                )
+            desc_lhs_names: list[str] = []
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
                 desc_lhs = f"desc_lhs{j}_{m_it}"
-                desc_template += _desc(
-                    desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
-                    f"operand.{lhs_name}.ptr", desc_const_lhs,
-                    lhs_offset if m_it > 0 else None,
-                )
+                if j > 0 and update_lhs_in_place:
+                    desc_lhs = f"desc_lhs0_{m_it}"
+                    assert lhs_delta is not None
+                    previous_delta = lhs_tile_deltas[j - 1]
+                    assert previous_delta is not None
+                    increment = (lhs_delta - previous_delta) // 16
+                    if increment:
+                        desc_template += (
+                            f"add.u64 ${{b64:{desc_lhs}}}, "
+                            f"${{b64:{desc_lhs}}}, {increment};\n"
+                        )
+                else:
+                    desc_template += _desc(
+                        desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
+                        f"operand.{lhs_name}.ptr", desc_const_lhs,
+                        lhs_offset if m_it > 0 else None,
+                    )
+                desc_lhs_names.append(desc_lhs)
 
             if mm.scale_d is None:
                 scale_d = "1"
@@ -693,11 +816,13 @@ class LowerToPtxTemplate(LoweringPass):
                 mma_template += textwrap.dedent(f"""\
                     wgmma.mma_async.sync.aligned.m64n{n_dim}k16.f32.bf16.bf16
                       {{{regs}}},
-                      ${{b64:desc_lhs{j}_{m_it}}},
+                      ${{b64:{desc_lhs_names[m_it]}}},
                       ${{b64:{desc_rhs}}},
                       {scale_d}, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
+
+            wgmma_template += desc_template + mma_template
 
         # One commit group for the whole batch: single fence, all mma_async, one
         # commit. Hardware serializes same-accumulator mmas, so the await's lone
@@ -707,8 +832,7 @@ class LowerToPtxTemplate(LoweringPass):
         template = (
             "wgmma.fence.sync.aligned;\n"
             + scale_template
-            + desc_template
-            + mma_template
+            + wgmma_template
             + "wgmma.commit_group.sync.aligned;\n"
         )
 
@@ -813,13 +937,12 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_mbar(
         self, op: AwaitOp, lock: Value,
     ) -> tuple[list[Op], list[object]]:
-        # Materializing the optional hint in a virtual register lets ptxas
-        # select the compact fused wait; an immediate or test_wait expands
-        # into substantially more phase-check, sleep, or yield instructions.
+        # Leave the optional timeHint absent. On Hopper, ptxas otherwise emits
+        # an out-of-line NANOSLEEP/phase-check slow path for every static wait.
+        # The enclosing retry loop already handles an incomplete barrier.
         template = textwrap.dedent(r"""
-            mov.u32 ${b32:ticks}, 0x989680;
             ${label:wait}:
-            mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity}, ${b32:ticks};
+            mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity};
             @!${pred:mbar_done} bra ${label:wait};
             xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;
         """)
@@ -1228,19 +1351,37 @@ class LowerToPtxTemplate(LoweringPass):
                 shr.u32 ${{b32:st_wg}}, ${{b32:st_full_tid}}, 7;
                 setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
             """)
-        template = writer_setup + textwrap.dedent(f"""\
-            mov.u32 ${{b32:st_lane}}, %laneid;
-            mov.u32 ${{b32:st_tid}}, %tid.x;
-            and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
-            shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
-            and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 15;
-            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
-            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 4;
-            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
-            mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, {dst_type.strides[0]}, ${{b32:st_col}};
-            shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
-            add.u32 ${{b32:base}}, ${{b32:operand.dst.ptr}}, ${{b32:st_off}};
-        """)
+        stride = dst_type.strides[0]
+        stmatrix_offset = self.stmatrix_offsets.get(stride)
+        operands = [dst, src]
+        operand_names = ["dst", "src"]
+        result_types = []
+        result_names = []
+        if stmatrix_offset is None:
+            result_types = [IndexType()]
+            result_names = ["offset"]
+            offset_reg = "${b32:result.offset.val}"
+            template = writer_setup + textwrap.dedent(f"""\
+                mov.u32 ${{b32:st_lane}}, %laneid;
+                mov.u32 ${{b32:st_tid}}, %tid.x;
+                and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
+                shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
+                and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 15;
+                mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
+                shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 4;
+                shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
+                mad.lo.u32 {offset_reg}, ${{b32:st_row}}, {stride}, ${{b32:st_col}};
+                shl.b32 {offset_reg}, {offset_reg}, 1;
+            """)
+        else:
+            operands.append(stmatrix_offset)
+            operand_names.append("offset")
+            offset_reg = "${b32:operand.offset.val}"
+            template = writer_setup
+        template += (
+            "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
+            f"{offset_reg};\n"
+        )
         for first, offset in zip(op.register_starts, op.offsets):
             regs = ", ".join(
                 f"${{b32:operand.src.r{i}}}" for i in range(first, first + 4)
@@ -1250,10 +1391,12 @@ class LowerToPtxTemplate(LoweringPass):
                 f"[${{b32:base}}+{offset}], {{{regs}}};\n"
             )
         lowered = PTXTemplateOp.build(
-            operands=[dst, src], result_types=[], template=template,
-            operand_names=["dst", "src"], result_names=[],
+            operands=operands, result_types=result_types, template=template,
+            operand_names=operand_names, result_names=result_names,
             description=str(op),
         )
+        if stmatrix_offset is None:
+            self.stmatrix_offsets[stride] = lowered.result()
         return [lowered], []
 
     def _lower_move_smem_to_wrmem_mma(
@@ -1493,6 +1636,13 @@ class LowerToPtxTemplate(LoweringPass):
         # handled by insert_syncs, which emits a barrier before this async.
         lines = [
             *self._thread_zero_guard("load", "after_load"),
+            # The branch above leaves exactly lane 0 active.  Stating that fact
+            # with elect.sync prevents ptxas from wrapping every UTMALDG in an
+            # ELECT/BRA.U.ANY serialization loop.  A lane-0-only member mask
+            # preserves the old thread-0 semantics even if an index is not
+            # warp-uniform; all other lanes have already branched away.
+            "elect.sync _|${pred:load_elected}, 1;",
+            "@!${pred:load_elected} bra ${label:after_load};",
             *load_lines,
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
             f"[${{b32:operand.lock.val}}], {total_bytes};",
@@ -1510,6 +1660,190 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], []
 
+
+def _constant_value(value: Value) -> int | None:
+    if isinstance(value.definition, IndexConstantOp):
+        return value.definition.value
+    return None
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
+
+
+class LowerScalarToPtxTemplate(LoweringPass):
+    """Finish scalar PTX lowering while preserving IR-visible liveness.
+
+    A constant used as an instruction immediate is deliberately omitted from
+    the resulting template's operands. This makes the constant definition
+    genuinely unused in SSA, allowing the ordinary DCE pass to remove it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register(IndexConstantOp, type(self).lower_constant)
+        self.register(IndexAddOp, type(self).lower_add)
+        self.register(IndexMulOp, type(self).lower_mul)
+        self.register(IndexDivOp, type(self).lower_div)
+        self.register(IndexModOp, type(self).lower_mod)
+        self.register(PtrAddOp, type(self).lower_ptr_add)
+
+    @staticmethod
+    def _template(
+        op: Op,
+        operands: list[Value],
+        operand_names: list[str],
+        result_type,
+        template: str,
+    ) -> tuple[list[Op], list[object]]:
+        lowered = PTXTemplateOp.build(
+            operands=operands,
+            result_types=[result_type],
+            template=template,
+            operand_names=operand_names,
+            result_names=["dst"],
+            description=str(op),
+            attrs={"pure": True, "inline": True},
+        )
+        return [lowered], [lowered.result()]
+
+    def lower_constant(
+        self, op: IndexConstantOp,
+    ) -> tuple[list[Op], list[object]]:
+        return self._template(
+            op, [], [], op.result().type,
+            f"mov.u32 ${{b32:result.dst.val}}, {op.value};\n",
+        )
+
+    def lower_add(
+        self, op: IndexAddOp,
+    ) -> tuple[list[Op], list[object]]:
+        lhs = self.value_map[op.lhs]
+        rhs_value = _constant_value(op.rhs)
+        if rhs_value is not None:
+            return self._template(
+                op, [lhs], ["lhs"], op.result().type,
+                "add.s32 ${b32:result.dst.val}, "
+                f"${{b32:operand.lhs.val}}, {rhs_value};\n",
+            )
+        rhs = self.value_map[op.rhs]
+        return self._template(
+            op, [lhs, rhs], ["lhs", "rhs"], op.result().type,
+            "add.s32 ${b32:result.dst.val}, ${b32:operand.lhs.val}, "
+            "${b32:operand.rhs.val};\n",
+        )
+
+    def lower_mul(
+        self, op: IndexMulOp,
+    ) -> tuple[list[Op], list[object]]:
+        lhs_value = _constant_value(op.lhs)
+        rhs_value = _constant_value(op.rhs)
+        if rhs_value is not None:
+            dynamic = self.value_map[op.lhs]
+            instruction, immediate = (
+                ("shl.b32", rhs_value.bit_length() - 1)
+                if _is_power_of_two(rhs_value)
+                else ("mul.lo.s32", rhs_value)
+            )
+            return self._template(
+                op, [dynamic], ["value"], op.result().type,
+                f"{instruction} ${{b32:result.dst.val}}, "
+                f"${{b32:operand.value.val}}, {immediate};\n",
+            )
+        if lhs_value is not None and _is_power_of_two(lhs_value):
+            dynamic = self.value_map[op.rhs]
+            return self._template(
+                op, [dynamic], ["value"], op.result().type,
+                "shl.b32 ${b32:result.dst.val}, "
+                f"${{b32:operand.value.val}}, {lhs_value.bit_length() - 1};\n",
+            )
+        lhs = self.value_map[op.lhs]
+        rhs = self.value_map[op.rhs]
+        return self._template(
+            op, [lhs, rhs], ["lhs", "rhs"], op.result().type,
+            "mul.lo.s32 ${b32:result.dst.val}, ${b32:operand.lhs.val}, "
+            "${b32:operand.rhs.val};\n",
+        )
+
+    def lower_div(
+        self, op: IndexDivOp,
+    ) -> tuple[list[Op], list[object]]:
+        lhs = self.value_map[op.lhs]
+        rhs_value = _constant_value(op.rhs)
+        if rhs_value is not None:
+            instruction, immediate = (
+                ("shr.b32", rhs_value.bit_length() - 1)
+                if _is_power_of_two(rhs_value)
+                else ("div.u32", rhs_value)
+            )
+            return self._template(
+                op, [lhs], ["lhs"], op.result().type,
+                f"{instruction} ${{b32:result.dst.val}}, "
+                f"${{b32:operand.lhs.val}}, {immediate};\n",
+            )
+        rhs = self.value_map[op.rhs]
+        return self._template(
+            op, [lhs, rhs], ["lhs", "rhs"], op.result().type,
+            "div.u32 ${b32:result.dst.val}, ${b32:operand.lhs.val}, "
+            "${b32:operand.rhs.val};\n",
+        )
+
+    def lower_mod(
+        self, op: IndexModOp,
+    ) -> tuple[list[Op], list[object]]:
+        lhs = self.value_map[op.lhs]
+        rhs_value = _constant_value(op.rhs)
+        if rhs_value is not None:
+            instruction, immediate = (
+                ("and.b32", rhs_value - 1)
+                if _is_power_of_two(rhs_value)
+                else ("rem.u32", rhs_value)
+            )
+            return self._template(
+                op, [lhs], ["lhs"], op.result().type,
+                f"{instruction} ${{b32:result.dst.val}}, "
+                f"${{b32:operand.lhs.val}}, {immediate};\n",
+            )
+        rhs = self.value_map[op.rhs]
+        return self._template(
+            op, [lhs, rhs], ["lhs", "rhs"], op.result().type,
+            "rem.u32 ${b32:result.dst.val}, ${b32:operand.lhs.val}, "
+            "${b32:operand.rhs.val};\n",
+        )
+
+    def lower_ptr_add(
+        self, op: PtrAddOp,
+    ) -> tuple[list[Op], list[object]]:
+        ptr = self.value_map[op.ptr]
+        offset_value = _constant_value(op.byte_offset)
+        is_gmem = op.result().type.space == "gmem"
+        opcode_type = "u64" if is_gmem else "u32"
+        register_type = "b64" if is_gmem else "b32"
+        if offset_value is not None:
+            template = (
+                f"add.{opcode_type} "
+                "${" + register_type + ":result.dst.ptr}, "
+                "${" + register_type + ":operand.ptr.ptr}, "
+                f"{offset_value};\n"
+            )
+            return self._template(
+                op, [ptr], ["ptr"], op.result().type, template,
+            )
+        offset = self.value_map[op.byte_offset]
+        if is_gmem:
+            template = (
+                "cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};\n"
+                "add.u64 ${b64:result.dst.ptr}, ${b64:operand.ptr.ptr}, "
+                "${b64:off64};\n"
+            )
+        else:
+            template = (
+                "add.u32 ${b32:result.dst.ptr}, ${b32:operand.ptr.ptr}, "
+                "${b32:operand.offset.val};\n"
+            )
+        return self._template(
+            op, [ptr, offset], ["ptr", "offset"], op.result().type, template,
+        )
 
 
 def _build_wgmma_layout_0_dynamic_offset(

@@ -93,7 +93,8 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=4, operand_stages=3, output_slices=2,
         output_tma_inner_padding=16, output_store_buffers=2,
-        operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"}},
+        operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"},
+                            "dst": {"l2_cache_hint": "evict_first"}},
     ))
     assert kernel.name.endswith("_k3_4tiles_split2_dbuf2")
     assert kernel.grid_dim == (8, 16, 1)
@@ -101,8 +102,25 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
     assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 8
     assert kernel.ptx.count("cp.async.bulk.wait_group") == 8
     assert kernel.ptx.count("stmatrix.") == 64
+    # The lane/warp-to-shared-memory offset is invariant across all eight
+    # STMatrix groups and should be calculated once, then added to each arena.
+    assert kernel.ptx.count("%laneid") == 1
     assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
     assert kernel.ptx.count("bytes.L2::cache_hint") == 28
+    assert kernel.ptx.count("bulk_group.L2::cache_hint") == 8
+    assert kernel.ptx.count("elect.sync") == 28
+    # Every completed output-arena store that is later reused must cross a
+    # full CTA barrier before the next cooperative STMatrix refill.  The first
+    # six waits have a later refill; the final two stores are never reused.
+    lines = kernel.ptx.splitlines()
+    waits = [i for i, line in enumerate(lines)
+             if "cp.async.bulk.wait_group" in line]
+    gathers = [i for i, line in enumerate(lines) if "stmatrix." in line]
+    for wait in waits:
+        next_gather = next((i for i in gathers if i > wait), None)
+        if next_gather is not None:
+            assert any(line.strip() == "bar.sync 0;"
+                       for line in lines[wait:next_gather])
 
 
 def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
@@ -144,17 +162,31 @@ def test_k3_keeps_warpgroup_descriptor_arithmetic_uniform():
         output_tiles_per_cta=2, operand_stages=3, output_slices=2,
         output_tma_inner_padding=16,
     ))
+    shared_tid = re.search(r"mov\.u32 (%r\d+), %tid\.x;", kernel.ptx)
+    assert shared_tid is not None
+    tid = re.escape(shared_tid.group(1))
     warpgroup_id = re.search(
-        r"mov\.u32 (%r\d+), %tid\.x;\n"
+        rf"mov\.u32 (%r\d+), {tid};\n"
         r"\s+shfl\.sync\.idx\.b32 \1, \1, 0, 0x1f, 0xffffffff;\n"
         r"\s+shr\.u32 \1, \1, 7;",
         kernel.ptx,
     )
     derived_descriptors = re.findall(
-        r"add\.u64 %rd\d+, %rd\d+, [246];", kernel.ptx,
+        r"add\.u64 (%rd\d+), (%rd\d+), ([246]);", kernel.ptx,
     )
     assert warpgroup_id is not None
-    assert len(derived_descriptors) == 72
+    # 14 wgmma groups (12 pipelined + one `k` unroll tail per output tile),
+    # each advancing its lhs/rhs base descriptors three times.  Updating in
+    # place avoids six one-use 64-bit descriptor names per group.
+    assert len(derived_descriptors) == 84
+    assert all(dst == src and increment == "2"
+               for dst, src, increment in derived_descriptors)
+    # The tail copy left by the `k` unroll must be unrolled and fused like the
+    # pipelined copies: one fence/commit/wait_group per group of four wgmmas,
+    # never a rolled `kk` loop draining after every single wgmma.
+    assert kernel.ptx.count("wgmma.mma_async") == 56
+    assert kernel.ptx.count("wgmma.wait_group") == 14
+    assert kernel.ptx.count("wgmma.fence") == 14
 
 
 def test_n384_split3_uses_three_warpgroups_and_sliced_tma():

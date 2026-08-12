@@ -113,6 +113,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         ),
         writeback_slices=output_slices,
         writeback_buffers=output_store_buffers,
+        # C is written once and never re-read, so an evict-first output store
+        # keeps A/B resident in L2 instead of being displaced by the epilogue.
+        move_attrs=operand_move_attrs,
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(
@@ -152,7 +155,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     )
     module = unroll_loop(
         module, unroll_factor=operand_k_tile // 16,
-        label_filter=r"kk(?:_iter\d+)?",
+        # The `k` unroll above leaves a `_tail0` copy when the trip count is not
+        # divisible by operand_stages; its `kk` loop must be unrolled too, or it
+        # keeps a fence/commit/wait_group per single wgmma instead of one group.
+        label_filter=r"kk(?:_tail\d+)?(?:_iter\d+)?",
     )
     module = fuse_async(module)
     for _ in range(4):
@@ -176,7 +182,8 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
          "output_tma_inner_padding": 16, "output_store_buffers": 2},
         {"output_tiles_per_cta": 4, "operand_stages": 3, "output_slices": 2,
          "output_tma_inner_padding": 16, "output_store_buffers": 2,
-         "operand_move_attrs": {"lhs": {"l2_cache_hint": "evict_first"}}},
+         "operand_move_attrs": {"lhs": {"l2_cache_hint": "evict_first"},
+                                "dst": {"l2_cache_hint": "evict_first"}}},
         {"output_tiles_per_cta": 2, "operand_stages": 2,
          "operand_k_tile": 128, "output_slices": 2},
         {"output_tiles_per_cta": 2, "operand_stages": 4, "output_slices": 2},
