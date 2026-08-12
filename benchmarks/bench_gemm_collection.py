@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -26,14 +27,6 @@ _PEAK_DENSE_TC_TFLOPS = {
     ("NVIDIA H100", torch.float8_e4m3fn): 1979.0,  # spec says 3958 w/ sparsity
     ("NVIDIA H100", torch.float8_e5m2): 1979.0,  # spec says 3958 w/ sparsity
 }
-
-
-def peak_dense_tc_tflops(
-    dtype: torch.dtype,
-    device_idx: int = 0,
-) -> float | None:
-    name = torch.cuda.get_device_name(device_idx)
-    return _PEAK_DENSE_TC_TFLOPS.get((name, dtype))
 
 
 @dataclass
@@ -62,7 +55,8 @@ class BenchResult:
     min_ms: float
     max_ms: float
     tflops: float
-    peak_pct: float | None  # None if peak unspecified
+    peak_pct: float | None = None  # None if peak unspecified
+    torch_mm_pct: float | None = None
 
 
 # CUDA-event timing config (GPU-only, cudaEvent-based like matmul.cu).
@@ -144,8 +138,6 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
     # Throughput / peak% from the fastest round (best-case steady clock, least
     # contaminated by clock dips or scheduling noise), not the median.
     tflops = cfg.flops / (min_ms / 1e3) / 1e12
-    peak = peak_dense_tc_tflops(cfg.dtype)
-    pct = (tflops / peak * 100) if peak else None
     return BenchResult(
         label=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})",
         rounds=n,
@@ -156,8 +148,26 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
         min_ms=min_ms,
         max_ms=max(times_ms),
         tflops=tflops,
-        peak_pct=pct,
     )
+
+
+def _populate_percentages(
+    configs: list[BenchGemmConfig], results: list[BenchResult]
+) -> None:
+    torch_mm_tflops = next(
+        (
+            result.tflops
+            for cfg, result in zip(configs, results)
+            if cfg.op is torch.mm
+        ),
+        None,
+    )
+    device_name = torch.cuda.get_device_name(0)
+    for cfg, result in zip(configs, results):
+        peak = _PEAK_DENSE_TC_TFLOPS.get((device_name, cfg.dtype))
+        result.peak_pct = result.tflops / peak * 100 if peak else None
+        if torch_mm_tflops is not None:
+            result.torch_mm_pct = result.tflops / torch_mm_tflops * 100
 
 
 def _format_value(value, name: str) -> str:
@@ -176,27 +186,29 @@ def _is_str_field(f) -> bool:
     return f.type is str or f.type == "str"
 
 
-# Label column width; fits "ayla.X (...) (4096x4096 @ 4096x4096)".
-_LABEL_WIDTH = 66
-
-
-def _width(f) -> int:
-    return _LABEL_WIDTH if _is_str_field(f) else 12
+def _width(f, label_width: int) -> int:
+    return label_width if _is_str_field(f) else 12
 
 
 def _align(f) -> str:
     return "<" if _is_str_field(f) else ">"
 
 
-def _print(r: BenchResult, with_header: bool = False) -> None:
+def _format_field(r: BenchResult, f, label_width: int) -> str:
+    value = _format_value(getattr(r, f.name), f.name)
+    return f"{value:{_align(f)}{_width(f, label_width)}s}"
+
+
+def _print(r: BenchResult, label_width: int, with_header: bool = False) -> None:
     fields = dataclasses.fields(r)
     if with_header:
-        print("  ".join(f"{f.name:{_align(f)}{_width(f)}s}" for f in fields))
-    print(
-        "  ".join(
-            f"{_format_value(getattr(r, f.name), f.name):{_align(f)}{_width(f)}s}"
-            for f in fields
+        print(
+            "  ".join(
+                f"{f.name:{_align(f)}{_width(f, label_width)}s}" for f in fields
+            )
         )
+    print(
+        "  ".join(_format_field(r, f, label_width) for f in fields)
     )
 
 
@@ -213,6 +225,11 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
+
+    def ayla_bf16(label: str, op: str) -> BenchGemmConfig:
+        return BenchGemmConfig(
+            label, 4096, 4096, 4096, getattr(torch.ops.ayla, op), torch.bfloat16,
+        )
 
     configs = [
         BenchGemmConfig(
@@ -256,6 +273,54 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3, 2 tiles/CTA, pre-STSM stores)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_pre_stsm,
+            dtype=torch.bfloat16,
+        ),
+        BenchGemmConfig(
+            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3, 2 tiles/CTA)",
+            m=4096,
+            n=4096,
+            k=4096,
+            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
+            dtype=torch.bfloat16,
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 2 tiles/CTA)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, 3D input TMA K-tile=128, split output, 2 tiles/CTA)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=4, split output, 2 tiles/CTA)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (128x384 CTA, three N=128 warpgroups, TMA store K=2)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (192x256 CTA, three M=64 warpgroups, TMA store K=3)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
+        ),
+        BenchGemmConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,
             n=4096,
@@ -269,8 +334,18 @@ def main() -> None:
         configs = [c for c in configs if pattern.search(c.label)]
     if args.reverse:
         configs = configs[::-1]
-    for i, cfg in enumerate(configs):
-        _print(_bench(cfg), with_header=(i == 0))
+    results = []
+    for i, cfg in enumerate(configs, 1):
+        results.append(_bench(cfg))
+        print(f"[{i}/{len(configs)}] {cfg.label}", file=sys.stderr, flush=True)
+
+    _populate_percentages(configs, results)
+
+    label_width = max(
+        (len(result.label) for result in results), default=len("label")
+    )
+    for i, result in enumerate(results):
+        _print(result, label_width, with_header=(i == 0))
 
 
 if __name__ == "__main__":

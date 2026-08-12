@@ -4,11 +4,60 @@ import textwrap
 
 import pytest
 
-from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
-from ayla.base.ir import find_ops
+from ayla.gpu_dialect import (
+    gpu_dialect,
+    BlockIdsOp,
+    IndexConstantOp,
+    IndexMulOp,
+    KernelOp,
+    ModuleOp,
+    PTXTemplateOp,
+)
+from ayla.base.ir import Block, Region, find_ops
+from ayla.passes.dce import DCE
 from ayla.passes.lower_to_async import lower_to_async
-from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
+from ayla.passes.lower_to_ptx_template import (
+    LowerScalarToPtxTemplate,
+    LowerToPtxTemplate,
+    lower_to_ptx_template,
+)
 from ayla.testing import assert_contains_in_order
+
+
+def test_immediate_index_constants_become_ir_dead_before_ptx_printing():
+    block_ids = BlockIdsOp.build()
+    factor = IndexConstantOp.build(128)
+    product = IndexMulOp.build(block_ids.x, factor.result())
+    consumer = PTXTemplateOp.build(
+        operands=[product.result()],
+        result_types=[],
+        template="mov.u32 ${b32:copy}, ${b32:operand[0].val};\n",
+    )
+    kernel = KernelOp.build(
+        "test",
+        Region(blocks=[Block(ops=[block_ids, factor, product, consumer])]),
+        grid_dim=(1, 1, 1),
+        block_dim=(1, 1, 1),
+    )
+    module = ModuleOp.build(Region(blocks=[Block(ops=[kernel])]))
+
+    module = LowerToPtxTemplate().run(module)
+    module = LowerScalarToPtxTemplate().run(module)
+    DCE().run(module)
+
+    assert not find_ops(module, lambda op: isinstance(
+        op, (IndexConstantOp, IndexMulOp),
+    ))
+    scalar_templates = find_ops(
+        module,
+        lambda op: isinstance(op, PTXTemplateOp)
+        and op.attrs.get("pure") is True,
+    )
+    assert len(scalar_templates) == 1
+    assert scalar_templates[0].template == (
+        "shl.b32 ${b32:result.dst.val}, ${b32:operand.value.val}, 7;\n"
+    )
+    assert len(scalar_templates[0].operands) == 1
 
 
 def _lower_barrier(scope: str) -> str:
@@ -37,12 +86,11 @@ def test_lower_barrier(scope, expected):
 def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
-        mov.u32 ${b32:bl_tid}, %tid.x;
-        mov.u32 ${b32:bl_ntid}, %ntid.x;
+        mov.u32 ${b32:result.tid_x.val}, %tid.x;
+        mov.u32 ${b32:bl_tid}, ${b32:operand.shared_tid_x.val};
         setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-        setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
-        @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
-        @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+        @${pred:bl_w0} bar.sync 1, 128;
+        @!${pred:bl_w0} bar.arrive 1, 128;
         """)
 
 
@@ -77,7 +125,7 @@ def test_lower_move_gmem_to_smem():
         # before this op (the smem WAR/RAW is modeled there).
         textwrap.dedent(
             """\
-            mov.u32 ${b32:co_idx}, %tid.x;
+            mov.u32 ${b32:co_idx}, ${b32:operand.shared_tid_x.val};
             mov.u32 ${b32:co_ntid}, %ntid.x;
             ${label:co_idx_loop}:
             setp.ge.u32 ${pred:co_idx_done}, ${b32:co_idx}, 16;

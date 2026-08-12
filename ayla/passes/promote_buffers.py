@@ -155,6 +155,31 @@ def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
     return [new_tile], [new_tile.result()]
 
 
+def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
+    typ = clone_type(value.type)
+    dim %= typ.rank
+    typ.sizes[dim] = size
+    indices = [0] * typ.rank
+    indices[dim] = index
+    return TileOp.build(value, indices, typ)
+
+
+def _sliced_moves(
+    dst: Value, src: Value, count: int, dim: int, attrs: dict[str, object],
+) -> list[Op]:
+    if count == 1:
+        return [MoveOp.build(dst, src, attrs=attrs)]
+    size, remainder = divmod(src.type.sizes[dim], count)
+    if remainder:
+        raise ValueError("move extent must divide evenly into slices")
+    ops: list[Op] = []
+    for index in range(count):
+        src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
+        move = MoveOp.build(dst_tile.result(), src_tile.result(), attrs=attrs)
+        ops.extend([src_tile, dst_tile, move])
+    return ops
+
+
 class PromoteBuffers(LoweringPass):
     """Promote matmul operands to *target_type* memory space.
 
@@ -181,9 +206,19 @@ class PromoteBuffers(LoweringPass):
     warps : int or None
         Wrmem warp count (``1``, ``4``).
     tma : bool
-        Use TMA for the move.
+        Use TMA for the move. A WRMEM destination is written back through a
+        block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
         Non-coherent cache hint for gmem→rmem loads.
+    physical_layout : dict or None
+        Optional physical shared-memory layout used for output staging.
+    writeback_slices, writeback_buffers : int
+        Number of TMA output slices and SMEM staging arenas.
+    tma_load_slices : dict[str, int] or None
+        Leading-dimension TMA load slices by operand.
+    move_attrs : dict[str, dict[str, object]] or None
+        Extra move attributes by operand. ``"dst"`` also reaches the TMA
+        writeback store, so an output-only L2 policy can be set there.
     """
 
     def __init__(
@@ -197,6 +232,11 @@ class PromoteBuffers(LoweringPass):
         warps: int | None = None,
         tma: bool = False,
         nc: bool = False,
+        physical_layout: dict[str, object] | None = None,
+        writeback_slices: int = 1,
+        writeback_buffers: int = 1,
+        tma_load_slices: dict[str, int] | None = None,
+        move_attrs: dict[str, dict[str, object]] | None = None,
         label_filter: str | None = None,
     ) -> None:
         super().__init__()
@@ -209,6 +249,15 @@ class PromoteBuffers(LoweringPass):
         self.warps = warps
         self.tma = tma
         self.nc = nc
+        self.physical_layout = physical_layout
+        self.writeback_slices = writeback_slices
+        self.writeback_buffers = writeback_buffers
+        self.tma_load_slices = dict(tma_load_slices or {})
+        self.move_attrs = dict(move_attrs or {})
+        if writeback_slices < 1 or any(n < 1 for n in self.tma_load_slices.values()):
+            raise ValueError("slice counts must be positive")
+        if writeback_buffers not in (1, writeback_slices):
+            raise ValueError("writeback_buffers must be 1 or equal writeback_slices")
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_target_type(self, base_type, dtype=None):
@@ -221,7 +270,9 @@ class PromoteBuffers(LoweringPass):
         if tensor_cls is GmemTensorType:
             return GmemTensorType.build(sizes, dtype)
         if tensor_cls is SmemTensorType:
-            return SmemTensorType.build(sizes, dtype, swizzle=self.swizzle)
+            return SmemTensorType.build_physical(
+                sizes, dtype, self.swizzle, self.physical_layout,
+            )
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WrmemTensorType:
@@ -238,6 +289,7 @@ class PromoteBuffers(LoweringPass):
             attrs["tma"] = True
         if self.nc and allow_nc:
             attrs["nc"] = True
+        attrs.update(self.move_attrs.get(operand_name, {}))
         return attrs
 
     def _build_operand_promotion(
@@ -292,8 +344,11 @@ class PromoteBuffers(LoweringPass):
         else:
             attrs = self._build_move_attrs(matmul_label, operand_name)
             alloc = AllocOp.build(self._build_target_type(chain_root.type, dtype=chain_root.type.dtype))
-            move = MoveOp.build(dst=alloc.result(), src=chain_root, attrs=attrs)
-            new_ops.extend([alloc, move])
+            new_ops.append(alloc)
+            new_ops.extend(_sliced_moves(
+                alloc.result(), chain_root,
+                self.tma_load_slices.get(operand_name, 1), 0, attrs,
+            ))
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build(target_type)
                 cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
@@ -308,6 +363,71 @@ class PromoteBuffers(LoweringPass):
                 new_ops.extend(ops)
 
         return new_ops, [result]
+
+    def _build_tma_writeback(
+        self, dst: Value, src: Value, matmul_label: str | None,
+    ) -> list[Op]:
+        """Stage a narrow distributed value for one block-wide TMA store.
+
+        The block-wide SMEM tile is allocated whole (the bulk store transfers it
+        in one copy), then tiled back down to the writer's collective level so
+        the gather move matches ``src``'s shape -- mirroring how
+        ``_build_operand_promotion`` replays narrow tiles on a promoted buffer,
+        which keeps the warp-group row placement in the IR rather than the
+        lowering.
+        """
+        block_dst = dst
+        narrow_tiles: list[TileOp] = []
+        while isinstance(block_dst.definition, TileOp):
+            tile = block_dst.definition
+            if not _introduces_narrow(tile, "block"):
+                break
+            narrow_tiles.append(tile)
+            block_dst = tile.arg
+        assert isinstance(block_dst.type, GmemTensorType)
+        smem_sizes = list(block_dst.type.sizes)
+        if smem_sizes[-1] % self.writeback_slices:
+            raise ValueError("output columns must divide evenly into writeback_slices")
+        smem_sizes[-1] //= self.writeback_slices
+        smem_type = SmemTensorType.build_physical(
+            smem_sizes, block_dst.type.dtype, None, self.physical_layout,
+        )
+        smems = [AllocOp.build(smem_type) for _ in range(self.writeback_buffers)]
+        new_ops: list[Op] = list(smems)
+        slice_cols = smem_sizes[-1]
+        wg_column_tile = next((
+            tile for tile in narrow_tiles
+            if tile.result().type.sizes[-1] != tile.arg.type.sizes[-1]
+        ), None)
+        expected_slices = block_dst.type.sizes[-1] // src.type.sizes[-1]
+        if wg_column_tile is not None and self.writeback_slices != expected_slices:
+            raise ValueError("warpgroup-column writeback needs one slice per warpgroup")
+        for slice_idx in range(self.writeback_slices):
+            smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
+            gather_dst = smem.result()
+            for tile in reversed(narrow_tiles):
+                if tile is wg_column_tile:
+                    continue
+                ops, [gather_dst] = _apply_tile(tile, gather_dst)
+                new_ops.extend(ops)
+            gather_attrs = {"label": f"{matmul_label}_dst_smem"}
+            if wg_column_tile is not None:
+                gather_attrs["writer_wg"] = slice_idx
+            elif self.writeback_slices > 1:
+                gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
+            gather = MoveOp.build(dst=gather_dst, src=src, attrs=gather_attrs)
+            store_tiles = (
+                [_slice_tile(block_dst, -1, slice_idx, slice_cols)]
+                if self.writeback_slices > 1 else []
+            )
+            store_dst_value = store_tiles[0].result() if store_tiles else block_dst
+            store_attrs = {"label": f"{matmul_label}_dst_tma", "tma": True}
+            store_attrs.update(self.move_attrs.get("dst", {}))
+            store = MoveOp.build(
+                dst=store_dst_value, src=smem.result(), attrs=store_attrs,
+            )
+            new_ops.extend([gather, *store_tiles, store])
+        return new_ops
 
     def _build_operand_writeback(
         self, dst: Value, src: Value, operand_name: str, matmul_label: str | None = None
@@ -326,6 +446,9 @@ class PromoteBuffers(LoweringPass):
             cvt = ConvertOp.build(dst=tmp_alloc.result(), src=src)
             new_ops.extend([tmp_alloc, cvt])
             src = tmp_alloc.result()
+        if self.tma and self.target_type == "wrmem":
+            new_ops.extend(self._build_tma_writeback(dst, src, matmul_label))
+            return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         move = MoveOp.build(dst=dst, src=src, attrs=attrs)
         new_ops.append(move)
@@ -377,6 +500,11 @@ def promote_buffers(
     warps: int | None = None,
     tma: bool = False,
     nc: bool = False,
+    physical_layout: dict[str, object] | None = None,
+    writeback_slices: int = 1,
+    writeback_buffers: int = 1,
+    tma_load_slices: dict[str, int] | None = None,
+    move_attrs: dict[str, dict[str, object]] | None = None,
     label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
@@ -389,5 +517,10 @@ def promote_buffers(
         warps=warps,
         tma=tma,
         nc=nc,
+        physical_layout=physical_layout,
+        writeback_slices=writeback_slices,
+        writeback_buffers=writeback_buffers,
+        tma_load_slices=tma_load_slices,
+        move_attrs=move_attrs,
         label_filter=label_filter,
     ).run(module)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from ..gpu_dialect import (
     AsyncOp,
+    BlockedLayout,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -72,14 +73,18 @@ class LowerToTmaMove(LoweringPass):
         gmem_operand = move.src if is_load else move.dst
         smem_operand = move.dst if is_load else move.src
 
-        index_ops, root, indices = _build_tile_chain_indices(gmem_operand)
         smem = self.value_map[smem_operand]
 
-        assert isinstance(root.type, GmemTensorType), (
-            f"lower_to_tma_move: tiled operand must be gmem; got {root.type}"
-        )
         assert isinstance(smem.type, SmemTensorType), (
             f"lower_to_tma_move: plain operand must be smem; got {smem.type}"
+        )
+
+        layout = smem.type.physical_layout
+        index_ops, root, indices = _build_tile_chain_indices(
+            gmem_operand, physical_layout=layout,
+        )
+        assert isinstance(root.type, GmemTensorType), (
+            f"lower_to_tma_move: tiled operand must be gmem; got {root.type}"
         )
 
         entry_block = root.definition
@@ -90,12 +95,21 @@ class LowerToTmaMove(LoweringPass):
             gmem_type=root.type,
             tile_shape=list(smem.type.sizes),
             swizzle=smem.type.swizzle,
+            attrs={"physical_layout": layout} if layout is not None else None,
         )
-        desc_value = Value(
-            name=f"{root.name}_desc" if root.name else None,
-            type=tma_type,
+        desc_value = next(
+            (
+                arg for arg in entry_block.arguments
+                if isinstance(arg.type, TmaDescType) and arg.type == tma_type
+            ),
+            None,
         )
-        entry_block.append_argument(desc_value)
+        if desc_value is None:
+            desc_value = Value(
+                name=f"{root.name}_desc" if root.name else None,
+                type=tma_type,
+            )
+            entry_block.append_argument(desc_value)
 
         if is_load:
             tma_op = TmaMoveOp.build(
@@ -106,12 +120,14 @@ class LowerToTmaMove(LoweringPass):
         return index_ops, tma_op
 
 
-def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value]]:
+def _build_tile_chain_indices(
+    value: Value,
+    physical_layout: dict[str, object] | None = None,
+) -> tuple[list[Op], Value, list[Value]]:
     """Walk up nested tile ops to find the root tensor and per-dim indices.
 
-    Returns (new_ops, root, indices) where new_ops are the index
-    arithmetic ops, root is the base tensor, and indices are the
-    accumulated per-dim element offsets.
+    Returns (new_ops, root, indices) where new_ops are the index arithmetic
+    ops, root is the base tensor, and indices are physical TMA coordinates.
     """
     tiles: list[TileOp] = []
     v = value
@@ -121,6 +137,12 @@ def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value
     root = v
 
     ndims = root.type.rank
+    layout = BlockedLayout.parse(physical_layout)
+    if layout is not None:
+        if any(tile.result().type.sizes[-1] % layout.block for tile in tiles):
+            raise ValueError(
+                "blocked-padding TMA coordinates must start on block boundaries"
+            )
     zero = IndexConstantOp.build(0)
     new_ops: list[Op] = [zero]
     indices = [zero.result()] * ndims
@@ -133,13 +155,26 @@ def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value
                 new_ops.append(const_op)
                 idx = const_op.result()
 
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
+            tile_size = result_sizes[dim]
+            if layout is not None and dim == ndims - 1:
+                tile_size //= layout.block
+            tile_size_op = IndexConstantOp.build(tile_size)
             new_ops.append(tile_size_op)
             mul_op = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(mul_op)
             add_op = IndexAddOp.build(indices[dim], mul_op.result())
             new_ops.append(add_op)
             indices[dim] = add_op.result()
+
+    if layout is not None:
+        # Every tiled offset starts at a physical block boundary.  Express that
+        # proof in the IR: the last coordinate counts blocks and the inner
+        # coordinate is zero.
+        indices.append(zero.result())
+        if layout.order == "block_major":
+            # Physical order is [inner blocks, outer dimensions..., inner].
+            # PTX reverses this list into fastest-dimension-first order.
+            indices = [indices[-2], *indices[:-2], indices[-1]]
 
     return new_ops, root, indices
 

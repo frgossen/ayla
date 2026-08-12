@@ -1,13 +1,70 @@
 """Concrete IR ops and types for the Ayla dialect."""
 from __future__ import annotations
 
+import enum
 import math
 import string
+from dataclasses import dataclass
 
 from .base.ir import Block, Dialect, Op, Region, Type, Value
 from .base.printer import Printer
 
 gpu_dialect = Dialect("gpu")
+
+
+@dataclass(frozen=True)
+class BlockedLayout:
+    """Validated view of a ``blocked_padding`` physical-layout attribute."""
+
+    block: int
+    padding: int
+    order: str = "row_major"
+    outer_size: int | None = None
+
+    @classmethod
+    def parse(cls, attrs: dict[str, object] | None) -> "BlockedLayout | None":
+        if attrs is None:
+            return None
+        if attrs.get("kind") != "blocked_padding":
+            raise NotImplementedError(f"unsupported physical layout {attrs!r}")
+        order = str(attrs.get("order", "row_major"))
+        if order not in ("row_major", "block_major"):
+            raise ValueError(f"unsupported blocked layout order {order!r}")
+        outer = attrs.get("outer_size")
+        return cls(
+            int(attrs["block"]), int(attrs["padding"]), order,
+            int(outer) if outer is not None else None,
+        )
+
+    def physical_inner(self, logical: int) -> int:
+        chunk, inner = divmod(logical, self.block)
+        stride = self.block + self.padding
+        if self.order == "block_major":
+            if self.outer_size is None:
+                raise ValueError("block-major layout requires outer_size")
+            stride *= self.outer_size
+        return chunk * stride + inner
+
+    def tensor_storage(
+        self, sizes: list[int], dtype: Type,
+    ) -> tuple[list[int], dict[str, object]]:
+        if len(sizes) != 2 or sizes[-1] % self.block:
+            raise ValueError("blocked padding requires a divisible rank-2 tile")
+        padded = self.block + self.padding
+        if self.padding < 0 or padded > 256 or padded * dtype.byte_size % 16:
+            raise ValueError("invalid padded TMA inner box")
+        outer = sizes[0] if self.order == "block_major" else None
+        attrs: dict[str, object] = {
+            "kind": "blocked_padding", "block": self.block,
+            "padding": self.padding,
+        }
+        if self.order != "row_major":
+            attrs.update(order=self.order, outer_size=outer)
+        row_stride = (
+            sizes[-1] // self.block * padded
+            if self.order == "row_major" else padded
+        )
+        return [row_stride, 1], attrs
 
 
 # TODO: Rename types : gmem_tensor --> gmem etc.
@@ -203,12 +260,14 @@ class MatmulOp(Op):
         dst: Value,
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
+        scale_d: Value | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if init is not None:
             a["init"] = init
         return cls(
-            operands=[lhs, rhs, dst], results=[], attrs=a,
+            operands=[lhs, rhs, dst] + ([scale_d] if scale_d is not None else []),
+            results=[], attrs=a,
         )
 
     @property
@@ -222,6 +281,11 @@ class MatmulOp(Op):
     @property
     def dst(self) -> Value:
         return self.operands[2]
+
+    @property
+    def scale_d(self) -> Value | None:
+        """Optional uniform condition controlling accumulation into ``dst``."""
+        return self.operands[3] if len(self.operands) == 4 else None
 
     @property
     def init(self) -> float | int | None:
@@ -305,6 +369,32 @@ class TileOp(Op):
                 f"TileOp: result strides {list(res_type.strides)} must "
                 f"match arg strides {list(arg_type.strides)}"
             )
+
+    def constant_byte_delta(self, base: "TileOp") -> int | None:
+        """Return the proven constant byte offset from a sibling tile."""
+        if self.arg is not base.arg or self.result().type != base.result().type:
+            return None
+
+        def constant(index: Value | int) -> int | None:
+            if isinstance(index, int):
+                return index
+            if isinstance(index.definition, IndexConstantOp):
+                return index.definition.value
+            return None
+
+        indices = [constant(index) for index in self.indices]
+        base_indices = [constant(index) for index in base.indices]
+        if any(index is None for index in indices + base_indices):
+            return None
+        typ = self.result().type
+        assert isinstance(typ, AddrMemTensorType)
+        offsets = [
+            typ.element_offset([
+                int(index) * size for index, size in zip(tile_indices, typ.sizes)
+            ])
+            for tile_indices in (indices, base_indices)
+        ]
+        return (offsets[0] - offsets[1]) * typ.dtype.byte_size
 
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):
@@ -433,12 +523,54 @@ class MoveOp(Op):
         return self.operands[2:]
 
 
+@gpu_dialect.register_op("stmatrix_store")
+class StMatrixStoreOp(Op):
+    """Target-level grouped store from a distributed fragment to SMEM.
+
+    Instruction selection has already proven layout compatibility and
+    captured the distributed-to-physical layout mapping. ``register_starts``
+    and ``offsets`` identify groups of four packed fragment registers and their
+    compile-time destination byte offsets.
+    """
+
+    @classmethod
+    def build(
+        cls, dst: Value, src: Value, register_starts: list[int], offsets: list[int],
+        attrs: dict[str, object] | None = None,
+    ) -> "StMatrixStoreOp":
+        return cls(
+            operands=[dst, src], results=[],
+            attrs={
+                "register_starts": list(register_starts),
+                "offsets": list(offsets),
+                **(attrs or {}),
+            },
+        )
+
+    @property
+    def dst(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def src(self) -> Value:
+        return self.operands[1]
+
+    @property
+    def offsets(self) -> list[int]:
+        return self.attrs["offsets"]  # type: ignore[return-value]
+
+    @property
+    def register_starts(self) -> list[int]:
+        return self.attrs["register_starts"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("tma_move")
 class TmaMoveOp(Op):
     """TMA bulk transfer between smem and gmem (block-collective), sync form.
 
     One operand is a TMA descriptor (gmem side), the other is smem. Indices are
-    per-dim element coordinates for the TMA engine. Direction (load/store) is
+    physical per-dimension coordinates for the TMA engine; a physical layout
+    may therefore add dimensions relative to the logical tensor. Direction is
     determined by which side is smem vs tma_desc. Completion tracking is the
     surrounding ``async { ... }`` wrapper's job (it owns the lock), so this op
     carries no lock itself — mirroring ``move`` and ``matmul``.
@@ -476,6 +608,13 @@ class TmaMoveOp(Op):
     @property
     def indices(self) -> list[Value]:
         return self.operands[2:]
+
+    @property
+    def l2_cache_hint(self) -> str | None:
+        hint = self.attrs.get("l2_cache_hint")
+        if hint not in (None, "evict_first", "evict_last"):
+            raise ValueError(f"unsupported TMA L2 cache hint {hint!r}")
+        return hint  # type: ignore[return-value]
 
 
 @gpu_dialect.register_type("token")
@@ -819,6 +958,45 @@ class AddrMemTensorType(MemTensorType):
         """Per-dim stride in elements."""
         return tuple(self.attrs["strides"])  # type: ignore[arg-type]
 
+    @property
+    def physical_layout(self) -> dict[str, object] | None:
+        """Optional non-affine physical layout of the logical tensor.
+
+        Strides describe the affine layout within a physical block.
+        ``blocked_padding`` splits the last logical dimension into fixed-size
+        blocks and appends padding to every block.  Its optional ``order`` is
+        ``row_major`` (blocks within each row) or ``block_major`` (all rows of
+        one block together). Keeping this on the memory type makes the mapping
+        available to allocation, instruction selection and transfers.
+        """
+        value = self.attrs.get("physical_layout")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def blocked_layout(self) -> BlockedLayout | None:
+        return BlockedLayout.parse(self.physical_layout)
+
+    def element_offset(self, indices: list[int]) -> int:
+        """Map logical element coordinates to a physical element offset."""
+        if len(indices) != self.rank:
+            raise ValueError(f"expected {self.rank} indices, got {len(indices)}")
+        layout = self.blocked_layout
+        offset = 0
+        for dim, (index, stride) in enumerate(zip(indices, self.strides)):
+            if layout is not None and dim == self.rank - 1:
+                index = layout.physical_inner(index)
+            offset += index * stride
+        return offset
+
+    @property
+    def storage_num_elements(self) -> int:
+        layout = self.blocked_layout
+        if layout is None:
+            return self.num_elements
+        return self.num_elements // layout.block * (
+            layout.block + layout.padding
+        )
+
     def write_strides(self, p: Printer) -> None:
         if not self.is_canonical_strides:
             p.write(" strides=")
@@ -896,6 +1074,20 @@ class SmemTensorType(AddrMemTensorType):
             "swizzle": swizzle,
             **(attrs or {}),
         })
+
+    @classmethod
+    def build_physical(
+        cls, sizes: list[int], dtype: Type, swizzle: str | None,
+        physical_layout: dict[str, object] | None,
+    ) -> "SmemTensorType":
+        layout = BlockedLayout.parse(physical_layout)
+        if layout is None:
+            return cls.build(sizes, dtype, swizzle=swizzle)
+        strides, normalized = layout.tensor_storage(sizes, dtype)
+        return cls.build(
+            sizes, dtype, strides, swizzle,
+            attrs={"physical_layout": normalized},
+        )
 
     @property
     def swizzle(self) -> str | None:
@@ -1068,6 +1260,11 @@ class TmaDescType(Type):
     @property
     def tile_num_elements(self) -> int:
         return math.prod(self.tile_sizes)
+
+    @property
+    def physical_layout(self) -> dict[str, object] | None:
+        value = self.attrs.get("physical_layout")
+        return value if isinstance(value, dict) else None
 
     @property
     def swizzle(self) -> str | None:
@@ -1551,25 +1748,131 @@ def root_buffer(value: Value) -> Value:
     return value
 
 
-def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
+def wgmma_layout_0_static_offsets(reg: int, n_dim: int) -> tuple[int, int]:
+    """Logical (row, column) of a packed WGMMA accumulator register."""
+    n_groups = n_dim // 16
+    m, w = divmod(reg // 4, n_groups)
+    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][reg % 4]
+    return (m * 64 + di, w * 16 + dj)
+
+
+class CollectiveScope(enum.IntEnum):
+    r"""The granularity at which an effect is completely independent of concurrent
+    operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
+    scope but performed exclusively by thread 0, e.g. a TMA::
+
+             GRID
+              |
+            BLOCK
+            /   \
+    WARPGROUP   BLOCK_LEADER
+           |     |
+         WARP    |
+            \   /
+            THREAD
+    """
+    THREAD = 0
+    WARP = 1
+    WARPGROUP = 2
+    BLOCK_LEADER = 3
+    BLOCK = 4
+    GRID = 5
+
+    def join(self, other: CollectiveScope) -> CollectiveScope:
+        """The join (least upper bound) on the CollectiveScope lattice."""
+        if self == CollectiveScope.GRID:
+            return self
+        if self == CollectiveScope.THREAD:
+            return other
+        if self == CollectiveScope.BLOCK:
+            return other if other == CollectiveScope.GRID else self
+        if self == CollectiveScope.BLOCK_LEADER:
+            if other in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
+                return self
+            if other in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
+                return other
+            return CollectiveScope.BLOCK  # other is WARP or WARPGROUP
+        if self == CollectiveScope.WARPGROUP:
+            if other in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
+                return other
+            if other == CollectiveScope.BLOCK_LEADER:
+                return CollectiveScope.BLOCK
+            return self  # other is THREAD, WARP, or WARPGROUP
+        if self == CollectiveScope.WARP:
+            if other in {CollectiveScope.WARP, CollectiveScope.THREAD}:
+                return self
+            if other == CollectiveScope.BLOCK_LEADER:
+                return CollectiveScope.BLOCK
+            return other  # other is WARPGROUP, BLOCK, or GRID
+        raise NotImplementedError(
+            f"CollectiveScope.join: unhandled pair {self!r}, {other!r}"
+        )
+
+    def leq(self, other: CollectiveScope) -> bool:
+        """The partial order (<=) of the CollectiveScope lattice."""
+        return self.join(other) == other
+
+
+def _type_collective_scope(t: Type) -> CollectiveScope:
+    if isinstance(t, RmemTensorType):
+        return CollectiveScope.THREAD
+    if isinstance(t, WrmemTensorType):
+        return CollectiveScope.WARPGROUP
+    if isinstance(t, SmemTensorType):
+        return CollectiveScope.BLOCK
+    if isinstance(t, GmemTensorType):
+        return CollectiveScope.GRID
+    raise NotImplementedError(
+        f"_type_collective_scope: unmodeled buffer type {type(t).__name__}"
+    )
+
+
+def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     """Best-effort memory effect summary for ``op``.
 
-    Returns a list of ``(kind, root)`` tuples where ``kind`` is
-    ``"R"`` or ``"W"`` and ``root`` is the underlying alloc/arg
-    (after stripping tile views via ``root_buffer``).
+    Returns a list of ``(kind, root, scope)`` tuples where ``kind`` is ``"R"`` or
+    ``"W"``, ``root`` is the underlying alloc/arg (after stripping tile views via
+    ``root_buffer``), and ``scope`` is the :class:`CollectiveScope` at which the
+    access is independent of concurrent threads.
 
-    Returns ``None`` for ops we don't know how to model; callers must
-    treat that as a worst-case conflict. Side-effect-free ops return
-    an empty list.
+    Returns ``None`` for ops we don't know how to model; callers must treat that
+    as a worst-case conflict.
     """
     if is_side_effect_free(op):
         return []
-    if isinstance(op, MoveOp):
-        return [("W", root_buffer(op.dst)), ("R", root_buffer(op.src))]
+    if isinstance(op, (MoveOp, StMatrixStoreOp)):
+        # A TMA move is issued by the leader thread (t0), so its smem write is
+        # BLOCK_LEADER; a cooperative move writes at the buffer's own scope.
+        src_scope = (
+            CollectiveScope.THREAD
+            if isinstance(op.src.type, WrmemTensorType)
+            else _type_collective_scope(op.src.type)
+        )
+        dst_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if isinstance(op, MoveOp)
+            and op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
+            else _type_collective_scope(op.dst.type)
+        )
+        return [("W", root_buffer(op.dst), dst_scope),
+                ("R", root_buffer(op.src), src_scope)]
+    if isinstance(op, TmaMoveOp):
+        # Leader-issued (t0): the smem side is BLOCK_LEADER (dst on a load, src on
+        # a store).
+        smem_is_dst = isinstance(op.dst.type, SmemTensorType)
+        smem = op.dst if smem_is_dst else op.src
+        kind = "W" if smem_is_dst else "R"
+        return [(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)]
     if isinstance(op, MatmulOp):
+        # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         dst = root_buffer(op.dst)
-        return [("R", root_buffer(op.lhs)), ("R", root_buffer(op.rhs)),
-                ("R", dst), ("W", dst)]
+        return [("R", root_buffer(op.lhs), _type_collective_scope(op.lhs.type)),
+                ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
+                ("R", dst, CollectiveScope.THREAD),
+                ("W", dst, CollectiveScope.THREAD)]
+    if isinstance(op, ConvertOp):
+        return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
+                ("R", root_buffer(op.src), CollectiveScope.THREAD)]
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
@@ -1586,9 +1889,17 @@ def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
             effects.extend(peer_effects)
         return effects
     if isinstance(op, AllocOp):
-        return [("W", op.result())]
+        # Only an initialized alloc writes (fills the buffer); an uninitialized
+        # one is side-effect-free, handled above. A wrmem accumulator is per-thread.
+        buf = op.result()
+        scope = (
+            CollectiveScope.THREAD
+            if isinstance(buf.type, WrmemTensorType)
+            else _type_collective_scope(buf.type)
+        )
+        return [("W", root_buffer(buf), scope)]
     if isinstance(op, (ForOp, AsyncOp)):
-        effects: list[tuple[str, Value]] = []
+        effects: list[tuple[str, Value, CollectiveScope]] = []
         for region in op.regions:
             for block in region.blocks:
                 for body_op in block.ops:
@@ -1602,6 +1913,8 @@ def memory_effects(op: Op) -> list[tuple[str, Value]] | None:
 
 def is_value_identical(op: Op) -> bool:
     """Same operands and attrs always produce identical results."""
+    if isinstance(op, PTXTemplateOp):
+        return op.attrs.get("pure") is True
     return isinstance(op, (
         BlockIdsOp,
         IndexAddOp,

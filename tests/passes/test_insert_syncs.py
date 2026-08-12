@@ -44,7 +44,7 @@ def test_war_on_shared_buffer_gets_barrier():
               %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc()
-              barrier() attrs={scope: "block_leader"}
+              barrier() attrs={id: 1, scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -56,6 +56,34 @@ def test_war_on_shared_buffer_gets_barrier():
             }
           }
         }""")  # noqa: E501
+
+
+def test_bulk_wait_completion_is_broadcast_before_shared_arena_reuse():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%out: tma_desc<arg_idx=0 gmem_tensor<4x4xf32> tile=4x4>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %s: smem_tensor<4x4xf32> = alloc()
+            %r: rmem_tensor<4x4xf32> = alloc()
+            %c0: index = index_constant() attrs={value: 0}
+            %lock: lock<bulk> = alloc()
+            async(%lock: lock<bulk>) tma_move(%out: tma_desc<arg_idx=0 gmem_tensor<4x4xf32> tile=4x4>, %s: smem_tensor<4x4xf32>, %c0: index, %c0: index)
+            await(%lock: lock<bulk>)
+            move(%s: smem_tensor<4x4xf32>, %r: rmem_tensor<4x4xf32>)
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    # cp.async.bulk.wait_group is per issuing thread.  The full CTA barrier
+    # after the logical await keeps consumer threads from refilling %s before
+    # thread 0 has observed completion of the TMA read from %s.
+    assert_contains_in_order(
+        repr(module),
+        textwrap.dedent("""\
+            await(%lock: lock<bulk>)
+            barrier() attrs={scope: "block"}
+            move(%s: smem_tensor<4x4xf32>, %r: rmem_tensor<4x4xf32>)"""),
+    )
 
 
 
@@ -265,12 +293,52 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 1, scope: "block_leader"}
             async(%10: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 2, scope: "block_leader"}
             async(%7: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 3, scope: "block_leader"}
             async(%4: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
-            barrier() attrs={scope: "block_leader"}
+            barrier() attrs={id: 4, scope: "block_leader"}
             async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
     )
+
+
+def test_named_barrier_id_is_reused_for_the_same_buffers():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<256x64xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %sa: smem_tensor<128x64xbf16> = alloc()
+            %sb: smem_tensor<256x64xbf16> = alloc()
+            %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %l0: lock<mbar> = alloc()
+            async(%l0: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={tma: True}
+            }
+            await(%l0: lock<mbar>)
+            matmul(%sa: smem_tensor<128x64xbf16>, %sb: smem_tensor<256x64xbf16>, %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            %l1: lock<mbar> = alloc()
+            async(%l1: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={tma: True}
+            }
+            await(%l1: lock<mbar>)
+            matmul(%sa: smem_tensor<128x64xbf16>, %sb: smem_tensor<256x64xbf16>, %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            %l2: lock<mbar> = alloc()
+            async(%l2: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={tma: True}
+            }
+          }
+        }"""))
+
+    insert_syncs(module)
+    barriers = [
+        line.strip() for line in repr(module).splitlines()
+        if 'scope: "block_leader"' in line
+    ]
+    assert barriers == [
+        'barrier() attrs={id: 1, scope: "block_leader"}',
+        'barrier() attrs={id: 1, scope: "block_leader"}',
+    ]
