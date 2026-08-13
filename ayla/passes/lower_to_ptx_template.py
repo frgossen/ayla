@@ -111,14 +111,29 @@ class LowerToPtxTemplate(LoweringPass):
             elem_off = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(elem_off)
 
-            layout = root_type.blocked_layout
-            if layout is not None and dim == root_type.rank - 1:
+            layout = (
+                root_type.physical_layout
+                if isinstance(root_type, SmemTensorType) else None
+            )
+            stride = root_type.strides[dim]
+            if layout is not None and layout.block is not None and dim == 0:
+                padded = layout.block + layout.padding
+                stride = (
+                    root_type.sizes[-1] // layout.block * padded
+                    if layout.order == "row_major" else padded
+                )
+            if (
+                layout is not None
+                and layout.block is not None
+                and dim == root_type.rank - 1
+            ):
                 block_op = IndexConstantOp.build(layout.block)
                 chunk = IndexDivOp.build(elem_off.result(), block_op.result())
                 inner = IndexModOp.build(elem_off.result(), block_op.result())
                 padded_op = IndexConstantOp.build(
                     layout.block + layout.padding
                 )
+                new_ops.extend([block_op, chunk, inner, padded_op])
                 if layout.order == "row_major":
                     chunk_stride = padded_op.result()
                 else:
@@ -133,12 +148,10 @@ class LowerToPtxTemplate(LoweringPass):
                 physical_off = IndexAddOp.build(
                     chunk_off.result(), inner.result(),
                 )
-                new_ops.extend([
-                    block_op, chunk, inner, padded_op, chunk_off, physical_off,
-                ])
+                new_ops.extend([chunk_off, physical_off])
                 elem_off = physical_off
 
-            stride_bytes = root_type.strides[dim] * dtype_bytes
+            stride_bytes = stride * dtype_bytes
             stride_op = IndexConstantOp.build(stride_bytes)
             new_ops.append(stride_op)
             byte_term = IndexMulOp.build(elem_off.result(), stride_op.result())
@@ -256,7 +269,12 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_elements = smem_type.storage_num_elements
+        layout = smem_type.physical_layout
+        n_elements = smem_type.num_elements
+        if layout is not None and layout.block is not None:
+            n_elements = n_elements // layout.block * (
+                layout.block + layout.padding
+            )
         n_bytes = n_elements * smem_type.dtype.byte_size
         template = textwrap.dedent(f"""\
             .shared .align 128 .b8 ${{smem:sym}}[{n_bytes}];
@@ -1228,7 +1246,7 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower smem → gmem TMA bulk store (block-collective).
 
-        Thread 0 issues cp.async.bulk.tensor.2d, commits, and waits.
+        Thread 0 issues the bulk tensor copy, commits, and waits.
         The barrier inserted before the async orders all threads' shared-memory
         writes before thread 0 starts the store.
         """
@@ -1242,11 +1260,10 @@ class LowerToPtxTemplate(LoweringPass):
         # commit_group/wait_group.
         operands = [dst_value, src_value] + idx_values
         operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
-        tensor_rank = len(idx_values)
-        if desc_type.physical_layout is not None:
-            assert tensor_rank == desc_type.gmem_type.rank + 1
-        else:
-            assert tensor_rank == desc_type.gmem_type.rank
+        layout = desc_type.physical_layout
+        tensor_rank = 3 if layout is not None and layout.block is not None else 2
+        assert desc_type.gmem_type.rank == 2
+        assert len(idx_values) == tensor_rank
         indices = ", ".join(
             f"${{b32:operand.idx{i}.val}}"
             for i in reversed(range(len(idx_values)))
@@ -1313,6 +1330,12 @@ class LowerToPtxTemplate(LoweringPass):
                 desc_type.tile_num_elements * desc_type.gmem_type.dtype.byte_size
             )
             idx_values = [self.value_map[v] for v in tma.indices]
+            layout = desc_type.physical_layout
+            tensor_rank = (
+                3 if layout is not None and layout.block is not None else 2
+            )
+            assert desc_type.gmem_type.rank == 2
+            assert len(idx_values) == tensor_rank
             dn, sn = f"dst{i}", f"desc{i}"
             idx_names = [f"idx{i}_{j}" for j in range(len(idx_values))]
             operands += [dst_value, desc_value] + idx_values
@@ -1322,7 +1345,7 @@ class LowerToPtxTemplate(LoweringPass):
                 for j in reversed(range(len(idx_values)))
             )
             load_lines.append(
-                f"cp.async.bulk.tensor.{len(idx_values)}d.shared::cluster.global."
+                f"cp.async.bulk.tensor.{tensor_rank}d.shared::cluster.global."
                 f"mbarrier::complete_tx::bytes "
                 f"[${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "

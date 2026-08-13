@@ -13,41 +13,43 @@ gpu_dialect = Dialect("gpu")
 
 
 @dataclass(frozen=True)
-class BlockedLayout:
-    """Validated view of a ``blocked_padding`` physical-layout attribute."""
+class PhysicalLayoutSpec:
+    """Metadata describing physical storage for a rank-2 tensor.
 
-    block: int
-    padding: int
+    ``swizzle`` controls shared-memory addressing. If ``block`` is set, the
+    logical inner dimension is split into blocks followed by ``padding``;
+    ``order`` controls how those blocks are arranged, and ``outer_size`` keeps
+    the allocation's outer extent for block-major address lowering.
+    """
+
+    swizzle: str | None
+    block: int | None = None
+    padding: int = 0
     order: str = "row_major"
     outer_size: int | None = None
 
     @classmethod
-    def parse(cls, attrs: dict[str, object] | None) -> "BlockedLayout | None":
+    def parse(
+        cls, swizzle: str | None, attrs: dict[str, object] | None,
+    ) -> "PhysicalLayoutSpec | None":
         if attrs is None:
-            return None
+            return cls(swizzle) if swizzle is not None else None
         if attrs.get("kind") != "blocked_padding":
             raise NotImplementedError(f"unsupported physical layout {attrs!r}")
         order = str(attrs.get("order", "row_major"))
         if order not in ("row_major", "block_major"):
-            raise ValueError(f"unsupported blocked layout order {order!r}")
+            raise ValueError(f"unsupported physical layout order {order!r}")
         outer = attrs.get("outer_size")
         return cls(
-            int(attrs["block"]), int(attrs["padding"]), order,
+            swizzle, int(attrs["block"]), int(attrs["padding"]), order,
             int(outer) if outer is not None else None,
         )
 
-    def physical_inner(self, logical: int) -> int:
-        chunk, inner = divmod(logical, self.block)
-        stride = self.block + self.padding
-        if self.order == "block_major":
-            if self.outer_size is None:
-                raise ValueError("block-major layout requires outer_size")
-            stride *= self.outer_size
-        return chunk * stride + inner
-
-    def tensor_storage(
+    def blocked_attr(
         self, sizes: list[int], dtype: Type,
-    ) -> tuple[list[int], dict[str, object]]:
+    ) -> dict[str, object] | None:
+        if self.block is None:
+            return None
         if len(sizes) != 2 or sizes[-1] % self.block:
             raise ValueError("blocked padding requires a divisible rank-2 tile")
         padded = self.block + self.padding
@@ -60,11 +62,7 @@ class BlockedLayout:
         }
         if self.order != "row_major":
             attrs.update(order=self.order, outer_size=outer)
-        row_stride = (
-            sizes[-1] // self.block * padded
-            if self.order == "row_major" else padded
-        )
-        return [row_stride, 1], attrs
+        return attrs
 
 
 # TODO: Rename types : gmem_tensor --> gmem etc.
@@ -876,45 +874,6 @@ class AddrMemTensorType(MemTensorType):
         """Per-dim stride in elements."""
         return tuple(self.attrs["strides"])  # type: ignore[arg-type]
 
-    @property
-    def physical_layout(self) -> dict[str, object] | None:
-        """Optional non-affine physical layout of the logical tensor.
-
-        Strides describe the affine layout within a physical block.
-        ``blocked_padding`` splits the last logical dimension into fixed-size
-        blocks and appends padding to every block.  Its optional ``order`` is
-        ``row_major`` (blocks within each row) or ``block_major`` (all rows of
-        one block together). Keeping this on the memory type makes the mapping
-        available to allocation, instruction selection and transfers.
-        """
-        value = self.attrs.get("physical_layout")
-        return value if isinstance(value, dict) else None
-
-    @property
-    def blocked_layout(self) -> BlockedLayout | None:
-        return BlockedLayout.parse(self.physical_layout)
-
-    def element_offset(self, indices: list[int]) -> int:
-        """Map logical element coordinates to a physical element offset."""
-        if len(indices) != self.rank:
-            raise ValueError(f"expected {self.rank} indices, got {len(indices)}")
-        layout = self.blocked_layout
-        offset = 0
-        for dim, (index, stride) in enumerate(zip(indices, self.strides)):
-            if layout is not None and dim == self.rank - 1:
-                index = layout.physical_inner(index)
-            offset += index * stride
-        return offset
-
-    @property
-    def storage_num_elements(self) -> int:
-        layout = self.blocked_layout
-        if layout is None:
-            return self.num_elements
-        return self.num_elements // layout.block * (
-            layout.block + layout.padding
-        )
-
     def write_strides(self, p: Printer) -> None:
         if not self.is_canonical_strides:
             p.write(" strides=")
@@ -993,23 +952,33 @@ class SmemTensorType(AddrMemTensorType):
             **(attrs or {}),
         })
 
-    @classmethod
+    @staticmethod
     def build_physical(
-        cls, sizes: list[int], dtype: Type, swizzle: str | None,
+        sizes: list[int], dtype: Type, swizzle: str | None,
         physical_layout: dict[str, object] | None,
     ) -> "SmemTensorType":
-        layout = BlockedLayout.parse(physical_layout)
-        if layout is None:
-            return cls.build(sizes, dtype, swizzle=swizzle)
-        strides, normalized = layout.tensor_storage(sizes, dtype)
-        return cls.build(
-            sizes, dtype, strides, swizzle,
-            attrs={"physical_layout": normalized},
+        layout = PhysicalLayoutSpec.parse(swizzle, physical_layout)
+        blocked_attr = (
+            layout.blocked_attr(sizes, dtype) if layout is not None else None
+        )
+        return SmemTensorType.build(
+            sizes, dtype, swizzle=swizzle,
+            attrs=(
+                {"physical_layout": blocked_attr}
+                if blocked_attr is not None else None
+            ),
         )
 
     @property
     def swizzle(self) -> str | None:
         return self.attrs["swizzle"]
+
+    @property
+    def physical_layout(self) -> PhysicalLayoutSpec | None:
+        return PhysicalLayoutSpec.parse(
+            self.swizzle,
+            self.attrs.get("physical_layout"),  # type: ignore[arg-type]
+        )
 
     def print(self, p: Printer) -> None:
         p.write(self.name)
@@ -1150,12 +1119,24 @@ class TmaDescType(Type):
         tile_shape: list[int],
         swizzle: str | None = None,
         attrs: dict[str, object] | None = None,
+        *,
+        physical_layout: PhysicalLayoutSpec | None = None,
     ) -> "TmaDescType":
+        if physical_layout is not None:
+            assert physical_layout.swizzle == swizzle
+        blocked_attr = (
+            physical_layout.blocked_attr(tile_shape, gmem_type.dtype)
+            if physical_layout is not None else None
+        )
         return cls(attrs={
             "arg_idx": arg_idx,
             "gmem_type": gmem_type,
             "tile_shape": list(tile_shape),
             "swizzle": swizzle,
+            **(
+                {"physical_layout": blocked_attr}
+                if blocked_attr is not None else {}
+            ),
             **(attrs or {}),
         })
 
@@ -1180,9 +1161,11 @@ class TmaDescType(Type):
         return math.prod(self.tile_sizes)
 
     @property
-    def physical_layout(self) -> dict[str, object] | None:
-        value = self.attrs.get("physical_layout")
-        return value if isinstance(value, dict) else None
+    def physical_layout(self) -> PhysicalLayoutSpec | None:
+        return PhysicalLayoutSpec.parse(
+            self.swizzle,
+            self.attrs.get("physical_layout"),  # type: ignore[arg-type]
+        )
 
     @property
     def swizzle(self) -> str | None:

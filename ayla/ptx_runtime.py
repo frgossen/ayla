@@ -73,6 +73,89 @@ static uintptr_t module_get_function(
     return reinterpret_cast<uintptr_t>(fn);
 }
 
+static CUtensorMap encode_tensor_map_2d(
+    const at::Tensor& tensor,
+    const std::vector<int64_t>& tile_shape,
+    CUtensorMapDataType dtype,
+    CUtensorMapSwizzle swizzle
+) {
+    CUtensorMap map{};
+    cuuint64_t global_dim[2] = {
+        static_cast<cuuint64_t>(tensor.size(1)),
+        static_cast<cuuint64_t>(tensor.size(0)),
+    };
+    cuuint64_t global_strides[1] = {
+        static_cast<cuuint64_t>(tensor.stride(0) * tensor.element_size()),
+    };
+    cuuint32_t box_dim[2] = {
+        static_cast<cuuint32_t>(tile_shape[1]),
+        static_cast<cuuint32_t>(tile_shape[0]),
+    };
+    cuuint32_t elem_strides[2] = {1, 1};
+    CU_CHECK(cuTensorMapEncodeTiled(
+        &map, dtype, 2, tensor.data_ptr(),
+        global_dim, global_strides, box_dim, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+    return map;
+}
+
+static CUtensorMap encode_blocked_tensor_map_3d(
+    const at::Tensor& tensor,
+    const std::vector<int64_t>& tile_shape,
+    CUtensorMapDataType dtype,
+    CUtensorMapSwizzle swizzle,
+    int64_t inner_size,
+    int64_t inner_padding,
+    const std::string& block_order
+) {
+    TORCH_CHECK(inner_padding >= 0, "TMA inner padding must be non-negative");
+    TORCH_CHECK(tensor.size(1) % inner_size == 0,
+                "tensor inner dimension must be divisible by TMA inner size");
+    TORCH_CHECK(tile_shape[1] % inner_size == 0,
+                "tile inner dimension must be divisible by TMA inner size");
+    TORCH_CHECK(block_order == "row_major" || block_order == "block_major",
+                "unsupported TMA blocked layout order");
+
+    cuuint64_t global_dim[3] = {
+        static_cast<cuuint64_t>(inner_size),
+        static_cast<cuuint64_t>(tensor.size(1) / inner_size),
+        static_cast<cuuint64_t>(tensor.size(0)),
+    };
+    cuuint64_t global_strides[2] = {
+        static_cast<cuuint64_t>(inner_size * tensor.element_size()),
+        static_cast<cuuint64_t>(tensor.stride(0) * tensor.element_size()),
+    };
+    cuuint32_t box_dim[3] = {
+        static_cast<cuuint32_t>(inner_size + inner_padding),
+        static_cast<cuuint32_t>(tile_shape[1] / inner_size),
+        static_cast<cuuint32_t>(tile_shape[0]),
+    };
+    if (block_order == "block_major") {
+        global_dim[1] = static_cast<cuuint64_t>(tensor.size(0));
+        global_dim[2] = static_cast<cuuint64_t>(tensor.size(1) / inner_size);
+        global_strides[0] = static_cast<cuuint64_t>(
+            tensor.stride(0) * tensor.element_size());
+        global_strides[1] = static_cast<cuuint64_t>(
+            inner_size * tensor.element_size());
+        box_dim[1] = static_cast<cuuint32_t>(tile_shape[0]);
+        box_dim[2] = static_cast<cuuint32_t>(tile_shape[1] / inner_size);
+    }
+    cuuint32_t elem_strides[3] = {1, 1, 1};
+
+    CUtensorMap map{};
+    CU_CHECK(cuTensorMapEncodeTiled(
+        &map, dtype, 3, tensor.data_ptr(),
+        global_dim, global_strides, box_dim, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+    return map;
+}
+
 static CUtensorMap tensor_map_encode_tiled(
     at::Tensor tensor,
     std::vector<int64_t> tile_shape,
@@ -85,84 +168,25 @@ static CUtensorMap tensor_map_encode_tiled(
     TORCH_CHECK(tensor.dim() == 2, "only 2D tensors supported");
     TORCH_CHECK(tile_shape.size() == 2, "tile_shape must have 2 elements");
 
-    auto dtype = tensor.scalar_type();
-    CUtensorMapDataType cu_dtype;
-    if (dtype == at::kFloat) cu_dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
-    else if (dtype == at::kHalf) cu_dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
-    else if (dtype == at::kBFloat16) cu_dtype = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
-    else if (dtype == at::kDouble) cu_dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT64;
+    auto scalar_type = tensor.scalar_type();
+    CUtensorMapDataType dtype;
+    if (scalar_type == at::kFloat) dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    else if (scalar_type == at::kHalf) dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    else if (scalar_type == at::kBFloat16) dtype = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    else if (scalar_type == at::kDouble) dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT64;
     else TORCH_CHECK(false, "unsupported dtype for TMA descriptor");
 
-    CUtensorMapSwizzle cu_swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;
-    if (swizzle == "32B") cu_swizzle = CU_TENSOR_MAP_SWIZZLE_32B;
-    else if (swizzle == "64B") cu_swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
-    else if (swizzle == "128B") cu_swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+    CUtensorMapSwizzle tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;
+    if (swizzle == "32B") tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_32B;
+    else if (swizzle == "64B") tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
+    else if (swizzle == "128B") tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
 
-    CUtensorMap map{};
     if (inner_size > 0) {
-        TORCH_CHECK(inner_padding >= 0, "TMA inner padding must be non-negative");
-        TORCH_CHECK(tensor.size(1) % inner_size == 0,
-                    "tensor inner dimension must be divisible by TMA inner size");
-        TORCH_CHECK(tile_shape[1] % inner_size == 0,
-                    "tile inner dimension must be divisible by TMA inner size");
-        // Reshape row-major [M,N] to [M,N/inner,inner].  Making the
-        // innermost box slightly wider than the global inner dimension adds
-        // shared-memory-only padding which TMA skips in global memory.
-        TORCH_CHECK(block_order == "row_major" || block_order == "block_major",
-                    "unsupported TMA blocked layout order");
-        bool block_major = block_order == "block_major";
-        cuuint64_t global_dim[3] = {
-            static_cast<cuuint64_t>(inner_size),
-            static_cast<cuuint64_t>(block_major
-                ? tensor.size(0) : tensor.size(1) / inner_size),
-            static_cast<cuuint64_t>(block_major
-                ? tensor.size(1) / inner_size : tensor.size(0)),
-        };
-        cuuint64_t global_strides[2] = {
-            static_cast<cuuint64_t>((block_major ? tensor.stride(0) : inner_size)
-                                    * tensor.element_size()),
-            static_cast<cuuint64_t>((block_major ? inner_size : tensor.stride(0))
-                                    * tensor.element_size()),
-        };
-        cuuint32_t box_dim[3] = {
-            static_cast<cuuint32_t>(inner_size + inner_padding),
-            static_cast<cuuint32_t>(block_major
-                ? tile_shape[0] : tile_shape[1] / inner_size),
-            static_cast<cuuint32_t>(block_major
-                ? tile_shape[1] / inner_size : tile_shape[0]),
-        };
-        cuuint32_t elem_strides[3] = {1, 1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(
-            &map, cu_dtype, 3, tensor.data_ptr(),
-            global_dim, global_strides, box_dim, elem_strides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, cu_swizzle,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        ));
-    } else {
-        // TMA uses fastest-varying-first ordering.  For row-major [M,N],
-        // dimension zero is N and dimension one is M.
-        cuuint64_t global_dim[2] = {
-            static_cast<cuuint64_t>(tensor.size(1)),
-            static_cast<cuuint64_t>(tensor.size(0)),
-        };
-        cuuint64_t global_strides[1] = {
-            static_cast<cuuint64_t>(tensor.stride(0) * tensor.element_size()),
-        };
-        cuuint32_t box_dim[2] = {
-            static_cast<cuuint32_t>(tile_shape[1]),
-            static_cast<cuuint32_t>(tile_shape[0]),
-        };
-        cuuint32_t elem_strides[2] = {1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(
-            &map, cu_dtype, 2, tensor.data_ptr(),
-            global_dim, global_strides, box_dim, elem_strides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, cu_swizzle,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        ));
+        return encode_blocked_tensor_map_3d(
+            tensor, tile_shape, dtype, tensor_swizzle,
+            inner_size, inner_padding, block_order);
     }
-    return map;
+    return encode_tensor_map_2d(tensor, tile_shape, dtype, tensor_swizzle);
 }
 
 // Return a stable pointer to a cached CUtensorMap, encoding it once per
@@ -339,14 +363,18 @@ class PtxLauncher:
             if isinstance(typ, GmemTensorType):
                 params.append(tensors[self._arg_to_tensor[i]])
             elif isinstance(typ, TmaDescType):
-                layout = typ.physical_layout or {}
+                layout = typ.physical_layout
+                block = (
+                    layout.block
+                    if layout is not None and layout.block is not None else 0
+                )
                 params.append((
                     tensors[self._arg_to_tensor[typ.arg_idx]],
                     list(typ.tile_sizes),
                     typ.swizzle or "",
-                    int(layout.get("block", 0)),
-                    int(layout.get("padding", 0)),
-                    str(layout.get("order", "row_major")),
+                    block,
+                    layout.padding if block else 0,
+                    layout.order if block else "row_major",
                 ))
         return params
 
