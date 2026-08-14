@@ -135,14 +135,15 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
 
     n = len(times_ms)
     min_ms = min(times_ms)
-    # Throughput / peak% from the fastest round (best-case steady clock, least
-    # contaminated by clock dips or scheduling noise), not the median.
-    tflops = cfg.flops / (min_ms / 1e3) / 1e12
+    median_ms = statistics.median(times_ms)
+    # Use the median for stable throughput and percentage comparisons rather
+    # than selecting the luckiest round.
+    tflops = cfg.flops / (median_ms / 1e3) / 1e12
     return BenchResult(
         label=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})",
         rounds=n,
         iters=iters,
-        median_ms=statistics.median(times_ms),
+        median_ms=median_ms,
         mean_ms=statistics.mean(times_ms),
         stdev_ms=statistics.stdev(times_ms) if n > 1 else 0.0,
         min_ms=min_ms,
@@ -301,8 +302,28 @@ def main() -> None:
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
         ),
         ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, full output store, 4 tiles/CTA, A promote 256B)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store",
+        ),
+        ayla_bf16(
             "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, 4 tiles/CTA, TMA promote 256B)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_promote_256b",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, N raster)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_raster_n",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, 16x8 grouped)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_group2x2_split2_dbuf2",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, 16x8 grouped A-first)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_group2x2_mouter_split2_dbuf2",
         ),
         ayla_bf16(
             "ayla.auto_matmul (wgmma256 wg, 3D input TMA K-tile=128, split output, 2 tiles/CTA)",

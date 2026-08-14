@@ -4,7 +4,7 @@ import textwrap
 
 from ..base.ir import find_ops
 from ..gpu_dialect import gpu_dialect
-from ..gpu_dialect import AsyncOp, MoveOp
+from ..gpu_dialect import AsyncOp, KernelOp, MoveOp, TileOp
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
@@ -38,6 +38,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     rhs_output_l2_promotions: tuple[str | None, ...] | None = None,
     k_tail_cache_hints: dict[str, str | None] | None = None,
     reuse_k_tail_mbarrier: bool = False,
+    startup_tma_stage_order: tuple[int, ...] | None = None,
     # Split each 256-column output row into two 128-element TMA dimensions.
     # Shared-only padding controls the physical row stride seen by the TMA
     # store; the best overall stride may trade some STMatrix bank expansion
@@ -108,6 +109,13 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     if reuse_k_tail_mbarrier and (operand_stages != 3 or operand_k_tile != 64):
         raise ValueError(
             "K-tail barrier reuse currently requires three K=64 stages"
+        )
+    if (
+        startup_tma_stage_order is not None
+        and tuple(sorted(startup_tma_stage_order)) != tuple(range(operand_stages))
+    ):
+        raise ValueError(
+            "startup_tma_stage_order must be a permutation of operand stages"
         )
     if output_store == "scalar":
         output_tma_inner_size = None
@@ -367,7 +375,43 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             raise ValueError("K-tail/stage-0 TMA barriers were not found")
         for user, operand_index in list(tail_lock.uses):
             user.operands[operand_index] = stage0_lock
-    return canonicalize(module)
+    module = canonicalize(module)
+    if startup_tma_stage_order is not None:
+        kernel = next(
+            op for op in module.body.entry_block.ops if isinstance(op, KernelOp)
+        )
+        block = kernel.body.entry_block
+        stage_pairs: dict[int, tuple[TileOp, AsyncOp]] = {}
+        for index, op in enumerate(block.ops):
+            if not isinstance(op, AsyncOp):
+                continue
+            match = re.fullmatch(
+                r"mm_lhs_smem_iter(\d+)_async_iter0",
+                str(op.attrs.get("label", "")),
+            )
+            if match is None:
+                continue
+            stage = int(match.group(1))
+            coordinate = block.ops[index - 1]
+            if not isinstance(coordinate, TileOp):
+                raise ValueError("startup TMA load is not preceded by its tile")
+            stage_pairs[stage] = (coordinate, op)
+        if set(stage_pairs) != set(startup_tma_stage_order):
+            raise ValueError(
+                "could not find every startup TMA stage load: "
+                f"found {sorted(stage_pairs)}, expected "
+                f"{sorted(startup_tma_stage_order)}"
+            )
+        members = [member for pair in stage_pairs.values() for member in pair]
+        indices = sorted(block.ops.index(member) for member in members)
+        if indices != list(range(indices[0], indices[0] + len(indices))):
+            raise ValueError("startup TMA stage loads are not contiguous")
+        block.ops[indices[0]:indices[-1] + 1] = [
+            member
+            for stage in startup_tma_stage_order
+            for member in stage_pairs[stage]
+        ]
+    return module
 
 
 def best_auto_matmul_4096_wgmma256_wg_tma_store_module():
@@ -379,13 +423,18 @@ def best_auto_matmul_4096_wgmma256_wg_tma_store_module():
     return auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=4,
         operand_stages=3,
-        output_slices=2,
+        output_slices=1,
         output_tma_inner_padding=0,
-        output_store_buffers=2,
+        output_store_buffers=1,
         regroup_stmatrix_block_major=True,
         reuse_k_tail_mbarrier=True,
+        startup_tma_stage_order=(0, 2, 1),
+        variant_suffix="full_output_store",
         operand_move_attrs={
-            "lhs": {"l2_cache_hint": "evict_first"},
+            "lhs": {
+                "l2_cache_hint": "evict_first",
+                "l2_promotion": "256B",
+            },
             "dst": {"l2_cache_hint": "evict_first"},
         },
     )
@@ -397,10 +446,22 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
         {"output_tiles_per_cta": 2},
         {"output_tiles_per_cta": 2, "operand_stages": 3, "output_slices": 2,
          "output_tma_inner_padding": 16, "output_store_buffers": 2},
+        {"output_tiles_per_cta": 4, "operand_stages": 3,
+         "output_slices": 2, "output_tma_inner_padding": 0,
+         "output_store_buffers": 2,
+         "regroup_stmatrix_block_major": True,
+         "reuse_k_tail_mbarrier": True,
+         "operand_move_attrs": {
+             "lhs": {"l2_cache_hint": "evict_first"},
+             "dst": {"l2_cache_hint": "evict_first"},
+         }},
         None,  # The retained best, built by the canonical helper above.
         {"output_tiles_per_cta": 4, "operand_stages": 3,
-         "output_slices": 2, "output_tma_inner_padding": 16,
-         "output_store_buffers": 2, "variant_suffix": "promote_256b",
+         "output_slices": 2, "output_tma_inner_padding": 0,
+         "output_store_buffers": 2,
+         "regroup_stmatrix_block_major": True,
+         "reuse_k_tail_mbarrier": True,
+         "variant_suffix": "promote_256b",
          "operand_move_attrs": {
              "lhs": {"l2_cache_hint": "evict_first",
                      "l2_promotion": "256B"},

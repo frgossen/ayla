@@ -1458,11 +1458,19 @@ class LowerToPtxTemplate(LoweringPass):
                     * dst_type.blocked_layout.outer_size
                     * dst_type.dtype.byte_size
                 )
-                template += (
-                    f"add.u32 ${{b32:st_base2}}, ${{b32:st_base0}}, "
-                    f"{block_bytes};\n"
-                    "xor.b32 ${b32:st_base3}, ${b32:st_base2}, 64;\n"
-                )
+                num_bases = len(op.register_starts) // 2
+                for base_index in range(2, num_bases):
+                    if base_index % 2 == 0:
+                        template += (
+                            f"add.u32 ${{b32:st_base{base_index}}}, "
+                            f"${{b32:st_base0}}, "
+                            f"{base_index // 2 * block_bytes};\n"
+                        )
+                    else:
+                        template += (
+                            f"xor.b32 ${{b32:st_base{base_index}}}, "
+                            f"${{b32:st_base{base_index - 1}}}, 64;\n"
+                        )
             else:
                 template += (
                     "xor.b32 ${b32:st_base2}, ${b32:st_base0}, 144;\n"
@@ -1475,7 +1483,7 @@ class LowerToPtxTemplate(LoweringPass):
             # A 128-column slice has eight 8x8 register starts and a
             # 64-column slice has four.  The same 8x32 regrouping applies; the
             # narrower slice simply uses the first two block-major bases.
-            assert len(op.register_starts) in (4, 8)
+            assert len(op.register_starts) in (4, 8, 16)
             for base_index, group in enumerate(
                 range(0, len(op.register_starts), 2)
             ):
