@@ -256,8 +256,10 @@ class PromoteBuffers(LoweringPass):
         self.move_attrs = dict(move_attrs or {})
         if writeback_slices < 1 or any(n < 1 for n in self.tma_load_slices.values()):
             raise ValueError("slice counts must be positive")
-        if writeback_buffers not in (1, writeback_slices):
-            raise ValueError("writeback_buffers must be 1 or equal writeback_slices")
+        if not 1 <= writeback_buffers <= writeback_slices:
+            raise ValueError(
+                "writeback_buffers must be between 1 and writeback_slices"
+            )
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_target_type(self, base_type, dtype=None):
@@ -390,7 +392,7 @@ class PromoteBuffers(LoweringPass):
             raise ValueError("output columns must divide evenly into writeback_slices")
         smem_sizes[-1] //= self.writeback_slices
         smem_type = SmemTensorType.build_physical(
-            smem_sizes, block_dst.type.dtype, None, self.physical_layout,
+            smem_sizes, block_dst.type.dtype, self.swizzle, self.physical_layout,
         )
         smems = [AllocOp.build(smem_type) for _ in range(self.writeback_buffers)]
         new_ops: list[Op] = list(smems)
@@ -403,7 +405,9 @@ class PromoteBuffers(LoweringPass):
         if wg_column_tile is not None and self.writeback_slices != expected_slices:
             raise ValueError("warpgroup-column writeback needs one slice per warpgroup")
         for slice_idx in range(self.writeback_slices):
-            smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
+            # A smaller arena ring is legal: the async scheduler will await a
+            # prior TMA read before a later slice refills the same arena.
+            smem = smems[slice_idx % self.writeback_buffers]
             gather_dst = smem.result()
             for tile in reversed(narrow_tiles):
                 if tile is wg_column_tile:

@@ -66,7 +66,7 @@ class LowerToPtxTemplate(LoweringPass):
         # STMatrix's lane/warp-to-row offset is identical for stores with the
         # same row stride.  Keep the first calculation as an SSA value and
         # reuse it for later stores in the same block.
-        self.stmatrix_offsets: dict[int, Value] = {}
+        self.stmatrix_offsets: dict[tuple[int, bool, str], Value] = {}
         self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
@@ -119,8 +119,46 @@ class LowerToPtxTemplate(LoweringPass):
             op.body.entry_block.ops.insert(0, policy_op)
             self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
         self.lower_region(op.body)
+        if op.attrs.get("batch_mbarrier_init", True):
+            self._batch_mbarrier_initializations(op.body.entry_block)
         self._share_thread_x(op)
         return [op], []
+
+    @staticmethod
+    def _batch_mbarrier_initializations(block: Block) -> None:
+        """Publish a block's startup mbarriers with one fence and rendezvous.
+
+        Static lock allocations are hoisted ahead of their first use.  Thread 0
+        may initialize all of them before one release fence publishes the whole
+        batch and one CTA barrier lets the consumers proceed.  Keep the last
+        allocation's fence/barrier and strip the redundant pair from preceding
+        allocations.  Refuse the fold if an mbarrier instruction appears
+        between allocations, which conservatively preserves non-startup cases.
+        """
+        inits = [
+            (index, candidate)
+            for index, candidate in enumerate(block.ops)
+            if isinstance(candidate, PTXTemplateOp)
+            and candidate.description is not None
+            and "lock<mbar> = alloc()" in candidate.description
+        ]
+        if len(inits) < 2:
+            return
+        first_index, last_index = inits[0][0], inits[-1][0]
+        init_ops = {candidate for _, candidate in inits}
+        if any(
+            isinstance(candidate, PTXTemplateOp)
+            and candidate not in init_ops
+            and "mbarrier." in candidate.template
+            for candidate in block.ops[first_index:last_index + 1]
+        ):
+            return
+        for _, init in inits[:-1]:
+            assert "fence.mbarrier_init.release.cluster;\n" in init.template
+            assert "bar.sync 0;\n" in init.template
+            init.attrs["template"] = init.template.replace(
+                "fence.mbarrier_init.release.cluster;\n", "",
+            ).replace("bar.sync 0;\n", "")
 
     @staticmethod
     def _share_thread_x(kernel: KernelOp) -> None:
@@ -1352,43 +1390,119 @@ class LowerToPtxTemplate(LoweringPass):
                 setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
             """)
         stride = dst_type.strides[0]
-        stmatrix_offset = self.stmatrix_offsets.get(stride)
+        regroup_rows = bool(op.attrs.get("regroup_rows", False))
+        layout_order = (
+            dst_type.blocked_layout.order
+            if dst_type.blocked_layout is not None else "row_major"
+        )
+        offset_key = (stride, regroup_rows, layout_order)
+        stmatrix_offset = self.stmatrix_offsets.get(offset_key)
         operands = [dst, src]
         operand_names = ["dst", "src"]
         result_types = []
         result_names = []
+        if regroup_rows:
+            assert dst_type.dtype.byte_size == 2
+            assert dst_type.blocked_layout is not None
+            assert dst_type.blocked_layout.block == 64
+            assert dst_type.blocked_layout.padding == 0
+            assert dst_type.swizzle == "128B"
+            assert stride == (
+                64 if layout_order == "block_major" else 128
+            )
         if stmatrix_offset is None:
             result_types = [IndexType()]
             result_names = ["offset"]
             offset_reg = "${b32:result.offset.val}"
+            lane_row_mask = 7 if regroup_rows else 15
+            lane_col_shift = 3 if regroup_rows else 4
             template = writer_setup + textwrap.dedent(f"""\
                 mov.u32 ${{b32:st_lane}}, %laneid;
                 mov.u32 ${{b32:st_tid}}, %tid.x;
                 and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
                 shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
-                and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 15;
+                and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, {lane_row_mask};
                 mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
-                shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 4;
+                shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, {lane_col_shift};
                 shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
                 mad.lo.u32 {offset_reg}, ${{b32:st_row}}, {stride}, ${{b32:st_col}};
                 shl.b32 {offset_reg}, {offset_reg}, 1;
             """)
+            if regroup_rows:
+                template += textwrap.dedent(f"""\
+                    and.b32 ${{b32:st_swizzle_mask}}, {offset_reg}, 896;
+                    shr.u32 ${{b32:st_swizzle_mask}}, ${{b32:st_swizzle_mask}}, 3;
+                    xor.b32 {offset_reg}, {offset_reg}, ${{b32:st_swizzle_mask}};
+                """)
         else:
             operands.append(stmatrix_offset)
             operand_names.append("offset")
             offset_reg = "${b32:operand.offset.val}"
             template = writer_setup
-        template += (
-            "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
-            f"{offset_reg};\n"
-        )
-        for first, offset in zip(op.register_starts, op.offsets):
+        if not regroup_rows:
+            template += (
+                "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
+                f"{offset_reg};\n"
+            )
+        else:
+            template += (
+                "add.u32 ${b32:st_base0}, ${b32:operand.dst.ptr}, "
+                f"{offset_reg};\n"
+                "xor.b32 ${b32:st_base1}, ${b32:st_base0}, 64;\n"
+            )
+            if layout_order == "block_major":
+                assert dst_type.blocked_layout is not None
+                assert dst_type.blocked_layout.outer_size is not None
+                block_bytes = (
+                    dst_type.blocked_layout.block
+                    * dst_type.blocked_layout.outer_size
+                    * dst_type.dtype.byte_size
+                )
+                template += (
+                    f"add.u32 ${{b32:st_base2}}, ${{b32:st_base0}}, "
+                    f"{block_bytes};\n"
+                    "xor.b32 ${b32:st_base3}, ${b32:st_base2}, 64;\n"
+                )
+            else:
+                template += (
+                    "xor.b32 ${b32:st_base2}, ${b32:st_base0}, 144;\n"
+                    "xor.b32 ${b32:st_base3}, ${b32:st_base0}, 208;\n"
+                )
+        if regroup_rows:
+            assert len(op.register_starts) % 2 == 0
+            bottom_rows = 8 * stride * dst_type.dtype.byte_size
+            groups = []
+            # A 128-column slice has eight 8x8 register starts and a
+            # 64-column slice has four.  The same 8x32 regrouping applies; the
+            # narrower slice simply uses the first two block-major bases.
+            assert len(op.register_starts) in (4, 8)
+            for base_index, group in enumerate(
+                range(0, len(op.register_starts), 2)
+            ):
+                first0 = op.register_starts[group]
+                first1 = op.register_starts[group + 1]
+                groups.extend([
+                    ([first0, first0 + 2, first1, first1 + 2],
+                     base_index, 0),
+                    ([first0 + 1, first0 + 3, first1 + 1, first1 + 3],
+                     base_index, bottom_rows),
+                ])
+        else:
+            groups = [
+                (list(range(first, first + 4)), 0, offset)
+                for first, offset in zip(op.register_starts, op.offsets)
+            ]
+        for register_indices, base_index, offset in groups:
+            if regroup_rows:
+                address = f"${{b32:st_base{base_index}}}"
+            else:
+                address = "${b32:base}"
             regs = ", ".join(
-                f"${{b32:operand.src.r{i}}}" for i in range(first, first + 4)
+                f"${{b32:operand.src.r{i}}}" for i in register_indices
             )
             template += (
                 f"{predicate}stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
-                f"[${{b32:base}}+{offset}], {{{regs}}};\n"
+                f"[{address}+{offset}], {{{regs}}};\n"
             )
         lowered = PTXTemplateOp.build(
             operands=operands, result_types=result_types, template=template,
@@ -1396,7 +1510,7 @@ class LowerToPtxTemplate(LoweringPass):
             description=str(op),
         )
         if stmatrix_offset is None:
-            self.stmatrix_offsets[stride] = lowered.result()
+            self.stmatrix_offsets[offset_key] = lowered.result()
         return [lowered], []
 
     def _lower_move_smem_to_wrmem_mma(

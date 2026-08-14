@@ -7,10 +7,12 @@ import pytest
 import torch
 from torch.ops import ayla
 
+from ayla.base.ir import find_ops
 from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    best_auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
-from ayla.gpu_dialect import TmaDescType
+from ayla.gpu_dialect import MoveOp, TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
 
 
@@ -90,12 +92,9 @@ def test_pre_stsm_variant_uses_scalar_shared_stores():
 
 
 def test_four_output_tiles_reuse_the_existing_pipeline_resources():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_tiles_per_cta=4, operand_stages=3, output_slices=2,
-        output_tma_inner_padding=16, output_store_buffers=2,
-        operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"},
-                            "dst": {"l2_cache_hint": "evict_first"}},
-    ))
+    kernel = make_ptx_kernel(
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module()
+    )
     assert kernel.name.endswith("_k3_4tiles_split2_dbuf2")
     assert kernel.grid_dim == (8, 16, 1)
     assert kernel.block_dim == (256, 1, 1)
@@ -121,6 +120,142 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
         if next_gather is not None:
             assert any(line.strip() == "bar.sync 0;"
                        for line in lines[wait:next_gather])
+
+
+def test_regrouped_stmatrix_rows_use_dense_block_major_swizzled_output():
+    kernel = make_ptx_kernel(
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module()
+    )
+    output_descs = [
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx == 2
+    ]
+    assert len(output_descs) == 1
+    assert output_descs[0].swizzle == "128B"
+    assert output_descs[0].physical_layout == {
+        "kind": "blocked_padding", "block": 64, "padding": 0,
+        "order": "block_major", "outer_size": 128,
+    }
+    assert kernel.ptx.count("stmatrix.") == 64
+    # The lane swizzle is computed once and the four 32-column bases are
+    # derived statically; regrouping does not add stores or synchronization.
+    assert kernel.ptx.count(", 896;") == 1
+    assert kernel.ptx.count(", 16384;") == 8
+    assert kernel.ptx.count("bar.sync") == 40
+
+
+def test_four_output_tiles_support_n_major_cta_raster():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4, operand_stages=3, output_slices=2,
+        output_tma_inner_padding=16, output_store_buffers=2,
+        cta_raster="n",
+    ))
+    assert kernel.name.endswith("_k3_4tiles_split2_dbuf2_raster_n")
+    assert kernel.grid_dim == (16, 8, 1)
+    assert kernel.ptx.count("wgmma.mma_async") == 112
+
+
+def test_tma_l2_promotion_reaches_input_descriptors():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_move_attrs={
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+        },
+    ))
+    input_descs = [
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    ]
+    output_descs = [
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx == 2
+    ]
+    assert input_descs and output_descs
+    assert all(desc.l2_promotion == "256B" for desc in input_descs)
+    assert all(desc.l2_promotion is None for desc in output_descs)
+
+
+def test_tma_cache_controls_can_vary_per_static_load():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4, promote_k_tail=False,
+        rhs_output_l2_promotions=("256B", "128B", "256B", "128B"),
+        k_tail_cache_hints={"rhs": "evict_first"},
+        rhs_output_cache_hints=(
+            "evict_last", "evict_last", "evict_last", "evict_first",
+        ),
+        operand_move_attrs={
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+        },
+    )
+    moves = find_ops(module, lambda op: isinstance(op, MoveOp))
+    tails = [op for op in moves if "_smem_tail" in op.attrs.get("label", "")]
+    rhs = [op for op in moves if "_rhs_smem_" in op.attrs.get("label", "")]
+    assert tails and rhs
+    assert all("l2_promotion" not in op.attrs for op in tails)
+    assert all(op.attrs.get("l2_cache_hint") == "evict_first"
+               for op in tails if "_rhs_smem_" in op.attrs.get("label", ""))
+    assert all(op.attrs.get("l2_promotion") == "256B"
+               for op in moves if re.search(
+                   r"_lhs_smem_", op.attrs.get("label", ""))
+               and op not in tails)
+    assert all(op.attrs.get("l2_promotion") == (
+                   "256B" if op.attrs.get("label", "").endswith(("_iter0", "_iter2"))
+                   else "128B"
+               ) for op in rhs if op not in tails)
+    assert all(op.attrs.get("l2_cache_hint") == "evict_first"
+               for op in rhs if op.attrs.get("label", "").endswith("_iter3"))
+    assert all(op.attrs.get("l2_cache_hint") == "evict_last"
+               for op in rhs if op not in tails
+               and not op.attrs.get("label", "").endswith("_iter3"))
+
+
+def test_k3_tail_reuses_stage_zero_mbarrier():
+    common = dict(
+        output_tiles_per_cta=4, operand_stages=3, output_slices=2,
+        output_tma_inner_padding=16, output_store_buffers=2,
+    )
+    baseline = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(**common)
+    )
+    reused = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        **common, reuse_k_tail_mbarrier=True,
+    ))
+    assert reused.ptx.count("mbarrier.init") == baseline.ptx.count("mbarrier.init") - 1
+    # All startup mbarriers share one publication fence/rendezvous, so deleting
+    # the tail lock now removes only its init; the batch barrier is still needed
+    # for the three operand-stage barriers.
+    assert reused.ptx.count("fence.mbarrier_init") == 1
+    assert reused.ptx.count("bar.sync 0;") == 7
+    assert reused.ptx.count("bar.sync") == baseline.ptx.count("bar.sync")
+    assert reused.ptx.count("mbarrier.try_wait") == baseline.ptx.count("mbarrier.try_wait")
+    assert reused.ptx.count("cp.async.bulk.tensor") == baseline.ptx.count(
+        "cp.async.bulk.tensor"
+    )
+
+
+def test_four_output_tiles_support_2x2_grouped_schedule():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4, output_tile_group=(2, 2),
+        operand_stages=3, output_slices=2,
+        output_tma_inner_padding=16, output_store_buffers=2,
+    ))
+    assert kernel.name.endswith("_k3_4tiles_group2x2_split2_dbuf2")
+    assert kernel.grid_dim == (16, 8, 1)
+    assert kernel.ptx.count("wgmma.mma_async") == 112
+    assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 8
+
+
+def test_four_output_tiles_support_2x2_m_outer_schedule():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4, output_tile_group=(2, 2),
+        output_group_outer="m", operand_stages=3, output_slices=2,
+        output_tma_inner_padding=16, output_store_buffers=2,
+    ))
+    assert kernel.name.endswith("_k3_4tiles_group2x2_mouter_split2_dbuf2")
+    assert kernel.grid_dim == (16, 8, 1)
+    assert kernel.ptx.count("wgmma.mma_async") == 112
 
 
 def test_k4_split2_uses_four_operand_stages_and_half_output_arena():
@@ -252,6 +387,10 @@ def test_m192_split2_uses_three_warpgroups_and_partial_m_tile():
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_promote_256b",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_raster_n",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_group2x2_split2_dbuf2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_group2x2_mouter_split2_dbuf2",
             "auto_matmul_4096_wgmma256_wg_tma_store_k2_ktile128_2tiles_split2",
             "auto_matmul_4096_wgmma256_wg_tma_store_k4_2tiles_split2",
         )),

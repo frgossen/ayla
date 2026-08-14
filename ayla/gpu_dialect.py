@@ -1267,6 +1267,13 @@ class TmaDescType(Type):
         return value if isinstance(value, dict) else None
 
     @property
+    def l2_promotion(self) -> str | None:
+        value = self.attrs.get("l2_promotion")
+        if value not in (None, "64B", "128B", "256B"):
+            raise ValueError(f"unsupported TMA L2 promotion {value!r}")
+        return value  # type: ignore[return-value]
+
+    @property
     def swizzle(self) -> str | None:
         return self.attrs["swizzle"]
 

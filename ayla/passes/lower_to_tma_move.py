@@ -83,6 +83,33 @@ class LowerToTmaMove(LoweringPass):
         index_ops, root, indices = _build_tile_chain_indices(
             gmem_operand, physical_layout=layout,
         )
+        # Experimental escape hatch for mixed-K schedules.  A regular TileOp
+        # expresses offsets in multiples of its result shape, which cannot
+        # represent (for example) a 64-wide box beginning at K=16.  Keep the
+        # ordinary descriptor shape, but bias its tensor coordinates by an
+        # explicit element count.  This deliberately remains a MoveOp detail
+        # so experiments do not need to weaken TileOp's aliasing invariant.
+        coordinate_offsets = move.attrs.get("tma_coordinate_offsets")
+        if coordinate_offsets is not None:
+            if layout is not None:
+                raise ValueError(
+                    "tma_coordinate_offsets does not support physical layouts"
+                )
+            if (not isinstance(coordinate_offsets, (list, tuple))
+                    or len(coordinate_offsets) != len(indices)
+                    or any(not isinstance(offset, int)
+                           for offset in coordinate_offsets)):
+                raise ValueError(
+                    "tma_coordinate_offsets must contain one integer per "
+                    "tensor dimension"
+                )
+            for dim, offset in enumerate(coordinate_offsets):
+                if offset == 0:
+                    continue
+                offset_op = IndexConstantOp.build(offset)
+                add_op = IndexAddOp.build(indices[dim], offset_op.result())
+                index_ops.extend([offset_op, add_op])
+                indices[dim] = add_op.result()
         assert isinstance(root.type, GmemTensorType), (
             f"lower_to_tma_move: tiled operand must be gmem; got {root.type}"
         )
@@ -90,12 +117,21 @@ class LowerToTmaMove(LoweringPass):
         entry_block = root.definition
         assert isinstance(entry_block, Block)
 
+        desc_attrs: dict[str, object] = {}
+        if layout is not None:
+            desc_attrs["physical_layout"] = layout
+        if (l2_promotion := move.attrs.get("l2_promotion")) is not None:
+            if l2_promotion not in ("64B", "128B", "256B"):
+                raise ValueError(
+                    f"unsupported TMA L2 promotion {l2_promotion!r}"
+                )
+            desc_attrs["l2_promotion"] = l2_promotion
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=root.type,
             tile_shape=list(smem.type.sizes),
             swizzle=smem.type.swizzle,
-            attrs={"physical_layout": layout} if layout is not None else None,
+            attrs=desc_attrs or None,
         )
         desc_value = next(
             (
