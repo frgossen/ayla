@@ -18,6 +18,7 @@ from ayla.gpu_dialect import (
     ForOp,
     LockType,
     MoveOp,
+    PhysicalLayout,
     SmemTensorType,
     gpu_dialect,
 )
@@ -158,6 +159,20 @@ def test_canonical_strides():
 
     t_smem = SmemTensorType.build([128, 64], F32Type())
     assert list(t_smem.strides) == [64, 1]
+
+    layout = PhysicalLayout(
+        swizzle="128B", block_width=64, order="block_major",
+    )
+    t_blocked = SmemTensorType.build(
+        [64, 256], F32Type(), swizzle="128B",
+        attrs={"physical_layout": {
+            "block_width": layout.block_width, "order": layout.order,
+        }},
+    )
+    assert list(t_blocked.strides) == [256, 1]
+    assert t_blocked.num_elements == 64 * 256
+    assert t_blocked.physical_layout == layout
+    assert "strides=" not in repr(t_blocked)
 
 
 def test_naive_matmul_4096_module():

@@ -76,22 +76,21 @@ class LowerToPtxTemplate(LoweringPass):
             to_ptr = ToPtrOp.build(arg)
             new_ops.append(to_ptr)
             ptr = to_ptr.result()
-            root_type = arg.type
         elif isinstance(arg, Value) and isinstance(arg.type, PtrType):
             ptr = arg
-            v = op.arg
-            while not isinstance(v.type, AddrMemTensorType):
-                assert isinstance(v.definition, TileOp)
-                v = v.definition.arg
-            root_type = v.type
         else:
             raise NotImplementedError(
                 f"lower_tile: unexpected arg type {type(arg)}"
             )
 
+        root_type = _root_addrmem_type(op.arg)
         assert isinstance(root_type, AddrMemTensorType)
         dtype_bytes = root_type.dtype.byte_size
         result_sizes = list(op.result().type.sizes)
+        physical_layout = (
+            root_type.physical_layout
+            if isinstance(root_type, SmemTensorType) else None
+        )
 
         # Accumulate byte offset for each dimension.
         zero = IndexConstantOp.build(0)
@@ -111,7 +110,19 @@ class LowerToPtxTemplate(LoweringPass):
             elem_off = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(elem_off)
 
-            stride_bytes = root_type.strides[dim] * dtype_bytes
+            stride = root_type.strides[dim]
+            if (
+                physical_layout is not None
+                and physical_layout.order == "block_major"
+            ):
+                assert root_type.rank == 2
+                if dim == 0:
+                    stride = physical_layout.block_width
+                elif dim == 1:
+                    assert result_sizes[1] % physical_layout.block_width == 0
+                    stride = root_type.sizes[0]
+
+            stride_bytes = stride * dtype_bytes
             stride_op = IndexConstantOp.build(stride_bytes)
             new_ops.append(stride_op)
             byte_term = IndexMulOp.build(elem_off.result(), stride_op.result())
@@ -230,8 +241,16 @@ class LowerToPtxTemplate(LoweringPass):
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
         n_bytes = smem_type.num_elements * smem_type.dtype.byte_size
+        # TMA swizzling and the corresponding software address swizzle operate
+        # within 1 KiB regions and require the shared-memory base to match.
+        alignment = (
+            1024
+            if smem_type.swizzle is not None
+            and smem_type.physical_layout is not None
+            else 128
+        )
         template = textwrap.dedent(f"""\
-            .shared .align 128 .b8 ${{smem:sym}}[{n_bytes}];
+            .shared .align {alignment} .b8 ${{smem:sym}}[{n_bytes}];
             mov.u32 ${{b32:result.dst.ptr}}, ${{smem:sym}};
         """)
         new_op = PTXTemplateOp.build(
@@ -1092,11 +1111,13 @@ class LowerToPtxTemplate(LoweringPass):
         src_type = op.src.type
         assert isinstance(dst_type, SmemTensorType)
         assert isinstance(src_type, WrmemTensorType)
-        assert dst_type.swizzle == "128B"
+        layout = dst_type.physical_layout
+        assert layout is not None
         assert dst_type.dtype.byte_size == 2
         col_start = int(op.attrs.get("wgmma_col_start", 0))
         n_dim = src_type.sizes[1]
-        dst_m, _ = dst_type.sizes
+        root_type = _root_addrmem_type(op.dst)
+        root_sizes = root_type.sizes
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:st_lane}}, %laneid;
             mov.u32 ${{b32:st_tid}}, %tid.x;
@@ -1110,8 +1131,6 @@ class LowerToPtxTemplate(LoweringPass):
             shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
         """)
         groups: list[tuple[list[int], int]] = []
-        # Regroup adjacent fragments into 64-column blocks so all three low
-        # row bits participate in the 128-byte swizzle.
         for i in range(0, len(register_starts), 2):
             first0 = register_starts[i]
             first1 = register_starts[i + 1]
@@ -1122,8 +1141,10 @@ class LowerToPtxTemplate(LoweringPass):
             assert next_di == di and next_dj == dj + 16
             relative_col = dj - col_start
             assert relative_col >= 0 and relative_col % 32 == 0
-            block_offset = relative_col // 64 * dst_m * 64
-            base_offset = block_offset + di * 64 + relative_col % 64
+            block, inner = divmod(relative_col, layout.block_width)
+            base_offset = (
+                (block * root_sizes[0] + di) * layout.block_width + inner
+            )
             groups.extend([
                 ([first0, first0 + 2, first1, first1 + 2], base_offset * 2),
                 (
@@ -1284,15 +1305,19 @@ class LowerToPtxTemplate(LoweringPass):
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
         idx_values = [self.value_map[v] for v in op.indices]
+        desc_type = dst_value.type
+        assert isinstance(desc_type, TmaDescType)
 
         # Bulk groups have no addressable lock object; completion is tracked by
         # commit_group/wait_group.
         operands = [dst_value, src_value] + idx_values
         operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
-        indices = ", ".join(
-            f"${{b32:operand.idx{i}.val}}"
-            for i in reversed(range(len(idx_values)))
+        coordinate_lines, coordinates = _tma_coordinates(
+            desc_type, [f"idx{i}" for i in range(len(idx_values))], "store",
         )
+        tensor_rank = len(coordinates)
+        indices = ", ".join(coordinates)
+        coordinate_code = "\n".join(coordinate_lines)
 
         # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
         # The RAW (all threads finish writing the smem tile before t0 stores it) is
@@ -1307,7 +1332,8 @@ class LowerToPtxTemplate(LoweringPass):
             setp.ne.s32 ${{pred:st_not_t0}}, ${{b32:st_tid}}, 0;
             @${{pred:st_not_t0}} bra ${{label:st_done}};
             fence.proxy.async.shared::cta;
-            cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
+            {coordinate_code}
+            cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
         """)
@@ -1359,12 +1385,14 @@ class LowerToPtxTemplate(LoweringPass):
             idx_names = [f"idx{i}_{j}" for j in range(len(idx_values))]
             operands += [dst_value, desc_value] + idx_values
             operand_names += [dn, sn] + idx_names
-            indices = ", ".join(
-                f"${{b32:operand.{idx_names[j]}.val}}"
-                for j in reversed(range(len(idx_values)))
+            coordinate_lines, coordinates = _tma_coordinates(
+                desc_type, idx_names, f"load{i}",
             )
+            tensor_rank = len(coordinates)
+            indices = ", ".join(coordinates)
+            load_lines.extend(coordinate_lines)
             load_lines.append(
-                f"cp.async.bulk.tensor.2d.shared::cluster.global."
+                f"cp.async.bulk.tensor.{tensor_rank}d.shared::cluster.global."
                 f"mbarrier::complete_tx::bytes [${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
                 f"[${{b32:operand.lock.val}}];"
@@ -1481,9 +1509,49 @@ def _get_wgmma_layout_0_static_offsets(reg: int, n_dim: int = 128) -> tuple[int,
     return (m * 64 + di, w * 16 + dj)
 
 
+def _root_addrmem_type(value: Value) -> AddrMemTensorType:
+    while isinstance(value.definition, TileOp):
+        value = value.definition.arg
+    assert isinstance(value.type, AddrMemTensorType)
+    return value.type
+
+
+def _tma_coordinates(
+    desc_type: TmaDescType,
+    index_names: list[str],
+    prefix: str,
+) -> tuple[list[str], list[str]]:
+    layout = desc_type.physical_layout
+    if layout is None:
+        return [], [
+            f"${{b32:operand.{name}.val}}"
+            for name in reversed(index_names)
+        ]
+
+    assert desc_type.gmem_type.rank == 2
+    assert len(index_names) == 2
+    row = f"${{b32:operand.{index_names[0]}.val}}"
+    col = f"${{b32:operand.{index_names[1]}.val}}"
+    block = f"${{b32:{prefix}_block}}"
+    inner = f"${{b32:{prefix}_inner}}"
+    lines = [
+        f"div.u32 {block}, {col}, {layout.block_width};",
+        f"rem.u32 {inner}, {col}, {layout.block_width};",
+    ]
+    if layout.order == "row_major":
+        coordinates = [inner, block, row]
+    else:
+        coordinates = [inner, row, block]
+    return lines, coordinates
+
+
 def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_type = op.dst.type
     src_type = op.src.type
+    layout = (
+        dst_type.physical_layout
+        if isinstance(dst_type, SmemTensorType) else None
+    )
     if not (
         isinstance(dst_type, SmemTensorType)
         and isinstance(src_type, WrmemTensorType)
@@ -1492,14 +1560,31 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         and dst_type.dtype == src_type.dtype
         and dst_type.rank == 2
         and dst_type.strides[-1] == 1
-        and dst_type.swizzle == "128B"
+        and layout is not None
+        and layout.swizzle == "128B"
+        and layout.block_width == 64
+        and layout.order == "block_major"
+    ):
+        return None
+
+    root_type = _root_addrmem_type(op.dst)
+    if (
+        not isinstance(root_type, SmemTensorType)
+        or root_type.rank != 2
+        or not root_type.is_canonical_strides
+        or root_type.sizes[0] % 64
     ):
         return None
 
     m_dim, n_dim = src_type.sizes
     col_start = int(op.attrs.get("wgmma_col_start", 0))
     dst_m, dst_n = dst_type.sizes
-    if dst_m != m_dim or col_start < 0 or col_start + dst_n > n_dim:
+    if (
+        dst_m != m_dim
+        or col_start < 0
+        or col_start % 16
+        or col_start + dst_n > n_dim
+    ):
         return None
     if (
         m_dim % 64
