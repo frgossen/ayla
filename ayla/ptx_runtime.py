@@ -333,13 +333,21 @@ class PtxLauncher:
             if isinstance(typ, GmemTensorType):
                 params.append(tensors[self._arg_to_tensor[i]])
             elif isinstance(typ, TmaDescType):
-                layout = typ.physical_layout
+                layout = typ.attrs.get("physical_layout")
+                assert layout is None or isinstance(layout, dict)
+                block_width = 0 if layout is None else layout["block_width"]
+                block_order = (
+                    "row_major" if layout is None
+                    else layout.get("order", "row_major")
+                )
+                assert isinstance(block_width, int)
+                assert isinstance(block_order, str)
                 params.append((
                     tensors[self._arg_to_tensor[typ.arg_idx]],
                     list(typ.tile_sizes),
                     typ.swizzle or "",
-                    layout.block_width if layout is not None else 0,
-                    layout.order if layout is not None else "row_major",
+                    block_width,
+                    block_order,
                 ))
         return params
 

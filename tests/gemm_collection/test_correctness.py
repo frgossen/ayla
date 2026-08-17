@@ -8,7 +8,7 @@ from torch.ops import ayla
 from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store_k3 import (
     auto_matmul_4096_wgmma256_wg_tma_store_k3_module,
 )
-from ayla.gpu_dialect import PhysicalLayout, TmaDescType
+from ayla.gpu_dialect import TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
 
 
@@ -37,9 +37,11 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
         typ for typ in kernel.signature
         if isinstance(typ, TmaDescType) and typ.arg_idx == 2
     )
-    assert output_desc.physical_layout == PhysicalLayout(
-        swizzle="128B", block_width=64, order="block_major",
-    )
+    assert output_desc.swizzle == "128B"
+    assert output_desc.attrs["physical_layout"] == {
+        "block_width": 64,
+        "order": "block_major",
+    }
     assert ".shared .align 1024 .b8" in kernel.ptx
     assert len(stores) == len(waits) == 2
     assert len(gathers) == 32

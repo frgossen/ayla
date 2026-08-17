@@ -88,7 +88,7 @@ class LowerToPtxTemplate(LoweringPass):
         dtype_bytes = root_type.dtype.byte_size
         result_sizes = list(op.result().type.sizes)
         physical_layout = (
-            root_type.physical_layout
+            _physical_layout(root_type)
             if isinstance(root_type, SmemTensorType) else None
         )
 
@@ -113,13 +113,15 @@ class LowerToPtxTemplate(LoweringPass):
             stride = root_type.strides[dim]
             if (
                 physical_layout is not None
-                and physical_layout.order == "block_major"
+                and physical_layout.get("order", "row_major") == "block_major"
             ):
+                block_width = physical_layout["block_width"]
+                assert isinstance(block_width, int)
                 assert root_type.rank == 2
                 if dim == 0:
-                    stride = physical_layout.block_width
+                    stride = block_width
                 elif dim == 1:
-                    assert result_sizes[1] % physical_layout.block_width == 0
+                    assert result_sizes[1] % block_width == 0
                     stride = root_type.sizes[0]
 
             stride_bytes = stride * dtype_bytes
@@ -246,7 +248,7 @@ class LowerToPtxTemplate(LoweringPass):
         alignment = (
             1024
             if smem_type.swizzle is not None
-            and smem_type.physical_layout is not None
+            and _physical_layout(smem_type) is not None
             else 128
         )
         template = textwrap.dedent(f"""\
@@ -1111,8 +1113,10 @@ class LowerToPtxTemplate(LoweringPass):
         src_type = op.src.type
         assert isinstance(dst_type, SmemTensorType)
         assert isinstance(src_type, WrmemTensorType)
-        layout = dst_type.physical_layout
+        layout = _physical_layout(dst_type)
         assert layout is not None
+        block_width = layout["block_width"]
+        assert isinstance(block_width, int)
         assert dst_type.dtype.byte_size == 2
         col_start = int(op.attrs.get("wgmma_col_start", 0))
         n_dim = src_type.sizes[1]
@@ -1141,9 +1145,9 @@ class LowerToPtxTemplate(LoweringPass):
             assert next_di == di and next_dj == dj + 16
             relative_col = dj - col_start
             assert relative_col >= 0 and relative_col % 32 == 0
-            block, inner = divmod(relative_col, layout.block_width)
+            block, inner = divmod(relative_col, block_width)
             base_offset = (
-                (block * root_sizes[0] + di) * layout.block_width + inner
+                (block * root_sizes[0] + di) * block_width + inner
             )
             groups.extend([
                 ([first0, first0 + 2, first1, first1 + 2], base_offset * 2),
@@ -1516,12 +1520,26 @@ def _root_addrmem_type(value: Value) -> AddrMemTensorType:
     return value.type
 
 
+def _physical_layout(
+    tensor_type: SmemTensorType | TmaDescType,
+) -> dict[str, object] | None:
+    layout = tensor_type.attrs.get("physical_layout")
+    if layout is None:
+        return None
+    assert isinstance(layout, dict)
+    block_width = layout.get("block_width")
+    order = layout.get("order", "row_major")
+    assert isinstance(block_width, int) and block_width > 0
+    assert order in ("row_major", "block_major")
+    return layout
+
+
 def _tma_coordinates(
     desc_type: TmaDescType,
     index_names: list[str],
     prefix: str,
 ) -> tuple[list[str], list[str]]:
-    layout = desc_type.physical_layout
+    layout = _physical_layout(desc_type)
     if layout is None:
         return [], [
             f"${{b32:operand.{name}.val}}"
@@ -1534,11 +1552,13 @@ def _tma_coordinates(
     col = f"${{b32:operand.{index_names[1]}.val}}"
     block = f"${{b32:{prefix}_block}}"
     inner = f"${{b32:{prefix}_inner}}"
+    block_width = layout["block_width"]
+    assert isinstance(block_width, int)
     lines = [
-        f"div.u32 {block}, {col}, {layout.block_width};",
-        f"rem.u32 {inner}, {col}, {layout.block_width};",
+        f"div.u32 {block}, {col}, {block_width};",
+        f"rem.u32 {inner}, {col}, {block_width};",
     ]
-    if layout.order == "row_major":
+    if layout.get("order", "row_major") == "row_major":
         coordinates = [inner, block, row]
     else:
         coordinates = [inner, row, block]
@@ -1549,7 +1569,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_type = op.dst.type
     src_type = op.src.type
     layout = (
-        dst_type.physical_layout
+        _physical_layout(dst_type)
         if isinstance(dst_type, SmemTensorType) else None
     )
     if not (
@@ -1561,9 +1581,9 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         and dst_type.rank == 2
         and dst_type.strides[-1] == 1
         and layout is not None
-        and layout.swizzle == "128B"
-        and layout.block_width == 64
-        and layout.order == "block_major"
+        and dst_type.swizzle == "128B"
+        and layout.get("block_width") == 64
+        and layout.get("order", "row_major") == "block_major"
     ):
         return None
 

@@ -4,51 +4,12 @@ from __future__ import annotations
 import enum
 import math
 import string
-from dataclasses import dataclass
 
 from .base.ir import Block, Dialect, Op, Region, Type, Value
 from .base.printer import Printer
 
 gpu_dialect = Dialect("gpu")
 
-
-@dataclass(frozen=True)
-class PhysicalLayout:
-    """Blocked physical layout for a logical rank-2 tensor.
-
-    ``col = block * B + inner`` and storage is ordered as::
-
-        row_major:   [row][block][inner]
-        block_major: [block][row][inner]
-
-    There is no padding; tensor sizes and strides remain logical.
-    """
-
-    swizzle: str | None
-    block_width: int
-    order: str = "row_major"
-
-    @classmethod
-    def from_attrs(
-        cls, attrs: dict[str, object],
-    ) -> "PhysicalLayout | None":
-        swizzle = attrs.get("swizzle")
-        raw = attrs.get("physical_layout")
-        if raw is None:
-            return None
-        assert swizzle is None or isinstance(swizzle, str)
-        assert isinstance(raw, dict)
-        block_width = raw["block_width"]
-        order = raw.get("order", "row_major")
-        assert isinstance(block_width, int)
-        assert isinstance(order, str)
-        assert block_width > 0
-        assert order in ("row_major", "block_major")
-        return cls(
-            swizzle=swizzle,
-            block_width=block_width,
-            order=order,
-        )
 
 # TODO: Rename types : gmem_tensor --> gmem etc.
 
@@ -941,10 +902,6 @@ class SmemTensorType(AddrMemTensorType):
     def swizzle(self) -> str | None:
         return self.attrs["swizzle"]
 
-    @property
-    def physical_layout(self) -> PhysicalLayout | None:
-        return PhysicalLayout.from_attrs(self.attrs)
-
     def print(self, p: Printer) -> None:
         p.write(self.name)
         p.write("<")
@@ -1112,10 +1069,6 @@ class TmaDescType(Type):
     @property
     def tile_num_elements(self) -> int:
         return math.prod(self.tile_sizes)
-
-    @property
-    def physical_layout(self) -> PhysicalLayout | None:
-        return PhysicalLayout.from_attrs(self.attrs)
 
     @property
     def swizzle(self) -> str | None:
