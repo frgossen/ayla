@@ -95,22 +95,34 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
     kernel = make_ptx_kernel(
         best_auto_matmul_4096_wgmma256_wg_tma_store_module()
     )
-    assert kernel.name.endswith("_k3_4tiles_split2_dbuf2")
+    assert kernel.name.endswith("_k3_4tiles_full_output_store")
     assert kernel.grid_dim == (8, 16, 1)
     assert kernel.block_dim == (256, 1, 1)
-    assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 8
-    assert kernel.ptx.count("cp.async.bulk.wait_group") == 8
+    assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 4
+    assert kernel.ptx.count("cp.async.bulk.wait_group") == 4
     assert kernel.ptx.count("stmatrix.") == 64
     # The lane/warp-to-shared-memory offset is invariant across all eight
     # STMatrix groups and should be calculated once, then added to each arena.
-    assert kernel.ptx.count("%laneid") == 1
+    # One STMatrix lane mapping plus 35 direct lane-0 guards.
+    assert kernel.ptx.count("%laneid") == 36
     assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
     assert kernel.ptx.count("bytes.L2::cache_hint") == 28
-    assert kernel.ptx.count("bulk_group.L2::cache_hint") == 8
-    assert kernel.ptx.count("elect.sync") == 28
+    assert kernel.ptx.count("bulk_group.L2::cache_hint") == 4
+    assert kernel.ptx.count("elect.sync") == 0
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+    assert input_descs[0].l2_promotion == "256B"
+    assert input_descs[1].l2_promotion is None
+    startup_loads = [
+        kernel.ptx.index(f"mm_lhs_smem_iter{stage}_async_iter0")
+        for stage in range(3)
+    ]
+    assert startup_loads[0] < startup_loads[2] < startup_loads[1]
     # Every completed output-arena store that is later reused must cross a
-    # full CTA barrier before the next cooperative STMatrix refill.  The first
-    # six waits have a later refill; the final two stores are never reused.
+    # full CTA barrier before the next cooperative STMatrix refill. The first
+    # three waits have a later refill; the final store is never reused.
     lines = kernel.ptx.splitlines()
     waits = [i for i, line in enumerate(lines)
              if "cp.async.bulk.wait_group" in line]
@@ -137,11 +149,10 @@ def test_regrouped_stmatrix_rows_use_dense_block_major_swizzled_output():
         "order": "block_major", "outer_size": 128,
     }
     assert kernel.ptx.count("stmatrix.") == 64
-    # The lane swizzle is computed once and the four 32-column bases are
-    # derived statically; regrouping does not add stores or synchronization.
+    # The lane swizzle is computed once and all eight 32-column bases are
+    # derived statically; regrouping does not add stores.
     assert kernel.ptx.count(", 896;") == 1
-    assert kernel.ptx.count(", 16384;") == 8
-    assert kernel.ptx.count("bar.sync") == 40
+    assert kernel.ptx.count("bar.sync") == 33
 
 
 def test_four_output_tiles_support_n_major_cta_raster():
@@ -386,6 +397,7 @@ def test_m192_split2_uses_three_warpgroups_and_partial_m_tile():
             "auto_matmul_4096_wgmma256_wg_tma_store_k2_n384_split3",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_m192_split2",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_promote_256b",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_raster_n",

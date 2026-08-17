@@ -228,13 +228,14 @@ def test_codegen_tma_load():
     assert "cp.async.bulk.tensor.2d" in kernel.ptx
     assert "mbarrier.try_wait.parity" in kernel.ptx
     assert "0x989680" not in kernel.ptx
-    # An explicit lane-0 election tells ptxas that the TMA issuer is a
-    # singleton, avoiding a serialization loop around UTMALDG in SASS.
-    assert "elect.sync _|" in kernel.ptx
+    # Select lane 0 directly so PTXAS keeps the TMA issuer and its address
+    # calculations on the uniform path without an ELECT serialization loop.
+    assert "elect.sync" not in kernel.ptx
     assert re.search(
-        r"setp\.ne\.s32 (%p\d+), %r\d+, 0;\s+"
+        r"setp\.ge\.u32 (%p\d+), %r\d+, 32;\s+"
         r"@\1 bra (\$L\d+);\s+"
-        r"elect\.sync _\|%p\d+, 1;\s+"
-        r"@!%p\d+ bra \2;",
+        r"mov\.u32 %r\d+, %laneid;\s+"
+        r"setp\.ne\.u32 \1, %r\d+, 0;\s+"
+        r"@\1 bra \2;",
         kernel.ptx,
     )

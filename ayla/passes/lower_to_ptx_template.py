@@ -220,26 +220,39 @@ class LowerToPtxTemplate(LoweringPass):
         return [lowered], list(lowered.results)
 
     def _thread_zero_guard(self, prefix: str, done: str) -> list[str]:
-        """Branch nonzero threads away, omitting statically singleton axes."""
-        axes = [
-            axis for axis, extent in zip("xyz", self.block_dim)
+        """Branch all but lane 0 of warp 0 away.
+
+        Reading ``%laneid`` directly preserves PTXAS's warp-uniform analysis
+        better than proving lane 0 from ``%tid.x == 0``.  The explicit warp-0
+        check retains thread-0 semantics for block-collective TMA and mbarrier
+        operations.
+        """
+        active_axes = [
+            (axis, extent) for axis, extent in zip("xyz", self.block_dim)
             if extent != 1
         ]
-        if not axes:
+        if not active_axes:
             return []
-        accumulator = f"{prefix}_tid"
-        lines = [f"mov.u32 ${{b32:{accumulator}}}, %tid.{axes[0]};"]
-        for axis in axes[1:]:
+        predicate = f"{prefix}_not_t0"
+        lines = []
+        for axis, extent in active_axes:
+            # Lane 0 handles x within the first warp.  Explicitly exclude
+            # later x warps and all nonzero higher-dimensional coordinates.
+            if axis == "x" and extent is not None and extent <= 32:
+                continue
             component = f"{prefix}_tid_{axis}"
+            comparison = "ge.u32" if axis == "x" else "ne.u32"
+            limit = 32 if axis == "x" else 0
             lines.extend([
                 f"mov.u32 ${{b32:{component}}}, %tid.{axis};",
-                f"or.b32 ${{b32:{accumulator}}}, "
-                f"${{b32:{accumulator}}}, ${{b32:{component}}};",
+                f"setp.{comparison} ${{pred:{predicate}}}, "
+                f"${{b32:{component}}}, {limit};",
+                f"@${{pred:{predicate}}} bra ${{label:{done}}};",
             ])
-        predicate = f"{prefix}_not_t0"
         lines.extend([
-            f"setp.ne.s32 ${{pred:{predicate}}}, "
-            f"${{b32:{accumulator}}}, 0;",
+            f"mov.u32 ${{b32:{prefix}_lane}}, %laneid;",
+            f"setp.ne.u32 ${{pred:{predicate}}}, "
+            f"${{b32:{prefix}_lane}}, 0;",
             f"@${{pred:{predicate}}} bra ${{label:{done}}};",
         ])
         return lines
@@ -1758,13 +1771,6 @@ class LowerToPtxTemplate(LoweringPass):
         # handled by insert_syncs, which emits a barrier before this async.
         lines = [
             *self._thread_zero_guard("load", "after_load"),
-            # The branch above leaves exactly lane 0 active.  Stating that fact
-            # with elect.sync prevents ptxas from wrapping every UTMALDG in an
-            # ELECT/BRA.U.ANY serialization loop.  A lane-0-only member mask
-            # preserves the old thread-0 semantics even if an index is not
-            # warp-uniform; all other lanes have already branched away.
-            "elect.sync _|${pred:load_elected}, 1;",
-            "@!${pred:load_elected} bra ${label:after_load};",
             *load_lines,
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
             f"[${{b32:operand.lock.val}}], {total_bytes};",
