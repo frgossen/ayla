@@ -17,7 +17,7 @@ from functools import cache
 import torch
 from torch.utils.cpp_extension import load_inline
 
-from .gpu_dialect import GmemTensorType, TmaDescType
+from .gpu_dialect import GmemTensorType, TmaDescType, physical_layout
 from .ptx_codegen import PtxKernel
 
 
@@ -333,15 +333,10 @@ class PtxLauncher:
             if isinstance(typ, GmemTensorType):
                 params.append(tensors[self._arg_to_tensor[i]])
             elif isinstance(typ, TmaDescType):
-                layout = typ.attrs.get("physical_layout")
-                assert layout is None or isinstance(layout, dict)
-                block_width = 0 if layout is None else layout["block_width"]
-                block_order = (
-                    "row_major" if layout is None
-                    else layout.get("order", "row_major")
+                layout = physical_layout(typ)
+                block_width, block_order = (
+                    (0, "row_major") if layout is None else layout
                 )
-                assert isinstance(block_width, int)
-                assert isinstance(block_order, str)
                 params.append((
                     tensors[self._arg_to_tensor[typ.arg_idx]],
                     list(typ.tile_sizes),
@@ -358,7 +353,7 @@ class PtxLauncher:
                 assert p.is_cuda, f"param {i}: expected CUDA tensor, got {p.device}"
             elif isinstance(p, tuple):
                 assert len(p) == 5, f"param {i}: expected 5-tuple, got {len(p)}"
-                t, tile, swz, _, _ = p
+                t, tile, swz, block_width, block_order = p
                 assert isinstance(t, torch.Tensor) and t.is_cuda, (
                     f"param {i}: first element must be a CUDA tensor"
                 )
@@ -366,6 +361,12 @@ class PtxLauncher:
                     f"param {i}: second element must be list[int]"
                 )
                 assert isinstance(swz, str), f"param {i}: third element must be str"
+                assert isinstance(block_width, int) and block_width >= 0, (
+                    f"param {i}: fourth element must be a nonnegative int"
+                )
+                assert block_order in ("row_major", "block_major"), (
+                    f"param {i}: fifth element must be a supported block order"
+                )
             else:
                 raise TypeError(f"param {i}: expected Tensor or tuple, got {type(p)}")
 

@@ -44,6 +44,8 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WrmemTensorType,
+    physical_layout,
+    root_buffer,
 )
 from ..base.ir import Op, Value
 from ..base.lowering_pass import LoweringPass
@@ -83,12 +85,12 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_tile: unexpected arg type {type(arg)}"
             )
 
-        root_type = _root_addrmem_type(op.arg)
+        root_type = root_buffer(op.arg).type
         assert isinstance(root_type, AddrMemTensorType)
         dtype_bytes = root_type.dtype.byte_size
         result_sizes = list(op.result().type.sizes)
-        physical_layout = (
-            _physical_layout(root_type)
+        layout = (
+            physical_layout(root_type)
             if isinstance(root_type, SmemTensorType) else None
         )
 
@@ -112,11 +114,10 @@ class LowerToPtxTemplate(LoweringPass):
 
             stride = root_type.strides[dim]
             if (
-                physical_layout is not None
-                and physical_layout.get("order", "row_major") == "block_major"
+                layout is not None
+                and layout[1] == "block_major"
             ):
-                block_width = physical_layout["block_width"]
-                assert isinstance(block_width, int)
+                block_width, _ = layout
                 assert root_type.rank == 2
                 if dim == 0:
                     stride = block_width
@@ -248,7 +249,7 @@ class LowerToPtxTemplate(LoweringPass):
         alignment = (
             1024
             if smem_type.swizzle is not None
-            and _physical_layout(smem_type) is not None
+            and physical_layout(smem_type) is not None
             else 128
         )
         template = textwrap.dedent(f"""\
@@ -1113,14 +1114,11 @@ class LowerToPtxTemplate(LoweringPass):
         src_type = op.src.type
         assert isinstance(dst_type, SmemTensorType)
         assert isinstance(src_type, WrmemTensorType)
-        layout = _physical_layout(dst_type)
-        assert layout is not None
-        block_width = layout["block_width"]
-        assert isinstance(block_width, int)
-        assert dst_type.dtype.byte_size == 2
+        block_width = 64
         col_start = int(op.attrs.get("wgmma_col_start", 0))
         n_dim = src_type.sizes[1]
-        root_type = _root_addrmem_type(op.dst)
+        root_type = root_buffer(op.dst).type
+        assert isinstance(root_type, SmemTensorType)
         root_sizes = root_type.sizes
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:st_lane}}, %laneid;
@@ -1513,33 +1511,12 @@ def _get_wgmma_layout_0_static_offsets(reg: int, n_dim: int = 128) -> tuple[int,
     return (m * 64 + di, w * 16 + dj)
 
 
-def _root_addrmem_type(value: Value) -> AddrMemTensorType:
-    while isinstance(value.definition, TileOp):
-        value = value.definition.arg
-    assert isinstance(value.type, AddrMemTensorType)
-    return value.type
-
-
-def _physical_layout(
-    tensor_type: SmemTensorType | TmaDescType,
-) -> dict[str, object] | None:
-    layout = tensor_type.attrs.get("physical_layout")
-    if layout is None:
-        return None
-    assert isinstance(layout, dict)
-    block_width = layout.get("block_width")
-    order = layout.get("order", "row_major")
-    assert isinstance(block_width, int) and block_width > 0
-    assert order in ("row_major", "block_major")
-    return layout
-
-
 def _tma_coordinates(
     desc_type: TmaDescType,
     index_names: list[str],
     prefix: str,
 ) -> tuple[list[str], list[str]]:
-    layout = _physical_layout(desc_type)
+    layout = physical_layout(desc_type)
     if layout is None:
         return [], [
             f"${{b32:operand.{name}.val}}"
@@ -1552,13 +1529,12 @@ def _tma_coordinates(
     col = f"${{b32:operand.{index_names[1]}.val}}"
     block = f"${{b32:{prefix}_block}}"
     inner = f"${{b32:{prefix}_inner}}"
-    block_width = layout["block_width"]
-    assert isinstance(block_width, int)
+    block_width, order = layout
     lines = [
         f"div.u32 {block}, {col}, {block_width};",
         f"rem.u32 {inner}, {col}, {block_width};",
     ]
-    if layout.get("order", "row_major") == "row_major":
+    if order == "row_major":
         coordinates = [inner, block, row]
     else:
         coordinates = [inner, row, block]
@@ -1569,7 +1545,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_type = op.dst.type
     src_type = op.src.type
     layout = (
-        _physical_layout(dst_type)
+        physical_layout(dst_type)
         if isinstance(dst_type, SmemTensorType) else None
     )
     if not (
@@ -1580,14 +1556,12 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         and dst_type.dtype == src_type.dtype
         and dst_type.rank == 2
         and dst_type.strides[-1] == 1
-        and layout is not None
         and dst_type.swizzle == "128B"
-        and layout.get("block_width") == 64
-        and layout.get("order", "row_major") == "block_major"
+        and layout == (64, "block_major")
     ):
         return None
 
-    root_type = _root_addrmem_type(op.dst)
+    root_type = root_buffer(op.dst).type
     if (
         not isinstance(root_type, SmemTensorType)
         or root_type.rank != 2
