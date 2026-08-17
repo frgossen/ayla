@@ -373,6 +373,15 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
             sep = "," if i < len(param_lines) - 1 else ""
             p.write_line(f"{line}{sep}")
     p.write_line(")")
+    if op.attrs.get("emit_reqntid", False):
+        block_dim = list(op.block_dim)
+        if op.num_warp_groups is not None and op.num_warp_groups > 0:
+            block_dim[0] = op.num_warp_groups * 128
+        if any(d is None for d in block_dim):
+            raise ValueError(
+                "emit_reqntid requires a fully static kernel block dimension"
+            )
+        p.write_line(f".reqntid {block_dim[0]}, {block_dim[1]}, {block_dim[2]}")
     p.write_line("{")
     with p.indented():
         decl_mark = p.mark()

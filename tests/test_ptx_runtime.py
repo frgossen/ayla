@@ -11,7 +11,7 @@ import torch
 
 from ayla.gpu_dialect import F32Type, GmemTensorType
 from ayla.ptx_codegen import PtxKernel
-from ayla.ptx_runtime import make_ptx_launcher
+from ayla.ptx_runtime import PtxJitOptions, make_ptx_launcher
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="no CUDA"
@@ -83,3 +83,32 @@ def test_cwise_add():
 
     torch.cuda.synchronize()
     assert torch.allclose(c, a + b)
+
+    configured = make_ptx_launcher(
+        kernel,
+        jit_options=PtxJitOptions(
+            optimization_level=4,
+            threads_per_block=block,
+            cache_mode="ca",
+            generate_line_info=False,
+        ),
+    )
+    configured(a, b, c)
+    torch.cuda.synchronize()
+    assert torch.allclose(c, a + b)
+    assert configured.function_attributes["num_regs"] > 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"optimization_level": -1},
+        {"optimization_level": 5},
+        {"max_registers": 0},
+        {"threads_per_block": 0},
+        {"cache_mode": "invalid"},
+    ],
+)
+def test_invalid_jit_options(kwargs):
+    with pytest.raises(ValueError):
+        PtxJitOptions(**kwargs)

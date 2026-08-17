@@ -103,12 +103,14 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
     assert kernel.ptx.count("stmatrix.") == 64
     # The lane/warp-to-shared-memory offset is invariant across all eight
     # STMatrix groups and should be calculated once, then added to each arena.
-    # One STMatrix lane mapping plus 35 direct lane-0 guards.
-    assert kernel.ptx.count("%laneid") == 36
+    # Every lane consumer shares one kernel-scoped special-register read.
+    assert kernel.ptx.count("%laneid") == 1
     assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
     assert kernel.ptx.count("bytes.L2::cache_hint") == 28
     assert kernel.ptx.count("bulk_group.L2::cache_hint") == 4
     assert kernel.ptx.count("elect.sync") == 0
+    assert kernel.ptx.count(".reqntid 256, 1, 1") == 1
+    assert "shfl.sync.idx" not in kernel.ptx
     input_descs = {
         typ.arg_idx: typ for typ in kernel.signature
         if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
@@ -132,6 +134,57 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
         if next_gather is not None:
             assert any(line.strip() == "bar.sync 0;"
                        for line in lines[wait:next_gather])
+
+
+def test_lhs_descriptor_precompute_is_an_opt_in_ptx_variant():
+    baseline = make_ptx_kernel(
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module(
+            precompute_wgmma_lhs_descriptors=False,
+        )
+    ).ptx
+    precomputed = make_ptx_kernel(
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module(
+            precompute_wgmma_lhs_descriptors=True,
+        )
+    ).ptx
+
+    def additions_around_first_mma(ptx: str) -> tuple[int, int]:
+        first_fence = ptx.index("wgmma.fence.sync.aligned")
+        first_mma = ptx.index("wgmma.mma_async", first_fence)
+        second_mma = ptx.index("wgmma.mma_async", first_mma + 1)
+        return (
+            ptx[first_fence:first_mma].count("add.u64"),
+            ptx[first_mma:second_mma].count("add.u64"),
+        )
+
+    assert additions_around_first_mma(baseline) == (0, 2)
+    assert additions_around_first_mma(precomputed) == (3, 1)
+
+
+def test_rhs_descriptor_precompute_is_an_opt_in_ptx_variant():
+    precomputed = make_ptx_kernel(
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module(
+            precompute_wgmma_lhs_descriptors=False,
+            precompute_wgmma_rhs_descriptors=True,
+        )
+    ).ptx
+    first_fence = precomputed.index("wgmma.fence.sync.aligned")
+    first_mma = precomputed.index("wgmma.mma_async", first_fence)
+    second_mma = precomputed.index("wgmma.mma_async", first_mma + 1)
+    assert precomputed[first_fence:first_mma].count("add.u64") == 3
+    assert precomputed[first_mma:second_mma].count("add.u64") == 1
+
+    both = make_ptx_kernel(
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module(
+            precompute_wgmma_lhs_descriptors=True,
+            precompute_wgmma_rhs_descriptors=True,
+        )
+    ).ptx
+    first_fence = both.index("wgmma.fence.sync.aligned")
+    first_mma = both.index("wgmma.mma_async", first_fence)
+    second_mma = both.index("wgmma.mma_async", first_mma + 1)
+    assert both[first_fence:first_mma].count("add.u64") == 6
+    assert both[first_mma:second_mma].count("add.u64") == 0
 
 
 def test_regrouped_stmatrix_rows_use_dense_block_major_swizzled_output():

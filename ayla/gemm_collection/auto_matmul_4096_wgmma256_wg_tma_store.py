@@ -4,7 +4,7 @@ import textwrap
 
 from ..base.ir import find_ops
 from ..gpu_dialect import gpu_dialect
-from ..gpu_dialect import AsyncOp, KernelOp, MoveOp, TileOp
+from ..gpu_dialect import AsyncOp, KernelOp, MoveOp, TileOp, WarpGroupIdOp
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
@@ -15,12 +15,13 @@ from ..passes.schedule_async import schedule_async
 from ..passes.tile_matmul import tile_matmul
 from ..passes.unroll_loop import unroll_loop
 from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
+from ..ptx_runtime import PtxJitOptions, make_ptx_launcher
 from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 
 def auto_matmul_4096_wgmma256_wg_tma_store_module(
-    *, output_tiles_per_cta: int = 1,
+    *, problem_size: int = 4096,
+    output_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -39,6 +40,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     k_tail_cache_hints: dict[str, str | None] | None = None,
     reuse_k_tail_mbarrier: bool = False,
     startup_tma_stage_order: tuple[int, ...] | None = None,
+    precompute_wgmma_lhs_descriptors: bool = False,
+    precompute_wgmma_rhs_descriptors: bool = False,
+    direct_warp_group_id: bool = False,
+    emit_reqntid: bool = False,
     # Split each 256-column output row into two 128-element TMA dimensions.
     # Shared-only padding controls the physical row stride seen by the TMA
     # store; the best overall stride may trade some STMatrix bank expansion
@@ -53,6 +58,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
 ):
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
+    if problem_size <= 0:
+        raise ValueError("problem_size must be positive")
     if output_tile_group is None:
         output_tile_group = (output_tiles_per_cta, 1)
     if (len(output_tile_group) != 2
@@ -106,9 +113,14 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         if any(h not in (None, "evict_first", "evict_last")
                for h in k_tail_cache_hints.values()):
             raise ValueError("unsupported K-tail cache hint")
-    if reuse_k_tail_mbarrier and (operand_stages != 3 or operand_k_tile != 64):
+    if reuse_k_tail_mbarrier and (
+        operand_stages != 3
+        or operand_k_tile != 64
+        or (problem_size // operand_k_tile) % operand_stages != 1
+    ):
         raise ValueError(
-            "K-tail barrier reuse currently requires three K=64 stages"
+            "K-tail barrier reuse currently requires three K=64 stages and "
+            "exactly one static tail stage"
         )
     if (
         startup_tma_stage_order is not None
@@ -128,7 +140,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             raise ValueError("STMatrix regrouping requires STMatrix output")
         output_tma_inner_size = 64
         output_tma_inner_padding = 0
-    name = f"auto_matmul_4096_wgmma256_wg_tma_store_k{operand_stages}"
+    name = f"auto_matmul_{problem_size}_wgmma256_wg_tma_store_k{operand_stages}"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
     if operand_swizzle != "128B":
@@ -155,8 +167,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_raster_{cta_raster}"
     if variant_suffix is not None:
         name += f"_{variant_suffix}"
-    m_blocks = (4096 + output_m_tile - 1) // output_m_tile
-    n_blocks = (4096 + output_n_tile - 1) // output_n_tile
+    m_blocks = (problem_size + output_m_tile - 1) // output_m_tile
+    n_blocks = (problem_size + output_n_tile - 1) // output_n_tile
     group_m, group_n = output_tile_group
     grid_x = (m_blocks + group_m - 1) // group_m
     grid_y = (n_blocks + group_n - 1) // group_n
@@ -165,8 +177,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     )
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{launch_grid[0]}, {launch_grid[1]}, 1] block_dim=[128, 1, 1] {{
-            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) grid_dim=[{launch_grid[0]}, {launch_grid[1]}, 1] block_dim=[128, 1, 1] {{
+            matmul(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
     if output_tiles_per_cta == 1:
@@ -411,10 +423,31 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             for stage in startup_tma_stage_order
             for member in stage_pairs[stage]
         ]
+    if precompute_wgmma_lhs_descriptors:
+        for async_op in find_ops(module, lambda op: isinstance(op, AsyncOp)):
+            if async_op.lock.type.kind == "wgmma":
+                async_op.attrs["precompute_lhs_descriptors"] = True
+    if precompute_wgmma_rhs_descriptors:
+        for async_op in find_ops(module, lambda op: isinstance(op, AsyncOp)):
+            if async_op.lock.type.kind == "wgmma":
+                async_op.attrs["precompute_rhs_descriptors"] = True
+    if direct_warp_group_id:
+        for warp_group_id in find_ops(
+            module, lambda op: isinstance(op, WarpGroupIdOp),
+        ):
+            warp_group_id.attrs["direct_from_thread_x"] = True
+    if emit_reqntid:
+        [kernel] = find_ops(module, lambda op: isinstance(op, KernelOp))
+        kernel.attrs["emit_reqntid"] = True
     return module
 
 
-def best_auto_matmul_4096_wgmma256_wg_tma_store_module():
+def best_auto_matmul_4096_wgmma256_wg_tma_store_module(
+    *, precompute_wgmma_lhs_descriptors: bool = True,
+    precompute_wgmma_rhs_descriptors: bool = False,
+    direct_warp_group_id: bool = True,
+    emit_reqntid: bool = True,
+):
     """Build the currently retained best 4096x4096 BF16 GEMM.
 
     Keep the winning configuration here so runtime registration, standalone
@@ -429,6 +462,10 @@ def best_auto_matmul_4096_wgmma256_wg_tma_store_module():
         regroup_stmatrix_block_major=True,
         reuse_k_tail_mbarrier=True,
         startup_tma_stage_order=(0, 2, 1),
+        precompute_wgmma_lhs_descriptors=precompute_wgmma_lhs_descriptors,
+        precompute_wgmma_rhs_descriptors=precompute_wgmma_rhs_descriptors,
+        direct_warp_group_id=direct_warp_group_id,
+        emit_reqntid=emit_reqntid,
         variant_suffix="full_output_store",
         operand_move_attrs={
             "lhs": {
@@ -438,6 +475,12 @@ def best_auto_matmul_4096_wgmma256_wg_tma_store_module():
             "dst": {"l2_cache_hint": "evict_first"},
         },
     )
+
+
+# The CUDA Driver defaults to optimization level 4.  Paired H100 measurements
+# of this already-explicit PTX consistently favor level 1 by about 0.06-0.14%
+# without changing registers, local memory, or numerical output.
+BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=1)
 
 
 def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
@@ -499,7 +542,13 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
         )
         kernel = make_ptx_kernel(module)
         make_torch_custom_call(
-            make_ptx_launcher(kernel),
+            make_ptx_launcher(
+                kernel,
+                jit_options=(
+                    BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS
+                    if config is None else None
+                ),
+            ),
             [OperandKind.R, OperandKind.R, OperandKind.RESULT],
         )
 

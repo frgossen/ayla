@@ -228,14 +228,21 @@ def test_codegen_tma_load():
     assert "cp.async.bulk.tensor.2d" in kernel.ptx
     assert "mbarrier.try_wait.parity" in kernel.ptx
     assert "0x989680" not in kernel.ptx
-    # Select lane 0 directly so PTXAS keeps the TMA issuer and its address
-    # calculations on the uniform path without an ELECT serialization loop.
+    # Select lane 0 from one kernel-scoped lane-id read so PTXAS keeps the TMA
+    # issuer and its address calculations on the uniform path without ELECT.
     assert "elect.sync" not in kernel.ptx
+    assert kernel.ptx.count("%laneid") == 1
     assert re.search(
-        r"setp\.ge\.u32 (%p\d+), %r\d+, 32;\s+"
+        r"setp\.ge\.u32 (%p\d+), (%r\d+), 32;\s+"
         r"@\1 bra (\$L\d+);\s+"
-        r"mov\.u32 %r\d+, %laneid;\s+"
         r"setp\.ne\.u32 \1, %r\d+, 0;\s+"
-        r"@\1 bra \2;",
+        r"@\1 bra \3;",
+        kernel.ptx,
+    )
+    # The kernel-scoped thread-id SSA register feeds setp directly; there is
+    # no template-local mov copy immediately before the warp-0 check.
+    assert not re.search(
+        r"mov\.u32 (%r\d+), %r\d+;\s+"
+        r"setp\.ge\.u32 %p\d+, \1, 32;",
         kernel.ptx,
     )

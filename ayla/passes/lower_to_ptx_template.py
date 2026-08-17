@@ -121,6 +121,9 @@ class LowerToPtxTemplate(LoweringPass):
         self.lower_region(op.body)
         if op.attrs.get("batch_mbarrier_init", True):
             self._batch_mbarrier_initializations(op.body.entry_block)
+        # Insert lane first so the subsequently inserted thread-x read remains
+        # the first kernel-scoped special-register read in the final PTX.
+        self._share_lane_id(op)
         self._share_thread_x(op)
         return [op], []
 
@@ -197,14 +200,60 @@ class LowerToPtxTemplate(LoweringPass):
             )
         entry.ops.insert(0, read)
 
+    @staticmethod
+    def _share_lane_id(kernel: KernelOp) -> None:
+        """Represent repeated ``%laneid`` reads as one kernel-scoped value."""
+        templates = find_ops(kernel, lambda candidate: (
+            isinstance(candidate, PTXTemplateOp)
+            and "%laneid" in candidate.template
+        ))
+        if not templates:
+            return
+
+        entry = kernel.body.entry_block
+        read = PTXTemplateOp.build(
+            operands=[],
+            result_types=[IndexType()],
+            template="mov.u32 ${b32:result.lane_id.val}, %laneid;\n",
+            operand_names=[],
+            result_names=["lane_id"],
+            description="read %laneid once",
+            attrs={"pure": True, "inline": True},
+        )
+        lane_id = read.result()
+        for template_op in templates:
+            operand_index = len(template_op.operands)
+            template_op.operands.append(lane_id)
+            names = template_op.operand_names
+            if names is None:
+                operand = f"operand[{operand_index}]"
+            else:
+                name = "shared_lane_id"
+                assert name not in names
+                names.append(name)
+                operand = f"operand.{name}"
+            template_op.attrs["template"] = template_op.template.replace(
+                "%laneid", f"${{b32:{operand}.val}}",
+            )
+        entry.ops.insert(0, read)
+
     def lower_warp_group_id(
         self, op: WarpGroupIdOp,
     ) -> tuple[list[Op], list[object]]:
         """Lower through a template so its thread-id read participates in SSA."""
-        template = textwrap.dedent("""\
-            mov.u32 ${b32:result.x.val}, %tid.x;
-            shfl.sync.idx.b32 ${b32:result.x.val}, ${b32:result.x.val}, 0, 0x1f, 0xffffffff;
-            shr.u32 ${b32:result.x.val}, ${b32:result.x.val}, 7;
+        if op.attrs.get("direct_from_thread_x", False):
+            # With an exact x block dimension made from 128-thread
+            # warpgroups, floor(tid.x / 128) is already warp-uniform. Avoiding
+            # the lane-0 shuffle gives PTXAS a shorter prologue without
+            # changing the uniform descriptor path.
+            x_template = "shr.u32 ${b32:result.x.val}, %tid.x, 7;\n"
+        else:
+            x_template = textwrap.dedent("""\
+                mov.u32 ${b32:result.x.val}, %tid.x;
+                shfl.sync.idx.b32 ${b32:result.x.val}, ${b32:result.x.val}, 0, 0x1f, 0xffffffff;
+                shr.u32 ${b32:result.x.val}, ${b32:result.x.val}, 7;
+            """)
+        template = x_template + textwrap.dedent("""\
             mov.u32 ${b32:result.y.val}, 0;
             mov.u32 ${b32:result.z.val}, 0;
         """)
@@ -240,19 +289,27 @@ class LowerToPtxTemplate(LoweringPass):
             # later x warps and all nonzero higher-dimensional coordinates.
             if axis == "x" and extent is not None and extent <= 32:
                 continue
-            component = f"{prefix}_tid_{axis}"
             comparison = "ge.u32" if axis == "x" else "ne.u32"
             limit = 32 if axis == "x" else 0
+            if axis == "x":
+                # _share_thread_x replaces this special-register spelling with
+                # the kernel-scoped SSA read. Use it directly in setp instead
+                # of copying that SSA value into a template-local register.
+                component = "%tid.x"
+            else:
+                component_name = f"{prefix}_tid_{axis}"
+                component = f"${{b32:{component_name}}}"
+                lines.append(
+                    f"mov.u32 {component}, %tid.{axis};"
+                )
             lines.extend([
-                f"mov.u32 ${{b32:{component}}}, %tid.{axis};",
                 f"setp.{comparison} ${{pred:{predicate}}}, "
-                f"${{b32:{component}}}, {limit};",
+                f"{component}, {limit};",
                 f"@${{pred:{predicate}}} bra ${{label:{done}}};",
             ])
         lines.extend([
-            f"mov.u32 ${{b32:{prefix}_lane}}, %laneid;",
             f"setp.ne.u32 ${{pred:{predicate}}}, "
-            f"${{b32:{prefix}_lane}}, 0;",
+            "%laneid, 0;",
             f"@${{pred:{predicate}}} bra ${{label:{done}}};",
         ])
         return lines
@@ -725,11 +782,15 @@ class LowerToPtxTemplate(LoweringPass):
             operand_names.append(name)
             return name
 
-        # Emit derived descriptors next to their consumers.  When consecutive
-        # tiles advance monotonically from the first tile, update the two base
-        # descriptors in place instead of naming six one-use temporaries.
-        wgmma_template = ""
+        # Emit derived descriptors next to their consumers by default. An
+        # experimental modes precompute one or both descriptor streams. They
+        # give PTXAS materially shorter SASS forms, but remain opt-in while the
+        # small runtime effects are compared under cooled, rotated inputs.
         scale_template = ""
+        lhs_precompute_template = ""
+        rhs_precompute_template = ""
+        desc_templates: list[str] = []
+        mma_templates: list[str] = []
         lhs_tile_deltas = [
             0 if j == 0 else _tile_delta(mm.lhs, mms[0].lhs, j)
             for j, mm in enumerate(mms)
@@ -747,6 +808,14 @@ class LowerToPtxTemplate(LoweringPass):
 
         update_lhs_in_place = _can_update_in_place(lhs_tile_deltas)
         update_rhs_in_place = _can_update_in_place(rhs_tile_deltas)
+        precompute_lhs = (
+            bool(op.attrs.get("precompute_lhs_descriptors", False))
+            and update_lhs_in_place
+        )
+        precompute_rhs = (
+            bool(op.attrs.get("precompute_rhs_descriptors", False))
+            and update_rhs_in_place
+        )
         for j, mm in enumerate(mms):
             desc_template = ""
             mma_template = ""
@@ -809,7 +878,13 @@ class LowerToPtxTemplate(LoweringPass):
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
             desc_rhs = f"desc_rhs{j}"
-            if j > 0 and update_rhs_in_place:
+            if j > 0 and precompute_rhs:
+                assert rhs_delta is not None
+                rhs_precompute_template += (
+                    f"add.u64 ${{b64:{desc_rhs}}}, "
+                    f"${{b64:desc_rhs0}}, {rhs_delta // 16};\n"
+                )
+            elif j > 0 and update_rhs_in_place:
                 desc_rhs = "desc_rhs0"
                 assert rhs_delta is not None
                 previous_delta = rhs_tile_deltas[j - 1]
@@ -829,7 +904,13 @@ class LowerToPtxTemplate(LoweringPass):
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
                 desc_lhs = f"desc_lhs{j}_{m_it}"
-                if j > 0 and update_lhs_in_place:
+                if j > 0 and precompute_lhs:
+                    assert lhs_delta is not None
+                    lhs_precompute_template += (
+                        f"add.u64 ${{b64:{desc_lhs}}}, "
+                        f"${{b64:desc_lhs0_{m_it}}}, {lhs_delta // 16};\n"
+                    )
+                elif j > 0 and update_lhs_in_place:
                     desc_lhs = f"desc_lhs0_{m_it}"
                     assert lhs_delta is not None
                     previous_delta = lhs_tile_deltas[j - 1]
@@ -873,7 +954,29 @@ class LowerToPtxTemplate(LoweringPass):
                 """)
                 reg_offset += num_regs_per_wgmma
 
-            wgmma_template += desc_template + mma_template
+            desc_templates.append(desc_template)
+            mma_templates.append(mma_template)
+
+        if precompute_lhs or precompute_rhs:
+            wgmma_template = (
+                desc_templates[0]
+                + lhs_precompute_template
+                + rhs_precompute_template
+                + mma_templates[0]
+                + "".join(
+                    desc_template + mma_template
+                    for desc_template, mma_template in zip(
+                        desc_templates[1:], mma_templates[1:]
+                    )
+                )
+            )
+        else:
+            wgmma_template = "".join(
+                desc_template + mma_template
+                for desc_template, mma_template in zip(
+                    desc_templates, mma_templates
+                )
+            )
 
         # One commit group for the whole batch: single fence, all mma_async, one
         # commit. Hardware serializes same-accumulator mmas, so the await's lone
@@ -962,11 +1065,11 @@ class LowerToPtxTemplate(LoweringPass):
                 str(block_threads) if block_threads is not None
                 else "${b32:bl_ntid}"
             )
-            lines = ["mov.u32 ${b32:bl_tid}, %tid.x;"]
+            lines = []
             if block_threads is None:
                 lines.append("mov.u32 ${b32:bl_ntid}, %ntid.x;")
             lines.extend([
-                "setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;",
+                "setp.lt.u32 ${pred:bl_w0}, %tid.x, 32;",
                 f"@${{pred:bl_w0}} bar.sync {bar_id}, {count};",
                 f"@!${{pred:bl_w0}} bar.arrive {bar_id}, {count};",
             ])

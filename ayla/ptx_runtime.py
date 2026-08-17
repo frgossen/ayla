@@ -12,6 +12,7 @@ side-effects out.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import cache
 
 import torch
@@ -49,13 +50,61 @@ static void cu_check(CUresult res, const char* expr) {
 
 #define CU_CHECK(expr) cu_check((expr), #expr)
 
-static uintptr_t module_load_data(const std::string& ptx) {
+static uintptr_t module_load_data(
+    const std::string& ptx,
+    int optimization_level,
+    int max_registers,
+    int threads_per_block,
+    int cache_mode,
+    bool generate_line_info
+) {
     CUmodule mod = nullptr;
-    // Emit line info during JIT so Nsight Compute can correlate the
-    // generated PTX with the SASS in its source view.
-    CUjit_option options[] = {CU_JIT_GENERATE_LINE_INFO};
-    void* values[] = {reinterpret_cast<void*>(1)};
-    CU_CHECK(cuModuleLoadDataEx(&mod, ptx.c_str(), 1, options, values));
+    TORCH_CHECK(
+        optimization_level >= -1 && optimization_level <= 4,
+        "optimization_level must be unset (-1) or in [0, 4]"
+    );
+    TORCH_CHECK(max_registers == -1 || max_registers > 0,
+                "max_registers must be unset (-1) or positive");
+    TORCH_CHECK(threads_per_block == -1 || threads_per_block > 0,
+                "threads_per_block must be unset (-1) or positive");
+    TORCH_CHECK(cache_mode >= -1 && cache_mode <= 2,
+                "cache_mode must be unset (-1), none (0), cg (1), or ca (2)");
+
+    std::vector<CUjit_option> options;
+    std::vector<void*> values;
+    auto add_uint_option = [&](CUjit_option option, int value) {
+        options.push_back(option);
+        values.push_back(reinterpret_cast<void*>(static_cast<uintptr_t>(value)));
+    };
+    // Line info lets Nsight Compute correlate generated PTX with SASS.
+    if (generate_line_info)
+        add_uint_option(CU_JIT_GENERATE_LINE_INFO, 1);
+    if (optimization_level >= 0)
+        add_uint_option(CU_JIT_OPTIMIZATION_LEVEL, optimization_level);
+    if (max_registers > 0)
+        add_uint_option(CU_JIT_MAX_REGISTERS, max_registers);
+    if (threads_per_block > 0)
+        add_uint_option(CU_JIT_THREADS_PER_BLOCK, threads_per_block);
+    if (cache_mode >= 0)
+        add_uint_option(CU_JIT_CACHE_MODE, cache_mode);
+
+    std::vector<char> error_log(16384, '\0');
+    options.push_back(CU_JIT_ERROR_LOG_BUFFER);
+    values.push_back(error_log.data());
+    add_uint_option(CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, error_log.size());
+
+    CUresult load_result = cuModuleLoadDataEx(
+        &mod, ptx.c_str(), options.size(), options.data(), values.data()
+    );
+    if (load_result != CUDA_SUCCESS) {
+        const char* message = nullptr;
+        cuGetErrorString(load_result, &message);
+        throw std::runtime_error(
+            std::string("CUDA driver error (cuModuleLoadDataEx): ")
+            + (message ? message : "unknown")
+            + (error_log[0] ? std::string("\n") + error_log.data() : "")
+        );
+    }
     return reinterpret_cast<uintptr_t>(mod);
 }
 
@@ -71,6 +120,24 @@ static uintptr_t module_get_function(
     CUfunction fn = nullptr;
     CU_CHECK(cuModuleGetFunction(&fn, mod, name.c_str()));
     return reinterpret_cast<uintptr_t>(fn);
+}
+
+static py::dict function_attributes(uintptr_t function_handle) {
+    auto fn = reinterpret_cast<CUfunction>(function_handle);
+    py::dict attrs;
+    auto add = [&](const char* name, CUfunction_attribute attribute) {
+        int value = 0;
+        CU_CHECK(cuFuncGetAttribute(&value, attribute, fn));
+        attrs[name] = value;
+    };
+    add("num_regs", CU_FUNC_ATTRIBUTE_NUM_REGS);
+    add("local_size_bytes", CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES);
+    add("shared_size_bytes", CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES);
+    add("const_size_bytes", CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES);
+    add("max_threads_per_block", CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK);
+    add("binary_version", CU_FUNC_ATTRIBUTE_BINARY_VERSION);
+    add("ptx_version", CU_FUNC_ATTRIBUTE_PTX_VERSION);
+    return attrs;
 }
 
 static CUtensorMap tensor_map_encode_tiled(
@@ -270,9 +337,16 @@ static void launch_kernel(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("module_load_data", &module_load_data);
+    m.def("module_load_data", &module_load_data,
+          py::arg("ptx"),
+          py::arg("optimization_level") = -1,
+          py::arg("max_registers") = -1,
+          py::arg("threads_per_block") = -1,
+          py::arg("cache_mode") = -1,
+          py::arg("generate_line_info") = true);
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
+    m.def("function_attributes", &function_attributes);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -295,6 +369,34 @@ def _get_ext():
     )
 
 
+@dataclass(frozen=True)
+class PtxJitOptions:
+    """CUDA Driver PTX-JIT controls.
+
+    ``None`` leaves an option unspecified so the driver uses its default.
+    CUDA documents optimization levels 0 through 4, with 4 as the default.
+    """
+
+    optimization_level: int | None = None
+    max_registers: int | None = None
+    threads_per_block: int | None = None
+    cache_mode: str | None = None
+    generate_line_info: bool = True
+
+    def __post_init__(self) -> None:
+        if (
+            self.optimization_level is not None
+            and self.optimization_level not in range(5)
+        ):
+            raise ValueError("optimization_level must be in [0, 4]")
+        if self.max_registers is not None and self.max_registers <= 0:
+            raise ValueError("max_registers must be positive")
+        if self.threads_per_block is not None and self.threads_per_block <= 0:
+            raise ValueError("threads_per_block must be positive")
+        if self.cache_mode not in (None, "none", "cg", "ca"):
+            raise ValueError("cache_mode must be None, 'none', 'cg', or 'ca'")
+
+
 class PtxLauncher:
     """Opaque host-side function that launches a PTX kernel.
 
@@ -303,9 +405,15 @@ class PtxLauncher:
     the current torch CUDA stream.
     """
 
-    def __init__(self, kernel: PtxKernel):
+    def __init__(
+        self,
+        kernel: PtxKernel,
+        *,
+        jit_options: PtxJitOptions | None = None,
+    ):
         self._ext = _get_ext()
         self._kernel = kernel
+        self._jit_options = jit_options or PtxJitOptions()
         self._module = None
         self._function = None
         # Map kernel arg index → user tensor index.
@@ -318,7 +426,17 @@ class PtxLauncher:
 
     def _ensure_loaded(self):
         if self._module is None:
-            self._module = self._ext.module_load_data(self._kernel.ptx)
+            options = self._jit_options
+            self._module = self._ext.module_load_data(
+                self._kernel.ptx,
+                options.optimization_level
+                if options.optimization_level is not None else -1,
+                options.max_registers if options.max_registers is not None else -1,
+                options.threads_per_block
+                if options.threads_per_block is not None else -1,
+                {None: -1, "none": 0, "cg": 1, "ca": 2}[options.cache_mode],
+                options.generate_line_info,
+            )
             self._function = self._ext.module_get_function(
                 self._module, self._kernel.name,
             )
@@ -330,6 +448,15 @@ class PtxLauncher:
     @property
     def signature(self):
         return self._kernel.signature
+
+    @property
+    def jit_options(self) -> PtxJitOptions:
+        return self._jit_options
+
+    @property
+    def function_attributes(self) -> dict[str, int]:
+        self._ensure_loaded()
+        return self._ext.function_attributes(self._function)
 
     def __call__(self, *tensors) -> None:
         self._ensure_loaded()
@@ -392,5 +519,9 @@ class PtxLauncher:
             pass
 
 
-def make_ptx_launcher(kernel: PtxKernel) -> PtxLauncher:
-    return PtxLauncher(kernel)
+def make_ptx_launcher(
+    kernel: PtxKernel,
+    *,
+    jit_options: PtxJitOptions | None = None,
+) -> PtxLauncher:
+    return PtxLauncher(kernel, jit_options=jit_options)
