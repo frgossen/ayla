@@ -40,6 +40,15 @@ _BINDING_TOKEN_RE = re.compile(
     r"(?P<immediate>(?<![A-Za-z0-9_])-?\d+(?![A-Za-z0-9_]))"
 )
 _NUMBER_SUFFIX_RE = re.compile(r"^(?P<prefix>.*?)(?P<number>\d+)$")
+_LABEL_RE = re.compile(r"^\s*(?P<label>\$L\d+):\s*$")
+_COUNTED_BACKEDGE_RE = re.compile(
+    r"add\.(?:s32|u32)\s+(?P<register>%r\d+),\s*(?P=register),\s*"
+    r"(?P<step>-?\d+);\s*"
+    r"setp\.(?P<comparison>lt|le|gt|ge)\.(?:s32|u32)\s+"
+    r"(?P<predicate>%p\d+),\s*(?P=register),\s*(?P<bound>-?\d+);\s*"
+    r"@(?P=predicate)\s+bra\s+(?P<label>\$L\d+);"
+)
+_BRANCH_RE = re.compile(r"\bbra(?:\.[A-Za-z0-9_]+)*\s+(?P<label>\$L\d+);")
 
 
 @dataclass(frozen=True)
@@ -103,7 +112,22 @@ def ptx_to_python(ptx: str, *, header: list[str] | None = None) -> str:
     """
     source_lines = ptx.splitlines()
     nonempty_lines = [line.strip() for line in source_lines if line.strip()]
-    templates, schedule = _factor_blocks(_split_blocks(ptx))
+    blocks = [
+        block for block in _split_blocks(ptx)
+        if _executable_lines(block.lines)
+    ]
+    templates, schedule = _factor_blocks(blocks)
+    execution_weights, exact_execution_counts = _execution_profile(blocks)
+    execution_qualifier = (
+        "exact logical" if exact_execution_counts else "conservative estimated"
+    )
+    execution_counts: dict[str, int] = {}
+    for name, weight in zip(schedule, execution_weights):
+        execution_counts[name] = execution_counts.get(name, 0) + weight
+    scheduled_instruction_executions = sum(
+        weight * _instruction_statement_count(_executable_lines(block.lines))
+        for block, weight in zip(blocks, execution_weights)
+    )
     block_kinds = {template.semantic_name for template in templates}
     output = [
         '"""Readable, complete PTX lift; call PTX_PROGRAM() to expand it."""',
@@ -122,15 +146,34 @@ def ptx_to_python(ptx: str, *, header: list[str] | None = None) -> str:
             f"{len(set(nonempty_lines))} unique non-empty"
         ),
         (
-            f"# Semantic schedule: {len(schedule)} block occurrences; "
+            f"# Semantic schedule: {len(schedule)} static block occurrences; "
+            f"{sum(execution_weights)} {execution_qualifier} PTX block "
+            "executions per CTA; "
             f"{len(block_kinds)} unique block kinds"
+        ),
+        (
+            "# Logical block counts include recognized inter-block loops; "
+            "retry iterations inside a block are not expanded"
+        ),
+        (
+            f"# Scheduled PTX instruction executions per CTA: "
+            f"{scheduled_instruction_executions}; extra same-block retry "
+            "iterations are excluded"
         ),
         "",
         *(header or []),
     ]
     for template in templates:
+        executions = execution_counts[template.name]
         output.append(
-            f"# {len(template.occurrences)} occurrence(s) in the full schedule"
+            f"# {executions} {execution_qualifier} PTX block execution(s) "
+            "per CTA from "
+            f"{len(template.occurrences)} static occurrence(s)"
+        )
+        statements = _instruction_statement_count(template.originals[0])
+        output.append(
+            f"# {executions * statements} scheduled PTX instruction "
+            f"execution(s) per CTA ({statements} per block execution)"
         )
         output.extend(_render_template(template))
         output.append("")
@@ -139,8 +182,93 @@ def ptx_to_python(ptx: str, *, header: list[str] | None = None) -> str:
     return "\n".join(output).rstrip() + "\n"
 
 
+def _execution_profile(blocks: list[_Block]) -> tuple[list[int], bool]:
+    """Return per-block logical execution counts and whether they are exact.
+
+    Simple counted do-while loops emitted by Ayla are multiplied exactly.
+    Same-block retry loops do not alter logical block invocation counts. An
+    unrecognized branch between blocks makes the profile conservative.
+    """
+    weights = [1] * len(blocks)
+    labels: dict[str, int] = {}
+    executable = [_executable_lines(block.lines) for block in blocks]
+    for index, lines in enumerate(executable):
+        for line in lines:
+            if match := _LABEL_RE.match(line):
+                labels[match.group("label")] = index
+
+    recognized_backedges: set[tuple[int, str]] = set()
+    for end, lines in enumerate(executable):
+        match = _COUNTED_BACKEDGE_RE.search("\n".join(lines))
+        if match is None:
+            continue
+        start = labels.get(match.group("label"))
+        if start is None or start >= end:
+            continue
+        register = re.escape(match.group("register"))
+        label = re.escape(match.group("label"))
+        init_match = re.search(
+            rf"mov\.(?:b32|s32|u32)\s+{register},\s*(-?\d+);\s*{label}:",
+            "\n".join(executable[start]),
+        )
+        if init_match is None:
+            continue
+        trip_count = _counted_loop_trip_count(
+            int(init_match.group(1)),
+            int(match.group("step")),
+            int(match.group("bound")),
+            match.group("comparison"),
+        )
+        if trip_count is None:
+            continue
+        recognized_backedges.add((end, match.group("label")))
+        # The initialization in the label block executes once. The body begins
+        # after that block and includes the latch/backedge block.
+        for index in range(start + 1, end + 1):
+            weights[index] *= trip_count
+
+    exact = True
+    for index, lines in enumerate(executable):
+        for branch in _BRANCH_RE.finditer("\n".join(lines)):
+            label = branch.group("label")
+            target = labels.get(label)
+            if target is None:
+                exact = False
+            elif target == index:
+                continue
+            elif target < index and (index, label) in recognized_backedges:
+                continue
+            else:
+                exact = False
+    return weights, exact
+
+
+def _counted_loop_trip_count(
+    initial: int, step: int, bound: int, comparison: str,
+) -> int | None:
+    """Return a do-while trip count for a monotonic counted backedge."""
+    if step > 0 and comparison in ("lt", "le"):
+        distance = bound - initial
+        count = (
+            (distance + step - 1) // step
+            if comparison == "lt"
+            else distance // step + 1
+        )
+    elif step < 0 and comparison in ("gt", "ge"):
+        positive_step = -step
+        distance = initial - bound
+        count = (
+            (distance + positive_step - 1) // positive_step
+            if comparison == "gt"
+            else distance // positive_step + 1
+        )
+    else:
+        return None
+    return max(1, count)
+
+
 def _default_readable_ptx() -> str:
-    """Generate the four-tile kernel used by the static PTX/SASS audit."""
+    """Generate the currently retained best GEMM kernel."""
     # Importing a GEMM collection module normally registers its kernels with
     # torch and builds the CUDA launcher. Readable PTX generation needs only
     # the pure-Python IR builder, so disable those registration side effects
@@ -148,21 +276,14 @@ def _default_readable_ptx() -> str:
     import ayla.ptx_runtime as runtime
     import ayla.torch_custom_call as custom_call
 
-    runtime.make_ptx_launcher = lambda kernel: None
+    runtime.make_ptx_launcher = lambda kernel, **kwargs: None
     custom_call.make_torch_custom_call = lambda *args, **kwargs: None
 
     from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
-        auto_matmul_4096_wgmma256_wg_tma_store_module,
+        best_auto_matmul_4096_wgmma256_wg_tma_store_module,
     )
 
-    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_tiles_per_cta=4,
-        operand_stages=3,
-        output_slices=2,
-        output_tma_inner_padding=16,
-        output_store_buffers=2,
-        operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"}},
-    )
+    module = best_auto_matmul_4096_wgmma256_wg_tma_store_module()
     return make_python_ptx(module)
 
 
@@ -177,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help=(
             "existing .ptx file to convert; omit it to build the repository's "
-            "four-tile GEMM kernel"
+            "currently retained best GEMM kernel"
         ),
     )
     parser.add_argument(
@@ -526,6 +647,14 @@ def _executable_lines(lines: tuple[str, ...]) -> tuple[str, ...]:
         if code.strip():
             result.append(code)
     return tuple(result)
+
+
+def _instruction_statement_count(lines: tuple[str, ...]) -> int:
+    """Count PTX statements that execute, rather than declarations/labels."""
+    return sum(
+        line.strip().endswith(";") and not line.lstrip().startswith(".")
+        for line in lines
+    )
 
 
 def _alpha_template(
