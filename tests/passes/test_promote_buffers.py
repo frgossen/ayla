@@ -51,6 +51,27 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
     assert text.count('attrs={label: "mm_dst_tma", tma: True}') == 2
 
 
+def test_wrmem_tma_writeback_can_slice_warpgroup_owned_rows():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<192x16xbf16>, %c: gmem_tensor<256x192xbf16>) grid_dim=[1, 1, 1] block_dim=[512, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem_tensor<64x192xbf16 strides=[192, 1]> = tile(%c: gmem_tensor<256x192xbf16>, %wgx: index, 0)
+            matmul(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<192x16xbf16>, %c_wg: gmem_tensor<64x192xbf16 strides=[192, 1]>) attrs={init: 0.0, label: "mm"}
+          }
+        }"""))  # noqa: E501
+    module = promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True,
+        writeback_slices=4, writeback_buffers=2,
+        writeback_slice_dim="rows", label_filter="mm",
+    )
+    text = repr(module)
+    assert text.count("smem_tensor<64x192xbf16> = alloc()") == 2
+    assert text.count('label: "mm_dst_smem", writer_wg:') == 4
+    assert text.count('attrs={label: "mm_dst_tma", tma: True}') == 4
+
+
 def test_promote_gmem_matmul_operands_to_smem():
     module_str = textwrap.dedent("""\
         module {

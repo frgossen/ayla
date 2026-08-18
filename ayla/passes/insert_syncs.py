@@ -5,18 +5,21 @@ import dataclasses
 import enum
 
 from ..gpu_dialect import (
+    AllocOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
     CollectiveScope,
     ForOp,
     KernelOp,
+    LockType,
     ModuleOp,
     PTXTemplateOp,
     is_side_effect_free,
     memory_effects,
+    multicast_count_for_lock,
 )
-from ..base.ir import Block, Op, Value
+from ..base.ir import Block, Op, Value, find_ops
 from ..base.pipeline import Pass
 
 
@@ -315,10 +318,51 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
 }
 
 
-def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
+def _multicast_count(op: Op) -> int | None:
+    if not isinstance(op, AsyncOp):
+        return None
+    return multicast_count_for_lock(op.lock)
+
+
+def _insert_cluster_init_barriers(block: Block) -> None:
+    """Publish multicast mbarriers before any CTA addresses a peer's lock."""
+    pending: set[Value] = set()
+    new_ops: list[Op] = []
+    for op in block.ops:
+        if (
+            isinstance(op, AllocOp)
+            and isinstance(op.result().type, LockType)
+            and multicast_count_for_lock(op.result()) is not None
+        ):
+            pending.add(op.result())
+
+        uses_pending = pending and any(
+            isinstance(inner, AsyncOp)
+            and inner.lock in pending
+            and _multicast_count(inner) is not None
+            for inner in find_ops(op, lambda candidate: isinstance(candidate, AsyncOp))
+        )
+        if uses_pending:
+            new_ops.append(BarrierOp.build(scope="cluster"))
+            pending.clear()
+
+        new_ops.append(op)
+        for region in op.regions:
+            for inner_block in region.blocks:
+                _insert_cluster_init_barriers(inner_block)
+    block.ops = new_ops
+
+
+def _insert_barriers(
+    block: Block,
+    targets: BarrierTargetsType,
+    cluster_local_tma_first: bool = False,
+) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
+        if cluster_local_tma_first and _multicast_count(op) is not None:
+            op.attrs["cluster_local_tma_first"] = True
         target = targets.get(op)
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
@@ -326,13 +370,29 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
                     f"no lowering for barrier {target.scope.name}"
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
-            new_ops.append(
-                BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
-            )
+            scope = _BARRIER_OP_SCOPE[target.scope]
+            if scope == "block_leader" and _multicast_count(op) is not None:
+                assert isinstance(op, AsyncOp)
+                # Multicast adds a cluster-wide stage-release dependency; it
+                # does not replace the original intra-CTA dependency.  First
+                # collect every local consumer at the ordinary asymmetric
+                # block-to-leader barrier.  Only then may t0 advertise this
+                # CTA's stage as empty to the cluster leader.
+                new_ops.append(BarrierOp.build(scope=scope, attrs=attrs))
+                if not cluster_local_tma_first:
+                    new_ops.append(
+                        BarrierOp.build(scope="cluster_leader", lock=op.lock)
+                    )
+            else:
+                new_ops.append(BarrierOp.build(scope=scope, attrs=attrs))
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:
-                _insert_barriers(inner, targets)
+                child_local_first = (
+                    bool(op.attrs.get("cluster_local_tma_first", False))
+                    if isinstance(op, KernelOp) else cluster_local_tma_first
+                )
+                _insert_barriers(inner, targets, child_local_first)
     block.ops = new_ops
 
 
@@ -341,6 +401,7 @@ class InsertSyncs(Pass):
     def run(self, module: ModuleOp) -> ModuleOp:
         targets: BarrierTargetsType = {}
         _analyze(module, DataflowState(), targets)  # analysis: where do barriers go
+        _insert_cluster_init_barriers(module.body.entry_block)
         _insert_barriers(module.body.entry_block, targets)  # transform: insert them
         return module
 

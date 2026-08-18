@@ -290,6 +290,7 @@ static void launch_kernel(
     uintptr_t function_handle,
     std::tuple<int, int, int> grid_dim,
     std::tuple<int, int, int> block_dim,
+    std::tuple<int, int, int> cluster_dim,
     py::list params,
     int64_t shared_mem_bytes
 ) {
@@ -329,11 +330,34 @@ static void launch_kernel(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto [gx, gy, gz] = grid_dim;
     auto [bx, by, bz] = block_dim;
-    CU_CHECK(cuLaunchKernel(
-        fn, gx, gy, gz, bx, by, bz,
-        static_cast<unsigned int>(shared_mem_bytes),
-        stream, arg_ptrs.data(), /*extra=*/nullptr
-    ));
+    auto [cx, cy, cz] = cluster_dim;
+    if (cx == 1 && cy == 1 && cz == 1) {
+        CU_CHECK(cuLaunchKernel(
+            fn, gx, gy, gz, bx, by, bz,
+            static_cast<unsigned int>(shared_mem_bytes),
+            stream, arg_ptrs.data(), /*extra=*/nullptr
+        ));
+    } else {
+        CUlaunchAttribute attr{};
+        attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attr.value.clusterDim.x = cx;
+        attr.value.clusterDim.y = cy;
+        attr.value.clusterDim.z = cz;
+        CUlaunchConfig config{};
+        config.gridDimX = gx;
+        config.gridDimY = gy;
+        config.gridDimZ = gz;
+        config.blockDimX = bx;
+        config.blockDimY = by;
+        config.blockDimZ = bz;
+        config.sharedMemBytes = static_cast<unsigned int>(shared_mem_bytes);
+        config.hStream = stream;
+        config.attrs = &attr;
+        config.numAttrs = 1;
+        CU_CHECK(cuLaunchKernelEx(
+            &config, fn, arg_ptrs.data(), /*extra=*/nullptr
+        ));
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -351,6 +375,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("function_handle"),
           py::arg("grid_dim"),
           py::arg("block_dim"),
+          py::arg("cluster_dim"),
           py::arg("params"),
           py::arg("shared_mem_bytes") = 0);
 }
@@ -466,6 +491,7 @@ class PtxLauncher:
             self._function,
             self._kernel.grid_dim,
             self._kernel.block_dim,
+            self._kernel.cluster_dim,
             params,
             self._kernel.shared_mem_bytes,
         )

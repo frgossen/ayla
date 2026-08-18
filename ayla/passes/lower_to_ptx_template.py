@@ -34,6 +34,7 @@ from ..gpu_dialect import (
     MatmulOp,
     KernelOp,
     ModuleOp,
+    multicast_count_for_lock,
     MoveOp,
     PTXTemplateOp,
     PtrAddOp,
@@ -52,6 +53,34 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Block, Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass
+
+
+def _cluster_leader_barrier_template() -> str:
+    """One arrival per CTA and a state-token wait on cluster rank zero."""
+    return textwrap.dedent("""\
+        mov.u32 ${b32:clb_tid}, %tid.x;
+        mov.u32 ${b32:clb_tid_y}, %tid.y;
+        or.b32 ${b32:clb_tid}, ${b32:clb_tid}, ${b32:clb_tid_y};
+        mov.u32 ${b32:clb_tid_z}, %tid.z;
+        or.b32 ${b32:clb_tid}, ${b32:clb_tid}, ${b32:clb_tid_z};
+        setp.ne.s32 ${pred:clb_not_t0}, ${b32:clb_tid}, 0;
+        @${pred:clb_not_t0} bra ${label:cluster_barrier_done};
+        mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
+        add.u32 ${b32:empty_val}, ${b32:operand.lock.val}, 8;
+        setp.eq.u32 ${pred:cluster_pred}, ${b32:cluster_rank}, 0;
+        @${pred:cluster_pred} bra ${label:cluster_leader_arrive};
+        mov.u32 ${b32:cluster_rank}, 0;
+        mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:empty_val}, ${b32:cluster_rank};
+        mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
+        bra ${label:cluster_barrier_done};
+        ${label:cluster_leader_arrive}:
+        mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:empty_val}];
+        ${label:cluster_empty_wait}:
+        mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:cluster_pred}, [${b32:empty_val}], ${b64:cluster_state};
+        @${pred:cluster_pred} bra ${label:cluster_barrier_done};
+        bra ${label:cluster_empty_wait};
+        ${label:cluster_barrier_done}:
+    """)
 
 
 class LowerToPtxTemplate(LoweringPass):
@@ -425,16 +454,31 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(lock_type, LockType)
         if lock_type.kind != "mbar":
             return [], [None]
+        multicast_count = multicast_count_for_lock(op.result())
+        barrier_count = 2 if multicast_count is not None else 1
         lines = [
-            ".shared .align 8 .b64 ${smem:bar}[1];",
+            f".shared .align 8 .b64 ${{smem:bar}}[{barrier_count}];",
             "mov.u32 ${b32:result.dst.val}, ${smem:bar};",
             "mov.u32 ${b32:result.dst.parity}, 0;",
             *self._thread_zero_guard("init", "after_init"),
             "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;",
             "fence.mbarrier_init.release.cluster;",
             "${label:after_init}:",
-            "bar.sync 0;",
         ]
+        if multicast_count is not None:
+            lines.extend([
+                *self._thread_zero_guard("empty_init", "after_empty_init"),
+                "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;",
+                "setp.ne.u32 ${pred:not_cluster_leader}, "
+                "${b32:cluster_rank}, 0;",
+                "@${pred:not_cluster_leader} bra ${label:after_empty_init};",
+                "add.u32 ${b32:empty_val}, ${b32:result.dst.val}, 8;",
+                f"mbarrier.init.shared::cta.b64 [${{b32:empty_val}}], "
+                f"{multicast_count};",
+                "fence.mbarrier_init.release.cluster;",
+                "${label:after_empty_init}:",
+            ])
+        lines.append("bar.sync 0;")
         template = "\n".join(lines) + "\n"
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
@@ -1050,8 +1094,21 @@ class LowerToPtxTemplate(LoweringPass):
         scope = op.attrs.get("scope")
         if scope == "thread":
             return [], []  # per-thread ordering is implicit in program order
+        if scope == "cluster_leader":
+            assert op.lock is not None
+            new_op = PTXTemplateOp.build(
+                operands=[self.value_map[op.lock]],
+                result_types=[],
+                template=_cluster_leader_barrier_template(),
+                operand_names=["lock"],
+                result_names=[],
+                description=str(op),
+            )
+            return [new_op], []
         if scope == "block":
             template = "bar.sync 0;\n"
+        elif scope == "cluster":
+            template = "barrier.cluster.arrive;\nbarrier.cluster.wait;\n"
         elif scope == "block_leader":
             # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
             # insert_syncs (unique among concurrently-live block-leader barriers).
@@ -1094,12 +1151,16 @@ class LowerToPtxTemplate(LoweringPass):
         # Leave the optional timeHint absent. On Hopper, ptxas otherwise emits
         # an out-of-line NANOSLEEP/phase-check slow path for every static wait.
         # The enclosing retry loop already handles an incomplete barrier.
+        acquire_scope = (
+            "cluster" if multicast_count_for_lock(op.lock) is not None
+            else "cta"
+        )
         template = textwrap.dedent(r"""
             ${label:wait}:
-            mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity};
+            mbarrier.try_wait.parity.acquire.SCOPE.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity};
             @!${pred:mbar_done} bra ${label:wait};
             xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;
-        """)
+        """).replace("SCOPE", acquire_scope)
         new_op = PTXTemplateOp.build(
             operands=[lock],
             result_types=[],
@@ -1596,10 +1657,10 @@ class LowerToPtxTemplate(LoweringPass):
             assert len(op.register_starts) % 2 == 0
             bottom_rows = 8 * stride * dst_type.dtype.byte_size
             groups = []
-            # A 128-column slice has eight 8x8 register starts and a
-            # 64-column slice has four.  The same 8x32 regrouping applies; the
-            # narrower slice simply uses the first two block-major bases.
-            assert len(op.register_starts) in (4, 8, 16)
+            # A 64-column block has four 8x8 register starts.  The same 8x32
+            # regrouping applies to any whole number of such blocks; current
+            # output widths use one through four blocks (64..256 columns).
+            assert len(op.register_starts) in (4, 8, 12, 16)
             for base_index, group in enumerate(
                 range(0, len(op.register_starts), 2)
             ):
@@ -1827,7 +1888,8 @@ class LowerToPtxTemplate(LoweringPass):
         operands: list[Value] = [lock_value]
         operand_names: list[str] = ["lock"]
         total_bytes = 0
-        load_lines: list[str] = []
+        local_load_templates: list[str] = []
+        multicast_load_templates: list[str] = []
         for i, tma in enumerate(tmas):
             dst_value = self.value_map[tma.dst]
             desc_value = self.value_map[tma.src]
@@ -1858,13 +1920,28 @@ class LowerToPtxTemplate(LoweringPass):
                 f", ${{b64:operand.{policy_name}.ptr}}"
                 if cache_hint is not None else ""
             )
-            load_lines.append(
-                f"cp.async.bulk.tensor.{len(idx_values)}d.shared::cluster.global."
-                f"mbarrier::complete_tx::bytes{cache_suffix} "
-                f"[${{b32:operand.{dn}.ptr}}], "
-                f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
-                f"[${{b32:operand.lock.val}}]{cache_operand};"
-            )
+            multicast_count = tma.attrs.get("multicast_count")
+            if multicast_count is None:
+                local_load_templates.append(
+                    f"cp.async.bulk.tensor.{len(idx_values)}d."
+                    f"shared::cluster.global.mbarrier::complete_tx::bytes"
+                    f"{cache_suffix} [${{b32:operand.{dn}.ptr}}], "
+                    f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
+                    f"[${{b32:operand.lock.val}}]{cache_operand};"
+                )
+            else:
+                if cache_hint is not None:
+                    raise ValueError(
+                        "multicast TMA cache hints are not yet supported"
+                    )
+                multicast_mask = (1 << int(multicast_count)) - 1
+                multicast_load_templates.append(textwrap.dedent(f"""\
+                    mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
+                    setp.ne.u32 ${{pred:cluster_pred}}, ${{b32:cluster_rank}}, 0;
+                    @${{pred:cluster_pred}} bra ${{label:after_multicast_{i}}};
+                    cp.async.bulk.tensor.{len(idx_values)}d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [${{b32:operand.{dn}.ptr}}], [${{b64:operand.{sn}.ptr}}, {{{indices}}}], [${{b32:operand.lock.val}}], {multicast_mask};
+                    ${{label:after_multicast_{i}}}:
+                """))
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
         # the byte count are interpolated, so we avoid f-string/dedent brace and
@@ -1872,13 +1949,27 @@ class LowerToPtxTemplate(LoweringPass):
         #
         # The buffer-reuse WAR (t0's reload vs prior readers of the smem tile) is
         # handled by insert_syncs, which emits a barrier before this async.
-        lines = [
-            *self._thread_zero_guard("load", "after_load"),
-            *load_lines,
-            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
-            f"[${{b32:operand.lock.val}}], {total_bytes};",
-            "${label:after_load}:",
-        ]
+        local_first = bool(op.attrs.get("cluster_local_tma_first", False))
+        if local_first:
+            assert multicast_load_templates
+            lines = [
+                *self._thread_zero_guard("load", "after_load"),
+                "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
+                f"[${{b32:operand.lock.val}}], {total_bytes};",
+                *local_load_templates,
+                _cluster_leader_barrier_template(),
+                *multicast_load_templates,
+                "${label:after_load}:",
+            ]
+        else:
+            lines = [
+                *self._thread_zero_guard("load", "after_load"),
+                *local_load_templates,
+                *multicast_load_templates,
+                "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
+                f"[${{b32:operand.lock.val}}], {total_bytes};",
+                "${label:after_load}:",
+            ]
         template = "\n".join(lines) + "\n"
 
         new_op = PTXTemplateOp.build(

@@ -10,6 +10,7 @@ from torch.ops import ayla
 from ayla.base.ir import find_ops
 from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    best_auto_matmul_16384_wgmma256_wg_tma_store_module,
     best_auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.gpu_dialect import MoveOp, TmaDescType
@@ -134,6 +135,26 @@ def test_four_output_tiles_reuse_the_existing_pipeline_resources():
         if next_gather is not None:
             assert any(line.strip() == "bar.sync 0;"
                        for line in lines[wait:next_gather])
+
+
+def test_retained_16384_kernel_uses_wide_grouped_ctas_and_ab_promotion():
+    kernel = make_ptx_kernel(
+        best_auto_matmul_16384_wgmma256_wg_tma_store_module()
+    )
+    assert kernel.name.endswith(
+        "_16384_wgmma256_wg_tma_store_k3_m256_n192_wg192_split3_"
+        "ctagroupm8_3d_best"
+    )
+    assert kernel.grid_dim == (8, 86, 8)
+    assert kernel.block_dim == (512, 1, 1)
+    assert ".reqntid 512, 1, 1" in kernel.ptx
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+    assert input_descs[0].l2_promotion == "256B"
+    assert input_descs[1].l2_promotion == "256B"
+    assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
 
 
 def test_lhs_descriptor_precompute_is_an_opt_in_ptx_variant():

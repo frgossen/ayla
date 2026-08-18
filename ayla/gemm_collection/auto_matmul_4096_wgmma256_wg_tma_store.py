@@ -4,7 +4,19 @@ import textwrap
 
 from ..base.ir import find_ops
 from ..gpu_dialect import gpu_dialect
-from ..gpu_dialect import AsyncOp, KernelOp, MoveOp, TileOp, WarpGroupIdOp
+from ..gpu_dialect import (
+    AsyncOp,
+    BlockIdsOp,
+    IndexAddOp,
+    IndexConstantOp,
+    IndexDivOp,
+    IndexModOp,
+    IndexMulOp,
+    KernelOp,
+    MoveOp,
+    TileOp,
+    WarpGroupIdOp,
+)
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
@@ -30,9 +42,14 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     operand_swizzle: str = "128B",
     output_slices: int = 1,
     output_store_buffers: int = 1,
+    output_slice_dim: str = "columns",
     output_tile_group: tuple[int, int] | None = None,
     output_group_outer: str = "n",
     cta_raster: str = "m",
+    cta_group_m: int | None = None,
+    cta_group_m_3d: bool = False,
+    cluster_shape: tuple[int, int] = (1, 1),
+    cluster_local_tma_first: bool = False,
     variant_suffix: str | None = None,
     promote_k_tail: bool = True,
     rhs_output_cache_hints: tuple[str | None, ...] | None = None,
@@ -56,8 +73,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
 ):
-    if output_tiles_per_cta not in (1, 2, 4):
-        raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
+    if output_tiles_per_cta not in (1, 2, 3, 4, 8):
+        raise ValueError("output_tiles_per_cta must be 1, 2, 3, 4, or 8")
     if problem_size <= 0:
         raise ValueError("problem_size must be positive")
     if output_tile_group is None:
@@ -69,26 +86,36 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             "output_tile_group must be (M tiles, N tiles) whose product "
             "equals output_tiles_per_cta"
         )
-    if output_m_tile not in (128, 192):
-        raise ValueError("output_m_tile must be 128 or 192")
-    if output_m_tile == 192 and output_tiles_per_cta != 1:
-        raise ValueError("M=192 currently requires one output tile per CTA")
-    if output_n_tile not in (256, 384):
-        raise ValueError("output_n_tile must be 256 or 384")
+    if output_m_tile not in (128, 192, 256):
+        raise ValueError("output_m_tile must be 128, 192, or 256")
+    if output_n_tile not in (192, 256, 384):
+        raise ValueError("output_n_tile must be 192, 256, or 384")
     if operand_k_tile not in (16, 32, 64, 128):
         raise ValueError("operand_k_tile must be 16, 32, 64, or 128")
     if operand_swizzle not in ("32B", "64B", "128B"):
         raise ValueError("unsupported operand swizzle")
     if warpgroup_n_tile is None:
-        warpgroup_n_tile = output_n_tile if output_n_tile == 256 else 128
+        warpgroup_n_tile = output_n_tile if output_n_tile in (192, 256) else 128
     if output_n_tile % warpgroup_n_tile:
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix"):
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
+    if output_slice_dim not in ("columns", "rows"):
+        raise ValueError("output_slice_dim must be 'columns' or 'rows'")
     if output_tma_block_order not in ("row_major", "block_major"):
         raise ValueError("unsupported output TMA block order")
     if cta_raster not in ("m", "n"):
         raise ValueError("cta_raster must be 'm' or 'n'")
+    if cta_group_m is not None and cta_raster != "m":
+        raise ValueError("cta_group_m currently requires M raster")
+    if cta_group_m_3d and cta_group_m is None:
+        raise ValueError("cta_group_m_3d requires cta_group_m")
+    if cluster_shape not in ((1, 1), (2, 1), (1, 2)):
+        raise ValueError(
+            "cluster_shape currently supports (1, 1), (2, 1), or (1, 2)"
+        )
+    if cluster_local_tma_first and cluster_shape == (1, 1):
+        raise ValueError("cluster_local_tma_first requires a CTA cluster")
     if output_group_outer not in ("m", "n"):
         raise ValueError("output_group_outer must be 'm' or 'n'")
     if rhs_output_cache_hints is not None:
@@ -159,12 +186,22 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             name += f"_{output_group_outer}outer"
     if output_slices != 1:
         name += f"_split{output_slices}"
+        if output_slice_dim != "columns":
+            name += f"_{output_slice_dim}"
     if output_store_buffers != 1:
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
     if cta_raster != "m":
         name += f"_raster_{cta_raster}"
+    if cta_group_m is not None:
+        name += f"_ctagroupm{cta_group_m}"
+        if cta_group_m_3d:
+            name += "_3d"
+    if cluster_shape != (1, 1):
+        name += f"_cluster{cluster_shape[0]}x{cluster_shape[1]}"
+        if cluster_local_tma_first:
+            name += "_localfirst"
     if variant_suffix is not None:
         name += f"_{variant_suffix}"
     m_blocks = (problem_size + output_m_tile - 1) // output_m_tile
@@ -172,15 +209,42 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     group_m, group_n = output_tile_group
     grid_x = (m_blocks + group_m - 1) // group_m
     grid_y = (n_blocks + group_n - 1) // group_n
-    launch_grid = (
+    logical_launch_grid = (
         (grid_x, grid_y) if cta_raster == "m" else (grid_y, grid_x)
+    )
+    launch_grid = logical_launch_grid
+    if cta_group_m is not None:
+        if cta_group_m <= 0 or grid_x % cta_group_m:
+            raise ValueError(
+                f"cta_group_m={cta_group_m} must divide M grid {grid_x}"
+            )
+        launch_grid = (
+            (cta_group_m, grid_y, grid_x // cta_group_m)
+            if cta_group_m_3d
+            else (cta_group_m, grid_y * (grid_x // cta_group_m))
+        )
+    cluster_dim = (*cluster_shape, 1)
+    if any(grid % cluster for grid, cluster in zip(launch_grid, cluster_dim)):
+        raise ValueError(
+            f"launch grid {launch_grid} must divide cluster {cluster_dim}"
+        )
+    cluster_attr = (
+        f" cluster_dim=[{cluster_dim[0]}, {cluster_dim[1]}, 1]"
+        if cluster_shape != (1, 1) else ""
     )
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) grid_dim=[{launch_grid[0]}, {launch_grid[1]}, 1] block_dim=[128, 1, 1] {{
+          kernel @{name}(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) grid_dim=[{logical_launch_grid[0]}, {logical_launch_grid[1]}, 1] block_dim=[128, 1, 1]{cluster_attr} {{
             matmul(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
+    if cluster_shape != (1, 1):
+        [kernel] = find_ops(module, lambda op: isinstance(op, KernelOp))
+        # Cluster mbarriers have an additional rank-zero initialization and
+        # publication step; keep their startup rendezvous explicit.
+        kernel.attrs["batch_mbarrier_init"] = False
+        if cluster_local_tma_first:
+            kernel.attrs["cluster_local_tma_first"] = True
     if output_tiles_per_cta == 1:
         block_levels = (
             ["block.x", "block.y"]
@@ -191,7 +255,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             tile_sizes=[output_m_tile, output_n_tile],
             tile_levels=block_levels, tile_labels=[None, None],
             label_filter="mm",
-            allow_partial=(output_m_tile == 192 or output_n_tile == 384),
+            allow_partial=(
+                output_m_tile == 192 or output_n_tile in (192, 384)
+            ),
         )
     elif group_n == 1:
         block_levels = (
@@ -200,10 +266,14 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         )
         module = tile_matmul(
             module, tile_dims=["M", "M", "N"],
-            tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
+            tile_sizes=[
+                grid_x * output_m_tile, output_m_tile, output_n_tile,
+            ],
             tile_levels=block_levels,
             tile_labels=["outm", None, None], label_filter="mm",
-            allow_partial=output_m_tile == 192,
+            allow_partial=(
+                output_m_tile == 192 or output_n_tile in (192, 384)
+            ),
         )
     else:
         # Keep 128 CTAs, but make each simultaneously executing phase a
@@ -230,10 +300,53 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             module, tile_dims=group_dims, tile_sizes=group_sizes,
             tile_levels=group_levels, tile_labels=group_labels,
             label_filter="mm",
-            allow_partial=(output_m_tile == 192 or output_n_tile == 384),
+            allow_partial=(
+                output_m_tile == 192 or output_n_tile in (192, 384)
+            ),
         )
+    if cta_group_m is not None:
+        [kernel] = find_ops(module, lambda op: isinstance(op, KernelOp))
+        kernel.grid_dim = (
+            launch_grid if len(launch_grid) == 3 else (*launch_grid, 1)
+        )
+        block = kernel.body.entry_block
+        [block_ids] = [
+            op for op in block.ops if isinstance(op, BlockIdsOp)
+        ]
+        physical_x, physical_y, physical_z = block_ids.results
+        x_uses = list(physical_x.uses)
+        y_uses = list(physical_y.uses)
+        group = IndexConstantOp.build(cta_group_m)
+        logical_grid_y = (
+            None if cta_group_m_3d else IndexConstantOp.build(grid_y)
+        )
+        group_index = (
+            physical_z if cta_group_m_3d
+            else IndexDivOp.build(physical_y, logical_grid_y.result()).result()
+        )
+        group_offset = IndexMulOp.build(group_index, group.result())
+        logical_x = IndexAddOp.build(physical_x, group_offset.result())
+        logical_y = (
+            physical_y if cta_group_m_3d
+            else IndexModOp.build(physical_y, logical_grid_y.result()).result()
+        )
+        insert_at = block.ops.index(block_ids) + 1
+        mapping_ops = [group]
+        if not cta_group_m_3d:
+            assert logical_grid_y is not None
+            mapping_ops.extend([
+                logical_grid_y, group_index.definition,
+            ])
+        mapping_ops.extend([group_offset, logical_x])
+        if not cta_group_m_3d:
+            mapping_ops.append(logical_y.definition)
+        block.ops[insert_at:insert_at] = mapping_ops
+        for user, operand_index in x_uses:
+            user.operands[operand_index] = logical_x.result()
+        for user, operand_index in y_uses:
+            user.operands[operand_index] = logical_y
     wg_dim, wg_size = (
-        ("M", 64) if output_n_tile == 256
+        ("M", 64) if output_n_tile in (192, 256)
         else ("N", warpgroup_n_tile)
     )
     module = tile_matmul(
@@ -257,6 +370,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         ),
         writeback_slices=output_slices,
         writeback_buffers=output_store_buffers,
+        writeback_slice_dim=output_slice_dim,
         # C is written once and never re-read, so an evict-first output store
         # keeps A/B resident in L2 instead of being displaced by the epilogue.
         move_attrs=operand_move_attrs,
@@ -398,7 +512,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             if not isinstance(op, AsyncOp):
                 continue
             match = re.fullmatch(
-                r"mm_lhs_smem_iter(\d+)_async_iter0",
+                r"mm_lhs_smem_iter(\d+)_async(?:_iter0)?",
                 str(op.attrs.get("label", "")),
             )
             if match is None:
@@ -483,6 +597,47 @@ def best_auto_matmul_4096_wgmma256_wg_tma_store_module(
 BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=1)
 
 
+def best_auto_matmul_16384_wgmma256_wg_tma_store_module():
+    """Build the retained square 16384 BF16 GEMM specialization.
+
+    A 256x192 CTA uses four 64x192 warpgroups.  Three K64 stages plus three
+    64-column output slices fit in shared memory, while the 8x16 3-D CTA phase
+    balances A/B reuse.  At this size both operands benefit from 256-byte TMA
+    promotion.  Driver O3 and short-lived WGMMA descriptors are faster for the
+    512-thread kernel than the O1/A-precompute policy retained at 4096.
+    """
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_size=16384,
+        output_tiles_per_cta=1,
+        output_m_tile=256,
+        output_n_tile=192,
+        operand_stages=3,
+        output_slices=3,
+        output_tma_inner_padding=0,
+        output_store_buffers=1,
+        regroup_stmatrix_block_major=True,
+        reuse_k_tail_mbarrier=True,
+        startup_tma_stage_order=(0, 2, 1),
+        precompute_wgmma_lhs_descriptors=False,
+        precompute_wgmma_rhs_descriptors=False,
+        direct_warp_group_id=True,
+        emit_reqntid=True,
+        cta_group_m=8,
+        cta_group_m_3d=True,
+        variant_suffix="best",
+        operand_move_attrs={
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
+# The 512-thread 256x192 kernel consistently favors Driver O3; unlike the
+# 256-thread specialization, precomputing A descriptors does not help it.
+BEST_AUTO_MATMUL_16384_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
+
+
 def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
     configs = [
         {},
@@ -551,6 +706,16 @@ def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:
             ),
             [OperandKind.R, OperandKind.R, OperandKind.RESULT],
         )
+
+    module = best_auto_matmul_16384_wgmma256_wg_tma_store_module()
+    kernel = make_ptx_kernel(module)
+    make_torch_custom_call(
+        make_ptx_launcher(
+            kernel,
+            jit_options=BEST_AUTO_MATMUL_16384_PTX_JIT_OPTIONS,
+        ),
+        [OperandKind.R, OperandKind.R, OperandKind.RESULT],
+    )
 
 
 _register_auto_matmul_4096_wgmma256_wg_tma_store()

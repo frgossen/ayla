@@ -135,6 +135,7 @@ class KernelOp(Op):
         body: Region,
         grid_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         block_dim: tuple[int | None, int | None, int | None] = (None, None, None),
+        cluster_dim: tuple[int, int, int] = (1, 1, 1),
         num_warp_groups: int | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "KernelOp":
@@ -145,6 +146,7 @@ class KernelOp(Op):
                 "name": name,
                 "grid_dim": list(grid_dim),
                 "block_dim": list(block_dim),
+                "cluster_dim": list(cluster_dim),
                 "num_warp_groups": num_warp_groups,
                 **(attrs or {}),
             },
@@ -172,6 +174,10 @@ class KernelOp(Op):
         self.attrs["block_dim"] = list(value)
 
     @property
+    def cluster_dim(self) -> tuple[int, int, int]:
+        return tuple(self.attrs.get("cluster_dim", [1, 1, 1]))  # type: ignore[return-value]
+
+    @property
     def num_warp_groups(self) -> int | None:
         return self.attrs["num_warp_groups"]  # type: ignore[return-value]
 
@@ -181,7 +187,7 @@ class KernelOp(Op):
 
     @property
     def extra_attrs(self) -> dict[str, object]:
-        return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "num_warp_groups")}
+        return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "cluster_dim", "num_warp_groups")}
 
     @property
     def signature(self) -> list[Type]:
@@ -205,10 +211,13 @@ class KernelOp(Op):
         if any(d is not None for d in self.block_dim):
             p.write(" block_dim=")
             p.write_list_attr(list(self.block_dim))
+        if self.cluster_dim != (1, 1, 1):
+            p.write(" cluster_dim=")
+            p.write_list_attr(list(self.cluster_dim))
         if self.num_warp_groups is not None:
             p.write(f" num_warp_groups={self.num_warp_groups}")
         p.write_extra_attrs(
-            self.attrs, skip_keys={"name", "grid_dim", "block_dim", "num_warp_groups"},
+            self.attrs, skip_keys={"name", "grid_dim", "block_dim", "cluster_dim", "num_warp_groups"},
         )
         p.write(" ")
         self.body.print(p, skip_entry_block_label=True)
@@ -239,6 +248,11 @@ class KernelOp(Op):
             p.read_literal("block_dim")
             p.read_literal("=")
             block_dim = tuple(p.read_list_attr())
+        cluster_dim = (1, 1, 1)
+        if p.can_read_literal("cluster_dim"):
+            p.read_literal("cluster_dim")
+            p.read_literal("=")
+            cluster_dim = tuple(p.read_list_attr())
         num_warp_groups = None
         if p.can_read_literal("num_warp_groups"):
             p.read_literal("num_warp_groups")
@@ -247,7 +261,11 @@ class KernelOp(Op):
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
         body = Region.parse(brace, p, entry_block_arguments=args)
-        return cls.build(name, body, grid_dim=grid_dim, block_dim=block_dim, num_warp_groups=num_warp_groups, attrs=attrs)
+        return cls.build(
+            name, body, grid_dim=grid_dim, block_dim=block_dim,
+            cluster_dim=cluster_dim, num_warp_groups=num_warp_groups,
+            attrs=attrs,
+        )
 
 
 @gpu_dialect.register_op("matmul")
@@ -707,11 +725,13 @@ class AwaitOp(Op):
 class BarrierOp(Op):
     """A rendezvous / synchronization point across a set of threads.
 
-    Carries no data and has no lock — it only establishes a happens-before
-    across its participating threads.
+    Establishes a happens-before across its participating threads. A
+    ``cluster_leader`` barrier additionally carries the multicast lock whose
+    cluster-shared empty mbarrier implements the handshake.
 
     The ``scope`` attribute records the participant set the sync spans, one of:
-    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``, ``grid``.
+    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
+    ``cluster_leader``, ``cluster``, ``grid``.
     """
 
     @classmethod
@@ -719,12 +739,20 @@ class BarrierOp(Op):
         cls,
         scope: str = "block",
         attrs: dict[str, object] | None = None,
+        lock: Value | None = None,
     ) -> "BarrierOp":
-        return cls(operands=[], results=[], attrs={"scope": scope, **(attrs or {})})
+        return cls(
+            operands=[] if lock is None else [lock], results=[],
+            attrs={"scope": scope, **(attrs or {})},
+        )
 
     @property
     def scope(self) -> str:
         return self.attrs["scope"]  # type: ignore[return-value]
+
+    @property
+    def lock(self) -> Value | None:
+        return self.operands[0] if self.operands else None
 
 
 @gpu_dialect.register_op("async")
@@ -1916,6 +1944,20 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
                     effects.extend(body_effects)
         return effects
     return None
+
+
+def multicast_count_for_lock(lock: Value) -> int | None:
+    """Return the cluster participant count of multicast work on ``lock``."""
+    counts = {
+        int(inner.attrs["multicast_count"])
+        for user in lock.users()
+        if isinstance(user, AsyncOp)
+        for inner in user.body.entry_block.ops
+        if "multicast_count" in inner.attrs
+    }
+    if len(counts) > 1:
+        raise ValueError("one lock cannot mix multicast participant counts")
+    return next(iter(counts), None)
 
 
 def is_value_identical(op: Op) -> bool:

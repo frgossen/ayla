@@ -58,6 +58,39 @@ def test_war_on_shared_buffer_gets_barrier():
         }""")  # noqa: E501
 
 
+def test_multicast_stage_reuse_keeps_local_consumer_barrier():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<256x64xbf16>, %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[2, 1, 1] block_dim=[256, 1, 1] cluster_dim=[2, 1, 1] {
+            %sa: smem_tensor<128x64xbf16> = alloc()
+            %sb: smem_tensor<256x64xbf16> = alloc()
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={multicast_count: 2, tma: True}
+            }
+            await(%lock: lock<mbar>)
+            matmul(%sa: smem_tensor<128x64xbf16>, %sb: smem_tensor<256x64xbf16>, %acc: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            async(%lock: lock<mbar>) {
+              move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              move(%sb: smem_tensor<256x64xbf16>, %b: gmem_tensor<256x64xbf16>) attrs={multicast_count: 2, tma: True}
+            }
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    # The cluster representative handshake is additional to, not a substitute
+    # for, gathering the local compute warps that consumed the reusable stage.
+    assert_contains_in_order(
+        repr(module),
+        textwrap.dedent("""\
+            barrier() attrs={id: 1, scope: "block_leader"}
+            barrier(%lock: lock<mbar>) attrs={scope: "cluster_leader"}
+            async(%lock: lock<mbar>) {"""),
+    )
+
+
 def test_bulk_wait_completion_is_broadcast_before_shared_arena_reuse():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
