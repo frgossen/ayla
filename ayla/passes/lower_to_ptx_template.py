@@ -649,12 +649,7 @@ class LowerToPtxTemplate(LoweringPass):
             and isinstance(src_type, WrmemTensorType)
             and src_type.layout == "wgmma_layout_0"
         ):
-            register_starts = _stmatrix_register_starts(op)
-            if register_starts is not None:
-                return self._lower_move_wrmem_wgmma_to_stmatrix(
-                    op, register_starts,
-                )
-            return self._lower_move_wrmem_wgmma_to_addrmem(op)
+            return self._lower_move_wrmem_wgmma(op)
         raise NotImplementedError(
             f"lower_move: unsupported; got "
             f"{type(dst_type).__name__} <- {type(src_type).__name__}"
@@ -1026,6 +1021,14 @@ class LowerToPtxTemplate(LoweringPass):
 
 
 
+    def _lower_move_wrmem_wgmma(
+        self, op: MoveOp,
+    ) -> tuple[list[Op], list[object]]:
+        register_starts = _stmatrix_register_starts(op)
+        if register_starts is None:
+            return self._lower_move_wrmem_wgmma_to_addrmem(op)
+        return self._lower_move_wrmem_wgmma_to_stmatrix(op, register_starts)
+
     def _lower_move_wrmem_wgmma_to_addrmem(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
@@ -1141,17 +1144,17 @@ class LowerToPtxTemplate(LoweringPass):
                 first1, n_dim,
             )
             assert next_di == di and next_dj == dj + 16
-            relative_col = dj - col_start
-            assert relative_col >= 0 and relative_col % 32 == 0
-            block, inner = divmod(relative_col, block_width)
-            base_offset = (
-                (block * root_sizes[0] + di) * block_width + inner
+            offset0 = _get_stmatrix_store_static_offset(
+                first0, n_dim, col_start, dst_m,
+            )
+            offset1 = _get_stmatrix_store_static_offset(
+                first0 + 1, n_dim, col_start, dst_m,
             )
             groups.extend([
-                ([first0, first0 + 2, first1, first1 + 2], base_offset * 2),
+                ([first0, first0 + 2, first1, first1 + 2], offset0),
                 (
                     [first0 + 1, first0 + 3, first1 + 1, first1 + 3],
-                    (base_offset + 8 * 64) * 2,
+                    offset1,
                 ),
             ])
         for registers, physical_offset in groups:
@@ -1509,36 +1512,6 @@ def _get_wgmma_layout_0_static_offsets(reg: int, n_dim: int = 128) -> tuple[int,
     m, w = divmod(reg // 4, n_groups)
     di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][reg % 4]
     return (m * 64 + di, w * 16 + dj)
-
-
-def _tma_coordinates(
-    desc_type: TmaDescType,
-    index_names: list[str],
-    prefix: str,
-) -> tuple[list[str], list[str]]:
-    layout = physical_layout(desc_type)
-    if layout is None:
-        return [], [
-            f"${{b32:operand.{name}.val}}"
-            for name in reversed(index_names)
-        ]
-
-    assert desc_type.gmem_type.rank == 2
-    assert len(index_names) == 2
-    row = f"${{b32:operand.{index_names[0]}.val}}"
-    col = f"${{b32:operand.{index_names[1]}.val}}"
-    block = f"${{b32:{prefix}_block}}"
-    inner = f"${{b32:{prefix}_inner}}"
-    block_width, order = layout
-    lines = [
-        f"div.u32 {block}, {col}, {block_width};",
-        f"rem.u32 {inner}, {col}, {block_width};",
-    ]
-    if order == "row_major":
-        coordinates = [inner, block, row]
-    else:
-        coordinates = [inner, row, block]
-    return lines, coordinates
 
 
 def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
