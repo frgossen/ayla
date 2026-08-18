@@ -38,6 +38,7 @@ class BenchGemmConfig:
     op: Callable  # the GEMM to time, called as op(a, b)
     dtype: torch.dtype
     allow_tf32: bool = True
+    is_torch_mm_baseline: bool = False
 
     @property
     def flops(self) -> int:
@@ -155,20 +156,18 @@ def _bench(cfg: BenchGemmConfig) -> BenchResult:
 def _populate_percentages(
     configs: list[BenchGemmConfig], results: list[BenchResult]
 ) -> None:
-    torch_mm_tflops = next(
-        (
-            result.tflops
-            for cfg, result in zip(configs, results)
-            if cfg.op is torch.mm
-        ),
-        None,
-    )
+    torch_mm_tflops = {
+        (cfg.m, cfg.n, cfg.k, cfg.dtype): result.tflops
+        for cfg, result in zip(configs, results)
+        if cfg.op is torch.mm or cfg.is_torch_mm_baseline
+    }
     device_name = torch.cuda.get_device_name(0)
     for cfg, result in zip(configs, results):
         peak = _PEAK_DENSE_TC_TFLOPS.get((device_name, cfg.dtype))
         result.peak_pct = result.tflops / peak * 100 if peak else None
-        if torch_mm_tflops is not None:
-            result.torch_mm_pct = result.tflops / torch_mm_tflops * 100
+        baseline = torch_mm_tflops.get((cfg.m, cfg.n, cfg.k, cfg.dtype))
+        if baseline is not None:
+            result.torch_mm_pct = result.tflops / baseline * 100
 
 
 def _format_value(value, name: str) -> str:
@@ -232,7 +231,30 @@ def main() -> None:
             label, 4096, 4096, 4096, getattr(torch.ops.ayla, op), torch.bfloat16,
         )
 
+    def torch_mm_bt(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.mm(a, b.t())
+
     configs = [
+        BenchGemmConfig(
+            label="torch.mm.bf16 16K (A @ B.T)",
+            m=16384,
+            n=16384,
+            k=16384,
+            op=torch_mm_bt,
+            dtype=torch.bfloat16,
+            is_torch_mm_baseline=True,
+        ),
+        BenchGemmConfig(
+            label="ayla.auto_matmul 16K (retained best)",
+            m=16384,
+            n=16384,
+            k=16384,
+            op=(
+                torch.ops.ayla
+                .auto_matmul_16384_wgmma256_wg_tma_store_k3_m256_n192_wg192_split3_ctagroupm8_3d_best
+            ),
+            dtype=torch.bfloat16,
+        ),
         BenchGemmConfig(
             label="torch.mm.bf16",
             m=4096,
