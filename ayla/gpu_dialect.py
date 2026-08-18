@@ -1113,6 +1113,21 @@ class TmaDescType(Type):
         return cls.build(arg_idx, gmem_type, tile_shape, swizzle=swizzle, attrs=attrs)
 
 
+def physical_layout(
+    tensor_type: SmemTensorType | TmaDescType,
+) -> tuple[int, str] | None:
+    """Return validated ``(block_width, order)`` layout metadata."""
+    layout = tensor_type.attrs.get("physical_layout")
+    if layout is None:
+        return None
+    assert isinstance(layout, dict)
+    block_width = layout.get("block_width")
+    order = layout.get("order", "row_major")
+    assert isinstance(block_width, int) and block_width > 0
+    assert isinstance(order, str) and order in ("row_major", "block_major")
+    return block_width, order
+
+
 @gpu_dialect.register_type("rmem_tensor")
 class RmemTensorType(RegMemTensorType):
     """Register-memory tensor (per-thread).

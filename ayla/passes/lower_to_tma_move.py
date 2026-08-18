@@ -85,11 +85,16 @@ class LowerToTmaMove(LoweringPass):
         entry_block = root.definition
         assert isinstance(entry_block, Block)
 
+        layout = smem.type.attrs.get("physical_layout")
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=root.type,
             tile_shape=list(smem.type.sizes),
             swizzle=smem.type.swizzle,
+            attrs=(
+                {"physical_layout": layout}
+                if layout is not None else None
+            ),
         )
         desc_value = Value(
             name=f"{root.name}_desc" if root.name else None,
