@@ -11,7 +11,13 @@ from ayla.base.ir import find_ops
 from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
     best_auto_matmul_16384_wgmma256_wg_tma_store_module,
+    best_auto_matmul_2048_wgmma256_wg_tma_store_module,
     best_auto_matmul_4096_wgmma256_wg_tma_store_module,
+    best_auto_matmul_laguna_down_wgmma256_wg_tma_store_module,
+    best_auto_matmul_laguna_up_wgmma256_wg_tma_store_module,
+    best_auto_matmul_muse_down_wgmma256_wg_tma_store_module,
+    best_auto_matmul_muse_intermediate_wgmma256_wg_tma_store_module,
+    best_auto_matmul_muse_up_wgmma256_wg_tma_store_module,
 )
 from ayla.gpu_dialect import MoveOp, TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
@@ -157,6 +163,32 @@ def test_retained_16384_kernel_uses_wide_grouped_ctas_and_ab_promotion():
     assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
 
 
+def test_retained_2048_kernel_uses_two_resident_cta_tile():
+    kernel = make_ptx_kernel(
+        best_auto_matmul_2048_wgmma256_wg_tma_store_module()
+    )
+    assert kernel.name.endswith(
+        "_2048_wgmma256_wg_tma_store_k2_n128_split2_"
+        "ctagroupm8_3d_best"
+    )
+    assert kernel.grid_dim == (8, 16, 2)
+    assert kernel.block_dim == (256, 1, 1)
+    assert ".reqntid 256, 1, 1" in kernel.ptx
+
+
+def test_retained_muse_intermediate_uses_grouped_192_square_tile():
+    kernel = make_ptx_kernel(
+        best_auto_matmul_muse_intermediate_wgmma256_wg_tma_store_module()
+    )
+    assert kernel.name.endswith(
+        "_k3_m192_n192_wg192_split3_ctagroupm13_3d_"
+        "muse_intermediate_best"
+    )
+    assert kernel.grid_dim == (13, 104, 8)
+    assert kernel.block_dim == (384, 1, 1)
+    assert ".reqntid 384, 1, 1" in kernel.ptx
+
+
 def test_lhs_descriptor_precompute_is_an_opt_in_ptx_variant():
     baseline = make_ptx_kernel(
         best_auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -227,6 +259,68 @@ def test_regrouped_stmatrix_rows_use_dense_block_major_swizzled_output():
     # derived statically; regrouping does not add stores.
     assert kernel.ptx.count(", 896;") == 1
     assert kernel.ptx.count("bar.sync") == 33
+
+
+def test_small_wgmma_output_tiles_are_supported():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            problem_size=512,
+            output_m_tile=64,
+            output_n_tile=64,
+            operand_stages=2,
+            output_slices=1,
+            output_tma_inner_padding=0,
+            regroup_stmatrix_block_major=True,
+        )
+    )
+    assert kernel.grid_dim == (8, 8, 1)
+    assert kernel.block_dim == (128, 1, 1)
+    assert kernel.ptx.count("wgmma.mma_async") == 16
+    assert kernel.ptx.count("stmatrix.") == 4
+
+
+def test_rectangular_problem_dimensions_are_preserved():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            problem_m=3072,
+            problem_n=1024,
+            problem_k=3072,
+            output_m_tile=256,
+            output_n_tile=128,
+            operand_stages=2,
+            output_slices=2,
+            output_tma_inner_padding=0,
+            regroup_stmatrix_block_major=True,
+        )
+    )
+    assert kernel.name.startswith("auto_matmul_m3072_n1024_k3072_")
+    assert kernel.grid_dim == (12, 8, 1)
+    descriptors = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType)
+    }
+    assert descriptors[0].gmem_type.sizes == [3072, 3072]
+    assert descriptors[1].gmem_type.sizes == [1024, 3072]
+    assert descriptors[2].gmem_type.sizes == [3072, 1024]
+
+
+def test_retained_model_shape_helpers_preserve_launch_geometry():
+    expected = (
+        (best_auto_matmul_laguna_up_wgmma256_wg_tma_store_module,
+         (16, 8, 1), (384, 1, 1)),
+        (best_auto_matmul_laguna_down_wgmma256_wg_tma_store_module,
+         (8, 16, 1), (256, 1, 1)),
+        (best_auto_matmul_muse_up_wgmma256_wg_tma_store_module,
+         (52, 78, 1), (256, 1, 1)),
+        (best_auto_matmul_muse_intermediate_wgmma256_wg_tma_store_module,
+         (13, 104, 8), (384, 1, 1)),
+        (best_auto_matmul_muse_down_wgmma256_wg_tma_store_module,
+         (13, 35, 6), (512, 1, 1)),
+    )
+    for build, grid, block in expected:
+        kernel = make_ptx_kernel(build())
+        assert kernel.grid_dim == grid
+        assert kernel.block_dim == block
 
 
 def test_four_output_tiles_support_n_major_cta_raster():
@@ -375,6 +469,27 @@ def test_k128_operand_tile_uses_block_major_3d_tma():
     assert "tensor.2d.shared::cluster.global" not in kernel.ptx
     assert kernel.ptx.count("[32768]") == 2
     assert kernel.ptx.count("[65536]") == 2
+
+
+def test_k128_startup_tma_stage_order_ignores_pipelined_label_reuse():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_size=1024,
+        output_m_tile=128,
+        output_n_tile=64,
+        operand_stages=4,
+        operand_k_tile=128,
+        output_tma_inner_padding=0,
+        regroup_stmatrix_block_major=True,
+        startup_tma_stage_order=(0, 1, 3, 2),
+    ))
+    startup_loads = [
+        kernel.ptx.index(f'label: "mm_lhs_smem_iter{stage}_async"')
+        for stage in range(4)
+    ]
+    assert (
+        startup_loads[0] < startup_loads[1]
+        < startup_loads[3] < startup_loads[2]
+    )
 
 
 def test_k3_keeps_warpgroup_descriptor_arithmetic_uniform():

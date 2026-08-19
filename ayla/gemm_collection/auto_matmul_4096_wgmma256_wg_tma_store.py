@@ -33,6 +33,9 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 def auto_matmul_4096_wgmma256_wg_tma_store_module(
     *, problem_size: int = 4096,
+    problem_m: int | None = None,
+    problem_n: int | None = None,
+    problem_k: int | None = None,
     output_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
@@ -75,8 +78,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
 ):
     if output_tiles_per_cta not in (1, 2, 3, 4, 8):
         raise ValueError("output_tiles_per_cta must be 1, 2, 3, 4, or 8")
-    if problem_size <= 0:
-        raise ValueError("problem_size must be positive")
+    problem_m = problem_size if problem_m is None else problem_m
+    problem_n = problem_size if problem_n is None else problem_n
+    problem_k = problem_size if problem_k is None else problem_k
+    if min(problem_m, problem_n, problem_k) <= 0:
+        raise ValueError("problem dimensions must be positive")
     if output_tile_group is None:
         output_tile_group = (output_tiles_per_cta, 1)
     if (len(output_tile_group) != 2
@@ -86,16 +92,18 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             "output_tile_group must be (M tiles, N tiles) whose product "
             "equals output_tiles_per_cta"
         )
-    if output_m_tile not in (128, 192, 256):
-        raise ValueError("output_m_tile must be 128, 192, or 256")
-    if output_n_tile not in (192, 256, 384):
-        raise ValueError("output_n_tile must be 192, 256, or 384")
-    if operand_k_tile not in (16, 32, 64, 128):
-        raise ValueError("operand_k_tile must be 16, 32, 64, or 128")
+    if output_m_tile not in (64, 128, 192, 256):
+        raise ValueError("output_m_tile must be 64, 128, 192, or 256")
+    if output_n_tile not in (64, 128, 192, 256, 384):
+        raise ValueError("output_n_tile must be 64, 128, 192, 256, or 384")
+    if operand_k_tile not in (16, 32, 64, 128, 256):
+        raise ValueError(
+            "operand_k_tile must be 16, 32, 64, 128, or 256"
+        )
     if operand_swizzle not in ("32B", "64B", "128B"):
         raise ValueError("unsupported operand swizzle")
     if warpgroup_n_tile is None:
-        warpgroup_n_tile = output_n_tile if output_n_tile in (192, 256) else 128
+        warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     if output_n_tile % warpgroup_n_tile:
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix"):
@@ -143,7 +151,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     if reuse_k_tail_mbarrier and (
         operand_stages != 3
         or operand_k_tile != 64
-        or (problem_size // operand_k_tile) % operand_stages != 1
+        or (problem_k // operand_k_tile) % operand_stages != 1
     ):
         raise ValueError(
             "K-tail barrier reuse currently requires three K=64 stages and "
@@ -167,7 +175,12 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             raise ValueError("STMatrix regrouping requires STMatrix output")
         output_tma_inner_size = 64
         output_tma_inner_padding = 0
-    name = f"auto_matmul_{problem_size}_wgmma256_wg_tma_store_k{operand_stages}"
+    problem_name = (
+        str(problem_size)
+        if problem_m == problem_n == problem_k == problem_size
+        else f"m{problem_m}_n{problem_n}_k{problem_k}"
+    )
+    name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
     if operand_swizzle != "128B":
@@ -204,8 +217,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             name += "_localfirst"
     if variant_suffix is not None:
         name += f"_{variant_suffix}"
-    m_blocks = (problem_size + output_m_tile - 1) // output_m_tile
-    n_blocks = (problem_size + output_n_tile - 1) // output_n_tile
+    m_blocks = (problem_m + output_m_tile - 1) // output_m_tile
+    n_blocks = (problem_n + output_n_tile - 1) // output_n_tile
     group_m, group_n = output_tile_group
     grid_x = (m_blocks + group_m - 1) // group_m
     grid_y = (n_blocks + group_n - 1) // group_n
@@ -234,8 +247,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     )
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) grid_dim=[{logical_launch_grid[0]}, {logical_launch_grid[1]}, 1] block_dim=[128, 1, 1]{cluster_attr} {{
-            matmul(%a: gmem_tensor<{problem_size}x{problem_size}xbf16>, %b: gmem_tensor<{problem_size}x{problem_size}xbf16>, %c: gmem_tensor<{problem_size}x{problem_size}xbf16>) attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem_tensor<{problem_m}x{problem_k}xbf16>, %b: gmem_tensor<{problem_n}x{problem_k}xbf16>, %c: gmem_tensor<{problem_m}x{problem_n}xbf16>) grid_dim=[{logical_launch_grid[0]}, {logical_launch_grid[1]}, 1] block_dim=[128, 1, 1]{cluster_attr} {{
+            matmul(%a: gmem_tensor<{problem_m}x{problem_k}xbf16>, %b: gmem_tensor<{problem_n}x{problem_k}xbf16>, %c: gmem_tensor<{problem_m}x{problem_n}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
     if cluster_shape != (1, 1):
@@ -346,7 +359,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         for user, operand_index in y_uses:
             user.operands[operand_index] = logical_y
     wg_dim, wg_size = (
-        ("M", 64) if output_n_tile in (192, 256)
+        ("M", 64) if output_n_tile <= 256
         else ("N", warpgroup_n_tile)
     )
     module = tile_matmul(
@@ -520,7 +533,12 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             stage = int(match.group(1))
             coordinate = block.ops[index - 1]
             if not isinstance(coordinate, TileOp):
-                raise ValueError("startup TMA load is not preceded by its tile")
+                # The pipelined loop body can reuse the startup label with an
+                # extra unroll suffix.  Only the top-level startup copies are
+                # adjacent to their coordinate TileOp.
+                continue
+            if stage in stage_pairs:
+                raise ValueError(f"duplicate startup TMA stage {stage}")
             stage_pairs[stage] = (coordinate, op)
         if set(stage_pairs) != set(startup_tma_stage_order):
             raise ValueError(
@@ -591,10 +609,90 @@ def best_auto_matmul_4096_wgmma256_wg_tma_store_module(
     )
 
 
+def best_auto_matmul_512_wgmma256_wg_tma_store_module():
+    """Build the retained square 512 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_size=512,
+        output_m_tile=64,
+        output_n_tile=64,
+        operand_stages=2,
+        operand_k_tile=256,
+        regroup_stmatrix_block_major=True,
+        direct_warp_group_id=True,
+        emit_reqntid=True,
+        variant_suffix="best",
+        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+    )
+
+
+def best_auto_matmul_1024_wgmma256_wg_tma_store_module():
+    """Build the retained square 1024 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_size=1024,
+        output_m_tile=128,
+        output_n_tile=64,
+        operand_stages=4,
+        operand_k_tile=128,
+        regroup_stmatrix_block_major=True,
+        cta_group_m=4,
+        startup_tma_stage_order=(0, 1, 2, 3),
+        direct_warp_group_id=True,
+        emit_reqntid=True,
+        variant_suffix="best",
+        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+    )
+
+
+def best_auto_matmul_2048_wgmma256_wg_tma_store_module():
+    """Build the retained two-resident-CTA square 2048 specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_size=2048,
+        output_m_tile=128,
+        output_n_tile=128,
+        operand_stages=2,
+        output_slices=2,
+        regroup_stmatrix_block_major=True,
+        cta_group_m=8,
+        cta_group_m_3d=True,
+        startup_tma_stage_order=(0, 1),
+        direct_warp_group_id=True,
+        emit_reqntid=True,
+        variant_suffix="best",
+        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+    )
+
+
+def best_auto_matmul_8192_wgmma256_wg_tma_store_module():
+    """Build the retained square 8192 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_size=8192,
+        output_tiles_per_cta=4,
+        operand_stages=4,
+        output_slices=2,
+        regroup_stmatrix_block_major=True,
+        startup_tma_stage_order=(0, 1, 3, 2),
+        precompute_wgmma_rhs_descriptors=True,
+        direct_warp_group_id=True,
+        emit_reqntid=True,
+        variant_suffix="best",
+        operand_move_attrs={
+            "rhs": {
+                "l2_cache_hint": "evict_last",
+                "l2_promotion": "256B",
+            },
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
 # The CUDA Driver defaults to optimization level 4.  Paired H100 measurements
 # of this already-explicit PTX consistently favor level 1 by about 0.06-0.14%
 # without changing registers, local memory, or numerical output.
+BEST_AUTO_MATMUL_512_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=2)
+BEST_AUTO_MATMUL_1024_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=2)
+BEST_AUTO_MATMUL_2048_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=4)
 BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=1)
+BEST_AUTO_MATMUL_8192_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
 
 
 def best_auto_matmul_16384_wgmma256_wg_tma_store_module():
@@ -636,6 +734,105 @@ def best_auto_matmul_16384_wgmma256_wg_tma_store_module():
 # The 512-thread 256x192 kernel consistently favors Driver O3; unlike the
 # 256-thread specialization, precomputing A descriptors does not help it.
 BEST_AUTO_MATMUL_16384_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
+
+
+def best_auto_matmul_laguna_up_wgmma256_wg_tma_store_module():
+    """Build the retained 3072x1024x3072 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=3072, problem_n=1024, problem_k=3072,
+        output_m_tile=192, output_n_tile=128,
+        operand_stages=4, output_slices=2,
+        regroup_stmatrix_block_major=True,
+        startup_tma_stage_order=(0, 1, 2, 3),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="laguna_up_best",
+        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+    )
+
+
+def best_auto_matmul_laguna_down_wgmma256_wg_tma_store_module():
+    """Build the retained 1024x3072x1024 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=1024, problem_n=3072, problem_k=1024,
+        output_m_tile=128, output_n_tile=192,
+        operand_stages=4, output_slices=3,
+        regroup_stmatrix_block_major=True,
+        startup_tma_stage_order=(0, 1, 2, 3),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="laguna_down_best",
+        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+    )
+
+
+def best_auto_matmul_muse_up_wgmma256_wg_tma_store_module():
+    """Build the retained 6656x19968x6656 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=6656, problem_n=19968, problem_k=6656,
+        output_m_tile=128, output_n_tile=256,
+        operand_stages=4, output_slices=2,
+        regroup_stmatrix_block_major=True,
+        startup_tma_stage_order=(0, 1, 2, 3),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="muse_up_best",
+        operand_move_attrs={
+            "rhs": {"l2_cache_hint": "evict_last", "l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
+def best_auto_matmul_muse_intermediate_wgmma256_wg_tma_store_module():
+    """Build the retained grouped 19968-cubed BF16 specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=19968, problem_n=19968, problem_k=19968,
+        output_m_tile=192, output_n_tile=192,
+        operand_stages=3, output_slices=3,
+        regroup_stmatrix_block_major=True,
+        cta_group_m=13, cta_group_m_3d=True,
+        startup_tma_stage_order=(0, 2, 1),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="muse_intermediate_best",
+        operand_move_attrs={
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
+def best_auto_matmul_muse_down_wgmma256_wg_tma_store_module():
+    """Build the retained 19968x6656x19968 BF16 GEMM specialization."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=19968, problem_n=6656, problem_k=19968,
+        output_m_tile=256, output_n_tile=192,
+        operand_stages=3, output_slices=3,
+        regroup_stmatrix_block_major=True,
+        cta_group_m=13, cta_group_m_3d=True,
+        startup_tma_stage_order=(0, 2, 1),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="muse_down_best",
+        operand_move_attrs={
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
+BEST_AUTO_MATMUL_LAGUNA_UP_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=3,
+)
+BEST_AUTO_MATMUL_LAGUNA_DOWN_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=3,
+)
+BEST_AUTO_MATMUL_MUSE_UP_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=4,
+)
+BEST_AUTO_MATMUL_MUSE_INTERMEDIATE_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=3,
+)
+BEST_AUTO_MATMUL_MUSE_DOWN_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=3,
+)
 
 
 def _register_auto_matmul_4096_wgmma256_wg_tma_store() -> None:

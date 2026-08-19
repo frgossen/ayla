@@ -12,6 +12,7 @@ side-effects out.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import cache
 
@@ -360,6 +361,96 @@ static void launch_kernel(
     }
 }
 
+struct PreparedLaunch {
+    CUfunction fn;
+    std::tuple<int, int, int> grid_dim;
+    std::tuple<int, int, int> block_dim;
+    std::tuple<int, int, int> cluster_dim;
+    int64_t shared_mem_bytes;
+    std::vector<int64_t> ptr_storage;
+    std::vector<void*> arg_ptrs;
+};
+
+static uintptr_t prepare_launch(
+    uintptr_t function_handle,
+    std::tuple<int, int, int> grid_dim,
+    std::tuple<int, int, int> block_dim,
+    std::tuple<int, int, int> cluster_dim,
+    py::list params,
+    int64_t shared_mem_bytes
+) {
+    auto prepared = new PreparedLaunch{
+        reinterpret_cast<CUfunction>(function_handle),
+        grid_dim, block_dim, cluster_dim, shared_mem_bytes, {}, {},
+    };
+    size_t n = params.size();
+    prepared->ptr_storage.reserve(n);
+    prepared->arg_ptrs.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        auto obj = params[i];
+        if (py::isinstance<py::tuple>(obj)) {
+            auto tup = obj.cast<py::tuple>();
+            auto tensor = tup[0].cast<at::Tensor>();
+            prepared->arg_ptrs.push_back(const_cast<CUtensorMap*>(
+                tensor_map_cached(
+                    tensor,
+                    tup[1].cast<std::vector<int64_t>>(),
+                    tup[2].cast<std::string>(),
+                    tup[3].cast<int64_t>(),
+                    tup[4].cast<int64_t>(),
+                    tup[5].cast<std::string>(),
+                    tup[6].cast<std::string>())));
+        } else {
+            auto tensor = obj.cast<at::Tensor>();
+            prepared->ptr_storage.push_back(
+                reinterpret_cast<int64_t>(tensor.data_ptr()));
+            prepared->arg_ptrs.push_back(&prepared->ptr_storage.back());
+        }
+    }
+    return reinterpret_cast<uintptr_t>(prepared);
+}
+
+static void destroy_prepared_launch(uintptr_t handle) {
+    delete reinterpret_cast<PreparedLaunch*>(handle);
+}
+
+static void launch_prepared(uintptr_t handle) {
+    auto prepared = reinterpret_cast<PreparedLaunch*>(handle);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto [gx, gy, gz] = prepared->grid_dim;
+    auto [bx, by, bz] = prepared->block_dim;
+    auto [cx, cy, cz] = prepared->cluster_dim;
+    if (cx == 1 && cy == 1 && cz == 1) {
+        CU_CHECK(cuLaunchKernel(
+            prepared->fn, gx, gy, gz, bx, by, bz,
+            static_cast<unsigned int>(prepared->shared_mem_bytes),
+            stream, prepared->arg_ptrs.data(), /*extra=*/nullptr
+        ));
+    } else {
+        CUlaunchAttribute attr{};
+        attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attr.value.clusterDim.x = cx;
+        attr.value.clusterDim.y = cy;
+        attr.value.clusterDim.z = cz;
+        CUlaunchConfig config{};
+        config.gridDimX = gx;
+        config.gridDimY = gy;
+        config.gridDimZ = gz;
+        config.blockDimX = bx;
+        config.blockDimY = by;
+        config.blockDimZ = bz;
+        config.sharedMemBytes = static_cast<unsigned int>(
+            prepared->shared_mem_bytes);
+        config.hStream = stream;
+        config.attrs = &attr;
+        config.numAttrs = 1;
+        CU_CHECK(cuLaunchKernelEx(
+            &config, prepared->fn, prepared->arg_ptrs.data(),
+            /*extra=*/nullptr
+        ));
+    }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("module_load_data", &module_load_data,
           py::arg("ptx"),
@@ -371,6 +462,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
     m.def("function_attributes", &function_attributes);
+    m.def("prepare_launch", &prepare_launch);
+    m.def("destroy_prepared_launch", &destroy_prepared_launch);
+    m.def("launch_prepared", &launch_prepared);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -441,6 +535,7 @@ class PtxLauncher:
         self._jit_options = jit_options or PtxJitOptions()
         self._module = None
         self._function = None
+        self._prepared_launches: OrderedDict[tuple, int] = OrderedDict()
         # Map kernel arg index → user tensor index.
         self._arg_to_tensor: dict[int, int] = {}
         ti = 0
@@ -485,16 +580,32 @@ class PtxLauncher:
 
     def __call__(self, *tensors) -> None:
         self._ensure_loaded()
-        params = self._build_params(tensors)
-        self._assert_params(params)
-        self._ext.launch_kernel(
-            self._function,
-            self._kernel.grid_dim,
-            self._kernel.block_dim,
-            self._kernel.cluster_dim,
-            params,
-            self._kernel.shared_mem_bytes,
+        key = tuple(
+            (
+                tensor.data_ptr(), tensor.dtype, tensor.device.index,
+                tuple(tensor.shape), tuple(tensor.stride()),
+            )
+            for tensor in tensors
         )
+        prepared = self._prepared_launches.get(key)
+        if prepared is None:
+            params = self._build_params(tensors)
+            self._assert_params(params)
+            prepared = self._ext.prepare_launch(
+                self._function,
+                self._kernel.grid_dim,
+                self._kernel.block_dim,
+                self._kernel.cluster_dim,
+                params,
+                self._kernel.shared_mem_bytes,
+            )
+            self._prepared_launches[key] = prepared
+            if len(self._prepared_launches) > 64:
+                _, evicted = self._prepared_launches.popitem(last=False)
+                self._ext.destroy_prepared_launch(evicted)
+        else:
+            self._prepared_launches.move_to_end(key)
+        self._ext.launch_prepared(prepared)
 
     def _build_params(self, tensors):
         params = []
@@ -540,6 +651,8 @@ class PtxLauncher:
 
     def __del__(self):
         try:
+            for prepared in self._prepared_launches.values():
+                self._ext.destroy_prepared_launch(prepared)
             self._ext.module_unload(self._module)
         except Exception:
             pass

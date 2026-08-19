@@ -80,9 +80,15 @@ def test_cwise_add():
     )
     ptx_launcher = make_ptx_launcher(kernel)
     ptx_launcher(a, b, c)
+    ptx_launcher(a, b, c)  # Reuse the prepared launch for identical tensors.
 
     torch.cuda.synchronize()
     assert torch.allclose(c, a + b)
+
+    c2 = torch.empty_like(a)
+    ptx_launcher(a, b, c2)  # Prepare a second pointer/layout tuple.
+    torch.cuda.synchronize()
+    assert torch.allclose(c2, a + b)
 
     configured = make_ptx_launcher(
         kernel,
