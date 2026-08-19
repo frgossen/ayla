@@ -105,10 +105,11 @@ def ptx_to_python(ptx: str, *, header: list[str] | None = None) -> str:
 
     Schedule-level repetition is considered first and may cover arbitrarily
     many PTX blocks.  Within an occurrence, a loop is emitted only for
-    at least three consecutive copies of a one-to-eight-line pattern, and every
+    at least three consecutive copies of a pattern up to sixteen lines, and every
     changing register, label, shared symbol, or address offset must be an
-    arithmetic progression.  Unnamed ``PTX`` runs are retained because they
-    contain scalar glue, directives, braces, and compiler metadata.
+    arithmetic progression. The wider bound keeps paired elementwise epilogues
+    compact. Unnamed ``PTX`` runs are retained because they contain scalar glue,
+    directives, braces, and compiler metadata.
     """
     source_lines = ptx.splitlines()
     nonempty_lines = [line.strip() for line in source_lines if line.strip()]
@@ -287,6 +288,56 @@ def _default_readable_ptx() -> str:
     return make_python_ptx(module)
 
 
+def laguna_swiglu_ptx_kernels() -> dict[str, PtxKernel]:
+    """Build the two PTX kernels in the optimized Laguna SwiGLU pass."""
+    from ayla.swiglu import (
+        best_auto_matmul_laguna_swiglu_output_wgmma256_wg_tma_store_module,
+        laguna_fused_dual_projection_module,
+    )
+
+    return {
+        "fused_dual_swiglu": make_ptx_kernel(
+            laguna_fused_dual_projection_module()
+        ),
+        "output_projection": make_ptx_kernel(
+            best_auto_matmul_laguna_swiglu_output_wgmma256_wg_tma_store_module()
+        ),
+    }
+
+
+def make_laguna_swiglu_python_ptx() -> dict[str, str]:
+    """Return readable Python/PTX lifts for the full optimized SwiGLU pass."""
+    return {
+        name: ptx_kernel_to_python(kernel)
+        for name, kernel in laguna_swiglu_ptx_kernels().items()
+    }
+
+
+def _write_laguna_swiglu_package(output: Path) -> list[Path]:
+    """Write both readable kernels and an importable pipeline manifest."""
+    output.mkdir(parents=True, exist_ok=True)
+    sources = make_laguna_swiglu_python_ptx()
+    written = []
+    for name, source in sources.items():
+        path = output / f"{name}.py"
+        path.write_text(source)
+        written.append(path)
+    init = output / "__init__.py"
+    init.write_text(
+        '"""Readable PTX programs for the optimized Laguna SwiGLU pass."""\n'
+        "\n"
+        "from .fused_dual_swiglu import PTX_PROGRAM as fused_dual_swiglu\n"
+        "from .output_projection import PTX_PROGRAM as output_projection\n"
+        "\n"
+        "KERNEL_ORDER = (fused_dual_swiglu, output_projection)\n"
+        "\n"
+        "def PTX_PROGRAMS():\n"
+        "    return tuple(program() for program in KERNEL_ORDER)\n"
+    )
+    written.append(init)
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     """Generate readable Python from the default kernel or an existing PTX."""
     parser = argparse.ArgumentParser(
@@ -311,9 +362,28 @@ def main(argv: list[str] | None = None) -> int:
             "built-in kernel"
         ),
     )
+    parser.add_argument(
+        "--target",
+        choices=("gemm", "laguna-swiglu"),
+        default="gemm",
+        help=(
+            "built-in program to generate when no input file is provided; "
+            "laguna-swiglu writes a directory containing both pipeline kernels"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.input is None:
+        if args.target == "laguna-swiglu":
+            output = args.output or (
+                Path(__file__).resolve().parents[1]
+                / "generated_ptx"
+                / "laguna_swiglu"
+            )
+            written = _write_laguna_swiglu_package(output)
+            for path in written:
+                print(f"wrote {path}")
+            return 0
         source = _default_readable_ptx()
         output = args.output or (
             Path(__file__).resolve().parents[1]
@@ -321,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
             / "auto_matmul_k3_4tiles_readable_ptx.py"
         )
     else:
+        if args.target != "gemm":
+            parser.error("--target cannot be combined with an input PTX file")
         source = ptx_to_python(args.input.read_text())
         output = args.output
 
@@ -705,15 +777,14 @@ def _render_template(template: _Template) -> list[str]:
                 result.extend(_append(value_name, part.lines))
             else:
                 result.append(f"for i in range({part.count}):")
-                for line in part.lines:
-                    result.extend(
-                        _append(
-                            value_name,
-                            (line,),
-                            indent=4,
-                            formatted=True,
-                        )
+                result.extend(
+                    _append(
+                        value_name,
+                        part.lines,
+                        indent=4,
+                        formatted=True,
                     )
+                )
         result.append(f'{value_name} = "\\n".join({value_name})')
 
     if singular:
@@ -880,8 +951,8 @@ def _string_statement(
         return [f'{pad}{statement}{prefix}"""{lines[0]}"""{suffix}']
     return [
         f'{pad}{statement}{prefix}"""{lines[0]}',
-        *(f"{pad}{line}" for line in lines[1:-1]),
-        f'{pad}{lines[-1]}"""{suffix}',
+        *lines[1:-1],
+        f'{lines[-1]}"""{suffix}',
     ]
 
 
@@ -908,7 +979,7 @@ def _compress_lines(lines: list[str]) -> list[_Text | _Loop]:
 def _best_loop(lines: list[str], start: int) -> _Loop | None:
     remaining = len(lines) - start
     best: tuple[int, _Loop] | None = None
-    for width in range(1, min(8, remaining // 3) + 1):
+    for width in range(1, min(16, remaining // 3) + 1):
         max_count = remaining // width
         for count in range(3, max_count + 1):
             samples = [
