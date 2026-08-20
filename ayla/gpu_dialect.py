@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import enum
 import math
-import string
 
 from .base.ir import Block, Dialect, Op, Region, Type, Value
 from .base.printer import Printer
