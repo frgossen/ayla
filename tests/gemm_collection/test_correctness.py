@@ -163,17 +163,22 @@ def test_retained_16384_kernel_uses_wide_grouped_ctas_and_ab_promotion():
     assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
 
 
-def test_retained_2048_kernel_uses_two_resident_cta_tile():
+def test_retained_2048_kernel_uses_cache_balanced_tile_and_rhs_policy():
     kernel = make_ptx_kernel(
         best_auto_matmul_2048_wgmma256_wg_tma_store_module()
     )
     assert kernel.name.endswith(
-        "_2048_wgmma256_wg_tma_store_k2_n128_split2_"
-        "ctagroupm8_3d_best"
+        "_2048_wgmma256_wg_tma_store_k4_split2_ctagroupm4_3d_best"
     )
-    assert kernel.grid_dim == (8, 16, 2)
+    assert kernel.grid_dim == (4, 8, 4)
     assert kernel.block_dim == (256, 1, 1)
     assert ".reqntid 256, 1, 1" in kernel.ptx
+    rhs_desc = next(
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx == 1
+    )
+    assert rhs_desc.l2_promotion == "256B"
+    assert kernel.ptx.count("createpolicy.fractional.L2::evict_last") == 1
 
 
 def test_retained_muse_intermediate_uses_grouped_192_square_tile():

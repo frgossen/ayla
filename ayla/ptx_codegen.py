@@ -33,6 +33,7 @@ from .passes.insert_syncs import InsertSyncs
 from .passes.infer_tma_multicast import InferTmaMulticast
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
+from .passes.schedule_async import ScheduleAsync
 from .passes.select_stmatrix import SelectStMatrix
 from .passes.lower_to_ptx_template import (
     LowerScalarToPtxTemplate,
@@ -48,6 +49,10 @@ class PtxLoweringPipeline(Pipeline):
         super().__init__()
         self.add_pass(InferTmaMulticast())
         self.add_pass(LowerToTmaMove())
+        # The high-level scheduler has already placed waits and TMA issues at
+        # shared-memory reuse boundaries. LowerToTmaMove creates only the
+        # descriptor-coordinate dependency cone that still needs hoisting.
+        self.add_pass(ScheduleAsync(sink_awaits=False))
         self.add_pass(LowerToAsync())
         self.add_pass(Folding())
         self.add_pass(CSE())

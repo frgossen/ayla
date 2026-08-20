@@ -31,18 +31,27 @@ from ..base.pipeline import Pass
 def _is_async_move(op: Op) -> bool:
     """The hoistable subset of async starts: data movement, not compute.
 
-    Covers a TMA descriptor move and an ``async`` wrapping only moves; an
-    ``async`` wrapping a matmul is tracked as a lock peer but never hoisted.
+    Covers an ``async`` wrapping only data movement, before or after TMA moves
+    have been lowered to descriptor-based ``tma_move`` ops. An ``async``
+    wrapping a matmul is tracked as a lock peer but never hoisted.
     """
-    if isinstance(op, TmaMoveOp):
-        return True
-    return isinstance(op, AsyncOp) and all(
-        isinstance(o, MoveOp) for o in op.body.entry_block.ops
+    if not isinstance(op, AsyncOp):
+        return False
+    body_ops = op.body.entry_block.ops
+    return bool(body_ops) and all(
+        isinstance(o, (MoveOp, TmaMoveOp)) for o in body_ops
     )
 
 
 def _is_await(op: Op) -> bool:
     return isinstance(op, AwaitOp)
+
+
+def _is_lowered_tma_async(op: Op) -> bool:
+    if not isinstance(op, AsyncOp):
+        return False
+    body_ops = op.body.entry_block.ops
+    return bool(body_ops) and all(isinstance(o, TmaMoveOp) for o in body_ops)
 
 
 def _can_swap(upper: Op, lower: Op) -> bool:
@@ -69,10 +78,12 @@ def _can_swap(upper: Op, lower: Op) -> bool:
     return True
 
 
-def _side_effect_free_operand_closure(seeds: list[Op], ops: list[Op]) -> list[Op]:
-    """The ``seeds`` plus their transitive side-effect-free dependency cone.
+def _side_effect_free_value_closure(
+    values: list[Value], ops: list[Op], *, seeds: list[Op] | None = None,
+) -> list[Op]:
+    """The transitive side-effect-free producers of ``values`` plus ``seeds``.
 
-    Walks operand definitions reachable from the seeds, keeping those that are
+    Walks definitions reachable from the values, keeping those that are
     in this block and side-effect-free, and stopping at any op that is not — a
     real barrier that must not be hoisted (including an ``alloc`` *with* an
     ``init``, which is not side-effect-free). Returned in block order. In valid
@@ -81,8 +92,8 @@ def _side_effect_free_operand_closure(seeds: list[Op], ops: list[Op]) -> list[Op
     pinned behind the ops that define its operands.
     """
     in_block = set(ops)
-    closure = set(seeds)
-    worklist: list[Value] = [v for seed in seeds for v in effective_operands(seed)]
+    closure = set(seeds or [])
+    worklist = list(values)
     while worklist:
         d = worklist.pop().definition
         if not isinstance(d, Op) or d not in in_block or d in closure:
@@ -92,6 +103,15 @@ def _side_effect_free_operand_closure(seeds: list[Op], ops: list[Op]) -> list[Op
         closure.add(d)
         worklist.extend(d.operands)
     return [o for o in ops if o in closure]
+
+
+def _side_effect_free_operand_closure(seeds: list[Op], ops: list[Op]) -> list[Op]:
+    """The ``seeds`` plus their transitive side-effect-free operand cone."""
+    return _side_effect_free_value_closure(
+        [v for seed in seeds for v in effective_operands(seed)],
+        ops,
+        seeds=seeds,
+    )
 
 
 def _bubble(
@@ -122,12 +142,24 @@ def _bubble(
 
 
 def _hoist_async_moves(ops: list[Op]) -> None:
-    # Targets: the async moves (matmuls are tracked as lock peers but never
-    # moved) plus the side-effect-free dependency cone feeding each. Then hoist
-    # each up.
-    targets = _side_effect_free_operand_closure(
-        [op for op in ops if _is_async_move(op)], ops
-    )
+    # Before TMA lowering, hoist async moves with their full operand closure.
+    # After lowering, leave the async issue at its established shared-memory
+    # reuse boundary and hoist only the arithmetic feeding TMA coordinates —
+    # not its lock, descriptor, or shared-memory allocation.
+    seeds = [
+        op for op in ops
+        if _is_async_move(op) and not _is_lowered_tma_async(op)
+    ]
+    lowered_tmas = [op for op in ops if _is_lowered_tma_async(op)]
+    coordinate_values = [
+        index
+        for async_op in lowered_tmas
+        for body_op in async_op.body.entry_block.ops
+        for index in body_op.indices
+    ]
+    target_set = set(_side_effect_free_operand_closure(seeds, ops))
+    target_set.update(_side_effect_free_value_closure(coordinate_values, ops))
+    targets = [op for op in ops if op in target_set]
     _bubble(ops, targets, step=-1)
 
 
@@ -139,9 +171,19 @@ def _sink_awaits(ops: list[Op]) -> None:
 
 class ScheduleAsync(Pass):
 
+    def __init__(self, *, sink_awaits: bool = True) -> None:
+        self.sink_awaits = sink_awaits
+
     def run_block(self, block: Block) -> None:
-        _hoist_async_moves(block.ops)
-        _sink_awaits(block.ops)
+        # Reordering through Block.ops directly would make every adjacent swap
+        # trigger _OpList's whole-block anchor reconciliation. Large unrolled
+        # GEMMs perform many swaps, so schedule a plain list and publish the
+        # final order once.
+        ops = list(block.ops)
+        _hoist_async_moves(ops)
+        if self.sink_awaits:
+            _sink_awaits(ops)
+        block.ops = ops
         super().run_block(block)
 
 

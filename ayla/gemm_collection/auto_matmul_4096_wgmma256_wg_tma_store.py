@@ -644,21 +644,32 @@ def best_auto_matmul_1024_wgmma256_wg_tma_store_module():
 
 
 def best_auto_matmul_2048_wgmma256_wg_tma_store_module():
-    """Build the retained two-resident-CTA square 2048 specialization."""
+    """Build the retained cache-balanced square 2048 specialization.
+
+    The 128x256 tile and four-stage K pipeline trade one-CTA residency for
+    substantially better first-touch operand throughput.  Grouping four M
+    tiles preserves enough RHS reuse to stay ahead on fixed hot inputs too.
+    """
     return auto_matmul_4096_wgmma256_wg_tma_store_module(
         problem_size=2048,
         output_m_tile=128,
-        output_n_tile=128,
-        operand_stages=2,
+        output_n_tile=256,
+        operand_stages=4,
         output_slices=2,
         regroup_stmatrix_block_major=True,
-        cta_group_m=8,
+        cta_group_m=4,
         cta_group_m_3d=True,
-        startup_tma_stage_order=(0, 1),
+        startup_tma_stage_order=(0, 1, 2, 3),
         direct_warp_group_id=True,
         emit_reqntid=True,
         variant_suffix="best",
-        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+        operand_move_attrs={
+            "rhs": {
+                "l2_cache_hint": "evict_last",
+                "l2_promotion": "256B",
+            },
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
     )
 
 
@@ -690,7 +701,7 @@ def best_auto_matmul_8192_wgmma256_wg_tma_store_module():
 # without changing registers, local memory, or numerical output.
 BEST_AUTO_MATMUL_512_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=2)
 BEST_AUTO_MATMUL_1024_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=2)
-BEST_AUTO_MATMUL_2048_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=4)
+BEST_AUTO_MATMUL_2048_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
 BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=1)
 BEST_AUTO_MATMUL_8192_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
 
