@@ -122,6 +122,49 @@ class KernelOp(Op):
     def num_warp_groups(self, value: int | None) -> None:
         self.attrs["num_warp_groups"] = value
 
+    def resolve_block_dim(self) -> tuple[int, int, int]:
+        """Resolve and store the concrete launch dimensions for this kernel.
+
+        A single warp group may use any 128-thread block shape. Multiple warp
+        groups currently use an x-only warp-group index, so those launches must
+        remain one-dimensional.
+        """
+        if all(dim is None for dim in self.block_dim):
+            raise ValueError(
+                f"kernel {self.name!r} block_dim is entirely unset: "
+                f"{self.block_dim}"
+            )
+        dims = [dim if dim is not None else 1 for dim in self.block_dim]
+        if not all(isinstance(dim, int) and dim > 0 for dim in dims):
+            raise ValueError(
+                f"kernel {self.name!r} has invalid block_dim: {tuple(dims)}"
+            )
+        if self.num_warp_groups is not None and self.num_warp_groups > 0:
+            num_warp_groups = self.num_warp_groups
+            num_threads = math.prod(dims)
+            if num_warp_groups == 1:
+                if num_threads != 128:
+                    raise ValueError(
+                        f"kernel {self.name!r} declares one warp group but "
+                        f"block_dim has {num_threads} threads: {tuple(dims)}"
+                    )
+            elif dims[1:] != [1, 1]:
+                raise ValueError(
+                    f"kernel {self.name!r} uses multiple warp groups with a "
+                    f"non-1D block_dim: {tuple(dims)}"
+                )
+            else:
+                expected_threads = num_warp_groups * 128
+                if dims[0] not in (128, expected_threads):
+                    raise ValueError(
+                        f"kernel {self.name!r} has incompatible block_dim "
+                        f"for {num_warp_groups} warp groups: {tuple(dims)}"
+                    )
+                dims[0] = expected_threads
+        resolved = tuple(dims)
+        self.block_dim = resolved
+        return resolved  # type: ignore[return-value]
+
     @property
     def extra_attrs(self) -> dict[str, object]:
         return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "num_warp_groups")}

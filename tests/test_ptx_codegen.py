@@ -67,6 +67,20 @@ def test_codegen_cwise_add():
         }""")
 
 
+def test_codegen_resolves_warp_group_block_dim_before_lowering():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
+          }
+        }"""))
+    [input_kernel] = module.body.entry_block.ops
+
+    kernel = make_ptx_kernel(module)
+    assert input_kernel.block_dim == (256, 1, 1)
+    assert kernel.block_dim == (256, 1, 1)
+    assert ".reqntid" not in kernel.ptx
+
+
 def test_codegen_naive_matmul_4096():
     """Codegen smoke test for the tile/alloc/load/store/matmul module."""
     module_str = textwrap.dedent("""\
