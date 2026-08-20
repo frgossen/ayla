@@ -575,7 +575,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
 
 
 def best_auto_matmul_4096_wgmma256_wg_tma_store_module(
-    *, precompute_wgmma_lhs_descriptors: bool = True,
+    *, precompute_wgmma_lhs_descriptors: bool = False,
     precompute_wgmma_rhs_descriptors: bool = False,
     direct_warp_group_id: bool = True,
     emit_reqntid: bool = True,
@@ -587,25 +587,19 @@ def best_auto_matmul_4096_wgmma256_wg_tma_store_module(
     """
     return auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=4,
-        operand_stages=3,
-        output_slices=1,
+        operand_stages=4,
+        output_slices=2,
         output_tma_inner_padding=0,
         output_store_buffers=1,
         regroup_stmatrix_block_major=True,
-        reuse_k_tail_mbarrier=True,
-        startup_tma_stage_order=(0, 2, 1),
+        reuse_k_tail_mbarrier=False,
+        startup_tma_stage_order=(0, 1, 3, 2),
         precompute_wgmma_lhs_descriptors=precompute_wgmma_lhs_descriptors,
         precompute_wgmma_rhs_descriptors=precompute_wgmma_rhs_descriptors,
         direct_warp_group_id=direct_warp_group_id,
         emit_reqntid=emit_reqntid,
-        variant_suffix="full_output_store",
-        operand_move_attrs={
-            "lhs": {
-                "l2_cache_hint": "evict_first",
-                "l2_promotion": "256B",
-            },
-            "dst": {"l2_cache_hint": "evict_first"},
-        },
+        variant_suffix="cold_best",
+        operand_move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
     )
 
 
@@ -696,13 +690,11 @@ def best_auto_matmul_8192_wgmma256_wg_tma_store_module():
     )
 
 
-# The CUDA Driver defaults to optimization level 4.  Paired H100 measurements
-# of this already-explicit PTX consistently favor level 1 by about 0.06-0.14%
-# without changing registers, local memory, or numerical output.
+# Retained driver optimization levels from paired H100 measurements.
 BEST_AUTO_MATMUL_512_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=2)
 BEST_AUTO_MATMUL_1024_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=2)
 BEST_AUTO_MATMUL_2048_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
-BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=1)
+BEST_AUTO_MATMUL_4096_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
 BEST_AUTO_MATMUL_8192_PTX_JIT_OPTIONS = PtxJitOptions(optimization_level=3)
 
 
@@ -712,8 +704,8 @@ def best_auto_matmul_16384_wgmma256_wg_tma_store_module():
     A 256x192 CTA uses four 64x192 warpgroups.  Three K64 stages plus three
     64-column output slices fit in shared memory, while the 8x16 3-D CTA phase
     balances A/B reuse.  At this size both operands benefit from 256-byte TMA
-    promotion.  Driver O3 and short-lived WGMMA descriptors are faster for the
-    512-thread kernel than the O1/A-precompute policy retained at 4096.
+    promotion.  Driver O3 and short-lived WGMMA descriptors are also retained
+    for the 512-thread kernel.
     """
     return auto_matmul_4096_wgmma256_wg_tma_store_module(
         problem_size=16384,

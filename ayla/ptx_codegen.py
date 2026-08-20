@@ -45,14 +45,19 @@ from .base.pipeline import Pipeline
 class PtxLoweringPipeline(Pipeline):
     """Lowers a high-level ModuleOp down to a PTX-template ModuleOp."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        schedule_tma_coordinates: bool = False,
+    ) -> None:
         super().__init__()
         self.add_pass(InferTmaMulticast())
         self.add_pass(LowerToTmaMove())
         # The high-level scheduler has already placed waits and TMA issues at
         # shared-memory reuse boundaries. LowerToTmaMove creates only the
         # descriptor-coordinate dependency cone that still needs hoisting.
-        self.add_pass(ScheduleAsync(sink_awaits=False))
+        if schedule_tma_coordinates:
+            self.add_pass(ScheduleAsync(sink_awaits=False))
         self.add_pass(LowerToAsync())
         self.add_pass(Folding())
         self.add_pass(CSE())
@@ -279,9 +284,15 @@ class PtxKernel:
     shared_mem_bytes: int = 0
 
 
-def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
+def make_ptx_kernel(
+    module: ModuleOp,
+    *,
+    schedule_tma_coordinates: bool = False,
+) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
-    module = PtxLoweringPipeline().run(module)
+    module = PtxLoweringPipeline(
+        schedule_tma_coordinates=schedule_tma_coordinates,
+    ).run(module)
     top_ops = module.body.entry_block.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
