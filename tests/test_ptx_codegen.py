@@ -49,6 +49,7 @@ def test_codegen_cwise_add():
           .param .b64 rhs_ptr,
           .param .b64 dst_ptr
         )
+        .reqntid 256, 1, 1
         {
           .reg .b64  %rd<3>;
           .reg .f32  %f<3>;
@@ -78,7 +79,7 @@ def test_codegen_resolves_warp_group_block_dim_before_lowering():
     kernel = make_ptx_kernel(module)
     assert input_kernel.block_dim == (256, 1, 1)
     assert kernel.block_dim == (256, 1, 1)
-    assert ".reqntid" not in kernel.ptx
+    assert kernel.ptx.count(".reqntid 256, 1, 1") == 1
 
 
 def test_codegen_naive_matmul_4096():
@@ -123,6 +124,7 @@ def test_codegen_naive_matmul_4096():
           .param .b64 b_ptr,
           .param .b64 c_ptr
         )
+        .reqntid 32, 32, 1
         {
           .reg .b32  %r<23>;
           .reg .b64  %rd<22>;

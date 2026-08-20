@@ -268,19 +268,17 @@ class PtxKernel:
 
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
+    module = PtxLoweringPipeline().run(module)
     top_ops = module.body.entry_block.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
     kernel.resolve_block_dim()
 
-    module = PtxLoweringPipeline().run(module)
-
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
     grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
     block_dim = kernel.block_dim
-    assert all(isinstance(d, int) for d in block_dim)
     p = PtxPrinter()
     _emit_op(p, module)
     return PtxKernel(
@@ -381,6 +379,8 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
             sep = "," if i < len(param_lines) - 1 else ""
             p.write_line(f"{line}{sep}")
     p.write_line(")")
+    block_dim = op.block_dim
+    p.write_line(f".reqntid {block_dim[0]}, {block_dim[1]}, {block_dim[2]}")
     p.write_line("{")
     with p.indented():
         decl_mark = p.mark()
