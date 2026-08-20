@@ -123,6 +123,16 @@ class KernelOp(Op):
         self.attrs["num_warp_groups"] = value
 
     @property
+    def num_threads(self) -> int:
+        """Number of threads in the resolved block dimensions."""
+        if not all(isinstance(dim, int) and dim > 0 for dim in self.block_dim):
+            raise ValueError(
+                f"kernel {self.name!r} block_dim must be resolved before "
+                f"computing num_threads: {self.block_dim}"
+            )
+        return math.prod(self.block_dim)
+
+    @property
     def extra_attrs(self) -> dict[str, object]:
         return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "num_warp_groups")}
 

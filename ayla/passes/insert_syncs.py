@@ -126,12 +126,15 @@ class ConcurrentMemoryEffect:
 @dataclasses.dataclass
 class DataflowState:
     """The forward analysis state: outstanding concurrent memory effects keyed by
-    root buffer, and the hardware named-barrier ids currently in use (so a fresh
-    block-leader barrier picks a non-conflicting one)."""
+    root buffer, named-barrier ids in use until a full-block sync, and ids in use
+    until an await on a particular lock."""
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
     named_barrier_ids: set[int] = dataclasses.field(default_factory=set)
+    named_barrier_ids_pending_await: dict[Value, set[int]] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def clone(self) -> DataflowState:
         """A copy with fresh sets, safe for in-place per-op mutation."""
@@ -140,9 +143,15 @@ class DataflowState:
     def join(self, other: DataflowState) -> DataflowState:
         """The dataflow join: per-buffer union of effects, union of barrier ids."""
         a, b = self.concurrent_memory_effects, other.concurrent_memory_effects
+        p, q = (
+            self.named_barrier_ids_pending_await,
+            other.named_barrier_ids_pending_await,
+        )
         return DataflowState(
             {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
             self.named_barrier_ids | other.named_barrier_ids,
+            {lock: p.get(lock, set()) | q.get(lock, set())
+             for lock in p.keys() | q.keys()},
         )
 
 
@@ -230,6 +239,9 @@ def _analyze(
             live.concurrent_memory_effects[buf] = {
                 e for e in effs if e.pending_await != op.lock
             }
+        # An mbar await also completes a block-leader handoff: all threads wait
+        # for t0's async work, so no arriving warp can lap the named barrier.
+        live.named_barrier_ids_pending_await.pop(op.lock, None)
         return live
     effects = memory_effects(op)
     if effects is None:
@@ -244,25 +256,57 @@ def _analyze(
             # A hazard needs a write (RAR is safe).
             if e.kind == "W" or kind_y == "W":
                 barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
-    # A block-leader barrier is a named barrier: give it a fresh id (reusing this
-    # op's recorded one keeps it stable across fixpoint revisits). A full block
-    # sync frees every named-barrier id.
+    # A block-leader barrier is named. Its id remains in use until either a
+    # full-block sync, or (for an mbar async) the await where everyone waits for
+    # t0. Reuse any id whose prior lifetime has ended.
     named_id = None
     if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
         recorded = targets.get(op)
-        named_id = (
-            recorded.named_id if recorded is not None and recorded.named_id is not None
-            else max(live.named_barrier_ids, default=0) + 1
-        )
-        # TODO: Reuse IDs once the analysis tracks when each named barrier is no
-        # longer live; until then, fail instead of emitting an invalid PTX ID.
-        assert named_id < _MAX_BARRIER_IDS, (
+        pending_ids = {
+            barrier_id
+            for ids in live.named_barrier_ids_pending_await.values()
+            for barrier_id in ids
+        }
+        used_ids = live.named_barrier_ids | pending_ids
+        if recorded is not None and recorded.named_id is not None:
+            named_id = recorded.named_id
+            assert named_id not in used_ids, (
+                f"named barrier {named_id} remains in use across a loop "
+                f"backedge before {op}; pending={live.named_barrier_ids_pending_await}"
+            )
+        if named_id is None:
+            # A barrier can first become necessary on a later loop-fixpoint
+            # iteration. Do not let it steal an id already assigned to another
+            # static barrier site that has not been revisited yet.
+            reserved_ids = (
+                {
+                    target.named_id
+                    for target_op, target in targets.items()
+                    if target_op is not op and target.named_id is not None
+                }
+                if recorded is not None else set()
+            )
+            available_ids = (
+                set(range(1, _MAX_BARRIER_IDS)) - used_ids - reserved_ids
+            )
+            assert available_ids, (
+                "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
+                "reserved for full-block barriers"
+            )
+            named_id = min(available_ids)
+        assert 0 < named_id < _MAX_BARRIER_IDS, (
             "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
             "reserved for full-block barriers"
         )
-        live.named_barrier_ids = live.named_barrier_ids | {named_id}
+        if isinstance(op, AsyncOp) and op.lock.type.kind == "mbar":
+            live.named_barrier_ids_pending_await.setdefault(
+                op.lock, set(),
+            ).add(named_id)
+        else:
+            live.named_barrier_ids.add(named_id)
     elif barrier_scope == BarrierScope.BLOCK:
         live.named_barrier_ids = set()
+        live.named_barrier_ids_pending_await = {}
     targets[op] = BarrierTarget(barrier_scope, named_id)
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.
@@ -293,7 +337,11 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
 }
 
 
-def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
+def _insert_barriers(
+    block: Block,
+    targets: BarrierTargetsType,
+    num_threads: int | None = None,
+) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
@@ -304,13 +352,19 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
                     f"no lowering for barrier {target.scope.name}"
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
+            if target.scope == BarrierScope.BLOCK_TO_LEADER:
+                assert num_threads is not None
+                attrs["num_threads"] = num_threads
             new_ops.append(
                 BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
             )
         new_ops.append(op)
+        inner_num_threads = num_threads
+        if isinstance(op, KernelOp):
+            inner_num_threads = op.num_threads
         for region in op.regions:
             for inner in region.blocks:
-                _insert_barriers(inner, targets)
+                _insert_barriers(inner, targets, inner_num_threads)
     block.ops = new_ops
 
 
