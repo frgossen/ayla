@@ -130,7 +130,13 @@ class KernelOp(Op):
                 f"kernel {self.name!r} block_dim must be resolved before "
                 f"computing num_threads: {self.block_dim}"
             )
-        return math.prod(self.block_dim)
+        num_threads = math.prod(self.block_dim)
+        if num_threads % 32 != 0:
+            raise ValueError(
+                f"kernel {self.name!r} block_dim must contain a whole number "
+                f"of warps: {self.block_dim}"
+            )
+        return num_threads
 
     @property
     def extra_attrs(self) -> dict[str, object]:

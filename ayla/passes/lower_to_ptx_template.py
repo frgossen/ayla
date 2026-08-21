@@ -680,12 +680,7 @@ class LowerToPtxTemplate(LoweringPass):
             # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
             # insert_syncs (unique among concurrently-live block-leader barriers).
             bar_id = op.attrs.get("id", 1)
-            num_threads = op.attrs.get("num_threads")
-            assert (
-                isinstance(num_threads, int)
-                and num_threads > 0
-                and num_threads % 32 == 0
-            )
+            num_threads = op.attrs["num_threads"]
             template = textwrap.dedent(f"""\
                 mov.u32 ${{b32:bl_tid}}, %tid.x;
                 setp.lt.u32 ${{pred:bl_w0}}, ${{b32:bl_tid}}, 32;
