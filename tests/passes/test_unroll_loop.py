@@ -85,7 +85,7 @@ def test_unroll_factor_greater_than_trip_count_fully_unrolls():
     )
 
 
-def test_unroll_remainder_reuses_first_alloc():
+def test_unroll_shares_the_loop_local_allocation():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
@@ -97,8 +97,10 @@ def test_unroll_remainder_reuses_first_alloc():
           }
         }"""))
     text = repr(unroll_loop(module, unroll_factor=3, label_filter="k"))
-    # Three main copies allocate; the single tail iteration reuses the first.
-    assert text.count("smem_tensor<4x1xf32> = alloc()") == 3
+    # One allocation, lifted out and shared by the three copies and the tail.
+    # Giving each copy its own would multi-buffer the loop, which is
+    # multi_buffer's job.
+    assert text.count("smem_tensor<4x1xf32> = alloc()") == 1
     assert_contains_in_order(
         text,
         "%smem: smem_tensor<4x1xf32> = alloc()",
@@ -123,46 +125,3 @@ def test_unroll_remainder_does_not_hoist_initialized_allocations():
     first_alloc = text.index("rmem_tensor<1xf32> = alloc()", loop_start)
     assert first_alloc > loop_start
 
-
-def test_plain_unrolling_shares_the_loop_local_buffer():
-    """Without clone_allocs every copy uses the one allocation.
-
-    Five iterations unrolled by two, so the tail runs too: it already reused
-    the first copy's buffer, and now the main copies do as well. The default
-    duplicates it instead, which multi-buffers the copies as a side effect.
-    """
-    module_str = textwrap.dedent("""\
-        module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            for (%k: index = 0 to 5 step 1) attrs={label: "k"} {
-              %s: smem_tensor<4x4xf32> = alloc()
-              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
-              move(%s: smem_tensor<4x4xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
-            }
-          }
-        }""")
-
-    module = unroll_loop(
-        gpu_dialect.parse(module_str),
-        unroll_factor=2,
-        label_filter="k",
-        clone_allocs=False,
-    )
-
-    assert repr(module) == textwrap.dedent("""\
-        module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            %s: smem_tensor<4x4xf32> = alloc()
-            for (%k: index = 0 to 4 step 2) attrs={label: "k"} {
-              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
-              move(%s: smem_tensor<4x4xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
-              %c1: index = index_constant() attrs={value: 1}
-              %0: index = index_add(%k: index, %c1: index)
-              %t1: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %0: index)
-              move(%s: smem_tensor<4x4xf32>, %t1: gmem_tensor<4x1xf32 strides=[4, 1]>)
-            }
-            %c4: index = index_constant() attrs={value: 4}
-            %t2: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %c4: index)
-            move(%s: smem_tensor<4x4xf32>, %t2: gmem_tensor<4x1xf32 strides=[4, 1]>)
-          }
-        }""")
