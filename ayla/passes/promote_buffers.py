@@ -246,10 +246,11 @@ class PromoteBuffers(LoweringPass):
     def _build_buffer_attrs(
         self, matmul_label: str | None, operand_name: str
     ) -> dict[str, object]:
-        """The label identifying the buffer promoted for one matmul operand."""
-        if matmul_label is None:
-            return {}
-        return {"label": f"{matmul_label}_{operand_name}_{self.target_type}"}
+        """Attrs for the buffer promoted for one matmul operand."""
+        attrs: dict[str, object] = {"id": AllocOp.fresh_id()}
+        if matmul_label is not None:
+            attrs["label"] = f"{matmul_label}_{operand_name}_{self.target_type}"
+        return attrs
 
     def _build_move_attrs(
         self, matmul_label: str | None, operand_name: str, allow_nc: bool = True
@@ -325,7 +326,9 @@ class PromoteBuffers(LoweringPass):
             move = MoveOp.build(dst=alloc.result(), src=chain_root, attrs=attrs)
             new_ops.extend([alloc, move])
             if target_type.dtype != chain_root.type.dtype:
-                cvt_alloc = AllocOp.build(target_type)
+                cvt_alloc = AllocOp.build(
+                    target_type, attrs={"id": AllocOp.fresh_id()}
+                )
                 cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
@@ -360,9 +363,12 @@ class PromoteBuffers(LoweringPass):
             narrow_tiles.append(tile)
             block_dst = tile.arg
         assert isinstance(block_dst.type, GmemTensorType)
-        smem = AllocOp.build(self._build_smem_type(
-            list(block_dst.type.sizes), block_dst.type.dtype,
-        ))
+        smem = AllocOp.build(
+            self._build_smem_type(
+                list(block_dst.type.sizes), block_dst.type.dtype,
+            ),
+            attrs={"id": AllocOp.fresh_id()},
+        )
         new_ops: list[Op] = [smem]
         gather_dst = smem.result()
         for tile in reversed(narrow_tiles):
@@ -392,7 +398,9 @@ class PromoteBuffers(LoweringPass):
         new_ops: list[Op] = []
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
-            tmp_alloc = AllocOp.build(tmp_type)
+            tmp_alloc = AllocOp.build(
+                tmp_type, attrs={"id": AllocOp.fresh_id()}
+            )
             cvt = ConvertOp.build(dst=tmp_alloc.result(), src=src)
             new_ops.extend([tmp_alloc, cvt])
             src = tmp_alloc.result()
