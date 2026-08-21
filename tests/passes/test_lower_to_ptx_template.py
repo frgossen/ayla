@@ -13,10 +13,11 @@ from ayla.testing import assert_contains_in_order
 
 def _lower_barrier(scope: str) -> str:
     """Lower a single ``barrier`` op of the given scope and return its PTX."""
+    num_threads = ", num_threads: 128" if scope == "block_leader" else ""
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
-            barrier() attrs={{scope: "{scope}"}}
+            barrier() attrs={{scope: "{scope}"{num_threads}}}
           }}
         }}"""))
     lowered = lower_to_ptx_template(module)
@@ -38,11 +39,9 @@ def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
         mov.u32 ${b32:bl_tid}, %tid.x;
-        mov.u32 ${b32:bl_ntid}, %ntid.x;
         setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-        setp.ge.u32 ${pred:bl_nw0}, ${b32:bl_tid}, 32;
-        @${pred:bl_w0} bar.sync 1, ${b32:bl_ntid};
-        @${pred:bl_nw0} bar.arrive 1, ${b32:bl_ntid};
+        @${pred:bl_w0} bar.sync 1, 128;
+        @!${pred:bl_w0} bar.arrive 1, 128;
         """)
 
 

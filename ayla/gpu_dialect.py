@@ -123,6 +123,11 @@ class KernelOp(Op):
         self.attrs["num_warp_groups"] = value
 
     @property
+    def num_threads(self) -> int:
+        """Number of threads in the resolved block dimensions."""
+        return math.prod(self.block_dim)  # type: ignore[arg-type]
+
+    @property
     def extra_attrs(self) -> dict[str, object]:
         return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "num_warp_groups")}
 

@@ -680,13 +680,12 @@ class LowerToPtxTemplate(LoweringPass):
             # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
             # insert_syncs (unique among concurrently-live block-leader barriers).
             bar_id = op.attrs.get("id", 1)
+            num_threads = op.attrs["num_threads"]
             template = textwrap.dedent(f"""\
                 mov.u32 ${{b32:bl_tid}}, %tid.x;
-                mov.u32 ${{b32:bl_ntid}}, %ntid.x;
                 setp.lt.u32 ${{pred:bl_w0}}, ${{b32:bl_tid}}, 32;
-                setp.ge.u32 ${{pred:bl_nw0}}, ${{b32:bl_tid}}, 32;
-                @${{pred:bl_w0}} bar.sync {bar_id}, ${{b32:bl_ntid}};
-                @${{pred:bl_nw0}} bar.arrive {bar_id}, ${{b32:bl_ntid}};
+                @${{pred:bl_w0}} bar.sync {bar_id}, {num_threads};
+                @!${{pred:bl_w0}} bar.arrive {bar_id}, {num_threads};
                 """)
         else:
             raise NotImplementedError(

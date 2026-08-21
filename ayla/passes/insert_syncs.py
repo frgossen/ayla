@@ -16,7 +16,7 @@ from ..gpu_dialect import (
     is_side_effect_free,
     memory_effects,
 )
-from ..base.ir import Block, Op, Value
+from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
 
 
@@ -126,12 +126,15 @@ class ConcurrentMemoryEffect:
 @dataclasses.dataclass
 class DataflowState:
     """The forward analysis state: outstanding concurrent memory effects keyed by
-    root buffer, and the hardware named-barrier ids currently in use (so a fresh
-    block-leader barrier picks a non-conflicting one)."""
+    root buffer, named-barrier ids in use until a full-block sync, and ids in use
+    until an await on a particular lock."""
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
     named_barrier_ids: set[int] = dataclasses.field(default_factory=set)
+    named_barrier_ids_pending_await: dict[Value, set[int]] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def clone(self) -> DataflowState:
         """A copy with fresh sets, safe for in-place per-op mutation."""
@@ -140,9 +143,15 @@ class DataflowState:
     def join(self, other: DataflowState) -> DataflowState:
         """The dataflow join: per-buffer union of effects, union of barrier ids."""
         a, b = self.concurrent_memory_effects, other.concurrent_memory_effects
+        p, q = (
+            self.named_barrier_ids_pending_await,
+            other.named_barrier_ids_pending_await,
+        )
         return DataflowState(
             {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
             self.named_barrier_ids | other.named_barrier_ids,
+            {lock: p.get(lock, set()) | q.get(lock, set())
+             for lock in p.keys() | q.keys()},
         )
 
 
@@ -230,6 +239,9 @@ def _analyze(
             live.concurrent_memory_effects[buf] = {
                 e for e in effs if e.pending_await != op.lock
             }
+        # An mbar await also completes a block-leader handoff: all threads wait
+        # for t0's async work, so no arriving warp can lap the named barrier.
+        live.named_barrier_ids_pending_await.pop(op.lock, None)
         return live
     effects = memory_effects(op)
     if effects is None:
@@ -244,25 +256,61 @@ def _analyze(
             # A hazard needs a write (RAR is safe).
             if e.kind == "W" or kind_y == "W":
                 barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
-    # A block-leader barrier is a named barrier: give it a fresh id (reusing this
-    # op's recorded one keeps it stable across fixpoint revisits). A full block
-    # sync frees every named-barrier id.
+    # A block-leader barrier is named. Its id remains in use until either a
+    # full-block sync, or (for an mbar async) the await where everyone waits for
+    # t0. Reuse any id whose prior lifetime has ended.
     named_id = None
     if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
         recorded = targets.get(op)
-        named_id = (
-            recorded.named_id if recorded is not None and recorded.named_id is not None
-            else max(live.named_barrier_ids, default=0) + 1
-        )
-        # TODO: Reuse IDs once the analysis tracks when each named barrier is no
-        # longer live; until then, fail instead of emitting an invalid PTX ID.
-        assert named_id < _MAX_BARRIER_IDS, (
-            "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
-            "reserved for full-block barriers"
-        )
-        live.named_barrier_ids = live.named_barrier_ids | {named_id}
+        pending_await_ids = {
+            barrier_id
+            for ids in live.named_barrier_ids_pending_await.values()
+            for barrier_id in ids
+        }
+        used_ids = live.named_barrier_ids | pending_await_ids
+        if recorded is not None and recorded.named_id is not None:
+            named_id = recorded.named_id
+            # TODO: Insert or upgrade to a full-block sync when a loop backedge
+            # keeps this named barrier live, instead of rejecting the program.
+            assert named_id not in used_ids, (
+                f"named barrier {named_id} remains in use across a loop "
+                f"backedge before {op}; named barriers are only released by a "
+                "full-block sync or their mbar await, so add a full-block sync "
+                "before the backedge; "
+                f"pending awaits={live.named_barrier_ids_pending_await}"
+            )
+        if named_id is None:
+            # A barrier can first become necessary on a later loop-fixpoint
+            # iteration. Do not let it steal an id already assigned to another
+            # static barrier site that has not been revisited yet.
+            reserved_ids = (
+                {
+                    target.named_id
+                    for target_op, target in targets.items()
+                    if target_op is not op and target.named_id is not None
+                }
+                if recorded is not None else set()
+            )
+            available_ids = (
+                set(range(1, _MAX_BARRIER_IDS)) - used_ids - reserved_ids
+            )
+            if not available_ids:
+                raise ValueError(
+                    "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 "
+                    "is reserved for full-block barriers"
+                )
+            named_id = min(available_ids)
+        # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
+        # an mbar await is an all-thread rendezvous that ends this handoff.
+        if isinstance(op, AsyncOp) and op.lock.type.kind == "mbar":
+            live.named_barrier_ids_pending_await.setdefault(
+                op.lock, set(),
+            ).add(named_id)
+        else:
+            live.named_barrier_ids.add(named_id)
     elif barrier_scope == BarrierScope.BLOCK:
         live.named_barrier_ids = set()
+        live.named_barrier_ids_pending_await = {}
     targets[op] = BarrierTarget(barrier_scope, named_id)
     # A barrier orders settled accesses it covers; pending (in-region) effects
     # survive — only their await completes them.
@@ -293,7 +341,11 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
 }
 
 
-def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
+def _insert_barriers(
+    block: Block,
+    targets: BarrierTargetsType,
+    num_threads: int,
+) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
     for op in block.ops:
@@ -304,13 +356,20 @@ def _insert_barriers(block: Block, targets: BarrierTargetsType) -> None:
                     f"no lowering for barrier {target.scope.name}"
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
+            if target.scope == BarrierScope.BLOCK_TO_LEADER:
+                if num_threads % 32 != 0:
+                    raise ValueError(
+                        "block-leader barriers require a whole number of "
+                        f"warps; got {num_threads} threads"
+                    )
+                attrs["num_threads"] = num_threads
             new_ops.append(
                 BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
             )
         new_ops.append(op)
         for region in op.regions:
             for inner in region.blocks:
-                _insert_barriers(inner, targets)
+                _insert_barriers(inner, targets, num_threads)
     block.ops = new_ops
 
 
@@ -319,7 +378,10 @@ class InsertSyncs(Pass):
     def run(self, module: ModuleOp) -> ModuleOp:
         targets: BarrierTargetsType = {}
         _analyze(module, DataflowState(), targets)  # analysis: where do barriers go
-        _insert_barriers(module.body.entry_block, targets)  # transform: insert them
+        kernel = find_op(module, lambda op: isinstance(op, KernelOp))
+        assert isinstance(kernel, KernelOp)
+        # Transform: insert the barriers with the kernel-wide participant count.
+        _insert_barriers(module.body.entry_block, targets, kernel.num_threads)
         return module
 
 

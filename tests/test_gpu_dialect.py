@@ -82,6 +82,15 @@ def test_kernel_op():
     assert_print_and_roundtrip(module, expected)
 
 
+def test_kernel_num_threads():
+    kernel = KernelOp.build(
+        "k", Region(blocks=[Block()]),
+        block_dim=(256, 1, 1), num_warp_groups=2,
+    )
+
+    assert kernel.num_threads == 256
+
+
 def test_for_loop():
     op = ForOp.build(0, 64, 4)
     op.body.entry_block.append(Op(operands=[op.iv], results=[]))
