@@ -1591,6 +1591,15 @@ def root_buffer(value: Value) -> Value:
     """
     while isinstance(value.definition, TileOp):
         value = value.definition.arg
+    if isinstance(value.definition, SelectOp):
+        # Returning the select would claim it is a buffer of its own, distinct
+        # from the cases it actually aliases -- the unsafe direction, since a
+        # caller would read that as "no dependency". A select is meant to be
+        # folded away before anything reasons about buffers.
+        raise ValueError(
+            f"root_buffer: {value.definition.op_id} has no single root buffer; "
+            "it aliases every one of its cases. Fold it first."
+        )
     return value
 
 
