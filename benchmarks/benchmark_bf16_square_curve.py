@@ -104,11 +104,26 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
     import matplotlib.pyplot as plt
 
     sizes = [int(row["size"]) for row in rows]
+    ayla = [float(row["ayla_tflops"]) for row in rows]
+    torch = [float(row["torch_tflops"]) for row in rows]
     fig, throughput = plt.subplots(figsize=(6.5, 4.5))
-    for label, prefix in (("Ayla", "ayla"), ("cuBLAS", "torch")):
-        throughput.plot(
-            sizes, [float(row[f"{prefix}_tflops"]) for row in rows],
-            marker="o", linewidth=2, label=label,
+    throughput.plot(sizes, ayla, marker="o", linewidth=2, label="Ayla")
+    throughput.plot(sizes, torch, marker="o", linewidth=2, label="cuBLAS")
+    for size, ayla_tflops, torch_tflops, row in zip(
+        sizes, ayla, torch, rows,
+    ):
+        latency_delta = 100 * (
+            float(row["ayla_us"]) / float(row["torch_us"]) - 1
+        )
+        throughput_delta = ayla_tflops - torch_tflops
+        throughput.annotate(
+            f"{latency_delta:+.2f}%\n{throughput_delta:+.1f} TFLOP/s",
+            (size, ayla_tflops),
+            xytext=(0, 8 if latency_delta < 0 else -14),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+            color="#1f4e79" if latency_delta < 0 else "#a61c00",
         )
     throughput.set_xscale("log", base=2)
     throughput.set_xticks(sizes, [str(size) for size in sizes])
@@ -117,6 +132,7 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
     throughput.legend()
     throughput.set_ylabel("TFLOP/s")
     throughput.set_title("H100 square BF16 GEMM — graph-batched throughput")
+    throughput.margins(y=.16)
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output)

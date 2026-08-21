@@ -156,16 +156,13 @@ class LowerToPtxTemplate(LoweringPass):
         self._share_thread_x(op)
         return [op], []
 
-    @staticmethod
-    def _batch_mbarrier_initializations(block: Block) -> None:
-        """Publish a block's startup mbarriers with one fence and rendezvous.
+    def _batch_mbarrier_initializations(self, block: Block) -> None:
+        """Fold independent startup mbarrier initializations into one guard.
 
-        Static lock allocations are hoisted ahead of their first use.  Thread 0
-        may initialize all of them before one release fence publishes the whole
-        batch and one CTA barrier lets the consumers proceed.  Keep the last
-        allocation's fence/barrier and strip the redundant pair from preceding
-        allocations.  Refuse the fold if an mbarrier instruction appears
-        between allocations, which conservatively preserves non-startup cases.
+        Lock allocation lowering stays self-contained and correct everywhere.
+        This peephole only rewrites a set of simple, already-lowered initializers
+        when no mbarrier operation appears between the first and last one.
+        Otherwise it leaves the original templates byte-for-byte unchanged.
         """
         inits = [
             (index, candidate)
@@ -176,6 +173,18 @@ class LowerToPtxTemplate(LoweringPass):
         ]
         if len(inits) < 2:
             return
+        immediate_suffix = "\n".join([
+            *self._thread_zero_guard("init", "after_init"),
+            "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;",
+            "fence.mbarrier_init.release.cluster;",
+            "${label:after_init}:",
+            "bar.sync 0;",
+        ]) + "\n"
+        # Cluster/multicast locks have additional initialization and are not
+        # the simple one-barrier pattern handled by this peephole.
+        if any(not candidate.template.endswith(immediate_suffix)
+               for _, candidate in inits):
+            return
         first_index, last_index = inits[0][0], inits[-1][0]
         init_ops = {candidate for _, candidate in inits}
         if any(
@@ -185,12 +194,31 @@ class LowerToPtxTemplate(LoweringPass):
             for candidate in block.ops[first_index:last_index + 1]
         ):
             return
-        for _, init in inits[:-1]:
-            assert "fence.mbarrier_init.release.cluster;\n" in init.template
-            assert "bar.sync 0;\n" in init.template
-            init.attrs["template"] = init.template.replace(
-                "fence.mbarrier_init.release.cluster;\n", "",
-            ).replace("bar.sync 0;\n", "")
+        for _, init in inits:
+            init.attrs["template"] = init.template[:-len(immediate_suffix)]
+
+        operands = [candidate.result() for _, candidate in inits]
+        names = [f"bar{i}" for i in range(len(operands))]
+        lines = self._thread_zero_guard("batch_init", "after_batch_init")
+        lines.extend(
+            f"mbarrier.init.shared::cta.b64 "
+            f"[${{b32:operand.{name}.val}}], 1;"
+            for name in names
+        )
+        lines.extend([
+            "fence.mbarrier_init.release.cluster;",
+            "${label:after_batch_init}:",
+            "bar.sync 0;",
+        ])
+        combined = PTXTemplateOp.build(
+            operands=operands,
+            result_types=[],
+            template="\n".join(lines) + "\n",
+            operand_names=names,
+            result_names=[],
+            description="batched mbarrier initialization",
+        )
+        block.ops.insert(last_index + 1, combined)
 
     @staticmethod
     def _share_thread_x(kernel: KernelOp) -> None:
@@ -973,7 +1001,9 @@ class LowerToPtxTemplate(LoweringPass):
                     )
                 desc_lhs_names.append(desc_lhs)
 
-            if mm.scale_d is None:
+            if mm.attrs.get("zero_accumulator", False):
+                scale_d = "0"
+            elif mm.scale_d is None:
                 scale_d = "1"
             else:
                 scale_name = _operand(self.value_map[mm.scale_d], "scale_d")

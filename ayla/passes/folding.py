@@ -39,7 +39,7 @@ def _first_matmul(ops: list[Op], dst: Value) -> MatmulOp | None:
 
 def _fold_accumulator_init(block: Block) -> None:
     """Replace a zero-filled WGMMA accumulator with first-iteration scale-d."""
-    for index, alloc in enumerate(block.ops):
+    for alloc in list(block.ops):
         if not (isinstance(alloc, AllocOp)
                 and isinstance(alloc.result().type, WrmemTensorType)
                 and alloc.init == 0):
@@ -47,15 +47,28 @@ def _fold_accumulator_init(block: Block) -> None:
         accumulator = alloc.result()
         users = {id(op) for op in accumulator.users()}
         first_user = next((
-            op for op in block.ops[index + 1:]
+            op for op in block.ops[block.ops.index(alloc) + 1:]
             if any(id(nested) in users for nested in iter_ops(op))
         ), None)
-        if not (isinstance(first_user, ForOp)
-                and first_user.lb == 0 and first_user.trip_count > 0):
+        if first_user is None:
             continue
-        matmul = _first_matmul(first_user.body.entry_block.ops, accumulator)
+        if isinstance(first_user, ForOp):
+            if first_user.lb != 0 or first_user.trip_count <= 0:
+                continue
+            scale_d = first_user.iv
+            matmul = _first_matmul(first_user.body.entry_block.ops, accumulator)
+        else:
+            # A fully unrolled K loop has no induction variable to reuse as
+            # scale-d. Mark its first straight-line WGMMA as an overwrite so
+            # lowering can use literal scale-d zero instead of filling every
+            # accumulator register with zero first.
+            scale_d = None
+            matmul = _first_matmul([first_user], accumulator)
         if matmul is not None and matmul.scale_d is None:
-            matmul.operands.append(first_user.iv)
+            if scale_d is None:
+                matmul.attrs["zero_accumulator"] = True
+            else:
+                matmul.operands.append(scale_d)
             alloc.attrs.pop("init")
 
 
