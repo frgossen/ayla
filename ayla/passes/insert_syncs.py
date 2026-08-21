@@ -357,6 +357,11 @@ def _insert_barriers(
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
+                if num_threads % 32 != 0:
+                    raise ValueError(
+                        "block-leader barriers require a whole number of "
+                        f"warps; got {num_threads} threads"
+                    )
                 attrs["num_threads"] = num_threads
             new_ops.append(
                 BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)

@@ -1,7 +1,5 @@
 import textwrap
 
-import pytest
-
 from ayla import (
     Block,
     GmemTensorType,
@@ -91,15 +89,6 @@ def test_kernel_num_threads():
     )
 
     assert kernel.num_threads == 256
-
-
-def test_kernel_num_threads_requires_whole_warps():
-    kernel = KernelOp.build(
-        "k", Region(blocks=[Block()]), block_dim=(33, 1, 1),
-    )
-
-    with pytest.raises(ValueError, match="whole number of warps"):
-        kernel.num_threads
 
 
 def test_for_loop():

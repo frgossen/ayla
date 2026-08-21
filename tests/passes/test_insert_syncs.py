@@ -1,9 +1,26 @@
 """Tests for the cross-thread sync-barrier insertion pass."""
 import textwrap
 
+import pytest
+
+from ayla import Block, Op
 from ayla.gpu_dialect import gpu_dialect
-from ayla.passes.insert_syncs import insert_syncs
+from ayla.passes.insert_syncs import (
+    BarrierScope,
+    BarrierTarget,
+    _insert_barriers,
+    insert_syncs,
+)
 from ayla.testing import assert_contains_in_order
+
+
+def test_block_leader_barrier_requires_whole_warps():
+    op = Op(operands=[], results=[])
+    block = Block(ops=[op])
+    targets = {op: BarrierTarget(BarrierScope.BLOCK_TO_LEADER, named_id=1)}
+
+    with pytest.raises(ValueError, match="whole number of warps"):
+        _insert_barriers(block, targets, num_threads=33)
 
 
 def test_war_on_shared_buffer_gets_barrier():
