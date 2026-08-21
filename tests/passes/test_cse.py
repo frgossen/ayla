@@ -41,3 +41,30 @@ def test_cse_deduplicates_index_constants():
             move(%val: rmem_tensor<1xf32>, %a: gmem_tensor<4096x4096xf32>, %offset_a: index)
           }
         }""")
+
+
+def test_cse_deduplicates_allocations_by_id():
+    """Allocations merge iff they name the same buffer.
+
+    An allocation is an ordinary value-identical op; `id` is what tells two
+    of them apart. Clones of one allocation carry its id and fold back
+    together, while separate allocations keep their own buffers.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) {
+            %same0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %same1: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %other: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
+            %opaque: smem_tensor<4x4xf32> = alloc()
+            %opaque2: smem_tensor<4x4xf32> = alloc()
+          }
+        }""")
+
+    text = repr(cse(gpu_dialect.parse(module_str)))
+
+    # The pair sharing id 0 collapses to one.
+    assert text.count("alloc() attrs={id: 0}") == 1
+    assert text.count("alloc() attrs={id: 1}") == 1
+    # An allocation with no id names nothing, so it never merges.
+    assert text.count("= alloc()\n") == 2
