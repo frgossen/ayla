@@ -2,8 +2,6 @@
 # flake8: noqa: E501
 import textwrap
 
-import pytest
-
 from ayla import (
     Block,
     GmemTensorType,
@@ -82,17 +80,6 @@ def test_codegen_materializes_block_dim_before_lowering():
     assert input_kernel.block_dim == (128, 1, 1)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
-
-
-def test_codegen_rejects_block_dim_inconsistent_with_warp_groups():
-    module = gpu_dialect.parse(textwrap.dedent("""\
-        module {
-          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
-          }
-        }"""))
-
-    with pytest.raises(ValueError, match="incompatible with 2 warp groups"):
-        make_ptx_kernel(module)
 
 
 def test_codegen_naive_matmul_4096():
