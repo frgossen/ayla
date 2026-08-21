@@ -94,8 +94,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         )
     if output_m_tile not in (64, 128, 192, 256):
         raise ValueError("output_m_tile must be 64, 128, 192, or 256")
-    if output_n_tile not in (64, 128, 192, 256, 384):
-        raise ValueError("output_n_tile must be 64, 128, 192, 256, or 384")
+    if output_n_tile not in (32, 64, 128, 192, 256, 384):
+        raise ValueError(
+            "output_n_tile must be 32, 64, 128, 192, 256, or 384"
+        )
     if operand_k_tile not in (16, 32, 64, 128, 256):
         raise ValueError(
             "operand_k_tile must be 16, 32, 64, 128, or 256"
@@ -608,10 +610,12 @@ def best_auto_matmul_512_wgmma256_wg_tma_store_module():
     return auto_matmul_4096_wgmma256_wg_tma_store_module(
         problem_size=512,
         output_m_tile=64,
-        output_n_tile=64,
+        output_n_tile=32,
+        warpgroup_n_tile=32,
         operand_stages=2,
         operand_k_tile=256,
-        regroup_stmatrix_block_major=True,
+        output_tma_inner_size=32,
+        output_tma_inner_padding=0,
         direct_warp_group_id=True,
         emit_reqntid=True,
         variant_suffix="best",
