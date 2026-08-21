@@ -2,11 +2,10 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 
+@register
 def naive_matmul_4096_loop_module():
     """Naive per-thread 4096x4096 f32 matmul using tile + move + fma."""
     module_str = textwrap.dedent("""\
@@ -34,13 +33,3 @@ def naive_matmul_4096_loop_module():
           }
         }""")  # noqa: E501
     return gpu_dialect.parse(module_str)
-
-
-def _register_naive_matmul_4096_loop() -> None:
-    module = naive_matmul_4096_loop_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-_register_naive_matmul_4096_loop()

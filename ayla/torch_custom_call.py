@@ -18,7 +18,7 @@ _TORCH_DTYPES = [
 ]
 
 
-def _to_torch_dtype(dtype) -> torch.dtype:
+def to_torch_dtype(dtype) -> torch.dtype:
     for ayla_dtype, torch_dtype in _TORCH_DTYPES:
         if dtype == ayla_dtype:
             return torch_dtype
@@ -84,7 +84,7 @@ def make_torch_custom_call(
                 kernel_args.append(input_tensors[in_idx])
                 in_idx += 1
             elif kind == OperandKind.RESULT:
-                t = torch.empty(arg_type.sizes, dtype=_to_torch_dtype(arg_type.dtype), device=device)
+                t = torch.empty(arg_type.sizes, dtype=to_torch_dtype(arg_type.dtype), device=device)
                 output_tensors.append(t)
                 kernel_args.append(t)
 

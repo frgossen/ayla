@@ -11,11 +11,10 @@ from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
 from ..passes.tile_matmul import tile_matmul
 from ..passes.unroll_loop import unroll_loop
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 
+@register
 def auto_matmul_4096_wgmma256_wg_module():
     module_str = textwrap.dedent("""\
         module {
@@ -83,13 +82,3 @@ def auto_matmul_4096_wgmma256_wg_module():
     module = canonicalize(module)
 
     return module
-
-
-def _register_auto_matmul_4096_wgmma256_wg() -> None:
-    module = auto_matmul_4096_wgmma256_wg_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-_register_auto_matmul_4096_wgmma256_wg()
