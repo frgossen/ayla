@@ -9,21 +9,25 @@ from .parser import Parser
 from .printer import Printer  # noqa: F401
 
 
-# Observable containers that keep the use-list self-maintaining.
+# Observable containers that keep the use-list and parent links
+# self-maintaining.
 #
-# The invariant: ``value.uses`` contains ``(op, i)`` iff ``op.operands[i] is
+# The invariants: ``value.uses`` contains ``(op, i)`` iff ``op.operands[i] is
 # value`` and ``op`` is anchored (held by a block, directly or nested inside an
-# anchored op's blocks). Two list subclasses capture the only two mutation
-# channels so no pass registers/deregisters by hand:
+# anchored op's blocks); ``op.parent_block`` / ``block.parent_op`` point at the
+# container holding the node. Three list subclasses capture the only three
+# mutation channels so no pass registers/deregisters by hand:
 #
 # - ``_OperandList`` wraps an op's ``operands`` — writes rewire its uses.
 # - ``_OpList`` wraps a block's ``ops`` — ops entering/leaving anchor/unanchor
-#   (which cascades into their blocks).
+#   (which cascades into their blocks) and get their ``parent_block`` set.
+# - ``_BlockList`` wraps an op's ``blocks`` — sets their ``parent_op``.
 #
-# Both react the same way: snapshot, run the real list method, reconcile via
+# All react the same way: snapshot, run the real list method, reconcile via
 # ``_sync(old)``. Every mutator is generated from that one pattern below.
-# Whole-list reassignment (``op.operands = [...]`` / ``block.ops = [...]``) is
-# handled by ``Op``/``Block`` ``__setattr__``, which re-wraps into these types.
+# Whole-list reassignment (``op.operands = [...]`` / ``block.ops = [...]`` /
+# ``op.blocks = [...]``) is handled by ``Op``/``Block`` ``__setattr__``, which
+# re-wraps into these types.
 
 
 class _ObservableList(list):
@@ -76,12 +80,17 @@ class _OperandList(_ObservableList):
 
 
 class _OpList(_ObservableList):
-    """A block's ``ops``; anchors/unanchors ops as they enter/leave. Stateless:
-    ``_sync`` reconciles purely from the element ops."""
+    """A block's ``ops``; anchors/unanchors ops as they enter/leave and sets
+    their ``parent_block``."""
 
-    __slots__ = ()
+    __slots__ = ("_block",)
+
+    def __init__(self, iterable=(), *, block: "Block | None" = None) -> None:
+        super().__init__(iterable)
+        self._block = block
 
     def _sync(self, old: list) -> None:
+        block = self._block
         # Unanchor removed ops before anchoring added ones so transplanted ops
         # (in both old and new) stay anchored.
         new_ids = {id(op) for op in self}
@@ -89,9 +98,33 @@ class _OpList(_ObservableList):
         for op in old:
             if id(op) not in new_ids:
                 op._unanchor()
+                # Only if still ours: a transplanted op already points at its
+                # new block, and this stale sync must not null that out.
+                if op.parent_block is block:
+                    op.parent_block = None
         for op in self:
             if id(op) not in old_ids:
                 op._anchor()
+                op.parent_block = block
+
+
+class _BlockList(_ObservableList):
+    __slots__ = ("_op",)
+
+    def __init__(self, iterable=(), *, op: "Op | None" = None) -> None:
+        super().__init__(iterable)
+        self._op = op
+
+    def _sync(self, old: list) -> None:
+        op = self._op
+        new_ids = {id(b) for b in self}
+        old_ids = {id(b) for b in old}
+        for b in old:
+            if id(b) not in new_ids and b.parent_op is op:
+                b.parent_op = None
+        for b in self:
+            if id(b) not in old_ids:
+                b.parent_op = op
 
 
 # Generic IR
@@ -210,6 +243,8 @@ class Op:
     attrs: dict[str, object] = field(default_factory=dict)
     blocks: list[Block] = field(default_factory=list)
 
+    parent_block: "Block | None" = field(default=None, init=False, repr=False)
+
     # Set by `Dialect.register_op` on each subclass.
     OP_ID: ClassVar[str] = "generic"
 
@@ -219,8 +254,7 @@ class Op:
 
     # TODO: anchoring triggers on entering any block's ops, including free-floating
     # blocks not reachable from the root, so their ops wrongly contribute to Value.uses.
-    # op.blocks is a plain list, so attachment doesn't propagate anchoring upward.
-    # Fix by making it observable as well.
+    # Now that every node has a parent link, replace this flag with a walk to the root.
     _anchored = False
 
     def __post_init__(self) -> None:
@@ -236,6 +270,11 @@ class Op:
         if name == "operands":
             old = self.__dict__.get("operands", [])
             new_list = _OperandList(value, op=self)
+            super().__setattr__(name, new_list)
+            new_list._sync(old)
+        elif name == "blocks":
+            old = self.__dict__.get("blocks", [])
+            new_list = _BlockList(value, op=self)
             super().__setattr__(name, new_list)
             new_list._sync(old)
         else:
@@ -378,6 +417,8 @@ class Block:
     ops: list[Op] = field(default_factory=list)
     name: str | None = None
 
+    parent_op: "Op | None" = field(default=None, init=False, repr=False)
+
     def __post_init__(self) -> None:
         assert self.name is None or not self.name.isdigit(), (
             f"block name {self.name!r} must not be all digits "
@@ -392,7 +433,7 @@ class Block:
         # _OpList. Re-wrap it and run the same reconcile as an in-place mutation.
         if name == "ops":
             old = self.__dict__.get("ops", [])
-            new_list = _OpList(value)
+            new_list = _OpList(value, block=self)
             super().__setattr__(name, new_list)
             new_list._sync(old)
         else:

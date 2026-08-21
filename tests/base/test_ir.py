@@ -326,3 +326,27 @@ def test_parsed_ir_registers_uses():
     a = block.arguments[0]
     inner = block.ops[0]
     assert a.uses == {(inner, 0)}
+
+
+def test_parent_links_track_containers():
+    """op.parent_block / block.parent_op follow placement, both ways."""
+    inner = Op(operands=[], results=[])
+    body = Block(ops=[inner])
+    root = Op(operands=[], results=[], blocks=[body])
+
+    assert inner.parent_block is body
+    assert body.parent_op is root
+    assert root.parent_block is None  # free-floating
+
+    # Removal clears the link; reassignment diffs it.
+    body.ops = []
+    assert inner.parent_block is None
+    root.blocks = []
+    assert body.parent_op is None
+
+    # Transplant: the new owner claims inner first, so the old block's later
+    # sync must not steal the link back.
+    old_block = Block(ops=[inner])
+    new_block = Block(ops=[inner])
+    old_block.ops = []
+    assert inner.parent_block is new_block
