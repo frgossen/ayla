@@ -1546,6 +1546,34 @@ class IndexModOp(Op):
         return _binop_expr_str(self, "%", 2, prec, val_str)
 
 
+@gpu_dialect.register_op("select")
+class SelectOp(Op):
+    """Pick one of several values by index: ``result = cases[index]``.
+
+    Introduced to name a choice the IR cannot yet make statically -- notably
+    "which of N buffers does this loop iteration use". Folding collapses it as
+    soon as the index is known, which is the only form the PTX backend can
+    lower: there is no runtime selection between SSA values.
+    """
+
+    @classmethod
+    def build(cls, index: Value, cases: list[Value]) -> "SelectOp":
+        assert cases, "select needs at least one case"
+        assert all(case.type == cases[0].type for case in cases), (
+            f"select: cases disagree on type, got {[c.type for c in cases]}"
+        )
+        result = Value(name=None, type=cases[0].type)
+        return cls(operands=[index, *cases], results=[result])
+
+    @property
+    def index(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def cases(self) -> list[Value]:
+        return self.operands[1:]
+
+
 @gpu_dialect.register_op("lane_id")
 class LaneIdOp(Op):
     """Produce the lane index within the warp (0..31)."""
@@ -1731,6 +1759,7 @@ def is_value_identical(op: Op) -> bool:
         IndexMulOp,
         LaneIdOp,
         PtrAddOp,
+        SelectOp,
         ThreadIdsOp,
         TileOp,
         ToPtrOp,
