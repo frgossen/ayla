@@ -8,16 +8,15 @@ When the trip count is not divisible by the factor, the leftover iterations are
 emitted as a straight-line tail after the unrolled loop. If the factor exceeds
 the trip count the whole loop becomes the tail (no loop remains).
 
-Loop-local allocations are lifted out of the body, so every copy and the tail
-share them. Giving each copy its own would multi-buffer the loop, which is
-``multi_buffer``'s job.
+Every copy is a plain clone of the body. Multi-buffering a loop is
+``multi_buffer``'s job, so run LICM first to lift the loop's allocations out --
+otherwise each copy gets its own.
 """
 from __future__ import annotations
 
 import re
 
 from ..gpu_dialect import (
-    AllocOp,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
@@ -53,13 +52,6 @@ class UnrollLoop(LoweringPass):
         # Recursively transform nested ops first.
         self.lower_region(op.body)
 
-        # Lift the loop-local allocations out before cloning, so every copy and
-        # the tail share them. Copying them per iteration would multi-buffer the
-        # loop, which is multi_buffer's job.
-        body = op.body.entry_block
-        hoisted_allocs = [o for o in body.ops if _is_static_alloc(o)]
-        body.ops = [o for o in body.ops if not _is_static_alloc(o)]
-
         lb, step = op.lb, op.step
         num_tail_iterations = op.trip_count % self.unroll_factor
         main_trip_count = op.trip_count - num_tail_iterations
@@ -86,17 +78,12 @@ class UnrollLoop(LoweringPass):
             tail_ops.append(tail_iv)
             tail_ops.extend(_clone_iteration(op, tail_iv.result(), f"_tail{i}"))
 
-        result: list[Op] = list(hoisted_allocs)
+        result: list[Op] = []
         if main_trip_count:
             new_body = Region(blocks=[Block(arguments=[new_iv], ops=main_body_ops)])
             result.append(ForOp.build(lb=lb, ub=new_ub, step=new_step, body=new_body, attrs=extra_attrs))
         result.extend(tail_ops)
         return result, []
-
-
-def _is_static_alloc(op: Op) -> bool:
-    """A loop-invariant allocation (no per-iteration initializer)."""
-    return isinstance(op, AllocOp) and op.init is None
 
 
 def _clone_iteration(

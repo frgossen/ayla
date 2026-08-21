@@ -74,6 +74,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     )
     module = multi_buffer(module, depth=3, label_filter="mm_lhs_smem")
     module = multi_buffer(module, depth=3, label_filter="mm_rhs_smem")
+    # Lift the buffers out of the loop so unrolling does not copy them.
+    module = licm(module)
     module = unroll_loop(module, unroll_factor=3, label_filter="k")
     module = canonicalize(module)
     module = lower_to_async(module)
