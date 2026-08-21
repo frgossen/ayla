@@ -6,6 +6,7 @@ from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
+from ..passes.multi_buffer import multi_buffer
 from ..passes.pipeline_loop import pipeline_loop
 from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
@@ -71,7 +72,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
         module, tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["kk"], label_filter="mm",
     )
-    module = unroll_loop(module, unroll_factor=3, label_filter="k")
+    module = multi_buffer(module, depth=3, label_filter="mm_lhs_smem")
+    module = multi_buffer(module, depth=3, label_filter="mm_rhs_smem")
+    module = unroll_loop(module, unroll_factor=3, label_filter="k", clone_allocs=False)
+    module = canonicalize(module)
     module = lower_to_async(module)
     module = fuse_async(module)
     for _ in range(4):

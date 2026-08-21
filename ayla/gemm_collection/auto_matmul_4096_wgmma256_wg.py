@@ -6,6 +6,7 @@ from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
+from ..passes.multi_buffer import multi_buffer
 from ..passes.pipeline_loop import pipeline_loop
 from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
@@ -58,7 +59,10 @@ def auto_matmul_4096_wgmma256_wg_module():
         tile_levels=["for"], tile_labels=["kk"],
         label_filter="mm",
     )
-    module = unroll_loop(module, unroll_factor=4, label_filter="k")
+    module = multi_buffer(module, depth=4, label_filter="mm_lhs_smem")
+    module = multi_buffer(module, depth=4, label_filter="mm_rhs_smem")
+    module = unroll_loop(module, unroll_factor=4, label_filter="k", clone_allocs=False)
+    module = canonicalize(module)
     module = lower_to_async(module)
     # Fuse each stage's lhs+rhs TMA loads onto one mbarrier BEFORE pipelining,
     # while load and await are still adjacent (post-pipeline the await moves to
