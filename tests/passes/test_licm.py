@@ -31,8 +31,8 @@ def test_hoist_alloc_without_init():
         module {
           kernel @test(%a: gmem_tensor<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             for (%k: index = 0 to 64) {
-              %s: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-              %r: rmem_tensor<128x64xbf16> = alloc() attrs={init: 0.0}
+              %s: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+              %r: rmem_tensor<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
               move(%s: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
             }
           }
@@ -45,9 +45,9 @@ def test_hoist_alloc_without_init():
     expected = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %s: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %s: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             for (%k: index = 0 to 64) {
-              %r: rmem_tensor<128x64xbf16> = alloc() attrs={init: 0.0}
+              %r: rmem_tensor<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
               move(%s: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
             }
           }

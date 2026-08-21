@@ -10,18 +10,18 @@ def test_war_on_shared_buffer_gets_barrier():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<128x4096xbf16>, %b: gmem_tensor<128x4096xbf16>, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %sa: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %sb: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %sa: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %sb: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             for (%k: index = 0 to 4) attrs={label: "k"} {
               %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, %k: index)
-              %lm: lock<mbar> = alloc()
+              %lm: lock<mbar> = alloc() attrs={id: 2}
               async(%lm: lock<mbar>) {
                 move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
               }
               await(%lm: lock<mbar>)
-              %lw: lock<wgmma> = alloc()
+              %lw: lock<wgmma> = alloc() attrs={id: 3}
               async(%lw: lock<wgmma>) matmul(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %sb: smem_tensor<128x64xbf16 swizzle="128B">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
               await(%lw: lock<wgmma>)
             }
@@ -38,19 +38,19 @@ def test_war_on_shared_buffer_gets_barrier():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<128x4096xbf16>, %b: gmem_tensor<128x4096xbf16>, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %sa: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %sb: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %sa: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %sb: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             for (%k: index = 0 to 4) attrs={label: "k"} {
               %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
               %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem_tensor<128x4096xbf16>, 0, %k: index)
-              %lm: lock<mbar> = alloc()
+              %lm: lock<mbar> = alloc() attrs={id: 2}
               barrier() attrs={id: 1, scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %ak: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem_tensor<128x64xbf16 swizzle="128B">, %bk: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
               }
               await(%lm: lock<mbar>)
-              %lw: lock<wgmma> = alloc()
+              %lw: lock<wgmma> = alloc() attrs={id: 3}
               async(%lw: lock<wgmma>) matmul(%sa: smem_tensor<128x64xbf16 swizzle="128B">, %sb: smem_tensor<128x64xbf16 swizzle="128B">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
               await(%lw: lock<wgmma>)
             }
@@ -64,21 +64,21 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
         module {
           kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
             %c0: index = index_constant() attrs={value: 0}
-            %0: smem_tensor<256x64xbf16 swizzle="128B"> = alloc()
-            %1: lock<mbar> = alloc()
-            %2: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %0: smem_tensor<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %1: lock<mbar> = alloc() attrs={id: 1}
+            %2: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 2}
             %c3: index = index_constant() attrs={value: 3}
-            %3: smem_tensor<256x64xbf16 swizzle="128B"> = alloc()
-            %4: lock<mbar> = alloc()
-            %5: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %3: smem_tensor<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 3}
+            %4: lock<mbar> = alloc() attrs={id: 4}
+            %5: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 5}
             %c2: index = index_constant() attrs={value: 2}
-            %6: smem_tensor<256x64xbf16 swizzle="128B"> = alloc()
-            %7: lock<mbar> = alloc()
-            %8: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %6: smem_tensor<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 6}
+            %7: lock<mbar> = alloc() attrs={id: 7}
+            %8: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 8}
             %c1: index = index_constant() attrs={value: 1}
-            %9: smem_tensor<256x64xbf16 swizzle="128B"> = alloc()
-            %10: lock<mbar> = alloc()
-            %11: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %9: smem_tensor<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 9}
+            %10: lock<mbar> = alloc() attrs={id: 10}
+            %11: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 11}
             %bx: index, %by: index, %bz: index = block_ids()
             %12: gmem_tensor<256x4096xbf16> = tile(%b: gmem_tensor<4096x4096xbf16>, %by: index, 0)
             %13: gmem_tensor<256x64xbf16 strides=[4096, 1]> = tile(%12: gmem_tensor<256x4096xbf16>, 0, %c3: index)
@@ -110,15 +110,15 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             %23: gmem_tensor<128x256xbf16 strides=[4096, 1]> = tile(%22: gmem_tensor<128x4096xbf16>, 0, %by: index)
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %24: gmem_tensor<64x256xbf16 strides=[4096, 1]> = tile(%23: gmem_tensor<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %25: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %25: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12, init: 0.0}
             %26: smem_tensor<64x64xbf16 swizzle="128B"> = tile(%11: smem_tensor<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %27: smem_tensor<64x64xbf16 swizzle="128B"> = tile(%8: smem_tensor<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %28: smem_tensor<64x64xbf16 swizzle="128B"> = tile(%5: smem_tensor<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %29: smem_tensor<64x64xbf16 swizzle="128B"> = tile(%2: smem_tensor<128x64xbf16 swizzle="128B">, %wgx: index, 0)
-            %30: lock<wgmma> = alloc()
-            %31: lock<wgmma> = alloc()
-            %32: lock<wgmma> = alloc()
-            %33: lock<wgmma> = alloc()
+            %30: lock<wgmma> = alloc() attrs={id: 13}
+            %31: lock<wgmma> = alloc() attrs={id: 14}
+            %32: lock<wgmma> = alloc() attrs={id: 15}
+            %33: lock<wgmma> = alloc() attrs={id: 16}
             %c4: index = index_constant() attrs={value: 4}
             %34: smem_tensor<64x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%26: smem_tensor<64x64xbf16 swizzle="128B">, 0, %c0: index)
             %35: smem_tensor<256x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%9: smem_tensor<256x64xbf16 swizzle="128B">, 0, %c0: index)
@@ -248,7 +248,7 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
               matmul(%62: smem_tensor<64x16xbf16 strides=[64, 1] swizzle="128B">, %63: smem_tensor<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_iter3_iter2"}
               matmul(%64: smem_tensor<64x16xbf16 strides=[64, 1] swizzle="128B">, %65: smem_tensor<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_iter3_iter3"}
             }
-            %78: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            %78: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 17}
             await(%33: lock<wgmma>)
             convert(%78: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
             move(%24: gmem_tensor<64x256xbf16 strides=[4096, 1]>, %78: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}

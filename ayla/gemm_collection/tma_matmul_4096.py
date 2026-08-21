@@ -23,20 +23,20 @@ def tma_matmul_4096_module():
             %b_block: gmem_tensor<64x4096xf32> = tile(%b: gmem_tensor<4096x4096xf32>, %cy: index, 0)
             %c_block: gmem_tensor<64x64xf32 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xf32>, %cx: index, %cy: index)
             %c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem_tensor<64x64xf32 strides=[4096, 1]>, %ty: index, %tx: index)
-            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={init: 0.0}
+            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
             for (%ko: index = 0 to 64) {
               %a_ko: gmem_tensor<64x64xf32 strides=[4096, 1]> = tile(%a_block: gmem_tensor<64x4096xf32>, 0, %ko: index)
               %b_ko: gmem_tensor<64x64xf32 strides=[4096, 1]> = tile(%b_block: gmem_tensor<64x4096xf32>, 0, %ko: index)
-              %a_ko_smem: smem_tensor<64x64xf32> = alloc()
+              %a_ko_smem: smem_tensor<64x64xf32> = alloc() attrs={id: 1}
               move(%a_ko_smem: smem_tensor<64x64xf32>, %a_ko: gmem_tensor<64x64xf32 strides=[4096, 1]>) attrs={tma: True}
-              %b_ko_smem: smem_tensor<64x64xf32> = alloc()
+              %b_ko_smem: smem_tensor<64x64xf32> = alloc() attrs={id: 2}
               move(%b_ko_smem: smem_tensor<64x64xf32>, %b_ko: gmem_tensor<64x64xf32 strides=[4096, 1]>) attrs={tma: True}
               for (%ki: index = 0 to 64) {
                 %a_ki: smem_tensor<2x1xf32 strides=[64, 1]> = tile(%a_ko_smem: smem_tensor<64x64xf32>, %ty: index, %ki: index)
                 %b_ki: smem_tensor<2x1xf32 strides=[64, 1]> = tile(%b_ko_smem: smem_tensor<64x64xf32>, %tx: index, %ki: index)
-                %a_ki_rmem: rmem_tensor<2x1xf32> = alloc()
+                %a_ki_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 3}
                 move(%a_ki_rmem: rmem_tensor<2x1xf32>, %a_ki: smem_tensor<2x1xf32 strides=[64, 1]>)
-                %b_ki_rmem: rmem_tensor<2x1xf32> = alloc()
+                %b_ki_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 4}
                 move(%b_ki_rmem: rmem_tensor<2x1xf32>, %b_ki: smem_tensor<2x1xf32 strides=[64, 1]>)
                 matmul(%a_ki_rmem: rmem_tensor<2x1xf32>, %b_ki_rmem: rmem_tensor<2x1xf32>, %c_thread_rmem: rmem_tensor<2x2xf32>)
               }
