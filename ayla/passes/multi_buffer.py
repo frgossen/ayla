@@ -79,7 +79,11 @@ class MultiBuffer(LoweringPass):
             f"MultiBuffer: expected an unstrided loop, got step {loop.step}"
         )
 
-        clones = [clone_op(op, {}) for _ in range(self.depth)]
+        # Each copy is its own buffer, so each needs its own name.
+        clones = [
+            clone_op(op, {}, attrs={**op.attrs, "uniq": AllocOp.fresh_uniq()})
+            for _ in range(self.depth)
+        ]
         # Which buffer this iteration uses: (iv - lb) % depth.
         lb = IndexConstantOp.build(value=-loop.lb)
         shifted = IndexAddOp.build(loop.iv, lb.result())

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import enum
+import itertools
 import math
+from typing import ClassVar, Iterator
 
 from .base.ir import Block, Dialect, Op, Region, Type, Value
 from .base.printer import Printer
@@ -379,7 +381,16 @@ class AllocOp(Op):
     """Allocate a register- or shared-memory tensor.
 
     Optional `init` attr fills the allocation with a constant value.
+
+    The `uniq` attr names the buffer: two allocations are the same one only if
+    they carry the same id.
     """
+
+    _uniq_counter: ClassVar[Iterator[int]] = itertools.count()
+
+    @classmethod
+    def fresh_uniq(cls) -> int:
+        return next(cls._uniq_counter)
 
     @classmethod
     def build(
@@ -391,6 +402,7 @@ class AllocOp(Op):
         a: dict[str, object] = dict(attrs or {})
         if init is not None:
             a["init"] = init
+        a.setdefault("uniq", cls.fresh_uniq())
         result = Value(name=None, type=type)
         return cls(operands=[], results=[result], attrs=a)
 
@@ -1759,6 +1771,11 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
 
 def is_value_identical(op: Op) -> bool:
     """Same operands and attrs always produce identical results."""
+    if isinstance(op, AllocOp):
+        # An allocation is only the same buffer as another if it says so, so
+        # one parsed without a `uniq` stays opaque rather than merging with
+        # every other allocation of its type.
+        return "uniq" in op.attrs
     return isinstance(op, (
         BlockIdsOp,
         IndexAddOp,
