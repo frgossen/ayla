@@ -2,7 +2,13 @@
 
 Folds index arithmetic where operands are known constants,
 eliminates trivial operations like `x * 1`, `x + 0`, `0 * n`,
-`x * 0`, and removes no-op tile ops.
+`x * 0`, removes no-op tile ops, and resolves a `select` whose index is known.
+
+One fact beyond plain constants: inside a ``for``, the induction variable is
+congruent to ``lb`` modulo ``step``. That is enough to fold ``(iv + c) % m``
+whenever ``m`` divides the step, even though ``iv`` itself is not a constant --
+which is how a per-iteration buffer choice becomes a static one after
+unrolling multiplies the step.
 """
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ from ..gpu_dialect import (
     IndexMulOp,
     ModuleOp,
     PtrAddOp,
+    SelectOp,
     TileOp,
 )
 from ..base.ir import Op, Value, clone_op
@@ -31,19 +38,55 @@ class Folding(LoweringPass):
         self.register(IndexDivOp, type(self).lower_div)
         self.register(IndexModOp, type(self).lower_mod)
         self.register(PtrAddOp, type(self).lower_ptr_add)
+        self.register(SelectOp, type(self).lower_select)
         self.register(TileOp, type(self).lower_tile)
+        # Induction variable -> (lb, step) of the loop it belongs to, for the
+        # loops enclosing the op currently being folded.
+        #
+        # TODO: this only exists because ops have no parent pointer. An
+        # induction variable is a block argument with no defining op, so the
+        # bounds it obeys live on the enclosing ForOp with no way to reach them
+        # from inside the body -- every pass that wants enclosing context has to
+        # thread its own scope stack down the walk instead. Give Op (or Block) a
+        # parent and this becomes a lookup at the point of use, and lower_for
+        # can go back to letting the framework walk the body.
+        self._iv_congruence: dict[Value, tuple[int, int]] = {}
 
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
         if op.trip_count != 1:
-            return None
+            assert len(op.body.blocks) == 1
+            # Walk the body ourselves rather than falling through, so the
+            # induction variable's congruence is in scope while folding it.
+            # See the TODO on _iv_congruence: with parent pointers this branch
+            # would not need to exist.
+            self._iv_congruence[op.iv] = (op.lb, op.step)
+            try:
+                self.lower_region(op.body)
+            finally:
+                del self._iv_congruence[op.iv]
+            return [op], list(op.results)
+
         assert len(op.body.blocks) == 1
         self.lower_region(op.body)
         iv_const = IndexConstantOp.build(value=op.lb)
         vmap: dict[Value, Value] = {op.iv: iv_const.result()}
         cloned = [clone_op(body_op, vmap) for body_op in op.body.entry_block.ops]
         return [iv_const, *cloned], []
+
+    def lower_select(
+        self, op: SelectOp,
+    ) -> tuple[list[Op], list[object]] | None:
+        index = self._const_val(op.index)
+        if index is None:
+            return None
+        cases = [self.value_map.get(case, case) for case in op.cases]
+        if not 0 <= index < len(cases):
+            raise ValueError(
+                f"select: index {index} out of range for {len(cases)} cases"
+            )
+        return [], [cases[index]]
 
     def _const_val(self, value: Value) -> int | None:
         mapped = self.value_map.get(value, value)
@@ -206,6 +249,16 @@ class Folding(LoweringPass):
         if lhs_val == 0:
             new_op = IndexConstantOp.build(0)
             return [new_op], [new_op.result()]
+
+        # An induction variable only takes values lb + i*step, so (iv + c) % m
+        # is (lb + c) % m for any m dividing the step.
+        base, offset = self._decompose_add(op.lhs)
+        congruence = self._iv_congruence.get(base) if rhs_val else None
+        if congruence is not None:
+            lb, step = congruence
+            if step % rhs_val == 0:
+                new_op = IndexConstantOp.build((lb + offset) % rhs_val)
+                return [new_op], [new_op.result()]
         return None
 
     def lower_ptr_add(

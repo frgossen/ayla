@@ -2,7 +2,9 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
+from ayla.passes.canonicalize import canonicalize
 from ayla.passes.folding import folding
+from ayla.passes.unroll_loop import unroll_loop
 
 
 def test_fold_constants():
@@ -40,3 +42,100 @@ def test_fold_constants():
             %cx_offset: index = index_mul(%cx: index, %c64: index)
           }
         }""")
+
+
+def test_per_iteration_buffer_choice_folds_after_unrolling():
+    """The capability select and the iv congruence exist for.
+
+    A loop that picks its buffer with ``(k % (depth*step)) / step`` is
+    double-buffered explicitly in the IR. Unrolling multiplies the step, which
+    makes each copy's index static, so folding resolves every select to a
+    concrete buffer and the arithmetic disappears -- the same result unrolling
+    currently gets by duplicating allocations behind CSE's back.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) {
+            %b0: smem_tensor<4x4xf32> = alloc()
+            %b1: smem_tensor<4x4xf32> = alloc()
+            for (%k: index = 0 to 24 step 3) attrs={label: "k"} {
+              %c6: index = index_constant() attrs={value: 6}
+              %r: index = index_mod(%k: index, %c6: index)
+              %c3: index = index_constant() attrs={value: 3}
+              %sel: index = index_div(%r: index, %c3: index)
+              %buf: smem_tensor<4x4xf32> = select(%sel: index, %b0: smem_tensor<4x4xf32>, %b1: smem_tensor<4x4xf32>)
+              move(%buf: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+            }
+          }
+        }""")
+
+    module = gpu_dialect.parse(module_str)
+    module = unroll_loop(module, unroll_factor=2, label_filter="k")
+    module = canonicalize(folding(module))
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) {
+            %b0: smem_tensor<4x4xf32> = alloc()
+            %b1: smem_tensor<4x4xf32> = alloc()
+            for (%k: index = 0 to 24 step 6) attrs={label: "k"} {
+              move(%b0: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+              move(%b1: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+            }
+          }
+        }""")
+
+
+def test_buffer_choice_stays_dynamic_when_depth_does_not_divide_the_unroll():
+    """Depth 3 with unroll 2: the index still varies, so nothing folds.
+
+    The multi-buffering pass will have to reject this up front -- there is no
+    static answer, and the backend cannot select between buffers at runtime.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) {
+            %b0: smem_tensor<4x4xf32> = alloc()
+            %b1: smem_tensor<4x4xf32> = alloc()
+            %b2: smem_tensor<4x4xf32> = alloc()
+            for (%k: index = 0 to 24 step 3) attrs={label: "k"} {
+              %c9: index = index_constant() attrs={value: 9}
+              %r: index = index_mod(%k: index, %c9: index)
+              %c3: index = index_constant() attrs={value: 3}
+              %sel: index = index_div(%r: index, %c3: index)
+              %buf: smem_tensor<4x4xf32> = select(%sel: index, %b0: smem_tensor<4x4xf32>, %b1: smem_tensor<4x4xf32>, %b2: smem_tensor<4x4xf32>)
+              move(%buf: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+            }
+          }
+        }""")
+
+    module = gpu_dialect.parse(module_str)
+    module = unroll_loop(module, unroll_factor=2, label_filter="k")
+    module = canonicalize(folding(module))
+
+    assert "select(" in repr(module)
+
+
+def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
+    """The residue is ``lb % m``, and the fact does not outlive the loop."""
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) {
+            for (%k: index = 5 to 29 step 6) attrs={label: "k"} {
+              %c3: index = index_constant() attrs={value: 3}
+              %inner: index = index_mod(%k: index, %c3: index)
+            }
+            %cx: index, %cy: index, %cz: index = block_ids()
+            %c3b: index = index_constant() attrs={value: 3}
+            %outer: index = index_mod(%cx: index, %c3b: index)
+          }
+        }""")
+
+    module = folding(gpu_dialect.parse(module_str))
+    after = repr(module)
+
+    # 5 % 3 == 2, on every iteration.
+    assert "index_constant() attrs={value: 2}" in after
+    assert "index_mod(%k: index" not in after
+    # The block id is not an induction variable, so its mod is untouched.
+    assert "index_mod(%cx: index, %c3b: index)" in after
