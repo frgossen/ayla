@@ -80,6 +80,11 @@ class MultiBuffer(LoweringPass):
         )
 
         clones = [clone_op(op, {}) for _ in range(self.depth)]
+        for clone in clones:
+            # Each copy is its own buffer, so it needs its own name -- clone_op
+            # carries the original's attrs across, uniq included, and CSE would
+            # merge them straight back into one.
+            clone.attrs["uniq"] = AllocOp.fresh_uniq()
         # Which buffer this iteration uses: (iv - lb) % depth.
         lb = IndexConstantOp.build(value=-loop.lb)
         shifted = IndexAddOp.build(loop.iv, lb.result())

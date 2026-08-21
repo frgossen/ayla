@@ -44,11 +44,11 @@ def test_promote_gmem_matmul_operands_to_smem():
     expected = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={uniq: 0}
             move(%0: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
-            %1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={uniq: 1}
             move(%1: smem_tensor<128x64xbf16 swizzle="128B">, %b: gmem_tensor<128x64xbf16>) attrs={tma: True}
-            %2: smem_tensor<128x128xf32 swizzle="128B"> = alloc() attrs={init: 0.0}
+            %2: smem_tensor<128x128xf32 swizzle="128B"> = alloc() attrs={init: 0.0, uniq: 2}
             matmul(%0: smem_tensor<128x64xbf16 swizzle="128B">, %1: smem_tensor<128x64xbf16 swizzle="128B">, %2: smem_tensor<128x128xf32 swizzle="128B">)
             move(%c: rmem_tensor<128x128xf32>, %2: smem_tensor<128x128xf32 swizzle="128B">) attrs={tma: True}
           }
@@ -72,9 +72,9 @@ def test_promote_lhs_rhs_preserves_init_on_matmul():
     expected = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: rmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={uniq: 0}
             move(%0: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
-            %1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+            %1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={uniq: 1}
             move(%1: smem_tensor<128x64xbf16 swizzle="128B">, %b: gmem_tensor<128x64xbf16>) attrs={tma: True}
             matmul(%0: smem_tensor<128x64xbf16 swizzle="128B">, %1: smem_tensor<128x64xbf16 swizzle="128B">, %c: rmem_tensor<128x128xf32>) attrs={init: 0.0}
           }
@@ -147,10 +147,10 @@ def test_promote_smem_with_warp_group_dependent_lhs():
               %6: gmem_tensor<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem_tensor<64x4096xbf16>, 0, %k: index)
               %7: gmem_tensor<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem_tensor<256x4096xbf16>, 0, %k: index)
               %8: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%0: gmem_tensor<128x4096xbf16>, 0, %k: index)
-              %9: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={label: "mm_lhs_smem"}
+              %9: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={label: "mm_lhs_smem", uniq: 0}
               move(%9: smem_tensor<128x64xbf16 swizzle="128B">, %8: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_lhs_smem", nc: True, tma: True}
               %10: smem_tensor<64x64xbf16 swizzle="128B"> = tile(%9: smem_tensor<128x64xbf16 swizzle="128B">, %wgx: index, 0)
-              %11: smem_tensor<256x64xbf16 swizzle="128B"> = alloc() attrs={label: "mm_rhs_smem"}
+              %11: smem_tensor<256x64xbf16 swizzle="128B"> = alloc() attrs={label: "mm_rhs_smem", uniq: 1}
               move(%11: smem_tensor<256x64xbf16 swizzle="128B">, %7: gmem_tensor<256x64xbf16 strides=[4096, 1]>) attrs={label: "mm_rhs_smem", nc: True, tma: True}
               matmul(%10: smem_tensor<64x64xbf16 swizzle="128B">, %11: smem_tensor<256x64xbf16 swizzle="128B">, %5: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
             }
