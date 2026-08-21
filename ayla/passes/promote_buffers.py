@@ -243,6 +243,14 @@ class PromoteBuffers(LoweringPass):
             return WrmemTensorType.build(sizes, dtype, warps=self.warps, layout=self.layout)
         raise ValueError(f"unsupported target type {self.target_type!r}")
 
+    def _build_buffer_attrs(
+        self, matmul_label: str | None, operand_name: str
+    ) -> dict[str, object]:
+        """The label identifying the buffer promoted for one matmul operand."""
+        if matmul_label is None:
+            return {}
+        return {"label": f"{matmul_label}_{operand_name}_{self.target_type}"}
+
     def _build_move_attrs(
         self, matmul_label: str | None, operand_name: str, allow_nc: bool = True
     ) -> dict[str, object]:
@@ -301,12 +309,19 @@ class PromoteBuffers(LoweringPass):
 
         # Alloc + move at the target level.
         target_type = self._build_target_type(chain_root.type)
+        # The allocation carries the same label as the move that fills it, so a
+        # later pass can name the buffer it wants -- multi_buffer only touches
+        # labelled ones.
+        buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
         if init is not None:
-            alloc = AllocOp.build(target_type, init=init)
+            alloc = AllocOp.build(target_type, init=init, attrs=buffer_attrs)
             new_ops.append(alloc)
         else:
             attrs = self._build_move_attrs(matmul_label, operand_name)
-            alloc = AllocOp.build(self._build_target_type(chain_root.type, dtype=chain_root.type.dtype))
+            alloc = AllocOp.build(
+                self._build_target_type(chain_root.type, dtype=chain_root.type.dtype),
+                attrs=buffer_attrs,
+            )
             move = MoveOp.build(dst=alloc.result(), src=chain_root, attrs=attrs)
             new_ops.extend([alloc, move])
             if target_type.dtype != chain_root.type.dtype:
