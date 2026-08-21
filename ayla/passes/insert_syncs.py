@@ -209,14 +209,14 @@ def _analyze(
     if isinstance(op, (ModuleOp, KernelOp)):
         # A module/kernel body is a fresh scope -- no live effects flow in, and
         # its internal effects don't escape to the enclosing scope.
-        _analyze_block(list(op.body.entry_block.ops), DataflowState(), targets)
+        _analyze_block(list(op.body.ops), DataflowState(), targets)
         return live
     if isinstance(op, ForOp):
         # Analyze the body to a fixpoint over its header (the loop-carried state
         # at the top of the body); return the loop's live-out.
         header = live
         while True:
-            live_out = _analyze_block(op.body.entry_block.ops, header, targets)
+            live_out = _analyze_block(op.body.ops, header, targets)
             joined = header.join(live_out)  # fold the back edge
             if joined == header:
                 return live_out
@@ -312,7 +312,7 @@ def _analyze(
         live.named_barrier_ids = set()
         live.named_barrier_ids_pending_await = {}
     targets[op] = BarrierTarget(barrier_scope, named_id)
-    # A barrier orders settled accesses it covers; pending (in-region) effects
+    # A barrier orders settled accesses it covers; pending (in-block) effects
     # survive — only their await completes them.
     for buf, effs in live.concurrent_memory_effects.items():
         live.concurrent_memory_effects[buf] = {
@@ -367,9 +367,8 @@ def _insert_barriers(
                 BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
             )
         new_ops.append(op)
-        for region in op.regions:
-            for inner in region.blocks:
-                _insert_barriers(inner, targets, num_threads)
+        for inner in op.blocks:
+            _insert_barriers(inner, targets, num_threads)
     block.ops = new_ops
 
 
@@ -381,7 +380,7 @@ class InsertSyncs(Pass):
         kernel = find_op(module, lambda op: isinstance(op, KernelOp))
         assert isinstance(kernel, KernelOp)
         # Transform: insert the barriers with the kernel-wide participant count.
-        _insert_barriers(module.body.entry_block, targets, kernel.num_threads)
+        _insert_barriers(module.body, targets, kernel.num_threads)
         return module
 
 

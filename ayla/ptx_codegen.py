@@ -279,7 +279,7 @@ def _resolve_block_dim(kernel: KernelOp) -> None:
 
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
-    top_ops = module.body.entry_block.ops
+    top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
@@ -336,11 +336,6 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         raise NotImplementedError(f"make_ptx_kernel: not implemented for {op.op_id}")
 
 
-def _emit_region(p: PtxPrinter, region) -> None:
-    for block in region.blocks:
-        _emit_block(p, block)
-
-
 def _emit_block(p: PtxPrinter, block) -> None:
     for op in block.ops:
         _emit_op(p, op)
@@ -355,7 +350,7 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     p.write_line(f"mov.b32 {iv_reg}, {op.lb};")
     p.write_line(f"{label}:")
     p.write_newline_once()
-    _emit_region(p, op.body)
+    _emit_block(p, op.body)
     p.write_line(f"// END: `{_op_description(p, op)}`")
     p.write_line(f"add.s32 {iv_reg}, {iv_reg}, {op.step};")
     p.write_line(f"setp.lt.s32 {pred}, {iv_reg}, {op.ub};")
@@ -368,7 +363,7 @@ def _emit_module(p: PtxPrinter, op: ModuleOp) -> None:
     p.write_line(f".target {op.target}")
     p.write_line(f".address_size {op.address_size}")
     p.write_newline_once()
-    _emit_region(p, op.body)
+    _emit_block(p, op.body)
 
 
 def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
@@ -376,7 +371,7 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
     p.write_line(f".visible .entry {op.name}(")
     with p.indented():
         param_lines: list[str] = []
-        for arg in op.body.entry_block.arguments:
+        for arg in op.body.arguments:
             mapping = map_type_to_registers(arg.type)
             types = list(pytree.flatten(mapping.member_register_types))
             names = list(pytree.flatten(
@@ -395,7 +390,7 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
     p.write_line("{")
     with p.indented():
         decl_mark = p.mark()
-        for arg in op.body.entry_block.arguments:
+        for arg in op.body.arguments:
             mapping = map_type_to_registers(arg.type)
             types = list(pytree.flatten(mapping.member_register_types))
             reg_names = list(pytree.flatten(
@@ -410,7 +405,7 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
                 ).splitlines():
                     p.write_line(line)
         p.write_newline_once()
-        _emit_region(p, op.body)
+        _emit_block(p, op.body)
         p.write_line("ret;")
     p.write_line("}")
 

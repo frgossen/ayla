@@ -37,7 +37,7 @@ def _is_async_move(op: Op) -> bool:
     if isinstance(op, TmaMoveOp):
         return True
     return isinstance(op, AsyncOp) and all(
-        isinstance(o, MoveOp) for o in op.body.entry_block.ops
+        isinstance(o, MoveOp) for o in op.body.ops
     )
 
 

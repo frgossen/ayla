@@ -4,7 +4,7 @@ from __future__ import annotations
 import enum
 import math
 
-from .base.ir import Block, Dialect, Op, Region, Type, Value
+from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
 
 gpu_dialect = Dialect("gpu")
@@ -23,17 +23,17 @@ class ModuleOp(Op):
     @classmethod
     def build(
         cls,
-        body: Region,
+        body: Block,
         attrs: dict[str, object] | None = None,
     ) -> "ModuleOp":
         merged = {**cls._DEFAULT_ATTRS, **(attrs or {})}
         return cls(
-            operands=[], results=[], attrs=merged, regions=[body],
+            operands=[], results=[], attrs=merged, blocks=[body],
         )
 
     @property
-    def body(self) -> Region:
-        return self.regions[0]
+    def body(self) -> Block:
+        return self.blocks[0]
 
     @property
     def version(self) -> str:
@@ -55,7 +55,7 @@ class ModuleOp(Op):
         }
         p.write_extra_attrs(non_default)
         p.write(" ")
-        self.body.print(p, skip_entry_block_label=True)
+        self.body.print(p, skip_label=True)
 
     @classmethod
     def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
@@ -65,7 +65,7 @@ class ModuleOp(Op):
             )
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
-        body = Region.parse(brace, p, entry_block_arguments=[])
+        body = Block.parse(brace, p, arguments=[])
         return cls.build(body, attrs=attrs)
 
 
@@ -75,7 +75,7 @@ class KernelOp(Op):
     def build(
         cls,
         name: str,
-        body: Region,
+        body: Block,
         grid_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         block_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         num_warp_groups: int | None = None,
@@ -91,7 +91,7 @@ class KernelOp(Op):
                 "num_warp_groups": num_warp_groups,
                 **(attrs or {}),
             },
-            regions=[body],
+            blocks=[body],
         )
 
     @property
@@ -133,14 +133,14 @@ class KernelOp(Op):
 
     @property
     def signature(self) -> list[Type]:
-        return [arg.type for arg in self.body.blocks[0].arguments]
+        return [arg.type for arg in self.body.arguments]
 
     @property
-    def body(self) -> Region:
-        return self.regions[0]
+    def body(self) -> Block:
+        return self.blocks[0]
 
     def print(self, p: Printer) -> None:
-        entry = self.body.entry_block
+        entry = self.body
         p.write(f"kernel @{self.name}(")
         for i, v in enumerate(entry.arguments):
             if i:
@@ -159,7 +159,7 @@ class KernelOp(Op):
             self.attrs, skip_keys={"name", "grid_dim", "block_dim", "num_warp_groups"},
         )
         p.write(" ")
-        self.body.print(p, skip_entry_block_label=True)
+        self.body.print(p, skip_label=True)
 
     @classmethod
     def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
@@ -194,7 +194,7 @@ class KernelOp(Op):
             num_warp_groups = p.read_int()
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
-        body = Region.parse(brace, p, entry_block_arguments=args)
+        body = Block.parse(brace, p, arguments=args)
         return cls.build(name, body, grid_dim=grid_dim, block_dim=block_dim, num_warp_groups=num_warp_groups, attrs=attrs)
 
 
@@ -597,31 +597,30 @@ class BarrierOp(Op):
 class AsyncOp(Op):
     """A group of async work issued together and completed by one ``await``.
 
-    Wraps a body region (a single block) of ops that run asynchronously under
-    one ``lock``. The lock is the only operand — what an async op carries
-    beyond the plain op(s) it wraps — while the work ops inside keep their own
-    (matmul/move) operands. Completion is signalled elsewhere by
-    ``await(%lock)``.
+    Wraps a body block of ops that run asynchronously under one ``lock``. The
+    lock is the only operand — what an async op carries beyond the plain op(s)
+    it wraps — while the work ops inside keep their own (matmul/move) operands.
+    Completion is signalled elsewhere by ``await(%lock)``.
     """
 
     @classmethod
     def build(
         cls,
         lock: Value,
-        body: Region | None = None,
+        body: Block | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "AsyncOp":
         assert isinstance(lock.type, LockType), (
             f"AsyncOp: expected LockType; got {lock.type}"
         )
         if body is None:
-            body = Region(blocks=[Block()])
-        elif body.entry_block.arguments:
+            body = Block()
+        elif body.arguments:
             raise ValueError(
                 f"async: body block takes no arguments, got "
-                f"{len(body.entry_block.arguments)}"
+                f"{len(body.arguments)}"
             )
-        return cls(operands=[lock], results=[], attrs=attrs or {}, regions=[body])
+        return cls(operands=[lock], results=[], attrs=attrs or {}, blocks=[body])
 
     @property
     def lock(self) -> Value:
@@ -632,8 +631,8 @@ class AsyncOp(Op):
         self.operands[0] = value
 
     @property
-    def body(self) -> Region:
-        return self.regions[0]
+    def body(self) -> Block:
+        return self.blocks[0]
 
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id}(")
@@ -641,12 +640,11 @@ class AsyncOp(Op):
         p.write(")")
         p.write_extra_attrs(self.attrs)
         p.write(" ")
-        block = self.body.entry_block
-        if len(self.body.blocks) == 1 and len(block.ops) == 1:
+        if len(self.body.ops) == 1:
             # Sugar: a single-op body prints inline, without braces.
-            block.ops[0].print(p)
+            self.body.ops[0].print(p)
         else:
-            self.body.print(p, skip_entry_block_label=True)
+            self.body.print(p, skip_label=True)
 
     @classmethod
     def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
@@ -660,10 +658,10 @@ class AsyncOp(Op):
         attrs = p.read_extra_attrs()
         if p.can_read_literal("{"):
             brace = p.read_literal("{")
-            body = Region.parse(brace, p, entry_block_arguments=[])
+            body = Block.parse(brace, p, arguments=[])
         else:
             # Sugar: a single op stands in for a one-op body block.
-            body = Region(blocks=[Block(ops=[Op.parse(p)])])
+            body = Block(ops=[Op.parse(p)])
         return cls.build(lock, body=body, attrs=attrs)
 
 
@@ -1236,21 +1234,21 @@ class ForOp(Op):
         lb: int,
         ub: int,
         step: int = 1,
-        body: Region | None = None,
+        body: Block | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "ForOp":
         if body is None:
             iv = Value(name=None, type=IndexType())
-            body = Region(blocks=[Block(arguments=[iv])])
+            body = Block(arguments=[iv])
         else:
-            args = body.entry_block.arguments
+            args = body.arguments
             if len(args) != 1:
                 raise ValueError(
-                    f"for: entry block must have 1 argument, got {len(args)}"
+                    f"for: body block must have 1 argument, got {len(args)}"
                 )
             if not isinstance(args[0].type, IndexType):
                 raise ValueError(
-                    f"for: entry block argument must have IndexType, "
+                    f"for: body block argument must have IndexType, "
                     f"got {type(args[0].type).__name__}"
                 )
         return cls(
@@ -1262,7 +1260,7 @@ class ForOp(Op):
                 "step": step,
                 **(attrs or {}),
             },
-            regions=[body],
+            blocks=[body],
         )
 
     @property
@@ -1286,12 +1284,12 @@ class ForOp(Op):
         return {k: v for k, v in self.attrs.items() if k not in ("lb", "ub", "step")}
 
     @property
-    def body(self) -> Region:
-        return self.regions[0]
+    def body(self) -> Block:
+        return self.blocks[0]
 
     @property
     def iv(self) -> Value:
-        return self.body.blocks[0].arguments[0]
+        return self.body.arguments[0]
 
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id} (")
@@ -1304,7 +1302,7 @@ class ForOp(Op):
             self.attrs, skip_keys=("lb", "ub", "step"),
         )
         p.write(" ")
-        self.body.print(p, skip_entry_block_label=True)
+        self.body.print(p, skip_label=True)
 
     @classmethod
     def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
@@ -1325,7 +1323,7 @@ class ForOp(Op):
         p.read_literal(")")
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
-        body = Region.parse(brace, p, entry_block_arguments=[iv])
+        body = Block.parse(brace, p, arguments=[iv])
         return cls.build(lb, ub, step, body=body, attrs=attrs)
 
 
@@ -1751,13 +1749,12 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         return [("W", root_buffer(buf), scope)]
     if isinstance(op, (ForOp, AsyncOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
-        for region in op.regions:
-            for block in region.blocks:
-                for body_op in block.ops:
-                    body_effects = memory_effects(body_op)
-                    if body_effects is None:
-                        return None
-                    effects.extend(body_effects)
+        for block in op.blocks:
+            for body_op in block.ops:
+                body_effects = memory_effects(body_op)
+                if body_effects is None:
+                    return None
+                effects.extend(body_effects)
         return effects
     return None
 
@@ -1789,20 +1786,20 @@ def is_side_effect_free(op: Op) -> bool:
 
 
 def effective_operands(op: Op) -> list[Value]:
-    """An op's explicit operands plus the values its regions capture.
+    """An op's explicit operands plus the values its blocks capture.
 
-    A region-bearing op (e.g. ``async``, ``for``) references SSA values defined
+    A block-bearing op (e.g. ``async``, ``for``) references SSA values defined
     in the enclosing scope from inside its body. Those captures are real data
     dependencies but are not in ``op.operands`` (the body refers to them
     directly). This returns ``op.operands`` followed by each captured value —
-    used somewhere in the regions, defined outside them — so dependency/SSA
+    used somewhere in the blocks, defined outside them — so dependency/SSA
     analysis sees an op's full read-set whether a value is an explicit operand
-    or a region capture. For an op with no regions it is just ``op.operands``.
+    or a block capture. For an op with no blocks it is just ``op.operands``.
 
     Single program-order walk leaning on SSA: a value used before it is defined
     within ``op`` must come from the enclosing scope, so it is a capture. For
-    each op we record any operands not yet defined, recurse into its regions
-    (whose block arguments — and, in SSA order, earlier siblings' results — are
+    each op we record any operands not yet defined, recurse into its blocks
+    (whose arguments — and, in SSA order, earlier siblings' results — are
     already defined), then mark its results defined for later siblings.
     """
     defined: set[Value] = set()
@@ -1814,11 +1811,10 @@ def effective_operands(op: Op) -> list[Value]:
             if v not in defined and v not in effective_set:
                 effective_set.add(v)
                 effective.append(v)
-        for region in o.regions:
-            for block in region.blocks:
-                defined.update(block.arguments)
-                for inner in block.ops:
-                    visit(inner)
+        for block in o.blocks:
+            defined.update(block.arguments)
+            for inner in block.ops:
+                visit(inner)
         defined.update(o.results)
 
     visit(op)

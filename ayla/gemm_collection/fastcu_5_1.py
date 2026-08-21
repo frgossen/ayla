@@ -1267,8 +1267,8 @@ def fastcu_5_1_module():
           kernel @fastcu_5_1(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[512, 1, 1] block_dim=[384, 1, 1] {
           }
         }"""))  # noqa: E501
-    kernel = module.body.entry_block.ops[0]
-    entry = kernel.body.entry_block
+    kernel = module.body.ops[0]
+    entry = kernel.body
     a, b, c = entry.arguments
     gmem_t = a.type
     # desc_a feeds matmul_5's A path (BM=128 tile) but is built from %b

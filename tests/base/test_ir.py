@@ -2,7 +2,7 @@
 
 import textwrap
 
-from ayla.base.ir import Block, Dialect, Op, Region, Type, Value, clone_op
+from ayla.base.ir import Block, Dialect, Op, Type, Value, clone_op
 
 
 def assert_print_and_roundtrip(op: Op, expected: str) -> None:
@@ -19,7 +19,7 @@ def test_minimal():
     assert_print_and_roundtrip(op, "generic()")
 
 
-def test_with_attrs_and_regions():
+def test_with_attrs_and_blocks():
     op = Op(
         operands=[],
         results=[],
@@ -31,31 +31,27 @@ def test_with_attrs_and_regions():
             "lst": [1, "x", [2, 3]],
             "d": {"k": [True, None]},
         },
-        regions=[
-            Region(
-                blocks=[
-                    Block(name="a"),
-                    Block(name="b", ops=[Op(operands=[], results=[])]),
-                ]
-            ),
-            Region(
-                blocks=[
-                    Block(name="c", ops=[Op(operands=[], results=[])]),
-                    Block(name="d"),
-                ]
-            ),
+        blocks=[
+            Block(name="a"),
+            Block(name="b", ops=[Op(operands=[], results=[])]),
+            Block(name="c", ops=[Op(operands=[], results=[])]),
+            Block(name="d"),
         ],
     )
     expected = textwrap.dedent(
         """\
         generic() attrs={b: True, d: {k: [True, None]}, f: 3.5, i: 42, lst: [1, "x", [2, 3]], s: "hello"} {
         ^a:
+        }
+        {
         ^b:
           generic()
         }
         {
         ^c:
           generic()
+        }
+        {
         ^d:
         }"""
     )  # noqa: E501
@@ -69,7 +65,7 @@ def test_with_operands_and_results():
     c = Value(name="c", type=t)
     inner = Op(operands=[a, b], results=[c])
     block = Block(name="entry", arguments=[a, b], ops=[inner])
-    op = Op(operands=[], results=[], regions=[Region(blocks=[block])])
+    op = Op(operands=[], results=[], blocks=[block])
     expected = textwrap.dedent(
         """\
         generic() {
@@ -85,7 +81,7 @@ def test_with_block_args():
     a = Value(name="a", type=t)
     b = Value(name="b", type=t)
     block = Block(name="entry", arguments=[a, b])
-    op = Op(operands=[], results=[], regions=[Region(blocks=[block])])
+    op = Op(operands=[], results=[], blocks=[block])
     expected = textwrap.dedent(
         """\
         generic() {
@@ -113,21 +109,17 @@ def test_nested_ops():
             Op(operands=[a], results=[], attrs={"flag": True}),
         ],
     )
-    region_a = Region(blocks=[entry, cont])
-
     c = Value(name="c", type=t)
-    region_b = Region(
-        blocks=[
-            Block(arguments=[c], ops=[Op(operands=[c], results=[])]),
-        ]
-    )
+    other = Block(arguments=[c], ops=[Op(operands=[c], results=[])])
 
-    op = Op(operands=[], results=[], regions=[region_a, region_b])
+    op = Op(operands=[], results=[], blocks=[entry, cont, other])
     expected = textwrap.dedent(
         """\
         generic() {
         ^entry(%a: generic<bits: 32>, %b: generic):
           %0: generic = generic(%a: generic<bits: 32>, %b: generic)
+        }
+        {
         ^cont:
           generic(%a: generic<bits: 32>) attrs={flag: True}
         }
@@ -143,7 +135,7 @@ def test_nested_ops():
 # Use-list invariant.
 #
 #   value.uses contains (op, i) iff op.operands[i] is value and op is anchored
-#   (held by a block, directly or nested inside an anchored op's regions).
+#   (held by a block, directly or nested inside an anchored op's blocks).
 #
 # These drive mutations the *plain* way — no helper methods — to prove the
 # invariant is self-maintaining through the two observable containers.
@@ -239,14 +231,14 @@ def test_block_ops_reassignment_diffs():
     assert a.uses == {(op2, 0)}
 
 
-def test_removing_region_op_clears_nested_uses():
+def test_removing_block_op_clears_nested_uses():
     t = Type()
     a = Value(name="a", type=t)
     inner = Op(operands=[a], results=[])
     outer = Op(
         operands=[],
         results=[],
-        regions=[Region(blocks=[Block(ops=[inner])])],
+        blocks=[Block(ops=[inner])],
     )
     root = Block(ops=[outer])
 
@@ -263,7 +255,7 @@ def test_transplant_keeps_use_removes_before_adds():
     wrapper = Op(
         operands=[],
         results=[],
-        regions=[Region(blocks=[Block(ops=[inner])])],
+        blocks=[Block(ops=[inner])],
     )
     root = Block(ops=[wrapper])
 
@@ -275,7 +267,7 @@ def test_transplant_keeps_use_removes_before_adds():
     new_wrapper = Op(
         operands=[],
         results=[],
-        regions=[Region(blocks=[new_group])],
+        blocks=[new_group],
     )
     root.ops = [new_wrapper]
 
@@ -299,7 +291,7 @@ def test_clone_subtree_no_double_count():
     outer = Op(
         operands=[a],
         results=[],
-        regions=[Region(blocks=[Block(ops=[inner])])],
+        blocks=[Block(ops=[inner])],
     )
     Block(ops=[outer])
 
@@ -330,7 +322,7 @@ def test_parsed_ir_registers_uses():
         }"""
     )
     op = Dialect.empty().parse(src)
-    block = op.regions[0].blocks[0]
+    block = op.blocks[0]
     a = block.arguments[0]
     inner = block.ops[0]
     assert a.uses == {(inner, 0)}

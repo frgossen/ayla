@@ -34,7 +34,7 @@ from ..gpu_dialect import (
     memory_effects,
     root_buffer,
 )
-from ..base.ir import Block, Op, Region, Value, clone_op
+from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass
 
 
@@ -109,7 +109,7 @@ class PipelineLoop(LoweringPass):
 
         Labeled and unlabeled communicate only via side effects on
         buffers defined outside the loop body.  The check walks nested
-        regions so that references hidden inside e.g. an inner ForOp
+        blocks so that references hidden inside e.g. an inner ForOp
         are detected.
         """
         in_body_def: dict[Value, Op] = {
@@ -257,7 +257,7 @@ class PipelineLoop(LoweringPass):
 
         # Lower inner loops first (bottom-up) so the body is fully
         # transformed before we pipeline this loop.
-        self.lower_region(op.body)
+        self.lower_block(op.body)
 
         if not self._loop_matches(op):
             return [op], []
@@ -270,13 +270,7 @@ class PipelineLoop(LoweringPass):
                 f"pipelining_offset ({n})"
             )
 
-        # TODO: extend to handle multiple blocks.
-        assert len(op.body.blocks) == 1, (
-            f"Pipeline: expected one block in for body, got "
-            f"{len(op.body.blocks)}"
-        )
-
-        body_ops = op.body.entry_block.ops
+        body_ops = op.body.ops
         labeled_set, shared_set = self._compute_labeled_and_shared(body_ops)
         labeled = [o for o in body_ops if o in labeled_set]
         shared = [o for o in body_ops if o in shared_set]
@@ -308,7 +302,7 @@ class PipelineLoop(LoweringPass):
         vmap = {op.iv: ahead_iv.result()}
         for body_op in shared + labeled:
             new_body_ops.append(clone_op(body_op, vmap))
-        new_body = Region(blocks=[Block(arguments=[new_iv], ops=new_body_ops)])
+        new_body = Block(arguments=[new_iv], ops=new_body_ops)
         new_ub = ub - n * step
         new_for = ForOp.build(lb=lb, ub=new_ub, step=step, body=new_body,
                               attrs=op.extra_attrs)

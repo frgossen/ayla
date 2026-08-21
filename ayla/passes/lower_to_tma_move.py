@@ -10,7 +10,7 @@ A move wrapped in ``async { move (tma) }`` is lowered so the coordinate index
 arithmetic lands *before* the enclosing ``async`` op and only the ``tma_move``
 stays in the body, leaving ``index ops…; async { tma_move }``. The index math is
 plain, side-effect-free arithmetic with no reason to sit inside the mbarrier
-region, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
+block, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
 ``tma_move`` body it expects. Non-tma moves and other ops are left untouched.
 """
 from __future__ import annotations
@@ -55,12 +55,12 @@ class LowerToTmaMove(LoweringPass):
 
         Lowering a body tma ``move`` yields coordinate index arithmetic plus a
         ``tma_move``. That arithmetic is side-effect-free and has no reason to
-        sit inside the mbarrier region, so it moves ahead of the async op,
+        sit inside the mbarrier block, so it moves ahead of the async op,
         leaving the body as just the ``tma_move``(s) that ``lower_async`` (PTX
         lowering) expects.
         """
         op.operands = [self.value_map[v] for v in op.operands]
-        body = op.body.entry_block
+        body = op.body
         self.lower_block(body)
         hoisted = [o for o in body.ops if is_side_effect_free(o)]
         body.ops = [o for o in body.ops if not is_side_effect_free(o)]

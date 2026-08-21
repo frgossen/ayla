@@ -1,7 +1,7 @@
 """Fuse consecutive same-kind async ops into one async group.
 
 A run of consecutive single-op ``async(lock){ inner }`` ops of the same fusion
-kind is merged into one ``async(lock){ inner; inner; … }`` region followed by a
+kind is merged into one ``async(lock){ inner; inner; … }`` block followed by a
 single ``await``. The kind is decided by the op *inside* the async (see
 :func:`_fusion_kind`), so what fuses is fixed by what codegen supports:
 
@@ -19,7 +19,7 @@ single ``await``. The kind is decided by the op *inside* the async (see
 Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
 the run. An already-fused (multi-op) async returns ``None`` and is left
 untouched, so the pass is idempotent. Side-effect-free ops between members (lock
-allocs, tile views) are transparent — emitted before the merged region — and the
+allocs, tile views) are transparent — emitted before the merged block — and the
 per-member awaits are dropped.
 
 **Placement matters** (caller's responsibility): fuse TMA loads *before*
@@ -41,7 +41,7 @@ from ..gpu_dialect import (
     SmemTensorType,
     is_side_effect_free,
 )
-from ..base.ir import Block, Op, Region
+from ..base.ir import Block, Op
 from ..base.pipeline import Pass
 
 
@@ -50,7 +50,7 @@ def _fusion_kind(op: Op) -> str | None:
     ``None``. Multi-op (already-fused) asyncs return ``None`` — idempotency."""
     if not isinstance(op, AsyncOp):
         return None
-    body = op.body.entry_block.ops
+    body = op.body.ops
     if len(body) != 1:
         return None
     inner = body[0]
@@ -93,7 +93,7 @@ class FuseAsync(Pass):
                 )
                 new_ops.append(AsyncOp.build(
                     group_lock,
-                    body=Region(blocks=[Block(ops=group_inner)]),
+                    body=Block(ops=group_inner),
                     attrs=group_attrs,
                 ))
                 new_ops.append(AwaitOp.build(group_lock))
@@ -113,11 +113,11 @@ class FuseAsync(Pass):
                     group_kind = kind
                     group_attrs = dict(op.attrs) if op.attrs else None
                 in_flight_locks.add(op.lock)
-                group_inner.extend(op.body.entry_block.ops)
+                group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:
                 in_flight_locks.discard(op.lock)  # member's await; group covers it
             elif is_side_effect_free(op):
-                # Transparent: safe to emit before the merged region since its
+                # Transparent: safe to emit before the merged block since its
                 # operands are defined outside the (single-kind) group.
                 new_ops.append(op)
             else:

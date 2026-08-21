@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from ..gpu_dialect import ModuleOp
-from .ir import Block, Op, Region
+from .ir import Block, Op
 
 
 class Pass:
     """Base class for all IR passes.
 
     Provides a default top-down walk: ``run`` → ``run_op`` →
-    ``run_region`` → ``run_block`` → ``run_op`` (recursive).
+    ``run_block`` → ``run_op`` (recursive).
     Subclasses override whichever level they need.
     """
 
@@ -18,11 +18,7 @@ class Pass:
         return module
 
     def run_op(self, op: Op) -> None:
-        for region in op.regions:
-            self.run_region(region)
-
-    def run_region(self, region: Region) -> None:
-        for block in region.blocks:
+        for block in op.blocks:
             self.run_block(block)
 
     def run_block(self, block: Block) -> None:

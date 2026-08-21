@@ -50,12 +50,9 @@ class MultiBuffer(LoweringPass):
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]]:
-        assert len(op.body.blocks) == 1, (
-            f"MultiBuffer: expected one block in for body, got {len(op.body.blocks)}"
-        )
         self._loops.append(op)
         try:
-            self.lower_region(op.body)
+            self.lower_block(op.body)
         finally:
             self._loops.pop()
         return [op], list(op.results)

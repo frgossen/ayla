@@ -13,12 +13,12 @@ from .printer import Printer  # noqa: F401
 #
 # The invariant: ``value.uses`` contains ``(op, i)`` iff ``op.operands[i] is
 # value`` and ``op`` is anchored (held by a block, directly or nested inside an
-# anchored op's regions). Two list subclasses capture the only two mutation
+# anchored op's blocks). Two list subclasses capture the only two mutation
 # channels so no pass registers/deregisters by hand:
 #
 # - ``_OperandList`` wraps an op's ``operands`` — writes rewire its uses.
 # - ``_OpList`` wraps a block's ``ops`` — ops entering/leaving anchor/unanchor
-#   (which cascades into their regions).
+#   (which cascades into their blocks).
 #
 # Both react the same way: snapshot, run the real list method, reconcile via
 # ``_sync(old)``. Every mutator is generated from that one pattern below.
@@ -208,7 +208,7 @@ class Op:
     operands: list[Value]
     results: list[Value]
     attrs: dict[str, object] = field(default_factory=dict)
-    regions: list[Region] = field(default_factory=list)
+    blocks: list[Block] = field(default_factory=list)
 
     # Set by `Dialect.register_op` on each subclass.
     OP_ID: ClassVar[str] = "generic"
@@ -217,10 +217,10 @@ class Op:
     # an anchored op). Only anchored ops contribute to `Value.uses`. Class-level
     # default so it always resolves, even mid-construction before __post_init__.
 
-    # TODO: anchoring triggers on entering any blocks ops, including free-floating
+    # TODO: anchoring triggers on entering any block's ops, including free-floating
     # blocks not reachable from the root, so their ops wrongly contribute to Value.uses.
-    # region.blocks / op.regions are plain lists, so attachment doesn't propagate anchoring
-    # upward. Fix by making those lists observable as well or by collapsing regions into blocks.
+    # op.blocks is a plain list, so attachment doesn't propagate anchoring upward.
+    # Fix by making it observable as well.
     _anchored = False
 
     def __post_init__(self) -> None:
@@ -249,10 +249,9 @@ class Op:
         self._anchored = True
         for i, v in enumerate(self.operands):
             v.uses.add((self, i))
-        for region in self.regions:
-            for block in region.blocks:
-                for op in block.ops:
-                    op._anchor()
+        for block in self.blocks:
+            for op in block.ops:
+                op._anchor()
 
     def _unanchor(self) -> None:
         """Inverse of ``_anchor``: deregister this op's subtree's operand uses."""
@@ -261,10 +260,9 @@ class Op:
         self._anchored = False
         for i, v in enumerate(self.operands):
             v.uses.discard((self, i))
-        for region in self.regions:
-            for block in region.blocks:
-                for op in block.ops:
-                    op._unanchor()
+        for block in self.blocks:
+            for op in block.ops:
+                op._unanchor()
 
     def operand(self, i: int = 0) -> Value:
         return self.operands[i]
@@ -272,8 +270,8 @@ class Op:
     def result(self, i: int = 0) -> Value:
         return self.results[i]
 
-    def region(self, i: int = 0) -> Region:
-        return self.regions[i]
+    def block(self, i: int = 0) -> Block:
+        return self.blocks[i]
 
     def attr(self, name: str) -> object:
         return self.attrs[name]
@@ -284,7 +282,7 @@ class Op:
         operands: list["Value"] | None = None,
         result_types: list["Type"] | None = None,
         attrs: dict[str, object] | None = None,
-        regions: list["Region"] | None = None,
+        blocks: list["Block"] | None = None,
     ) -> "Op":
         """Default builder. Constructs results from `result_types`.
         Subclasses with richer ergonomic signatures (lhs/rhs/dst/...)
@@ -297,7 +295,7 @@ class Op:
             operands=list(operands or []),
             results=results,
             attrs=dict(attrs or {}),
-            regions=list(regions or []),
+            blocks=list(blocks or []),
         )
 
     def __iter__(self):
@@ -319,12 +317,12 @@ class Op:
         if self.attrs:
             p.write(" attrs=")
             p.write_attr(self.attrs)
-        if self.regions:
+        if self.blocks:
             p.write(" ")
-        for i, r in enumerate(self.regions):
+        for i, b in enumerate(self.blocks):
             if i:
                 p.write_newline()
-            r.print(p)
+            b.print(p)
 
     @staticmethod
     def parse(p: Parser) -> "Op":
@@ -357,15 +355,15 @@ class Op:
             p.read_literal("attrs")
             p.read_literal("=")
             attrs = p.read_dict_attr()
-        regions: list[Region] = []
+        blocks: list[Block] = []
         while p.can_read_literal("{"):
             prefix_brace = p.read_literal("{")
-            regions.append(Region.parse(prefix_brace, p))
+            blocks.append(Block.parse(prefix_brace, p))
         return cls(
             operands=operands,
             results=results,
             attrs=attrs,
-            regions=regions,
+            blocks=blocks,
         )
 
     def __repr__(self) -> str:
@@ -413,6 +411,8 @@ class Block:
         return self.arguments[i]
 
     def print(self, p: Printer, skip_label: bool = False) -> None:
+        p.write("{")
+        p.write_newline()
         if not skip_label:
             basename = f"^{self.name}" if self.name is not None else "^bb"
             label = p.unique_names(
@@ -433,22 +433,28 @@ class Block:
             for op in self.ops:
                 op.print(p)
                 p.write_newline()
+        p.write("}")
 
     @classmethod
     def parse(
         cls,
-        prefix: str | None,
+        prefix: str,
         p: Parser,
         arguments: list[Value] | None = None,
     ) -> "Block":
+        """Parse ``{ ^name(%a: t, ...): ops... }``. Passing `arguments`
+        supplies the block's arguments from the enclosing op's own syntax
+        (see `Block.print`'s `skip_label`), so no label is expected.
+        """
+        if prefix != "{":
+            raise ValueError(
+                f"expected block prefix '{{', got {prefix!r} at pos {p.pos}"
+            )
         name: str | None = None
         if arguments is None:
-            if prefix != "^":
-                raise ValueError(
-                    f"expected block prefix '^', got {prefix!r} at pos {p.pos}"
-                )
-            name = p.read_identifier()
             arguments = []
+            p.read_literal("^")
+            name = p.read_identifier()
             if p.can_read_literal("("):
                 p.read_literal("(")
                 if not p.can_read_literal(")"):
@@ -459,58 +465,10 @@ class Block:
                 p.read_literal(")")
             p.read_literal(":")
         ops: list[Op] = []
-        while not (p.can_read_literal("^") or p.can_read_literal("}")):
-            ops.append(Op.parse(p))
-        return cls(name=name, arguments=arguments, ops=ops)
-
-    def __repr__(self) -> str:
-        p = Printer()
-        self.print(p)
-        return p.render()
-
-
-@dataclass(eq=False)
-class Region:
-    blocks: list[Block] = field(default_factory=list)
-
-    def block(self, i: int = 0) -> Block:
-        return self.blocks[i]
-
-    @property
-    def entry_block(self) -> Block:
-        return self.blocks[0]
-
-    def print(
-        self, p: Printer, skip_entry_block_label: bool = False,
-    ) -> None:
-        p.write("{")
-        p.write_newline()
-        for i, b in enumerate(self.blocks):
-            skip_label = i == 0 and skip_entry_block_label
-            b.print(p, skip_label=skip_label)
-        p.write("}")
-
-    @classmethod
-    def parse(
-        cls,
-        prefix: str,
-        p: Parser,
-        entry_block_arguments: list[Value] | None = None,
-    ) -> "Region":
-        if prefix != "{":
-            raise ValueError(
-                f"expected region prefix '{{', got {prefix!r} at pos {p.pos}"
-            )
-        blocks: list[Block] = []
-        if entry_block_arguments is not None:
-            blocks.append(
-                Block.parse(None, p, arguments=entry_block_arguments)
-            )
         while not p.can_read_literal("}"):
-            prefix_caret = p.read_literal("^")
-            blocks.append(Block.parse(prefix_caret, p))
+            ops.append(Op.parse(p))
         p.read_literal("}")
-        return cls(blocks=blocks)
+        return cls(name=name, arguments=arguments, ops=ops)
 
     def __repr__(self) -> str:
         p = Printer()
@@ -582,10 +540,9 @@ def iter_ops(
 ) -> Iterator[Op]:
     if predicate(root):
         yield root
-    for region in root.regions:
-        for block in region.blocks:
-            for op in block.ops:
-                yield from iter_ops(op, predicate)
+    for block in root.blocks:
+        for op in block.ops:
+            yield from iter_ops(op, predicate)
 
 
 def find_ops(root: Op, predicate: Callable[[Op], bool]) -> list[Op]:
@@ -603,13 +560,13 @@ def clone_type(t: "Type") -> "Type":
 def clone_op(op: Op, vmap: dict[Value, Value]) -> Op:
     new_operands = [vmap.get(v, v) for v in op.operands]
     new_results = [Value(name=v.name, type=clone_type(v.type)) for v in op.results]
-    new_regions = [clone_region(r, vmap) for r in op.regions]
+    new_blocks = [clone_block(b, vmap) for b in op.blocks]
 
     new_op = type(op)(
         operands=new_operands,
         results=new_results,
         attrs=dict(op.attrs),
-        regions=new_regions,
+        blocks=new_blocks,
     )
 
     for old_r, new_r in zip(op.results, new_op.results):
@@ -626,8 +583,3 @@ def clone_block(block: Block, vmap: dict[Value, Value]) -> Block:
         inner_vmap[arg] = new_arg
         new_args.append(new_arg)
     return Block(arguments=new_args, ops=[clone_op(op, inner_vmap) for op in block.ops])
-
-
-def clone_region(region: Region, vmap: dict[Value, Value]) -> Region:
-    inner_vmap = dict(vmap)
-    return Region(blocks=[clone_block(block, inner_vmap) for block in region.blocks])
