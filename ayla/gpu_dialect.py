@@ -122,40 +122,6 @@ class KernelOp(Op):
     def num_warp_groups(self, value: int | None) -> None:
         self.attrs["num_warp_groups"] = value
 
-    def resolve_block_dim(self) -> None:
-        """Resolve and store the concrete launch dimensions for this kernel.
-
-        A single warp group may use any 128-thread block shape. Multiple warp
-        groups currently use an x-only warp-group index, so those launches must
-        remain one-dimensional.
-        """
-        if all(dim is None for dim in self.block_dim):
-            raise ValueError(
-                f"kernel {self.name!r} block_dim is entirely unset: "
-                f"{self.block_dim}"
-            )
-        dims = tuple(dim if dim is not None else 1 for dim in self.block_dim)
-        if any(not isinstance(dim, int) or dim <= 0 for dim in dims):
-            raise ValueError(
-                f"kernel {self.name!r} has invalid block_dim: {dims}"
-            )
-        num_warp_groups = self.num_warp_groups
-        if num_warp_groups is not None:
-            expected = (num_warp_groups * 128, 1, 1)
-            compatible = (
-                math.prod(dims) == 128
-                if num_warp_groups == 1
-                else dims in ((128, 1, 1), expected)
-            )
-            if num_warp_groups <= 0 or not compatible:
-                raise ValueError(
-                    f"kernel {self.name!r} has block_dim {dims}, "
-                    f"incompatible with {num_warp_groups} warp groups"
-                )
-            if num_warp_groups > 1:
-                dims = expected
-        self.block_dim = dims
-
     @property
     def extra_attrs(self) -> dict[str, object]:
         return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "num_warp_groups")}

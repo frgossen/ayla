@@ -95,7 +95,7 @@ def test_promote_smem_with_warp_group_dependent_lhs():
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
+          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
             %bx: index, %by: index, %bz: index = block_ids()
             %0: gmem_tensor<128x4096xbf16> = tile(%a: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
             %1: gmem_tensor<256x4096xbf16> = tile(%b: gmem_tensor<4096x4096xbf16>, %by: index, 0)
@@ -134,7 +134,7 @@ def test_promote_smem_with_warp_group_dependent_lhs():
     # as 256x64 smem — no supertile needed.
     expected = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
+          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
             %bx: index, %by: index, %bz: index = block_ids()
             %0: gmem_tensor<128x4096xbf16> = tile(%a: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
             %1: gmem_tensor<256x4096xbf16> = tile(%b: gmem_tensor<4096x4096xbf16>, %by: index, 0)

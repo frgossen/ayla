@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -266,19 +267,45 @@ class PtxKernel:
     shared_mem_bytes: int = 0
 
 
+def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
+    """Materialize and validate the kernel's PTX launch dimensions."""
+    if all(dim is None for dim in kernel.block_dim):
+        raise ValueError(
+            f"make_ptx_kernel: block_dim is entirely unset: {kernel.block_dim}"
+        )
+    dims = tuple(dim if dim is not None else 1 for dim in kernel.block_dim)
+    if any(not isinstance(dim, int) or dim <= 0 for dim in dims):
+        raise ValueError(
+            f"make_ptx_kernel: invalid block_dim: {dims}"
+        )
+
+    num_warp_groups = kernel.num_warp_groups
+    if num_warp_groups is not None and num_warp_groups > 0:
+        compatible = math.prod(dims) == num_warp_groups * 128
+        if num_warp_groups > 1:
+            compatible = compatible and dims[1:] == (1, 1)
+        if not compatible:
+            raise ValueError(
+                f"make_ptx_kernel: block_dim {dims} is incompatible with "
+                f"{num_warp_groups} warp groups"
+            )
+    return dims  # type: ignore[return-value]
+
+
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
-    module = PtxLoweringPipeline().run(module)
     top_ops = module.body.entry_block.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    kernel.resolve_block_dim()
+    block_dim = _resolve_block_dim(kernel)
+    kernel.block_dim = block_dim
+
+    module = PtxLoweringPipeline().run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
     grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
-    block_dim = kernel.block_dim
     p = PtxPrinter()
     _emit_op(p, module)
     return PtxKernel(

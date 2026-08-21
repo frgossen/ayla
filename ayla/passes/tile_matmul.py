@@ -246,6 +246,9 @@ class TileMatmul(LoweringPass):
             self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
                 self.num_warp_groups_constraints, [ub],
             )
+            self.block_dim_constraints = _resolve_launch_dim_constraints(
+                self.block_dim_constraints, [ub * 128, 1, 1],
+            )
         elif tile_level in ("wg.y", "wg.z"):
             raise ValueError(
                 f"TileMatmul: tile_level {tile_level!r} is not "
@@ -335,5 +338,3 @@ def tile_matmul(
         tile_dims, tile_sizes, tile_levels, tile_labels,
         label_filter, collective,
     ).run(module)
-
-

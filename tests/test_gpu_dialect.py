@@ -1,7 +1,5 @@
 import textwrap
 
-import pytest
-
 from ayla import (
     Block,
     GmemTensorType,
@@ -82,36 +80,6 @@ def test_kernel_op():
           }
         }""")  # noqa: E501
     assert_print_and_roundtrip(module, expected)
-
-
-def test_kernel_resolve_block_dim():
-    kernel = KernelOp.build(
-        "k", Region(blocks=[Block()]),
-        block_dim=(128, None, None), num_warp_groups=2,
-    )
-
-    kernel.resolve_block_dim()
-    assert kernel.block_dim == (256, 1, 1)
-
-
-def test_kernel_resolves_multidimensional_single_warp_group_layout():
-    kernel = KernelOp.build(
-        "k", Region(blocks=[Block()]),
-        block_dim=(8, 16, 1), num_warp_groups=1,
-    )
-
-    kernel.resolve_block_dim()
-    assert kernel.block_dim == (8, 16, 1)
-
-
-def test_kernel_rejects_multidimensional_multi_warp_group_layout():
-    kernel = KernelOp.build(
-        "k", Region(blocks=[Block()]),
-        block_dim=(8, 16, 1), num_warp_groups=2,
-    )
-
-    with pytest.raises(ValueError, match="incompatible with 2 warp groups"):
-        kernel.resolve_block_dim()
 
 
 def test_for_loop():
