@@ -11,8 +11,6 @@ import math
 import struct
 import textwrap
 
-from dataclasses import dataclass
-
 from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
@@ -172,8 +170,7 @@ class LowerToPtxTemplate(LoweringPass):
             or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
             setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
             @${pred:not_t0} bra ${label:after_init};
-            mov.u32 ${b32:cnt}, 1;
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], ${b32:cnt};
+            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
             fence.mbarrier_init.release.cluster;
             ${label:after_init}:
             bar.sync 0;
@@ -1117,7 +1114,6 @@ class LowerToPtxTemplate(LoweringPass):
         src_type = op.src.type
         assert isinstance(dst_type, SmemTensorType)
         assert isinstance(src_type, WrmemTensorType)
-        block_width = 64
         col_start = int(op.attrs.get("wgmma_col_start", 0))
         n_dim = src_type.sizes[1]
         root_type = root_buffer(op.dst).type
@@ -1145,10 +1141,10 @@ class LowerToPtxTemplate(LoweringPass):
             )
             assert next_di == di and next_dj == dj + 16
             offset0 = _get_stmatrix_store_static_offset(
-                first0, n_dim, col_start, dst_m,
+                first0, n_dim, col_start, root_sizes[0],
             )
             offset1 = _get_stmatrix_store_static_offset(
-                first0 + 1, n_dim, col_start, dst_m,
+                first0 + 1, n_dim, col_start, root_sizes[0],
             )
             groups.extend([
                 ([first0, first0 + 2, first1, first1 + 2], offset0),
@@ -1418,9 +1414,8 @@ class LowerToPtxTemplate(LoweringPass):
             "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
             "@${pred:not_t0} bra ${label:after_load};",
             *load_lines,
-            f"mov.u32 ${{b32:exp_bytes}}, {total_bytes};",
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
-            "[${b32:operand.lock.val}], ${b32:exp_bytes};",
+            f"[${{b32:operand.lock.val}}], {total_bytes};",
             "${label:after_load}:",
         ]
         template = "\n".join(lines) + "\n"
@@ -1512,6 +1507,47 @@ def _get_wgmma_layout_0_static_offsets(reg: int, n_dim: int = 128) -> tuple[int,
     m, w = divmod(reg // 4, n_groups)
     di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][reg % 4]
     return (m * 64 + di, w * 16 + dj)
+
+
+def _get_stmatrix_store_static_offset(
+    reg: int, n_dim: int, col_start: int, dst_m: int,
+) -> int:
+    """Byte offset for a register in the selected 64-column blocked layout."""
+    di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
+    relative_col = dj - col_start
+    assert relative_col >= 0 and relative_col % 32 == 0
+    block_offset = relative_col // 64 * dst_m * 64
+    return (block_offset + di * 64 + relative_col % 64) * 2
+
+
+def _tma_coordinates(
+    desc_type: TmaDescType,
+    index_names: list[str],
+    prefix: str,
+) -> tuple[list[str], list[str]]:
+    layout = physical_layout(desc_type)
+    if layout is None:
+        return [], [
+            f"${{b32:operand.{name}.val}}"
+            for name in reversed(index_names)
+        ]
+
+    assert desc_type.gmem_type.rank == 2
+    assert len(index_names) == 2
+    row = f"${{b32:operand.{index_names[0]}.val}}"
+    col = f"${{b32:operand.{index_names[1]}.val}}"
+    block = f"${{b32:{prefix}_block}}"
+    inner = f"${{b32:{prefix}_inner}}"
+    block_width, order = layout
+    lines = [
+        f"div.u32 {block}, {col}, {block_width};",
+        f"rem.u32 {inner}, {col}, {block_width};",
+    ]
+    if order == "row_major":
+        coordinates = [inner, block, row]
+    else:
+        coordinates = [inner, row, block]
+    return lines, coordinates
 
 
 def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
