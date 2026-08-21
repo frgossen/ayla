@@ -170,7 +170,8 @@ class LowerToPtxTemplate(LoweringPass):
             or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
             setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
             @${pred:not_t0} bra ${label:after_init};
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
+            mov.u32 ${b32:cnt}, 1;
+            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], ${b32:cnt};
             fence.mbarrier_init.release.cluster;
             ${label:after_init}:
             bar.sync 0;

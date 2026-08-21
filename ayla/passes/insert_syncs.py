@@ -16,7 +16,7 @@ from ..gpu_dialect import (
     is_side_effect_free,
     memory_effects,
 )
-from ..base.ir import Block, Op, Value
+from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
 
 
@@ -262,17 +262,22 @@ def _analyze(
     named_id = None
     if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
         recorded = targets.get(op)
-        pending_ids = {
+        pending_await_ids = {
             barrier_id
             for ids in live.named_barrier_ids_pending_await.values()
             for barrier_id in ids
         }
-        used_ids = live.named_barrier_ids | pending_ids
+        used_ids = live.named_barrier_ids | pending_await_ids
         if recorded is not None and recorded.named_id is not None:
             named_id = recorded.named_id
+            # TODO: Insert or upgrade to a full-block sync when a loop backedge
+            # keeps this named barrier live, instead of rejecting the program.
             assert named_id not in used_ids, (
                 f"named barrier {named_id} remains in use across a loop "
-                f"backedge before {op}; pending={live.named_barrier_ids_pending_await}"
+                f"backedge before {op}; named barriers are only released by a "
+                "full-block sync or their mbar await, so add a full-block sync "
+                "before the backedge; "
+                f"pending awaits={live.named_barrier_ids_pending_await}"
             )
         if named_id is None:
             # A barrier can first become necessary on a later loop-fixpoint
@@ -289,15 +294,14 @@ def _analyze(
             available_ids = (
                 set(range(1, _MAX_BARRIER_IDS)) - used_ids - reserved_ids
             )
-            assert available_ids, (
-                "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
-                "reserved for full-block barriers"
-            )
+            if not available_ids:
+                raise ValueError(
+                    "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 "
+                    "is reserved for full-block barriers"
+                )
             named_id = min(available_ids)
-        assert 0 < named_id < _MAX_BARRIER_IDS, (
-            "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 is "
-            "reserved for full-block barriers"
-        )
+        # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
+        # an mbar await is an all-thread rendezvous that ends this handoff.
         if isinstance(op, AsyncOp) and op.lock.type.kind == "mbar":
             live.named_barrier_ids_pending_await.setdefault(
                 op.lock, set(),
@@ -340,7 +344,7 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
 def _insert_barriers(
     block: Block,
     targets: BarrierTargetsType,
-    num_threads: int | None = None,
+    num_threads: int,
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
@@ -353,18 +357,14 @@ def _insert_barriers(
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
-                assert num_threads is not None
                 attrs["num_threads"] = num_threads
             new_ops.append(
                 BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
             )
         new_ops.append(op)
-        inner_num_threads = num_threads
-        if isinstance(op, KernelOp):
-            inner_num_threads = op.num_threads
         for region in op.regions:
             for inner in region.blocks:
-                _insert_barriers(inner, targets, inner_num_threads)
+                _insert_barriers(inner, targets, num_threads)
     block.ops = new_ops
 
 
@@ -373,7 +373,10 @@ class InsertSyncs(Pass):
     def run(self, module: ModuleOp) -> ModuleOp:
         targets: BarrierTargetsType = {}
         _analyze(module, DataflowState(), targets)  # analysis: where do barriers go
-        _insert_barriers(module.body.entry_block, targets)  # transform: insert them
+        kernel = find_op(module, lambda op: isinstance(op, KernelOp))
+        assert isinstance(kernel, KernelOp)
+        # Transform: insert the barriers with the kernel-wide participant count.
+        _insert_barriers(module.body.entry_block, targets, kernel.num_threads)
         return module
 
 
