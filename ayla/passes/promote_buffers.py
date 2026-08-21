@@ -314,18 +314,21 @@ class PromoteBuffers(LoweringPass):
         # labelled ones.
         buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
         if init is not None:
-            alloc = AllocOp.build(target_type, init=init, attrs=buffer_attrs)
+            alloc = AllocOp.build(
+                target_type, init=init, id=AllocOp.fresh_id(), attrs=buffer_attrs
+            )
             new_ops.append(alloc)
         else:
             attrs = self._build_move_attrs(matmul_label, operand_name)
             alloc = AllocOp.build(
                 self._build_target_type(chain_root.type, dtype=chain_root.type.dtype),
+                id=AllocOp.fresh_id(),
                 attrs=buffer_attrs,
             )
             move = MoveOp.build(dst=alloc.result(), src=chain_root, attrs=attrs)
             new_ops.extend([alloc, move])
             if target_type.dtype != chain_root.type.dtype:
-                cvt_alloc = AllocOp.build(target_type)
+                cvt_alloc = AllocOp.build(target_type, id=AllocOp.fresh_id())
                 cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
@@ -360,9 +363,12 @@ class PromoteBuffers(LoweringPass):
             narrow_tiles.append(tile)
             block_dst = tile.arg
         assert isinstance(block_dst.type, GmemTensorType)
-        smem = AllocOp.build(self._build_smem_type(
-            list(block_dst.type.sizes), block_dst.type.dtype,
-        ))
+        smem = AllocOp.build(
+            self._build_smem_type(
+                list(block_dst.type.sizes), block_dst.type.dtype,
+            ),
+            id=AllocOp.fresh_id(),
+        )
         new_ops: list[Op] = [smem]
         gather_dst = smem.result()
         for tile in reversed(narrow_tiles):
@@ -392,7 +398,7 @@ class PromoteBuffers(LoweringPass):
         new_ops: list[Op] = []
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
-            tmp_alloc = AllocOp.build(tmp_type)
+            tmp_alloc = AllocOp.build(tmp_type, id=AllocOp.fresh_id())
             cvt = ConvertOp.build(dst=tmp_alloc.result(), src=src)
             new_ops.extend([tmp_alloc, cvt])
             src = tmp_alloc.result()

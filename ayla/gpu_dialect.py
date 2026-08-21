@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import enum
+import itertools
 import math
+from typing import ClassVar, Iterator
 
 from .base.ir import Block, Dialect, Op, Region, Type, Value
 from .base.printer import Printer
@@ -379,16 +381,30 @@ class AllocOp(Op):
     """Allocate a register- or shared-memory tensor.
 
     Optional `init` attr fills the allocation with a constant value.
+
+    The `id` attr names the buffer: two allocations are the same one only if
+    they carry the same id. One built without it is opaque and never merges,
+    so a caller that wants its allocation deduplicated passes `fresh_id()`.
     """
+
+    _id_counter: ClassVar[Iterator[int]] = itertools.count()
+
+    @classmethod
+    def fresh_id(cls) -> int:
+        return next(cls._id_counter)
 
     @classmethod
     def build(
         cls,
         type: Type,
         init: float | int | None = None,
+        id: int | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "AllocOp":
-        a: dict[str, object] = dict(attrs or {})
+        a: dict[str, object] = {}
+        if id is not None:
+            a["id"] = id
+        a.update(attrs or {})
         if init is not None:
             a["init"] = init
         result = Value(name=None, type=type)
@@ -1759,6 +1775,11 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
 
 def is_value_identical(op: Op) -> bool:
     """Same operands and attrs always produce identical results."""
+    if isinstance(op, AllocOp):
+        # An allocation is only the same buffer as another if it says so, so
+        # one parsed without a `id` stays opaque rather than merging with
+        # every other allocation of its type.
+        return "id" in op.attrs
     return isinstance(op, (
         BlockIdsOp,
         IndexAddOp,
