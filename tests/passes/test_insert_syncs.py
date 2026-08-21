@@ -62,7 +62,7 @@ def test_war_on_shared_buffer_gets_barrier():
 def test_wgmma256_wg_pipeline_inserts_barriers():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] num_warp_groups=2 {
+          kernel @auto_matmul_4096_wgmma256_wg(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
             %c0: index = index_constant() attrs={value: 0}
             %0: smem_tensor<256x64xbf16 swizzle="128B"> = alloc()
             %1: lock<mbar> = alloc()

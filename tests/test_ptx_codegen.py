@@ -49,6 +49,7 @@ def test_codegen_cwise_add():
           .param .b64 rhs_ptr,
           .param .b64 dst_ptr
         )
+        .reqntid 256, 1, 1
         {
           .reg .b64  %rd<3>;
           .reg .f32  %f<3>;
@@ -65,6 +66,20 @@ def test_codegen_cwise_add():
 
           ret;
         }""")
+
+
+def test_codegen_materializes_block_dim_before_lowering():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, None, None] num_warp_groups=1 {
+          }
+        }"""))
+    [input_kernel] = module.body.entry_block.ops
+
+    kernel = make_ptx_kernel(module)
+    assert input_kernel.block_dim == (128, 1, 1)
+    assert kernel.block_dim == (128, 1, 1)
+    assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
 
 
 def test_codegen_naive_matmul_4096():
@@ -109,6 +124,7 @@ def test_codegen_naive_matmul_4096():
           .param .b64 b_ptr,
           .param .b64 c_ptr
         )
+        .reqntid 32, 32, 1
         {
           .reg .b32  %r<23>;
           .reg .b64  %rd<22>;

@@ -27,7 +27,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     grid_x = 32 // output_tiles_per_cta
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] block_dim=[128, 1, 1] {{
+          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] {{
             matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
