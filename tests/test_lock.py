@@ -9,7 +9,7 @@ def test_lock_based_gemm_inner_loop():
     module_str = textwrap.dedent("""\
         module {
           kernel @mm(%a: smem_tensor<128x64xbf16 swizzle="128B">, %b: smem_tensor<128x64xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %lock: lock<?> = alloc()
+            %lock: lock<?> = alloc() attrs={id: 0}
             for (%ki: index = 0 to 4) {
               %a_ki: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%a: smem_tensor<128x64xbf16 swizzle="128B">, 0, %ki: index)
               %b_ki: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%b: smem_tensor<128x64xbf16 swizzle="128B">, 0, %ki: index)
@@ -29,7 +29,7 @@ def test_lock_based_tma_load():
     module_str = textwrap.dedent("""\
         module {
           kernel @load(%a: gmem_tensor<128x64xbf16>, %sa: smem_tensor<128x64xbf16>, %sb: smem_tensor<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %lock: lock<?> = alloc()
+            %lock: lock<?> = alloc() attrs={id: 0}
             async(%lock: lock<?>) move(%sa: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
             async(%lock: lock<?>) move(%sb: smem_tensor<128x64xbf16>, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
             await(%lock: lock<?>)

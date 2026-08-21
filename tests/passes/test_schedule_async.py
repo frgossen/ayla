@@ -10,9 +10,9 @@ def test_bulk_await_sinks_until_shared_source_is_overwritten():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @test(%g: gmem_tensor<4x4xf32>, %a: rmem_tensor<1x1xf32>, %b: rmem_tensor<1x1xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            %s: smem_tensor<4x4xf32> = alloc()
-            %r: rmem_tensor<4x4xf32> = alloc()
-            %acc: rmem_tensor<1x1xf32> = alloc() attrs={init: 0.0}
+            %s: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %r: rmem_tensor<4x4xf32> = alloc() attrs={id: 1}
+            %acc: rmem_tensor<1x1xf32> = alloc() attrs={id: 2, init: 0.0}
             move(%g: gmem_tensor<4x4xf32>, %s: smem_tensor<4x4xf32>) attrs={label: "store", tma: true}
             matmul(%a: rmem_tensor<1x1xf32>, %b: rmem_tensor<1x1xf32>, %acc: rmem_tensor<1x1xf32>) attrs={label: "next_compute"}
             move(%s: smem_tensor<4x4xf32>, %r: rmem_tensor<4x4xf32>) attrs={label: "reuse"}

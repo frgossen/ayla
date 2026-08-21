@@ -59,7 +59,7 @@ def test_lower_move_gmem_to_smem():
           kernel @load_tile(%a: gmem_tensor<4096x4096xbf16>) grid_dim=[64, 64, 1] block_dim=[128, 1, 1] {
             %bx: index, %by: index, %bz: index = block_ids()
             %a_tile: gmem_tensor<64x16xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<4096x4096xbf16>, %by: index, %bx: index)
-            %smem_a: smem_tensor<64x16xbf16> = alloc()
+            %smem_a: smem_tensor<64x16xbf16> = alloc() attrs={id: 0}
             move(%smem_a: smem_tensor<64x16xbf16>, %a_tile: gmem_tensor<64x16xbf16 strides=[4096, 1]>) attrs={collective: "block"}
           }
         }"""
