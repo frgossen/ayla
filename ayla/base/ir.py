@@ -12,16 +12,21 @@ from .printer import Printer  # noqa: F401
 # Observable containers that keep the use-list and parent links
 # self-maintaining.
 #
-# The invariants: ``value.uses`` contains ``(op, i)`` iff ``op.operands[i] is
-# value`` and ``op`` is anchored (held by a block, directly or nested inside an
-# anchored op's blocks); ``op.parent_block`` / ``block.parent_op`` point at the
-# container holding the node. Three list subclasses capture the only three
-# mutation channels so no pass registers/deregisters by hand:
+# The invariants: ``op.parent_block`` / ``block.parent_op`` point at the
+# container holding the node, and ``value.uses`` contains ``(op, i)`` iff
+# ``op.operands[i] is value`` — unconditionally, for as long as the op exists.
+# Three list subclasses capture the three mutation channels so no pass
+# registers/deregisters by hand:
 #
 # - ``_OperandList`` wraps an op's ``operands`` — writes rewire its uses.
-# - ``_OpList`` wraps a block's ``ops`` — ops entering/leaving anchor/unanchor
-#   (which cascades into their blocks) and get their ``parent_block`` set.
-# - ``_BlockList`` wraps an op's ``blocks`` — sets their ``parent_op``.
+# - ``_OpList`` wraps a block's ``ops`` — sets each op's ``parent_block``.
+# - ``_BlockList`` wraps an op's ``blocks`` — sets each block's ``parent_op``.
+#
+# ``uses`` is deliberately structural rather than filtered: an op that has been
+# spliced out of the IR, or built but not yet inserted, still appears there.
+# Liveness is a question about *position*, so it is answered by position, at
+# query time — see ``Value.users``, which keeps only users sharing a tree with
+# the value's definition.
 #
 # All react the same way: snapshot, run the real list method, reconcile via
 # ``_sync(old)``. Every mutator is generated from that one pattern below.
@@ -61,18 +66,16 @@ for _name in (
 
 
 class _OperandList(_ObservableList):
-    """An op's ``operands``; rewires its values' ``uses`` when anchored."""
+    """An op's ``operands``; rewires its values' ``uses``."""
 
     __slots__ = ("_op",)
 
-    def __init__(self, iterable=(), *, op: "Op | None" = None) -> None:
+    def __init__(self, iterable=(), *, op: "Op") -> None:
         super().__init__(iterable)
         self._op = op
 
     def _sync(self, old: list) -> None:
         op = self._op
-        if op is None or not op._anchored:
-            return
         for i, v in enumerate(old):
             v.uses.discard((op, i))
         for i, v in enumerate(self):
@@ -80,38 +83,34 @@ class _OperandList(_ObservableList):
 
 
 class _OpList(_ObservableList):
-    """A block's ``ops``; anchors/unanchors ops as they enter/leave and sets
-    their ``parent_block``."""
+    """A block's ``ops``; points each op's ``parent_block`` back at it."""
 
     __slots__ = ("_block",)
 
-    def __init__(self, iterable=(), *, block: "Block | None" = None) -> None:
+    def __init__(self, iterable=(), *, block: "Block") -> None:
         super().__init__(iterable)
         self._block = block
 
     def _sync(self, old: list) -> None:
         block = self._block
-        # Unanchor removed ops before anchoring added ones so transplanted ops
-        # (in both old and new) stay anchored.
         new_ids = {id(op) for op in self}
         old_ids = {id(op) for op in old}
         for op in old:
-            if id(op) not in new_ids:
-                op._unanchor()
-                # Only if still ours: a transplanted op already points at its
-                # new block, and this stale sync must not null that out.
-                if op.parent_block is block:
-                    op.parent_block = None
+            # Only if still ours: a transplanted op already points at its new
+            # block, and this stale sync must not null that out.
+            if id(op) not in new_ids and op.parent_block is block:
+                op.parent_block = None
         for op in self:
             if id(op) not in old_ids:
-                op._anchor()
                 op.parent_block = block
 
 
 class _BlockList(_ObservableList):
+    """An op's ``blocks``; points each block's ``parent_op`` back at it."""
+
     __slots__ = ("_op",)
 
-    def __init__(self, iterable=(), *, op: "Op | None" = None) -> None:
+    def __init__(self, iterable=(), *, op: "Op") -> None:
         super().__init__(iterable)
         self._op = op
 
@@ -182,7 +181,7 @@ class Type:
 class Value:
     name: str | None
     type: Type
-    definition: Op | Block = field(init=False)
+    definition: Op | Block | None = field(default=None, init=False)
     result_index: int = field(init=False)
     uses: set[tuple[Op, int]] = field(
         default_factory=set, init=False, repr=False,
@@ -195,15 +194,23 @@ class Value:
         )
 
     def users(self) -> list[Op]:
+        """Ops consuming this value from within the same IR tree.
+
+        ``uses`` is structural, so it also holds ops that have been spliced out
+        of the IR or built but never inserted. Those reference the value but are
+        not part of the program any more (or yet), so they are filtered out
+        here: a user counts when it shares a tree root with this value.
         """
-        Ops consuming this value.
-        """
+        root = root_ancestor(self)
         seen: set[int] = set()
         out: list[Op] = []
         for op, _ in self.uses:
-            if id(op) not in seen:
-                seen.add(id(op))
-                out.append(op)
+            if id(op) in seen:
+                continue
+            if root_ancestor(op) is not root:
+                continue
+            seen.add(id(op))
+            out.append(op)
         return out
 
     def print(self, p: Printer) -> None:
@@ -248,15 +255,6 @@ class Op:
     # Set by `Dialect.register_op` on each subclass.
     OP_ID: ClassVar[str] = "generic"
 
-    # Whether this op is currently held by a block (directly, or nested inside
-    # an anchored op). Only anchored ops contribute to `Value.uses`. Class-level
-    # default so it always resolves, even mid-construction before __post_init__.
-
-    # TODO: anchoring triggers on entering any block's ops, including free-floating
-    # blocks not reachable from the root, so their ops wrongly contribute to Value.uses.
-    # Now that every node has a parent link, replace this flag with a walk to the root.
-    _anchored = False
-
     def __post_init__(self) -> None:
         self.op_id = type(self).OP_ID
         for i, v in enumerate(self.results):
@@ -279,29 +277,6 @@ class Op:
             new_list._sync(old)
         else:
             super().__setattr__(name, value)
-
-    def _anchor(self) -> None:
-        """Mark this op (and its whole subtree) as held by a block, registering
-        operand uses. Idempotent: set-keyed and guarded by ``_anchored``."""
-        if self._anchored:
-            return
-        self._anchored = True
-        for i, v in enumerate(self.operands):
-            v.uses.add((self, i))
-        for block in self.blocks:
-            for op in block.ops:
-                op._anchor()
-
-    def _unanchor(self) -> None:
-        """Inverse of ``_anchor``: deregister this op's subtree's operand uses."""
-        if not self._anchored:
-            return
-        self._anchored = False
-        for i, v in enumerate(self.operands):
-            v.uses.discard((self, i))
-        for block in self.blocks:
-            for op in block.ops:
-                op._unanchor()
 
     def operand(self, i: int = 0) -> Value:
         return self.operands[i]
@@ -574,6 +549,29 @@ class Dialect:
     def empty() -> "Dialect":
         """Create an anonymous dialect with only the generic Op/Type."""
         return Dialect("")
+
+
+def root_ancestor(node: "Op | Block | Value") -> "Op | Block | Value":
+    """The top of ``node``'s tree, following the links that lead upward —
+    ``node`` itself if nothing holds it.
+
+    Two nodes share a root exactly when they belong to the same IR tree, which
+    is how `Value.users` tells a live user from one that has been spliced out.
+    A value sits under whatever defines it, so an undefined one is its own
+    root and shares a tree with nothing.
+    """
+    while True:
+        if isinstance(node, Value):
+            parent = node.definition
+        elif isinstance(node, Op):
+            parent = node.parent_block
+        elif isinstance(node, Block):
+            parent = node.parent_op
+        else:
+            assert False, f"root_ancestor: unsupported node {type(node).__name__}"
+        if parent is None:
+            return node
+        node = parent
 
 
 def iter_ops(

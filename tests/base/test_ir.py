@@ -134,11 +134,13 @@ def test_nested_ops():
 # ---------------------------------------------------------------------------
 # Use-list invariant.
 #
-#   value.uses contains (op, i) iff op.operands[i] is value and op is anchored
-#   (held by a block, directly or nested inside an anchored op's blocks).
+#   value.uses  contains (op, i) iff op.operands[i] is value -- structural,
+#               regardless of where the op sits.
+#   value.users() keeps only those sharing a tree root with value.definition.
 #
-# These drive mutations the *plain* way — no helper methods — to prove the
-# invariant is self-maintaining through the two observable containers.
+# These drive mutations the *plain* way -- no helper methods -- to prove both
+# stay right through the observable containers. Values are block arguments so
+# they have a definition, and therefore a tree to be judged against.
 # ---------------------------------------------------------------------------
 
 
@@ -147,9 +149,9 @@ def test_operand_item_assignment_moves_use():
     a = Value(name="a", type=t)
     b = Value(name="b", type=t)
     op = Op(operands=[a], results=[])
-    Block(ops=[op])  # anchors op
+    Block(arguments=[a], ops=[op])
 
-    assert a.uses == {(op, 0)}
+    assert a.users() == [op]
 
     op.operands[0] = b
     assert a.uses == set()
@@ -162,7 +164,7 @@ def test_operand_list_reassignment_reorder_and_grow():
     b = Value(name="b", type=t)
     c = Value(name="c", type=t)
     op = Op(operands=[a, b], results=[])
-    Block(ops=[op])
+    Block(arguments=[a, b], ops=[op])
 
     assert a.uses == {(op, 0)}
     assert b.uses == {(op, 1)}
@@ -180,12 +182,15 @@ def test_operand_list_reassignment_reorder_and_grow():
     assert c.uses == {(op, 0)}
 
 
-def test_free_floating_op_reassignment_does_not_register():
+def test_op_outside_the_tree_is_not_a_user():
     t = Type()
     a = Value(name="a", type=t)
-    op = Op(operands=[], results=[])  # never placed in a block
+    Block(arguments=[a])  # `a` now belongs to that block's tree
+    op = Op(operands=[], results=[])  # never placed in it
     op.operands = [a]
-    assert a.uses == set()
+
+    assert a.uses == {(op, 0)}  # structural: the reference is real
+    assert a.users() == []  # but the op is not part of `a`'s tree
 
 
 def test_block_ops_inplace_mutations():
@@ -193,29 +198,28 @@ def test_block_ops_inplace_mutations():
     a = Value(name="a", type=t)
     op1 = Op(operands=[a], results=[])
     op2 = Op(operands=[a], results=[])
-    block = Block(ops=[])
+    block = Block(arguments=[a])
 
-    # free-floating ops are not registered
-    assert a.uses == set()
+    # ops outside the tree are not users of it
+    assert a.users() == []
 
     block.ops.append(op1)
-    assert (op1, 0) in a.uses
+    assert a.users() == [op1]
 
     block.ops.insert(0, op2)
-    assert (op2, 0) in a.uses
+    assert set(a.users()) == {op1, op2}
 
     assert block.ops.pop() is op1
-    assert (op1, 0) not in a.uses
-    assert (op2, 0) in a.uses
+    assert a.users() == [op2]
 
     block.ops.remove(op2)
-    assert a.uses == set()
+    assert a.users() == []
 
     op3 = Op(operands=[a], results=[])
     block.ops.append(op3)
-    assert (op3, 0) in a.uses
+    assert a.users() == [op3]
     del block.ops[0]
-    assert a.uses == set()
+    assert a.users() == []
 
 
 def test_block_ops_reassignment_diffs():
@@ -223,12 +227,12 @@ def test_block_ops_reassignment_diffs():
     a = Value(name="a", type=t)
     op1 = Op(operands=[a], results=[])
     op2 = Op(operands=[a], results=[])
-    block = Block(ops=[op1])
+    block = Block(arguments=[a], ops=[op1])
 
-    assert a.uses == {(op1, 0)}
+    assert a.users() == [op1]
 
     block.ops = [op2]  # dropped op1, added op2
-    assert a.uses == {(op2, 0)}
+    assert a.users() == [op2]
 
 
 def test_removing_block_op_clears_nested_uses():
@@ -240,15 +244,15 @@ def test_removing_block_op_clears_nested_uses():
         results=[],
         blocks=[Block(ops=[inner])],
     )
-    root = Block(ops=[outer])
+    root = Block(arguments=[a], ops=[outer])
 
-    assert (inner, 0) in a.uses
+    assert a.users() == [inner]
 
-    root.ops = []  # cascade: dropping outer clears inner's uses too
-    assert a.uses == set()
+    root.ops = []  # dropping outer takes the whole subtree with it
+    assert a.users() == []
 
 
-def test_transplant_keeps_use_removes_before_adds():
+def test_transplant_keeps_use():
     t = Type()
     a = Value(name="a", type=t)
     inner = Op(operands=[a], results=[])
@@ -257,12 +261,13 @@ def test_transplant_keeps_use_removes_before_adds():
         results=[],
         blocks=[Block(ops=[inner])],
     )
-    root = Block(ops=[wrapper])
+    root = Block(arguments=[a], ops=[wrapper])
 
     assert (inner, 0) in a.uses
 
     # Move the inner op into a fresh group, then drop the old wrapper by
-    # reassigning root.ops. Removes-before-adds must keep inner anchored.
+    # reassigning root.ops. Inner must end up rooted under the new wrapper,
+    # whichever order the two lists happen to sync in.
     new_group = Block(ops=[inner])
     new_wrapper = Op(
         operands=[],
@@ -274,14 +279,15 @@ def test_transplant_keeps_use_removes_before_adds():
     assert (inner, 0) in a.uses
 
 
-def test_build_is_free_floating_until_placed():
+def test_build_is_not_a_user_until_placed():
     t = Type()
     a = Value(name="a", type=t)
+    block = Block(arguments=[a])
     op = Op.build(operands=[a])
-    assert a.uses == set()
+    assert a.users() == []
 
-    Block(ops=[op])
-    assert a.uses == {(op, 0)}
+    block.ops.append(op)
+    assert a.users() == [op]
 
 
 def test_clone_subtree_no_double_count():
@@ -293,13 +299,16 @@ def test_clone_subtree_no_double_count():
         results=[],
         blocks=[Block(ops=[inner])],
     )
-    Block(ops=[outer])
+    Block(arguments=[a], ops=[outer])
 
     cloned = clone_op(outer, {})
-    Block(ops=[cloned])
 
-    # a is used once by each of: outer, inner, cloned outer, cloned inner.
+    # The clone references `a` too, but sits in its own tree...
     assert len(a.uses) == 4
+    assert len(a.users()) == 2
+
+    # ...until it is spliced into the same one.
+    outer.parent_block.ops.append(cloned)
     assert len(a.users()) == 4
 
 
@@ -307,7 +316,7 @@ def test_users_dedupes_repeated_operand():
     t = Type()
     a = Value(name="a", type=t)
     op = Op(operands=[a, a], results=[])
-    Block(ops=[op])
+    Block(arguments=[a], ops=[op])
 
     assert a.uses == {(op, 0), (op, 1)}
     assert a.users() == [op]
