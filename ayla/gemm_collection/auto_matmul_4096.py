@@ -6,6 +6,7 @@ from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
+from ..passes.multi_buffer import multi_buffer
 from ..passes.pipeline_loop import pipeline_loop
 from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
@@ -67,7 +68,9 @@ def auto_matmul_4096_module():
         tile_levels=["for"], tile_labels=["l"],
         label_filter="mm",
     )
-    module = unroll_loop(module, unroll_factor=2, label_filter="k")
+    module = multi_buffer(module, depth=2)
+    module = unroll_loop(module, unroll_factor=2, label_filter="k", clone_allocs=False)
+    module = canonicalize(module)
     module = licm(module)
     module = pipeline_loop(module, label_filter_loop="k", label_filter_op="mm_(lhs|rhs)_smem_iter0", pipelining_offset=1)
     module = unroll_loop(module, unroll_factor=4, label_filter=r"l_iter\d+")
