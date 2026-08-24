@@ -27,3 +27,16 @@ curl -fsSL https://pixi.sh/install.sh | bash
 ```
 
 Then set up the environment with [pixi](https://pixi.sh): `pixi shell` to activate the env, `pixi run install` provisions Python 3.12 with ayla (editable) plus the CUDA 12.8 (cu128) PyTorch build, then `pixi run test` runs the tests and `pixi run bench` runs the benchmark.
+
+## Models to try
+
+Candidate test subjects, once ayla is ready to serve real GEMM shapes:
+
+- **Muse Glimmer 30B** — the best first target. A Meta model, open weights (Apache 2.0),
+  and it serves on a single H100 at TP=1 in bf16, which is exactly what ayla emits. Its
+  weight dimensions are all multiples of 256, so the existing tiling divides evenly.
+- **Gemma 4 31B** and **Qwen 3.5/3.6 27B** — the two models Glimmer is benchmarked
+  against, so they are the natural second and third subjects. Dense, single GPU, fp8.
+- **DeepSeek V4**, **Kimi K2.7**, **GLM 5.2** — the frontier, and the furthest away.
+  All mixture of experts, mostly fp8 with block scaling, so they need grouped GEMM and a
+  narrower operand type before ayla has anything to say about them.
