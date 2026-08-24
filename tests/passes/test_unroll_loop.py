@@ -122,3 +122,47 @@ def test_unroll_remainder_does_not_hoist_initialized_allocations():
     loop_start = text.index("for (%k: index = 0 to 3 step 3)")
     first_alloc = text.index("rmem_tensor<1xf32> = alloc()", loop_start)
     assert first_alloc > loop_start
+
+
+def test_plain_unrolling_shares_the_loop_local_buffer():
+    """Without clone_allocs every copy uses the one allocation.
+
+    Five iterations unrolled by two, so the tail runs too: it already reused
+    the first copy's buffer, and now the main copies do as well. The default
+    duplicates it instead, which multi-buffers the copies as a side effect.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            for (%k: index = 0 to 5 step 1) attrs={label: "k"} {
+              %s: smem_tensor<4x4xf32> = alloc()
+              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
+              move(%s: smem_tensor<4x4xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
+            }
+          }
+        }""")
+
+    module = unroll_loop(
+        gpu_dialect.parse(module_str),
+        unroll_factor=2,
+        label_filter="k",
+        clone_allocs=False,
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            %s: smem_tensor<4x4xf32> = alloc()
+            for (%k: index = 0 to 4 step 2) attrs={label: "k"} {
+              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
+              move(%s: smem_tensor<4x4xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
+              %c1: index = index_constant() attrs={value: 1}
+              %0: index = index_add(%k: index, %c1: index)
+              %t1: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %0: index)
+              move(%s: smem_tensor<4x4xf32>, %t1: gmem_tensor<4x1xf32 strides=[4, 1]>)
+            }
+            %c4: index = index_constant() attrs={value: 4}
+            %t2: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %c4: index)
+            move(%s: smem_tensor<4x4xf32>, %t2: gmem_tensor<4x1xf32 strides=[4, 1]>)
+          }
+        }""")

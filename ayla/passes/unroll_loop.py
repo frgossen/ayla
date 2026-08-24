@@ -6,10 +6,15 @@ Each copy's induction variable is offset by `i * original_step`.
 
 When the trip count is not divisible by the factor, the leftover iterations are
 emitted as a straight-line tail after the unrolled loop. If the factor exceeds
-the trip count the whole loop becomes the tail (no loop remains). Static
-loop-local allocations are cloned once per main-loop copy (forming distinct
-pipeline stages); the non-overlapping tail reuses the first copy's buffers
-instead of creating an extra stage.
+the trip count the whole loop becomes the tail (no loop remains).
+
+``clone_allocs`` gives each main-loop copy its own static loop-local
+allocations, so the copies come out multi-buffered. That is a side effect of
+unrolling rather than a job for it, and ``multi_buffer`` now does it on purpose;
+pass ``clone_allocs=False`` for plain unrolling, where every copy shares the
+first one's buffers. The non-overlapping tail always reuses them.
+
+TODO: drop clone_allocs once every kernel has moved to multi_buffer.
 """
 from __future__ import annotations
 
@@ -30,11 +35,17 @@ from ..base.lowering_pass import LoweringPass
 class UnrollLoop(LoweringPass):
     """Unroll all ForOps by `unroll_factor`."""
 
-    def __init__(self, unroll_factor: int, label_filter: str | None = None) -> None:
+    def __init__(
+        self,
+        unroll_factor: int,
+        label_filter: str | None = None,
+        clone_allocs: bool = True,
+    ) -> None:
         super().__init__()
         self.register(ForOp, type(self).lower_for)
         self.unroll_factor = unroll_factor
         self.label_filter = label_filter
+        self.clone_allocs = clone_allocs
 
     def lower_for(
         self, op: ForOp,
@@ -72,7 +83,15 @@ class UnrollLoop(LoweringPass):
                 offset_iv = IndexAddOp.build(lhs=new_iv, rhs=offset_const.result())
                 main_body_ops.extend([offset_const, offset_iv])
                 iteration_iv = offset_iv.result()
-            cloned, vmap = _clone_iteration(op, iteration_iv, f"_iter{i}")
+            # With clone_allocs, each copy allocates its own buffers and the
+            # stages end up multi-buffered; without it, they share the first
+            # copy's, which is what plain unrolling does.
+            cloned, vmap = _clone_iteration(
+                op,
+                iteration_iv,
+                f"_iter{i}",
+                None if self.clone_allocs else reusable_allocs,
+            )
             main_body_ops.extend(cloned)
             if i == 0:
                 reusable_allocs = _static_alloc_map(op, vmap)
@@ -145,6 +164,11 @@ def _suffix_labels(ops: list[Op], suffix: str) -> None:
                 nested.attrs["label"] = label + suffix
 
 
-def unroll_loop(module: ModuleOp, unroll_factor: int, label_filter: str | None = None) -> ModuleOp:
+def unroll_loop(
+    module: ModuleOp,
+    unroll_factor: int,
+    label_filter: str | None = None,
+    clone_allocs: bool = True,
+) -> ModuleOp:
     """Convenience entry point."""
-    return UnrollLoop(unroll_factor, label_filter).run(module)
+    return UnrollLoop(unroll_factor, label_filter, clone_allocs).run(module)
