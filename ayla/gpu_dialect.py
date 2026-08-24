@@ -208,12 +208,14 @@ class MatmulOp(Op):
         dst: Value,
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
+        scale_d: Value | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if init is not None:
             a["init"] = init
         return cls(
-            operands=[lhs, rhs, dst], results=[], attrs=a,
+            operands=[lhs, rhs, dst] + ([scale_d] if scale_d is not None else []),
+            results=[], attrs=a,
         )
 
     @property
@@ -227,6 +229,11 @@ class MatmulOp(Op):
     @property
     def dst(self) -> Value:
         return self.operands[2]
+
+    @property
+    def scale_d(self) -> Value | None:
+        """Optional uniform condition controlling accumulation into ``dst``."""
+        return self.operands[3] if len(self.operands) == 4 else None
 
     @property
     def init(self) -> float | int | None:
