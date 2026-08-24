@@ -21,7 +21,6 @@ from ..gpu_dialect import (
     ConvertOp,
     F16Type,
     F32Type,
-    ForOp,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -31,7 +30,6 @@ from ..gpu_dialect import (
     LockType,
     MatmulOp,
     ModuleOp,
-    KernelOp,
     MoveOp,
     PTXTemplateOp,
     PtrAddOp,
@@ -47,74 +45,8 @@ from ..gpu_dialect import (
     physical_layout,
     root_buffer,
 )
-from ..base.ir import Block, Op, Value, iter_ops
+from ..base.ir import Op, Value
 from ..base.lowering_pass import LoweringPass
-
-
-def _first_accumulator_user(ops: list[Op], users: set[int]) -> Op | None:
-    for op in ops:
-        if id(op) in users:
-            return op
-        if isinstance(op, ForOp):
-            if any(id(nested) in users for nested in iter_ops(op)):
-                return op
-            continue
-        for region in op.regions:
-            for block in region.blocks:
-                if found := _first_accumulator_user(block.ops, users):
-                    return found
-    return None
-
-
-def _fold_wgmma_accumulator_init(block: Block) -> None:
-    """Use WGMMA scale-D instead of explicitly zeroing its accumulator."""
-    for index, alloc in enumerate(block.ops):
-        if not (
-            isinstance(alloc, AllocOp)
-            and isinstance(alloc.result().type, WrmemTensorType)
-            and alloc.init == 0
-        ):
-            continue
-
-        accumulator = alloc.result()
-        users = {id(op) for op in accumulator.users()}
-        first_container = next((
-            op for op in block.ops[index + 1:]
-            if any(id(nested) in users for nested in iter_ops(op))
-        ), None)
-        if first_container is None:
-            continue
-
-        if isinstance(first_container, ForOp):
-            if first_container.lb != 0 or first_container.trip_count <= 0:
-                continue
-            scale_d = first_container.iv
-            first_user = _first_accumulator_user(
-                first_container.body.entry_block.ops, users,
-            )
-        else:
-            # A fully unrolled workload has no induction variable. Its first
-            # straight-line WGMMA can overwrite the zeroed accumulator.
-            scale_d = None
-            first_user = _first_accumulator_user([first_container], users)
-
-        if (
-            isinstance(first_user, MatmulOp)
-            and first_user.dst is accumulator
-            and isinstance(first_user.lhs.type, SmemTensorType)
-            and isinstance(first_user.rhs.type, SmemTensorType)
-            and first_user.scale_d is None
-        ):
-            if scale_d is None:
-                first_user.attrs["zero_accumulator"] = True
-            else:
-                first_user.operands.append(scale_d)
-            alloc.attrs.pop("init")
-
-    for op in block.ops:
-        for region in op.regions:
-            for nested_block in region.blocks:
-                _fold_wgmma_accumulator_init(nested_block)
 
 
 class LowerToPtxTemplate(LoweringPass):
@@ -122,7 +54,6 @@ class LowerToPtxTemplate(LoweringPass):
 
     def __init__(self) -> None:
         super().__init__()
-        self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
         self.register(MatmulOp, type(self).lower_matmul)
@@ -132,13 +63,6 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
 
-    def lower_kernel(
-        self, op: KernelOp,
-    ) -> tuple[list[Op], list[object]]:
-        for block in op.body.blocks:
-            _fold_wgmma_accumulator_init(block)
-        self.lower_region(op.body)
-        return [op], []
 
     def lower_tile(
         self, op: TileOp,
@@ -590,7 +514,6 @@ class LowerToPtxTemplate(LoweringPass):
             return name
 
         desc_template = ""
-        scale_template = ""
         mma_template = ""
         for j, mm in enumerate(mms):
             lhs_type = mm.lhs.type
@@ -658,20 +581,6 @@ class LowerToPtxTemplate(LoweringPass):
                     offset=lhs_offset if m_it > 0 else None,
                 )
 
-            if mm.attrs.get("zero_accumulator", False):
-                scale_d = "0"
-            elif mm.scale_d is None:
-                scale_d = "1"
-            else:
-                scale_name = _operand(
-                    self.value_map[mm.scale_d], "scale_d",
-                )
-                scale_pred = f"scale_d{j}"
-                scale_template += (
-                    f"setp.ne.u32 ${{pred:{scale_pred}}}, "
-                    f"${{b32:operand.{scale_name}.val}}, 0;\n"
-                )
-                scale_d = f"${{pred:{scale_pred}}}"
             reg_offset = 0
             for m_it in range(m_iters):
                 regs = ", ".join(
@@ -683,7 +592,7 @@ class LowerToPtxTemplate(LoweringPass):
                       {{{regs}}},
                       ${{b64:desc_lhs{j}_{m_it}}},
                       ${{b64:{desc_rhs}}},
-                      {scale_d}, 1, 1, 0, 0;
+                      1, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
 
@@ -694,7 +603,6 @@ class LowerToPtxTemplate(LoweringPass):
         # warpgroup-wide wgmma reads).
         template = (
             "wgmma.fence.sync.aligned;\n"
-            + scale_template
             + desc_template
             + mma_template
             + "wgmma.commit_group.sync.aligned;\n"
