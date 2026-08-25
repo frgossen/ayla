@@ -1790,10 +1790,17 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     return None
 
 
-def is_value_identical(op: Op) -> bool:
-    """Same operands and attrs always produce identical results."""
+def is_side_effect_free(op: Op) -> bool:
+    """Safe to move, and interchangeable with an identical op.
+
+    Same operands and attrs always produce the same result, and nothing is read
+    or written along the way.
+    """
+    if isinstance(op, AllocOp):
+        # The initialiser writes the buffer, so such an allocation neither
+        # moves freely nor stands in for another.
+        return op.init is None
     return isinstance(op, (
-        AllocOp,
         BlockIdsOp,
         IndexAddOp,
         IndexConstantOp,
@@ -1808,13 +1815,6 @@ def is_value_identical(op: Op) -> bool:
         ToPtrOp,
         WarpGroupIdOp,
     ))
-
-
-def is_side_effect_free(op: Op) -> bool:
-    """Safe to reorder or hoist — does not read or write memory."""
-    if isinstance(op, AllocOp):
-        return op.init is None
-    return is_value_identical(op)
 
 
 def effective_operands(op: Op) -> list[Value]:
