@@ -507,6 +507,9 @@ class LowerToPtxTemplate(LoweringPass):
                 return None
             tile = value.definition
             base_tile = base.definition
+            # TODO: Support arbitrary-length TileOp chains. Currently descriptor
+            # reuse is limited to siblings in one WGMMA commit group that share
+            # the same direct parent/base.
             if (
                 tile.arg is not base_tile.arg
                 or tile.result().type != base_tile.result().type
