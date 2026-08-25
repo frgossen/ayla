@@ -16,7 +16,7 @@ def test_cse_deduplicates_index_constants():
             %offset_a: index = index_mul(%cx: index, %c64a: index)
             %c64b: index = index_constant() attrs={value: 64}
             %offset_b: index = index_mul(%cx: index, %c64b: index)
-            %val: rmem_tensor<1xf32> = alloc()
+            %val: rmem_tensor<1xf32> = alloc() attrs={id: 0}
             move(%val: rmem_tensor<1xf32>, %a: gmem_tensor<4096x4096xf32>, %offset_b: index)
           }
         }""")
@@ -37,7 +37,34 @@ def test_cse_deduplicates_index_constants():
             %cx: index, %cy: index, %cz: index = block_ids()
             %c64a: index = index_constant() attrs={value: 64}
             %offset_a: index = index_mul(%cx: index, %c64a: index)
-            %val: rmem_tensor<1xf32> = alloc()
+            %val: rmem_tensor<1xf32> = alloc() attrs={id: 0}
             move(%val: rmem_tensor<1xf32>, %a: gmem_tensor<4096x4096xf32>, %offset_a: index)
           }
         }""")
+
+
+def test_cse_deduplicates_allocations_by_id():
+    """Allocations merge iff they name the same buffer.
+
+    An allocation is an ordinary value-identical op; the id is what tells two
+    of them apart. Copies of one allocation carry its id and fold back
+    together, while separate allocations keep their own buffers.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem_tensor<4x4xf32>) {
+            %same0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %same1: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %other: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
+            %init0: rmem_tensor<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
+            %init1: rmem_tensor<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
+          }
+        }""")
+
+    text = repr(cse(gpu_dialect.parse(module_str)))
+
+    assert text.count("alloc() attrs={id: 0}") == 1
+    assert text.count("alloc() attrs={id: 1}") == 1
+    # An initialiser writes the buffer, so two of them are not interchangeable
+    # even sharing an id -- unrolling clones them, and each copy must re-zero.
+    assert text.count("alloc() attrs={id: 2, init: 0.0}") == 2

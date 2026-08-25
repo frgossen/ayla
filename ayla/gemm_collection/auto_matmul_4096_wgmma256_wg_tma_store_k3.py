@@ -70,6 +70,7 @@ def _tma_store_k3_module(*, output_tiles_per_cta: int):
     )
     module = multi_buffer(module, depth=3, label_filter="mm_lhs_smem")
     module = multi_buffer(module, depth=3, label_filter="mm_rhs_smem")
+    module = licm(module)
     module = unroll_loop(module, unroll_factor=3, label_filter="k")
     module = canonicalize(module)
     module = lower_to_async(module)

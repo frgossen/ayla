@@ -11,9 +11,9 @@ def pranjalssh_4096_module():
         module {
           kernel @pranjalssh_4096(%a: gmem_tensor<4096x4096xbf16>, %bt: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 32, 1] block_dim=[128, 1, 1] {
             %bx: index, %by: index, %bz: index = block_ids()
-            %smem_a: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %smem_b: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %smem_a: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %smem_b: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
+            %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2, init: 0.0}
             %a_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<4096x4096xbf16>, %by: index, 0)
             %bt_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]> = tile(%bt: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
             for (%k: index = 0 to 64) {
@@ -27,7 +27,7 @@ def pranjalssh_4096_module():
                 matmul(%a_inner: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
               }
             }
-            %acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            %acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 3}
             convert(%acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
             %c_block: gmem_tensor<128x128xbf16 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xbf16>, %by: index, %bx: index)
             move(%c_block: gmem_tensor<128x128xbf16 strides=[4096, 1]>, %acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0">)
