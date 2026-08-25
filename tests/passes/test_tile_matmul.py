@@ -70,6 +70,6 @@ def test_warp_group_tiling_sets_block_dim():
         tile_levels=["wg.x"], tile_labels=[None],
     )
 
-    [kernel] = module.body.entry_block.ops
+    [kernel] = module.body.ops
     assert kernel.block_dim == (256, 1, 1)
     assert kernel.num_warp_groups == 2

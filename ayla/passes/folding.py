@@ -56,23 +56,21 @@ class Folding(LoweringPass):
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
         if op.trip_count != 1:
-            assert len(op.body.blocks) == 1
             # Walk the body ourselves rather than falling through, so the
             # induction variable's congruence is in scope while folding it.
             # See the TODO on _iv_congruence: with parent pointers this branch
             # would not need to exist.
             self._iv_congruence[op.iv] = (op.lb, op.step)
             try:
-                self.lower_region(op.body)
+                self.lower_block(op.body)
             finally:
                 del self._iv_congruence[op.iv]
             return [op], list(op.results)
 
-        assert len(op.body.blocks) == 1
-        self.lower_region(op.body)
+        self.lower_block(op.body)
         iv_const = IndexConstantOp.build(value=op.lb)
         vmap: dict[Value, Value] = {op.iv: iv_const.result()}
-        cloned = [clone_op(body_op, vmap) for body_op in op.body.entry_block.ops]
+        cloned = [clone_op(body_op, vmap) for body_op in op.body.ops]
         return [iv_const, *cloned], []
 
     def lower_select(

@@ -8,7 +8,6 @@ from ayla import (
     ModuleOp,
     Op,
     PTXTemplateOp,
-    Region,
     Value,
 )
 from ayla.gpu_dialect import (
@@ -40,7 +39,7 @@ def test_matmul_program():
     c = Value(name="c", type=c_type)
     matmul = MatmulOp.build(a, b, c, attrs={"library": "cublas"})
     block = Block(arguments=[a, b, c], ops=[matmul])
-    program = Op(operands=[], results=[], regions=[Region(blocks=[block])])
+    program = Op(operands=[], results=[], blocks=[block])
 
     expected = textwrap.dedent("""\
         generic() {
@@ -58,16 +57,14 @@ def test_kernel_op():
     rhs = Value(name="rhs", type=buf_type)
     dst = Value(name="dst", type=buf_type)
     template = "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\n"
-    entry_block = Block(arguments=[lhs, rhs, dst], ops=[
+    body = Block(arguments=[lhs, rhs, dst], ops=[
         PTXTemplateOp.build([lhs, rhs, dst], [buf_type], template=template),
     ])
-    second_block = Block(ops=[Op(operands=[], results=[])])
-    body = Region(blocks=[entry_block, second_block])
     kernel = KernelOp.build(
         "cwise_add", body, attrs={"version": 1},
     )
     module = ModuleOp.build(
-        Region(blocks=[Block(ops=[kernel])]),
+        Block(ops=[kernel]),
         attrs={"target": "sm_80"},
     )
 
@@ -75,8 +72,6 @@ def test_kernel_op():
         module attrs={target: "sm_80"} {
           kernel @cwise_add(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) attrs={version: 1} {
             %0: gmem_tensor<1048576xf32> = ptx_template(%lhs: gmem_tensor<1048576xf32>, %rhs: gmem_tensor<1048576xf32>, %dst: gmem_tensor<1048576xf32>) attrs={template: "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\\n"}
-          ^bb0:
-            generic()
           }
         }""")  # noqa: E501
     assert_print_and_roundtrip(module, expected)
@@ -84,7 +79,7 @@ def test_kernel_op():
 
 def test_kernel_num_threads():
     kernel = KernelOp.build(
-        "k", Region(blocks=[Block()]),
+        "k", Block(),
         block_dim=(256, 1, 1), num_warp_groups=2,
     )
 
@@ -93,7 +88,7 @@ def test_kernel_num_threads():
 
 def test_for_loop():
     op = ForOp.build(0, 64, 4)
-    op.body.entry_block.append(Op(operands=[op.iv], results=[]))
+    op.body.append(Op(operands=[op.iv], results=[]))
     expected = textwrap.dedent("""\
         for (%0: index = 0 to 64 step 4) {
           generic(%0: index)
@@ -109,10 +104,10 @@ def test_async_op():
     rhs1 = Value(name="rhs1", type=t)
     dst = Value(name="dst", type=t)
     lock = Value(name="lock", type=LockType.build(kind="wgmma"))
-    body = Region(blocks=[Block(ops=[
+    body = Block(ops=[
         MatmulOp.build(lhs0, rhs0, dst),
         MatmulOp.build(lhs1, rhs1, dst),
-    ])])
+    ])
     op = AsyncOp.build(lock, body=body)
     expected = textwrap.dedent("""\
         async(%lock: lock<wgmma>) {
@@ -127,7 +122,7 @@ def test_async_op_single_move():
     dst = Value(name="dst", type=t)
     src = Value(name="src", type=t)
     lock = Value(name="lock", type=LockType.build(kind="bulk"))
-    body = Region(blocks=[Block(ops=[MoveOp.build(dst, src)])])
+    body = Block(ops=[MoveOp.build(dst, src)])
     op = AsyncOp.build(lock, body=body)
     expected = "async(%lock: lock<bulk>) move(%dst: gmem_tensor<64x64xf32>, %src: gmem_tensor<64x64xf32>)"  # noqa: E501
     assert_print_and_roundtrip(op, expected)
@@ -135,7 +130,7 @@ def test_async_op_single_move():
 
 def test_for_loop_default_step():
     op = ForOp.build(0, 4096)
-    op.body.entry_block.append(Op(operands=[op.iv], results=[]))
+    op.body.append(Op(operands=[op.iv], results=[]))
     expected = textwrap.dedent("""\
         for (%0: index = 0 to 4096) {
           generic(%0: index)

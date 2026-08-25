@@ -24,7 +24,7 @@ from ..gpu_dialect import (
     IndexType,
     ModuleOp,
 )
-from ..base.ir import Block, Op, Region, Value, clone_op, iter_ops
+from ..base.ir import Block, Op, Value, clone_op, iter_ops
 from ..base.lowering_pass import LoweringPass
 
 
@@ -45,18 +45,13 @@ class UnrollLoop(LoweringPass):
         if self.label_filter is not None and not re.fullmatch(self.label_filter, op.attrs.get("label", "")):
             return None
 
-        # TODO: extend to handle multiple blocks.
-        assert len(op.body.blocks) == 1, (
-            f"Unroll: expected one block in for body, got {len(op.body.blocks)}"
-        )
-
         # Recursively transform nested ops first.
-        self.lower_region(op.body)
+        self.lower_block(op.body)
 
         # Lift the loop-local allocations out before cloning, so every copy and
         # the tail share them. Copying them per iteration would multi-buffer the
         # loop, which is multi_buffer's job.
-        body = op.body.entry_block
+        body = op.body
         hoisted_allocs = [o for o in body.ops if _is_static_alloc(o)]
         body.ops = [o for o in body.ops if not _is_static_alloc(o)]
 
@@ -88,7 +83,7 @@ class UnrollLoop(LoweringPass):
 
         result: list[Op] = list(hoisted_allocs)
         if main_trip_count:
-            new_body = Region(blocks=[Block(arguments=[new_iv], ops=main_body_ops)])
+            new_body = Block(arguments=[new_iv], ops=main_body_ops)
             result.append(ForOp.build(lb=lb, ub=new_ub, step=new_step, body=new_body, attrs=extra_attrs))
         result.extend(tail_ops)
         return result, []
@@ -104,7 +99,7 @@ def _clone_iteration(
 ) -> list[Op]:
     """Clone the loop body once, rebinding the induction variable."""
     vmap: dict[Value, Value] = {op.iv: iteration_iv}
-    cloned = [clone_op(body_op, vmap) for body_op in op.body.entry_block.ops]
+    cloned = [clone_op(body_op, vmap) for body_op in op.body.ops]
     _suffix_labels(cloned, label_suffix)
     return cloned
 

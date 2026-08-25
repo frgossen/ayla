@@ -2,7 +2,7 @@
 
 Wraps the ops that run asynchronously on the hardware — a TMA bulk transfer
 (``move`` with ``tma=True`` or a lowered ``tma_move``) and a wgmma matmul
-(smem×smem→wrmem with 4 warps) — in an ``async`` region carrying the lock,
+(smem×smem→wrmem with 4 warps) — in an ``async`` block carrying the lock,
 followed by an ``await``. The lock kind is ``mbar`` for a TMA load, ``bulk``
 for a TMA store, ``wgmma`` for a matmul.
 
@@ -24,7 +24,7 @@ from ..gpu_dialect import (
     TmaMoveOp,
     WrmemTensorType,
 )
-from ..base.ir import Block, Op, Region, Value
+from ..base.ir import Block, Op, Value
 from ..base.lowering_pass import LoweringPass
 
 
@@ -50,12 +50,12 @@ class LowerToAsync(LoweringPass):
 
         The label is tagged ``{label}_async`` on the async op and
         ``{label}_await`` on the await (mirroring each other), so label-matching
-        passes see it on the top-level ops rather than buried in the region.
+        passes see it on the top-level ops rather than buried in the block.
         """
         lock = AllocOp.build(LockType.build(kind=kind))
         label = attrs.get("label")
         async_op = AsyncOp.build(
-            lock.result(), body=Region(blocks=[Block(ops=[inner])]),
+            lock.result(), body=Block(ops=[inner]),
             attrs={"label": f"{label}_async"} if label is not None else None,
         )
         await_op = AwaitOp.build(

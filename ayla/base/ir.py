@@ -9,21 +9,30 @@ from .parser import Parser
 from .printer import Printer  # noqa: F401
 
 
-# Observable containers that keep the use-list self-maintaining.
+# Observable containers that keep the use-list and parent links
+# self-maintaining.
 #
-# The invariant: ``value.uses`` contains ``(op, i)`` iff ``op.operands[i] is
-# value`` and ``op`` is anchored (held by a block, directly or nested inside an
-# anchored op's regions). Two list subclasses capture the only two mutation
-# channels so no pass registers/deregisters by hand:
+# The invariants: ``op.parent_block`` / ``block.parent_op`` point at the
+# container holding the node, and ``value.uses`` contains ``(op, i)`` iff
+# ``op.operands[i] is value`` — unconditionally, for as long as the op exists.
+# Three list subclasses capture the three mutation channels so no pass
+# registers/deregisters by hand:
 #
 # - ``_OperandList`` wraps an op's ``operands`` — writes rewire its uses.
-# - ``_OpList`` wraps a block's ``ops`` — ops entering/leaving anchor/unanchor
-#   (which cascades into their regions).
+# - ``_OpList`` wraps a block's ``ops`` — sets each op's ``parent_block``.
+# - ``_BlockList`` wraps an op's ``blocks`` — sets each block's ``parent_op``.
 #
-# Both react the same way: snapshot, run the real list method, reconcile via
+# ``uses`` is deliberately structural rather than filtered: an op that has been
+# spliced out of the IR, or built but not yet inserted, still appears there.
+# Liveness is a question about *position*, so it is answered by position, at
+# query time — see ``Value.users``, which keeps only users sharing a tree with
+# the value's definition.
+#
+# All react the same way: snapshot, run the real list method, reconcile via
 # ``_sync(old)``. Every mutator is generated from that one pattern below.
-# Whole-list reassignment (``op.operands = [...]`` / ``block.ops = [...]``) is
-# handled by ``Op``/``Block`` ``__setattr__``, which re-wraps into these types.
+# Whole-list reassignment (``op.operands = [...]`` / ``block.ops = [...]`` /
+# ``op.blocks = [...]``) is handled by ``Op``/``Block`` ``__setattr__``, which
+# re-wraps into these types.
 
 
 class _ObservableList(list):
@@ -57,18 +66,16 @@ for _name in (
 
 
 class _OperandList(_ObservableList):
-    """An op's ``operands``; rewires its values' ``uses`` when anchored."""
+    """An op's ``operands``; rewires its values' ``uses``."""
 
     __slots__ = ("_op",)
 
-    def __init__(self, iterable=(), *, op: "Op | None" = None) -> None:
+    def __init__(self, iterable=(), *, op: "Op") -> None:
         super().__init__(iterable)
         self._op = op
 
     def _sync(self, old: list) -> None:
         op = self._op
-        if op is None or not op._anchored:
-            return
         for i, v in enumerate(old):
             v.uses.discard((op, i))
         for i, v in enumerate(self):
@@ -76,22 +83,47 @@ class _OperandList(_ObservableList):
 
 
 class _OpList(_ObservableList):
-    """A block's ``ops``; anchors/unanchors ops as they enter/leave. Stateless:
-    ``_sync`` reconciles purely from the element ops."""
+    """A block's ``ops``; points each op's ``parent_block`` back at it."""
 
-    __slots__ = ()
+    __slots__ = ("_block",)
+
+    def __init__(self, iterable=(), *, block: "Block") -> None:
+        super().__init__(iterable)
+        self._block = block
 
     def _sync(self, old: list) -> None:
-        # Unanchor removed ops before anchoring added ones so transplanted ops
-        # (in both old and new) stay anchored.
+        block = self._block
         new_ids = {id(op) for op in self}
         old_ids = {id(op) for op in old}
         for op in old:
-            if id(op) not in new_ids:
-                op._unanchor()
+            # Only if still ours: a transplanted op already points at its new
+            # block, and this stale sync must not null that out.
+            if id(op) not in new_ids and op.parent_block is block:
+                op.parent_block = None
         for op in self:
             if id(op) not in old_ids:
-                op._anchor()
+                op.parent_block = block
+
+
+class _BlockList(_ObservableList):
+    """An op's ``blocks``; points each block's ``parent_op`` back at it."""
+
+    __slots__ = ("_op",)
+
+    def __init__(self, iterable=(), *, op: "Op") -> None:
+        super().__init__(iterable)
+        self._op = op
+
+    def _sync(self, old: list) -> None:
+        op = self._op
+        new_ids = {id(b) for b in self}
+        old_ids = {id(b) for b in old}
+        for b in old:
+            if id(b) not in new_ids and b.parent_op is op:
+                b.parent_op = None
+        for b in self:
+            if id(b) not in old_ids:
+                b.parent_op = op
 
 
 # Generic IR
@@ -149,7 +181,7 @@ class Type:
 class Value:
     name: str | None
     type: Type
-    definition: Op | Block = field(init=False)
+    definition: Op | Block | None = field(default=None, init=False)
     result_index: int = field(init=False)
     uses: set[tuple[Op, int]] = field(
         default_factory=set, init=False, repr=False,
@@ -162,15 +194,23 @@ class Value:
         )
 
     def users(self) -> list[Op]:
+        """Ops consuming this value from within the same IR tree.
+
+        ``uses`` is structural, so it also holds ops that have been spliced out
+        of the IR or built but never inserted. Those reference the value but are
+        not part of the program any more (or yet), so they are filtered out
+        here: a user counts when it shares a tree root with this value.
         """
-        Ops consuming this value.
-        """
+        root = root_ancestor(self)
         seen: set[int] = set()
         out: list[Op] = []
         for op, _ in self.uses:
-            if id(op) not in seen:
-                seen.add(id(op))
-                out.append(op)
+            if id(op) in seen:
+                continue
+            if root_ancestor(op) is not root:
+                continue
+            seen.add(id(op))
+            out.append(op)
         return out
 
     def print(self, p: Printer) -> None:
@@ -208,20 +248,12 @@ class Op:
     operands: list[Value]
     results: list[Value]
     attrs: dict[str, object] = field(default_factory=dict)
-    regions: list[Region] = field(default_factory=list)
+    blocks: list[Block] = field(default_factory=list)
+
+    parent_block: "Block | None" = field(default=None, init=False, repr=False)
 
     # Set by `Dialect.register_op` on each subclass.
     OP_ID: ClassVar[str] = "generic"
-
-    # Whether this op is currently held by a block (directly, or nested inside
-    # an anchored op). Only anchored ops contribute to `Value.uses`. Class-level
-    # default so it always resolves, even mid-construction before __post_init__.
-
-    # TODO: anchoring triggers on entering any blocks ops, including free-floating
-    # blocks not reachable from the root, so their ops wrongly contribute to Value.uses.
-    # region.blocks / op.regions are plain lists, so attachment doesn't propagate anchoring
-    # upward. Fix by making those lists observable as well or by collapsing regions into blocks.
-    _anchored = False
 
     def __post_init__(self) -> None:
         self.op_id = type(self).OP_ID
@@ -238,33 +270,13 @@ class Op:
             new_list = _OperandList(value, op=self)
             super().__setattr__(name, new_list)
             new_list._sync(old)
+        elif name == "blocks":
+            old = self.__dict__.get("blocks", [])
+            new_list = _BlockList(value, op=self)
+            super().__setattr__(name, new_list)
+            new_list._sync(old)
         else:
             super().__setattr__(name, value)
-
-    def _anchor(self) -> None:
-        """Mark this op (and its whole subtree) as held by a block, registering
-        operand uses. Idempotent: set-keyed and guarded by ``_anchored``."""
-        if self._anchored:
-            return
-        self._anchored = True
-        for i, v in enumerate(self.operands):
-            v.uses.add((self, i))
-        for region in self.regions:
-            for block in region.blocks:
-                for op in block.ops:
-                    op._anchor()
-
-    def _unanchor(self) -> None:
-        """Inverse of ``_anchor``: deregister this op's subtree's operand uses."""
-        if not self._anchored:
-            return
-        self._anchored = False
-        for i, v in enumerate(self.operands):
-            v.uses.discard((self, i))
-        for region in self.regions:
-            for block in region.blocks:
-                for op in block.ops:
-                    op._unanchor()
 
     def operand(self, i: int = 0) -> Value:
         return self.operands[i]
@@ -272,8 +284,8 @@ class Op:
     def result(self, i: int = 0) -> Value:
         return self.results[i]
 
-    def region(self, i: int = 0) -> Region:
-        return self.regions[i]
+    def block(self, i: int = 0) -> Block:
+        return self.blocks[i]
 
     def attr(self, name: str) -> object:
         return self.attrs[name]
@@ -284,7 +296,7 @@ class Op:
         operands: list["Value"] | None = None,
         result_types: list["Type"] | None = None,
         attrs: dict[str, object] | None = None,
-        regions: list["Region"] | None = None,
+        blocks: list["Block"] | None = None,
     ) -> "Op":
         """Default builder. Constructs results from `result_types`.
         Subclasses with richer ergonomic signatures (lhs/rhs/dst/...)
@@ -297,7 +309,7 @@ class Op:
             operands=list(operands or []),
             results=results,
             attrs=dict(attrs or {}),
-            regions=list(regions or []),
+            blocks=list(blocks or []),
         )
 
     def __iter__(self):
@@ -319,12 +331,12 @@ class Op:
         if self.attrs:
             p.write(" attrs=")
             p.write_attr(self.attrs)
-        if self.regions:
+        if self.blocks:
             p.write(" ")
-        for i, r in enumerate(self.regions):
+        for i, b in enumerate(self.blocks):
             if i:
                 p.write_newline()
-            r.print(p)
+            b.print(p)
 
     @staticmethod
     def parse(p: Parser) -> "Op":
@@ -357,15 +369,15 @@ class Op:
             p.read_literal("attrs")
             p.read_literal("=")
             attrs = p.read_dict_attr()
-        regions: list[Region] = []
+        blocks: list[Block] = []
         while p.can_read_literal("{"):
             prefix_brace = p.read_literal("{")
-            regions.append(Region.parse(prefix_brace, p))
+            blocks.append(Block.parse(prefix_brace, p))
         return cls(
             operands=operands,
             results=results,
             attrs=attrs,
-            regions=regions,
+            blocks=blocks,
         )
 
     def __repr__(self) -> str:
@@ -379,6 +391,8 @@ class Block:
     arguments: list[Value] = field(default_factory=list)
     ops: list[Op] = field(default_factory=list)
     name: str | None = None
+
+    parent_op: "Op | None" = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.name is None or not self.name.isdigit(), (
@@ -394,7 +408,7 @@ class Block:
         # _OpList. Re-wrap it and run the same reconcile as an in-place mutation.
         if name == "ops":
             old = self.__dict__.get("ops", [])
-            new_list = _OpList(value)
+            new_list = _OpList(value, block=self)
             super().__setattr__(name, new_list)
             new_list._sync(old)
         else:
@@ -413,6 +427,8 @@ class Block:
         return self.arguments[i]
 
     def print(self, p: Printer, skip_label: bool = False) -> None:
+        p.write("{")
+        p.write_newline()
         if not skip_label:
             basename = f"^{self.name}" if self.name is not None else "^bb"
             label = p.unique_names(
@@ -433,22 +449,28 @@ class Block:
             for op in self.ops:
                 op.print(p)
                 p.write_newline()
+        p.write("}")
 
     @classmethod
     def parse(
         cls,
-        prefix: str | None,
+        prefix: str,
         p: Parser,
         arguments: list[Value] | None = None,
     ) -> "Block":
+        """Parse ``{ ^name(%a: t, ...): ops... }``. Passing `arguments`
+        supplies the block's arguments from the enclosing op's own syntax
+        (see `Block.print`'s `skip_label`), so no label is expected.
+        """
+        if prefix != "{":
+            raise ValueError(
+                f"expected block prefix '{{', got {prefix!r} at pos {p.pos}"
+            )
         name: str | None = None
         if arguments is None:
-            if prefix != "^":
-                raise ValueError(
-                    f"expected block prefix '^', got {prefix!r} at pos {p.pos}"
-                )
-            name = p.read_identifier()
             arguments = []
+            p.read_literal("^")
+            name = p.read_identifier()
             if p.can_read_literal("("):
                 p.read_literal("(")
                 if not p.can_read_literal(")"):
@@ -459,58 +481,10 @@ class Block:
                 p.read_literal(")")
             p.read_literal(":")
         ops: list[Op] = []
-        while not (p.can_read_literal("^") or p.can_read_literal("}")):
-            ops.append(Op.parse(p))
-        return cls(name=name, arguments=arguments, ops=ops)
-
-    def __repr__(self) -> str:
-        p = Printer()
-        self.print(p)
-        return p.render()
-
-
-@dataclass(eq=False)
-class Region:
-    blocks: list[Block] = field(default_factory=list)
-
-    def block(self, i: int = 0) -> Block:
-        return self.blocks[i]
-
-    @property
-    def entry_block(self) -> Block:
-        return self.blocks[0]
-
-    def print(
-        self, p: Printer, skip_entry_block_label: bool = False,
-    ) -> None:
-        p.write("{")
-        p.write_newline()
-        for i, b in enumerate(self.blocks):
-            skip_label = i == 0 and skip_entry_block_label
-            b.print(p, skip_label=skip_label)
-        p.write("}")
-
-    @classmethod
-    def parse(
-        cls,
-        prefix: str,
-        p: Parser,
-        entry_block_arguments: list[Value] | None = None,
-    ) -> "Region":
-        if prefix != "{":
-            raise ValueError(
-                f"expected region prefix '{{', got {prefix!r} at pos {p.pos}"
-            )
-        blocks: list[Block] = []
-        if entry_block_arguments is not None:
-            blocks.append(
-                Block.parse(None, p, arguments=entry_block_arguments)
-            )
         while not p.can_read_literal("}"):
-            prefix_caret = p.read_literal("^")
-            blocks.append(Block.parse(prefix_caret, p))
+            ops.append(Op.parse(p))
         p.read_literal("}")
-        return cls(blocks=blocks)
+        return cls(name=name, arguments=arguments, ops=ops)
 
     def __repr__(self) -> str:
         p = Printer()
@@ -577,15 +551,37 @@ class Dialect:
         return Dialect("")
 
 
+def root_ancestor(node: "Op | Block | Value") -> "Op | Block | Value":
+    """The top of ``node``'s tree, following the links that lead upward —
+    ``node`` itself if nothing holds it.
+
+    Two nodes share a root exactly when they belong to the same IR tree, which
+    is how `Value.users` tells a live user from one that has been spliced out.
+    A value sits under whatever defines it, so an undefined one is its own
+    root and shares a tree with nothing.
+    """
+    while True:
+        if isinstance(node, Value):
+            parent = node.definition
+        elif isinstance(node, Op):
+            parent = node.parent_block
+        elif isinstance(node, Block):
+            parent = node.parent_op
+        else:
+            assert False, f"root_ancestor: unsupported node {type(node).__name__}"
+        if parent is None:
+            return node
+        node = parent
+
+
 def iter_ops(
     root: Op, predicate: Callable[[Op], bool] = lambda op: True,
 ) -> Iterator[Op]:
     if predicate(root):
         yield root
-    for region in root.regions:
-        for block in region.blocks:
-            for op in block.ops:
-                yield from iter_ops(op, predicate)
+    for block in root.blocks:
+        for op in block.ops:
+            yield from iter_ops(op, predicate)
 
 
 def find_ops(root: Op, predicate: Callable[[Op], bool]) -> list[Op]:
@@ -603,13 +599,13 @@ def clone_type(t: "Type") -> "Type":
 def clone_op(op: Op, vmap: dict[Value, Value]) -> Op:
     new_operands = [vmap.get(v, v) for v in op.operands]
     new_results = [Value(name=v.name, type=clone_type(v.type)) for v in op.results]
-    new_regions = [clone_region(r, vmap) for r in op.regions]
+    new_blocks = [clone_block(b, vmap) for b in op.blocks]
 
     new_op = type(op)(
         operands=new_operands,
         results=new_results,
         attrs=dict(op.attrs),
-        regions=new_regions,
+        blocks=new_blocks,
     )
 
     for old_r, new_r in zip(op.results, new_op.results):
@@ -626,8 +622,3 @@ def clone_block(block: Block, vmap: dict[Value, Value]) -> Block:
         inner_vmap[arg] = new_arg
         new_args.append(new_arg)
     return Block(arguments=new_args, ops=[clone_op(op, inner_vmap) for op in block.ops])
-
-
-def clone_region(region: Region, vmap: dict[Value, Value]) -> Region:
-    inner_vmap = dict(vmap)
-    return Region(blocks=[clone_block(block, inner_vmap) for block in region.blocks])

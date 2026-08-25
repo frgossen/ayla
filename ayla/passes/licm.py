@@ -19,34 +19,33 @@ class LICM(LoweringPass):
 
     def __init__(self) -> None:
         super().__init__()
-        self.register(ForOp, type(self).lower_region_op)
+        self.register(ForOp, type(self).lower_block_op)
 
-    def lower_region_op(
+    def lower_block_op(
         self, op: Op,
     ) -> tuple[list[Op], list[object]]:
-        assert len(op.body.blocks) == 1
-        body = op.body.entry_block
+        body = op.body
         # Defined inside the loop: block arguments (e.g. the iv) plus the
         # results of the body ops we keep.
-        region_defined: set[Value] = set(body.arguments)
+        body_defined: set[Value] = set(body.arguments)
         hoisted: list[Op] = []
         remaining: list[Op] = []
         for body_op in body.ops:
-            if _can_hoist(body_op, region_defined):
+            if _can_hoist(body_op, body_defined):
                 hoisted.append(body_op)
             else:
-                region_defined.update(body_op.results)
+                body_defined.update(body_op.results)
                 remaining.append(body_op)
         body.ops = remaining
         for h in hoisted:
             for r in h.results:
                 self.value_map[r] = r
-        self.lower_region(op.body)
+        self.lower_block(op.body)
         return hoisted + [op], list(op.results)
 
 
-def _can_hoist(op: Op, region_defined: set[Value]) -> bool:
-    if any(v in region_defined for v in effective_operands(op)):
+def _can_hoist(op: Op, body_defined: set[Value]) -> bool:
+    if any(v in body_defined for v in effective_operands(op)):
         return False
     return is_side_effect_free(op)
 

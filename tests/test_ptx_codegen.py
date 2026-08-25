@@ -8,7 +8,6 @@ from ayla import (
     KernelOp,
     ModuleOp,
     PTXTemplateOp,
-    Region,
     Value,
     make_ptx_kernel,
 )
@@ -30,10 +29,10 @@ def test_codegen_cwise_add():
         ops=[block_ids, thread_ids, ptx_op],
     )
     kernel_op = KernelOp.build(
-        "cwise_add", Region(blocks=[body_block]),
+        "cwise_add", body_block,
         grid_dim=(4, 1, 1), block_dim=(256, 1, 1),
     )
-    module = ModuleOp.build(Region(blocks=[Block(ops=[kernel_op])]))
+    module = ModuleOp.build(Block(ops=[kernel_op]))
 
     kernel = make_ptx_kernel(module)
     assert kernel.name == "cwise_add"
@@ -74,7 +73,7 @@ def test_codegen_materializes_block_dim_before_lowering():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, None, None] num_warp_groups=1 {
           }
         }"""))
-    [input_kernel] = module.body.entry_block.ops
+    [input_kernel] = module.body.ops
 
     kernel = make_ptx_kernel(module)
     assert input_kernel.block_dim == (128, 1, 1)

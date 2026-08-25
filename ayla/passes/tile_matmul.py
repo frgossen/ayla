@@ -11,7 +11,7 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
 )
-from ..base.ir import Block, Op, Region, Value, clone_type
+from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass
 
 
@@ -79,8 +79,8 @@ class TileMatmul(LoweringPass):
         self.grid_dim_constraints = [None, None, None]
         self.block_dim_constraints = [None, None, None]
         self.num_warp_groups_constraints = [None]
-        for region in op.regions:
-            self.lower_region(region)
+        for block in op.blocks:
+            self.lower_block(block)
         op.grid_dim = _resolve_launch_dim_constraints(
             op.grid_dim, self.grid_dim_constraints,
         )
@@ -209,7 +209,7 @@ class TileMatmul(LoweringPass):
         ):
             if level != "for":
                 continue
-            body = Region(blocks=[Block(arguments=[iv], ops=body_ops)])
+            body = Block(arguments=[iv], ops=body_ops)
             attrs = {"label": label} if label is not None else None
             body_ops = [ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)]
         new_ops.extend(body_ops)

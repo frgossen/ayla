@@ -442,7 +442,7 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_async(
         self, op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:
-        body_ops = op.body.entry_block.ops
+        body_ops = op.body.ops
         if body_ops and all(isinstance(o, TmaMoveOp) for o in body_ops):
             kind = op.lock.type.kind
             if kind == "mbar":  # one or more gmem→smem loads sharing the mbar

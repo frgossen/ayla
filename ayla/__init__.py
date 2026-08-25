@@ -10,7 +10,6 @@ from .base.ir import (
     Block,
     Op,
     Printer,
-    Region,
     Type,
     Value,
 )
@@ -26,7 +25,6 @@ __all__ = [
     "Op",
     "PTXTemplateOp",
     "Printer",
-    "Region",
     "Type",
     "Value",
     "PtxPrinter",

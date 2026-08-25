@@ -16,13 +16,13 @@ returning:
 The walker threads ``self.value_map: dict[Value, pytree]`` through the
 walk, recording each result's replacement so downstream rewriters can
 look up their operands. Ops without a registered rewriter pass through:
-the walker recurses into their regions and identity-maps their results.
+the walker recurses into their blocks and identity-maps their results.
 """
 from __future__ import annotations
 
 from typing import Callable
 
-from .ir import Block, Op, Region, Value
+from .ir import Block, Op, Value
 from ..gpu_dialect import ModuleOp
 from .pipeline import Pass
 
@@ -67,7 +67,7 @@ class LoweringPass(Pass):
         self, op: Op,
     ) -> tuple[list[Op], list[object]]:
         """Dispatch via the registry. Falls through to pass-through
-        (rewrite operands, recurse into regions, identity-map results)
+        (rewrite operands, recurse into blocks, identity-map results)
         when no rewriter is registered for `type(op)`.
 
         Pass-through assumes every operand's replacement in `value_map`
@@ -89,13 +89,9 @@ class LoweringPass(Pass):
             )
             new_operands.append(replacement)
         op.operands = new_operands
-        for r in op.regions:
-            self.lower_region(r)
+        for b in op.blocks:
+            self.lower_block(b)
         return [op], list(op.results)
-
-    def lower_region(self, region: Region) -> None:
-        for block in region.blocks:
-            self.lower_block(block)
 
     def lower_block(self, block: Block) -> None:
         # Block arguments are unchanged; register identity mappings so

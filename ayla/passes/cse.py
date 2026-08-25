@@ -14,20 +14,16 @@ from ..gpu_dialect import (
     ModuleOp,
     is_value_identical,
 )
-from ..base.ir import Block, Op, Region, Type, Value
+from ..base.ir import Block, Op, Type, Value
 from ..base.pipeline import Pass
 
 
 class CSE(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
-        for region in module.regions:
-            self.run_region(region, {})
+        for block in module.blocks:
+            self.run_block(block, {})
         return module
-
-    def run_region(self, region: Region, canonical_value: dict[int, Value]) -> None:
-        for block in region.blocks:
-            self.run_block(block, canonical_value)
 
     def run_block(self, block: Block, parent_canonical: dict[int, Value]) -> None:
         canonical_value = dict(parent_canonical)
@@ -39,8 +35,8 @@ class CSE(Pass):
                 canonical_value.get(id(v), v) for v in op.operands
             ]
 
-            for region in op.regions:
-                self.run_region(region, canonical_value)
+            for inner in op.blocks:
+                self.run_block(inner, canonical_value)
 
             if is_value_identical(op):
                 key = self._op_key(op)
