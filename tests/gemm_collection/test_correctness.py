@@ -62,6 +62,20 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     assert waits[0] < gathers[len(gathers) // 2] < stores[1] < waits[1]
 
 
+def test_configurable_tma_gemm_supports_rectangular_shapes():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=512,
+        problem_n=19968,
+        problem_k=6656,
+        output_tiles_per_cta=2,
+        operand_stages=4,
+        output_slices=2,
+    ))
+    assert kernel.name.startswith("auto_matmul_m512_n19968_k6656_")
+    assert kernel.grid_dim == (2, 78, 1)
+    assert kernel.block_dim == (256, 1, 1)
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(

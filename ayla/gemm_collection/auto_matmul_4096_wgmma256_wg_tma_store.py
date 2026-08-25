@@ -16,7 +16,11 @@ from .registry import register
 
 
 def auto_matmul_4096_wgmma256_wg_tma_store_module(
-    *, output_tiles_per_cta: int = 1,
+    *, problem_size: int = 4096,
+    problem_m: int | None = None,
+    problem_n: int | None = None,
+    problem_k: int | None = None,
+    output_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -34,6 +38,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
 ):
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
+    problem_m = problem_size if problem_m is None else problem_m
+    problem_n = problem_size if problem_n is None else problem_n
+    problem_k = problem_size if problem_k is None else problem_k
+    if min(problem_m, problem_n, problem_k) <= 0:
+        raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (128, 192):
         raise ValueError("output_m_tile must be 128 or 192")
     if output_m_tile == 192 and output_tiles_per_cta != 1:
@@ -50,7 +59,12 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
     if output_store == "scalar":
         output_tma_inner_size = None
-    name = f"auto_matmul_4096_wgmma256_wg_tma_store_k{operand_stages}"
+    problem_name = (
+        str(problem_size)
+        if problem_m == problem_n == problem_k == problem_size
+        else f"m{problem_m}_n{problem_n}_k{problem_k}"
+    )
+    name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
     if output_m_tile != 128:
@@ -67,13 +81,13 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
-    m_blocks = (4096 + output_m_tile - 1) // output_m_tile
+    m_blocks = (problem_m + output_m_tile - 1) // output_m_tile
     grid_x = (m_blocks + output_tiles_per_cta - 1) // output_tiles_per_cta
-    grid_y = (4096 + output_n_tile - 1) // output_n_tile
+    grid_y = (problem_n + output_n_tile - 1) // output_n_tile
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[{grid_x}, {grid_y}, 1] {{
-            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem<{problem_m}x{problem_k}xbf16>, %b: gmem<{problem_n}x{problem_k}xbf16>, %c: gmem<{problem_m}x{problem_n}xbf16>) grid_dim=[{grid_x}, {grid_y}, 1] {{
+            matmul(%a: gmem<{problem_m}x{problem_k}xbf16>, %b: gmem<{problem_n}x{problem_k}xbf16>, %c: gmem<{problem_m}x{problem_n}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
     if output_tiles_per_cta == 1:
@@ -82,7 +96,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             tile_sizes=[output_m_tile, output_n_tile],
             tile_levels=["block.x", "block.y"], tile_labels=[None, None],
             label_filter="mm",
-            allow_partial=(output_m_tile == 192 or output_n_tile == 384),
+            allow_partial=(
+                problem_m % output_m_tile != 0
+                or problem_n % output_n_tile != 0
+            ),
         )
     else:
         module = tile_matmul(
@@ -90,7 +107,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
             tile_levels=["for", "block.x", "block.y"],
             tile_labels=["outm", None, None], label_filter="mm",
-            allow_partial=output_m_tile == 192,
+            allow_partial=(
+                problem_m % output_m_tile != 0
+                or problem_n % output_n_tile != 0
+            ),
         )
     wg_dim, wg_size = (
         ("M", 64) if output_n_tile == 256
