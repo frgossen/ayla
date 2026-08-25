@@ -94,9 +94,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         )
     if output_m_tile not in (64, 128, 192, 256):
         raise ValueError("output_m_tile must be 64, 128, 192, or 256")
-    if output_n_tile not in (32, 64, 128, 192, 256, 384):
+    if output_n_tile not in (32, 64, 128, 192, 208, 256, 384):
         raise ValueError(
-            "output_n_tile must be 32, 64, 128, 192, 256, or 384"
+            "output_n_tile must be 32, 64, 128, 192, 208, 256, or 384"
         )
     if operand_k_tile not in (16, 32, 64, 128, 256):
         raise ValueError(
@@ -788,6 +788,25 @@ def best_auto_matmul_muse_up_wgmma256_wg_tma_store_module():
     )
 
 
+def best_auto_matmul_muse_up_m512_wgmma256_wg_tma_store_module():
+    """Build the retained Muse up projection for a 512-token batch."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=512, problem_n=19968, problem_k=6656,
+        output_m_tile=128, output_n_tile=208,
+        operand_stages=4, output_slices=1,
+        output_tma_inner_size=None,
+        output_tma_inner_padding=0,
+        startup_tma_stage_order=(0, 1, 2, 3),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="muse_up_m512_best",
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_last", "l2_promotion": "256B"},
+            "rhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
 def best_auto_matmul_muse_intermediate_wgmma256_wg_tma_store_module():
     """Build the retained grouped 19968-cubed BF16 specialization."""
     return auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -825,6 +844,25 @@ def best_auto_matmul_muse_down_wgmma256_wg_tma_store_module():
     )
 
 
+def best_auto_matmul_muse_down_m1024_wgmma256_wg_tma_store_module():
+    """Build the retained Muse down projection for a 1024-token batch."""
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        problem_m=1024, problem_n=6656, problem_k=19968,
+        output_m_tile=128, output_n_tile=208,
+        operand_stages=4, output_slices=1,
+        output_tma_inner_size=104,
+        output_tma_inner_padding=0,
+        startup_tma_stage_order=(0, 1, 3, 2),
+        direct_warp_group_id=True, emit_reqntid=True,
+        variant_suffix="muse_down_m1024_best",
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_last", "l2_promotion": "256B"},
+            "rhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+
+
 BEST_AUTO_MATMUL_LAGUNA_UP_PTX_JIT_OPTIONS = PtxJitOptions(
     optimization_level=3,
 )
@@ -838,6 +876,12 @@ BEST_AUTO_MATMUL_MUSE_INTERMEDIATE_PTX_JIT_OPTIONS = PtxJitOptions(
     optimization_level=3,
 )
 BEST_AUTO_MATMUL_MUSE_DOWN_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=3,
+)
+BEST_AUTO_MATMUL_MUSE_UP_M512_PTX_JIT_OPTIONS = PtxJitOptions(
+    optimization_level=3,
+)
+BEST_AUTO_MATMUL_MUSE_DOWN_M1024_PTX_JIT_OPTIONS = PtxJitOptions(
     optimization_level=3,
 )
 
