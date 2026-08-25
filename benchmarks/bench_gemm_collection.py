@@ -324,8 +324,8 @@ def main() -> None:
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
         ),
         ayla_bf16(
-            "ayla.auto_matmul (wgmma256 wg, TMA store K=3, full output store, 4 tiles/CTA, A promote 256B)",
-            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store",
+            "ayla.auto_matmul (wgmma256 wg, retained cold best)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k4_4tiles_split2_cold_best",
         ),
         ayla_bf16(
             "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
