@@ -71,6 +71,7 @@ def auto_matmul_4096_module():
     )
     module = multi_buffer(module, depth=2, label_filter="mm_lhs_smem")
     module = multi_buffer(module, depth=2, label_filter="mm_rhs_smem")
+    module = licm(module)
     module = unroll_loop(module, unroll_factor=2, label_filter="k")
     module = canonicalize(module)
     module = licm(module)
