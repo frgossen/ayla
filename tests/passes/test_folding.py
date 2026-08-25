@@ -56,8 +56,8 @@ def test_per_iteration_buffer_choice_folds_after_unrolling():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %b0: smem_tensor<4x4xf32> = alloc()
-            %b1: smem_tensor<4x4xf32> = alloc()
+            %b0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %b1: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
             for (%k: index = 0 to 24 step 3) attrs={label: "k"} {
               %c6: index = index_constant() attrs={value: 6}
               %r: index = index_mod(%k: index, %c6: index)
@@ -76,8 +76,8 @@ def test_per_iteration_buffer_choice_folds_after_unrolling():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %b0: smem_tensor<4x4xf32> = alloc()
-            %b1: smem_tensor<4x4xf32> = alloc()
+            %b0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %b1: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
             for (%k: index = 0 to 24 step 6) attrs={label: "k"} {
               move(%b0: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
               move(%b1: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
@@ -95,9 +95,9 @@ def test_buffer_choice_stays_dynamic_when_depth_does_not_divide_the_unroll():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %b0: smem_tensor<4x4xf32> = alloc()
-            %b1: smem_tensor<4x4xf32> = alloc()
-            %b2: smem_tensor<4x4xf32> = alloc()
+            %b0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
+            %b1: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
+            %b2: smem_tensor<4x4xf32> = alloc() attrs={id: 2}
             for (%k: index = 0 to 24 step 3) attrs={label: "k"} {
               %c9: index = index_constant() attrs={value: 9}
               %r: index = index_mod(%k: index, %c9: index)

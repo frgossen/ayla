@@ -20,13 +20,13 @@ def naive_matmul_4096_loop_module():
             %a_thread: gmem_tensor<2x4096xf32> = tile(%a_block: gmem_tensor<64x4096xf32>, %tx: index, 0)
             %b_thread: gmem_tensor<2x4096xf32> = tile(%b_block: gmem_tensor<64x4096xf32>, %ty: index, 0)
             %c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem_tensor<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={init: 0.0}
+            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
             for (%k: index = 0 to 4096) {
               %a_k: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
               %b_k: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%b_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
-              %a_k_rmem: rmem_tensor<2x1xf32> = alloc()
+              %a_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 1}
               move(%a_k_rmem: rmem_tensor<2x1xf32>, %a_k: gmem_tensor<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              %b_k_rmem: rmem_tensor<2x1xf32> = alloc()
+              %b_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 2}
               move(%b_k_rmem: rmem_tensor<2x1xf32>, %b_k: gmem_tensor<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
               matmul(%a_k_rmem: rmem_tensor<2x1xf32>, %b_k_rmem: rmem_tensor<2x1xf32>, %c_thread_rmem: rmem_tensor<2x2xf32>)
             }

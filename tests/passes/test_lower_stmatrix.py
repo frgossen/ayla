@@ -13,8 +13,8 @@ def test_lowers_128b_block_major_move_with_stmatrix():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
-            %s: smem_tensor<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc()
-            %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            %s: smem_tensor<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
+            %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             move(%s: smem_tensor<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
@@ -33,9 +33,9 @@ def test_lowers_128b_block_major_column_slice():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
-            %s: smem_tensor<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc()
+            %s: smem_tensor<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
             %slice: smem_tensor<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%s: smem_tensor<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 0, 1)
-            %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             move(%slice: smem_tensor<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={wgmma_col_start: 128}
           }
         }"""))
@@ -53,8 +53,8 @@ def test_unswizzled_move_uses_scalar_store_fallback():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
-            %s: smem_tensor<64x256xbf16> = alloc()
-            %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            %s: smem_tensor<64x256xbf16> = alloc() attrs={id: 0}
+            %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             move(%s: smem_tensor<64x256xbf16>, %r: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
