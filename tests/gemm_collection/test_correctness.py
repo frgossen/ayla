@@ -5,8 +5,8 @@ import pytest
 import torch
 from torch.ops import ayla
 
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store_k3 import (
-    auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_module,
+from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
+    auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.gpu_dialect import TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
@@ -19,9 +19,9 @@ BF16 = torch.bfloat16
 
 
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
-    kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_module()
-    )
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=2,
+    ))
     lines = kernel.ptx.splitlines()
     stores = [i for i, line in enumerate(lines)
               if "cp.async.bulk.tensor.3d.global.shared" in line]
