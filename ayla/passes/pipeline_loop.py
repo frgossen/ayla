@@ -30,7 +30,6 @@ from ..gpu_dialect import (
     ModuleOp,
     effective_operands,
     is_side_effect_free,
-    is_value_identical,
     memory_effects,
     root_buffer,
 )
@@ -85,7 +84,7 @@ class PipelineLoop(LoweringPass):
                 defining = in_body_def.get(v)
                 if defining is None or defining in labeled or defining in shared:
                     continue
-                if is_value_identical(defining):
+                if is_side_effect_free(defining):
                     shared.add(defining)
                 else:
                     labeled.add(defining)

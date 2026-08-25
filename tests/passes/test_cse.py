@@ -56,6 +56,8 @@ def test_cse_deduplicates_allocations_by_id():
             %same0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
             %same1: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
             %other: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
+            %init0: rmem_tensor<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
+            %init1: rmem_tensor<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
           }
         }""")
 
@@ -63,3 +65,6 @@ def test_cse_deduplicates_allocations_by_id():
 
     assert text.count("alloc() attrs={id: 0}") == 1
     assert text.count("alloc() attrs={id: 1}") == 1
+    # An initialiser writes the buffer, so two of them are not interchangeable
+    # even sharing an id -- unrolling clones them, and each copy must re-zero.
+    assert text.count("alloc() attrs={id: 2, init: 0.0}") == 2
