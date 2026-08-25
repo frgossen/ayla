@@ -11,9 +11,7 @@ import textwrap
 
 from ..base.ir import Value
 from ..gpu_dialect import PTXTemplateOp, TmaDescType, gpu_dialect
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 FASTCU_MATMUL_5_1_TEMPLATE = r'''.reg .pred 	%Kp<19>;
 	.reg .b16 	%Krs<129>;
@@ -1244,6 +1242,7 @@ $L__BB0_20:
 '''
 
 
+@register
 def fastcu_5_1_module():
     """4096x4096 bf16 matmul from pranjalssh/fast.cu ``matmul_5_1``.
 
@@ -1298,13 +1297,3 @@ def fastcu_5_1_module():
         description="fastcu_5_1",
     ))
     return module
-
-
-def _register_fastcu_5_1() -> None:
-    module = fastcu_5_1_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-_register_fastcu_5_1()
