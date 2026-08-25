@@ -29,7 +29,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     # store; the best overall stride may trade some STMatrix bank expansion
     # for faster TMA reads of the arena.
     output_tma_inner_size: int | None = 128,
-    output_tma_inner_padding: int = 8,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
 ):
@@ -51,7 +50,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
     if output_store == "scalar":
         output_tma_inner_size = None
-        output_tma_inner_padding = 0
     name = f"auto_matmul_4096_wgmma256_wg_tma_store_k{operand_stages}"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
@@ -198,7 +196,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2_module():
         output_tiles_per_cta=2,
         operand_stages=3,
         output_slices=2,
-        output_tma_inner_padding=16,
         output_store_buffers=2,
     )
 
@@ -209,7 +206,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
         output_tiles_per_cta=4,
         operand_stages=3,
         output_slices=2,
-        output_tma_inner_padding=16,
         output_store_buffers=2,
         operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"}},
     )
