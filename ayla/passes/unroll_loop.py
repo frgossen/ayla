@@ -8,16 +8,15 @@ When the trip count is not divisible by the factor, the leftover iterations are
 emitted as a straight-line tail after the unrolled loop. If the factor exceeds
 the trip count the whole loop becomes the tail (no loop remains).
 
-Loop-local allocations are lifted out of the body, so every copy and the tail
-share them. Giving each copy its own would multi-buffer the loop, which is
-``multi_buffer``'s job.
+Every copy is a plain clone of the body. Multi-buffering a loop is
+``multi_buffer``'s job, so run LICM first to lift the loop's allocations out --
+otherwise each copy gets its own.
 """
 from __future__ import annotations
 
 import re
 
 from ..gpu_dialect import (
-    AllocOp,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
@@ -53,13 +52,6 @@ class UnrollLoop(LoweringPass):
         # Recursively transform nested ops first.
         self.lower_region(op.body)
 
-        # Lift the loop-local allocations out before cloning, so every copy and
-        # the tail share them. Copying them per iteration would multi-buffer the
-        # loop, which is multi_buffer's job.
-        body = op.body.entry_block
-        hoisted_allocs = [o for o in body.ops if _is_static_alloc(o)]
-        body.ops = [o for o in body.ops if not _is_static_alloc(o)]
-
         lb, step = op.lb, op.step
         num_tail_iterations = op.trip_count % self.unroll_factor
         main_trip_count = op.trip_count - num_tail_iterations
@@ -86,7 +78,7 @@ class UnrollLoop(LoweringPass):
             tail_ops.append(tail_iv)
             tail_ops.extend(_clone_iteration(op, tail_iv.result(), f"_tail{i}"))
 
-        result: list[Op] = list(hoisted_allocs)
+        result: list[Op] = []
         if main_trip_count:
             new_body = Region(blocks=[Block(arguments=[new_iv], ops=main_body_ops)])
             result.append(ForOp.build(lb=lb, ub=new_ub, step=new_step, body=new_body, attrs=extra_attrs))
@@ -94,27 +86,21 @@ class UnrollLoop(LoweringPass):
         return result, []
 
 
-def _is_static_alloc(op: Op) -> bool:
-    """A loop-invariant allocation (no per-iteration initializer)."""
-    return isinstance(op, AllocOp) and op.init is None
-
-
 def _clone_iteration(
     op: ForOp, iteration_iv: Value, label_suffix: str,
 ) -> list[Op]:
-    """Clone the loop body once, rebinding the induction variable."""
+    """Clone the loop body once, rebinding the induction variable.
+
+    Labels get the suffix so that later passes can name a single copy.
+    """
     vmap: dict[Value, Value] = {op.iv: iteration_iv}
     cloned = [clone_op(body_op, vmap) for body_op in op.body.entry_block.ops]
-    _suffix_labels(cloned, label_suffix)
-    return cloned
-
-
-def _suffix_labels(ops: list[Op], suffix: str) -> None:
-    for op in ops:
-        for nested in iter_ops(op):
+    for cloned_op in cloned:
+        for nested in iter_ops(cloned_op):
             label = nested.attrs.get("label")
             if isinstance(label, str):
-                nested.attrs["label"] = label + suffix
+                nested.attrs["label"] = label + label_suffix
+    return cloned
 
 
 def unroll_loop(module: ModuleOp, unroll_factor: int, label_filter: str | None = None) -> ModuleOp:
