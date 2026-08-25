@@ -18,7 +18,7 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
             for (%k: index = 0 to 4) attrs={label: "k"} {
-              %s: smem_tensor<4x1xf32> = alloc()
+              %s: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
               %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
               move(%s: smem_tensor<4x1xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
             }
@@ -30,7 +30,7 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %s: smem_tensor<4x1xf32> = alloc()
+            %s: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
             for (%k: index = 0 to 3 step 3) attrs={label: "k"} {
               %c0: index = index_constant() attrs={value: 0}
               %0: index = index_add(%k: index, %c0: index)
