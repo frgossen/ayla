@@ -2,11 +2,10 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 
+@register
 def pranjalssh_4096_pipelined_module():
     module_str = textwrap.dedent("""\
         module {
@@ -85,13 +84,3 @@ def pranjalssh_4096_pipelined_module():
           }
         }""")  # noqa: E501
     return gpu_dialect.parse(module_str)
-
-
-def _register_pranjalssh_4096_pipelined() -> None:
-    module = pranjalssh_4096_pipelined_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-_register_pranjalssh_4096_pipelined()

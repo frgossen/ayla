@@ -2,11 +2,10 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 
+@register
 def tma_matmul_4096_module():
     """4096x4096 f32 matmul using TMA loads.
 
@@ -45,13 +44,3 @@ def tma_matmul_4096_module():
           }
         }""")  # noqa: E501
     return gpu_dialect.parse(module_str)
-
-
-def _register_tma_matmul_4096() -> None:
-    module = tma_matmul_4096_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-_register_tma_matmul_4096()

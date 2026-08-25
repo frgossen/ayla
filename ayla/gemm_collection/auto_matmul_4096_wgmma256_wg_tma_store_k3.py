@@ -12,14 +12,10 @@ from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
 from ..passes.tile_matmul import tile_matmul
 from ..passes.unroll_loop import unroll_loop
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 
-def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
-    *, output_tiles_per_cta: int = 1,
-):
+def _tma_store_k3_module(*, output_tiles_per_cta: int):
     if output_tiles_per_cta not in (1, 2):
         raise ValueError("output_tiles_per_cta must be 1 or 2")
     name = "auto_matmul_4096_wgmma256_wg_tma_store_k3"
@@ -104,24 +100,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
     return canonicalize(module)
 
 
-def _register_auto_matmul_4096_wgmma256_wg_tma_store_k3() -> None:
-    kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_module()
-    )
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(
-        launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
-
-    two_tile_kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_module(
-            output_tiles_per_cta=2
-        )
-    )
-    two_tile_launcher = make_ptx_launcher(two_tile_kernel)
-    make_torch_custom_call(
-        two_tile_launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT]
-    )
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_module():
+    return _tma_store_k3_module(output_tiles_per_cta=1)
 
 
-_register_auto_matmul_4096_wgmma256_wg_tma_store_k3()
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_module():
+    return _tma_store_k3_module(output_tiles_per_cta=2)
