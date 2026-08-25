@@ -2,11 +2,12 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
-from ..torch_custom_call import OperandKind, make_torch_custom_call
+from .registry import register
 
 
+# Based on https://github.com/pranjalssh/fast.cu/blob/main/examples/matmul/matmul_3.cuh
+# BM=128, BN=128, BK=64, 128 threads.
+@register
 def loop_8x8_matmul_4096_module():
     return gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -32,18 +33,3 @@ def loop_8x8_matmul_4096_module():
             move(%c_thread: gmem_tensor<8x8xf32 strides=[4096, 1]>, %c_rmem: rmem_tensor<8x8xf32>)
           }
         }"""))  # noqa: E501
-
-
-def _register_loop_8x8_matmul_4096() -> None:
-    module = loop_8x8_matmul_4096_module()
-    kernel = make_ptx_kernel(module)
-    launcher = make_ptx_launcher(kernel)
-    make_torch_custom_call(
-        launcher, [OperandKind.R, OperandKind.R, OperandKind.RESULT])
-
-
-# Based on https://github.com/pranjalssh/fast.cu/blob/main/examples/matmul/matmul_3.cuh
-# BM=128, BN=128, BK=64, 128 threads.
-
-
-_register_loop_8x8_matmul_4096()
