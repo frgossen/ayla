@@ -32,8 +32,8 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
 def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @mm(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c: gmem_tensor<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c: gmem_tensor<64x256xbf16>) attrs={init: 0.0, label: "mm"}
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
           }
         }"""))
     module = promote_buffers(
@@ -43,19 +43,19 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
     )
     assert repr(module) == textwrap.dedent("""\
         module {
-          kernel @mm(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %c: gmem_tensor<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %0: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
-            matmul(%a: smem_tensor<64x16xbf16>, %b: smem_tensor<256x16xbf16>, %0: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
-            %1: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            convert(%1: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem_tensor<64x256xf32 warps=4 layout="wgmma_layout_0">)
-            %2: smem_tensor<64x128xbf16> = alloc() attrs={id: 2}
-            %3: smem_tensor<64x128xbf16> = alloc() attrs={id: 3}
-            move(%2: smem_tensor<64x128xbf16>, %1: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_smem", wgmma_col_start: 0}
-            %4: gmem_tensor<64x128xbf16 strides=[256, 1]> = tile(%c: gmem_tensor<64x256xbf16>, 0, 0)
-            move(%4: gmem_tensor<64x128xbf16 strides=[256, 1]>, %2: smem_tensor<64x128xbf16>) attrs={label: "mm_dst_tma", tma: True}
-            move(%3: smem_tensor<64x128xbf16>, %1: wrmem_tensor<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_smem", wgmma_col_start: 128}
-            %5: gmem_tensor<64x128xbf16 strides=[256, 1]> = tile(%c: gmem_tensor<64x256xbf16>, 0, 1)
-            move(%5: gmem_tensor<64x128xbf16 strides=[256, 1]>, %3: smem_tensor<64x128xbf16>) attrs={label: "mm_dst_tma", tma: True}
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
+            %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            %2: smem<64x128xbf16> = alloc() attrs={id: 2}
+            %3: smem<64x128xbf16> = alloc() attrs={id: 3}
+            move(%2: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_smem", wgmma_col_start: 0}
+            %4: gmem<64x128xbf16 strides=[256, 1]> = tile(%c: gmem<64x256xbf16>, 0, 0)
+            move(%4: gmem<64x128xbf16 strides=[256, 1]>, %2: smem<64x128xbf16>) attrs={label: "mm_dst_tma", tma: True}
+            move(%3: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_smem", wgmma_col_start: 128}
+            %5: gmem<64x128xbf16 strides=[256, 1]> = tile(%c: gmem<64x256xbf16>, 0, 1)
+            move(%5: gmem<64x128xbf16 strides=[256, 1]>, %3: smem<64x128xbf16>) attrs={label: "mm_dst_tma", tma: True}
           }
         }""")
 
@@ -85,6 +85,27 @@ def test_promote_gmem_matmul_operands_to_smem():
           }
         }""")
     assert text == expected
+
+
+def test_promote_can_slice_tma_operand_loads():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<384x64xbf16>, %c: rmem<128x384xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<384x64xbf16>, %c: rmem<128x384xf32>) attrs={label: "mm"}
+          }
+        }"""))
+    promote_buffers(
+        module, target_type="smem", operands=["lhs", "rhs"],
+        swizzle="128B", tma=True, tma_load_slices={"rhs": 3},
+        move_attrs={"rhs": {"l2_cache_hint": "evict_last"}},
+        label_filter="mm",
+    )
+    text = repr(module)
+    # One label belongs to the allocation; the other three are sliced moves.
+    assert text.count('label: "mm_rhs_smem"') == 4
+    assert text.count('l2_cache_hint: "evict_last"') == 3
+    assert text.count("gmem<128x64xbf16> = tile(%b") == 3
+    assert text.count("smem<128x64xbf16") >= 3
 
 
 def test_promote_lhs_rhs_preserves_init_on_matmul():
