@@ -26,7 +26,6 @@ from .gpu_dialect import (
     SmemTensorType,
     ThreadIdsOp,
     TmaDescType,
-    TokenType,
     ToPtrOp,
     LaneIdOp,
     WarpGroupIdOp,
@@ -181,11 +180,6 @@ def map_type_to_registers(type):
         return TypeRegisterMapping(
             member_register_types=ptx_type,
             member_names="ptr",
-        )
-    if isinstance(type, TokenType):
-        return TypeRegisterMapping(
-            member_register_types=PtxType.B32,
-            member_names="val",
         )
     if isinstance(type, LockType):
         if type.kind == "mbar":

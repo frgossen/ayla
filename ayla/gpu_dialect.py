@@ -511,28 +511,6 @@ class TmaMoveOp(Op):
         return self.operands[2:]
 
 
-@gpu_dialect.register_type("token")
-class TokenType(Type):
-    """Opaque async completion token.
-
-    Produced by async operations (e.g. async_move), consumed by await.
-    The associated memory is not valid until the token is awaited.
-    """
-
-    @classmethod
-    def build(cls, kind: str | None = None) -> "TokenType":
-        return cls(attrs={"kind": kind})
-
-    def print(self, p: Printer) -> None:
-        p.write("token")
-
-    @classmethod
-    def parse(cls, prefix: str, p) -> "TokenType":
-        assert prefix == "token"
-        return cls.build()
-
-
-
 @gpu_dialect.register_type("lock")
 class LockType(Type):
     """Shared synchronization handle for async operations.
