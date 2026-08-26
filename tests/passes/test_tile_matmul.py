@@ -79,8 +79,8 @@ def test_warp_group_tiling_sets_block_dim():
 def test_partial_block_tile_rounds_up_the_grid():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @mm(%a: gmem_tensor<192x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<192x128xf32>) {
-            matmul(%a: gmem_tensor<192x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<192x128xf32>) attrs={label: "mm"}
+          kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) {
+            matmul(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) attrs={label: "mm"}
           }
         }"""))
     tile_matmul(
