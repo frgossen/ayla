@@ -1263,7 +1263,7 @@ def fastcu_5_1_module():
     """
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @fastcu_5_1(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[512, 1, 1] block_dim=[384, 1, 1] {
+          kernel @fastcu_5_1(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[512, 1, 1] block_dim=[384, 1, 1] {
           }
         }"""))  # noqa: E501
     kernel = module.body.ops[0]

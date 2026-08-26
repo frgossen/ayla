@@ -11,7 +11,7 @@ def test_fold_constants():
     """Constant folding eliminates trivial index arithmetic."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) {
+          kernel @test(%a: gmem<4096x4096xf32>) {
             %cx: index, %cy: index, %cz: index = block_ids()
             %c0: index = index_constant() attrs={value: 0}
             %c4096: index = index_constant() attrs={value: 4096}
@@ -33,7 +33,7 @@ def test_fold_constants():
     # 0 * 4096 folds to 0, cx_offset + 0 folds to cx_offset.
     assert after == textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) {
+          kernel @test(%a: gmem<4096x4096xf32>) {
             %cx: index, %cy: index, %cz: index = block_ids()
             %c0: index = index_constant() attrs={value: 0}
             %c4096: index = index_constant() attrs={value: 4096}
@@ -55,16 +55,16 @@ def test_per_iteration_buffer_choice_folds_after_unrolling():
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %b0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
-            %b1: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
+          kernel @test(%a: gmem<4x4xf32>) {
+            %b0: smem<4x4xf32> = alloc() attrs={id: 0}
+            %b1: smem<4x4xf32> = alloc() attrs={id: 1}
             for (%k: index = 0 to 24 step 3) attrs={label: "k"} {
               %c6: index = index_constant() attrs={value: 6}
               %r: index = index_mod(%k: index, %c6: index)
               %c3: index = index_constant() attrs={value: 3}
               %sel: index = index_div(%r: index, %c3: index)
-              %buf: smem_tensor<4x4xf32> = select(%sel: index, %b0: smem_tensor<4x4xf32>, %b1: smem_tensor<4x4xf32>)
-              move(%buf: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+              %buf: smem<4x4xf32> = select(%sel: index, %b0: smem<4x4xf32>, %b1: smem<4x4xf32>)
+              move(%buf: smem<4x4xf32>, %a: gmem<4x4xf32>)
             }
           }
         }""")
@@ -75,12 +75,12 @@ def test_per_iteration_buffer_choice_folds_after_unrolling():
 
     assert repr(module) == textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %b0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
-            %b1: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
+          kernel @test(%a: gmem<4x4xf32>) {
+            %b0: smem<4x4xf32> = alloc() attrs={id: 0}
+            %b1: smem<4x4xf32> = alloc() attrs={id: 1}
             for (%k: index = 0 to 24 step 6) attrs={label: "k"} {
-              move(%b0: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
-              move(%b1: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+              move(%b0: smem<4x4xf32>, %a: gmem<4x4xf32>)
+              move(%b1: smem<4x4xf32>, %a: gmem<4x4xf32>)
             }
           }
         }""")
@@ -94,17 +94,17 @@ def test_buffer_choice_stays_dynamic_when_depth_does_not_divide_the_unroll():
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %b0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
-            %b1: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
-            %b2: smem_tensor<4x4xf32> = alloc() attrs={id: 2}
+          kernel @test(%a: gmem<4x4xf32>) {
+            %b0: smem<4x4xf32> = alloc() attrs={id: 0}
+            %b1: smem<4x4xf32> = alloc() attrs={id: 1}
+            %b2: smem<4x4xf32> = alloc() attrs={id: 2}
             for (%k: index = 0 to 24 step 3) attrs={label: "k"} {
               %c9: index = index_constant() attrs={value: 9}
               %r: index = index_mod(%k: index, %c9: index)
               %c3: index = index_constant() attrs={value: 3}
               %sel: index = index_div(%r: index, %c3: index)
-              %buf: smem_tensor<4x4xf32> = select(%sel: index, %b0: smem_tensor<4x4xf32>, %b1: smem_tensor<4x4xf32>, %b2: smem_tensor<4x4xf32>)
-              move(%buf: smem_tensor<4x4xf32>, %a: gmem_tensor<4x4xf32>)
+              %buf: smem<4x4xf32> = select(%sel: index, %b0: smem<4x4xf32>, %b1: smem<4x4xf32>, %b2: smem<4x4xf32>)
+              move(%buf: smem<4x4xf32>, %a: gmem<4x4xf32>)
             }
           }
         }""")
@@ -120,7 +120,7 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
     """The residue is ``lb % m``, and the fact does not outlive the loop."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
+          kernel @test(%a: gmem<4x4xf32>) {
             for (%k: index = 5 to 29 step 6) attrs={label: "k"} {
               %c3: index = index_constant() attrs={value: 3}
               %inner: index = index_mod(%k: index, %c3: index)

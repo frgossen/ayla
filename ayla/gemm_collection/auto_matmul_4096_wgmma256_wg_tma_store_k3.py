@@ -24,8 +24,8 @@ def _tma_store_k3_module(*, output_tiles_per_cta: int):
     grid_x = 32 // output_tiles_per_cta
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] {{
-            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[{grid_x}, 16, 1] {{
+            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
     if output_tiles_per_cta == 1:

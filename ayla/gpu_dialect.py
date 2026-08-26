@@ -12,8 +12,6 @@ from .base.printer import Printer
 gpu_dialect = Dialect("gpu")
 
 
-# TODO: Rename types : gmem_tensor --> gmem etc.
-
 @gpu_dialect.register_op("module")
 class ModuleOp(Op):
     _DEFAULT_ATTRS = {
@@ -900,12 +898,12 @@ class RegMemTensorType(MemTensorType):
     """
 
 
-@gpu_dialect.register_type("gmem_tensor")
+@gpu_dialect.register_type("gmem")
 class GmemTensorType(AddrMemTensorType):
     """Global-memory tensor."""
 
 
-@gpu_dialect.register_type("smem_tensor")
+@gpu_dialect.register_type("smem")
 class SmemTensorType(AddrMemTensorType):
     """Shared-memory tensor (per-block)."""
 
@@ -1158,7 +1156,7 @@ def physical_layout(
     return block_width, order
 
 
-@gpu_dialect.register_type("rmem_tensor")
+@gpu_dialect.register_type("rmem")
 class RmemTensorType(RegMemTensorType):
     """Register-memory tensor (per-thread).
 
@@ -1167,7 +1165,7 @@ class RmemTensorType(RegMemTensorType):
     """
 
 
-@gpu_dialect.register_type("wrmem_tensor")
+@gpu_dialect.register_type("wrmem")
 class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
     """Warp register-memory tensor.
 

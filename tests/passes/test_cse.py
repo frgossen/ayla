@@ -10,14 +10,14 @@ def test_cse_deduplicates_index_constants():
     """Two index_constant(64) ops in the same block should be merged."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) {
+          kernel @test(%a: gmem<4096x4096xf32>) {
             %cx: index, %cy: index, %cz: index = block_ids()
             %c64a: index = index_constant() attrs={value: 64}
             %offset_a: index = index_mul(%cx: index, %c64a: index)
             %c64b: index = index_constant() attrs={value: 64}
             %offset_b: index = index_mul(%cx: index, %c64b: index)
-            %val: rmem_tensor<1xf32> = alloc() attrs={id: 0}
-            move(%val: rmem_tensor<1xf32>, %a: gmem_tensor<4096x4096xf32>, %offset_b: index)
+            %val: rmem<1xf32> = alloc() attrs={id: 0}
+            move(%val: rmem<1xf32>, %a: gmem<4096x4096xf32>, %offset_b: index)
           }
         }""")
 
@@ -33,12 +33,12 @@ def test_cse_deduplicates_index_constants():
     # The load now references offset_a. offset_a is kept (dead but no DCE yet).
     assert repr(module) == textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) {
+          kernel @test(%a: gmem<4096x4096xf32>) {
             %cx: index, %cy: index, %cz: index = block_ids()
             %c64a: index = index_constant() attrs={value: 64}
             %offset_a: index = index_mul(%cx: index, %c64a: index)
-            %val: rmem_tensor<1xf32> = alloc() attrs={id: 0}
-            move(%val: rmem_tensor<1xf32>, %a: gmem_tensor<4096x4096xf32>, %offset_a: index)
+            %val: rmem<1xf32> = alloc() attrs={id: 0}
+            move(%val: rmem<1xf32>, %a: gmem<4096x4096xf32>, %offset_a: index)
           }
         }""")
 
@@ -52,12 +52,12 @@ def test_cse_deduplicates_allocations_by_id():
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
-            %same0: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
-            %same1: smem_tensor<4x4xf32> = alloc() attrs={id: 0}
-            %other: smem_tensor<4x4xf32> = alloc() attrs={id: 1}
-            %init0: rmem_tensor<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
-            %init1: rmem_tensor<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
+          kernel @test(%a: gmem<4x4xf32>) {
+            %same0: smem<4x4xf32> = alloc() attrs={id: 0}
+            %same1: smem<4x4xf32> = alloc() attrs={id: 0}
+            %other: smem<4x4xf32> = alloc() attrs={id: 1}
+            %init0: rmem<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
+            %init1: rmem<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
           }
         }""")
 
