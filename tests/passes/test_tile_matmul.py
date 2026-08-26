@@ -1,7 +1,8 @@
 """Tests for the tile_matmul pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import TileOp, gpu_dialect
 from ayla.passes.tile_matmul import tile_matmul
 
 
@@ -88,3 +89,6 @@ def test_partial_block_tile_rounds_up_the_grid():
         label_filter="mm", allow_partial=True,
     )
     assert "grid_dim=[2, None, None]" in repr(module)
+    tiles = find_ops(module, lambda op: isinstance(op, TileOp))
+    assert len(tiles) == 2
+    assert all(tile.maybe_partial for tile in tiles)

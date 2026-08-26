@@ -320,15 +320,21 @@ def _build_tile_op(
     name_to_idx = {n: i for i, n in enumerate(dim_names)}
     ops: list[Op] = []
     cur = arg
+    maybe_partial_dims: set[str] = set()
     for name, iv, ts in zip(tile_dims, tile_idxs, tile_sizes):
         d = name_to_idx.get(name)
         if d is None:
             continue
+        maybe_partial = name in maybe_partial_dims or cur.type.sizes[d] % ts != 0
+        if maybe_partial:
+            maybe_partial_dims.add(name)
         new_type = clone_type(cur.type)
         indices: list[Value | int] = [0] * len(new_type.sizes)
         indices[d] = iv
         new_type.sizes[d] = ts
-        tile_op = TileOp.build(cur, indices, new_type)
+        tile_op = TileOp.build(
+            cur, indices, new_type, maybe_partial=maybe_partial,
+        )
         ops.append(tile_op)
         cur = tile_op.result()
     return ops, cur

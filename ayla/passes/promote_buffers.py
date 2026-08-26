@@ -151,7 +151,10 @@ def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
     for i in range(len(new_tile_type.sizes)):
         if tile_type.sizes[i] != arg_type.sizes[i]:
             new_tile_type.sizes[i] = tile_type.sizes[i]
-    new_tile = TileOp.build(new_arg, list(tile.indices), new_tile_type)
+    new_tile = TileOp.build(
+        new_arg, list(tile.indices), new_tile_type,
+        maybe_partial=tile.maybe_partial,
+    )
     return [new_tile], [new_tile.result()]
 
 
