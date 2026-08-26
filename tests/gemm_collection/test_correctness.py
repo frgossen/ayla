@@ -33,15 +33,19 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
         if "wgmma.mma_async" in line and stores[0] < i < waits[0]
     ]
     assert kernel.grid_dim == (16, 16, 1)
-    output_desc = next(
-        typ for typ in kernel.signature
-        if isinstance(typ, TmaDescType) and typ.arg_idx == 2
-    )
+    descs = [typ for typ in kernel.signature if isinstance(typ, TmaDescType)]
+    assert len(descs) == 3
+    output_desc = next(typ for typ in descs if typ.arg_idx == 2)
     assert output_desc.swizzle == "128B"
     assert output_desc.attrs["physical_layout"] == {
         "block_width": 64,
         "order": "block_major",
     }
+    first_fence = kernel.ptx.index("wgmma.fence.sync.aligned")
+    first_mma = kernel.ptx.index("wgmma.mma_async", first_fence)
+    descriptor_setup = kernel.ptx[first_fence:first_mma]
+    assert descriptor_setup.count("shr.b32") == 2
+    assert descriptor_setup.count("add.u64") == 6
     assert ".shared .align 1024 .b8" in kernel.ptx
     assert len(stores) == len(waits) == 2
     assert len(gathers) == 32

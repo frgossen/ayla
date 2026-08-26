@@ -139,3 +139,30 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
     assert "index_mod(%k: index" not in after
     # The block id is not an induction variable, so its mod is untouched.
     assert "index_mod(%cx: index, %c3b: index)" in after
+
+
+def test_distribute_constant_multiply_over_affine_offset():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test() {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c3: index = index_constant() attrs={value: 3}
+            %offset: index = index_add(%bx: index, %c3: index)
+            %c64: index = index_constant() attrs={value: 64}
+            %coordinate: index = index_mul(%offset: index, %c64: index)
+          }
+        }"""))
+    folding(module)
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test() {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c3: index = index_constant() attrs={value: 3}
+            %offset: index = index_add(%bx: index, %c3: index)
+            %c64: index = index_constant() attrs={value: 64}
+            %c64_1: index = index_constant() attrs={value: 64}
+            %0: index = index_mul(%bx: index, %c64_1: index)
+            %c192: index = index_constant() attrs={value: 192}
+            %1: index = index_add(%0: index, %c192: index)
+          }
+        }""")

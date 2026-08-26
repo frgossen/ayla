@@ -486,7 +486,8 @@ class LowerToPtxTemplate(LoweringPass):
         def _build_static_desc(lbo, sbo, swizzle):
             return (lbo >> 4) << 16 | (sbo >> 4) << 32 | swizzle << 62
 
-        # TODO: Building the descrptor should be hoisted out of the loop.
+        # Descriptors are deliberately rematerialized near each WGMMA group:
+        # keeping them live across the loop raises register pressure.
         def _build_desc(name, ptr_reg, desc_const, offset=None):
             t = ""
             if offset is not None:
@@ -497,6 +498,54 @@ class LowerToPtxTemplate(LoweringPass):
             t += f"cvt.u64.u32 ${{b64:{name}}}, ${{b32:{name}_addr}};\n"
             t += f"or.b64 ${{b64:{name}}}, ${{b64:{name}}}, {desc_const};\n"
             return t
+
+        def _tile_delta(value: Value, base: Value, group: int) -> int | None:
+            if group == 0 or not (
+                isinstance(value.definition, TileOp)
+                and isinstance(base.definition, TileOp)
+            ):
+                return None
+            tile = value.definition
+            base_tile = base.definition
+            # TODO: Support arbitrary-length TileOp chains. Currently descriptor
+            # reuse is limited to siblings in one WGMMA commit group that share
+            # the same direct parent/base.
+            if (
+                tile.arg is not base_tile.arg
+                or tile.result().type != base_tile.result().type
+            ):
+                return None
+
+            typ = tile.result().type
+            assert isinstance(typ, AddrMemTensorType)
+            assert len(tile.indices) == len(base_tile.indices) == typ.rank, (
+                "_tile_delta: TileOp indices must match the result rank; "
+                f"got {len(tile.indices)}, {len(base_tile.indices)}, and {typ.rank}"
+            )
+
+            def constant(index: Value | int) -> int | None:
+                if isinstance(index, int):
+                    return index
+                if isinstance(index.definition, IndexConstantOp):
+                    return index.definition.value
+                return None
+
+            indices = [constant(index) for index in tile.indices]
+            base_indices = [constant(index) for index in base_tile.indices]
+            if any(index is None for index in indices + base_indices):
+                return None
+            # Non-affine layouts need a root-aware address mapping. Rebuild
+            # their descriptors until that support is introduced with K=128.
+            if typ.attrs.get("physical_layout") is not None:
+                return None
+            delta = sum(
+                (int(index) - int(base_index)) * size * stride
+                for index, base_index, size, stride in zip(
+                    indices, base_indices, typ.sizes, typ.strides,
+                )
+            )
+            byte_delta = delta * typ.dtype.byte_size
+            return byte_delta if byte_delta >= 0 and byte_delta % 16 == 0 else None
 
         # Each distinct operand value gets a single unique placeholder name —
         # matmuls accumulating into the same dst share that operand/register set.
@@ -512,6 +561,14 @@ class LowerToPtxTemplate(LoweringPass):
             operands.append(value)
             operand_names.append(name)
             return name
+
+        def _desc(name, base, delta, value, hint, const, offset=None):
+            if delta is not None:
+                return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
+            operand = _operand(self.value_map[value], hint)
+            return _build_desc(
+                name, f"operand.{operand}.ptr", const, offset,
+            )
 
         desc_template = ""
         mma_template = ""
@@ -568,17 +625,22 @@ class LowerToPtxTemplate(LoweringPass):
             desc_const_rhs = _build_static_desc(
                 lead_dim, rhs_row_stride_bytes * 8, _swizzle_to_bits[rhs_type.swizzle])
 
-            lhs_name = _operand(self.value_map[mm.lhs], "lhs")
-            rhs_name = _operand(self.value_map[mm.rhs], "rhs")
+            lhs_delta = _tile_delta(mm.lhs, mms[0].lhs, j)
+            rhs_delta = _tile_delta(mm.rhs, mms[0].rhs, j)
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
             desc_rhs = f"desc_rhs{j}"
-            desc_template += _build_desc(desc_rhs, f"operand.{rhs_name}.ptr", desc_const_rhs)
+            desc_template += _desc(
+                desc_rhs, "desc_rhs0", rhs_delta,
+                mm.rhs, "rhs", desc_const_rhs,
+            )
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
-                desc_template += _build_desc(
-                    f"desc_lhs{j}_{m_it}", f"operand.{lhs_name}.ptr", desc_const_lhs,
-                    offset=lhs_offset if m_it > 0 else None,
+                desc_lhs = f"desc_lhs{j}_{m_it}"
+                desc_template += _desc(
+                    desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
+                    mm.lhs, "lhs", desc_const_lhs,
+                    lhs_offset if m_it > 0 else None,
                 )
 
             reg_offset = 0
