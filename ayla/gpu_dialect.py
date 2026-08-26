@@ -484,9 +484,13 @@ class TmaMoveOp(Op):
         src: Value,
         indices: list[Value],
         attrs: dict[str, object] | None = None,
+        l2_cache_hint: str | None = None,
     ) -> "TmaMoveOp":
         operands = [dst, src] + indices
-        return cls(operands=operands, results=[], attrs=attrs or {})
+        attrs = dict(attrs or {})
+        if l2_cache_hint is not None:
+            attrs["l2_cache_hint"] = l2_cache_hint
+        return cls(operands=operands, results=[], attrs=attrs)
 
     def __post_init__(self) -> None:  # type: ignore[override]
         super().__post_init__()
@@ -509,6 +513,13 @@ class TmaMoveOp(Op):
     @property
     def indices(self) -> list[Value]:
         return self.operands[2:]
+
+    @property
+    def l2_cache_hint(self) -> str | None:
+        hint = self.attrs.get("l2_cache_hint")
+        if hint not in (None, "evict_first", "evict_last"):
+            raise ValueError(f"unsupported TMA L2 cache hint {hint!r}")
+        return hint  # type: ignore[return-value]
 
 
 @gpu_dialect.register_type("token")

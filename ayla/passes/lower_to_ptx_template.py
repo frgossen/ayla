@@ -27,6 +27,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    KernelOp,
     LockType,
     MatmulOp,
     ModuleOp,
@@ -45,7 +46,7 @@ from ..gpu_dialect import (
     physical_layout,
     root_buffer,
 )
-from ..base.ir import Op, Value
+from ..base.ir import Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass
 
 
@@ -54,6 +55,8 @@ class LowerToPtxTemplate(LoweringPass):
 
     def __init__(self) -> None:
         super().__init__()
+        self.cache_policy_values: dict[str, Value] = {}
+        self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
         self.register(MatmulOp, type(self).lower_matmul)
@@ -63,6 +66,53 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
 
+    def lower_kernel(
+        self, op: KernelOp,
+    ) -> tuple[list[Op], list[object]]:
+        # TODO: Materialize cache policies in an earlier pass, potentially
+        # alongside buffer promotion, so this pass only renders their PTX.
+        cache_hints = sorted({
+            hint
+            for tma in find_ops(op, lambda candidate: isinstance(
+                candidate, TmaMoveOp,
+            ))
+            if (hint := tma.l2_cache_hint) is not None
+        })
+        self.cache_policy_values = {}
+        if cache_hints:
+            names = [f"policy{i}" for i in range(len(cache_hints))]
+            policy_op = PTXTemplateOp.build(
+                operands=[],
+                result_types=[PtrType.build("gmem") for _ in cache_hints],
+                template="\n".join(
+                    f"createpolicy.fractional.L2::{hint}.b64 "
+                    f"${{b64:result.{name}.ptr}}, 1.0;"
+                    for hint, name in zip(cache_hints, names)
+                ) + "\n",
+                result_names=names,
+                description="create TMA L2 cache policies",
+            )
+            op.body.ops.insert(0, policy_op)
+            self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
+        self.lower_block(op.body)
+        return [op], []
+
+    def _tma_instruction(
+        self,
+        op: TmaMoveOp,
+        opcode: str,
+        arguments: str,
+        operands: list[Value],
+        operand_names: list[str],
+        policy_name: str,
+    ) -> str:
+        hint = op.l2_cache_hint
+        if hint is None:
+            return f"{opcode} {arguments};"
+        operands.append(self.cache_policy_values[hint])
+        operand_names.append(policy_name)
+        policy = f"${{b64:operand.{policy_name}.ptr}}"
+        return f"{opcode}.L2::cache_hint {arguments}, {policy};"
 
     def lower_tile(
         self, op: TileOp,
@@ -1372,6 +1422,15 @@ class LowerToPtxTemplate(LoweringPass):
         tensor_rank = len(coordinates)
         indices = ", ".join(coordinates)
         coordinate_code = "\n".join(coordinate_lines)
+        tma_instruction = self._tma_instruction(
+            op,
+            f"cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group",
+            f"[${{b64:operand.dst.ptr}}, {{{indices}}}], "
+            f"[${{b32:operand.src.ptr}}]",
+            operands,
+            operand_names,
+            "cache_policy",
+        )
 
         # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
         # The RAW (all threads finish writing the smem tile before t0 stores it) is
@@ -1387,7 +1446,7 @@ class LowerToPtxTemplate(LoweringPass):
             @${{pred:st_not_t0}} bra ${{label:st_done}};
             fence.proxy.async.shared::cta;
             {coordinate_code}
-            cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group [${{b64:operand.dst.ptr}}, {{{indices}}}], [${{b32:operand.src.ptr}}];
+            {tma_instruction}
             cp.async.bulk.commit_group;
             ${{label:st_done}}:
         """)
@@ -1445,12 +1504,17 @@ class LowerToPtxTemplate(LoweringPass):
             tensor_rank = len(coordinates)
             indices = ", ".join(coordinates)
             load_lines.extend(coordinate_lines)
-            load_lines.append(
+            load_lines.append(self._tma_instruction(
+                tma,
                 f"cp.async.bulk.tensor.{tensor_rank}d.shared::cluster.global."
-                f"mbarrier::complete_tx::bytes [${{b32:operand.{dn}.ptr}}], "
+                "mbarrier::complete_tx::bytes",
+                f"[${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
-                f"[${{b32:operand.lock.val}}];"
-            )
+                f"[${{b32:operand.lock.val}}]",
+                operands,
+                operand_names,
+                f"cache_policy{i}",
+            ))
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
         # the byte count are interpolated, so we avoid f-string/dedent brace and

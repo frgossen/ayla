@@ -15,9 +15,12 @@ from ayla.gpu_dialect import (
     AsyncOp,
     F32Type,
     ForOp,
+    IndexType,
     LockType,
     MoveOp,
     SmemTensorType,
+    TmaDescType,
+    TmaMoveOp,
     gpu_dialect,
 )
 
@@ -126,6 +129,22 @@ def test_async_op_single_move():
     op = AsyncOp.build(lock, body=body)
     expected = "async(%lock: lock<bulk>) move(%dst: gmem_tensor<64x64xf32>, %src: gmem_tensor<64x64xf32>)"  # noqa: E501
     assert_print_and_roundtrip(op, expected)
+
+
+def test_tma_move_build_accepts_l2_cache_hint():
+    gmem_type = GmemTensorType.build((64, 64), F32Type())
+    desc = Value(
+        name="desc",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
+    indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
+
+    op = TmaMoveOp.build(
+        smem, desc, indices, l2_cache_hint="evict_last",
+    )
+
+    assert op.l2_cache_hint == "evict_last"
 
 
 def test_for_loop_default_step():
