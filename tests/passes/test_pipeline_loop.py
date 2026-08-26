@@ -16,9 +16,9 @@ def test_pipeline_reorders_across_inner_loop():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            %buf0: smem_tensor<4x1xf32> = alloc()
-            %buf1: smem_tensor<4x1xf32> = alloc()
-            %acc: smem_tensor<4x1xf32> = alloc() attrs={init: 0.0}
+            %buf0: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
+            %buf1: smem_tensor<4x1xf32> = alloc() attrs={id: 1}
+            %acc: smem_tensor<4x1xf32> = alloc() attrs={id: 2, init: 0.0}
             for (%k: index = 0 to 4) attrs={label: "k"} {
               for (%l: index = 0 to 2) {
                 matmul(%buf0: smem_tensor<4x1xf32>, %buf0: smem_tensor<4x1xf32>, %acc: smem_tensor<4x1xf32>)
@@ -35,9 +35,9 @@ def test_pipeline_reorders_across_inner_loop():
     expected = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            %buf0: smem_tensor<4x1xf32> = alloc()
-            %buf1: smem_tensor<4x1xf32> = alloc()
-            %acc: smem_tensor<4x1xf32> = alloc() attrs={init: 0.0}
+            %buf0: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
+            %buf1: smem_tensor<4x1xf32> = alloc() attrs={id: 1}
+            %acc: smem_tensor<4x1xf32> = alloc() attrs={id: 2, init: 0.0}
             %c0: index = index_constant() attrs={value: 0}
             %a_k: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %c0: index)
             move(%buf1: smem_tensor<4x1xf32>, %a_k: gmem_tensor<4x1xf32 strides=[4, 1]>) attrs={label: "load"}
@@ -65,11 +65,11 @@ def test_pipeline_matmul_smem_skeleton():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<8x8xf32>, %b: gmem_tensor<8x8xf32>, %c: gmem_tensor<8x8xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            %sa: smem_tensor<8x1xf32> = alloc()
-            %sb: smem_tensor<8x1xf32> = alloc()
-            %sa2: smem_tensor<8x1xf32> = alloc()
-            %sb2: smem_tensor<8x1xf32> = alloc()
-            %sc: smem_tensor<8x1xf32> = alloc() attrs={init: 0.0}
+            %sa: smem_tensor<8x1xf32> = alloc() attrs={id: 0}
+            %sb: smem_tensor<8x1xf32> = alloc() attrs={id: 1}
+            %sa2: smem_tensor<8x1xf32> = alloc() attrs={id: 2}
+            %sb2: smem_tensor<8x1xf32> = alloc() attrs={id: 3}
+            %sc: smem_tensor<8x1xf32> = alloc() attrs={id: 4, init: 0.0}
             for (%k: index = 0 to 4 step 2) {
               %a_k: gmem_tensor<8x1xf32 strides=[8, 1]> = tile(%a: gmem_tensor<8x8xf32>, 0, %k: index)
               %b_k: gmem_tensor<8x1xf32 strides=[8, 1]> = tile(%b: gmem_tensor<8x8xf32>, 0, %k: index)
@@ -93,11 +93,11 @@ def test_pipeline_matmul_smem_skeleton():
     expected = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem_tensor<8x8xf32>, %b: gmem_tensor<8x8xf32>, %c: gmem_tensor<8x8xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
-            %sa: smem_tensor<8x1xf32> = alloc()
-            %sb: smem_tensor<8x1xf32> = alloc()
-            %sa2: smem_tensor<8x1xf32> = alloc()
-            %sb2: smem_tensor<8x1xf32> = alloc()
-            %sc: smem_tensor<8x1xf32> = alloc() attrs={init: 0.0}
+            %sa: smem_tensor<8x1xf32> = alloc() attrs={id: 0}
+            %sb: smem_tensor<8x1xf32> = alloc() attrs={id: 1}
+            %sa2: smem_tensor<8x1xf32> = alloc() attrs={id: 2}
+            %sb2: smem_tensor<8x1xf32> = alloc() attrs={id: 3}
+            %sc: smem_tensor<8x1xf32> = alloc() attrs={id: 4, init: 0.0}
             %c0: index = index_constant() attrs={value: 0}
             %a_k: gmem_tensor<8x1xf32 strides=[8, 1]> = tile(%a: gmem_tensor<8x8xf32>, 0, %c0: index)
             %b_k: gmem_tensor<8x1xf32 strides=[8, 1]> = tile(%b: gmem_tensor<8x8xf32>, 0, %c0: index)

@@ -94,13 +94,13 @@ def test_codegen_naive_matmul_4096():
             %a_thread: gmem_tensor<2x4096xf32> = tile(%a_block: gmem_tensor<64x4096xf32>, %tx: index, 0)
             %b_thread: gmem_tensor<2x4096xf32> = tile(%b_block: gmem_tensor<64x4096xf32>, %ty: index, 0)
             %c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem_tensor<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={init: 0.0}
+            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
             for (%k: index = 0 to 4096) {
               %a_k: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
               %b_k: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%b_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
-              %a_k_rmem: rmem_tensor<2x1xf32> = alloc()
+              %a_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 1}
               move(%a_k_rmem: rmem_tensor<2x1xf32>, %a_k: gmem_tensor<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              %b_k_rmem: rmem_tensor<2x1xf32> = alloc()
+              %b_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 2}
               move(%b_k_rmem: rmem_tensor<2x1xf32>, %b_k: gmem_tensor<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
               matmul(%a_k_rmem: rmem_tensor<2x1xf32>, %b_k_rmem: rmem_tensor<2x1xf32>, %c_thread_rmem: rmem_tensor<2x2xf32>)
             }
@@ -175,7 +175,7 @@ def test_codegen_naive_matmul_4096():
           cvt.u64.u32 %rd17, %r19;
           add.u64 %rd16, %rd10, %rd17;  // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + %r3 * 32768 + %r4 * 8
 
-          // PTX template `%c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={init: 0.0}`
+          // PTX template `%c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={id: 0, init: 0.0}`
           mov.f32 %f0, 0f00000000;
           mov.f32 %f1, 0f00000000;
           mov.f32 %f2, 0f00000000;
@@ -192,13 +192,13 @@ def test_codegen_naive_matmul_4096():
           cvt.u64.u32 %rd21, %r22;
           add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768 + %r20 * 4
 
-          // PTX template `%a_k_rmem: rmem_tensor<2x1xf32> = alloc()`
+          // PTX template `%a_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 1}`
 
           // PTX template `move(%a_k_rmem: rmem_tensor<2x1xf32>, %a_k: gmem_tensor<2x1xf32 strides=[4096, 1...`
           ld.global.nc.f32 %f4, [%rd18+0];
           ld.global.nc.f32 %f5, [%rd18+16384];
 
-          // PTX template `%b_k_rmem: rmem_tensor<2x1xf32> = alloc()`
+          // PTX template `%b_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 2}`
 
           // PTX template `move(%b_k_rmem: rmem_tensor<2x1xf32>, %b_k: gmem_tensor<2x1xf32 strides=[4096, 1...`
           ld.global.nc.f32 %f6, [%rd20+0];
@@ -233,7 +233,7 @@ def test_codegen_tma_load():
             %tx: index, %ty: index, %tz: index = thread_ids()
             %a_block: gmem_tensor<128x64xf32 strides=[4096, 1]> = tile(%a: gmem_tensor<4096x4096xf32>, %cx: index, %cy: index)
             %a_thread: gmem_tensor<64x32xf32 strides=[4096, 1]> = tile(%a_block: gmem_tensor<128x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %a_smem: smem_tensor<64x32xf32 swizzle="128B"> = alloc()
+            %a_smem: smem_tensor<64x32xf32 swizzle="128B"> = alloc() attrs={id: 0}
             move(%a_smem: smem_tensor<64x32xf32 swizzle="128B">, %a_thread: gmem_tensor<64x32xf32 strides=[4096, 1]>) attrs={tma: True}
           }
         }""")  # noqa: E501

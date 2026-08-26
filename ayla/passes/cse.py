@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from ..gpu_dialect import (
     ModuleOp,
-    is_value_identical,
+    is_side_effect_free,
 )
 from ..base.ir import Block, Op, Type, Value
 from ..base.pipeline import Pass
@@ -38,7 +38,7 @@ class CSE(Pass):
             for inner in op.blocks:
                 self.run_block(inner, canonical_value)
 
-            if is_value_identical(op):
+            if is_side_effect_free(op):
                 key = self._op_key(op)
                 if key in cache:
                     original = cache[key]

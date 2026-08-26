@@ -11,18 +11,18 @@ def pranjalssh_4096_pipelined_module():
         module {
           kernel @pranjalssh_4096_pipelined(%a: gmem_tensor<4096x4096xbf16>, %bt: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 32, 1] block_dim=[128, 1, 1] {
             %bx: index, %by: index, %bz: index = block_ids()
-            %smem_a0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %smem_b0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %smem_a1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %smem_b1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
-            %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %smem_a0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %smem_b0: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
+            %smem_a1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 2}
+            %smem_b1: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 3}
+            %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 4, init: 0.0}
             %a_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<4096x4096xbf16>, %by: index, 0)
             %bt_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]> = tile(%bt: gmem_tensor<4096x4096xbf16>, %bx: index, 0)
             %a_tile_pro: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, 0)
             %bt_tile_pro: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%bt_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, 0)
-            %lock_a0_pro: lock<mbar> = alloc()
+            %lock_a0_pro: lock<mbar> = alloc() attrs={id: 5}
             async(%lock_a0_pro: lock<mbar>) move(%smem_a0: smem_tensor<128x64xbf16 swizzle="128B">, %a_tile_pro: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
-            %lock_b0_pro: lock<mbar> = alloc()
+            %lock_b0_pro: lock<mbar> = alloc() attrs={id: 6}
             async(%lock_b0_pro: lock<mbar>) move(%smem_b0: smem_tensor<128x64xbf16 swizzle="128B">, %bt_tile_pro: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
             await(%lock_a0_pro: lock<mbar>)
             await(%lock_b0_pro: lock<mbar>)
@@ -33,9 +33,9 @@ def pranjalssh_4096_pipelined_module():
               %k2: index = index_add(%k: index, %c2: index)
               %a_tile_1: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, %k1: index)
               %bt_tile_1: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%bt_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, %k1: index)
-              %lock_a1: lock<mbar> = alloc()
+              %lock_a1: lock<mbar> = alloc() attrs={id: 7}
               async(%lock_a1: lock<mbar>) move(%smem_a1: smem_tensor<128x64xbf16 swizzle="128B">, %a_tile_1: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
-              %lock_b1: lock<mbar> = alloc()
+              %lock_b1: lock<mbar> = alloc() attrs={id: 8}
               async(%lock_b1: lock<mbar>) move(%smem_b1: smem_tensor<128x64xbf16 swizzle="128B">, %bt_tile_1: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
               for (%ki0: index = 0 to 4) {
                 %a_inner_0: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a0: smem_tensor<128x64xbf16 swizzle="128B">, 0, %ki0: index)
@@ -44,9 +44,9 @@ def pranjalssh_4096_pipelined_module():
               }
               %a_tile_next: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, %k2: index)
               %bt_tile_next: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%bt_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, %k2: index)
-              %lock_a0_next: lock<mbar> = alloc()
+              %lock_a0_next: lock<mbar> = alloc() attrs={id: 9}
               async(%lock_a0_next: lock<mbar>) move(%smem_a0: smem_tensor<128x64xbf16 swizzle="128B">, %a_tile_next: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
-              %lock_b0_next: lock<mbar> = alloc()
+              %lock_b0_next: lock<mbar> = alloc() attrs={id: 10}
               async(%lock_b0_next: lock<mbar>) move(%smem_b0: smem_tensor<128x64xbf16 swizzle="128B">, %bt_tile_next: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
               await(%lock_a1: lock<mbar>)
               await(%lock_b1: lock<mbar>)
@@ -61,9 +61,9 @@ def pranjalssh_4096_pipelined_module():
             %c63: index = index_constant() attrs={value: 63}
             %a_tile_e1: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, %c63: index)
             %bt_tile_e1: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%bt_block: gmem_tensor<128x4096xbf16 strides=[4096, 1]>, 0, %c63: index)
-            %lock_a1_e: lock<mbar> = alloc()
+            %lock_a1_e: lock<mbar> = alloc() attrs={id: 11}
             async(%lock_a1_e: lock<mbar>) move(%smem_a1: smem_tensor<128x64xbf16 swizzle="128B">, %a_tile_e1: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
-            %lock_b1_e: lock<mbar> = alloc()
+            %lock_b1_e: lock<mbar> = alloc() attrs={id: 12}
             async(%lock_b1_e: lock<mbar>) move(%smem_b1: smem_tensor<128x64xbf16 swizzle="128B">, %bt_tile_e1: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: true}
             for (%ki0e: index = 0 to 4) {
               %a_inner_0e: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a0: smem_tensor<128x64xbf16 swizzle="128B">, 0, %ki0e: index)
@@ -77,7 +77,7 @@ def pranjalssh_4096_pipelined_module():
               %b_inner_1e: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b1: smem_tensor<128x64xbf16 swizzle="128B">, 0, %ki1e: index)
               matmul(%a_inner_1e: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1e: smem_tensor<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
             }
-            %acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc()
+            %acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 13}
             convert(%acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
             %c_block: gmem_tensor<128x128xbf16 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xbf16>, %by: index, %bx: index)
             move(%c_block: gmem_tensor<128x128xbf16 strides=[4096, 1]>, %acc_bf: wrmem_tensor<128x128xbf16 warps=4 layout="wgmma_layout_0">)

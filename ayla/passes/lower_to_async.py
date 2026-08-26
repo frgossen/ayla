@@ -52,7 +52,7 @@ class LowerToAsync(LoweringPass):
         ``{label}_await`` on the await (mirroring each other), so label-matching
         passes see it on the top-level ops rather than buried in the block.
         """
-        lock = AllocOp.build(LockType.build(kind=kind))
+        lock = AllocOp.build_with_fresh_id(LockType.build(kind=kind))
         label = attrs.get("label")
         async_op = AsyncOp.build(
             lock.result(), body=Block(ops=[inner]),

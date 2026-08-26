@@ -596,7 +596,14 @@ def clone_type(t: "Type") -> "Type":
     return type(t)(attrs=copy.deepcopy(t.attrs))
 
 
-def clone_op(op: Op, vmap: dict[Value, Value]) -> Op:
+def clone_op(
+    op: Op, vmap: dict[Value, Value], override_attrs: dict[str, object] | None = None,
+) -> Op:
+    """Clone `op`, remapping operands through `vmap`.
+
+    `override_attrs` is merged over the original's, for a copy that differs in
+    one of them.
+    """
     new_operands = [vmap.get(v, v) for v in op.operands]
     new_results = [Value(name=v.name, type=clone_type(v.type)) for v in op.results]
     new_blocks = [clone_block(b, vmap) for b in op.blocks]
@@ -604,7 +611,7 @@ def clone_op(op: Op, vmap: dict[Value, Value]) -> Op:
     new_op = type(op)(
         operands=new_operands,
         results=new_results,
-        attrs=dict(op.attrs),
+        attrs={**op.attrs, **(override_attrs or {})},
         blocks=new_blocks,
     )
 

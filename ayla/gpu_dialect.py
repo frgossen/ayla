@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import enum
+import itertools
 import math
+from typing import ClassVar, Iterator
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
@@ -384,20 +386,46 @@ class AllocOp(Op):
     """Allocate a register- or shared-memory tensor.
 
     Optional `init` attr fills the allocation with a constant value.
+
+    The `id` attr names the buffer: two allocations are the same one only if
+    they carry the same id, which is what lets CSE treat an allocation like any
+    other value-identical op. Every allocation carries one.
+
+    A pass that wants a buffer of its own calls `build_with_fresh_id`, which
+    takes the next id from a counter shared by the process. `build` takes the id
+    as an argument instead, for when it has to be a particular one.
     """
+
+    _id_counter: ClassVar[Iterator[int]] = itertools.count()
+
+    @classmethod
+    def fresh_id(cls) -> int:
+        return next(cls._id_counter)
 
     @classmethod
     def build(
         cls,
         type: Type,
+        id: int,
         init: float | int | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "AllocOp":
         a: dict[str, object] = dict(attrs or {})
+        a["id"] = id
         if init is not None:
             a["init"] = init
         result = Value(name=None, type=type)
         return cls(operands=[], results=[result], attrs=a)
+
+    @classmethod
+    def build_with_fresh_id(
+        cls,
+        type: Type,
+        init: float | int | None = None,
+        attrs: dict[str, object] | None = None,
+    ) -> "AllocOp":
+        """Build an allocation that is nobody else's buffer."""
+        return cls.build(type, id=cls.fresh_id(), init=init, attrs=attrs)
 
     @property
     def init(self) -> float | int | None:
@@ -1759,8 +1787,16 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     return None
 
 
-def is_value_identical(op: Op) -> bool:
-    """Same operands and attrs always produce identical results."""
+def is_side_effect_free(op: Op) -> bool:
+    """Safe to move, and interchangeable with an identical op.
+
+    Same operands and attrs always produce the same result, and nothing is read
+    or written along the way.
+    """
+    if isinstance(op, AllocOp):
+        # The initialiser writes the buffer, so such an allocation neither
+        # moves freely nor stands in for another.
+        return op.init is None
     return isinstance(op, (
         BlockIdsOp,
         IndexAddOp,
@@ -1776,13 +1812,6 @@ def is_value_identical(op: Op) -> bool:
         ToPtrOp,
         WarpGroupIdOp,
     ))
-
-
-def is_side_effect_free(op: Op) -> bool:
-    """Safe to reorder or hoist — does not read or write memory."""
-    if isinstance(op, AllocOp):
-        return op.init is None
-    return is_value_identical(op)
 
 
 def effective_operands(op: Op) -> list[Value]:
