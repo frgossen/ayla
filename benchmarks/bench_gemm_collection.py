@@ -96,7 +96,7 @@ def main() -> None:
         BenchGemmConfig(
             label=(
                 "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, "
-                "4 tiles/CTA, A evict-first)"
+                "4 tiles/CTA, A+C evict-first)"
             ),
             m=4096,
             n=4096,

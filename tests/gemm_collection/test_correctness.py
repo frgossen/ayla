@@ -76,6 +76,23 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
     assert kernel.block_dim == (256, 1, 1)
 
 
+def test_four_tile_output_evict_first_reaches_tma_stores():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=2,
+        output_store_buffers=2,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    ))
+    assert kernel.name.endswith("_4tiles_split2_dbuf2")
+    assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
+    assert kernel.ptx.count("bytes.L2::cache_hint") == 28
+    assert kernel.ptx.count("bulk_group.L2::cache_hint") == 8
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -99,6 +116,11 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],

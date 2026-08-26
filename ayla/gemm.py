@@ -132,6 +132,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         ),
         writeback_slices=output_slices,
         writeback_buffers=output_store_buffers,
+        move_attrs=operand_move_attrs,
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(

@@ -33,5 +33,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
         operand_stages=3,
         output_slices=2,
         output_store_buffers=2,
-        operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"}},
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
     )
