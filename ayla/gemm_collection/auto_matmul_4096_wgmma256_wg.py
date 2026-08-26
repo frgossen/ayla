@@ -4,6 +4,7 @@ import textwrap
 from ..gpu_dialect import gpu_dialect
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
+from ..passes.fold_wgmma_accumulator_init import fold_wgmma_accumulator_init
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
 from ..passes.multi_buffer import multi_buffer
@@ -85,5 +86,6 @@ def auto_matmul_4096_wgmma256_wg_module():
 
     module = schedule_async(module)
     module = canonicalize(module)
+    module = fold_wgmma_accumulator_init(module)
 
     return module

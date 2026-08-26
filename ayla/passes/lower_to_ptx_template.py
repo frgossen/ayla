@@ -704,7 +704,7 @@ class LowerToPtxTemplate(LoweringPass):
                       {{{regs}}},
                       ${{b64:desc_lhs{j}_{m_it}}},
                       ${{b64:{desc_rhs}}},
-                      1, 1, 1, 0, 0;
+                      {0 if mm.init == 0 else 1}, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
 

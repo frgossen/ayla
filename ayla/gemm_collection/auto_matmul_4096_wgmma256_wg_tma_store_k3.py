@@ -4,6 +4,7 @@ import textwrap
 from ..gpu_dialect import gpu_dialect
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
+from ..passes.fold_wgmma_accumulator_init import fold_wgmma_accumulator_init
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
 from ..passes.multi_buffer import multi_buffer
@@ -97,7 +98,8 @@ def _tma_store_k3_module(*, output_tiles_per_cta: int):
             module, unroll_factor=2, label_filter="outm"
         )
     module = schedule_async(module)
-    return canonicalize(module)
+    module = canonicalize(module)
+    return fold_wgmma_accumulator_init(module)
 
 
 @register
