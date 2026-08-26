@@ -12,7 +12,7 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
 )
 from ..base.ir import Block, Op, Value, clone_type
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class TileMatmul(LoweringPass):
@@ -76,9 +76,8 @@ class TileMatmul(LoweringPass):
         self.grid_dim_constraints: list[int | None]
         self.block_dim_constraints: list[int | None]
         self.num_warp_groups_constraints: list[int | None]
-        self.register(MatmulOp, type(self).lower_matmul)
-        self.register(KernelOp, type(self).lower_kernel)
 
+    @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
@@ -98,6 +97,7 @@ class TileMatmul(LoweringPass):
         )
         return [op], []
 
+    @lowers(MatmulOp)
     def lower_matmul(
         self, op: MatmulOp,
     ) -> tuple[list[Op], list[object]] | None:

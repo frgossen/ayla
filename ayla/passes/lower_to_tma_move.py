@@ -30,16 +30,12 @@ from ..gpu_dialect import (
     is_side_effect_free,
 )
 from ..base.ir import Block, Op, Value
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class LowerToTmaMove(LoweringPass):
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.register(MoveOp, type(self).lower_move)
-        self.register(AsyncOp, type(self).lower_async)
-
+    @lowers(MoveOp)
     def lower_move(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -48,6 +44,7 @@ class LowerToTmaMove(LoweringPass):
         index_ops, tma_op = self._materialize(op)
         return index_ops + [tma_op], []
 
+    @lowers(AsyncOp)
     def lower_async(
         self, op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:

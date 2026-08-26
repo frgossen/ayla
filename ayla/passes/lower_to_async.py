@@ -25,7 +25,7 @@ from ..gpu_dialect import (
     WrmemTensorType,
 )
 from ..base.ir import Block, Op, Value
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 def _tma_lock_kind(dst: Value) -> str:
@@ -35,13 +35,6 @@ def _tma_lock_kind(dst: Value) -> str:
 
 
 class LowerToAsync(LoweringPass):
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.register(MoveOp, type(self).lower_move)
-        self.register(TmaMoveOp, type(self).lower_tma_move)
-        self.register(MatmulOp, type(self).lower_matmul)
-        self.register(AsyncOp, type(self).lower_async)
 
     def _wrap(
         self, inner: Op, kind: str, attrs: dict[str, object],
@@ -64,6 +57,7 @@ class LowerToAsync(LoweringPass):
         )
         return [lock, async_op, await_op], []
 
+    @lowers(AsyncOp)
     def lower_async(
         self, op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:
@@ -72,6 +66,7 @@ class LowerToAsync(LoweringPass):
         # lowering its inner op a second time — idempotency for a second run.
         return [op], list(op.results)
 
+    @lowers(MoveOp)
     def lower_move(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -82,6 +77,7 @@ class LowerToAsync(LoweringPass):
         move = MoveOp.build(dst=dst, src=src, attrs=op.attrs)
         return self._wrap(move, _tma_lock_kind(dst), op.attrs)
 
+    @lowers(TmaMoveOp)
     def lower_tma_move(
         self, op: TmaMoveOp,
     ) -> tuple[list[Op], list[object]]:
@@ -91,6 +87,7 @@ class LowerToAsync(LoweringPass):
         tma = TmaMoveOp.build(dst=dst, src=src, indices=indices, attrs=op.attrs)
         return self._wrap(tma, _tma_lock_kind(dst), op.attrs)
 
+    @lowers(MatmulOp)
     def lower_matmul(
         self, op: MatmulOp,
     ) -> tuple[list[Op], list[object]] | None:
