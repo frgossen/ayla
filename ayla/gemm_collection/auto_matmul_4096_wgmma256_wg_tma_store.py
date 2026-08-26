@@ -35,6 +35,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    variant_suffix: str | None = None,
 ):
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
@@ -81,6 +82,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
+    if variant_suffix is not None:
+        name += f"_{variant_suffix}"
     m_blocks = (problem_m + output_m_tile - 1) // output_m_tile
     grid_x = (m_blocks + output_tiles_per_cta - 1) // output_tiles_per_cta
     grid_y = (problem_n + output_n_tile - 1) // output_n_tile
@@ -133,6 +136,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         ),
         writeback_slices=output_slices,
         writeback_buffers=output_store_buffers,
+        move_attrs=operand_move_attrs,
         target_dtype="f32", label_filter="mm",
     )
     module = tile_matmul(
@@ -228,4 +232,19 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
         output_slices=2,
         output_store_buffers=2,
         operand_move_attrs={"lhs": {"l2_cache_hint": "evict_first"}},
+    )
+
+
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_output_ef_module():
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=2,
+        output_store_buffers=2,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        variant_suffix="output_ef",
     )

@@ -456,9 +456,10 @@ class PromoteBuffers(LoweringPass):
                 if self.writeback_slices > 1 else []
             )
             store_dst_value = store_tiles[0].result() if store_tiles else block_dst
+            store_attrs = {"label": f"{matmul_label}_dst_tma", "tma": True}
+            store_attrs.update(self.move_attrs.get("dst", {}))
             store = MoveOp.build(
-                dst=store_dst_value, src=smem.result(),
-                attrs={"label": f"{matmul_label}_dst_tma", "tma": True},
+                dst=store_dst_value, src=smem.result(), attrs=store_attrs,
             )
             new_ops.extend([gather, *store_tiles, store])
         return new_ops

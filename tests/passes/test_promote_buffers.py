@@ -60,6 +60,24 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
         }""")
 
 
+def test_wrmem_tma_writeback_propagates_destination_move_attrs():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
+          }
+        }"""))
+    module = promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True,
+        move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
+        label_filter="mm",
+    )
+    text = repr(module)
+    assert text.count('l2_cache_hint: "evict_first"') == 1
+    assert 'label: "mm_dst_tma"' in text
+
+
 def test_promote_gmem_matmul_operands_to_smem():
     module_str = textwrap.dedent("""\
         module {

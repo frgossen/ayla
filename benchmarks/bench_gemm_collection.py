@@ -92,6 +92,10 @@ def main() -> None:
             "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, 4 tiles/CTA, A evict-first)",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, split output, 4 tiles/CTA, A+C evict-first)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_output_ef",
+        ),
         BenchGemmConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,
