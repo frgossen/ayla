@@ -13,6 +13,15 @@ from ..base.ir import Block, Op
 from ..base.pipeline import Pass
 
 
+def _collect_uses(block: Block, used: set[int]) -> None:
+    """Add every value `block` and its descendants read to `used`."""
+    for op in block.ops:
+        for v in op.operands:
+            used.add(id(v))
+        for inner in op.blocks:
+            _collect_uses(inner, used)
+
+
 class DCE(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
@@ -21,31 +30,28 @@ class DCE(Pass):
         return module
 
     def run_block(self, block: Block) -> None:
+        # Innermost blocks first, so the ops dropped there stop counting as
+        # uses of the values this block defines.
         for op in block.ops:
             for inner in op.blocks:
                 self.run_block(inner)
 
+        # Backwards, so an op is judged only against the ops that survive
+        # after it. That clears a whole dead chain in one sweep: dropping the
+        # last of them takes the operands it was the only reader of with it.
         used: set[int] = set()
-        for op in block.ops:
-            for v in op.operands:
-                used.add(id(v))
-            for inner in op.blocks:
-                self._collect_uses(inner, used)
-
-    def _collect_uses(self, block: Block, used: set[int]) -> None:
-        for op in block.ops:
-            for v in op.operands:
-                used.add(id(v))
-            for inner in op.blocks:
-                self._collect_uses(inner, used)
-
-        new_ops: list[Op] = []
-        for op in block.ops:
-            if not is_side_effect_free(op) or any(
+        kept: list[Op] = []
+        for op in reversed(block.ops):
+            if is_side_effect_free(op) and not any(
                 id(r) in used for r in op.results
             ):
-                new_ops.append(op)
-        block.ops = new_ops
+                continue
+            kept.append(op)
+            for v in op.operands:
+                used.add(id(v))
+            for inner in op.blocks:
+                _collect_uses(inner, used)
+        block.ops = list(reversed(kept))
 
 
 def dce(module: ModuleOp) -> ModuleOp:
