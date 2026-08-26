@@ -2,7 +2,7 @@
 
 import textwrap
 
-from ayla.base.ir import Block, Dialect, Op, Type, Value, clone_op
+from ayla.base.ir import Block, Dialect, Op, Type, Value, clone_op, clone_type
 
 
 def assert_print_and_roundtrip(op: Op, expected: str) -> None:
@@ -310,6 +310,16 @@ def test_clone_subtree_no_double_count():
     # ...until it is spliced into the same one.
     outer.parent_block.ops.append(cloned)
     assert len(a.users()) == 4
+
+
+def test_clone_type_overrides_one_attr():
+    """The override wins, the rest carries over, and the original is untouched."""
+    t = Type(attrs={"sizes": [4, 4], "swizzle": "128B"})
+
+    cloned = clone_type(t, {"swizzle": None})
+
+    assert cloned.attrs == {"sizes": [4, 4], "swizzle": None}
+    assert t.attrs == {"sizes": [4, 4], "swizzle": "128B"}
 
 
 def test_users_dedupes_repeated_operand():

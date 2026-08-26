@@ -592,8 +592,17 @@ def find_op(root: Op, predicate: Callable[[Op], bool]) -> Op | None:
     return next(iter_ops(root, predicate), None)
 
 
-def clone_type(t: "Type") -> "Type":
-    return type(t)(attrs=copy.deepcopy(t.attrs))
+def clone_type(
+    t: "Type", override_attrs: dict[str, object] | None = None,
+) -> "Type":
+    """Clone `t`.
+
+    `override_attrs` is merged over the original's, for a copy that differs in
+    one of them.
+    """
+    return type(t)(
+        attrs={**copy.deepcopy(t.attrs), **(override_attrs or {})},
+    )
 
 
 def clone_op(
