@@ -233,10 +233,10 @@ class PromoteBuffers(LoweringPass):
         self.move_attrs = dict(move_attrs or {})
         self.writeback_slices = writeback_slices
         self.writeback_buffers = writeback_buffers
-        if writeback_slices < 1:
-            raise ValueError("slice counts must be positive")
-        if writeback_buffers not in (1, writeback_slices):
-            raise ValueError("writeback_buffers must be 1 or equal writeback_slices")
+        assert writeback_slices >= 1, "writeback_slices must be positive"
+        assert writeback_buffers in (1, writeback_slices), (
+            "writeback_buffers must be 1 or equal writeback_slices"
+        )
         self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_smem_type(self, sizes, dtype):
