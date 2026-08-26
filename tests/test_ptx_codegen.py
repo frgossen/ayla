@@ -125,7 +125,7 @@ def test_codegen_naive_matmul_4096():
         )
         .reqntid 32, 32, 1
         {
-          .reg .b32  %r<23>;
+          .reg .b32  %r<21>;
           .reg .b64  %rd<22>;
           .reg .f32  %f<8>;
           .reg .pred %p<1>;
@@ -146,33 +146,31 @@ def test_codegen_naive_matmul_4096():
           mov.u32 %r5, %tid.z;
 
           mov.u64 %rd3, %rd0;           // to_ptr(%rd0)
-          mov.u32 %r6, 64;              // 64
-          mov.u32 %r7, 1048576;         // 1048576
-          shl.b32 %r8, %r0, 20;         // %r0 * 1048576
-          cvt.u64.u32 %rd5, %r8;
+          mov.u32 %r6, 1048576;         // 1048576
+          shl.b32 %r7, %r0, 20;         // %r0 * 1048576
+          cvt.u64.u32 %rd5, %r7;
           add.u64 %rd4, %rd3, %rd5;     // to_ptr(%rd0) + %r0 * 1048576
           mov.u64 %rd6, %rd1;           // to_ptr(%rd1)
-          shl.b32 %r9, %r1, 20;         // %r1 * 1048576
-          cvt.u64.u32 %rd8, %r9;
+          shl.b32 %r8, %r1, 20;         // %r1 * 1048576
+          cvt.u64.u32 %rd8, %r8;
           add.u64 %rd7, %rd6, %rd8;     // to_ptr(%rd1) + %r1 * 1048576
           mov.u64 %rd9, %rd2;           // to_ptr(%rd2)
-          mov.u32 %r10, 256;            // 256
-          shl.b32 %r11, %r1, 8;         // %r1 * 256
-          add.s32 %r12, %r8, %r11;      // %r0 * 1048576 + %r1 * 256
-          cvt.u64.u32 %rd11, %r12;
+          mov.u32 %r9, 256;             // 256
+          shl.b32 %r10, %r1, 8;         // %r1 * 256
+          add.s32 %r11, %r7, %r10;      // %r0 * 1048576 + %r1 * 256
+          cvt.u64.u32 %rd11, %r11;
           add.u64 %rd10, %rd9, %rd11;   // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256
-          mov.u32 %r13, 2;              // 2
-          mov.u32 %r14, 32768;          // 32768
-          shl.b32 %r15, %r3, 15;        // %r3 * 32768
-          cvt.u64.u32 %rd13, %r15;
+          mov.u32 %r12, 32768;          // 32768
+          shl.b32 %r13, %r3, 15;        // %r3 * 32768
+          cvt.u64.u32 %rd13, %r13;
           add.u64 %rd12, %rd4, %rd13;   // to_ptr(%rd0) + %r0 * 1048576 + %r3 * 32768
-          shl.b32 %r16, %r4, 15;        // %r4 * 32768
-          cvt.u64.u32 %rd15, %r16;
+          shl.b32 %r14, %r4, 15;        // %r4 * 32768
+          cvt.u64.u32 %rd15, %r14;
           add.u64 %rd14, %rd7, %rd15;   // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768
-          mov.u32 %r17, 8;              // 8
-          shl.b32 %r18, %r4, 3;         // %r4 * 8
-          add.s32 %r19, %r15, %r18;     // %r3 * 32768 + %r4 * 8
-          cvt.u64.u32 %rd17, %r19;
+          mov.u32 %r15, 8;              // 8
+          shl.b32 %r16, %r4, 3;         // %r4 * 8
+          add.s32 %r17, %r13, %r16;     // %r3 * 32768 + %r4 * 8
+          cvt.u64.u32 %rd17, %r17;
           add.u64 %rd16, %rd10, %rd17;  // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + %r3 * 32768 + %r4 * 8
 
           // PTX template `%c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}`
@@ -182,15 +180,15 @@ def test_codegen_naive_matmul_4096():
           mov.f32 %f3, 0f00000000;
 
           // BEGIN: `for (%k: index = 0 to 4096) {...`
-          mov.b32 %r20, 0;
+          mov.b32 %r18, 0;
           $L0:
 
-          mov.u32 %r21, 4;              // 4
-          shl.b32 %r22, %r20, 2;        // %r20 * 4
-          cvt.u64.u32 %rd19, %r22;
-          add.u64 %rd18, %rd12, %rd19;  // to_ptr(%rd0) + %r0 * 1048576 + %r3 * 32768 + %r20 * 4
-          cvt.u64.u32 %rd21, %r22;
-          add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768 + %r20 * 4
+          mov.u32 %r19, 4;              // 4
+          shl.b32 %r20, %r18, 2;        // %r18 * 4
+          cvt.u64.u32 %rd19, %r20;
+          add.u64 %rd18, %rd12, %rd19;  // to_ptr(%rd0) + %r0 * 1048576 + %r3 * 32768 + %r18 * 4
+          cvt.u64.u32 %rd21, %r20;
+          add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r4 * 32768 + %r18 * 4
 
           // PTX template `%a_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 1}`
 
@@ -211,8 +209,8 @@ def test_codegen_naive_matmul_4096():
           fma.rn.f32 %f3, %f5, %f7, %f3;
 
           // END: `for (%k: index = 0 to 4096) {...`
-          add.s32 %r20, %r20, 1;
-          setp.lt.s32 %p0, %r20, 4096;
+          add.s32 %r18, %r18, 1;
+          setp.lt.s32 %p0, %r18, 4096;
           @%p0 bra $L0;
 
           // PTX template `move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)`
