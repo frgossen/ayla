@@ -516,6 +516,13 @@ class LowerToPtxTemplate(LoweringPass):
             ):
                 return None
 
+            typ = tile.result().type
+            assert isinstance(typ, AddrMemTensorType)
+            assert len(tile.indices) == len(base_tile.indices) == typ.rank, (
+                "_tile_delta: TileOp indices must match the result rank; "
+                f"got {len(tile.indices)}, {len(base_tile.indices)}, and {typ.rank}"
+            )
+
             def constant(index: Value | int) -> int | None:
                 if isinstance(index, int):
                     return index
@@ -527,8 +534,6 @@ class LowerToPtxTemplate(LoweringPass):
             base_indices = [constant(index) for index in base_tile.indices]
             if any(index is None for index in indices + base_indices):
                 return None
-            typ = tile.result().type
-            assert isinstance(typ, AddrMemTensorType)
             # Non-affine layouts need a root-aware address mapping. Rebuild
             # their descriptors until that support is introduced with K=128.
             if typ.attrs.get("physical_layout") is not None:

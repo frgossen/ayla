@@ -1,10 +1,7 @@
 """Tests for the `folding` pass."""
 import textwrap
 
-from ayla.base.ir import find_ops
-from ayla.gpu_dialect import (
-    IndexConstantOp, IndexMulOp, gpu_dialect,
-)
+from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.canonicalize import canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
@@ -156,6 +153,16 @@ def test_distribute_constant_multiply_over_affine_offset():
           }
         }"""))
     folding(module)
-    assert len(find_ops(module, lambda op: isinstance(op, IndexMulOp))) == 1
-    constants = find_ops(module, lambda op: isinstance(op, IndexConstantOp))
-    assert 192 in [op.value for op in constants]
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test() {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c3: index = index_constant() attrs={value: 3}
+            %offset: index = index_add(%bx: index, %c3: index)
+            %c64: index = index_constant() attrs={value: 64}
+            %c64_1: index = index_constant() attrs={value: 64}
+            %0: index = index_mul(%bx: index, %c64_1: index)
+            %c192: index = index_constant() attrs={value: 192}
+            %1: index = index_add(%0: index, %c192: index)
+          }
+        }""")
