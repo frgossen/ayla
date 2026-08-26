@@ -24,42 +24,35 @@ from ..gpu_dialect import (
     SelectOp,
     TileOp,
 )
-from ..base.ir import Op, Value, clone_op
+from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
 
 
-class Folding(LoweringPass):
+def _iv_loop(value: Value) -> ForOp | None:
+    """The loop ``value`` is the induction variable of, if it is one.
 
-    def __init__(self) -> None:
-        super().__init__()
-        # Induction variable -> (lb, step) of the loop it belongs to, for the
-        # loops enclosing the op currently being folded.
-        #
-        # TODO: this only exists because ops have no parent pointer. An
-        # induction variable is a block argument with no defining op, so the
-        # bounds it obeys live on the enclosing ForOp with no way to reach them
-        # from inside the body -- every pass that wants enclosing context has to
-        # thread its own scope stack down the walk instead. Give Op (or Block) a
-        # parent and this becomes a lookup at the point of use, and lower_for
-        # can go back to letting the framework walk the body.
-        self._iv_congruence: dict[Value, tuple[int, int]] = {}
+    An induction variable is a block argument, so it has no defining op -- the
+    loop it belongs to is the one holding that block, which the parent links
+    reach directly. Returning the loop rather than its bounds keeps `ub`,
+    `trip_count` and the rest available to callers that need them.
+    """
+    block = value.definition
+    if not isinstance(block, Block):
+        return None
+    loop = block.parent_op
+    if not isinstance(loop, ForOp) or value is not loop.iv:
+        return None
+    return loop
+
+
+class Folding(LoweringPass):
 
     @lowers(ForOp)
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
         if op.trip_count != 1:
-            # Walk the body ourselves rather than falling through, so the
-            # induction variable's congruence is in scope while folding it.
-            # See the TODO on _iv_congruence: with parent pointers this branch
-            # would not need to exist.
-            self._iv_congruence[op.iv] = (op.lb, op.step)
-            try:
-                self.lower_block(op.body)
-            finally:
-                del self._iv_congruence[op.iv]
-            return [op], list(op.results)
-
+            return None
         self.lower_block(op.body)
         iv_const = IndexConstantOp.build(value=op.lb)
         vmap: dict[Value, Value] = {op.iv: iv_const.result()}
@@ -272,12 +265,10 @@ class Folding(LoweringPass):
         # An induction variable only takes values lb + i*step, so (iv + c) % m
         # is (lb + c) % m for any m dividing the step.
         base, offset = self._decompose_add(op.lhs)
-        congruence = self._iv_congruence.get(base) if rhs_val else None
-        if congruence is not None:
-            lb, step = congruence
-            if step % rhs_val == 0:
-                new_op = IndexConstantOp.build((lb + offset) % rhs_val)
-                return [new_op], [new_op.result()]
+        loop = _iv_loop(base) if rhs_val and base is not None else None
+        if loop is not None and loop.step % rhs_val == 0:
+            new_op = IndexConstantOp.build((loop.lb + offset) % rhs_val)
+            return [new_op], [new_op.result()]
         return None
 
     @lowers(PtrAddOp)
