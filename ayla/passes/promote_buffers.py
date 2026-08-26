@@ -188,7 +188,7 @@ class PromoteBuffers(LoweringPass):
     physical_layout : dict or None
         Physical layout attrs for promoted shared-memory buffers.
     move_attrs : dict[str, dict[str, object]] or None
-        Extra move attributes by operand.
+        Extra move attributes by operand, such as a TMA ``l2_cache_hint``.
     """
 
     def __init__(

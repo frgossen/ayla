@@ -69,6 +69,8 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
+        # TODO: Materialize cache policies in an earlier pass, potentially
+        # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({
             hint
             for tma in find_ops(op, lambda candidate: isinstance(
@@ -90,9 +92,9 @@ class LowerToPtxTemplate(LoweringPass):
                 result_names=names,
                 description="create TMA L2 cache policies",
             )
-            op.body.entry_block.ops.insert(0, policy_op)
+            op.body.ops.insert(0, policy_op)
             self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
-        self.lower_region(op.body)
+        self.lower_block(op.body)
         return [op], []
 
     def _tma_instruction(

@@ -484,9 +484,13 @@ class TmaMoveOp(Op):
         src: Value,
         indices: list[Value],
         attrs: dict[str, object] | None = None,
+        l2_cache_hint: str | None = None,
     ) -> "TmaMoveOp":
         operands = [dst, src] + indices
-        return cls(operands=operands, results=[], attrs=attrs or {})
+        attrs = dict(attrs or {})
+        if l2_cache_hint is not None:
+            attrs["l2_cache_hint"] = l2_cache_hint
+        return cls(operands=operands, results=[], attrs=attrs)
 
     def __post_init__(self) -> None:  # type: ignore[override]
         super().__post_init__()
