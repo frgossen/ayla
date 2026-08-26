@@ -166,3 +166,26 @@ def test_distribute_constant_multiply_over_affine_offset():
             %1: index = index_add(%0: index, %c192: index)
           }
         }""")
+
+
+def test_for_that_never_runs_is_erased():
+    """An empty range means the body never executes, so the loop goes away."""
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x4xf32>) {
+            for (%k: index = 8 to 8) attrs={label: "empty"} {
+              %v: rmem<1xf32> = alloc()
+            }
+            for (%j: index = 5 to 3 step 2) attrs={label: "backwards"} {
+              %w: rmem<1xf32> = alloc()
+            }
+            %c: index = index_constant() attrs={value: 7}
+          }
+        }""")
+
+    after = repr(folding(gpu_dialect.parse(module_str)))
+
+    assert "for (" not in after
+    assert "alloc()" not in after
+    # ...and the rest of the kernel is untouched.
+    assert "index_constant() attrs={value: 7}" in after
