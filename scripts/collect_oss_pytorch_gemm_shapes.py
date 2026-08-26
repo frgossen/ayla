@@ -15,7 +15,7 @@ against shapes real models produce instead of invented ones.
 
 The logs ship with a PyTorch *source* checkout, not the installed wheel, so a
 checkout is required. Only run this when refreshing the corpus -- the benchmarks
-read the committed ``benchmarks/oss_pytorch_gemm_shapes.json``::
+read the committed ``benchmarks/oss_pytorch_gemm_collection.json``::
 
     scripts/collect_oss_pytorch_gemm_shapes.py --pytorch-root ~/workspace-phoenix/pytorch
 """
@@ -34,7 +34,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 AYLA_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = AYLA_ROOT / "benchmarks" / "oss_pytorch_gemm_shapes.json"
+DEFAULT_OUTPUT = AYLA_ROOT / "benchmarks" / "oss_pytorch_gemm_collection.json"
 
 MICROBENCHMARK_SUBDIR = Path("benchmarks") / "dynamo" / "microbenchmarks"
 
