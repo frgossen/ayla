@@ -1,9 +1,7 @@
 """Shared timing harness for the GEMM benchmarks.
 
-Both ``bench_gemm_collection.py`` (one hand-picked shape, every kernel) and
-``bench_oss_pytorch_gemm_collection.py`` (the shapes real models run) build a
-list of :class:`BenchGemmConfig` and hand it to :func:`run`, so they report
-identical columns measured identically.
+The benchmark entry points build lists of :class:`BenchGemmConfig` and hand
+them to :func:`run`, so they report identical columns measured identically.
 
 Configs describe the mathematical GEMM, ``(m, k) @ (k, n)``. The operands are
 built in the layout ayla's kernels take: the right one transposed, as ``(n, k)``,
@@ -13,10 +11,13 @@ reason -- timing an NN GEMM against ayla's NT one would not be a comparison.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
+import math
 import statistics
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -81,6 +82,48 @@ _MAX_ROUNDS = 200
 def torch_mm_nt(a: torch.Tensor, bt: torch.Tensor) -> torch.Tensor:
     """The baseline GEMM in the collection's operand layout: ``a @ bt.T``."""
     return torch.mm(a, bt.t())
+
+
+def out_parameter_op(launcher: Callable) -> Callable:
+    """Adapt a launcher that writes its third argument to a benchmark op."""
+    output = None
+
+    def op(a: torch.Tensor, bt: torch.Tensor) -> torch.Tensor:
+        nonlocal output
+        if output is None:
+            output = torch.empty(
+                (a.shape[0], bt.shape[0]), dtype=a.dtype, device=a.device,
+            )
+        launcher(a, bt, output)
+        return output
+
+    return op
+
+
+def check_against_torch(
+    cfg: BenchGemmConfig,
+    *,
+    seed: int = 0,
+    max_abs_error: float = 0,
+    max_relative_rms_error: float = 0,
+) -> tuple[float, float]:
+    """Check a GEMM config against torch and return its two error metrics."""
+    torch.manual_seed(seed)
+    a = torch.randn((cfg.m, cfg.k), dtype=cfg.dtype, device="cuda")
+    bt = torch.randn((cfg.n, cfg.k), dtype=cfg.dtype, device="cuda")
+    actual = cfg.op(a, bt)
+    expected = torch_mm_nt(a, bt)
+    torch.cuda.synchronize()
+    difference = actual.float() - expected.float()
+    max_abs = float(difference.abs().max())
+    relative_rms = float(difference.square().mean().sqrt()) / float(
+        expected.float().square().mean().sqrt()
+    )
+    if max_abs > max_abs_error or relative_rms > max_relative_rms_error:
+        raise RuntimeError(
+            f"{cfg.label}: max abs {max_abs}, relative RMS {relative_rms}"
+        )
+    return max_abs, relative_rms
 
 
 def _capture_graph(
@@ -273,3 +316,54 @@ def print_results(results: list[BenchResult]) -> None:
     label_width = max((len(result.label) for result in results), default=len("label"))
     for i, result in enumerate(results):
         _print(result, label_width, with_header=(i == 0))
+
+
+def write_csv(rows: list[dict[str, object]], output: Path) -> None:
+    """Write benchmark rows, creating the output directory if necessary."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_tflops_curve(
+    axis,
+    x_values: list[int],
+    ayla_tflops: list[float],
+    torch_tflops: list[float],
+    *,
+    annotation_prefix: str = "",
+    annotation_fontsize: float = 7,
+) -> None:
+    """Plot and annotate an Ayla/cuBLAS throughput comparison curve."""
+    axis.plot(x_values, ayla_tflops, marker="o", linewidth=2, label="Ayla")
+    axis.plot(
+        x_values, torch_tflops, marker="o", linewidth=2,
+        label="cuBLAS (torch.mm)",
+    )
+    for index, (x, ayla_value, torch_value) in enumerate(zip(
+        x_values, ayla_tflops, torch_tflops, strict=True,
+    )):
+        difference = ayla_value - torch_value
+        advantage = 100 * difference / torch_value
+        axis.annotate(
+            f"{annotation_prefix}{advantage:+.1f}%\n{difference:+.1f} TFLOP/s",
+            (x, max(ayla_value, torch_value)),
+            xytext=(0, 7 + 12 * (index % 2)),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=annotation_fontsize,
+            color="#147d3f" if advantage >= 0 else "#b3261e",
+        )
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(
+        x_values, [f"{value:,}" for value in x_values], rotation=45, ha="right",
+    )
+    log_min = math.log2(min(x_values))
+    log_max = math.log2(max(x_values))
+    padding = max(.4, .05 * (log_max - log_min))
+    axis.set_xlim(2 ** (log_min - padding), 2 ** (log_max + padding))
+    axis.grid(True, alpha=.3)
+    axis.margins(y=.25)

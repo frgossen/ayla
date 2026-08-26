@@ -40,6 +40,9 @@ pip = "*"
 ninja = "*"
 numpy = "*"
 
+[tool.pixi.pypi-dependencies]
+matplotlib = "*"
+
 [tool.pixi.environments]
 default = ["dev"]
 
