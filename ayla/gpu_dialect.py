@@ -244,6 +244,10 @@ class MatmulOp(Op):
 class TileOp(Op):
     """Select a sub-region (view) of a buffer.
 
+    ``maybe_partial`` marks a tile whose logical extent may cross the valid
+    bounds of its source for some index values. Consumers must then provide
+    defined out-of-bounds behavior.
+
     Invariant: distinct tile results of the same buffer are
     non-conflicting — they are either disjoint (safe for concurrent
     writes) or overlapping read-only. This is the responsibility of
@@ -259,6 +263,7 @@ class TileOp(Op):
         indices: list[Value | int],
         type: Type,
         attrs: dict[str, object] | None = None,
+        maybe_partial: bool = False,
     ) -> "TileOp":
         operands: list[Value] = [arg]
         static_indices: list[int | None] = []
@@ -269,10 +274,13 @@ class TileOp(Op):
                 static_indices.append(None)
                 operands.append(idx)
         result = Value(name=None, type=type)
+        attrs = dict(attrs or {})
+        if maybe_partial:
+            attrs["maybe_partial"] = True
         return cls(
             operands=operands,
             results=[result],
-            attrs={"static_indices": static_indices, **(attrs or {})},
+            attrs={"static_indices": static_indices, **attrs},
         )
 
     @property
@@ -292,6 +300,10 @@ class TileOp(Op):
         return [
             s if s is not None else next(dyn) for s in self.static_indices
         ]
+
+    @property
+    def maybe_partial(self) -> bool:
+        return bool(self.attrs.get("maybe_partial", False))
 
     def __post_init__(self) -> None:  # type: ignore[override]
         super().__post_init__()

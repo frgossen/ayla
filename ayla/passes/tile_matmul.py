@@ -34,6 +34,10 @@ class TileMatmul(LoweringPass):
     ``dim_size / tile_size`` as usual and kernel constraints are set,
     but no tile ops, loops, or id ops are emitted — the matmul passes
     through with its original shapes.
+
+    ``allow_partial`` permits a non-divisible block-level tile by rounding the
+    grid dimension up. Addressing remains full-tile; callers must use memory
+    operations with defined out-of-bounds behavior, such as TMA.
     """
 
     def __init__(
@@ -44,10 +48,12 @@ class TileMatmul(LoweringPass):
         tile_labels: list[str | None],
         label_filter: str | None = None,
         collective: bool = False,
+        allow_partial: bool = False,
     ) -> None:
         super().__init__()
         self.label_filter = label_filter
         self.collective = collective
+        self.allow_partial = allow_partial
         if not (len(tile_dims) == len(tile_sizes) == len(tile_levels) == len(tile_labels)):
             raise ValueError(
                 f"TileMatmul: tile_dims, tile_sizes, tile_levels, tile_labels "
@@ -121,13 +127,17 @@ class TileMatmul(LoweringPass):
                     f"got {tile_dim!r}"
                 )
             tile_dim_size = sizes_by_dim[tile_dim]
-            if tile_dim_size % tile_size != 0:
+            is_partial = tile_dim_size % tile_size != 0
+            if is_partial and not (
+                self.allow_partial
+                and (tile_level == "for" or tile_level.startswith("block."))
+            ):
                 raise ValueError(
                     f"TileMatmul: tile_dim {tile_dim} size "
                     f"({tile_dim_size}) is not divisible by tile "
                     f"size ({tile_size})"
                 )
-            ub = tile_dim_size // tile_size
+            ub = (tile_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
             self._accumulate_constraint(tile_level, ub)
             sizes_by_dim[tile_dim] = tile_size
@@ -310,15 +320,21 @@ def _build_tile_op(
     name_to_idx = {n: i for i, n in enumerate(dim_names)}
     ops: list[Op] = []
     cur = arg
+    maybe_partial_dims: set[str] = set()
     for name, iv, ts in zip(tile_dims, tile_idxs, tile_sizes):
         d = name_to_idx.get(name)
         if d is None:
             continue
+        maybe_partial = name in maybe_partial_dims or cur.type.sizes[d] % ts != 0
+        if maybe_partial:
+            maybe_partial_dims.add(name)
         new_type = clone_type(cur.type)
         indices: list[Value | int] = [0] * len(new_type.sizes)
         indices[d] = iv
         new_type.sizes[d] = ts
-        tile_op = TileOp.build(cur, indices, new_type)
+        tile_op = TileOp.build(
+            cur, indices, new_type, maybe_partial=maybe_partial,
+        )
         ops.append(tile_op)
         cur = tile_op.result()
     return ops, cur
@@ -332,9 +348,10 @@ def tile_matmul(
     tile_labels: list[str | None],
     label_filter: str | None = None,
     collective: bool = False,
+    allow_partial: bool = False,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
         tile_dims, tile_sizes, tile_levels, tile_labels,
-        label_filter, collective,
+        label_filter, collective, allow_partial,
     ).run(module)

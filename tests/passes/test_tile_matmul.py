@@ -1,7 +1,8 @@
 """Tests for the tile_matmul pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import TileOp, gpu_dialect
 from ayla.passes.tile_matmul import tile_matmul
 
 
@@ -73,3 +74,21 @@ def test_warp_group_tiling_sets_block_dim():
     [kernel] = module.body.ops
     assert kernel.block_dim == (256, 1, 1)
     assert kernel.num_warp_groups == 2
+
+
+def test_partial_block_tile_rounds_up_the_grid():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem_tensor<192x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<192x128xf32>) {
+            matmul(%a: gmem_tensor<192x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<192x128xf32>) attrs={label: "mm"}
+          }
+        }"""))
+    tile_matmul(
+        module, tile_dims=["M"], tile_sizes=[128],
+        tile_levels=["block.x"], tile_labels=[None],
+        label_filter="mm", allow_partial=True,
+    )
+    assert "grid_dim=[2, None, None]" in repr(module)
+    tiles = find_ops(module, lambda op: isinstance(op, TileOp))
+    assert len(tiles) == 2
+    assert all(tile.maybe_partial for tile in tiles)
