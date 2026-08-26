@@ -418,6 +418,8 @@ class PromoteBuffers(LoweringPass):
             if wg_column_tile is not None:
                 gather_attrs["writer_wg"] = slice_idx
             elif self.writeback_slices > 1:
+                # TODO: Express this source slice with a tile op instead of the
+                # wgmma_col_start attribute.
                 gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
             gather = MoveOp.build(dst=gather_dst, src=src, attrs=gather_attrs)
             store_tiles = (
