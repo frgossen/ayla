@@ -21,11 +21,11 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
+          kernel @test(%a: gmem<4x4xf32>) {
             for (%k: index = 0 to 4) attrs={label: "k"} {
-              %s: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
-              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %k: index)
-              move(%s: smem_tensor<4x1xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
+              %s: smem<4x1xf32> = alloc() attrs={id: 0}
+              %t: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %k: index)
+              move(%s: smem<4x1xf32>, %t: gmem<4x1xf32 strides=[4, 1]>)
             }
           }
         }""")
@@ -34,28 +34,28 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
 
     assert repr(module) == textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4x4xf32>) {
+          kernel @test(%a: gmem<4x4xf32>) {
             for (%k: index = 0 to 3 step 3) attrs={label: "k"} {
               %c0: index = index_constant() attrs={value: 0}
               %0: index = index_add(%k: index, %c0: index)
-              %s: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
-              %t: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %0: index)
-              move(%s: smem_tensor<4x1xf32>, %t: gmem_tensor<4x1xf32 strides=[4, 1]>)
+              %s: smem<4x1xf32> = alloc() attrs={id: 0}
+              %t: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %0: index)
+              move(%s: smem<4x1xf32>, %t: gmem<4x1xf32 strides=[4, 1]>)
               %c1: index = index_constant() attrs={value: 1}
               %1: index = index_add(%k: index, %c1: index)
-              %s1: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
-              %t1: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %1: index)
-              move(%s1: smem_tensor<4x1xf32>, %t1: gmem_tensor<4x1xf32 strides=[4, 1]>)
+              %s1: smem<4x1xf32> = alloc() attrs={id: 0}
+              %t1: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %1: index)
+              move(%s1: smem<4x1xf32>, %t1: gmem<4x1xf32 strides=[4, 1]>)
               %c2: index = index_constant() attrs={value: 2}
               %2: index = index_add(%k: index, %c2: index)
-              %s2: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
-              %t2: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %2: index)
-              move(%s2: smem_tensor<4x1xf32>, %t2: gmem_tensor<4x1xf32 strides=[4, 1]>)
+              %s2: smem<4x1xf32> = alloc() attrs={id: 0}
+              %t2: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %2: index)
+              move(%s2: smem<4x1xf32>, %t2: gmem<4x1xf32 strides=[4, 1]>)
             }
             %c3: index = index_constant() attrs={value: 3}
-            %s3: smem_tensor<4x1xf32> = alloc() attrs={id: 0}
-            %t3: gmem_tensor<4x1xf32 strides=[4, 1]> = tile(%a: gmem_tensor<4x4xf32>, 0, %c3: index)
-            move(%s3: smem_tensor<4x1xf32>, %t3: gmem_tensor<4x1xf32 strides=[4, 1]>)
+            %s3: smem<4x1xf32> = alloc() attrs={id: 0}
+            %t3: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %c3: index)
+            move(%s3: smem<4x1xf32>, %t3: gmem<4x1xf32 strides=[4, 1]>)
           }
         }""")
 

@@ -46,10 +46,10 @@ def test_cwise_add_from_ir():
     template_str = json.dumps(CWISE_ADD_TEMPLATE)
     module_str = textwrap.dedent(f"""\
         module {{
-          kernel @cwise_add(%lhs: gmem_tensor<1024xf32>, %rhs: gmem_tensor<1024xf32>, %dst: gmem_tensor<1024xf32>) grid_dim=[4, 1, 1] block_dim=[256, 1, 1] {{
+          kernel @cwise_add(%lhs: gmem<1024xf32>, %rhs: gmem<1024xf32>, %dst: gmem<1024xf32>) grid_dim=[4, 1, 1] block_dim=[256, 1, 1] {{
             %gx: index, %gy: index, %gz: index = block_ids()
             %bx: index, %by: index, %bz: index = thread_ids()
-            ptx_template(%lhs: gmem_tensor<1024xf32>, %rhs: gmem_tensor<1024xf32>, %dst: gmem_tensor<1024xf32>, %gx: index, %gy: index, %gz: index, %bx: index, %by: index, %bz: index) attrs={{template: {template_str}}}
+            ptx_template(%lhs: gmem<1024xf32>, %rhs: gmem<1024xf32>, %dst: gmem<1024xf32>, %gx: index, %gy: index, %gz: index, %bx: index, %by: index, %bz: index) attrs={{template: {template_str}}}
           }}
         }}""")  # noqa: E501
 
@@ -114,10 +114,10 @@ def test_matmul_16_from_ir():
     template_str = json.dumps(MATMUL_16_TEMPLATE)
     module_str = textwrap.dedent(f"""\
         module {{
-          kernel @matmul_16(%a: gmem_tensor<16x16xf32>, %b: gmem_tensor<16x16xf32>, %c: gmem_tensor<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[16, 16, 1] {{
+          kernel @matmul_16(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>, %c: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[16, 16, 1] {{
             %gx: index, %gy: index, %gz: index = block_ids()
             %bx: index, %by: index, %bz: index = thread_ids()
-            ptx_template(%a: gmem_tensor<16x16xf32>, %b: gmem_tensor<16x16xf32>, %c: gmem_tensor<16x16xf32>, %gx: index, %gy: index, %gz: index, %bx: index, %by: index, %bz: index) attrs={{template: {template_str}}}
+            ptx_template(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>, %c: gmem<16x16xf32>, %gx: index, %gy: index, %gz: index, %bx: index, %by: index, %bz: index) attrs={{template: {template_str}}}
           }}
         }}""")  # noqa: E501
 
@@ -143,26 +143,26 @@ def test_matmul_16_from_ir():
 def test_naive_matmul_4096_from_ir():
     module_str = textwrap.dedent("""\
         module {
-          kernel @naive_matmul_4096(%a: gmem_tensor<4096x4096xf32>, %b: gmem_tensor<4096x4096xf32>, %c: gmem_tensor<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
+          kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
             %cx: index, %cy: index, %cz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
-            %a_block: gmem_tensor<64x4096xf32> = tile(%a: gmem_tensor<4096x4096xf32>, %cx: index, 0)
-            %b_block: gmem_tensor<64x4096xf32> = tile(%b: gmem_tensor<4096x4096xf32>, %cy: index, 0)
-            %c_block: gmem_tensor<64x64xf32 strides=[4096, 1]> = tile(%c: gmem_tensor<4096x4096xf32>, %cx: index, %cy: index)
-            %a_thread: gmem_tensor<2x4096xf32> = tile(%a_block: gmem_tensor<64x4096xf32>, %tx: index, 0)
-            %b_thread: gmem_tensor<2x4096xf32> = tile(%b_block: gmem_tensor<64x4096xf32>, %ty: index, 0)
-            %c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem_tensor<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %c_thread_rmem: rmem_tensor<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
+            %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
+            %b_block: gmem<64x4096xf32> = tile(%b: gmem<4096x4096xf32>, %cy: index, 0)
+            %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)
+            %a_thread: gmem<2x4096xf32> = tile(%a_block: gmem<64x4096xf32>, %tx: index, 0)
+            %b_thread: gmem<2x4096xf32> = tile(%b_block: gmem<64x4096xf32>, %ty: index, 0)
+            %c_thread: gmem<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
+            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
             for (%k: index = 0 to 4096) {
-              %a_k: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
-              %b_k: gmem_tensor<2x1xf32 strides=[4096, 1]> = tile(%b_thread: gmem_tensor<2x4096xf32>, 0, %k: index)
-              %a_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 1}
-              move(%a_k_rmem: rmem_tensor<2x1xf32>, %a_k: gmem_tensor<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              %b_k_rmem: rmem_tensor<2x1xf32> = alloc() attrs={id: 2}
-              move(%b_k_rmem: rmem_tensor<2x1xf32>, %b_k: gmem_tensor<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              matmul(%a_k_rmem: rmem_tensor<2x1xf32>, %b_k_rmem: rmem_tensor<2x1xf32>, %c_thread_rmem: rmem_tensor<2x2xf32>)
+              %a_k: gmem<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem<2x4096xf32>, 0, %k: index)
+              %b_k: gmem<2x1xf32 strides=[4096, 1]> = tile(%b_thread: gmem<2x4096xf32>, 0, %k: index)
+              %a_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 1}
+              move(%a_k_rmem: rmem<2x1xf32>, %a_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
+              %b_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 2}
+              move(%b_k_rmem: rmem<2x1xf32>, %b_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
+              matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>)
             }
-            move(%c_thread: gmem_tensor<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem_tensor<2x2xf32>)
+            move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
           }
         }""")  # noqa: E501
 
@@ -186,13 +186,13 @@ def test_tma():
     """High-level IR: tiles + load(gmem → smem). Nice to write."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @tma(%a: gmem_tensor<4096x4096xf32>) grid_dim=[32, 64, 1] block_dim=[128, 1, 1] {
+          kernel @tma(%a: gmem<4096x4096xf32>) grid_dim=[32, 64, 1] block_dim=[128, 1, 1] {
             %cx: index, %cy: index, %cz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
-            %a_block: gmem_tensor<128x64xf32 strides=[4096, 1]> = tile(%a: gmem_tensor<4096x4096xf32>, %cx: index, %cy: index)
-            %a_thread: gmem_tensor<64x32xf32 strides=[4096, 1]> = tile(%a_block: gmem_tensor<128x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %a_smem: smem_tensor<64x32xf32 swizzle="128B"> = alloc() attrs={id: 0}
-            move(%a_smem: smem_tensor<64x32xf32 swizzle="128B">, %a_thread: gmem_tensor<64x32xf32 strides=[4096, 1]>) attrs={tma: True}
+            %a_block: gmem<128x64xf32 strides=[4096, 1]> = tile(%a: gmem<4096x4096xf32>, %cx: index, %cy: index)
+            %a_thread: gmem<64x32xf32 strides=[4096, 1]> = tile(%a_block: gmem<128x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
+            %a_smem: smem<64x32xf32 swizzle="128B"> = alloc() attrs={id: 0}
+            move(%a_smem: smem<64x32xf32 swizzle="128B">, %a_thread: gmem<64x32xf32 strides=[4096, 1]>) attrs={tma: True}
           }
         }""")  # noqa: E501
 
@@ -217,12 +217,12 @@ def test_tma_lowered():
     """Lowered IR: one TMA load, nothing else. Minimal e2e for TMA codegen + runtime."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @tma_load(%a: gmem_tensor<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @tma_load(%a: gmem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %gx: index, %gy: index, %gz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
-            %a_smem: smem_tensor<64x64xf32> = alloc() attrs={id: 0}
+            %a_smem: smem<64x64xf32> = alloc() attrs={id: 0}
             %lock: lock<mbar> = alloc() attrs={id: 1}
-            async(%lock: lock<mbar>) tma_move(%a_smem: smem_tensor<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>, %gx: index, %gy: index)
+            async(%lock: lock<mbar>) tma_move(%a_smem: smem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %gx: index, %gy: index)
             await(%lock: lock<mbar>)
           }
         }""")  # noqa: E501
@@ -247,8 +247,8 @@ def test_experimental_auto_matmul_4096():
     """Experimental: build a wgmma matmul from high-level tiling passes."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) {
-            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
+          kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) {
+            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
           }
         }""")
     module = gpu_dialect.parse(module_str)
@@ -311,8 +311,8 @@ def test_experimental_auto_matmul_4096():
 def test_dbg_module():
     module_str = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem_tensor<4096x4096xbf16>, %b: gmem_tensor<4096x4096xbf16>, %c: gmem_tensor<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
+          kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
           }
         }""")
     module = gpu_dialect.parse(module_str)

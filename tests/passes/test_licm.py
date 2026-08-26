@@ -10,10 +10,10 @@ def test_no_hoist_k_dependent_ops():
     """Ops that depend on the loop IV stay inside."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<128x4096xbf16>, %s: smem_tensor<128x64xbf16 swizzle="128B">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: gmem<128x4096xbf16>, %s: smem<128x64xbf16 swizzle="128B">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             for (%k: index = 0 to 64) {
-              %t: gmem_tensor<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem_tensor<128x4096xbf16>, 0, %k: index)
-              move(%s: smem_tensor<128x64xbf16 swizzle="128B">, %t: gmem_tensor<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+              %t: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %k: index)
+              move(%s: smem<128x64xbf16 swizzle="128B">, %t: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
             }
           }
         }""")  # noqa: E501
@@ -29,11 +29,11 @@ def test_hoist_alloc_without_init():
     """Static allocs (no init) are hoisted; allocs with init stay."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: gmem<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             for (%k: index = 0 to 64) {
-              %s: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
-              %r: rmem_tensor<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
-              move(%s: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              %s: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+              %r: rmem<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
+              move(%s: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) attrs={tma: True}
             }
           }
         }""")
@@ -44,11 +44,11 @@ def test_hoist_alloc_without_init():
 
     expected = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %s: smem_tensor<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+          kernel @test(%a: gmem<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %s: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             for (%k: index = 0 to 64) {
-              %r: rmem_tensor<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
-              move(%s: smem_tensor<128x64xbf16 swizzle="128B">, %a: gmem_tensor<128x64xbf16>) attrs={tma: True}
+              %r: rmem<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
+              move(%s: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) attrs={tma: True}
             }
           }
         }""")

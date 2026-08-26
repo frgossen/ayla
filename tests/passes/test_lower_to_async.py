@@ -9,9 +9,9 @@ def test_sync_move_stays_as_move():
     """Non-TMA move stays as MoveOp (not converted to async)."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %smem: smem_tensor<128x64xf32> = alloc() attrs={id: 0}
-            move(%smem: smem_tensor<128x64xf32>, %a: gmem_tensor<4096x4096xf32>)
+          kernel @test(%a: gmem<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %smem: smem<128x64xf32> = alloc() attrs={id: 0}
+            move(%smem: smem<128x64xf32>, %a: gmem<4096x4096xf32>)
           }
         }""")
 
@@ -26,9 +26,9 @@ def test_tma_to_async_move_await():
     """TMA-eligible move becomes async { move } + await with a lock."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %smem: smem_tensor<128x64xf32> = alloc() attrs={id: 0}
-            move(%smem: smem_tensor<128x64xf32>, %a: gmem_tensor<4096x4096xf32>) attrs={tma: True}
+          kernel @test(%a: gmem<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %smem: smem<128x64xf32> = alloc() attrs={id: 0}
+            move(%smem: smem<128x64xf32>, %a: gmem<4096x4096xf32>) attrs={tma: True}
           }
         }""")
 
@@ -38,10 +38,10 @@ def test_tma_to_async_move_await():
 
     expected = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %smem: smem_tensor<128x64xf32> = alloc() attrs={id: 0}
+          kernel @test(%a: gmem<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %smem: smem<128x64xf32> = alloc() attrs={id: 0}
             %0: lock<mbar> = alloc() attrs={id: 0}
-            async(%0: lock<mbar>) move(%smem: smem_tensor<128x64xf32>, %a: gmem_tensor<4096x4096xf32>) attrs={tma: True}
+            async(%0: lock<mbar>) move(%smem: smem<128x64xf32>, %a: gmem<4096x4096xf32>) attrs={tma: True}
             await(%0: lock<mbar>)
           }
         }""")
@@ -52,11 +52,11 @@ def test_sync_matmul_stays_as_matmul():
     """Non-wgmma matmul stays as MatmulOp."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem_tensor<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %lhs: rmem_tensor<2x2xf32> = alloc() attrs={id: 0}
-            %rhs: rmem_tensor<2x2xf32> = alloc() attrs={id: 1}
-            %dst: rmem_tensor<2x2xf32> = alloc() attrs={id: 2}
-            matmul(%lhs: rmem_tensor<2x2xf32>, %rhs: rmem_tensor<2x2xf32>, %dst: rmem_tensor<2x2xf32>)
+          kernel @test(%a: gmem<4096x4096xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %lhs: rmem<2x2xf32> = alloc() attrs={id: 0}
+            %rhs: rmem<2x2xf32> = alloc() attrs={id: 1}
+            %dst: rmem<2x2xf32> = alloc() attrs={id: 2}
+            matmul(%lhs: rmem<2x2xf32>, %rhs: rmem<2x2xf32>, %dst: rmem<2x2xf32>)
           }
         }""")
 
@@ -71,8 +71,8 @@ def test_wgmma_matmul_to_async_await():
     """wgmma-eligible matmul becomes async { matmul } + await with a lock."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: smem_tensor<128x16xbf16 swizzle="128B">, %b: smem_tensor<128x16xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: smem_tensor<128x16xbf16 swizzle="128B">, %b: smem_tensor<128x16xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
+          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
           }
         }""")
 
@@ -82,9 +82,9 @@ def test_wgmma_matmul_to_async_await():
 
     expected = textwrap.dedent("""\
         module {
-          kernel @test(%a: smem_tensor<128x16xbf16 swizzle="128B">, %b: smem_tensor<128x16xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %0: lock<wgmma> = alloc() attrs={id: 0}
-            async(%0: lock<wgmma>) matmul(%a: smem_tensor<128x16xbf16 swizzle="128B">, %b: smem_tensor<128x16xbf16 swizzle="128B">, %c: wrmem_tensor<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            async(%0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
             await(%0: lock<wgmma>)
           }
         }""")

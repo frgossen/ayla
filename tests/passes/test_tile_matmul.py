@@ -11,8 +11,8 @@ def test_tiles_gmem_matmul_along_m_and_k():
     # Here M=128, N=128, K=64.
     module_str = textwrap.dedent("""\
         module {
-          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<128x128xf32>)
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>)
           }
         }""")
 
@@ -22,14 +22,14 @@ def test_tiles_gmem_matmul_along_m_and_k():
 
     expected = textwrap.dedent("""\
         module {
-          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             for (%m: index = 0 to 4) attrs={label: "m"} {
               for (%k: index = 0 to 4) attrs={label: "k"} {
-                %0: gmem_tensor<32x64xbf16> = tile(%a: gmem_tensor<128x64xbf16>, %m: index, 0)
-                %1: gmem_tensor<32x16xbf16 strides=[64, 1]> = tile(%0: gmem_tensor<32x64xbf16>, 0, %k: index)
-                %2: gmem_tensor<128x16xbf16 strides=[64, 1]> = tile(%b: gmem_tensor<128x64xbf16>, 0, %k: index)
-                %3: gmem_tensor<32x128xf32> = tile(%c: gmem_tensor<128x128xf32>, %m: index, 0)
-                matmul(%1: gmem_tensor<32x16xbf16 strides=[64, 1]>, %2: gmem_tensor<128x16xbf16 strides=[64, 1]>, %3: gmem_tensor<32x128xf32>)
+                %0: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %m: index, 0)
+                %1: gmem<32x16xbf16 strides=[64, 1]> = tile(%0: gmem<32x64xbf16>, 0, %k: index)
+                %2: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
+                %3: gmem<32x128xf32> = tile(%c: gmem<128x128xf32>, %m: index, 0)
+                matmul(%1: gmem<32x16xbf16 strides=[64, 1]>, %2: gmem<128x16xbf16 strides=[64, 1]>, %3: gmem<32x128xf32>)
               }
             }
           }
@@ -40,8 +40,8 @@ def test_tiles_gmem_matmul_along_m_and_k():
 def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @mm(%a: gmem_tensor<4096x16xbf16>, %b: gmem_tensor<256x16xbf16>, %c: gmem_tensor<4096x256xbf16>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem_tensor<4096x16xbf16>, %b: gmem_tensor<256x16xbf16>, %c: gmem_tensor<4096x256xbf16>) attrs={label: "mm"}
+          kernel @mm(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) attrs={label: "mm"}
           }
         }"""))
     module = tile_matmul(
@@ -53,15 +53,15 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
     text = repr(module)
     assert "grid_dim=[16, 1, 1]" in text
     assert 'for (%outm: index = 0 to 2) attrs={label: "outm"}' in text
-    assert "tile(%a: gmem_tensor<4096x16xbf16>, %outm: index, 0)" in text
-    assert "tile(%0: gmem_tensor<2048x16xbf16>, %bx: index, 0)" in text
+    assert "tile(%a: gmem<4096x16xbf16>, %outm: index, 0)" in text
+    assert "tile(%0: gmem<2048x16xbf16>, %bx: index, 0)" in text
 
 
 def test_warp_group_tiling_sets_block_dim():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @mm(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<128x128xf32>) {
-            matmul(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>, %c: gmem_tensor<128x128xf32>)
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>)
           }
         }"""))
 

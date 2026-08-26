@@ -6,13 +6,13 @@ For each ``MatmulOp``, selected operands are promoted by inserting
 Example — promote lhs/rhs to smem::
 
     # Before:
-    matmul(%a: gmem_tensor<128x64xbf16>, %b: gmem_tensor<128x64xbf16>,
-           %c: rmem_tensor<128x128xf32>)
+    matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>,
+           %c: rmem<128x128xf32>)
 
     # After:
-    %a_smem: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+    %a_smem: smem<128x64xbf16 swizzle="128B"> = alloc()
     move(%a_smem, %a) attrs={tma: true}
-    %b_smem: smem_tensor<128x64xbf16 swizzle="128B"> = alloc()
+    %b_smem: smem<128x64xbf16 swizzle="128B"> = alloc()
     move(%b_smem, %b) attrs={tma: true}
     matmul(%a_smem, %b_smem, %c)
 """
