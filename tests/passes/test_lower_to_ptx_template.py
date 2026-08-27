@@ -53,11 +53,11 @@ def test_lower_barrier_unsupported_scope_raises():
 def test_lower_tma_load_with_l2_cache_hint():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @load(%desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @load(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %x: index, %y: index, %z: index = block_ids()
-            %smem: smem_tensor<64x64xf32> = alloc()
+            %smem: smem<64x64xf32> = alloc()
             %lock: lock<mbar> = alloc()
-            async(%lock: lock<mbar>) tma_move(%smem: smem_tensor<64x64xf32>, %desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>, %x: index, %y: index) attrs={l2_cache_hint: "evict_last"}
+            async(%lock: lock<mbar>) tma_move(%smem: smem<64x64xf32>, %desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %x: index, %y: index) attrs={l2_cache_hint: "evict_last"}
           }
         }"""))
     lower_to_ptx_template(module)
@@ -72,11 +72,11 @@ def test_lower_tma_load_with_l2_cache_hint():
 def test_lower_tma_store_with_l2_cache_hint():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @store(%desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @store(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %x: index, %y: index, %z: index = block_ids()
-            %smem: smem_tensor<64x64xf32> = alloc()
+            %smem: smem<64x64xf32> = alloc()
             %lock: lock<bulk> = alloc()
-            async(%lock: lock<bulk>) tma_move(%desc: tma_desc<arg_idx=0 gmem_tensor<64x64xf32> tile=64x64>, %smem: smem_tensor<64x64xf32>, %x: index, %y: index) attrs={l2_cache_hint: "evict_first"}
+            async(%lock: lock<bulk>) tma_move(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %smem: smem<64x64xf32>, %x: index, %y: index) attrs={l2_cache_hint: "evict_first"}
           }
         }"""))
     lower_to_ptx_template(module)
