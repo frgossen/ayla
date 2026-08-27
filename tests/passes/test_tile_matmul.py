@@ -72,7 +72,7 @@ def test_warp_group_tiling_sets_block_dim():
     )
 
     [kernel] = module.body.ops
-    assert kernel.block_dim == (256, 1, 1)
+    assert kernel.block_dim == [256, 1, 1]
     assert kernel.num_warp_groups == 2
 
 

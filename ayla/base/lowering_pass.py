@@ -115,10 +115,12 @@ class LoweringPass(Pass):
         return [op], list(op.results)
 
     def lower_block(self, block: Block) -> None:
-        # Block arguments are unchanged; register identity mappings so
-        # downstream lookups succeed.
+        # Register identity mappings for the block arguments so downstream
+        # lookups succeed. `setdefault`, not assignment: a rewriter inlining
+        # this block has already bound an argument to the value replacing it,
+        # and that binding is the whole point.
         for v in block.arguments:
-            self.value_map[v] = v
+            self.value_map.setdefault(v, v)
         new_block_ops: list[Op] = []
         for op in block.ops:
             new_ops, new_results = self.lower_op(op)

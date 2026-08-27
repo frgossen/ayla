@@ -76,7 +76,7 @@ def test_codegen_materializes_block_dim_before_lowering():
     [input_kernel] = module.body.ops
 
     kernel = make_ptx_kernel(module)
-    assert input_kernel.block_dim == (128, 1, 1)
+    assert input_kernel.block_dim == [128, 1, 1]
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
 
