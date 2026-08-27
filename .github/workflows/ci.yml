@@ -15,20 +15,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      # --no-deps skips torch/numpy/ninja. Nothing in the suite below imports
-      # them, and torch alone is a ~200MB download for no gain.
+      # The CPU torch wheel, not the default CUDA one: a tenth of the download
+      # and the suite's GPU half skips here anyway. --no-deps then keeps pip
+      # from pulling the CUDA build back in over the top.
       - name: Install
         run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install --no-deps -e .
-          pip install pytest
+          pip install numpy pytest
 
-      # The GPU half of the suite is excluded rather than skipped. Its skipif
-      # marks guard the test bodies, but the modules JIT-compile a CUDA
-      # extension at import (registry's @register -> load_inline), so a runner
-      # with no GPU dies during collection, before a mark can apply.
+      # The whole suite runs. Tests needing a GPU carry skipif marks and report
+      # as skipped on this runner.
       - name: pytest
-        run: |
-          pytest -q \
-            --ignore=tests/gemm_collection \
-            --ignore=tests/test_e2e.py \
-            --ignore=tests/test_ptx_runtime.py
+        run: pytest -q -rs
