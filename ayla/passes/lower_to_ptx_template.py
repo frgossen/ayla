@@ -27,6 +27,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    IndexType,
     KernelOp,
     LockType,
     MatmulOp,
@@ -42,11 +43,12 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     ToPtrOp,
+    WarpGroupIdOp,
     WrmemTensorType,
     physical_layout,
     root_buffer,
 )
-from ..base.ir import Op, Value, find_ops
+from ..base.ir import Block, Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass
 
 
@@ -56,6 +58,12 @@ class LowerToPtxTemplate(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
+        self.block_dim: tuple[int | None, int | None, int | None] = (
+            None, None, None,
+        )
+        self.lane_zero_tma_guard = False
+        self.compact_sass = False
+        self.stmatrix_offsets: dict[int, Value] = {}
         self.register(KernelOp, type(self).lower_kernel)
         self.register(AllocOp, type(self).lower_alloc)
         self.register(MoveOp, type(self).lower_move)
@@ -65,10 +73,24 @@ class LowerToPtxTemplate(LoweringPass):
         self.register(BarrierOp, type(self).lower_barrier)
         self.register(ConvertOp, type(self).lower_convert)
         self.register(TileOp, type(self).lower_tile)
+        self.register(WarpGroupIdOp, type(self).lower_warp_group_id)
+
+    def lower_block(self, block: Block) -> None:
+        outer_offsets = self.stmatrix_offsets
+        self.stmatrix_offsets = {}
+        try:
+            super().lower_block(block)
+        finally:
+            self.stmatrix_offsets = outer_offsets
 
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
+        self.block_dim = op.block_dim
+        self.lane_zero_tma_guard = bool(
+            op.attrs.get("lane_zero_tma_guard", False)
+        )
+        self.compact_sass = bool(op.attrs.get("compact_sass", False))
         # TODO: Materialize cache policies in an earlier pass, potentially
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({
@@ -95,7 +117,121 @@ class LowerToPtxTemplate(LoweringPass):
             op.body.ops.insert(0, policy_op)
             self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
         self.lower_block(op.body)
+        if op.attrs.get("batch_mbarrier_init", False):
+            self._batch_mbarrier_initializations(op.body)
+        if self.compact_sass:
+            self._share_special_register(op, "%laneid", "lane_id")
+            self._share_special_register(op, "%tid.x", "tid_x")
         return [op], []
+
+    @staticmethod
+    def _share_special_register(
+        kernel: KernelOp, spelling: str, result_name: str,
+    ) -> None:
+        templates = find_ops(kernel, lambda candidate: (
+            isinstance(candidate, PTXTemplateOp)
+            and spelling in candidate.template
+        ))
+        if not templates:
+            return
+        read = PTXTemplateOp.build(
+            operands=[],
+            result_types=[IndexType()],
+            template=(
+                "mov.u32 ${b32:result."
+                + result_name
+                + ".val}, "
+                + spelling
+                + ";\n"
+            ),
+            operand_names=[],
+            result_names=[result_name],
+            description=f"read {spelling} once",
+            attrs={"pure": True, "inline": True},
+        )
+        value = read.result()
+        for template_op in templates:
+            operand_index = len(template_op.operands)
+            template_op.operands.append(value)
+            names = template_op.operand_names
+            if names is None:
+                operand = f"operand[{operand_index}]"
+            else:
+                name = f"shared_{result_name}"
+                assert name not in names
+                names.append(name)
+                operand = f"operand.{name}"
+            template_op.attrs["template"] = template_op.template.replace(
+                spelling, f"${{b32:{operand}.val}}",
+            )
+        kernel.body.ops.insert(0, read)
+
+    def _thread_zero_guard(self, prefix: str, done: str) -> list[str]:
+        """Branch every thread except the CTA's lane-zero leader away."""
+        if not self.lane_zero_tma_guard:
+            return [
+                f"mov.u32 ${{b32:{prefix}_tid}}, %tid.x;",
+                f"mov.u32 ${{b32:{prefix}_tid_y}}, %tid.y;",
+                f"or.b32 ${{b32:{prefix}_tid}}, ${{b32:{prefix}_tid}}, "
+                f"${{b32:{prefix}_tid_y}};",
+                f"mov.u32 ${{b32:{prefix}_tid_z}}, %tid.z;",
+                f"or.b32 ${{b32:{prefix}_tid}}, ${{b32:{prefix}_tid}}, "
+                f"${{b32:{prefix}_tid_z}};",
+                f"setp.ne.s32 ${{pred:{prefix}_not_t0}}, "
+                f"${{b32:{prefix}_tid}}, 0;",
+                f"@${{pred:{prefix}_not_t0}} bra ${{label:{done}}};",
+            ]
+
+        lines: list[str] = []
+        for axis, extent in zip("xyz", self.block_dim):
+            if extent == 1:
+                continue
+            if axis == "x" and extent is not None and extent <= 32:
+                continue
+            component = f"{prefix}_tid_{axis}"
+            comparison = "ge.u32" if axis == "x" else "ne.u32"
+            limit = 32 if axis == "x" else 0
+            lines.extend([
+                f"mov.u32 ${{b32:{component}}}, %tid.{axis};",
+                f"setp.{comparison} ${{pred:{prefix}_not_t0}}, "
+                f"${{b32:{component}}}, {limit};",
+                f"@${{pred:{prefix}_not_t0}} bra ${{label:{done}}};",
+            ])
+        lines.extend([
+            f"mov.u32 ${{b32:{prefix}_lane}}, %laneid;",
+            f"setp.ne.u32 ${{pred:{prefix}_not_t0}}, "
+            f"${{b32:{prefix}_lane}}, 0;",
+            f"@${{pred:{prefix}_not_t0}} bra ${{label:{done}}};",
+        ])
+        return lines
+
+    @staticmethod
+    def _batch_mbarrier_initializations(block: Block) -> None:
+        """Publish startup mbarriers with one fence and CTA rendezvous."""
+        inits = [
+            (index, candidate)
+            for index, candidate in enumerate(block.ops)
+            if isinstance(candidate, PTXTemplateOp)
+            and candidate.description is not None
+            and "lock<mbar> = alloc()" in candidate.description
+        ]
+        if len(inits) < 2:
+            return
+        first_index, last_index = inits[0][0], inits[-1][0]
+        init_ops = {candidate for _, candidate in inits}
+        if any(
+            isinstance(candidate, PTXTemplateOp)
+            and candidate not in init_ops
+            and "mbarrier." in candidate.template
+            for candidate in block.ops[first_index:last_index + 1]
+        ):
+            return
+        for _, init in inits[:-1]:
+            assert "fence.mbarrier_init.release.cluster;\n" in init.template
+            assert "bar.sync 0;\n" in init.template
+            init.attrs["template"] = init.template.replace(
+                "fence.mbarrier_init.release.cluster;\n", "",
+            ).replace("bar.sync 0;\n", "")
 
     def _tma_instruction(
         self,
@@ -113,6 +249,25 @@ class LowerToPtxTemplate(LoweringPass):
         operand_names.append(policy_name)
         policy = f"${{b64:operand.{policy_name}.ptr}}"
         return f"{opcode}.L2::cache_hint {arguments}, {policy};"
+
+    def lower_warp_group_id(
+        self, op: WarpGroupIdOp,
+    ) -> tuple[list[Op], list[object]]:
+        if not self.compact_sass:
+            return [op], list(op.results)
+        lowered = PTXTemplateOp.build(
+            operands=[],
+            result_types=[IndexType(), IndexType(), IndexType()],
+            template=textwrap.dedent("""\
+                shr.u32 ${b32:result.x.val}, %tid.x, 7;
+                mov.u32 ${b32:result.y.val}, 0;
+                mov.u32 ${b32:result.z.val}, 0;
+            """),
+            operand_names=[],
+            result_names=["x", "y", "z"],
+            description=str(op),
+        )
+        return [lowered], list(lowered.results)
 
     def lower_tile(
         self, op: TileOp,
@@ -209,22 +364,17 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(lock_type, LockType)
         if lock_type.kind != "mbar":
             return [], [None]
-        template = textwrap.dedent("""\
-            .shared .align 8 .b64 ${smem:bar}[1];
-            mov.u32 ${b32:result.dst.val}, ${smem:bar};
-            mov.u32 ${b32:result.dst.parity}, 0;
-            mov.u32 ${b32:tid_x}, %tid.x;
-            mov.u32 ${b32:tid_y}, %tid.y;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
-            mov.u32 ${b32:tid_z}, %tid.z;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
-            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
-            @${pred:not_t0} bra ${label:after_init};
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
-            fence.mbarrier_init.release.cluster;
-            ${label:after_init}:
-            bar.sync 0;
-        """)
+        lines = [
+            ".shared .align 8 .b64 ${smem:bar}[1];",
+            "mov.u32 ${b32:result.dst.val}, ${smem:bar};",
+            "mov.u32 ${b32:result.dst.parity}, 0;",
+            *self._thread_zero_guard("init", "after_init"),
+            "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;",
+            "fence.mbarrier_init.release.cluster;",
+            "${label:after_init}:",
+            "bar.sync 0;",
+        ]
+        template = "\n".join(lines) + "\n"
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
             operand_names=[], result_names=["dst"],
@@ -620,9 +770,33 @@ class LowerToPtxTemplate(LoweringPass):
                 name, f"operand.{operand}.ptr", const, offset,
             )
 
-        desc_template = ""
-        mma_template = ""
+        desc_templates: list[str] = []
+        mma_templates: list[str] = []
+        lhs_tile_deltas = [
+            0 if j == 0 else _tile_delta(mm.lhs, mms[0].lhs, j)
+            for j, mm in enumerate(mms)
+        ]
+        rhs_tile_deltas = [
+            0 if j == 0 else _tile_delta(mm.rhs, mms[0].rhs, j)
+            for j, mm in enumerate(mms)
+        ]
+
+        def _can_update_in_place(deltas: list[int | None]) -> bool:
+            """Each tile advances the previous one, so the chain must hold."""
+            return all(delta is not None for delta in deltas) and all(
+                previous <= current
+                for previous, current in zip(deltas, deltas[1:])
+            )
+
+        update_lhs_in_place = (
+            self.compact_sass and _can_update_in_place(lhs_tile_deltas)
+        )
+        update_rhs_in_place = (
+            self.compact_sass and _can_update_in_place(rhs_tile_deltas)
+        )
         for j, mm in enumerate(mms):
+            desc_template = ""
+            mma_template = ""
             lhs_type = mm.lhs.type
             rhs_type = mm.rhs.type
             dst_type = mm.dst.type
@@ -680,18 +854,40 @@ class LowerToPtxTemplate(LoweringPass):
             dst_name = _operand(self.value_map[mm.dst], "dst")
 
             desc_rhs = f"desc_rhs{j}"
-            desc_template += _desc(
-                desc_rhs, "desc_rhs0", rhs_delta,
-                mm.rhs, "rhs", desc_const_rhs,
-            )
+            if j > 0 and update_rhs_in_place:
+                desc_rhs = "desc_rhs0"
+                assert rhs_delta is not None
+                increment = (rhs_delta - rhs_tile_deltas[j - 1]) // 16
+                if increment:
+                    desc_template += (
+                        f"add.u64 ${{b64:{desc_rhs}}}, "
+                        f"${{b64:{desc_rhs}}}, {increment};\n"
+                    )
+            else:
+                desc_template += _desc(
+                    desc_rhs, "desc_rhs0", rhs_delta,
+                    mm.rhs, "rhs", desc_const_rhs,
+                )
+            desc_lhs_names: list[str] = []
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
                 desc_lhs = f"desc_lhs{j}_{m_it}"
-                desc_template += _desc(
-                    desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
-                    mm.lhs, "lhs", desc_const_lhs,
-                    lhs_offset if m_it > 0 else None,
-                )
+                if j > 0 and update_lhs_in_place:
+                    desc_lhs = f"desc_lhs0_{m_it}"
+                    assert lhs_delta is not None
+                    increment = (lhs_delta - lhs_tile_deltas[j - 1]) // 16
+                    if increment:
+                        desc_template += (
+                            f"add.u64 ${{b64:{desc_lhs}}}, "
+                            f"${{b64:{desc_lhs}}}, {increment};\n"
+                        )
+                else:
+                    desc_template += _desc(
+                        desc_lhs, f"desc_lhs0_{m_it}", lhs_delta,
+                        mm.lhs, "lhs", desc_const_lhs,
+                        lhs_offset if m_it > 0 else None,
+                    )
+                desc_lhs_names.append(desc_lhs)
 
             reg_offset = 0
             for m_it in range(m_iters):
@@ -702,11 +898,27 @@ class LowerToPtxTemplate(LoweringPass):
                 mma_template += textwrap.dedent(f"""\
                     wgmma.mma_async.sync.aligned.m64n{n_dim}k16.f32.bf16.bf16
                       {{{regs}}},
-                      ${{b64:desc_lhs{j}_{m_it}}},
+                      ${{b64:{desc_lhs_names[m_it]}}},
                       ${{b64:{desc_rhs}}},
                       1, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
+
+            desc_templates.append(desc_template)
+            mma_templates.append(mma_template)
+
+        if update_lhs_in_place or update_rhs_in_place:
+            # In-place updates alias every tile onto the first tile's
+            # descriptor registers, so a tile's mmas have to issue before the
+            # next tile's add.u64 overwrites what they read.
+            wgmma_template = "".join(
+                desc_template + mma_template
+                for desc_template, mma_template in zip(
+                    desc_templates, mma_templates,
+                )
+            )
+        else:
+            wgmma_template = "".join(desc_templates) + "".join(mma_templates)
 
         # One commit group for the whole batch: single fence, all mma_async, one
         # commit. Hardware serializes same-accumulator mmas, so the await's lone
@@ -715,8 +927,7 @@ class LowerToPtxTemplate(LoweringPass):
         # warpgroup-wide wgmma reads).
         template = (
             "wgmma.fence.sync.aligned;\n"
-            + desc_template
-            + mma_template
+            + wgmma_template
             + "wgmma.commit_group.sync.aligned;\n"
         )
 
@@ -810,6 +1021,22 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_mbar(
         self, op: AwaitOp, lock: Value,
     ) -> tuple[list[Op], list[object]]:
+        if self.compact_sass:
+            template = textwrap.dedent(r"""
+                ${label:wait}:
+                mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity};
+                @!${pred:mbar_done} bra ${label:wait};
+                xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;
+            """)
+            new_op = PTXTemplateOp.build(
+                operands=[lock],
+                result_types=[],
+                template=template,
+                operand_names=["lock"],
+                result_names=[],
+                description=str(op),
+            )
+            return [new_op], []
         # Materializing the optional hint in a virtual register lets ptxas
         # select the compact fused wait; an immediate or test_wait expands
         # into substantially more phase-check, sleep, or yield instructions.
@@ -1242,18 +1469,36 @@ class LowerToPtxTemplate(LoweringPass):
                 shr.u32 ${{b32:st_wg}}, ${{b32:st_full_tid}}, 7;
                 setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
             """)
-        template = writer_setup + textwrap.dedent(f"""\
-            mov.u32 ${{b32:st_lane}}, %laneid;
-            mov.u32 ${{b32:st_tid}}, %tid.x;
-            and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
-            shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
-            and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 7;
-            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
-            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 3;
-            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
-            mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, 64, ${{b32:st_col}};
-            shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
-        """)
+        operands = [dst, src]
+        operand_names = ["dst", "src"]
+        result_types = []
+        result_names = []
+        can_reuse_offset = self.compact_sass and writer_wg is None
+        stmatrix_offset = self.stmatrix_offsets.get(64) if can_reuse_offset else None
+        if stmatrix_offset is None:
+            result_types = [IndexType()] if can_reuse_offset else []
+            result_names = ["offset"] if can_reuse_offset else []
+            offset_reg = (
+                "${b32:result.offset.val}"
+                if can_reuse_offset else "${b32:st_off}"
+            )
+            template = writer_setup + textwrap.dedent(f"""\
+                mov.u32 ${{b32:st_lane}}, %laneid;
+                mov.u32 ${{b32:st_tid}}, %tid.x;
+                and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
+                shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
+                and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 7;
+                mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
+                shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 3;
+                shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
+                mad.lo.u32 {offset_reg}, ${{b32:st_row}}, 64, ${{b32:st_col}};
+                shl.b32 {offset_reg}, {offset_reg}, 1;
+            """)
+        else:
+            operands.append(stmatrix_offset)
+            operand_names.append("offset")
+            offset_reg = "${b32:operand.offset.val}"
+            template = writer_setup
         groups: list[tuple[list[int], int]] = []
         for i in range(0, len(register_starts), 2):
             first0 = register_starts[i]
@@ -1281,7 +1526,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"${{b32:operand.src.r{i}}}" for i in registers
             )
             template += textwrap.dedent(f"""\
-                add.u32 ${{b32:st_addr_off}}, ${{b32:st_off}}, {physical_offset};
+                add.u32 ${{b32:st_addr_off}}, {offset_reg}, {physical_offset};
                 and.b32 ${{b32:st_swizzle_mask}}, ${{b32:st_addr_off}}, 896;
                 shr.u32 ${{b32:st_swizzle_mask}}, ${{b32:st_swizzle_mask}}, 3;
                 xor.b32 ${{b32:st_addr_off}}, ${{b32:st_addr_off}},
@@ -1294,10 +1539,12 @@ class LowerToPtxTemplate(LoweringPass):
                 f"[${{b32:st_addr}}], {{{regs}}};\n"
             )
         lowered = PTXTemplateOp.build(
-            operands=[dst, src], result_types=[], template=template,
-            operand_names=["dst", "src"], result_names=[],
+            operands=operands, result_types=result_types, template=template,
+            operand_names=operand_names, result_names=result_names,
             description=str(op),
         )
+        if can_reuse_offset and stmatrix_offset is None:
+            self.stmatrix_offsets[64] = lowered.result()
         return [lowered], []
 
     def _lower_move_smem_to_wrmem_mma(
@@ -1454,14 +1701,9 @@ class LowerToPtxTemplate(LoweringPass):
         # The RAW (all threads finish writing the smem tile before t0 stores it) is
         # handled by insert_syncs, which emits a barrier before this async.
 
+        guard = "\n".join(self._thread_zero_guard("st", "st_done"))
         template = textwrap.dedent(f"""\
-            mov.u32 ${{b32:st_tid}}, %tid.x;
-            mov.u32 ${{b32:st_tidy}}, %tid.y;
-            or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidy}};
-            mov.u32 ${{b32:st_tidz}}, %tid.z;
-            or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidz}};
-            setp.ne.s32 ${{pred:st_not_t0}}, ${{b32:st_tid}}, 0;
-            @${{pred:st_not_t0}} bra ${{label:st_done}};
+            {guard}
             fence.proxy.async.shared::cta;
             {coordinate_code}
             {tma_instruction}
@@ -1541,13 +1783,7 @@ class LowerToPtxTemplate(LoweringPass):
         # The buffer-reuse WAR (t0's reload vs prior readers of the smem tile) is
         # handled by insert_syncs, which emits a barrier before this async.
         lines = [
-            "mov.u32 ${b32:tid_x}, %tid.x;",
-            "mov.u32 ${b32:tid_y}, %tid.y;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
-            "mov.u32 ${b32:tid_z}, %tid.z;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};",
-            "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
-            "@${pred:not_t0} bra ${label:after_load};",
+            *self._thread_zero_guard("load", "after_load"),
             *load_lines,
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
             f"[${{b32:operand.lock.val}}], {total_bytes};",

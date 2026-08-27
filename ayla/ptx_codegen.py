@@ -433,8 +433,13 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
                     key = base if mname == "" else f"{base}.{mname}"
                     placeholder_values[key] = rname
 
-    bind_values("operand", op.operands, op.operand_names)
-    bind_values("result", op.results, op.result_names)
+    inline = op.attrs.get("inline") is True
+    if inline:
+        bind_values("result", op.results, op.result_names)
+        bind_values("operand", op.operands, op.operand_names)
+    else:
+        bind_values("operand", op.operands, op.operand_names)
+        bind_values("result", op.results, op.result_names)
 
     def repl(m: re.Match) -> str:
         ty, name = m.group("ty"), m.group("name")
@@ -446,6 +451,11 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
         return placeholder_values[name]
 
     expanded = re.sub(PLACEHOLDER_RE, repl, op.template)
+
+    if inline:
+        for line in expanded.splitlines():
+            p.write_line(line.strip())
+        return
 
     p.write_newline_once()
     p.write_line(f"// PTX template `{_op_description(p, op)}`")

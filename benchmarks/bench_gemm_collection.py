@@ -96,6 +96,26 @@ def main() -> None:
             "ayla.auto_matmul (wgmma256 wg, split output, 4 tiles/CTA, A+C evict-first)",
             "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_output_ef",
         ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, full output, 4 tiles/CTA, A+C evict-first)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, full output, batched mbarrier init)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_batched_barriers",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, full output, startup TMA order 0/2/1)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_stage021",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, full output, lane-zero TMA guards)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_lane0",
+        ),
+        ayla_bf16(
+            "ayla.auto_matmul (wgmma256 wg, full output, compact SASS lowering)",
+            "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_compact_sass",
+        ),
         BenchGemmConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,

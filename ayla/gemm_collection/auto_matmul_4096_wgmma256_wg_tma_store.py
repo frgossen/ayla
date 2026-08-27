@@ -1,7 +1,9 @@
 """Configurable wgmma256 GEMM with pipelined TMA output stores."""
+import re
 import textwrap
 
-from ..gpu_dialect import gpu_dialect
+from ..base.ir import find_ops
+from ..gpu_dialect import AsyncOp, KernelOp, TileOp, gpu_dialect
 from ..passes.canonicalize import canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
@@ -35,6 +37,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    batch_mbarrier_init: bool = False,
+    startup_tma_stage_order: tuple[int, ...] | None = None,
+    lane_zero_tma_guard: bool = False,
+    compact_sass: bool = False,
     variant_suffix: str | None = None,
 ):
     if output_tiles_per_cta not in (1, 2, 4):
@@ -58,6 +64,13 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix"):
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
+    if (
+        startup_tma_stage_order is not None
+        and tuple(sorted(startup_tma_stage_order)) != tuple(range(operand_stages))
+    ):
+        raise ValueError(
+            "startup_tma_stage_order must be a permutation of operand stages"
+        )
     if output_store == "scalar":
         output_tma_inner_size = None
     problem_name = (
@@ -199,7 +212,53 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             label_filter="outm",
         )
     module = schedule_async(module)
-    return canonicalize(module)
+    module = canonicalize(module)
+    if batch_mbarrier_init:
+        kernel = module.body.ops[0]
+        assert isinstance(kernel, KernelOp)
+        kernel.attrs["batch_mbarrier_init"] = True
+    if lane_zero_tma_guard:
+        kernel = module.body.ops[0]
+        assert isinstance(kernel, KernelOp)
+        kernel.attrs["lane_zero_tma_guard"] = True
+    if compact_sass:
+        kernel = module.body.ops[0]
+        assert isinstance(kernel, KernelOp)
+        kernel.attrs["compact_sass"] = True
+    if startup_tma_stage_order is not None:
+        kernel = module.body.ops[0]
+        assert isinstance(kernel, KernelOp)
+        block = kernel.body
+        stage_pairs: dict[int, tuple[TileOp, AsyncOp]] = {}
+        for index, op in enumerate(block.ops):
+            if not isinstance(op, AsyncOp):
+                continue
+            match = re.search(
+                r"mm_lhs_smem_iter(\d+)_async_iter0$",
+                str(op.attrs.get("label", "")),
+            )
+            if match is None:
+                continue
+            coordinate = block.ops[index - 1]
+            if not isinstance(coordinate, TileOp):
+                raise ValueError("startup TMA load is not preceded by its tile")
+            stage_pairs[int(match.group(1))] = (coordinate, op)
+        if set(stage_pairs) != set(startup_tma_stage_order):
+            raise ValueError(
+                "could not find every startup TMA stage load: "
+                f"found {sorted(stage_pairs)}, expected "
+                f"{sorted(startup_tma_stage_order)}"
+            )
+        members = [member for pair in stage_pairs.values() for member in pair]
+        indices = sorted(block.ops.index(member) for member in members)
+        if indices != list(range(indices[0], indices[0] + len(indices))):
+            raise ValueError("startup TMA stage loads are not contiguous")
+        block.ops[indices[0]:indices[-1] + 1] = [
+            member
+            for stage in startup_tma_stage_order
+            for member in stage_pairs[stage]
+        ]
+    return module
 
 
 @register
@@ -247,4 +306,89 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_output_ef_modu
             "dst": {"l2_cache_hint": "evict_first"},
         },
         variant_suffix="output_ef",
+    )
+
+
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store_module():
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        variant_suffix="full_output_store",
+    )
+
+
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_batched_barriers_module():
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        batch_mbarrier_init=True,
+        variant_suffix="full_output_batched_barriers",
+    )
+
+
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_stage021_module():
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        batch_mbarrier_init=True,
+        startup_tma_stage_order=(0, 2, 1),
+        variant_suffix="full_output_stage021",
+    )
+
+
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_lane0_module():
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        batch_mbarrier_init=True,
+        startup_tma_stage_order=(0, 2, 1),
+        lane_zero_tma_guard=True,
+        variant_suffix="full_output_lane0",
+    )
+
+
+@register
+def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_compact_sass_module():
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        batch_mbarrier_init=True,
+        startup_tma_stage_order=(0, 2, 1),
+        lane_zero_tma_guard=True,
+        compact_sass=True,
+        variant_suffix="full_output_compact_sass",
     )

@@ -94,6 +94,98 @@ def test_four_tile_output_evict_first_reaches_tma_stores():
     assert kernel.ptx.count("bulk_group.L2::cache_hint") == 8
 
 
+def test_four_tile_full_output_uses_one_store_per_output_tile():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+        variant_suffix="full_output_store",
+    ))
+    assert kernel.name.endswith("_4tiles_full_output_store")
+    assert kernel.ptx.count("cp.async.bulk.tensor.3d.global.shared") == 4
+    assert kernel.ptx.count("cp.async.bulk.wait_group") == 4
+    assert kernel.ptx.count("stmatrix.") == 64
+
+
+def test_four_tile_batches_startup_mbarrier_initialization():
+    common = dict(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    )
+    baseline = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        **common, variant_suffix="full_output_store_test",
+    ))
+    batched = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        **common, batch_mbarrier_init=True,
+        variant_suffix="full_output_batched_barriers_test",
+    ))
+    assert batched.ptx.count("mbarrier.init") == baseline.ptx.count("mbarrier.init")
+    assert batched.ptx.count("fence.mbarrier_init") == 1
+    assert batched.ptx.count("bar.sync 0;") == baseline.ptx.count("bar.sync 0;") - 3
+
+
+def test_four_tile_reorders_startup_tma_stages():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        batch_mbarrier_init=True,
+        startup_tma_stage_order=(0, 2, 1),
+        variant_suffix="full_output_stage021_test",
+    ))
+    startup_loads = [
+        kernel.ptx.index(f"mm_lhs_smem_iter{stage}_async_iter0")
+        for stage in range(3)
+    ]
+    assert startup_loads[0] < startup_loads[2] < startup_loads[1]
+
+
+def test_four_tile_uses_lane_zero_tma_guards():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        batch_mbarrier_init=True,
+        startup_tma_stage_order=(0, 2, 1),
+        lane_zero_tma_guard=True,
+        variant_suffix="full_output_lane0_test",
+    ))
+    assert "%laneid" in kernel.ptx
+    assert "setp.ge.u32" in kernel.ptx
+    assert "%tid.y" not in kernel.ptx
+    assert "%tid.z" not in kernel.ptx
+
+
+def test_four_tile_compact_sass_reuses_scalar_setup():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        batch_mbarrier_init=True,
+        startup_tma_stage_order=(0, 2, 1),
+        lane_zero_tma_guard=True,
+        compact_sass=True,
+        variant_suffix="full_output_compact_sass_test",
+    ))
+    assert kernel.ptx.count("%laneid") == 1
+    assert kernel.ptx.count("%tid.x") == 1
+    assert "0x989680" not in kernel.ptx
+    assert kernel.ptx.count("mbarrier.try_wait") == 28
+    assert kernel.ptx.count("stmatrix.") == 64
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -122,6 +214,31 @@ def test_four_tile_output_evict_first_reaches_tma_stores():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_output_ef,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_output_ef",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_store",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_batched_barriers,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_batched_barriers",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_stage021,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_stage021",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_lane0,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_lane0",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_full_output_compact_sass,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_compact_sass",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],
