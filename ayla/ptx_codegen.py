@@ -291,7 +291,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         name=kernel.name,
         signature=kernel.signature,
         grid_dim=grid_dim,
-        block_dim=kernel.block_dim,
+        block_dim=tuple(kernel.block_dim),
     )
 
 

@@ -99,16 +99,18 @@ class KernelOp(Op):
         return self.attrs["name"]  # type: ignore[return-value]
 
     @property
-    def grid_dim(self) -> tuple[int | None, int | None, int | None]:
-        return tuple(self.attrs["grid_dim"])  # type: ignore[return-value]
+    def grid_dim(self) -> list[int | None]:
+        """The launch grid, as the live list -- writing an axis is the write."""
+        return self.attrs["grid_dim"]  # type: ignore[return-value]
 
     @grid_dim.setter
     def grid_dim(self, value) -> None:
         self.attrs["grid_dim"] = list(value)
 
     @property
-    def block_dim(self) -> tuple[int | None, int | None, int | None]:
-        return tuple(self.attrs["block_dim"])  # type: ignore[return-value]
+    def block_dim(self) -> list[int | None]:
+        """The block shape, as the live list -- writing an axis is the write."""
+        return self.attrs["block_dim"]  # type: ignore[return-value]
 
     @block_dim.setter
     def block_dim(self, value) -> None:
