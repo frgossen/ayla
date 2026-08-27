@@ -15,6 +15,109 @@ from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 
 
+def _resolve_launch_dim_constraints(
+    a_list: list[int | None], b_list: list[int | None],
+) -> list[int | None]:
+    """Symmetric per-axis merge of two ``int | None`` lists.
+
+    For each axis: if either side is ``None``, take the other; if they
+    agree, take it; otherwise raise.
+    """
+    assert len(a_list) == len(b_list)
+    result: list[int | None] = []
+    for a, b in zip(a_list, b_list):
+        if a is None:
+            result.append(b)
+        elif b is None:
+            result.append(a)
+        elif a == b:
+            result.append(a)
+        else:
+            raise ValueError(
+                f"launch dim conflict: {a_list} vs {b_list}"
+            )
+    return result
+
+
+def _tile_level_iv(
+    tile_level: str,
+    tile_label: str | None,
+    block_ids_op: BlockIdsOp | None,
+    thread_ids_op: ThreadIdsOp | None,
+    wg_id_op: WarpGroupIdOp | None,
+) -> Value:
+    """The induction variable a tile level iterates over.
+
+    A ``for`` level gets a fresh block argument; every other level takes
+    the matching axis of the id op the caller emitted for it.
+    """
+    if tile_level == "for":
+        return Value(name=tile_label, type=IndexType())
+    elif tile_level == "block.x":
+        return block_ids_op.x
+    elif tile_level == "block.y":
+        return block_ids_op.y
+    elif tile_level == "block.z":
+        return block_ids_op.z
+    elif tile_level == "thread.x":
+        return thread_ids_op.x
+    elif tile_level == "thread.y":
+        return thread_ids_op.y
+    elif tile_level == "thread.z":
+        return thread_ids_op.z
+    elif tile_level == "wg.x":
+        return wg_id_op.x
+    else:
+        raise ValueError(
+            f"TileMatmul: unexpected tile_level {tile_level!r}"
+        )
+
+
+def _build_tile_op(
+    arg: Value,
+    dim_names: list[str],
+    *,
+    tile_dims: list[str],
+    tile_idxs: list[Value],
+    tile_sizes: list[int],
+) -> tuple[list[Op], Value]:
+    """Build TileOps that contract the dims of ``arg`` named in
+    ``tile_dims`` to the matching ``tile_sizes`` at the matching
+    ``tile_idxs``. Each tiling step produces a new value that
+    subsequent steps operate on, so the same dim can be tiled
+    multiple times (e.g. K=64 then K=16).
+    """
+    assert len(dim_names) == len(arg.type.sizes), (
+        f"_build_tile_op: dim_names ({dim_names}) must have one entry "
+        f"per arg dim ({arg.type.sizes})"
+    )
+    assert len(tile_dims) == len(tile_idxs) == len(tile_sizes), (
+        "_build_tile_op: tile_dims, tile_idxs, tile_sizes must have the "
+        "same length"
+    )
+    name_to_idx = {n: i for i, n in enumerate(dim_names)}
+    ops: list[Op] = []
+    cur = arg
+    maybe_partial_dims: set[str] = set()
+    for name, iv, ts in zip(tile_dims, tile_idxs, tile_sizes):
+        d = name_to_idx.get(name)
+        if d is None:
+            continue
+        maybe_partial = name in maybe_partial_dims or cur.type.sizes[d] % ts != 0
+        if maybe_partial:
+            maybe_partial_dims.add(name)
+        new_type = clone_type(cur.type)
+        indices: list[Value | int] = [0] * len(new_type.sizes)
+        indices[d] = iv
+        new_type.sizes[d] = ts
+        tile_op = TileOp.build(
+            cur, indices, new_type, maybe_partial=maybe_partial,
+        )
+        ops.append(tile_op)
+        cur = tile_op.result()
+    return ops, cur
+
+
 class TileMatmul(LoweringPass):
     """Tile every ``matmul`` along ``tile_dims`` by matching ``tile_sizes``.
 
@@ -164,28 +267,12 @@ class TileMatmul(LoweringPass):
             wg_id_op = WarpGroupIdOp.build()
             new_ops.append(wg_id_op)
 
-        ivs: list[Value] = []
-        for tile_level, tile_label in zip(self.tile_levels, self.tile_labels):
-            if tile_level == "for":
-                ivs.append(Value(name=tile_label, type=IndexType()))
-            elif tile_level == "block.x":
-                ivs.append(block_ids_op.x)
-            elif tile_level == "block.y":
-                ivs.append(block_ids_op.y)
-            elif tile_level == "block.z":
-                ivs.append(block_ids_op.z)
-            elif tile_level == "thread.x":
-                ivs.append(thread_ids_op.x)
-            elif tile_level == "thread.y":
-                ivs.append(thread_ids_op.y)
-            elif tile_level == "thread.z":
-                ivs.append(thread_ids_op.z)
-            elif tile_level == "wg.x":
-                ivs.append(wg_id_op.x)
-            else:
-                raise ValueError(
-                    f"TileMatmul: unexpected tile_level {tile_level!r}"
-                )
+        ivs = [
+            _tile_level_iv(
+                tile_level, tile_label, block_ids_op, thread_ids_op, wg_id_op,
+            )
+            for tile_level, tile_label in zip(self.tile_levels, self.tile_labels)
+        ]
 
         body_ops: list[Op] = []
         ops, lhs = _build_tile_op(
@@ -269,75 +356,6 @@ class TileMatmul(LoweringPass):
             raise ValueError(
                 f"TileMatmul: unexpected tile_level {tile_level!r}"
             )
-
-
-def _resolve_launch_dim_constraints(
-    a_list: list[int | None], b_list: list[int | None],
-) -> list[int | None]:
-    """Symmetric per-axis merge of two ``int | None`` lists.
-
-    For each axis: if either side is ``None``, take the other; if they
-    agree, take it; otherwise raise.
-    """
-    assert len(a_list) == len(b_list)
-    result: list[int | None] = []
-    for a, b in zip(a_list, b_list):
-        if a is None:
-            result.append(b)
-        elif b is None:
-            result.append(a)
-        elif a == b:
-            result.append(a)
-        else:
-            raise ValueError(
-                f"launch dim conflict: {a_list} vs {b_list}"
-            )
-    return result
-
-
-def _build_tile_op(
-    arg: Value,
-    dim_names: list[str],
-    *,
-    tile_dims: list[str],
-    tile_idxs: list[Value],
-    tile_sizes: list[int],
-) -> tuple[list[Op], Value]:
-    """Build TileOps that contract the dims of ``arg`` named in
-    ``tile_dims`` to the matching ``tile_sizes`` at the matching
-    ``tile_idxs``. Each tiling step produces a new value that
-    subsequent steps operate on, so the same dim can be tiled
-    multiple times (e.g. K=64 then K=16).
-    """
-    assert len(dim_names) == len(arg.type.sizes), (
-        f"_build_tile_op: dim_names ({dim_names}) must have one entry "
-        f"per arg dim ({arg.type.sizes})"
-    )
-    assert len(tile_dims) == len(tile_idxs) == len(tile_sizes), (
-        "_build_tile_op: tile_dims, tile_idxs, tile_sizes must have the "
-        "same length"
-    )
-    name_to_idx = {n: i for i, n in enumerate(dim_names)}
-    ops: list[Op] = []
-    cur = arg
-    maybe_partial_dims: set[str] = set()
-    for name, iv, ts in zip(tile_dims, tile_idxs, tile_sizes):
-        d = name_to_idx.get(name)
-        if d is None:
-            continue
-        maybe_partial = name in maybe_partial_dims or cur.type.sizes[d] % ts != 0
-        if maybe_partial:
-            maybe_partial_dims.add(name)
-        new_type = clone_type(cur.type)
-        indices: list[Value | int] = [0] * len(new_type.sizes)
-        indices[d] = iv
-        new_type.sizes[d] = ts
-        tile_op = TileOp.build(
-            cur, indices, new_type, maybe_partial=maybe_partial,
-        )
-        ops.append(tile_op)
-        cur = tile_op.result()
-    return ops, cur
 
 
 def tile_matmul(
