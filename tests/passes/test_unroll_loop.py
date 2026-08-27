@@ -1,9 +1,10 @@
 """Tests for the unroll_loop pass."""
 import textwrap
 
-from ayla.gpu_dialect import AllocOp, gpu_dialect
+from ayla.gpu_dialect import AllocOp, ForOp, MoveOp, gpu_dialect
 from ayla.base.ir import iter_ops
 from ayla.passes.canonicalize import canonicalize
+from ayla.passes.folding import folding
 from ayla.passes.licm import licm
 from ayla.passes.unroll_loop import unroll_loop
 
@@ -63,3 +64,30 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
     # CSE can see the two are the same buffer.
     folded = canonicalize(licm(module))
     assert sum(isinstance(o, AllocOp) for o in iter_ops(folded)) == 1
+
+
+def test_unroll_wider_than_the_trip_count_leaves_an_empty_main_loop():
+    """Three iterations by four: no main loop survives, three tail copies.
+
+    Nothing divides into the main loop, so it is emitted empty rather than
+    special cased away, and folding erases it -- the same job it does for any
+    other loop that never runs.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x4xf32>) {
+            for (%k: index = 0 to 3) attrs={label: "k"} {
+              %t: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %k: index)
+              move(%a: gmem<4x4xf32>, %t: gmem<4x1xf32 strides=[4, 1]>)
+            }
+          }
+        }""")
+
+    module = unroll_loop(gpu_dialect.parse(module_str), unroll_factor=4, label_filter="k")
+
+    loops = [o for o in iter_ops(module) if isinstance(o, ForOp)]
+    assert len(loops) == 1 and loops[0].trip_count == 0
+
+    folded = folding(module)
+    assert not [o for o in iter_ops(folded) if isinstance(o, ForOp)]
+    assert sum(isinstance(o, MoveOp) for o in iter_ops(folded)) == 3

@@ -56,10 +56,7 @@ class UnrollLoop(LoweringPass):
 
         new_iv = Value(name=op.iv.name, type=IndexType())
         main_body_ops: list[Op] = []
-        # TODO: remove the zero-main-loop case after PTX loop lowering can
-        # canonicalize an empty loop instead of emitting its body once.
-        num_main_copies = self.unroll_factor if main_trip_count else 0
-        for i in range(num_main_copies):
+        for i in range(self.unroll_factor):
             offset = IndexConstantOp.build(value=i * step)
             iteration_iv = IndexAddOp.build(lhs=new_iv, rhs=offset.result())
             main_body_ops.extend([offset, iteration_iv])
@@ -73,10 +70,12 @@ class UnrollLoop(LoweringPass):
             tail_ops.append(tail_iv)
             tail_ops.extend(_clone_iteration(op, tail_iv.result(), f"_tail{i}"))
 
-        result: list[Op] = []
-        if main_trip_count:
-            new_body = Block(arguments=[new_iv], ops=main_body_ops)
-            result.append(ForOp.build(lb=lb, ub=new_ub, step=new_step, body=new_body, attrs=extra_attrs))
+        # An empty main loop is left for folding to erase rather than special
+        # cased here.
+        new_body = Block(arguments=[new_iv], ops=main_body_ops)
+        result: list[Op] = [
+            ForOp.build(lb=lb, ub=new_ub, step=new_step, body=new_body, attrs=extra_attrs)
+        ]
         result.extend(tail_ops)
         return result, []
 
