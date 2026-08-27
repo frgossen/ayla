@@ -1,6 +1,7 @@
 """Registered variants of the configurable pipelined TMA GEMM."""
 
 from ..gemm import auto_matmul_4096_wgmma256_wg_tma_store_module
+from ..passes.pack_smem_allocs import pack_smem_allocs
 from .registry import register
 
 
@@ -28,7 +29,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2_module():
 
 @register
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
-    return auto_matmul_4096_wgmma256_wg_tma_store_module(
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=4,
         operand_stages=3,
         output_slices=2,
@@ -38,3 +39,4 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
             "dst": {"l2_cache_hint": "evict_first"},
         },
     )
+    return pack_smem_allocs(module)
