@@ -93,6 +93,28 @@ def test_four_tile_output_evict_first_reaches_tma_stores():
     assert kernel.ptx.count("bulk_group.L2::cache_hint") == 8
 
 
+def test_lhs_l2_promotion_reaches_tma_descriptor():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=2,
+        output_store_buffers=2,
+        operand_move_attrs={
+            "lhs": {
+                "l2_cache_hint": "evict_first",
+                "l2_promotion": "256B",
+            },
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+    assert input_descs[0].l2_promotion == "256B"
+    assert input_descs[1].l2_promotion is None
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(

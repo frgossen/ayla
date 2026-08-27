@@ -73,11 +73,22 @@ static uintptr_t module_get_function(
     return reinterpret_cast<uintptr_t>(fn);
 }
 
+static CUtensorMapL2promotion parse_l2_promotion(
+    const std::string& l2_promotion
+) {
+    if (l2_promotion == "64B") return CU_TENSOR_MAP_L2_PROMOTION_L2_64B;
+    if (l2_promotion == "128B") return CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+    if (l2_promotion == "256B") return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+    TORCH_CHECK(l2_promotion.empty(), "unsupported TMA L2 promotion");
+    return CU_TENSOR_MAP_L2_PROMOTION_NONE;
+}
+
 static CUtensorMap tensor_map_encode_2d(
     const at::Tensor& tensor,
     const std::vector<int64_t>& tile_shape,
     CUtensorMapDataType dtype,
-    CUtensorMapSwizzle swizzle
+    CUtensorMapSwizzle swizzle,
+    const std::string& l2_promotion
 ) {
     cuuint64_t global_dim[2] = {
         static_cast<cuuint64_t>(tensor.size(1)),
@@ -96,7 +107,7 @@ static CUtensorMap tensor_map_encode_2d(
         &map, dtype, 2, tensor.data_ptr(),
         global_dim, global_strides, box_dim, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        parse_l2_promotion(l2_promotion),
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
     return map;
@@ -108,7 +119,8 @@ static CUtensorMap tensor_map_encode_3d(
     CUtensorMapDataType dtype,
     CUtensorMapSwizzle swizzle,
     int64_t block_width,
-    const std::string& block_order
+    const std::string& block_order,
+    const std::string& l2_promotion
 ) {
     TORCH_CHECK(block_width > 0, "TMA block width must be positive");
     TORCH_CHECK(tensor.size(1) % block_width == 0,
@@ -145,7 +157,7 @@ static CUtensorMap tensor_map_encode_3d(
         &map, dtype, 3, tensor.data_ptr(),
         global_dim, global_strides, box_dim, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        parse_l2_promotion(l2_promotion),
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
     return map;
@@ -164,7 +176,8 @@ static const CUtensorMap* tensor_map_cached(
     std::vector<int64_t> tile_shape,
     std::string swizzle,
     int64_t block_width,
-    std::string block_order
+    std::string block_order,
+    std::string l2_promotion
 ) {
     TORCH_CHECK(tensor.is_cuda(), "tensor must be on CUDA");
     TORCH_CHECK(tensor.dim() == 2, "only 2D tensors supported");
@@ -190,7 +203,7 @@ static const CUtensorMap* tensor_map_cached(
         static_cast<int64_t>(tensor.size(1)),
         static_cast<int64_t>(tensor.stride(0)),
         tile_shape[0], tile_shape[1],
-        swizzle, block_width, block_order
+        swizzle, block_width, block_order, l2_promotion
     );
     static std::map<decltype(key), CUtensorMap> cache;
     auto it = cache.find(key);
@@ -198,9 +211,9 @@ static const CUtensorMap* tensor_map_cached(
         CUtensorMap map = block_width > 0
             ? tensor_map_encode_3d(
                 tensor, tile_shape, dtype, tensor_swizzle,
-                block_width, block_order)
+                block_width, block_order, l2_promotion)
             : tensor_map_encode_2d(
-                tensor, tile_shape, dtype, tensor_swizzle);
+                tensor, tile_shape, dtype, tensor_swizzle, l2_promotion);
         it = cache.emplace(key, map).first;
     }
     return &it->second;
@@ -231,9 +244,11 @@ static void launch_kernel(
             auto swizzle = tup[2].cast<std::string>();
             auto block_width = tup[3].cast<int64_t>();
             auto block_order = tup[4].cast<std::string>();
+            auto l2_promotion = tup[5].cast<std::string>();
             arg_ptrs.push_back(const_cast<CUtensorMap*>(
                 tensor_map_cached(
-                    tensor, tile_shape, swizzle, block_width, block_order)));
+                    tensor, tile_shape, swizzle, block_width, block_order,
+                    l2_promotion)));
         } else {
             auto t = obj.cast<at::Tensor>();
             ptr_storage.push_back(reinterpret_cast<int64_t>(t.data_ptr()));
@@ -344,6 +359,7 @@ class PtxLauncher:
                     typ.swizzle or "",
                     block_width,
                     block_order,
+                    typ.l2_promotion or "",
                 ))
         return params
 
@@ -353,8 +369,8 @@ class PtxLauncher:
             if isinstance(p, torch.Tensor):
                 assert p.is_cuda, f"param {i}: expected CUDA tensor, got {p.device}"
             elif isinstance(p, tuple):
-                assert len(p) == 5, f"param {i}: expected 5-tuple, got {len(p)}"
-                t, tile, swz, block_width, block_order = p
+                assert len(p) == 6, f"param {i}: expected 6-tuple, got {len(p)}"
+                t, tile, swz, block_width, block_order, promotion = p
                 assert isinstance(t, torch.Tensor) and t.is_cuda, (
                     f"param {i}: first element must be a CUDA tensor"
                 )
@@ -367,6 +383,9 @@ class PtxLauncher:
                 )
                 assert block_order in ("row_major", "block_major"), (
                     f"param {i}: fifth element must be a supported block order"
+                )
+                assert promotion in ("", "64B", "128B", "256B"), (
+                    f"param {i}: sixth element must be a supported L2 promotion"
                 )
             else:
                 raise TypeError(f"param {i}: expected Tensor or tuple, got {type(p)}")

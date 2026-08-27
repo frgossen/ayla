@@ -1071,12 +1071,16 @@ class TmaDescType(Type):
         swizzle: str | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "TmaDescType":
+        attrs = dict(attrs or {})
+        l2_promotion = attrs.get("l2_promotion")
+        if l2_promotion not in (None, "64B", "128B", "256B"):
+            raise ValueError(f"unsupported TMA L2 promotion {l2_promotion!r}")
         return cls(attrs={
             "arg_idx": arg_idx,
             "gmem_type": gmem_type,
             "tile_shape": list(tile_shape),
             "swizzle": swizzle,
-            **(attrs or {}),
+            **attrs,
         })
 
     @property
@@ -1098,6 +1102,10 @@ class TmaDescType(Type):
     @property
     def tile_num_elements(self) -> int:
         return math.prod(self.tile_sizes)
+
+    @property
+    def l2_promotion(self) -> str | None:
+        return self.attrs.get("l2_promotion")  # type: ignore[return-value]
 
     @property
     def swizzle(self) -> str | None:
