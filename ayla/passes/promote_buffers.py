@@ -46,7 +46,7 @@ from ..gpu_dialect import (
     WrmemTensorType,
 )
 from ..base.ir import Block, Op, Value, clone_type
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 def _target_level(target_type: str) -> str:
@@ -263,7 +263,6 @@ class PromoteBuffers(LoweringPass):
         assert all(n >= 1 for n in self.tma_load_slices.values()), (
             "TMA load slice counts must be positive"
         )
-        self.register(MatmulOp, type(self).lower_matmul)
 
     def _build_smem_type(self, sizes, dtype):
         layout = dict(self.physical_layout or {})
@@ -488,6 +487,7 @@ class PromoteBuffers(LoweringPass):
         new_ops.append(move)
         return new_ops, []
 
+    @lowers(MatmulOp)
     def lower_matmul(self, op: MatmulOp):
         if self.label_filter is not None and op.attrs.get("label") != self.label_filter:
             return None

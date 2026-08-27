@@ -12,15 +12,12 @@ from ..gpu_dialect import (
     is_side_effect_free,
 )
 from ..base.ir import Op, Value
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class LICM(LoweringPass):
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.register(ForOp, type(self).lower_block_op)
-
+    @lowers(ForOp)
     def lower_block_op(
         self, op: Op,
     ) -> tuple[list[Op], list[object]]:

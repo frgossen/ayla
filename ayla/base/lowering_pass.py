@@ -1,7 +1,7 @@
 """Base class for IR-to-IR lowering passes.
 
-Subclasses register per-op rewriters via `self.register(OpType, fn)` in
-their `__init__`. Each rewriter has signature::
+Subclasses declare per-op rewriters by decorating a method with
+`@lowers(OpType)`. Each rewriter has signature::
 
     def fn(self, op) -> tuple[list[Op], list[pytree]]
 
@@ -20,36 +20,57 @@ the walker recurses into their blocks and identity-maps their results.
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, ClassVar
 
 from .ir import Block, Op, Value
 from ..gpu_dialect import ModuleOp
 from .pipeline import Pass
 
 
+def lowers(*op_types: type):
+    """Mark a method as the rewriter for ``op_types``.
+
+    `LoweringPass.__init_subclass__` collects these into the class's rewriter
+    table, so declaring one is all it takes -- there is no separate
+    registration step to keep in sync.
+    """
+    for op_type in op_types:
+        assert isinstance(op_type, type) and issubclass(op_type, Op), (
+            f"lowers: expected an Op subclass, got {op_type!r}"
+        )
+
+    def deco(fn):
+        fn._lowers = op_types
+        return fn
+
+    return deco
+
+
 class LoweringPass(Pass):
     """Walks the IR top-down, dispatching ops via a registry."""
 
+    _rewriters: ClassVar[
+        dict[type, Callable[["LoweringPass", Op], tuple[list[Op], list[object]]]]
+    ] = {}
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        table: dict[type, Callable] = {}
+        # Base classes first, so a subclass overriding a rewriter wins.
+        for klass in reversed(cls.__mro__):
+            claimed: dict[type, str] = {}
+            for name, member in vars(klass).items():
+                for op_type in getattr(member, "_lowers", ()):
+                    assert op_type not in claimed, (
+                        f"{klass.__name__}: {op_type.__name__} claimed by both "
+                        f"{claimed[op_type]} and {name}"
+                    )
+                    claimed[op_type] = name
+                    table[op_type] = member
+        cls._rewriters = table
+
     def __init__(self) -> None:
         self.value_map: dict[Value, object] = {}
-        self._rewriters: dict[
-            type,
-            Callable[["LoweringPass", Op], tuple[list[Op], list[object]]],
-        ] = {}
-
-    def register(
-        self,
-        op_type: type,
-        fn: Callable[
-            ["LoweringPass", Op], tuple[list[Op], list[object]]
-        ],
-    ) -> None:
-        """Register a rewriter for ops of `op_type`."""
-        assert op_type not in self._rewriters, (
-            f"{type(self).__name__}: rewriter for {op_type.__name__} "
-            "already registered"
-        )
-        self._rewriters[op_type] = fn
 
     def run(self, module: ModuleOp) -> ModuleOp:
         new_ops, new_results = self.lower_op(module)

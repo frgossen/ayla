@@ -34,7 +34,7 @@ from ..gpu_dialect import (
     root_buffer,
 )
 from ..base.ir import Block, Op, Value, clone_op
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class PipelineLoop(LoweringPass):
@@ -47,7 +47,6 @@ class PipelineLoop(LoweringPass):
         pipelining_offset: int,
     ) -> None:
         super().__init__()
-        self.register(ForOp, type(self).lower_for)
         self.label_filter_loop = re.compile(label_filter_loop)
         self.label_filter_op = re.compile(label_filter_op)
         self.pipelining_offset = pipelining_offset
@@ -248,6 +247,7 @@ class PipelineLoop(LoweringPass):
         label = op.attrs.get("label", "")
         return self.label_filter_loop.fullmatch(label or "") is not None
 
+    @lowers(ForOp)
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:

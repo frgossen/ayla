@@ -47,7 +47,7 @@ from ..gpu_dialect import (
     root_buffer,
 )
 from ..base.ir import Op, Value, find_ops
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class LowerToPtxTemplate(LoweringPass):
@@ -56,16 +56,8 @@ class LowerToPtxTemplate(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
-        self.register(KernelOp, type(self).lower_kernel)
-        self.register(AllocOp, type(self).lower_alloc)
-        self.register(MoveOp, type(self).lower_move)
-        self.register(MatmulOp, type(self).lower_matmul)
-        self.register(AsyncOp, type(self).lower_async)
-        self.register(AwaitOp, type(self).lower_await)
-        self.register(BarrierOp, type(self).lower_barrier)
-        self.register(ConvertOp, type(self).lower_convert)
-        self.register(TileOp, type(self).lower_tile)
 
+    @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
@@ -114,6 +106,7 @@ class LowerToPtxTemplate(LoweringPass):
         policy = f"${{b64:operand.{policy_name}.ptr}}"
         return f"{opcode}.L2::cache_hint {arguments}, {policy};"
 
+    @lowers(TileOp)
     def lower_tile(
         self, op: TileOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -186,6 +179,7 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops.append(ptr_add)
         return new_ops, [ptr_add.result()]
 
+    @lowers(AllocOp)
     def lower_alloc(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
@@ -310,6 +304,7 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], [new_op.result()]
 
+    @lowers(ConvertOp)
     def lower_convert(
         self, op: ConvertOp,
     ) -> tuple[list[Op], list[object]]:
@@ -358,6 +353,7 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], []
 
+    @lowers(MatmulOp)
     def lower_matmul(
         self, op: MatmulOp,
     ) -> tuple[list[Op], list[object]]:
@@ -489,6 +485,7 @@ class LowerToPtxTemplate(LoweringPass):
 
 
 
+    @lowers(AsyncOp)
     def lower_async(
         self, op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:
@@ -730,6 +727,7 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], []
 
+    @lowers(MoveOp)
     def lower_move(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
@@ -758,6 +756,7 @@ class LowerToPtxTemplate(LoweringPass):
             f"{type(dst_type).__name__} <- {type(src_type).__name__}"
         )
 
+    @lowers(AwaitOp)
     def lower_await(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
@@ -773,6 +772,7 @@ class LowerToPtxTemplate(LoweringPass):
             f"lower_await: unsupported lock kind {kind!r}"
         )
 
+    @lowers(BarrierOp)
     def lower_barrier(
         self, op: BarrierOp,
     ) -> tuple[list[Op], list[object]]:

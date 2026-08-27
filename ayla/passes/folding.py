@@ -25,21 +25,13 @@ from ..gpu_dialect import (
     TileOp,
 )
 from ..base.ir import Op, Value, clone_op
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class Folding(LoweringPass):
 
     def __init__(self) -> None:
         super().__init__()
-        self.register(ForOp, type(self).lower_for)
-        self.register(IndexAddOp, type(self).lower_add)
-        self.register(IndexMulOp, type(self).lower_mul)
-        self.register(IndexDivOp, type(self).lower_div)
-        self.register(IndexModOp, type(self).lower_mod)
-        self.register(PtrAddOp, type(self).lower_ptr_add)
-        self.register(SelectOp, type(self).lower_select)
-        self.register(TileOp, type(self).lower_tile)
         # Induction variable -> (lb, step) of the loop it belongs to, for the
         # loops enclosing the op currently being folded.
         #
@@ -52,6 +44,7 @@ class Folding(LoweringPass):
         # can go back to letting the framework walk the body.
         self._iv_congruence: dict[Value, tuple[int, int]] = {}
 
+    @lowers(ForOp)
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -73,6 +66,7 @@ class Folding(LoweringPass):
         cloned = [clone_op(body_op, vmap) for body_op in op.body.ops]
         return [iv_const, *cloned], []
 
+    @lowers(SelectOp)
     def lower_select(
         self, op: SelectOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -110,6 +104,7 @@ class Folding(LoweringPass):
                 return lhs, rhs_const
         return mapped, 0
 
+    @lowers(IndexAddOp)
     def lower_add(
         self, op: IndexAddOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -170,6 +165,7 @@ class Folding(LoweringPass):
                 return lhs, rhs_const
         return mapped, 1
 
+    @lowers(IndexMulOp)
     def lower_mul(
         self, op: IndexMulOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -241,6 +237,7 @@ class Folding(LoweringPass):
         return new_ops, [result]
 
 
+    @lowers(IndexDivOp)
     def lower_div(
         self, op: IndexDivOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -258,6 +255,7 @@ class Folding(LoweringPass):
             return [], [lhs]
         return None
 
+    @lowers(IndexModOp)
     def lower_mod(
         self, op: IndexModOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -282,6 +280,7 @@ class Folding(LoweringPass):
                 return [new_op], [new_op.result()]
         return None
 
+    @lowers(PtrAddOp)
     def lower_ptr_add(
         self, op: PtrAddOp,
     ) -> tuple[list[Op], list[object]] | None:
@@ -292,6 +291,7 @@ class Folding(LoweringPass):
         return None
 
 
+    @lowers(TileOp)
     def lower_tile(
         self, op: TileOp,
     ) -> tuple[list[Op], list[object]] | None:

@@ -28,7 +28,7 @@ from ..gpu_dialect import (
     SelectOp,
 )
 from ..base.ir import Op, clone_op
-from ..base.lowering_pass import LoweringPass
+from ..base.lowering_pass import LoweringPass, lowers
 
 
 class MultiBuffer(LoweringPass):
@@ -36,8 +36,6 @@ class MultiBuffer(LoweringPass):
 
     def __init__(self, depth: int, label_filter: str | None = None) -> None:
         super().__init__()
-        self.register(AllocOp, type(self).lower_alloc)
-        self.register(ForOp, type(self).lower_for)
         self.depth = depth
         self.label_filter = label_filter
         # The loops enclosing the allocation currently being rewritten.
@@ -47,6 +45,7 @@ class MultiBuffer(LoweringPass):
         # iterations index it. Second pass to want this; see folding.
         self._loops: list[ForOp] = []
 
+    @lowers(ForOp)
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]]:
@@ -57,6 +56,7 @@ class MultiBuffer(LoweringPass):
             self._loops.pop()
         return [op], list(op.results)
 
+    @lowers(AllocOp)
     def lower_alloc(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]] | None:
