@@ -2,7 +2,8 @@
 
 Folds index arithmetic where operands are known constants,
 eliminates trivial operations like `x * 1`, `x + 0`, `0 * n`,
-`x * 0`, removes no-op tile ops, and resolves a `select` whose index is known.
+`x * 0`, removes no-op tile ops, resolves a `select` whose index is known,
+inlines a `for` that runs once, and erases one that never runs.
 
 One fact beyond plain constants: inside a ``for``, the induction variable is
 congruent to ``lb`` modulo ``step``. That is enough to fold ``(iv + c) % m``
@@ -51,6 +52,11 @@ class Folding(LoweringPass):
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
+        # `(ub - lb) // step` floors, so an empty range reads as <= 0 for either
+        # sign of step. The body never runs, so nothing it defines can be
+        # referenced from outside and nothing it does is observable.
+        if op.trip_count <= 0:
+            return [], []
         if op.trip_count != 1:
             return None
         self.lower_block(op.body)
