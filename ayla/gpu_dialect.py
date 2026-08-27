@@ -1265,19 +1265,7 @@ class ForOp(Op):
         attrs: dict[str, object] | None = None,
     ) -> "ForOp":
         if body is None:
-            iv = Value(name=None, type=IndexType())
-            body = Block(arguments=[iv])
-        else:
-            args = body.arguments
-            if len(args) != 1:
-                raise ValueError(
-                    f"for: body block must have 1 argument, got {len(args)}"
-                )
-            if not isinstance(args[0].type, IndexType):
-                raise ValueError(
-                    f"for: body block argument must have IndexType, "
-                    f"got {type(args[0].type).__name__}"
-                )
+            body = Block(arguments=[Value(name=None, type=IndexType())])
         return cls(
             operands=[],
             results=[],
@@ -1352,6 +1340,157 @@ class ForOp(Op):
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=[iv])
         return cls.build(lb, ub, step, body=body, attrs=attrs)
+
+
+@gpu_dialect.register_op("ploop")
+class PLoopOp(Op):
+    """Parallel loop over a 1D range, mapped onto a GPU index.
+
+    Same range as ``for`` -- ``iv = lb to ub [step s]``, one index as the
+    body's block argument -- but the iterations are independent and run
+    concurrently. ``level`` says at what granularity -- ``block``, ``thread``
+    or ``wg`` -- and ``axis`` which of that level's three it rides, as the
+    index it is: it subscripts ``grid_dim``, ``block_dim`` and the id op's
+    results alike. Build with ``PLoopOp.X``/``Y``/``Z``; ``AXES`` names them
+    for the printed form. Warp groups are 1D, so ``wg`` only has ``X``. The
+    trip count is the extent the mapped axis of the launch geometry must
+    have; a range that is not ``0 to n step 1`` becomes index arithmetic on
+    the hardware id when the loop is lowered.
+    """
+
+    LEVELS: ClassVar[tuple[str, ...]] = ("block", "thread", "wg")
+    AXES: ClassVar[tuple[str, ...]] = ("x", "y", "z")
+    X: ClassVar[int] = 0
+    Y: ClassVar[int] = 1
+    Z: ClassVar[int] = 2
+
+    @classmethod
+    def build(
+        cls,
+        lb: int,
+        ub: int,
+        level: str,
+        axis: int,
+        step: int = 1,
+        body: Block | None = None,
+        attrs: dict[str, object] | None = None,
+    ) -> "PLoopOp":
+        if level not in cls.LEVELS:
+            raise ValueError(
+                f"ploop: unexpected level {level!r}; expected one of "
+                f"{', '.join(cls.LEVELS)}"
+            )
+        if axis not in range(len(cls.AXES)):
+            raise ValueError(
+                f"ploop: unexpected axis {axis!r}; expected an index into "
+                f"{', '.join(cls.AXES)}"
+            )
+        if level == "wg" and axis != 0:
+            raise ValueError(
+                f"ploop: warp groups are 1D, so wg has no "
+                f"{cls.AXES[axis]!r} axis -- use thread.{cls.AXES[axis]} "
+                f"instead"
+            )
+        if body is None:
+            body = Block(arguments=[Value(name=None, type=IndexType())])
+        return cls(
+            operands=[],
+            results=[],
+            attrs={
+                "lb": lb,
+                "ub": ub,
+                "step": step,
+                "level": level,
+                "axis": axis,
+                **(attrs or {}),
+            },
+            blocks=[body],
+        )
+
+    @property
+    def lb(self) -> int:
+        return self.attrs["lb"]  # type: ignore[return-value]
+
+    @property
+    def ub(self) -> int:
+        return self.attrs["ub"]  # type: ignore[return-value]
+
+    @property
+    def step(self) -> int:
+        return self.attrs["step"]  # type: ignore[return-value]
+
+    @property
+    def level(self) -> str:
+        return self.attrs["level"]  # type: ignore[return-value]
+
+    @property
+    def axis(self) -> int:
+        return self.attrs["axis"]  # type: ignore[return-value]
+
+    @property
+    def trip_count(self) -> int:
+        return (self.ub - self.lb) // self.step
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            k: v for k, v in self.attrs.items()
+            if k not in ("lb", "ub", "step", "level", "axis")
+        }
+
+    @property
+    def body(self) -> Block:
+        return self.blocks[0]
+
+    @property
+    def iv(self) -> Value:
+        return self.body.arguments[0]
+
+    def print(self, p: Printer) -> None:
+        p.write(f"{self.op_id} {self.level}.{self.AXES[self.axis]} (")
+        self.iv.print(p)
+        p.write(f" = {self.lb} to {self.ub}")
+        if self.step != 1:
+            p.write(f" step {self.step}")
+        p.write(")")
+        p.write_extra_attrs(
+            self.attrs, skip_keys=("lb", "ub", "step", "level", "axis"),
+        )
+        p.write(" ")
+        self.body.print(p, skip_label=True)
+
+    @classmethod
+    def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        level = p.read_identifier()
+        p.read_literal(".")
+        axis_name = p.read_identifier()
+        if axis_name not in cls.AXES:
+            raise ValueError(
+                f"ploop: unexpected axis {axis_name!r} at pos {p.pos}; "
+                f"expected one of {', '.join(cls.AXES)}"
+            )
+        axis = cls.AXES.index(axis_name)
+        p.read_literal("(")
+        iv = Value.parse(p)
+        p.read_literal("=")
+        lb = p.read_literal_attr()
+        p.read_literal("to")
+        ub = p.read_literal_attr()
+        step = 1
+        if p.can_read_literal("step"):
+            p.read_literal("step")
+            step = p.read_literal_attr()
+        p.read_literal(")")
+        attrs = p.read_extra_attrs()
+        brace = p.read_literal("{")
+        body = Block.parse(brace, p, arguments=[iv])
+        return cls.build(
+            lb, ub, level, axis, step, body=body, attrs=attrs,
+        )
 
 
 @gpu_dialect.register_type("index")
@@ -1774,7 +1913,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             else _type_collective_scope(buf.type)
         )
         return [("W", root_buffer(buf), scope)]
-    if isinstance(op, (ForOp, AsyncOp)):
+    if isinstance(op, (ForOp, PLoopOp, AsyncOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
             for body_op in block.ops:

@@ -18,6 +18,7 @@ from ayla.gpu_dialect import (
     IndexType,
     LockType,
     MoveOp,
+    PLoopOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
@@ -157,11 +158,20 @@ def test_for_loop_default_step():
     assert_print_and_roundtrip(op, expected)
 
 
-
-
-
-
-
+def test_ploop():
+    outer = PLoopOp.build(0, 32, "block", PLoopOp.X)
+    inner = PLoopOp.build(8, 64, "thread", PLoopOp.Y, 4)
+    outer.body.append(inner)
+    inner.body.append(Op(operands=[outer.iv, inner.iv], results=[]))
+    expected = textwrap.dedent("""\
+        ploop block.x (%0: index = 0 to 32) {
+          ploop thread.y (%1: index = 8 to 64 step 4) {
+            generic(%0: index, %1: index)
+          }
+        }""")
+    assert_print_and_roundtrip(outer, expected)
+    assert outer.trip_count == 32
+    assert inner.trip_count == 14
 
 
 def test_canonical_strides():
