@@ -49,13 +49,29 @@ static void cu_check(CUresult res, const char* expr) {
 
 #define CU_CHECK(expr) cu_check((expr), #expr)
 
-static uintptr_t module_load_data(const std::string& ptx) {
+static uintptr_t module_load_data(
+    const std::string& ptx,
+    int optimization_level
+) {
+    TORCH_CHECK(
+        optimization_level >= -1 && optimization_level <= 4,
+        "optimization_level must be unset (-1) or in [0, 4]"
+    );
     CUmodule mod = nullptr;
     // Emit line info during JIT so Nsight Compute can correlate the
     // generated PTX with the SASS in its source view.
-    CUjit_option options[] = {CU_JIT_GENERATE_LINE_INFO};
-    void* values[] = {reinterpret_cast<void*>(1)};
-    CU_CHECK(cuModuleLoadDataEx(&mod, ptx.c_str(), 1, options, values));
+    CUjit_option options[] = {
+        CU_JIT_GENERATE_LINE_INFO,
+        CU_JIT_OPTIMIZATION_LEVEL,
+    };
+    void* values[] = {
+        reinterpret_cast<void*>(1),
+        reinterpret_cast<void*>(static_cast<uintptr_t>(optimization_level)),
+    };
+    unsigned int num_options = optimization_level < 0 ? 1 : 2;
+    CU_CHECK(cuModuleLoadDataEx(
+        &mod, ptx.c_str(), num_options, options, values
+    ));
     return reinterpret_cast<uintptr_t>(mod);
 }
 
@@ -267,7 +283,8 @@ static void launch_kernel(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("module_load_data", &module_load_data);
+    m.def("module_load_data", &module_load_data,
+          py::arg("ptx"), py::arg("optimization_level") = -1);
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
     m.def("launch_kernel", &launch_kernel,
@@ -302,9 +319,17 @@ class PtxLauncher:
     the current torch CUDA stream.
     """
 
-    def __init__(self, kernel: PtxKernel):
+    def __init__(
+        self,
+        kernel: PtxKernel,
+        *,
+        optimization_level: int | None = None,
+    ):
+        if optimization_level is not None and optimization_level not in range(5):
+            raise ValueError("optimization_level must be in [0, 4]")
         self._ext = None
         self._kernel = kernel
+        self._optimization_level = optimization_level
         self._module = None
         self._function = None
         # Map kernel arg index → user tensor index.
@@ -318,7 +343,11 @@ class PtxLauncher:
     def _ensure_loaded(self):
         if self._module is None:
             self._ext = _get_ext()
-            self._module = self._ext.module_load_data(self._kernel.ptx)
+            self._module = self._ext.module_load_data(
+                self._kernel.ptx,
+                self._optimization_level
+                if self._optimization_level is not None else -1,
+            )
             self._function = self._ext.module_get_function(
                 self._module, self._kernel.name,
             )
@@ -399,5 +428,9 @@ class PtxLauncher:
             pass
 
 
-def make_ptx_launcher(kernel: PtxKernel) -> PtxLauncher:
-    return PtxLauncher(kernel)
+def make_ptx_launcher(
+    kernel: PtxKernel,
+    *,
+    optimization_level: int | None = None,
+) -> PtxLauncher:
+    return PtxLauncher(kernel, optimization_level=optimization_level)

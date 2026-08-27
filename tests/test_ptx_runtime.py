@@ -83,3 +83,15 @@ def test_cwise_add():
 
     torch.cuda.synchronize()
     assert torch.allclose(c, a + b)
+
+
+def test_rejects_invalid_ptx_optimization_level():
+    kernel = PtxKernel(
+        ptx=SIMPLE_ADD_PTX,
+        name="cwise_add",
+        signature=[],
+        grid_dim=(1, 1, 1),
+        block_dim=(1, 1, 1),
+    )
+    with pytest.raises(ValueError, match="optimization_level"):
+        make_ptx_launcher(kernel, optimization_level=5)
