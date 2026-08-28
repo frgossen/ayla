@@ -31,6 +31,21 @@ from ..base.ir import Op, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
 
 
+def _enclosing_loop(op: Op) -> ForOp | None:
+    """The innermost ``for`` whose body holds ``op``, if there is one.
+
+    The loop that indexes an allocation's buffers is the one it sits inside,
+    which the parent links reach directly from the allocation itself.
+    """
+    block = op.parent_block
+    while block is not None:
+        parent = block.parent_op
+        if isinstance(parent, ForOp):
+            return parent
+        block = None if parent is None else parent.parent_block
+    return None
+
+
 class MultiBuffer(LoweringPass):
     """Clone loop-local allocations `depth` times and select per iteration."""
 
@@ -38,29 +53,13 @@ class MultiBuffer(LoweringPass):
         super().__init__()
         self.depth = depth
         self.label_filter = label_filter
-        # The loops enclosing the allocation currently being rewritten.
-        #
-        # TODO: with a parent pointer on Op this goes away, and so does the
-        # ForOp hook -- an allocation could just walk up to the loop whose
-        # iterations index it. Second pass to want this; see folding.
-        self._loops: list[ForOp] = []
-
-    @lowers(ForOp)
-    def lower_for(
-        self, op: ForOp,
-    ) -> tuple[list[Op], list[object]]:
-        self._loops.append(op)
-        try:
-            self.lower_block(op.body)
-        finally:
-            self._loops.pop()
-        return [op], list(op.results)
 
     @lowers(AllocOp)
     def lower_alloc(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]] | None:
-        if self.depth <= 1 or not self._loops:
+        loop = _enclosing_loop(op)
+        if self.depth <= 1 or loop is None:
             return None
         if self.label_filter is not None and op.attrs.get("label") != self.label_filter:
             return None
@@ -68,7 +67,6 @@ class MultiBuffer(LoweringPass):
         if op.init is not None:
             return None
 
-        loop = self._loops[-1]
         # Unrolling is the only thing that gives a loop a step other than 1, and
         # it runs after this pass, so a strided loop here means the pipeline is
         # wrong rather than that the index needs to divide the step out.
