@@ -100,14 +100,14 @@ def out_parameter_op(launcher: Callable) -> Callable:
     return op
 
 
-def check_against_torch(
+def assert_against_torch(
     cfg: BenchGemmConfig,
     *,
     seed: int = 0,
     max_abs_error: float = 0,
     max_relative_rms_error: float = 0,
 ) -> tuple[float, float]:
-    """Check a GEMM config against torch and return its two error metrics."""
+    """Assert a GEMM config agrees with torch and return its error metrics."""
     torch.manual_seed(seed)
     a = torch.randn((cfg.m, cfg.k), dtype=cfg.dtype, device="cuda")
     bt = torch.randn((cfg.n, cfg.k), dtype=cfg.dtype, device="cuda")

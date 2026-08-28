@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.ops import ayla
 
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
+from ayla.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.gpu_dialect import TmaDescType

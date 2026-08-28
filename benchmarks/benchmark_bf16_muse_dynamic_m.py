@@ -9,25 +9,14 @@ from pathlib import Path
 
 import torch
 
-import ayla.ptx_runtime as runtime
-import ayla.torch_custom_call as custom_call
-
-
-# Import the configurable builder without registering its default kernels.
-_make_launcher = runtime.make_ptx_launcher
-_make_custom_call = custom_call.make_torch_custom_call
-runtime.make_ptx_launcher = lambda kernel, **kwargs: None
-custom_call.make_torch_custom_call = lambda *args, **kwargs: None
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (  # noqa: E402
+from ayla.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
-runtime.make_ptx_launcher = _make_launcher
-custom_call.make_torch_custom_call = _make_custom_call
-
-from ayla.ptx_codegen import make_ptx_kernel  # noqa: E402
-from common import (  # noqa: E402
+from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_runtime import make_ptx_launcher
+from common import (
     BenchGemmConfig,
-    check_against_torch,
+    assert_against_torch,
     out_parameter_op,
     plot_tflops_curve,
     print_results,
@@ -44,16 +33,17 @@ M_VALUES = (128, 256, 512, 1024, 2048, 4096)
 
 
 @dataclass(frozen=True)
-class Workload:
+class MatmulConfig:
     label: str
+    m: int
     n: int
     k: int
 
 
-WORKLOADS = {
-    "up": Workload("up", 19968, 6656),
-    "intermediate": Workload("intermediate", 19968, 19968),
-    "down": Workload("down", 6656, 19968),
+PROJECTION_DIMS = {
+    "up": (19968, 6656),
+    "intermediate": (19968, 19968),
+    "down": (6656, 19968),
 }
 
 CONFIGS = {
@@ -84,18 +74,18 @@ def _default_config(m: int) -> str:
     return "four_tile_k3_split2"
 
 
-def _ayla_config(workload: Workload, m: int) -> tuple[BenchGemmConfig, str]:
-    config_name = _default_config(m)
+def _ayla_config(matmul: MatmulConfig) -> tuple[BenchGemmConfig, str]:
+    config_name = _default_config(matmul.m)
     module = auto_matmul_4096_wgmma256_wg_tma_store_module(
-        problem_m=m,
-        problem_n=workload.n,
-        problem_k=workload.k,
+        m=matmul.m,
+        n=matmul.n,
+        k=matmul.k,
         **CONFIGS[config_name],
     )
-    op = out_parameter_op(_make_launcher(make_ptx_kernel(module)))
+    op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
     return (
         BenchGemmConfig(
-            f"Ayla {workload.label}", m, workload.n, workload.k, op,
+            f"Ayla {matmul.label}", matmul.m, matmul.n, matmul.k, op,
             torch.bfloat16,
         ),
         config_name,
@@ -106,7 +96,7 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
     import matplotlib.pyplot as plt
 
     workloads = [
-        name for name in WORKLOADS
+        name for name in PROJECTION_DIMS
         if any(row["workload"] == name for row in rows)
     ]
     figure, axes = plt.subplots(
@@ -124,9 +114,9 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
         plot_tflops_curve(
             axis, ms, ayla, torch_values, annotation_fontsize=6.5,
         )
-        workload = WORKLOADS[workload_name]
         axis.set_title(
-            f"{workload_name.capitalize()}: N={workload.n:,}, K={workload.k:,}"
+            f"{workload_name.capitalize()}: "
+            f"N={int(selected[0]['n']):,}, K={int(selected[0]['k']):,}"
         )
         axis.set_xlabel("M = flattened tokens (B×S)")
     axes[0][0].set_ylabel("Useful TFLOP/s")
@@ -141,7 +131,8 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS),
+        "--workloads", nargs="+", choices=PROJECTION_DIMS,
+        default=list(PROJECTION_DIMS),
     )
     parser.add_argument("--ms", nargs="+", type=int, default=list(M_VALUES))
     parser.add_argument("--output", type=Path, default=CSV_PATH)
@@ -154,26 +145,27 @@ def main() -> int:
 
     rows = []
     for workload_name in args.workloads:
-        workload = WORKLOADS[workload_name]
+        n, k = PROJECTION_DIMS[workload_name]
         for m in args.ms:
-            ayla_config, config_name = _ayla_config(workload, m)
-            max_abs, relative_rms = check_against_torch(
+            matmul = MatmulConfig(workload_name, m, n, k)
+            ayla_config, config_name = _ayla_config(matmul)
+            max_abs, relative_rms = assert_against_torch(
                 ayla_config, seed=m, max_abs_error=4, max_relative_rms_error=1e-3,
             )
             configs = [
                 ayla_config,
                 BenchGemmConfig(
-                    "cuBLAS", m, workload.n, workload.k, torch_mm_nt,
+                    "cuBLAS", matmul.m, matmul.n, matmul.k, torch_mm_nt,
                     torch.bfloat16,
                 ),
             ]
             ayla_result, torch_result = run(configs)
             print_results([ayla_result, torch_result])
             rows.append({
-                "workload": workload.label,
-                "m": m,
-                "n": workload.n,
-                "k": workload.k,
+                "workload": matmul.label,
+                "m": matmul.m,
+                "n": matmul.n,
+                "k": matmul.k,
                 "config": config_name,
                 "ayla_ms": ayla_result.median_ms,
                 "ayla_tflops": ayla_result.tflops,

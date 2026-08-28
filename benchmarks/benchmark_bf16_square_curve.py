@@ -3,29 +3,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import torch
 
-import ayla.ptx_runtime as runtime
-import ayla.torch_custom_call as custom_call
-
-
-# Import the configurable builder without registering its default kernels.
-_make_launcher = runtime.make_ptx_launcher
-_make_custom_call = custom_call.make_torch_custom_call
-runtime.make_ptx_launcher = lambda kernel, **kwargs: None
-custom_call.make_torch_custom_call = lambda *args, **kwargs: None
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (  # noqa: E402
+from ayla import ModuleOp
+from ayla.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
-runtime.make_ptx_launcher = _make_launcher
-custom_call.make_torch_custom_call = _make_custom_call
-
-from ayla.ptx_codegen import make_ptx_kernel  # noqa: E402
-from common import (  # noqa: E402
+from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_runtime import make_ptx_launcher
+from common import (
     BenchGemmConfig,
-    check_against_torch,
+    assert_against_torch,
     out_parameter_op,
     plot_tflops_curve,
     print_results,
@@ -40,22 +32,24 @@ CSV_PATH = OUTPUT_DIR / "bf16_square_curve.csv"
 PLOT_PATH = OUTPUT_DIR / "bf16_square_curve.png"
 
 
-def _square(size: int, **config):
-    return lambda: auto_matmul_4096_wgmma256_wg_tma_store_module(
+def _square_module(size: int, **config: object) -> ModuleOp:
+    return auto_matmul_4096_wgmma256_wg_tma_store_module(
         problem_size=size, **config,
     )
 
 
-CONFIGS = {
-    512: (_square(512, operand_stages=2), "m128n256_k64_s2"),
+CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
+    512: (partial(_square_module, 512, operand_stages=2), "m128n256_k64_s2"),
     1024: (
-        _square(
+        partial(
+            _square_module,
             1024, output_tiles_per_cta=2, operand_stages=4, output_slices=2,
         ),
         "m2x128n256_k64_s4_split2",
     ),
     2048: (
-        _square(
+        partial(
+            _square_module,
             2048,
             output_tiles_per_cta=4,
             operand_stages=3,
@@ -66,7 +60,8 @@ CONFIGS = {
         "m4x128n256_k64_s3_split2",
     ),
     4096: (
-        _square(
+        partial(
+            _square_module,
             4096,
             output_tiles_per_cta=4,
             operand_stages=3,
@@ -77,13 +72,15 @@ CONFIGS = {
         "four_stage_split_output",
     ),
     8192: (
-        _square(
+        partial(
+            _square_module,
             8192, output_tiles_per_cta=4, operand_stages=4, output_slices=2,
         ),
         "m4x128n256_k64_s4_split2",
     ),
     16384: (
-        _square(
+        partial(
+            _square_module,
             16384, output_tiles_per_cta=4, operand_stages=4, output_slices=2,
         ),
         "m4x128n256_k64_s4_split2",
@@ -121,11 +118,11 @@ def main() -> int:
     rows = []
     for size, (build, config_name) in CONFIGS.items():
         print(f"size={size}: build {config_name}", flush=True)
-        ayla_op = out_parameter_op(_make_launcher(make_ptx_kernel(build())))
+        ayla_op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
         ayla_config = BenchGemmConfig(
             "Ayla", size, size, size, ayla_op, torch.bfloat16,
         )
-        check_against_torch(ayla_config)
+        assert_against_torch(ayla_config)
         configs = [
             ayla_config,
             BenchGemmConfig(
