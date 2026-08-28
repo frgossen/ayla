@@ -344,6 +344,10 @@ class PtxLauncher:
                 self._module, self._kernel.name,
             )
 
+    def warmup(self) -> None:
+        """Load and JIT-compile the PTX without launching the kernel."""
+        self._ensure_loaded()
+
     @property
     def name(self):
         return self._kernel.name
