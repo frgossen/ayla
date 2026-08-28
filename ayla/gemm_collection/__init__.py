@@ -22,6 +22,7 @@ from . import (  # noqa: F401,E402  (each import registers its op)
     auto_matmul_4096,
     auto_matmul_4096_wgmma256_wg,
     auto_matmul_4096_wgmma256_wg_tma_store,
+    blackwell_tcgen05_4096,
     fastcu_5_1,
     loop_4x4_matmul_4096,
     loop_8x8_matmul_4096,

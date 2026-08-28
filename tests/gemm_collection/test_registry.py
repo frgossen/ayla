@@ -51,7 +51,9 @@ def test_query_filters_on_every_field():
     by_dtype = query(dtype=torch.bfloat16)
     assert by_dtype and all(k.dtype is torch.bfloat16 for k in by_dtype)
     assert len(by_dtype) + len(query(dtype=torch.float32)) == len(everything)
-    assert query(compute_capability=(10, 0)) == []
+    blackwell = query(compute_capability=(10, 0))
+    assert [kernel.name for kernel in blackwell] == ["blackwell_tcgen05_4096"]
+    assert blackwell[0].target.architecture == "sm_100a"
 
 
 def test_registered_kernels_match_their_op_names():

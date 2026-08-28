@@ -1,7 +1,28 @@
 """Configurable GEMM module builders."""
 import textwrap
 
-from .gpu_dialect import ModuleOp, gpu_dialect
+from .base.ir import Block, Value
+from .gpu_dialect import (
+    AllocOp,
+    AsyncOp,
+    AwaitOp,
+    BF16Type,
+    BlockIdsOp,
+    DeallocOp,
+    F32Type,
+    ForOp,
+    GmemTensorType,
+    KernelOp,
+    LockType,
+    MatmulOp,
+    ModuleOp,
+    MoveOp,
+    SmemTensorType,
+    TileOp,
+    TmemTensorType,
+    gpu_dialect,
+)
+from .targets import BLACKWELL
 from .passes.canonicalize import Canonicalize
 from .passes.fuse_async import fuse_async
 from .passes.licm import licm
@@ -12,6 +33,89 @@ from .passes.promote_buffers import promote_buffers
 from .passes.schedule_async import schedule_async
 from .passes.tile_matmul import tile_matmul
 from .passes.unroll_loop import unroll_loop
+
+
+def blackwell_tcgen05_gemm_module(
+    *, m: int = 4096, n: int = 4096, k: int = 4096,
+) -> ModuleOp:
+    """Build the first native SM100 BF16 GEMM pipeline.
+
+    Each CTA computes one 128x64 output tile. All four warps cooperatively
+    stage both operands and read the tensor-memory accumulator; only the
+    elected issue sequence required by ``tcgen05.mma`` is single-threaded.
+    """
+    if m % 128 or n % 64 or k % 16:
+        raise ValueError("tcgen05 GEMM dimensions must divide 128x64x16 tiles")
+
+    bf16 = BF16Type()
+    a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
+    bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
+    c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
+    block_ids = BlockIdsOp.build()
+    a_block = TileOp.build(
+        a, [block_ids.x, 0],
+        GmemTensorType.build([128, k], bf16, strides=[k, 1]),
+    )
+    bt_block = TileOp.build(
+        bt, [block_ids.y, 0],
+        GmemTensorType.build([64, k], bf16, strides=[k, 1]),
+    )
+    c_block = TileOp.build(
+        c, [block_ids.x, block_ids.y],
+        GmemTensorType.build([128, 64], bf16, strides=[n, 1]),
+    )
+    accumulator = AllocOp.build_with_fresh_id(
+        TmemTensorType.build([128, 64], F32Type()), init=0.0,
+    )
+    lhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
+        [128, 16], bf16, swizzle="32B",
+        attrs={"tcgen05_layout": "lhs_128x16"},
+    ))
+    rhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
+        [64, 16], bf16, swizzle="128B",
+        attrs={"tcgen05_layout": "rhs_64x16"},
+    ))
+    mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+    loop = ForOp.build(0, k // 16)
+    a_tile = TileOp.build(
+        a_block.result(), [0, loop.iv],
+        GmemTensorType.build([128, 16], bf16, strides=[k, 1]),
+    )
+    bt_tile = TileOp.build(
+        bt_block.result(), [0, loop.iv],
+        GmemTensorType.build([64, 16], bf16, strides=[k, 1]),
+    )
+    mma = MatmulOp.build(
+        lhs_smem.result(), rhs_smem.result(), accumulator.result(),
+    )
+    loop.body.ops.extend([
+        a_tile,
+        bt_tile,
+        MoveOp.build(lhs_smem.result(), a_tile.result()),
+        MoveOp.build(rhs_smem.result(), bt_tile.result()),
+        AsyncOp.build(mma_lock.result(), body=Block(ops=[mma])),
+        AwaitOp.build(mma_lock.result()),
+    ])
+    body = Block(arguments=[a, bt, c], ops=[
+        block_ids,
+        a_block,
+        bt_block,
+        c_block,
+        accumulator,
+        lhs_smem,
+        rhs_smem,
+        mma_lock,
+        loop,
+        MoveOp.build(c_block.result(), accumulator.result()),
+        DeallocOp.build(accumulator.result()),
+    ])
+    return ModuleOp.build(Block(ops=[KernelOp.build(
+        "blackwell_tcgen05_4096",
+        body,
+        grid_dim=(m // 128, n // 64, 1),
+        block_dim=(128, 1, 1),
+        ptx_optimization_level=1,
+    )]), target=BLACKWELL)
 
 
 def auto_matmul_4096_wgmma256_wg_tma_store_module(

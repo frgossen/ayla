@@ -13,9 +13,30 @@ from ayla.ptx_codegen import make_ptx_kernel
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+requires_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="requires an SM100 GPU",
+)
 
 F32 = torch.float32
 BF16 = torch.bfloat16
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [42, 43, 44])
+def test_blackwell_tcgen05_4096_correctness(seed):
+    torch.manual_seed(seed)
+    a = torch.randn(4096, 4096, dtype=BF16, device="cuda")
+    bt = torch.randn(4096, 4096, dtype=BF16, device="cuda")
+
+    actual = ayla.blackwell_tcgen05_4096(a, bt)
+    expected = torch.mm(a, bt.t())
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    assert torch.allclose(actual, expected, atol=2.0), (
+        f"max error {(actual - expected).abs().max().item()}"
+    )
 
 
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
