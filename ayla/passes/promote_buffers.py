@@ -28,16 +28,19 @@ from ..gpu_dialect import (
     F16Type,
     F32Type,
     F64Type,
+    ForOp,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    KernelOp,
     LaneIdOp,
     MatmulOp,
     ModuleOp,
     MoveOp,
+    PLoopOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -76,10 +79,20 @@ def _collective_level(value: Value) -> str:
     """
     defn = value.definition
 
-    # Block arguments are kernel args or for-loop IVs — both are uniform
-    # across all threads in a block.
     if isinstance(defn, Block):
-        return "block"
+        owner = defn.parent_op
+        # A ploop's induction variable varies at exactly the level the loop is
+        # mapped to -- which is the vocabulary this function returns.
+        if isinstance(owner, PLoopOp):
+            return owner.level
+        # A for-loop's induction variable and a kernel's arguments are both
+        # uniform across a block.
+        if isinstance(owner, (ForOp, KernelOp)):
+            return "block"
+        assert False, (
+            f"_collective_level: block argument of "
+            f"{type(owner).__name__} is not modelled"
+        )
 
     if isinstance(defn, BlockIdsOp):
         return "block"

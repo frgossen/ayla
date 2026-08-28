@@ -212,3 +212,36 @@ def test_promote_smem_with_warp_group_dependent_lhs():
           }
         }""")
     assert text == expected
+
+
+def test_wg_ploop_iv_is_not_block_uniform():
+    """A ploop's induction variable varies at its own level.
+
+    The lhs here is tiled by a warp-group ploop index, so the load has to stay
+    block-wide and the tile be replayed on the promoted buffer. Reading the iv
+    as block-uniform would stage only one warp group's 64 rows.
+    """
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<128x256xf32>) {
+            ploop wg.x (%w: index = 0 to 2) {
+              %a_wg: gmem<64x64xbf16 strides=[64, 1]> = tile(%a: gmem<128x64xbf16>, %w: index, 0)
+              %c_wg: gmem<64x256xf32 strides=[256, 1]> = tile(%c: gmem<128x256xf32>, %w: index, 0)
+              matmul(%a_wg: gmem<64x64xbf16 strides=[64, 1]>, %b: gmem<256x64xbf16>, %c_wg: gmem<64x256xf32 strides=[256, 1]>) attrs={label: "mm"}
+            }
+          }
+        }"""))  # noqa: E501
+    module = promote_buffers(
+        module, target_type="smem", operands=["lhs"], swizzle="128B",
+        tma=True, nc=True, label_filter="mm",
+    )
+    text = repr(module)
+
+    # All 128 rows are staged block-collectively ...
+    assert 'smem<128x64xbf16 swizzle="128B"> = alloc()' in text
+    assert 'move(%0: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>)' in text
+    # ... and the warp-group tile is replayed on the promoted buffer.
+    assert (
+        'smem<64x64xbf16 swizzle="128B"> = tile('
+        '%0: smem<128x64xbf16 swizzle="128B">, %w: index, 0)'
+    ) in text
