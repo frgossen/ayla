@@ -36,6 +36,7 @@ from .passes.folding import Folding
 from .passes.cse import CSE
 from .passes.dce import DCE
 from .passes.insert_syncs import InsertSyncs
+from .passes.lower_ploop import LowerPloop
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
@@ -47,6 +48,7 @@ class PtxLoweringPipeline(Pipeline):
 
     def __init__(self) -> None:
         super().__init__()
+        self.add_pass(LowerPloop())
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Folding())
@@ -260,37 +262,22 @@ class PtxKernel:
     shared_mem_bytes: int = 0
 
 
-def _resolve_block_dim(kernel: KernelOp) -> None:
-    """Materialize the kernel's PTX launch dimensions."""
-    if all(dim is None for dim in kernel.block_dim):
-        raise ValueError(
-            f"make_ptx_kernel: block_dim is entirely unset: {kernel.block_dim}"
-        )
-    kernel.block_dim = tuple(
-        dim if dim is not None else 1 for dim in kernel.block_dim
-    )
-
-
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
     top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    _resolve_block_dim(kernel)
 
     module = PtxLoweringPipeline().run(module)
 
-    if all(d is None for d in kernel.grid_dim):
-        raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
-    grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
     p = PtxPrinter()
     _emit_op(p, module)
     return PtxKernel(
         ptx=p.render(),
         name=kernel.name,
         signature=kernel.signature,
-        grid_dim=grid_dim,
+        grid_dim=tuple(kernel.grid_dim),
         block_dim=tuple(kernel.block_dim),
     )
 

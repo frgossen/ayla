@@ -246,3 +246,28 @@ def test_codegen_tma_load():
     assert "mbarrier.init.shared::cta.b64" in kernel.ptx
     assert "cp.async.bulk.tensor.2d" in kernel.ptx
     assert "mbarrier.try_wait.parity" in kernel.ptx
+
+
+def test_codegen_lowers_ploops_into_the_launch_dims():
+    """A kernel that declares no geometry gets it from the ploops."""
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%a: gmem<4096x4096xf32>, %s: smem<128x128xf32>) {
+            ploop block.x (%bx: index = 0 to 32) {
+              ploop thread.x (%tx: index = 0 to 128) {
+                %t: gmem<128x128xf32 strides=[4096, 1]> = tile(%a: gmem<4096x4096xf32>, %bx: index, %tx: index)
+                move(%s: smem<128x128xf32>, %t: gmem<128x128xf32 strides=[4096, 1]>)
+              }
+            }
+          }
+        }"""))  # noqa: E501
+
+    kernel = make_ptx_kernel(module)
+
+    assert kernel.grid_dim == (32, 1, 1)
+    assert kernel.block_dim == (128, 1, 1)
+    assert ".reqntid 128, 1, 1" in kernel.ptx
+    # The ids the ploops lowered to, and no `iv * 1 + 0` left over.
+    assert "%ctaid.x" in kernel.ptx
+    assert "%tid.x" in kernel.ptx
+    assert "mul.lo.s32" not in kernel.ptx
