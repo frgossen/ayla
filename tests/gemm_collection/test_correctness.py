@@ -64,9 +64,9 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
 
 def test_configurable_tma_gemm_supports_rectangular_shapes():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        problem_m=512,
-        problem_n=19968,
-        problem_k=6656,
+        m=512,
+        n=19968,
+        k=6656,
         output_tiles_per_cta=2,
         operand_stages=4,
         output_slices=2,
