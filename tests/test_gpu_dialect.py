@@ -25,6 +25,7 @@ from ayla.gpu_dialect import (
     TmaMoveOp,
     gpu_dialect,
 )
+from ayla.targets import BLACKWELL, HOPPER
 
 
 def assert_print_and_roundtrip(op, expected):
@@ -84,6 +85,19 @@ def test_kernel_op():
 
     with pytest.raises(ValueError, match="ptx_optimization_level"):
         KernelOp.build("invalid", Block(), ptx_optimization_level=5)
+
+
+def test_module_explicit_target():
+    module = ModuleOp.build(Block(), target=BLACKWELL)
+
+    assert module.ptx_target == BLACKWELL
+    assert repr(module) == textwrap.dedent("""\
+        module attrs={target: "sm_100a"} {
+        }""")
+    assert ModuleOp.build(Block()).ptx_target == HOPPER
+
+    with pytest.raises(ValueError, match="target conflicts with attrs: target"):
+        ModuleOp.build(Block(), attrs={"target": "sm_80"}, target=BLACKWELL)
 
 
 def test_kernel_num_threads():

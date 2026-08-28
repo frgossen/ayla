@@ -12,6 +12,7 @@ from ayla import (
     make_ptx_kernel,
 )
 from ayla.gpu_dialect import gpu_dialect, BlockIdsOp, ThreadIdsOp, F32Type
+from ayla.targets import BLACKWELL
 
 
 def test_codegen_cwise_add():
@@ -81,6 +82,18 @@ def test_codegen_materializes_block_dim_before_lowering():
     assert input_kernel.block_dim == (128, 1, 1)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
+
+
+def test_codegen_blackwell_target():
+    kernel_op = KernelOp.build(
+        "blackwell_smoke", Block(), grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+    )
+    kernel = make_ptx_kernel(
+        ModuleOp.build(Block(ops=[kernel_op]), target=BLACKWELL)
+    )
+
+    assert kernel.target == BLACKWELL
+    assert kernel.ptx.startswith(".version 9.0\n.target sm_100a\n")
 
 
 def test_codegen_naive_matmul_4096():

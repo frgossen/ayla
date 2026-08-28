@@ -38,18 +38,19 @@ from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
 from .base.pipeline import Pipeline
+from .targets import PtxTarget
 
 
 class PtxLoweringPipeline(Pipeline):
     """Lowers a high-level ModuleOp down to a PTX-template ModuleOp."""
 
-    def __init__(self) -> None:
+    def __init__(self, target: PtxTarget) -> None:
         super().__init__()
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
-        self.add_pass(LowerToPtxTemplate())
+        self.add_pass(LowerToPtxTemplate(target))
         self.add_pass(Canonicalize())
 
 
@@ -253,6 +254,7 @@ class PtxKernel:
     block_dim: tuple[int, int, int]
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
+    target: PtxTarget | None = None
 
 
 def _resolve_block_dim(kernel: KernelOp) -> None:
@@ -274,7 +276,8 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     kernel: KernelOp = top_ops[0]
     _resolve_block_dim(kernel)
 
-    module = PtxLoweringPipeline().run(module)
+    target = module.ptx_target
+    module = PtxLoweringPipeline(target).run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
@@ -288,6 +291,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         grid_dim=grid_dim,
         block_dim=kernel.block_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
+        target=target,
     )
 
 

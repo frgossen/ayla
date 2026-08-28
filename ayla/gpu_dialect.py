@@ -8,25 +8,34 @@ from typing import ClassVar, Iterator
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
+from .targets import HOPPER, PtxTarget, target_from_attrs
 
 gpu_dialect = Dialect("gpu")
 
 
 @gpu_dialect.register_op("module")
 class ModuleOp(Op):
-    _DEFAULT_ATTRS = {
-        "version": "9.0",
-        "target": "sm_90a",
-        "address_size": 64,
-    }
+    _DEFAULT_ATTRS = HOPPER.module_attrs()
 
     @classmethod
     def build(
         cls,
         body: Block,
         attrs: dict[str, object] | None = None,
+        target: PtxTarget | None = None,
     ) -> "ModuleOp":
-        merged = {**cls._DEFAULT_ATTRS, **(attrs or {})}
+        if target is not None and attrs is not None:
+            conflicting = set(target.module_attrs()) & set(attrs)
+            if conflicting:
+                names = ", ".join(sorted(conflicting))
+                raise ValueError(
+                    f"ModuleOp.build: target conflicts with attrs: {names}"
+                )
+        merged = {
+            **cls._DEFAULT_ATTRS,
+            **(target.module_attrs() if target is not None else {}),
+            **(attrs or {}),
+        }
         return cls(
             operands=[], results=[], attrs=merged, blocks=[body],
         )
@@ -46,6 +55,10 @@ class ModuleOp(Op):
     @property
     def address_size(self) -> int:
         return self.attrs["address_size"]
+
+    @property
+    def ptx_target(self) -> PtxTarget:
+        return target_from_attrs(self.version, self.target, self.address_size)
 
     def print(self, p: Printer) -> None:
         p.write("module")

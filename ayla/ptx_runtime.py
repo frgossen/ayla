@@ -56,18 +56,49 @@ static uintptr_t module_load_data(
     CUmodule mod = nullptr;
     // Emit line info during JIT so Nsight Compute can correlate the
     // generated PTX with the SASS in its source view.
+    constexpr size_t LOG_SIZE = 16384;
+    char error_log[LOG_SIZE] = {};
+    char info_log[LOG_SIZE] = {};
     CUjit_option options[] = {
         CU_JIT_GENERATE_LINE_INFO,
         CU_JIT_OPTIMIZATION_LEVEL,
+        CU_JIT_ERROR_LOG_BUFFER,
+        CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        CU_JIT_INFO_LOG_BUFFER,
+        CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
     };
     void* values[] = {
         reinterpret_cast<void*>(1),
         reinterpret_cast<void*>(static_cast<uintptr_t>(optimization_level)),
+        error_log,
+        reinterpret_cast<void*>(LOG_SIZE),
+        info_log,
+        reinterpret_cast<void*>(LOG_SIZE),
     };
-    unsigned int num_options = optimization_level < 0 ? 1 : 2;
-    CU_CHECK(cuModuleLoadDataEx(
+    if (optimization_level < 0) {
+        options[1] = CU_JIT_ERROR_LOG_BUFFER;
+        values[1] = error_log;
+        options[2] = CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES;
+        values[2] = reinterpret_cast<void*>(LOG_SIZE);
+        options[3] = CU_JIT_INFO_LOG_BUFFER;
+        values[3] = info_log;
+        options[4] = CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES;
+        values[4] = reinterpret_cast<void*>(LOG_SIZE);
+    }
+    unsigned int num_options = optimization_level < 0 ? 5 : 6;
+    CUresult result = cuModuleLoadDataEx(
         &mod, ptx.c_str(), num_options, options, values
-    ));
+    );
+    if (result != CUDA_SUCCESS) {
+        const char* msg = nullptr;
+        cuGetErrorString(result, &msg);
+        throw std::runtime_error(
+            std::string("CUDA driver error (cuModuleLoadDataEx): ")
+            + (msg ? msg : "unknown")
+            + "\nCUDA JIT error log:\n" + error_log
+            + "\nCUDA JIT info log:\n" + info_log
+        );
+    }
     return reinterpret_cast<uintptr_t>(mod);
 }
 

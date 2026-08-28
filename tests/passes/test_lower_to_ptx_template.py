@@ -141,3 +141,16 @@ def test_lower_move_gmem_to_smem():
         ),
     )
     assert template.count("ld.global.b16") == 64, "64 rows unrolled"
+
+
+def test_blackwell_target_rejects_hopper_wgmma_lowering():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module attrs={target: "sm_100a"} {
+          kernel @bad(%a: smem<64x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<64x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %lock: lock<wgmma> = alloc()
+            async(%lock: lock<wgmma>) matmul(%a: smem<64x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<64x128xf32 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="wgmma lowering requires a Hopper target"):
+        lower_to_ptx_template(module)

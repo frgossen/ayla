@@ -48,13 +48,15 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass, lowers
+from ..targets import PtxTarget
 
 
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
-    def __init__(self) -> None:
+    def __init__(self, target: PtxTarget) -> None:
         super().__init__()
+        self.target = target
         self.cache_policy_values: dict[str, Value] = {}
 
     @lowers(KernelOp)
@@ -524,6 +526,12 @@ class LowerToPtxTemplate(LoweringPass):
         ``wgmma``) emits the wait plus a ``bar.sync`` that closes the TMA-reload
         vs warpgroup-read WAR (see ``_lower_await_wgmma``).
         """
+        if self.target.tensor_core_kind != "wgmma":
+            raise ValueError(
+                "wgmma lowering requires a Hopper target; "
+                f"module target {self.target.architecture!r} uses "
+                f"{self.target.tensor_core_kind!r} tensor cores"
+            )
         assert op.lock.type.kind == "wgmma", (
             f"_lower_async_matmul_wgmma: expected lock kind 'wgmma'; got {op.lock.type.kind!r}"
         )
@@ -1763,4 +1771,4 @@ def _ptx_literal(dtype, value) -> str:
 
 def lower_to_ptx_template(module: ModuleOp) -> ModuleOp:
     """Convenience entry point."""
-    return LowerToPtxTemplate().run(module)
+    return LowerToPtxTemplate(module.ptx_target).run(module)

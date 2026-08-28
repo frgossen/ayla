@@ -9,9 +9,11 @@ import textwrap
 import pytest
 import torch
 
+from ayla import Block, KernelOp, ModuleOp, PTXTemplateOp, Value, make_ptx_kernel
 from ayla.gpu_dialect import F32Type, GmemTensorType
 from ayla.ptx_codegen import PtxKernel
 from ayla.ptx_runtime import make_ptx_launcher
+from ayla.targets import BLACKWELL
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="no CUDA"
@@ -83,3 +85,51 @@ def test_cwise_add():
 
     torch.cuda.synchronize()
     assert torch.allclose(c, a + b)
+
+
+@requires_cuda
+def test_generated_blackwell_memory_kernel():
+    buf_type = GmemTensorType.build((1,), F32Type())
+    src = Value(name="src", type=buf_type)
+    dst = Value(name="dst", type=buf_type)
+    copy = PTXTemplateOp.build(
+        [src, dst], [],
+        template=textwrap.dedent("""\
+            ld.global.f32 ${f32:value}, [${b64:operand.src.ptr}];
+            st.global.f32 [${b64:operand.dst.ptr}], ${f32:value};
+        """),
+        operand_names=["src", "dst"],
+    )
+    kernel_op = KernelOp.build(
+        "blackwell_copy", Block(arguments=[src, dst], ops=[copy]),
+        grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+    )
+    kernel = make_ptx_kernel(
+        ModuleOp.build(Block(ops=[kernel_op]), target=BLACKWELL)
+    )
+    launcher = make_ptx_launcher(kernel)
+    source = torch.tensor([3.25], dtype=torch.float32, device="cuda")
+    destination = torch.zeros_like(source)
+
+    launcher(source, destination)
+    torch.cuda.synchronize()
+
+    assert destination.item() == source.item()
+
+
+@requires_cuda
+def test_ptx_jit_failure_includes_driver_logs():
+    bad_ptx = SIMPLE_ADD_PTX.replace(".target sm_70", ".target sm_999")
+    buf_type = GmemTensorType.build((1,), F32Type())
+    launcher = make_ptx_launcher(PtxKernel(
+        ptx=bad_ptx,
+        name="cwise_add",
+        signature=[buf_type, buf_type, buf_type],
+        grid_dim=(1, 1, 1),
+        block_dim=(1, 1, 1),
+    ))
+    tensor = torch.zeros(1, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="CUDA JIT error log") as exc:
+        launcher(tensor, tensor, tensor)
+    assert "sm_999" in str(exc.value)

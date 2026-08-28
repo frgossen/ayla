@@ -14,6 +14,7 @@ from .base.ir import (
     Value,
 )
 from .ptx_codegen import PtxPrinter, PtxKernel, make_ptx_kernel
+from .targets import BLACKWELL, HOPPER, PtxTarget
 
 __all__ = [
     "AsyncOp",
@@ -30,4 +31,7 @@ __all__ = [
     "PtxPrinter",
     "PtxKernel",
     "make_ptx_kernel",
+    "BLACKWELL",
+    "HOPPER",
+    "PtxTarget",
 ]
