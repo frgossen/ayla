@@ -288,7 +288,7 @@ class PtxLauncher:
     """
 
     def __init__(self, kernel: PtxKernel):
-        self._ext = _get_ext()
+        self._ext = None
         self._kernel = kernel
         self._module = None
         self._function = None
@@ -302,6 +302,7 @@ class PtxLauncher:
 
     def _ensure_loaded(self):
         if self._module is None:
+            self._ext = _get_ext()
             self._module = self._ext.module_load_data(self._kernel.ptx)
             self._function = self._ext.module_get_function(
                 self._module, self._kernel.name,
@@ -371,6 +372,8 @@ class PtxLauncher:
                 raise TypeError(f"param {i}: expected Tensor or tuple, got {type(p)}")
 
     def __del__(self):
+        if self._module is None:
+            return
         try:
             self._ext.module_unload(self._module)
         except Exception:

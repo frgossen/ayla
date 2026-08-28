@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The CPU torch wheel, not the default CUDA one: a tenth of the download
+      # and the suite's GPU half skips here anyway. --no-deps then keeps pip
+      # from pulling the CUDA build back in over the top.
+      - name: Install
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps -e .
+          pip install numpy pytest
+
+      # The whole suite runs. Tests needing a GPU carry skipif marks and report
+      # as skipped on this runner.
+      - name: pytest
+        run: pytest -q -rs
