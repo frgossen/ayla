@@ -26,10 +26,14 @@ class Pass:
             self.run_op(op)
 
 
-class Pipeline:
+class Pipeline(Pass):
     """A sequence of passes invoked one after the other.
 
     Subclasses register passes via `add_pass` (typically in `__init__`).
+
+    A pipeline is itself a pass, so one nests inside another: a group of passes
+    that always run together can be named once and added wherever a single pass
+    goes. `run` is overridden outright, so the inherited walk never runs.
     """
 
     def __init__(self) -> None:

@@ -5,7 +5,6 @@ import textwrap
 import pytest
 import torch
 
-from ayla.passes.canonicalize import canonicalize
 from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.licm import licm
 from ayla.passes.pipeline_loop import pipeline_loop

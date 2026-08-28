@@ -2,7 +2,7 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from ..passes.canonicalize import canonicalize
+from ..passes.canonicalize import Canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
@@ -62,7 +62,7 @@ def auto_matmul_4096_wgmma256_wg_module():
     module = multi_buffer(module, depth=4, label_filter="mm_rhs_smem")
     module = licm(module)
     module = unroll_loop(module, unroll_factor=4, label_filter="k")
-    module = canonicalize(module)
+    module = Canonicalize().run(module)
     module = lower_to_async(module)
     # Fuse each stage's lhs+rhs TMA loads onto one mbarrier BEFORE pipelining,
     # while load and await are still adjacent (post-pipeline the await moves to
@@ -70,7 +70,7 @@ def auto_matmul_4096_wgmma256_wg_module():
     module = fuse_async(module)
     for i in range(4):
       module = licm(module)
-      module = canonicalize(module)
+      module = Canonicalize().run(module)
 
     module = pipeline_loop(module, label_filter_loop="k", label_filter_op=r"mm_(lhs|rhs)_smem_iter\d+_async", pipelining_offset=1)
 
@@ -80,10 +80,10 @@ def auto_matmul_4096_wgmma256_wg_module():
 
     for i in range(4):
       module = licm(module)
-      module = canonicalize(module)
+      module = Canonicalize().run(module)
 
 
     module = schedule_async(module)
-    module = canonicalize(module)
+    module = Canonicalize().run(module)
 
     return module

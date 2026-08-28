@@ -3,7 +3,7 @@ import textwrap
 
 from ayla.gpu_dialect import AllocOp, ForOp, MoveOp, gpu_dialect
 from ayla.base.ir import iter_ops
-from ayla.passes.canonicalize import canonicalize
+from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.licm import licm
 from ayla.passes.unroll_loop import unroll_loop
@@ -62,7 +62,7 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
 
     # LICM lifts the loop's copy into the block the tail's copy lives in, where
     # CSE can see the two are the same buffer.
-    folded = canonicalize(licm(module))
+    folded = Canonicalize().run(licm(module))
     assert sum(isinstance(o, AllocOp) for o in iter_ops(folded)) == 1
 
 
