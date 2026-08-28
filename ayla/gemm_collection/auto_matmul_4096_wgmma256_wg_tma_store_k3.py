@@ -2,7 +2,7 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from ..passes.canonicalize import canonicalize
+from ..passes.canonicalize import Canonicalize
 from ..passes.fuse_async import fuse_async
 from ..passes.licm import licm
 from ..passes.lower_to_async import lower_to_async
@@ -72,12 +72,12 @@ def _tma_store_k3_module(*, output_tiles_per_cta: int):
     module = multi_buffer(module, depth=3, label_filter="mm_rhs_smem")
     module = licm(module)
     module = unroll_loop(module, unroll_factor=3, label_filter="k")
-    module = canonicalize(module)
+    module = Canonicalize().run(module)
     module = lower_to_async(module)
     module = fuse_async(module)
     for _ in range(4):
         module = licm(module)
-        module = canonicalize(module)
+        module = Canonicalize().run(module)
 
     module = pipeline_loop(
         module, label_filter_loop="k",
@@ -90,14 +90,14 @@ def _tma_store_k3_module(*, output_tiles_per_cta: int):
     module = fuse_async(module)
     for _ in range(4):
         module = licm(module)
-        module = canonicalize(module)
+        module = Canonicalize().run(module)
 
     if output_tiles_per_cta == 2:
         module = unroll_loop(
             module, unroll_factor=2, label_filter="outm"
         )
     module = schedule_async(module)
-    return canonicalize(module)
+    return Canonicalize().run(module)
 
 
 @register

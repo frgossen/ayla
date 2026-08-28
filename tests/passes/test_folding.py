@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
-from ayla.passes.canonicalize import canonicalize
+from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
 
@@ -71,7 +71,7 @@ def test_per_iteration_buffer_choice_folds_after_unrolling():
 
     module = gpu_dialect.parse(module_str)
     module = unroll_loop(module, unroll_factor=2, label_filter="k")
-    module = canonicalize(folding(module))
+    module = Canonicalize().run(folding(module))
 
     assert repr(module) == textwrap.dedent("""\
         module {
@@ -111,7 +111,7 @@ def test_buffer_choice_stays_dynamic_when_depth_does_not_divide_the_unroll():
 
     module = gpu_dialect.parse(module_str)
     module = unroll_loop(module, unroll_factor=2, label_filter="k")
-    module = canonicalize(folding(module))
+    module = Canonicalize().run(folding(module))
 
     assert "select(" in repr(module)
 

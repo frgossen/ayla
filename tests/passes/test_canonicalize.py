@@ -1,7 +1,7 @@
 """Tests for the canonicalize pass (folding + CSE + DCE)."""
 import textwrap
 
-from ayla.passes.canonicalize import canonicalize
+from ayla.passes.canonicalize import Canonicalize
 from ayla.gpu_dialect import gpu_dialect
 
 
@@ -21,7 +21,7 @@ def test_inline_single_trip_for():
 
     module = gpu_dialect.parse(module_str)
 
-    module = canonicalize(module)
+    module = Canonicalize().run(module)
     expected_after_first = textwrap.dedent("""\
         module {
           kernel @test(%a: smem<128x64xbf16 swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
@@ -34,7 +34,7 @@ def test_inline_single_trip_for():
         }""")  # noqa: E501
     assert repr(module) == expected_after_first
 
-    module = canonicalize(module)
+    module = Canonicalize().run(module)
     expected_after_second = textwrap.dedent("""\
         module {
           kernel @test(%a: smem<128x64xbf16 swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {

@@ -32,9 +32,7 @@ from .gpu_dialect import (
     WrmemTensorType,
 )
 from .base.ir import Op, Printer, Value
-from .passes.folding import Folding
-from .passes.cse import CSE
-from .passes.dce import DCE
+from .passes.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
@@ -49,14 +47,10 @@ class PtxLoweringPipeline(Pipeline):
         super().__init__()
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
-        self.add_pass(Folding())
-        self.add_pass(CSE())
-        self.add_pass(DCE())
+        self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
         self.add_pass(LowerToPtxTemplate())
-        self.add_pass(Folding())
-        self.add_pass(CSE())
-        self.add_pass(DCE())
+        self.add_pass(Canonicalize())
 
 
 # Matches placeholders like ${r:tid}, ${rd:operand[0].ptr}, ${label:exit}.
