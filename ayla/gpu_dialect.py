@@ -4,7 +4,7 @@ from __future__ import annotations
 import enum
 import itertools
 import math
-from typing import ClassVar, Iterator
+from typing import ClassVar, Iterator, cast
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
@@ -1069,12 +1069,16 @@ class TmaDescType(Type):
         gmem_type: "GmemTensorType",
         tile_shape: list[int],
         swizzle: str | None = None,
+        l2_promotion: str | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "TmaDescType":
         attrs = dict(attrs or {})
-        l2_promotion = attrs.get("l2_promotion")
+        if "l2_promotion" in attrs:
+            raise ValueError("pass l2_promotion as an explicit argument")
         if l2_promotion not in (None, "64B", "128B", "256B"):
             raise ValueError(f"unsupported TMA L2 promotion {l2_promotion!r}")
+        if l2_promotion is not None:
+            attrs["l2_promotion"] = l2_promotion
         return cls(attrs={
             "arg_idx": arg_idx,
             "gmem_type": gmem_type,
@@ -1147,7 +1151,15 @@ class TmaDescType(Type):
             swizzle = p.read_str_attr()
         attrs = p.read_extra_attrs()
         p.read_literal(">")
-        return cls.build(arg_idx, gmem_type, tile_shape, swizzle=swizzle, attrs=attrs)
+        l2_promotion = cast(str | None, attrs.pop("l2_promotion", None))
+        return cls.build(
+            arg_idx,
+            gmem_type,
+            tile_shape,
+            swizzle=swizzle,
+            l2_promotion=l2_promotion,
+            attrs=attrs,
+        )
 
 
 def physical_layout(

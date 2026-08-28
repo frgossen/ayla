@@ -153,13 +153,13 @@ def test_tma_descriptor_validates_l2_promotion():
     gmem_type = GmemTensorType.build((64, 64), F32Type())
     desc = TmaDescType.build(
         0, gmem_type, tile_shape=[64, 64],
-        attrs={"l2_promotion": "256B"},
+        l2_promotion="256B",
     )
     assert desc.l2_promotion == "256B"
     with pytest.raises(ValueError, match="unsupported TMA L2 promotion"):
         TmaDescType.build(
             0, gmem_type, tile_shape=[64, 64],
-            attrs={"l2_promotion": "512B"},
+            l2_promotion="512B",
         )
 
 
