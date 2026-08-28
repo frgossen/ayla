@@ -1,13 +1,16 @@
 """Loop-invariant code motion.
 
-Hoists side-effect-free ops out of a ``for`` loop body when all their operands
-are defined outside the loop.
+Hoists side-effect-free ops out of a loop body -- ``for`` or ``ploop`` --
+when all their operands are defined outside the loop. An op that does not
+depend on the induction variable computes the same value at every point of
+the iteration space, sequential or parallel alike.
 """
 from __future__ import annotations
 
 from ..gpu_dialect import (
     ForOp,
     ModuleOp,
+    PLoopOp,
     effective_operands,
     is_side_effect_free,
 )
@@ -17,7 +20,7 @@ from ..base.lowering_pass import LoweringPass, lowers
 
 class LICM(LoweringPass):
 
-    @lowers(ForOp)
+    @lowers(ForOp, PLoopOp)
     def lower_block_op(
         self, op: Op,
     ) -> tuple[list[Op], list[object]]:

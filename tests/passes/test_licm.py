@@ -53,3 +53,30 @@ def test_hoist_alloc_without_init():
           }
         }""")
     assert text == expected
+
+
+def test_hoist_out_of_a_ploop():
+    """A ploop is a loop body like any other: what does not use the iv leaves."""
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<128x4096xbf16>) grid_dim=[32, 1, 1] block_dim=[128, 1, 1] {
+            ploop block.x (%bx: index = 0 to 32) {
+              %s: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+              %t: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %bx: index)
+              move(%s: smem<128x64xbf16 swizzle="128B">, %t: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+            }
+          }
+        }""")  # noqa: E501
+
+    expected = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<128x4096xbf16>) grid_dim=[32, 1, 1] block_dim=[128, 1, 1] {
+            %s: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            ploop block.x (%bx: index = 0 to 32) {
+              %t: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %bx: index)
+              move(%s: smem<128x64xbf16 swizzle="128B">, %t: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
+            }
+          }
+        }""")  # noqa: E501
+
+    assert repr(licm(gpu_dialect.parse(module_str))) == expected
