@@ -141,3 +141,34 @@ def test_lower_move_gmem_to_smem():
         ),
     )
     assert template.count("ld.global.b16") == 64, "64 rows unrolled"
+
+
+def test_lower_elementwise_sigmoid():
+    """One f32 element per thread: -x*log2(e), ex2, +1, reciprocal.
+
+    The hardware exponential is base 2, so exp(-x) is ex2 of -x*log2(e)
+    (0fBFB8AA3B). dst doubles as the scratch register -- src is read by the
+    first instruction and not after, which is what lets dst be src.
+    """
+    w = 'wrmem<128x1xf32 warps=4 layout="wgmma_layout_0">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %a: {w} = alloc() attrs={{id: 0}}
+            %b: {w} = alloc() attrs={{id: 1}}
+            elementwise(%b: {w}, %a: {w}) attrs={{fn: "sigmoid"}}
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda o: isinstance(o, PTXTemplateOp)
+    )[-1].attrs["template"]
+
+    assert template == textwrap.dedent("""\
+        mul.f32 ${f32:operand.dst.r0}, ${f32:operand.src.r0}, 0fBFB8AA3B;
+        ex2.approx.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0};
+        add.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0}, 0f3F800000;
+        rcp.approx.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0};
+        """)
+
