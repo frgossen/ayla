@@ -122,7 +122,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     )
     module = promote_buffers(
         module, target_type="wrmem", operands=["dst"], swizzle=None,
-        layout="wgmma_layout_0", warps=4, tma=True, nc=False,
+        layout="wgmma_layout_0", warps=4, tma=True,
         physical_layout=(
             {
                 "swizzle": "128B",
@@ -142,7 +142,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     )
     module = promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
-        swizzle="128B", layout=None, warps=None, tma=True, nc=True,
+        swizzle="128B", layout=None, warps=None, tma=True,
         physical_layout=(
             {
                 "block_width": 64,

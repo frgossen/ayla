@@ -218,10 +218,10 @@ def test_promote_smem_with_warp_group_dependent_lhs():
               %7: gmem<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem<256x4096xbf16>, 0, %k: index)
               %8: gmem<128x64xbf16 strides=[4096, 1]> = tile(%0: gmem<128x4096xbf16>, 0, %k: index)
               %9: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0, label: "mm_lhs_smem"}
-              move(%9: smem<128x64xbf16 swizzle="128B">, %8: gmem<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_lhs_smem", nc: True, tma: True}
+              move(%9: smem<128x64xbf16 swizzle="128B">, %8: gmem<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_lhs_smem", tma: True}
               %10: smem<64x64xbf16 swizzle="128B"> = tile(%9: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
               %11: smem<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "mm_rhs_smem"}
-              move(%11: smem<256x64xbf16 swizzle="128B">, %7: gmem<256x64xbf16 strides=[4096, 1]>) attrs={label: "mm_rhs_smem", nc: True, tma: True}
+              move(%11: smem<256x64xbf16 swizzle="128B">, %7: gmem<256x64xbf16 strides=[4096, 1]>) attrs={label: "mm_rhs_smem", tma: True}
               matmul(%10: smem<64x64xbf16 swizzle="128B">, %11: smem<256x64xbf16 swizzle="128B">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
             }
             %12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
