@@ -28,23 +28,22 @@ def _tma_store_k3_module(*, output_tiles_per_cta: int):
             matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
+    # The warp-group split rides along in the same call: a ploop created
+    # after a `for` exists would land inside it, and unrolling that `for`
+    # would then duplicate the whole nest.
     if output_tiles_per_cta == 1:
         module = tile_matmul(
-            module, tile_dims=["M", "N"], tile_sizes=[128, 256],
-            tile_levels=["block.x", "block.y"], tile_labels=[None, None],
-            label_filter="mm",
+            module, tile_dims=["M", "N", "M"], tile_sizes=[128, 256, 64],
+            tile_levels=["block.x", "block.y", "wg.x"],
+            tile_labels=[None, None, None], label_filter="mm",
         )
     else:
         module = tile_matmul(
-            module, tile_dims=["M", "M", "N"],
-            tile_sizes=[2048, 128, 256],
-            tile_levels=["for", "block.x", "block.y"],
-            tile_labels=["outm", None, None], label_filter="mm",
+            module, tile_dims=["M", "M", "N", "M"],
+            tile_sizes=[2048, 128, 256, 64],
+            tile_levels=["for", "block.x", "block.y", "wg.x"],
+            tile_labels=["outm", None, None, None], label_filter="mm",
         )
-    module = tile_matmul(
-        module, tile_dims=["M"], tile_sizes=[64],
-        tile_levels=["wg.x"], tile_labels=[None], label_filter="mm",
-    )
     module = promote_buffers(
         module, target_type="wrmem", operands=["dst"], swizzle=None,
         layout="wgmma_layout_0", warps=4, tma=True, nc=False,
