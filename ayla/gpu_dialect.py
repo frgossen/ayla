@@ -1177,7 +1177,7 @@ class TmaDescType(Type):
             swizzle = p.read_str_attr()
         attrs = p.read_extra_attrs()
         p.read_literal(">")
-        l2_promotion = cast(str | None, attrs.pop("l2_promotion", None))
+        l2_promotion = attrs.pop("l2_promotion", None)
         return cls.build(
             arg_idx,
             gmem_type,

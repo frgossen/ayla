@@ -53,10 +53,6 @@ static uintptr_t module_load_data(
     const std::string& ptx,
     int optimization_level
 ) {
-    TORCH_CHECK(
-        optimization_level >= -1 && optimization_level <= 4,
-        "optimization_level must be unset (-1) or in [0, 4]"
-    );
     CUmodule mod = nullptr;
     // Emit line info during JIT so Nsight Compute can correlate the
     // generated PTX with the SASS in its source view.

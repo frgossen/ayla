@@ -27,7 +27,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2_module():
     )
 
 
-@register(ptx_optimization_level=1)
+@register
 def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
     module = auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tiles_per_cta=4,
