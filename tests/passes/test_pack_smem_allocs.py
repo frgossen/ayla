@@ -6,7 +6,7 @@ from ayla.gpu_dialect import AllocOp, KernelOp, gpu_dialect
 from ayla.passes.pack_smem_allocs import pack_smem_allocs
 
 
-def test_hoists_smaller_alignment_allocs_when_footprint_does_not_grow():
+def test_reorders_lower_aligned_allocs_when_footprint_does_not_grow():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
@@ -23,7 +23,7 @@ def test_hoists_smaller_alignment_allocs_when_footprint_does_not_grow():
     assert labels == ["lhs", "rhs", "output"]
 
 
-def test_keeps_order_when_hoisting_would_add_padding():
+def test_keeps_order_when_reordering_would_add_padding():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {

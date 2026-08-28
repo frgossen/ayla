@@ -34,7 +34,7 @@ def _footprint(allocs: list[AllocOp]) -> int:
 
 
 class PackSmemAllocs(Pass):
-    """Hoist lower-aligned tensor allocations before the first widest one."""
+    """Reorder lower-aligned tensor allocations before the first widest one."""
 
     def run_block(self, block: Block) -> None:
         allocs = [
@@ -42,21 +42,35 @@ class PackSmemAllocs(Pass):
             if isinstance(op, AllocOp)
             and isinstance(op.result().type, SmemTensorType)
         ]
-        if len(allocs) >= 2:
-            widest = max(map(_alignment, allocs))
-            first_wide = next(op for op in allocs if _alignment(op) == widest)
+        if len(allocs) < 2:
+            super().run_block(block)
+            return
+
+        alignments = [_alignment(op) for op in allocs]
+        widest = max(alignments)
+        first_wide_index = alignments.index(widest)
+        first_wide = allocs[first_wide_index]
+
+        # TODO: A general kernel-wide packing pass should use find_ops to
+        # collect nested SMEM allocations, safely hoist them to a common block,
+        # and optimize their complete layout. This heuristic only reorders
+        # allocations that are already direct children of the same block.
+        to_move = []
+        reordered = []
+        for index, (alloc, alignment) in enumerate(
+            zip(allocs, alignments, strict=True),
+        ):
+            if index > first_wide_index and alignment < widest:
+                to_move.append(alloc)
+            else:
+                reordered.append(alloc)
+
+        reordered = to_move + reordered
+        if to_move and _footprint(reordered) <= _footprint(allocs):
+            for alloc in to_move:
+                block.ops.remove(alloc)
             first_wide_index = block.ops.index(first_wide)
-            to_hoist = [
-                op for op in allocs
-                if block.ops.index(op) > first_wide_index
-                and _alignment(op) < widest
-            ]
-            reordered = to_hoist + [op for op in allocs if op not in to_hoist]
-            if to_hoist and _footprint(reordered) <= _footprint(allocs):
-                for alloc in to_hoist:
-                    block.ops.remove(alloc)
-                first_wide_index = block.ops.index(first_wide)
-                block.ops[first_wide_index:first_wide_index] = to_hoist
+            block.ops[first_wide_index:first_wide_index] = to_move
         super().run_block(block)
 
 
