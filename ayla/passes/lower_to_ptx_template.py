@@ -19,6 +19,7 @@ from ..gpu_dialect import (
     BarrierOp,
     BF16Type,
     ConvertOp,
+    DeallocOp,
     F16Type,
     F32Type,
     GmemTensorType,
@@ -38,6 +39,7 @@ from ..gpu_dialect import (
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
+    TmemTensorType,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -192,18 +194,74 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_alloc_rmem(op)
         if isinstance(result_type, WrmemTensorType):
             return self._lower_alloc_wrmem(op)
+        if isinstance(result_type, TmemTensorType):
+            return self._lower_alloc_tmem(op)
         if isinstance(result_type, LockType):
             return self._lower_alloc_lock(op)
         raise NotImplementedError(
             f"lower_alloc: unsupported result type {type(result_type).__name__}"
         )
 
+    def _lower_alloc_tmem(
+        self, op: AllocOp,
+    ) -> tuple[list[Op], list[object]]:
+        result_type = op.result().type
+        assert isinstance(result_type, TmemTensorType)
+        if self.target.tensor_core_kind != "tcgen05":
+            raise ValueError(
+                "tensor-memory allocation requires a Blackwell target; "
+                f"got {self.target.architecture!r}"
+            )
+        if op.init is not None:
+            raise ValueError("tensor-memory allocation does not support init")
+        # tcgen05.alloc is warp-collective. Warp 0 briefly performs the required
+        # issue sequence; it is not assigned a persistent pipeline role.
+        template = textwrap.dedent(f"""\
+            .shared .align 4 .b32 ${{smem:tmem_addr}}[1];
+            mov.u32 ${{b32:tmem_tid}}, %tid.x;
+            setp.lt.u32 ${{pred:tmem_warp0}}, ${{b32:tmem_tid}}, 32;
+            @${{pred:tmem_warp0}} tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {result_type.columns};
+            bar.sync 0;
+            ld.shared.b32 ${{b32:result.dst.ptr}}, [${{smem:tmem_addr}}];
+            bar.sync 0;
+            @${{pred:tmem_warp0}} tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+        """)
+        new_op = PTXTemplateOp.build(
+            operands=[], result_types=[result_type], template=template,
+            operand_names=[], result_names=["dst"], description=str(op),
+        )
+        return [new_op], [new_op.result()]
+
+    @lowers(DeallocOp)
+    def lower_dealloc(
+        self, op: DeallocOp,
+    ) -> tuple[list[Op], list[object]]:
+        value = self.value_map[op.value]
+        value_type = op.value.type
+        assert isinstance(value_type, TmemTensorType)
+        if self.target.tensor_core_kind != "tcgen05":
+            raise ValueError(
+                "tensor-memory deallocation requires a Blackwell target; "
+                f"got {self.target.architecture!r}"
+            )
+        template = textwrap.dedent(f"""\
+            bar.sync 0;
+            mov.u32 ${{b32:tmem_tid}}, %tid.x;
+            setp.lt.u32 ${{pred:tmem_warp0}}, ${{b32:tmem_tid}}, 32;
+            @${{pred:tmem_warp0}} tcgen05.dealloc.cta_group::1.sync.aligned.b32 ${{b32:operand.src.ptr}}, {value_type.columns};
+        """)
+        new_op = PTXTemplateOp.build(
+            operands=[value], result_types=[], template=template,
+            operand_names=["src"], result_names=[], description=str(op),
+        )
+        return [new_op], []
+
     def _lower_alloc_lock(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
         lock_type = op.result().type
         assert isinstance(lock_type, LockType)
-        if lock_type.kind != "mbar":
+        if lock_type.kind not in ("mbar", "tcgen05"):
             return [], [None]
         template = textwrap.dedent("""\
             .shared .align 8 .b64 ${smem:bar}[1];
@@ -507,6 +565,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_async: tma_move with lock kind {kind!r}"
             )
         if body_ops and all(isinstance(o, MatmulOp) for o in body_ops):
+            if op.lock.type.kind == "tcgen05":
+                return self._lower_async_matmul_tcgen05(op, body_ops)
             return self._lower_async_matmul_wgmma(op, body_ops)
         raise NotImplementedError(
             f"lower_async: unsupported body ops "
@@ -735,6 +795,85 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], []
 
+    def _lower_async_matmul_tcgen05(
+        self, op: AsyncOp, mms: list[MatmulOp],
+    ) -> tuple[list[Op], list[object]]:
+        """Lower the first supported SM100 BF16 tile to ``tcgen05.mma``.
+
+        ``tcgen05.mma`` has single-thread issue semantics. One elected lane of
+        warp 0 issues the MMA and its completion commit, while all four warps
+        execute the same surrounding load/compute/store pipeline. This is the
+        instruction's required issue sequence, not producer/consumer warp
+        specialization.
+        """
+        if self.target.tensor_core_kind != "tcgen05":
+            raise ValueError(
+                "tcgen05 lowering requires a Blackwell target; "
+                f"got {self.target.architecture!r}"
+            )
+        if len(mms) != 1:
+            raise NotImplementedError(
+                "tcgen05 lowering currently supports one matmul per async group"
+            )
+        mm = mms[0]
+        lhs_type, rhs_type, dst_type = mm.lhs.type, mm.rhs.type, mm.dst.type
+        supported = (
+            isinstance(lhs_type, SmemTensorType)
+            and isinstance(rhs_type, SmemTensorType)
+            and isinstance(dst_type, TmemTensorType)
+            and tuple(lhs_type.sizes) == (128, 16)
+            and tuple(rhs_type.sizes) == (64, 16)
+            and tuple(dst_type.sizes) == (128, 64)
+            and lhs_type.dtype.name == rhs_type.dtype.name == "bf16"
+            and dst_type.dtype.name == "f32"
+            and lhs_type.swizzle == "32B"
+            and rhs_type.swizzle == "128B"
+        )
+        if not supported:
+            raise NotImplementedError(
+                "tcgen05 lowering currently supports "
+                "smem<128x16xbf16 swizzle=32B> @ "
+                "smem<64x16xbf16 swizzle=128B> -> tmem<128x64xf32>"
+            )
+
+        lhs = self.value_map[mm.lhs]
+        rhs = self.value_map[mm.rhs]
+        dst = self.value_map[mm.dst]
+        lock = self.value_map[op.lock]
+        # Descriptor constants encode the proven compact SM100 layouts used by
+        # the cooperative staging path in the end-to-end test. The instruction
+        # descriptor is f32 D, bf16 A/B, M=128, N=64, dense, no transpose.
+        template = textwrap.dedent("""\
+            fence.proxy.async.shared::cta;
+            mov.u32 ${b32:tid}, %tid.x;
+            shr.u32 ${b32:warp}, ${b32:tid}, 5;
+            setp.eq.u32 ${pred:warp0}, ${b32:warp}, 0;
+            elect.sync ${b32:elected_lane}|${pred:elected}, -1;
+            and.pred ${pred:issue}, ${pred:warp0}, ${pred:elected};
+            bfe.u32 ${b32:lhs_addr}, ${b32:operand.lhs.ptr}, 4, 14;
+            cvt.u64.u32 ${b64:lhs_desc}, ${b32:lhs_addr};
+            bfe.u32 ${b32:rhs_addr}, ${b32:operand.rhs.ptr}, 4, 14;
+            cvt.u64.u32 ${b64:rhs_desc}, ${b32:rhs_addr};
+            or.b64 ${b64:lhs_desc}, ${b64:lhs_desc}, 0xc000401000000000;
+            or.b64 ${b64:rhs_desc}, ${b64:rhs_desc}, 0x4000404000000000;
+            mov.b32 ${b32:idesc}, 0x08110490;
+            mov.b32 ${b32:disable}, 0;
+            mov.pred ${pred:discard_d}, 0;
+            @${pred:issue} tcgen05.mma.cta_group::1.kind::f16
+                [${b32:operand.dst.ptr}], ${b64:lhs_desc}, ${b64:rhs_desc},
+                ${b32:idesc},
+                {${b32:disable}, ${b32:disable}, ${b32:disable}, ${b32:disable}},
+                ${pred:discard_d};
+            @${pred:issue} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
+                [${b32:operand.lock.val}];
+        """)
+        new_op = PTXTemplateOp.build(
+            operands=[lhs, rhs, dst, lock], result_types=[], template=template,
+            operand_names=["lhs", "rhs", "dst", "lock"], result_names=[],
+            description=str(op),
+        )
+        return [new_op], []
+
     @lowers(MoveOp)
     def lower_move(
         self, op: MoveOp,
@@ -774,6 +913,8 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_await_mbar(op, lock)
         if kind == "wgmma":
             return self._lower_await_wgmma(op)
+        if kind == "tcgen05":
+            return self._lower_await_mbar(op, lock)
         if kind == "bulk":
             return self._lower_await_bulk(op)
         raise NotImplementedError(

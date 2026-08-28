@@ -15,6 +15,7 @@ from ayla import (
 from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    DeallocOp,
     F32Type,
     ForOp,
     IndexType,
@@ -23,6 +24,7 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    TmemTensorType,
     gpu_dialect,
 )
 from ayla.targets import BLACKWELL, HOPPER
@@ -98,6 +100,17 @@ def test_module_explicit_target():
 
     with pytest.raises(ValueError, match="target conflicts with attrs: target"):
         ModuleOp.build(Block(), attrs={"target": "sm_80"}, target=BLACKWELL)
+
+
+def test_tensor_memory_type_and_dealloc_roundtrip():
+    tmem = TmemTensorType.build([128, 64], F32Type())
+    value = Value(name="acc", type=tmem)
+    op = DeallocOp.build(value)
+
+    assert repr(tmem) == "tmem<128x64xf32>"
+    assert repr(gpu_dialect.parse(repr(op))) == repr(op)
+    with pytest.raises(AssertionError, match="columns must be a power of two"):
+        TmemTensorType.build([128, 48], F32Type())
 
 
 def test_kernel_num_threads():

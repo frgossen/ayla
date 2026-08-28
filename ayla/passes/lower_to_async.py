@@ -22,6 +22,7 @@ from ..gpu_dialect import (
     MoveOp,
     SmemTensorType,
     TmaMoveOp,
+    TmemTensorType,
     WrmemTensorType,
 )
 from ..base.ir import Block, Op, Value
@@ -94,19 +95,24 @@ class LowerToAsync(LoweringPass):
         lhs = self.value_map[op.lhs]
         rhs = self.value_map[op.rhs]
         dst = self.value_map[op.dst]
-        # Only wgmma matmuls (smem×smem→wrmem, 4 warps) are async; plain FMA
-        # matmuls stay synchronous. Same idea as ``lower_move``'s tma gate.
+        # Tensor-core matmuls are asynchronous; plain FMA matmuls stay
+        # synchronous. The destination type identifies the architecture's
+        # accumulator storage without consulting the runtime GPU.
         # TODO: lower *all* matmuls as async (FMA ones too), wrapping every
         # matmul uniformly — the non-async ones get a trivial lock whose await
         # is a no-op (async + immediate await ≡ sync). That removes this gate
         # and the sync/async split entirely.
         if not (isinstance(lhs.type, SmemTensorType)
-                and isinstance(rhs.type, SmemTensorType)
-                and isinstance(dst.type, WrmemTensorType)
-                and dst.type.warps == 4):
+                and isinstance(rhs.type, SmemTensorType)):
+            return None
+        if isinstance(dst.type, TmemTensorType):
+            kind = "tcgen05"
+        elif isinstance(dst.type, WrmemTensorType) and dst.type.warps == 4:
+            kind = "wgmma"
+        else:
             return None
         matmul = MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs)
-        return self._wrap(matmul, "wgmma", op.attrs)
+        return self._wrap(matmul, kind, op.attrs)
 
 
 def lower_to_async(module: ModuleOp) -> ModuleOp:

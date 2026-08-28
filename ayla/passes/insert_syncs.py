@@ -177,6 +177,10 @@ def _async_collective_scope(lock: Value) -> CollectiveScope:
     kind = lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
+    if kind == "tcgen05":
+        # One elected thread issues the MMA, but its destination is CTA-owned
+        # tensor memory and every participating thread waits on the commit.
+        return CollectiveScope.BLOCK
     if kind == "mbar":
         # A TMA-load mbar await is a leader completion: t0 issues the copy, all
         # threads wait the mbarrier for it. So it closes BLOCK_LEADER (the leader

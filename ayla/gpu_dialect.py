@@ -485,6 +485,22 @@ class AllocOp(Op):
         return {k: v for k, v in self.attrs.items() if k != "init"}
 
 
+@gpu_dialect.register_op("dealloc")
+class DeallocOp(Op):
+    """Release an explicitly managed architecture-specific allocation."""
+
+    @classmethod
+    def build(cls, value: Value) -> "DeallocOp":
+        assert isinstance(value.type, TmemTensorType), (
+            f"DeallocOp: expected tensor memory; got {value.type}"
+        )
+        return cls(operands=[value], results=[])
+
+    @property
+    def value(self) -> Value:
+        return self.operands[0]
+
+
 @gpu_dialect.register_op("move")
 class MoveOp(Op):
     """Move data into a destination, with optional indices."""
@@ -1225,6 +1241,69 @@ class RmemTensorType(RegMemTensorType):
     """
 
 
+@gpu_dialect.register_type("tmem")
+class TmemTensorType(MemTensorType):
+    """Blackwell tensor-memory allocation owned by one CTA.
+
+    Tensor memory has 128 lanes of 32-bit cells. Dense f32 accumulators use one
+    tensor-memory column per logical output column; allocation is therefore
+    explicit and constrained to the hardware's power-of-two column granularity.
+    """
+
+    @classmethod
+    def build(  # type: ignore[override]
+        cls,
+        sizes: list[int],
+        dtype: Type,
+        columns: int | None = None,
+        attrs: dict[str, object] | None = None,
+    ):
+        assert len(sizes) == 2, f"TmemTensorType: expected rank 2; got {sizes}"
+        columns = sizes[1] if columns is None else columns
+        assert columns in (32, 64, 128, 256, 512), (
+            "TmemTensorType: columns must be a power of two in [32, 512]; "
+            f"got {columns}"
+        )
+        return cls(attrs={
+            "sizes": list(sizes),
+            "dtype": dtype,
+            "columns": columns,
+            **(attrs or {}),
+        })
+
+    @property
+    def columns(self) -> int:
+        return self.attrs["columns"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write(self.name)
+        p.write("<")
+        p.write_shape(self.sizes, self.dtype)
+        if self.columns != self.sizes[1]:
+            p.write(f" columns={self.columns}")
+        p.write_extra_attrs(
+            self.attrs, skip_keys=("sizes", "dtype", "columns"),
+        )
+        p.write(">")
+
+    @classmethod
+    def parse(cls, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.TYPE_ID:
+            raise ValueError(
+                f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal("<")
+        sizes, dtype = p.read_shape(with_dtype=True)
+        columns = sizes[1]
+        if p.can_read_literal("columns"):
+            p.read_literal("columns")
+            p.read_literal("=")
+            columns = p.read_int()
+        attrs = p.read_extra_attrs()
+        p.read_literal(">")
+        return cls.build(sizes, dtype, columns=columns, attrs=attrs)
+
+
 @gpu_dialect.register_type("wrmem")
 class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
     """Warp register-memory tensor.
@@ -1756,6 +1835,8 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
         return CollectiveScope.WARPGROUP
     if isinstance(t, SmemTensorType):
         return CollectiveScope.BLOCK
+    if isinstance(t, TmemTensorType):
+        return CollectiveScope.BLOCK
     if isinstance(t, GmemTensorType):
         return CollectiveScope.GRID
     raise NotImplementedError(
@@ -1799,12 +1880,16 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         kind = "W" if smem_is_dst else "R"
         return [(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)]
     if isinstance(op, MatmulOp):
-        # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         dst = root_buffer(op.dst)
+        dst_scope = (
+            CollectiveScope.BLOCK
+            if isinstance(op.dst.type, TmemTensorType)
+            else CollectiveScope.THREAD
+        )
         return [("R", root_buffer(op.lhs), _type_collective_scope(op.lhs.type)),
                 ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
-                ("R", dst, CollectiveScope.THREAD),
-                ("W", dst, CollectiveScope.THREAD)]
+                ("R", dst, dst_scope),
+                ("W", dst, dst_scope)]
     if isinstance(op, ConvertOp):
         return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
                 ("R", root_buffer(op.src), CollectiveScope.THREAD)]
@@ -1833,6 +1918,8 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             else _type_collective_scope(buf.type)
         )
         return [("W", root_buffer(buf), scope)]
+    if isinstance(op, DeallocOp):
+        return [("W", root_buffer(op.value), CollectiveScope.BLOCK)]
     if isinstance(op, (ForOp, AsyncOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
@@ -1854,7 +1941,7 @@ def is_side_effect_free(op: Op) -> bool:
     if isinstance(op, AllocOp):
         # The initialiser writes the buffer, so such an allocation neither
         # moves freely nor stands in for another.
-        return op.init is None
+        return op.init is None and not isinstance(op.result().type, TmemTensorType)
     return isinstance(op, (
         BlockIdsOp,
         IndexAddOp,

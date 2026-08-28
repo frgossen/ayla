@@ -1,10 +1,12 @@
 from .gpu_dialect import (
     AsyncOp,
+    DeallocOp,
     GmemTensorType,
     KernelOp,
     MatmulOp,
     ModuleOp,
     PTXTemplateOp,
+    TmemTensorType,
 )
 from .base.ir import (
     Block,
@@ -19,12 +21,14 @@ from .targets import BLACKWELL, HOPPER, PtxTarget
 __all__ = [
     "AsyncOp",
     "Block",
+    "DeallocOp",
     "GmemTensorType",
     "KernelOp",
     "MatmulOp",
     "ModuleOp",
     "Op",
     "PTXTemplateOp",
+    "TmemTensorType",
     "Printer",
     "Type",
     "Value",
