@@ -4,7 +4,7 @@ from __future__ import annotations
 import enum
 import itertools
 import math
-from typing import ClassVar, Iterator, cast
+from typing import ClassVar, Iterator
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
@@ -212,9 +212,7 @@ class KernelOp(Op):
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=args)
-        ptx_optimization_level = cast(
-            int | None, attrs.pop("ptx_optimization_level", None),
-        )
+        ptx_optimization_level = attrs.pop("ptx_optimization_level", None)
         return cls.build(
             name,
             body,
