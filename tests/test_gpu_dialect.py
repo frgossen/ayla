@@ -66,8 +66,9 @@ def test_kernel_op():
         PTXTemplateOp.build([lhs, rhs, dst], [buf_type], template=template),
     ])
     kernel = KernelOp.build(
-        "cwise_add", body, attrs={"version": 1},
+        "cwise_add", body, ptx_optimization_level=1, attrs={"version": 1},
     )
+    assert kernel.ptx_optimization_level == 1
     module = ModuleOp.build(
         Block(ops=[kernel]),
         attrs={"target": "sm_80"},
@@ -75,11 +76,14 @@ def test_kernel_op():
 
     expected = textwrap.dedent("""\
         module attrs={target: "sm_80"} {
-          kernel @cwise_add(%lhs: gmem<1048576xf32>, %rhs: gmem<1048576xf32>, %dst: gmem<1048576xf32>) attrs={version: 1} {
+          kernel @cwise_add(%lhs: gmem<1048576xf32>, %rhs: gmem<1048576xf32>, %dst: gmem<1048576xf32>) attrs={ptx_optimization_level: 1, version: 1} {
             %0: gmem<1048576xf32> = ptx_template(%lhs: gmem<1048576xf32>, %rhs: gmem<1048576xf32>, %dst: gmem<1048576xf32>) attrs={template: "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\\n"}
           }
         }""")  # noqa: E501
     assert_print_and_roundtrip(module, expected)
+
+    with pytest.raises(ValueError, match="ptx_optimization_level"):
+        KernelOp.build("invalid", Block(), ptx_optimization_level=5)
 
 
 def test_kernel_num_threads():

@@ -242,8 +242,8 @@ class PtxPrinter(Printer):
 @dataclass
 class PtxKernel:
     """A self-contained PTX program: source plus everything the runner needs
-    to load and launch it (entry point, grid/block, shmem, and — in the
-    future — tensor-core / arg-layout settings).
+    to load and launch it, including entry point, launch dimensions, shared
+    memory, and host-side JIT settings.
     """
 
     ptx: str
@@ -252,6 +252,7 @@ class PtxKernel:
     grid_dim: tuple[int, int, int]
     block_dim: tuple[int, int, int]
     shared_mem_bytes: int = 0
+    ptx_optimization_level: int | None = None
 
 
 def _resolve_block_dim(kernel: KernelOp) -> None:
@@ -286,6 +287,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         signature=kernel.signature,
         grid_dim=grid_dim,
         block_dim=kernel.block_dim,
+        ptx_optimization_level=kernel.ptx_optimization_level,
     )
 
 

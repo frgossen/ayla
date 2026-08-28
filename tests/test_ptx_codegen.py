@@ -31,6 +31,7 @@ def test_codegen_cwise_add():
     kernel_op = KernelOp.build(
         "cwise_add", body_block,
         grid_dim=(4, 1, 1), block_dim=(256, 1, 1),
+        ptx_optimization_level=1,
     )
     module = ModuleOp.build(Block(ops=[kernel_op]))
 
@@ -38,6 +39,7 @@ def test_codegen_cwise_add():
     assert kernel.name == "cwise_add"
     assert kernel.grid_dim == (4, 1, 1)
     assert kernel.block_dim == (256, 1, 1)
+    assert kernel.ptx_optimization_level == 1
     assert kernel.ptx == textwrap.dedent("""\
         .version 9.0
         .target sm_90a

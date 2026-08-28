@@ -34,6 +34,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    ptx_optimization_level: int | None = None,
 ) -> ModuleOp:
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
@@ -85,7 +86,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     grid_y = (n + output_n_tile - 1) // output_n_tile
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) grid_dim=[{grid_x}, {grid_y}, 1] {{
+          kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) grid_dim=[{grid_x}, {grid_y}, 1] attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
             matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))

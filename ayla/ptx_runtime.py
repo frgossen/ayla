@@ -322,11 +322,10 @@ class PtxLauncher:
     def __init__(
         self,
         kernel: PtxKernel,
-        *,
-        optimization_level: int | None = None,
     ):
+        optimization_level = kernel.ptx_optimization_level
         if optimization_level is not None and optimization_level not in range(5):
-            raise ValueError("optimization_level must be in [0, 4]")
+            raise ValueError("ptx_optimization_level must be in [0, 4]")
         self._ext = None
         self._kernel = kernel
         self._optimization_level = optimization_level
@@ -428,9 +427,5 @@ class PtxLauncher:
             pass
 
 
-def make_ptx_launcher(
-    kernel: PtxKernel,
-    *,
-    optimization_level: int | None = None,
-) -> PtxLauncher:
-    return PtxLauncher(kernel, optimization_level=optimization_level)
+def make_ptx_launcher(kernel: PtxKernel) -> PtxLauncher:
+    return PtxLauncher(kernel)

@@ -41,5 +41,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_module():
             },
             "dst": {"l2_cache_hint": "evict_first"},
         },
+        ptx_optimization_level=1,
     )
     return pack_smem_allocs(module)

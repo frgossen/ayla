@@ -92,6 +92,7 @@ def test_rejects_invalid_ptx_optimization_level():
         signature=[],
         grid_dim=(1, 1, 1),
         block_dim=(1, 1, 1),
+        ptx_optimization_level=5,
     )
     with pytest.raises(ValueError, match="optimization_level"):
-        make_ptx_launcher(kernel, optimization_level=5)
+        make_ptx_launcher(kernel)

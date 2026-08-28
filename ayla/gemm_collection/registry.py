@@ -115,11 +115,7 @@ def _gemm_dims(kernel) -> tuple[int, int, int, torch.dtype]:
     return int(m), int(k), int(n), dtypes.pop()
 
 
-def register(
-    builder: Callable[[], object] | None = None,
-    *,
-    ptx_optimization_level: int | None = None,
-):
+def register(builder: Callable[[], object]) -> Callable[[], object]:
     """Build and register the kernel a builder produces, at import time.
 
     Decorating runs the builder immediately -- which compiles the kernel, adds
@@ -139,29 +135,21 @@ def register(
     Shape and dtype are not declared either -- they are read off the built
     kernel, so there is nothing to keep in sync.
     """
-    def decorate(builder):
-        if inspect.signature(builder).parameters:
-            raise TypeError(
-                f"{builder.__name__}: @register builders take no arguments; give "
-                f"each variant its own builder over a shared private helper"
-            )
-
-        kernel = make_ptx_kernel(builder())
-        # Derive before defining the op: a bad signature should not leave a
-        # torch.ops.ayla.* entry behind that makes the retry fail with
-        # "registered multiple times" instead of the real error.
-        m, k, n, dtype = _gemm_dims(kernel)
-
-        launcher = make_ptx_launcher(
-            kernel, optimization_level=ptx_optimization_level,
+    if inspect.signature(builder).parameters:
+        raise TypeError(
+            f"{builder.__name__}: @register builders take no arguments; give each "
+            f"variant its own builder over a shared private helper"
         )
-        op = make_torch_custom_call(launcher, list(_MATMUL_OPERANDS))
-        _KERNELS.append(GemmKernel(
-            name=kernel.name, op=op, m=m, k=k, n=n, dtype=dtype,
-        ))
-        return builder
 
-    return decorate if builder is None else decorate(builder)
+    kernel = make_ptx_kernel(builder())
+    # Derive before defining the op: a bad signature should not leave a
+    # torch.ops.ayla.* entry behind that makes the retry fail with "registered
+    # multiple times" instead of the real error.
+    m, k, n, dtype = _gemm_dims(kernel)
+
+    op = make_torch_custom_call(make_ptx_launcher(kernel), list(_MATMUL_OPERANDS))
+    _KERNELS.append(GemmKernel(name=kernel.name, op=op, m=m, k=k, n=n, dtype=dtype))
+    return builder
 
 
 def query(
