@@ -1,76 +1,37 @@
 from __future__ import annotations
 
 from ..gpu_dialect import (
-    BlockIdsOp,
     ForOp,
     IndexType,
-    KernelOp,
     MatmulOp,
     ModuleOp,
-    ThreadIdsOp,
+    PLoopOp,
     TileOp,
-    WarpGroupIdOp,
 )
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 
 
-def _resolve_launch_dim_constraints(
-    a_list: list[int | None], b_list: list[int | None],
-) -> list[int | None]:
-    """Symmetric per-axis merge of two ``int | None`` lists.
+def _build_loop(
+    tile_level: str, ub: int, body: Block, attrs: dict[str, object] | None,
+) -> Op:
+    """The loop a tile level iterates as.
 
-    For each axis: if either side is ``None``, take the other; if they
-    agree, take it; otherwise raise.
-    """
-    assert len(a_list) == len(b_list)
-    result: list[int | None] = []
-    for a, b in zip(a_list, b_list):
-        if a is None:
-            result.append(b)
-        elif b is None:
-            result.append(a)
-        elif a == b:
-            result.append(a)
-        else:
-            raise ValueError(
-                f"launch dim conflict: {a_list} vs {b_list}"
-            )
-    return result
-
-
-def _tile_level_iv(
-    tile_level: str,
-    tile_label: str | None,
-    block_ids_op: BlockIdsOp | None,
-    thread_ids_op: ThreadIdsOp | None,
-    wg_id_op: WarpGroupIdOp | None,
-) -> Value:
-    """The induction variable a tile level iterates over.
-
-    A ``for`` level gets a fresh block argument; every other level takes
-    the matching axis of the id op the caller emitted for it.
+    ``for`` is the sequential one; every other level names a hardware axis
+    and becomes a ``ploop``, which is what carries the extent to the kernel
+    once it is lowered.
     """
     if tile_level == "for":
-        return Value(name=tile_label, type=IndexType())
-    elif tile_level == "block.x":
-        return block_ids_op.x
-    elif tile_level == "block.y":
-        return block_ids_op.y
-    elif tile_level == "block.z":
-        return block_ids_op.z
-    elif tile_level == "thread.x":
-        return thread_ids_op.x
-    elif tile_level == "thread.y":
-        return thread_ids_op.y
-    elif tile_level == "thread.z":
-        return thread_ids_op.z
-    elif tile_level == "wg.x":
-        return wg_id_op.x
-    else:
+        return ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)
+    level, _, axis = tile_level.partition(".")
+    if axis not in PLoopOp.AXES:
         raise ValueError(
-            f"TileMatmul: unexpected tile_level {tile_level!r}"
+            f"TileMatmul: unexpected tile_level {tile_level!r}; expected "
+            f"'for' or <level>.<axis>"
         )
+    return PLoopOp.build(
+        0, ub, level, PLoopOp.AXES.index(axis), body=body, attrs=attrs,
+    )
 
 
 def _build_tile_op(
@@ -172,33 +133,6 @@ class TileMatmul(LoweringPass):
         self.tile_sizes = list(tile_sizes)
         self.tile_levels = list(tile_levels)
         self.tile_labels = list(tile_labels)
-        # Per-kernel state: two 3-lists of `int | None` (x/y/z).
-        # `grid_dim_constraints` holds the demands from `block.*` levels
-        # (writes to kernel.grid_dim). `block_dim_constraints` holds the
-        # demands from `thread.*` levels (writes to kernel.block_dim).
-        self.grid_dim_constraints: list[int | None]
-        self.block_dim_constraints: list[int | None]
-        self.num_warp_groups_constraints: list[int | None]
-
-    @lowers(KernelOp)
-    def lower_kernel(
-        self, op: KernelOp,
-    ) -> tuple[list[Op], list[object]]:
-        self.grid_dim_constraints = [None, None, None]
-        self.block_dim_constraints = [None, None, None]
-        self.num_warp_groups_constraints = [None]
-        for block in op.blocks:
-            self.lower_block(block)
-        op.grid_dim = _resolve_launch_dim_constraints(
-            op.grid_dim, self.grid_dim_constraints,
-        )
-        op.block_dim = _resolve_launch_dim_constraints(
-            op.block_dim, self.block_dim_constraints,
-        )
-        [op.num_warp_groups] = _resolve_launch_dim_constraints(
-            [op.num_warp_groups], self.num_warp_groups_constraints,
-        )
-        return [op], []
 
     @lowers(MatmulOp)
     def lower_matmul(
@@ -219,7 +153,7 @@ class TileMatmul(LoweringPass):
             "K": lhs.type.sizes[1],
         }
 
-        # Compute iteration bounds and accumulate kernel constraints.
+        # Compute the iteration bounds.
         ubs: list[int] = []
         for tile_dim, tile_size, tile_level in zip(
             self.tile_dims, self.tile_sizes, self.tile_levels,
@@ -242,120 +176,53 @@ class TileMatmul(LoweringPass):
                 )
             ub = (tile_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
-            self._accumulate_constraint(tile_level, ub)
             sizes_by_dim[tile_dim] = tile_size
 
-        if self.collective:
-            return None
-
-        # -- Non-collective: emit id ops, tile ops, and for-loops. --
-
-        new_ops: list[Op] = []
-        block_ids_op: BlockIdsOp | None = None
-        thread_ids_op: ThreadIdsOp | None = None
-        wg_id_op: WarpGroupIdOp | None = None
-        if any(level.startswith("block.") for level in self.tile_levels):
-            block_ids_op = BlockIdsOp.build()
-            new_ops.append(block_ids_op)
-        if any(level.startswith("thread.") for level in self.tile_levels):
-            thread_ids_op = ThreadIdsOp.build()
-            new_ops.append(thread_ids_op)
-            self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
-                self.num_warp_groups_constraints, [-1],
-            )
-        if any(level.startswith("wg.") for level in self.tile_levels):
-            wg_id_op = WarpGroupIdOp.build()
-            new_ops.append(wg_id_op)
-
         ivs = [
-            _tile_level_iv(
-                tile_level, tile_label, block_ids_op, thread_ids_op, wg_id_op,
-            )
-            for tile_level, tile_label in zip(self.tile_levels, self.tile_labels)
+            Value(name=tile_label, type=IndexType())
+            for tile_label in self.tile_labels
         ]
 
+        # Collective tiling derives the iteration space but leaves the matmul
+        # at full shape: every point of it runs the whole op.
         body_ops: list[Op] = []
-        ops, lhs = _build_tile_op(
-            lhs, ["M", "K"],
-            tile_dims=self.tile_dims,
-            tile_idxs=ivs,
-            tile_sizes=self.tile_sizes,
-        )
-        body_ops.extend(ops)
-        ops, rhs = _build_tile_op(
-            rhs, ["N", "K"],
-            tile_dims=self.tile_dims,
-            tile_idxs=ivs,
-            tile_sizes=self.tile_sizes,
-        )
-        body_ops.extend(ops)
-        ops, dst = _build_tile_op(
-            dst, ["M", "N"],
-            tile_dims=self.tile_dims,
-            tile_idxs=ivs,
-            tile_sizes=self.tile_sizes,
-        )
-        body_ops.extend(ops)
+        if not self.collective:
+            ops, lhs = _build_tile_op(
+                lhs, ["M", "K"],
+                tile_dims=self.tile_dims,
+                tile_idxs=ivs,
+                tile_sizes=self.tile_sizes,
+            )
+            body_ops.extend(ops)
+            ops, rhs = _build_tile_op(
+                rhs, ["N", "K"],
+                tile_dims=self.tile_dims,
+                tile_idxs=ivs,
+                tile_sizes=self.tile_sizes,
+            )
+            body_ops.extend(ops)
+            ops, dst = _build_tile_op(
+                dst, ["M", "N"],
+                tile_dims=self.tile_dims,
+                tile_idxs=ivs,
+                tile_sizes=self.tile_sizes,
+            )
+            body_ops.extend(ops)
         body_ops.append(
             MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs),
         )
 
+        # Wrap outer -> inner, so the last level is the innermost loop.
         for iv, ub, level, label in zip(
             reversed(ivs), reversed(ubs), reversed(self.tile_levels),
             reversed(self.tile_labels),
         ):
-            if level != "for":
-                continue
-            body = Block(arguments=[iv], ops=body_ops)
-            attrs = {"label": label} if label is not None else None
-            body_ops = [ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)]
-        new_ops.extend(body_ops)
-        return new_ops, []
-
-    def _accumulate_constraint(self, tile_level: str, ub: int) -> None:
-        if tile_level == "for":
-            pass
-        elif tile_level == "block.x":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [ub, None, None],
-            )
-        elif tile_level == "block.y":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [None, ub, None],
-            )
-        elif tile_level == "block.z":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [None, None, ub],
-            )
-        elif tile_level == "thread.x":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [ub, None, None],
-            )
-        elif tile_level == "thread.y":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [None, ub, None],
-            )
-        elif tile_level == "thread.z":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [None, None, ub],
-            )
-        elif tile_level == "wg.x":
-            self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
-                self.num_warp_groups_constraints, [ub],
-            )
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [ub * 128, 1, 1],
-            )
-        elif tile_level in ("wg.y", "wg.z"):
-            raise ValueError(
-                f"TileMatmul: tile_level {tile_level!r} is not "
-                f"supported; warp groups are 1D — use "
-                f"'thread.{tile_level[-1]}' instead"
-            )
-        else:
-            raise ValueError(
-                f"TileMatmul: unexpected tile_level {tile_level!r}"
-            )
+            body_ops = [_build_loop(
+                level, ub,
+                Block(arguments=[iv], ops=body_ops),
+                {"label": label} if label is not None else None,
+            )]
+        return body_ops, []
 
 
 def tile_matmul(

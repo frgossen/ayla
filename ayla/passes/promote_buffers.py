@@ -38,6 +38,7 @@ from ..gpu_dialect import (
     MatmulOp,
     ModuleOp,
     MoveOp,
+    PLoopOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -76,9 +77,14 @@ def _collective_level(value: Value) -> str:
     """
     defn = value.definition
 
-    # Block arguments are kernel args or for-loop IVs — both are uniform
-    # across all threads in a block.
+    # A ploop's induction variable varies at exactly the level the loop is
+    # mapped to -- which is the vocabulary this function returns. Every other
+    # block argument is a kernel arg or a for-loop IV, both uniform across a
+    # block.
     if isinstance(defn, Block):
+        loop = defn.parent_op
+        if isinstance(loop, PLoopOp) and value is loop.iv:
+            return loop.level
         return "block"
 
     if isinstance(defn, BlockIdsOp):
