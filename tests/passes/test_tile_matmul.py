@@ -24,12 +24,12 @@ def test_tiles_gmem_matmul_along_m_and_k():
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             for (%m: index = 0 to 4) attrs={label: "m"} {
+              %0: gmem<32x128xf32> = tile(%c: gmem<128x128xf32>, %m: index, 0)
               for (%k: index = 0 to 4) attrs={label: "k"} {
-                %0: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %m: index, 0)
-                %1: gmem<32x16xbf16 strides=[64, 1]> = tile(%0: gmem<32x64xbf16>, 0, %k: index)
-                %2: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-                %3: gmem<32x128xf32> = tile(%c: gmem<128x128xf32>, %m: index, 0)
-                matmul(%1: gmem<32x16xbf16 strides=[64, 1]>, %2: gmem<128x16xbf16 strides=[64, 1]>, %3: gmem<32x128xf32>)
+                %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %m: index, 0)
+                %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
+                %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
+                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>)
               }
             }
           }
@@ -92,3 +92,40 @@ def test_partial_block_tile_rounds_up_the_grid():
     tiles = find_ops(module, lambda op: isinstance(op, TileOp))
     assert len(tiles) == 2
     assert all(tile.maybe_partial for tile in tiles)
+
+
+def test_tiles_a_sigmoid_epilogue_with_the_matmul():
+    """The epilogue is cut to the matmul's tile and left outside the K loop.
+
+    It has M and N but no K, so it runs once per output tile rather than once
+    per K step. The destination tile goes with it: an op standing after the
+    loop cannot name a value defined inside it.
+    """
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) block_dim=[128, 1, 1] {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) attrs={label: "mm"}
+            elementwise(%c: gmem<128x128xf32>, %c: gmem<128x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+          }
+        }""")  # noqa: E501
+
+    module = tile_matmul(
+        gpu_dialect.parse(module_str),
+        ["M", "K"], [32, 16], ["block.x", "for"], [None, "k"],
+        label_filter="mm", epilogue_label_filter="epilogue",
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) grid_dim=[4, None, None] block_dim=[128, 1, 1] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %0: gmem<32x128xf32> = tile(%c: gmem<128x128xf32>, %bx: index, 0)
+            for (%k: index = 0 to 4) attrs={label: "k"} {
+              %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
+              %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
+              %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
+              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) attrs={label: "mm"}
+            }
+            elementwise(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+          }
+        }""")  # noqa: E501
