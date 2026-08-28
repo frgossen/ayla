@@ -184,7 +184,7 @@ def test_naive_matmul_4096_from_ir():
 def test_tma():
     """High-level IR: tiles + load(gmem → smem). Nice to write."""
     module_str = textwrap.dedent("""\
-        module {
+        module attrs={target: "sm_100a"} {
           kernel @tma(%a: gmem<4096x4096xf32>) grid_dim=[32, 64, 1] block_dim=[128, 1, 1] {
             %cx: index, %cy: index, %cz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
@@ -215,7 +215,7 @@ def test_tma():
 def test_tma_lowered():
     """Lowered IR: one TMA load, nothing else. Minimal e2e for TMA codegen + runtime."""
     module_str = textwrap.dedent("""\
-        module {
+        module attrs={target: "sm_100a"} {
           kernel @tma_load(%a: gmem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %gx: index, %gy: index, %gz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
