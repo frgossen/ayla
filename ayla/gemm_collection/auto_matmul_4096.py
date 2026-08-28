@@ -19,17 +19,19 @@ from .registry import register
 def auto_matmul_4096_module():
     """4096x4096 bf16 matmul built from high-level tiling passes (wgmma m64n128k16).
 
+    The kernel declares block_dim=128: the wgmma is issued by a whole
+    warpgroup, so the threads are not something the tiling hands out.
+
     Starts from a single matmul op and applies:
       1. Block-level tiling (M=128, N=128)
       2. Promote dst to wrmem (wgmma accumulator)
       3. K-tiling (K=64) sequential loop
       4. Promote lhs/rhs to smem (TMA loads)
-      5. Collective thread mapping (block_dim=128)
-      6. Inner K-tiling (K=16) sequential loop
+      5. Inner K-tiling (K=16) sequential loop
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) {
+          kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) block_dim=[128, 1, 1] {
             matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
           }
         }""")
@@ -55,12 +57,6 @@ def auto_matmul_4096_module():
         module, target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None,
         tma=True, nc=True, label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
-        tile_dims=["M"], tile_sizes=[1],
-        tile_levels=["thread.x"], tile_labels=[None],
-        label_filter="mm", collective=True,
     )
     module = tile_matmul(
         module,
