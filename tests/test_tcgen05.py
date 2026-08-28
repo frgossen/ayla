@@ -93,7 +93,7 @@ def test_tcgen05_typed_ir_lowering():
     assert "tcgen05.mma.cta_group::1.kind::f16" in ptx
     assert "tcgen05.commit.cta_group::1.mbarrier::arrive::one" in ptx
     assert "mbarrier.try_wait.parity" in ptx
-    assert "tcgen05.ld.sync.aligned.32x32b.x1.b32" in ptx
+    assert "tcgen05.ld.sync.aligned.32x32b.x64.b32" in ptx
     assert "tcgen05.dealloc.cta_group::1" in ptx
     assert "wgmma" not in ptx
 

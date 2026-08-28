@@ -955,17 +955,37 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 tmem-to-gmem move currently supports 128x64 f32 "
                 "tensor memory to row-strided f32/bf16 global memory"
             )
-        # Each warp owns 32 tensor-memory lanes. All four warps execute the
-        # same 64-column loop and write their corresponding 32 output rows.
+        # Each warp owns 32 tensor-memory lanes. Load all 64 columns in one
+        # collective operation, then use wide stores within each output row.
         row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
+        values = [f"${{b32:value{i}}}" for i in range(64)]
+        load_values = ", ".join(values)
         if dst_type.dtype.name == "f32":
-            store = "st.global.b32 [${b64:address}], ${b32:value};"
+            stores = "\n".join(
+                f"st.global.v4.b32 [${{b64:row}}+{i * 4}], "
+                f"{{{', '.join(values[i:i + 4])}}};"
+                for i in range(0, 64, 4)
+            )
         else:
-            store = textwrap.dedent("""\
-                mov.b32 ${f32:fvalue}, ${b32:value};
-                cvt.rn.bf16.f32 ${b16:converted}, ${f32:fvalue};
-                st.global.b16 [${b64:address}], ${b16:converted};
-            """).rstrip()
+            conversions = []
+            packed = []
+            for i in range(0, 64, 2):
+                packed_reg = f"${{b32:packed{i // 2}}}"
+                packed.append(packed_reg)
+                conversions.extend([
+                    f"mov.b32 ${{f32:f{i}}}, {values[i]};",
+                    f"mov.b32 ${{f32:f{i + 1}}}, {values[i + 1]};",
+                    f"cvt.rn.bf16x2.f32 {packed_reg}, "
+                    f"${{f32:f{i + 1}}}, ${{f32:f{i}}};",
+                ])
+            stores = "\n".join([
+                *conversions,
+                *(
+                    f"st.global.v4.b32 [${{b64:row}}+{i * 4}], "
+                    f"{{{', '.join(packed[i:i + 4])}}};"
+                    for i in range(0, 32, 4)
+                ),
+            ])
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:tid}}, %tid.x;
             shr.u32 ${{b32:warp}}, ${{b32:tid}}, 5;
@@ -973,17 +993,9 @@ class LowerToPtxTemplate(LoweringPass):
             add.u32 ${{b32:taddr_row}}, ${{b32:operand.src.ptr}}, ${{b32:lane_base}};
             mul.wide.u32 ${{b64:row_offset}}, ${{b32:tid}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
-            mov.u32 ${{b32:col}}, 0;
-            ${{label:loop}}:
-            add.u32 ${{b32:taddr}}, ${{b32:taddr_row}}, ${{b32:col}};
-            tcgen05.ld.sync.aligned.32x32b.x1.b32 {{${{b32:value}}}}, [${{b32:taddr}}];
+            tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{load_values}}}, [${{b32:taddr_row}}];
             tcgen05.wait::ld.sync.aligned;
-            mul.wide.u32 ${{b64:col_offset}}, ${{b32:col}}, {dst_type.dtype.byte_size};
-            add.u64 ${{b64:address}}, ${{b64:row}}, ${{b64:col_offset}};
-            {store}
-            add.u32 ${{b32:col}}, ${{b32:col}}, 1;
-            setp.lt.u32 ${{pred:more}}, ${{b32:col}}, 64;
-            @${{pred:more}} bra ${{label:loop}};
+            {stores}
         """)
         new_op = PTXTemplateOp.build(
             operands=[self.value_map[op.dst], self.value_map[op.src]],
