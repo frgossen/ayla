@@ -33,6 +33,7 @@ import torch
 from ..gpu_dialect import GmemTensorType
 from ..ptx_codegen import make_ptx_kernel
 from ..ptx_runtime import make_ptx_launcher
+from ..targets import PtxTarget
 from ..torch_custom_call import OperandKind, make_torch_custom_call, to_torch_dtype
 
 
@@ -52,6 +53,7 @@ class GemmKernel:
     k: int
     n: int
     dtype: torch.dtype
+    target: PtxTarget
 
     @property
     def label(self) -> str:
@@ -63,6 +65,7 @@ class GemmKernel:
         k: int | None = None,
         n: int | None = None,
         dtype: torch.dtype | None = None,
+        compute_capability: tuple[int, int] | None = None,
     ) -> bool:
         """Whether this kernel runs that GEMM. ``None`` matches anything."""
         return (
@@ -70,6 +73,10 @@ class GemmKernel:
             and (k is None or k == self.k)
             and (n is None or n == self.n)
             and (dtype is None or dtype == self.dtype)
+            and (
+                compute_capability is None
+                or self.target.supports_compute_capability(compute_capability)
+            )
         )
 
 
@@ -148,7 +155,11 @@ def register(builder: Callable[[], object]) -> Callable[[], object]:
     m, k, n, dtype = _gemm_dims(kernel)
 
     op = make_torch_custom_call(make_ptx_launcher(kernel), list(_MATMUL_OPERANDS))
-    _KERNELS.append(GemmKernel(name=kernel.name, op=op, m=m, k=k, n=n, dtype=dtype))
+    assert kernel.target is not None
+    _KERNELS.append(GemmKernel(
+        name=kernel.name, op=op, m=m, k=k, n=n, dtype=dtype,
+        target=kernel.target,
+    ))
     return builder
 
 
@@ -157,6 +168,10 @@ def query(
     k: int | None = None,
     n: int | None = None,
     dtype: torch.dtype | None = None,
+    compute_capability: tuple[int, int] | None = None,
 ) -> list[GemmKernel]:
     """The kernels that can run this GEMM. ``None`` leaves a field unconstrained."""
-    return [kernel for kernel in _KERNELS if kernel.matches(m, k, n, dtype)]
+    return [
+        kernel for kernel in _KERNELS
+        if kernel.matches(m, k, n, dtype, compute_capability)
+    ]

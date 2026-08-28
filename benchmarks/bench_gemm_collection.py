@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 
-import ayla.gemm_collection  # noqa: F401 -- registers torch.ops.ayla.*
+import ayla.gemm_collection
 import torch
 
 from common import BenchGemmConfig, print_results, run, torch_mm_nt
@@ -31,92 +31,32 @@ def main() -> None:
             op=torch_mm_nt,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
-            label="ayla.pranjalssh",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.pranjalssh_4096,
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label="ayla.pranjalssh_pipelined (prev best)",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.pranjalssh_4096_pipelined,
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label="ayla.auto_matmul (wgmma128)",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.auto_matmul_4096,
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label="ayla.auto_matmul (wgmma256 wg)",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg,
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3)",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3, 2 tiles/CTA)",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label=(
-                "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, "
-                "2 tiles/CTA)"
-            ),
-            m=4096,
-            n=4096,
-            k=4096,
-            op=(
-                torch.ops.ayla
-                .auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2
-            ),
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label=(
-                "ayla.auto_matmul (wgmma256 wg, PTX JIT O1, packed shared "
-                "allocations, A promote 256B, split output, 4 tiles/CTA, "
-                "A+C evict-first)"
-            ),
-            m=4096,
-            n=4096,
-            k=4096,
-            op=(
-                torch.ops.ayla
-                .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2
-            ),
-            dtype=torch.bfloat16,
-        ),
-        BenchGemmConfig(
-            label="ayla.fastcu_5_1 (fast.cu static smem)",
-            m=4096,
-            n=4096,
-            k=4096,
-            op=torch.ops.ayla.fastcu_5_1,
-            dtype=torch.bfloat16,
-        ),
     ]
+    capability = torch.cuda.get_device_capability()
+    candidates = ayla.gemm_collection.query(
+        m=4096, k=4096, n=4096, dtype=torch.bfloat16,
+    )
+    compatible = [
+        kernel for kernel in candidates
+        if kernel.target.supports_compute_capability(capability)
+    ]
+    incompatible = [kernel for kernel in candidates if kernel not in compatible]
+    for kernel in incompatible:
+        print(
+            f"[skip] {kernel.label}: target {kernel.target.architecture} "
+            f"is incompatible with compute capability {capability[0]}.{capability[1]}"
+        )
+    configs.extend(
+        BenchGemmConfig(
+            label=kernel.label,
+            m=kernel.m,
+            n=kernel.n,
+            k=kernel.k,
+            op=kernel.op,
+            dtype=kernel.dtype,
+        )
+        for kernel in compatible
+    )
     if args.filter:
         pattern = re.compile(args.filter)
         configs = [c for c in configs if pattern.search(c.label)]

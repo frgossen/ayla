@@ -18,6 +18,7 @@ def test_kernel_shapes_come_from_the_built_kernel():
     bf16 = _kernel_named("auto_matmul_4096_wgmma256_wg_tma_store_k3")
     assert (bf16.m, bf16.k, bf16.n) == (4096, 4096, 4096)
     assert bf16.dtype is torch.bfloat16
+    assert bf16.target.architecture == "sm_90a"
 
     f32 = _kernel_named("loop_8x8_matmul_4096")
     assert (f32.m, f32.k, f32.n) == (4096, 4096, 4096)
@@ -50,6 +51,7 @@ def test_query_filters_on_every_field():
     by_dtype = query(dtype=torch.bfloat16)
     assert by_dtype and all(k.dtype is torch.bfloat16 for k in by_dtype)
     assert len(by_dtype) + len(query(dtype=torch.float32)) == len(everything)
+    assert query(compute_capability=(10, 0)) == []
 
 
 def test_registered_kernels_match_their_op_names():

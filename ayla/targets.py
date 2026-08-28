@@ -7,6 +7,7 @@ family rather than scattered string comparisons.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,20 @@ class PtxTarget:
             "target": self.architecture,
             "address_size": self.address_size,
         }
+
+    def supports_compute_capability(self, capability: tuple[int, int]) -> bool:
+        """Whether PTX for this target may be loaded on ``capability``.
+
+        NVIDIA's architecture-specific ``a`` targets expose instructions that
+        are only guaranteed within that exact compute capability. Plain
+        ``sm_XX`` targets retain PTX's forward-compatibility behavior.
+        """
+        match = re.fullmatch(r"sm_(\d+)([a-z]?)", self.architecture)
+        if match is None:
+            return False
+        encoded = int(match.group(1))
+        required = (encoded // 10, encoded % 10)
+        return capability == required if match.group(2) else capability >= required
 
 
 HOPPER = PtxTarget(
