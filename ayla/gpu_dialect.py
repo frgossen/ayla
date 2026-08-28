@@ -79,8 +79,21 @@ class KernelOp(Op):
         grid_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         block_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         num_warp_groups: int | None = None,
+        ptx_optimization_level: int | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "KernelOp":
+        attrs = dict(attrs or {})
+        if "ptx_optimization_level" in attrs:
+            raise ValueError(
+                "pass ptx_optimization_level as an explicit argument"
+            )
+        if (
+            ptx_optimization_level is not None
+            and ptx_optimization_level not in range(5)
+        ):
+            raise ValueError("ptx_optimization_level must be in [0, 4]")
+        if ptx_optimization_level is not None:
+            attrs["ptx_optimization_level"] = ptx_optimization_level
         return cls(
             operands=[],
             results=[],
@@ -89,7 +102,7 @@ class KernelOp(Op):
                 "grid_dim": list(grid_dim),
                 "block_dim": list(block_dim),
                 "num_warp_groups": num_warp_groups,
-                **(attrs or {}),
+                **attrs,
             },
             blocks=[body],
         )
@@ -121,6 +134,10 @@ class KernelOp(Op):
     @num_warp_groups.setter
     def num_warp_groups(self, value: int | None) -> None:
         self.attrs["num_warp_groups"] = value
+
+    @property
+    def ptx_optimization_level(self) -> int | None:
+        return self.attrs.get("ptx_optimization_level")  # type: ignore[return-value]
 
     @property
     def num_threads(self) -> int:
@@ -195,7 +212,16 @@ class KernelOp(Op):
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=args)
-        return cls.build(name, body, grid_dim=grid_dim, block_dim=block_dim, num_warp_groups=num_warp_groups, attrs=attrs)
+        ptx_optimization_level = attrs.pop("ptx_optimization_level", None)
+        return cls.build(
+            name,
+            body,
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            num_warp_groups=num_warp_groups,
+            ptx_optimization_level=ptx_optimization_level,
+            attrs=attrs,
+        )
 
 
 @gpu_dialect.register_op("matmul")
@@ -1069,14 +1095,22 @@ class TmaDescType(Type):
         gmem_type: "GmemTensorType",
         tile_shape: list[int],
         swizzle: str | None = None,
+        l2_promotion: str | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "TmaDescType":
+        attrs = dict(attrs or {})
+        if "l2_promotion" in attrs:
+            raise ValueError("pass l2_promotion as an explicit argument")
+        if l2_promotion not in (None, "64B", "128B", "256B"):
+            raise ValueError(f"unsupported TMA L2 promotion {l2_promotion!r}")
+        if l2_promotion is not None:
+            attrs["l2_promotion"] = l2_promotion
         return cls(attrs={
             "arg_idx": arg_idx,
             "gmem_type": gmem_type,
             "tile_shape": list(tile_shape),
             "swizzle": swizzle,
-            **(attrs or {}),
+            **attrs,
         })
 
     @property
@@ -1098,6 +1132,10 @@ class TmaDescType(Type):
     @property
     def tile_num_elements(self) -> int:
         return math.prod(self.tile_sizes)
+
+    @property
+    def l2_promotion(self) -> str | None:
+        return self.attrs.get("l2_promotion")  # type: ignore[return-value]
 
     @property
     def swizzle(self) -> str | None:
@@ -1139,7 +1177,15 @@ class TmaDescType(Type):
             swizzle = p.read_str_attr()
         attrs = p.read_extra_attrs()
         p.read_literal(">")
-        return cls.build(arg_idx, gmem_type, tile_shape, swizzle=swizzle, attrs=attrs)
+        l2_promotion = attrs.pop("l2_promotion", None)
+        return cls.build(
+            arg_idx,
+            gmem_type,
+            tile_shape,
+            swizzle=swizzle,
+            l2_promotion=l2_promotion,
+            attrs=attrs,
+        )
 
 
 def physical_layout(

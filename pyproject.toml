@@ -14,6 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+bench = ["matplotlib"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
@@ -27,8 +28,8 @@ testpaths = ["tests"]
 # pixi environment management (formerly pixi.toml). Name/version/description,
 # the Python version, and the runtime/dev deps are read from [project] above —
 # not duplicated here. pixi installs this project editable, so its
-# [project.dependencies] (ninja, numpy, torch) come along; the ``dev`` feature
-# pulls in pytest for the ``test`` task.
+# [project.dependencies] (ninja, numpy, torch) come along; the optional
+# ``dev`` and ``bench`` features provide tooling for their respective tasks.
 # ---------------------------------------------------------------------------
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -41,7 +42,7 @@ ninja = "*"
 numpy = "*"
 
 [tool.pixi.environments]
-default = ["dev"]
+default = ["dev", "bench"]
 
 [tool.pixi.tasks]
 install = { cmd = "pip install torch --index-url https://download.pytorch.org/whl/cu128 && pip install -e ." }

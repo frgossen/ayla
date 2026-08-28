@@ -5,8 +5,8 @@ import pytest
 import torch
 from torch.ops import ayla
 
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store_k3 import (
-    auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_module,
+from ayla.gemm import (
+    auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.gpu_dialect import TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
@@ -19,9 +19,9 @@ BF16 = torch.bfloat16
 
 
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
-    kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_module()
-    )
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=2,
+    ))
     lines = kernel.ptx.splitlines()
     stores = [i for i, line in enumerate(lines)
               if "cp.async.bulk.tensor.3d.global.shared" in line]
@@ -62,6 +62,59 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     assert waits[0] < gathers[len(gathers) // 2] < stores[1] < waits[1]
 
 
+def test_configurable_tma_gemm_supports_rectangular_shapes():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=512,
+        n=19968,
+        k=6656,
+        output_tiles_per_cta=2,
+        operand_stages=4,
+        output_slices=2,
+    ))
+    assert kernel.name.startswith("auto_matmul_m512_n19968_k6656_")
+    assert kernel.grid_dim == (2, 78, 1)
+    assert kernel.block_dim == (256, 1, 1)
+
+
+def test_four_tile_output_evict_first_reaches_tma_stores():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=2,
+        output_store_buffers=2,
+        operand_move_attrs={
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    ))
+    assert kernel.name.endswith("_4tiles_split2_dbuf2")
+    assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
+    assert kernel.ptx.count("bytes.L2::cache_hint") == 28
+    assert kernel.ptx.count("bulk_group.L2::cache_hint") == 8
+
+
+def test_lhs_l2_promotion_reaches_tma_descriptor():
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_tiles_per_cta=4,
+        operand_stages=3,
+        output_slices=2,
+        output_store_buffers=2,
+        operand_move_attrs={
+            "lhs": {
+                "l2_cache_hint": "evict_first",
+                "l2_promotion": "256B",
+            },
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+    assert input_descs[0].l2_promotion == "256B"
+    assert input_descs[1].l2_promotion is None
+
+
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
@@ -85,6 +138,11 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
+            BF16,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
         pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
     ],

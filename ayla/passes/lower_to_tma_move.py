@@ -15,6 +15,8 @@ block, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
 """
 from __future__ import annotations
 
+from typing import cast
+
 from ..gpu_dialect import (
     AsyncOp,
     GmemTensorType,
@@ -83,15 +85,16 @@ class LowerToTmaMove(LoweringPass):
         assert isinstance(entry_block, Block)
 
         layout = smem.type.attrs.get("physical_layout")
+        desc_attrs: dict[str, object] = {}
+        if layout is not None:
+            desc_attrs["physical_layout"] = layout
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=root.type,
             tile_shape=list(smem.type.sizes),
             swizzle=smem.type.swizzle,
-            attrs=(
-                {"physical_layout": layout}
-                if layout is not None else None
-            ),
+            l2_promotion=cast(str | None, move.attrs.get("l2_promotion")),
+            attrs=desc_attrs or None,
         )
         desc_value = next(
             (

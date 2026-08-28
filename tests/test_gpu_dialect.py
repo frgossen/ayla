@@ -1,5 +1,7 @@
 import textwrap
 
+import pytest
+
 from ayla import (
     Block,
     GmemTensorType,
@@ -64,8 +66,9 @@ def test_kernel_op():
         PTXTemplateOp.build([lhs, rhs, dst], [buf_type], template=template),
     ])
     kernel = KernelOp.build(
-        "cwise_add", body, attrs={"version": 1},
+        "cwise_add", body, ptx_optimization_level=1, attrs={"version": 1},
     )
+    assert kernel.ptx_optimization_level == 1
     module = ModuleOp.build(
         Block(ops=[kernel]),
         attrs={"target": "sm_80"},
@@ -73,11 +76,14 @@ def test_kernel_op():
 
     expected = textwrap.dedent("""\
         module attrs={target: "sm_80"} {
-          kernel @cwise_add(%lhs: gmem<1048576xf32>, %rhs: gmem<1048576xf32>, %dst: gmem<1048576xf32>) attrs={version: 1} {
+          kernel @cwise_add(%lhs: gmem<1048576xf32>, %rhs: gmem<1048576xf32>, %dst: gmem<1048576xf32>) attrs={ptx_optimization_level: 1, version: 1} {
             %0: gmem<1048576xf32> = ptx_template(%lhs: gmem<1048576xf32>, %rhs: gmem<1048576xf32>, %dst: gmem<1048576xf32>) attrs={template: "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\\n"}
           }
         }""")  # noqa: E501
     assert_print_and_roundtrip(module, expected)
+
+    with pytest.raises(ValueError, match="ptx_optimization_level"):
+        KernelOp.build("invalid", Block(), ptx_optimization_level=5)
 
 
 def test_kernel_num_threads():
@@ -145,6 +151,20 @@ def test_tma_move_build_accepts_l2_cache_hint():
     )
 
     assert op.l2_cache_hint == "evict_last"
+
+
+def test_tma_descriptor_validates_l2_promotion():
+    gmem_type = GmemTensorType.build((64, 64), F32Type())
+    desc = TmaDescType.build(
+        0, gmem_type, tile_shape=[64, 64],
+        l2_promotion="256B",
+    )
+    assert desc.l2_promotion == "256B"
+    with pytest.raises(ValueError, match="unsupported TMA L2 promotion"):
+        TmaDescType.build(
+            0, gmem_type, tile_shape=[64, 64],
+            l2_promotion="512B",
+        )
 
 
 def test_for_loop_default_step():
