@@ -19,6 +19,7 @@ test.
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
+from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.tile_matmul import tile_matmul
 
 MODULE_STR = textwrap.dedent("""\
@@ -30,6 +31,23 @@ MODULE_STR = textwrap.dedent("""\
     }""")
 
 
+def _tiled():
+    """The module after both tilings -- the input to promotion."""
+    module = gpu_dialect.parse(MODULE_STR)
+    module = tile_matmul(
+        module,
+        tile_dims=["M", "N"], tile_sizes=[128, 256],
+        tile_levels=["block.x", "block.y"], tile_labels=[None, None],
+        label_filter="mm", epilogue_label_filter="epilogue",
+    )
+    return tile_matmul(
+        module,
+        tile_dims=["M"], tile_sizes=[64],
+        tile_levels=["wg.x"], tile_labels=[None],
+        label_filter="mm", epilogue_label_filter="epilogue",
+    )
+
+
 def test_block_and_warp_group_tiling_carry_the_epilogue():
     """Two tilings in sequence, each cutting the epilogue along with the matmul.
 
@@ -38,24 +56,29 @@ def test_block_and_warp_group_tiling_carry_the_epilogue():
     launch geometry is derived rather than declared -- 4096/128 by 4096/256
     blocks, two warp groups of 128 threads.
     """
-    module = gpu_dialect.parse(MODULE_STR)
-    module = tile_matmul(
-        module,
-        tile_dims=["M", "N"], tile_sizes=[128, 256],
-        tile_levels=["block.x", "block.y"], tile_labels=[None, None],
+    assert repr(_tiled()) == TILED_IR
+
+
+def test_promotion_moves_the_epilogue_onto_the_accumulator():
+    """Promotion reads what tiling produced, and takes the epilogue with it.
+
+    Tiling leaves the epilogue on the destination tile in gmem. Promoting that
+    destination into registers moves the epilogue onto the buffer, ahead of the
+    convert and store -- so it happens on the way out rather than as a second
+    pass over what was just written.
+    """
+    module = _tiled()
+    module = promote_buffers(
+        module, target_type="wrmem", operands=["dst"],
+        swizzle=None, layout="wgmma_layout_0", warps=4,
+        tma=False, nc=False, target_dtype="f32",
         label_filter="mm", epilogue_label_filter="epilogue",
     )
-    module = tile_matmul(
-        module,
-        tile_dims=["M"], tile_sizes=[64],
-        tile_levels=["wg.x"], tile_labels=[None],
-        label_filter="mm", epilogue_label_filter="epilogue",
-    )
 
-    assert repr(module) == EXPECTED_IR
+    assert repr(module) == PROMOTED_IR
 
 
-EXPECTED_IR = textwrap.dedent("""\
+TILED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
         %bx: index, %by: index, %bz: index = block_ids()
@@ -68,5 +91,25 @@ EXPECTED_IR = textwrap.dedent("""\
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
         matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={init: 0.0, label: "mm"}
         elementwise(%5: gmem<64x256xbf16 strides=[4096, 1]>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={fn: "sigmoid", label: "epilogue"}
+      }
+    }""")
+
+PROMOTED_IR = textwrap.dedent("""\
+    module {
+      kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
+        %bx: index, %by: index, %bz: index = block_ids()
+        %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)
+        %1: gmem<256x4096xbf16> = tile(%b: gmem<4096x4096xbf16>, %by: index, 0)
+        %2: gmem<128x4096xbf16> = tile(%c: gmem<4096x4096xbf16>, %bx: index, 0)
+        %3: gmem<128x256xbf16 strides=[4096, 1]> = tile(%2: gmem<128x4096xbf16>, 0, %by: index)
+        %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+        %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
+        %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
+        %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
+        elementwise(%6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
+        %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+        convert(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
       }
     }""")
