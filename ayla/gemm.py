@@ -55,6 +55,7 @@ def blackwell_tcgen05_gemm_module(
     split_n_tile: int | None = None,
     split_last_n_tile_rows: int | None = None,
     tail_n_tile: int | None = None,
+    predicated_tail_stores: bool = False,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
     lhs_l2_promotion: str | None = None,
@@ -145,6 +146,12 @@ def blackwell_tcgen05_gemm_module(
     ):
         raise ValueError(
             "a narrow N tail requires direct staging and a transposed CTA grid"
+        )
+    if predicated_tail_stores and (
+        tail_n_tile is None or output_m_tile != 128
+    ):
+        raise ValueError(
+            "predicated tail stores require an M128 narrow-tail launch"
         )
     m_tiles = m // output_m_tile
     n_tiles = (n + output_n_tile - 1) // output_n_tile
@@ -888,6 +895,8 @@ def blackwell_tcgen05_gemm_module(
                 {
                     "hybrid_n_tiles": hybrid_n_tiles,
                     "hybrid_n_width": hybrid_n_width,
+                    **({"predicated_tail_stores": True}
+                       if predicated_tail_stores else {}),
                     **({"hybrid_split_rows": hybrid_split_rows}
                        if hybrid_split_rows is not None else {}),
                     **({"hybrid_split_tile": hybrid_split_tile}

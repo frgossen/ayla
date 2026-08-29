@@ -1349,6 +1349,7 @@ class LowerToPtxTemplate(LoweringPass):
             )
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
         hybrid_n_width = op.attrs.get("hybrid_n_width")
+        predicated_tail_stores = bool(op.attrs.get("predicated_tail_stores"))
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
         if hybrid_n_tiles is not None and (
@@ -1364,6 +1365,12 @@ class LowerToPtxTemplate(LoweringPass):
                 "hybrid-N output requires at least two N tiles and a "
                 "240-, 248-, or 256-column BF16 output tile with a valid "
                 "narrow width"
+            )
+        if predicated_tail_stores and (
+            hybrid_n_tiles is None or src_type.sizes[0] != 128
+        ):
+            raise ValueError(
+                "predicated tail stores require a hybrid-N M128 output"
             )
         if (
             hybrid_split_rows is not None or hybrid_split_tile is not None
@@ -1473,9 +1480,12 @@ class LowerToPtxTemplate(LoweringPass):
                         f"cvt.rn.bf16x2.f32 {packed_reg}, "
                         f"{values[i + 1]}, {values[i]};"
                     )
-                def vector_stores(starts_and_widths):
+                def vector_stores(
+                    starts_and_widths,
+                    predicate=store_predicate,
+                ):
                     return [
-                        f"{store_predicate}st.global.v{width}.b32 "
+                        f"{predicate}st.global.v{width}.b32 "
                         f"[${{b64:row}}+{col * 2 + start * 4}], "
                         f"{{{', '.join(packed[start:start + width])}}};"
                         for start, width in starts_and_widths
@@ -1500,14 +1510,49 @@ class LowerToPtxTemplate(LoweringPass):
                         f"${{label:n248_done_{col}}}:",
                     ])
                 else:
-                    stores = "\n".join([
-                        *conversions,
-                        *vector_stores([
-                            (start, min(8, len(packed) - start))
-                            for start in range(0, len(packed), 8)
-                        ]),
-                    ])
+                    groups = [
+                        (start, min(8, len(packed) - start))
+                        for start in range(0, len(packed), 8)
+                    ]
+                    if predicated_tail_stores:
+                        assert isinstance(hybrid_n_width, int)
+                        tail_dwords = max(
+                            0,
+                            min(len(packed), (hybrid_n_width - col) // 2),
+                        )
+                        split_groups = []
+                        for start, width in groups:
+                            end = start + width
+                            if start < tail_dwords < end:
+                                split_groups.extend([
+                                    (start, tail_dwords - start, False),
+                                    (tail_dwords, end - tail_dwords, True),
+                                ])
+                            else:
+                                split_groups.append(
+                                    (start, width, start >= tail_dwords)
+                                )
+                        stores = "\n".join([
+                            *conversions,
+                            *(
+                                vector_stores(
+                                    [(start, width)],
+                                    predicate=(
+                                        "@!${pred:hybrid_narrow} "
+                                        if tail_only else ""
+                                    ),
+                                )[0]
+                                for start, width, tail_only in split_groups
+                            ),
+                        ])
+                    else:
+                        stores = "\n".join([
+                            *conversions,
+                            *vector_stores(groups),
+                        ])
                 if (
+                    not predicated_tail_stores
+                    and
                     isinstance(hybrid_n_width, int)
                     and col < hybrid_n_width < col + valid_cols
                 ):
@@ -1544,6 +1589,7 @@ class LowerToPtxTemplate(LoweringPass):
             """)
             if (
                 hybrid_n_tiles is not None
+                and not predicated_tail_stores
                 and isinstance(hybrid_n_width, int)
                 and col + valid_cols >= hybrid_n_width
             ):

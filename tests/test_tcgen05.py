@@ -356,6 +356,7 @@ def test_tcgen05_n248_tail_lowering():
     assert "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32" in kernel.ptx
     assert ", 256;" in kernel.ptx
     assert "st.global.v8.b32" in kernel.ptx
+
     assert "st.global.v4.b32" in kernel.ptx
 
     with pytest.raises(ValueError, match="positive 8-column multiple"):
@@ -386,6 +387,17 @@ def test_tcgen05_n240_tail16_lowering():
     # Fifteen stores cover the full N240 tile; the sixteenth is the N16
     # partial-chunk path selected only by the tail CTA.
     assert kernel.ptx.count("st.global.v8.b32") == 16
+
+    predicated = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=240, tail_n_tile=16,
+        predicated_tail_stores=True,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    ))
+    assert predicated.ptx.count("st.global.v8.b32") == 15
+    assert "@!" in predicated.ptx
 
 
 def test_tcgen05_next_lhs_prefetch_lowering():
