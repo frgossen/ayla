@@ -18,6 +18,10 @@ from ayla.targets import BLACKWELL
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="no CUDA"
 )
+requires_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="requires an SM100 GPU",
+)
 
 
 # c[i] = a[i] + b[i]; assumes grid_x * block_x == len(a).
@@ -87,7 +91,7 @@ def test_cwise_add():
     assert torch.allclose(c, a + b)
 
 
-@requires_cuda
+@requires_blackwell
 def test_generated_blackwell_memory_kernel():
     buf_type = GmemTensorType.build((1,), F32Type())
     src = Value(name="src", type=buf_type)
@@ -117,7 +121,7 @@ def test_generated_blackwell_memory_kernel():
     assert destination.item() == source.item()
 
 
-@requires_cuda
+@requires_blackwell
 def test_generated_blackwell_cluster_kernel():
     output_type = GmemTensorType.build((2,), F32Type())
     output = Value(name="output", type=output_type)

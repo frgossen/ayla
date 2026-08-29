@@ -13,10 +13,27 @@ from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from ayla.passes.tile_matmul import tile_matmul
 from ayla.passes.unroll_loop import unroll_loop
+from ayla.targets import BLACKWELL, HOPPER
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="no CUDA"
 )
+requires_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="requires an SM100 GPU",
+)
+requires_hopper = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="requires an SM90 GPU",
+)
+
+
+def _active_cuda_target():
+    capability = torch.cuda.get_device_capability()
+    for target in (HOPPER, BLACKWELL):
+        if target.supports_compute_capability(capability):
+            return target
+    pytest.skip(f"no Ayla PTX target for compute capability {capability}")
 
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(
@@ -41,10 +58,11 @@ CWISE_ADD_TEMPLATE = textwrap.dedent(
 @requires_cuda
 def test_cwise_add_from_ir():
     n = 1024
+    target = _active_cuda_target()
 
     template_str = json.dumps(CWISE_ADD_TEMPLATE)
     module_str = textwrap.dedent(f"""\
-        module {{
+        module attrs={{target: "{target.architecture}"}} {{
           kernel @cwise_add(%lhs: gmem<1024xf32>, %rhs: gmem<1024xf32>, %dst: gmem<1024xf32>) grid_dim=[4, 1, 1] block_dim=[256, 1, 1] {{
             %gx: index, %gy: index, %gz: index = block_ids()
             %bx: index, %by: index, %bz: index = thread_ids()
@@ -110,9 +128,10 @@ MATMUL_16_TEMPLATE = textwrap.dedent(
 
 @requires_cuda
 def test_matmul_16_from_ir():
+    target = _active_cuda_target()
     template_str = json.dumps(MATMUL_16_TEMPLATE)
     module_str = textwrap.dedent(f"""\
-        module {{
+        module attrs={{target: "{target.architecture}"}} {{
           kernel @matmul_16(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>, %c: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[16, 16, 1] {{
             %gx: index, %gy: index, %gz: index = block_ids()
             %bx: index, %by: index, %bz: index = thread_ids()
@@ -140,8 +159,9 @@ def test_matmul_16_from_ir():
 
 @requires_cuda
 def test_naive_matmul_4096_from_ir():
+    target = _active_cuda_target()
     module_str = textwrap.dedent("""\
-        module {
+        module attrs={target: "__TARGET__"} {
           kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
             %cx: index, %cy: index, %cz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
@@ -163,7 +183,7 @@ def test_naive_matmul_4096_from_ir():
             }
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
           }
-        }""")  # noqa: E501
+        }""").replace("__TARGET__", target.architecture)  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
     ptx_kernel = make_ptx_kernel(module)
@@ -180,7 +200,7 @@ def test_naive_matmul_4096_from_ir():
     assert torch.allclose(c, a @ b.T, atol=1e-2)
 
 
-@requires_cuda
+@requires_blackwell
 def test_tma():
     """High-level IR: tiles + load(gmem → smem). Nice to write."""
     module_str = textwrap.dedent("""\
@@ -211,7 +231,7 @@ def test_tma():
     torch.cuda.synchronize()
 
 
-@requires_cuda
+@requires_blackwell
 def test_tma_lowered():
     """Lowered IR: one TMA load, nothing else. Minimal e2e for TMA codegen + runtime."""
     module_str = textwrap.dedent("""\
@@ -241,7 +261,7 @@ def test_tma_lowered():
     torch.cuda.synchronize()
 
 
-@requires_cuda
+@requires_hopper
 def test_experimental_auto_matmul_4096():
     """Experimental: build a wgmma matmul from high-level tiling passes."""
     module_str = textwrap.dedent("""\
@@ -306,7 +326,7 @@ def test_experimental_auto_matmul_4096():
     )
 
 
-@requires_cuda
+@requires_hopper
 def test_dbg_module():
     module_str = textwrap.dedent("""\
         module {

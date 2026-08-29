@@ -17,6 +17,10 @@ requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="requires an SM100 GPU",
 )
+requires_hopper = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="requires an SM90 GPU",
+)
 
 F32 = torch.float32
 BF16 = torch.bfloat16
@@ -142,30 +146,60 @@ def test_lhs_l2_promotion_reaches_tma_descriptor():
     "op,dtype",
     [
         pytest.param(lambda a, b: torch.mm(a, b.t()), F32, id="torch.mm"),
-        pytest.param(ayla.naive_matmul_4096_loop, F32, id="naive_matmul_4096_loop"),
-        pytest.param(ayla.loop_4x4_matmul_4096, F32, id="loop_4x4_matmul_4096"),
-        pytest.param(ayla.loop_8x8_matmul_4096, F32, id="loop_8x8_matmul_4096"),
-        pytest.param(ayla.tma_matmul_4096, F32, id="tma_matmul_4096"),
-        pytest.param(ayla.pranjalssh_4096, BF16, id="pranjalssh_4096"),
-        pytest.param(ayla.pranjalssh_4096_pipelined, BF16, id="pranjalssh_4096_pipelined"),
-        pytest.param(ayla.auto_matmul_4096, BF16, id="auto_matmul_4096"),
-        pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, id="auto_matmul_4096_wgmma256_wg"),
+        pytest.param(
+            ayla.naive_matmul_4096_loop, F32,
+            marks=requires_hopper, id="naive_matmul_4096_loop",
+        ),
+        pytest.param(
+            ayla.loop_4x4_matmul_4096, F32,
+            marks=requires_hopper, id="loop_4x4_matmul_4096",
+        ),
+        pytest.param(
+            ayla.loop_8x8_matmul_4096, F32,
+            marks=requires_hopper, id="loop_8x8_matmul_4096",
+        ),
+        pytest.param(
+            ayla.tma_matmul_4096, F32,
+            marks=requires_hopper, id="tma_matmul_4096",
+        ),
+        pytest.param(
+            ayla.pranjalssh_4096, BF16,
+            marks=requires_hopper, id="pranjalssh_4096",
+        ),
+        pytest.param(
+            ayla.pranjalssh_4096_pipelined, BF16,
+            marks=requires_hopper, id="pranjalssh_4096_pipelined",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096, BF16,
+            marks=requires_hopper, id="auto_matmul_4096",
+        ),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg, BF16,
+            marks=requires_hopper, id="auto_matmul_4096_wgmma256_wg",
+        ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
             BF16,
+            marks=requires_hopper,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
+            marks=requires_hopper,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
             BF16,
+            marks=requires_hopper,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
-        pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
+        pytest.param(
+            ayla.fastcu_5_1, BF16,
+            marks=requires_hopper, id="fastcu_5_1",
+        ),
     ],
 )
 def test_gemm_correctness(op, dtype, seed):
