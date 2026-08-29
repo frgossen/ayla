@@ -548,6 +548,8 @@ def test_tcgen05_persistent_balanced_n_pairs_lowering():
     assert "disjoint_grid_iterations: True" in ptx
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 16
     assert "tcgen05.st.sync" not in ptx
+    dealloc = ptx.index("// PTX template `dealloc(")
+    assert not ptx[:dealloc].rstrip().endswith("bar.sync 0;")
     overwrite = ptx.index("mov.pred")
     first_mma = ptx.index("tcgen05.mma.cta_group::1", overwrite)
     restore = ptx.index("mov.pred", overwrite + 1)

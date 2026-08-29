@@ -30,6 +30,7 @@ from ayla.gpu_dialect import (
     TmemTensorType,
     TileOp,
     gpu_dialect,
+    memory_effects,
 )
 from ayla.targets import BLACKWELL, HOPPER
 
@@ -182,6 +183,7 @@ def test_tensor_memory_type_and_dealloc_roundtrip():
 
     assert repr(tmem) == "tmem<128x64xf32>"
     assert repr(gpu_dialect.parse(repr(op))) == repr(op)
+    assert memory_effects(op) == []
     with pytest.raises(AssertionError, match="columns must be a power of two"):
         TmemTensorType.build([128, 48], F32Type())
 

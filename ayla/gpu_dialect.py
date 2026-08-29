@@ -2157,7 +2157,10 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         )
         return [("W", root_buffer(buf), scope)]
     if isinstance(op, DeallocOp):
-        return [("W", root_buffer(op.value), CollectiveScope.BLOCK)]
+        # Tensor-memory deallocation lowers to an intrinsic full-CTA barrier
+        # immediately before tcgen05.dealloc. Reporting another write effect
+        # here would make sync insertion emit a redundant adjacent barrier.
+        return []
     if isinstance(op, (ForOp, AsyncOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
