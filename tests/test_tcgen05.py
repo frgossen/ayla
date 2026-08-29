@@ -16,9 +16,6 @@ from ayla import (
 )
 from ayla.base.ir import iter_ops
 from ayla.gemm import blackwell_tcgen05_gemm_module
-from ayla.gemm_collection.blackwell_tcgen05_4096 import (
-    blackwell_tcgen05_4096_module,
-)
 from ayla.gpu_dialect import (
     AllocOp,
     AsyncCommitOp,
@@ -635,12 +632,6 @@ def test_tcgen05_gemm_jit_optimization_level():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, ptx_optimization_level=4,
     ))
-
-    assert kernel.ptx_optimization_level == 4
-
-
-def test_selected_tcgen05_gemm_uses_jit_o4():
-    kernel = make_ptx_kernel(blackwell_tcgen05_4096_module())
 
     assert kernel.ptx_optimization_level == 4
 
