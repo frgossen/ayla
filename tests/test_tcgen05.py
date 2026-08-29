@@ -265,6 +265,14 @@ def test_tcgen05_wide_tma_staging_lowering():
     assert bf16_output_ptx.count("st.global.v8.b32") == 8
 
 
+def test_tcgen05_gemm_jit_optimization_level():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=64, ptx_optimization_level=4,
+    ))
+
+    assert kernel.ptx_optimization_level == 4
+
+
 def test_tcgen05_m64_tma_staging_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, output_m_tile=64,

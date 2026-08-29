@@ -42,6 +42,7 @@ def blackwell_tcgen05_gemm_module(
     *, m: int = 4096, n: int = 4096, k: int = 4096,
     operand_stages: int = 4, tma_staging: str | None = "direct",
     output_m_tile: int = 128, output_n_tile: int = 128,
+    ptx_optimization_level: int | None = 1,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -247,7 +248,7 @@ def blackwell_tcgen05_gemm_module(
         body,
         grid_dim=(m // output_m_tile, n // output_n_tile, 1),
         block_dim=(128, 1, 1),
-        ptx_optimization_level=1,
+        ptx_optimization_level=ptx_optimization_level,
     )]), target=BLACKWELL)
 
 
