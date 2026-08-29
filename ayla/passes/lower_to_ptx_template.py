@@ -1094,9 +1094,9 @@ class LowerToPtxTemplate(LoweringPass):
                 stores = "\n".join([
                     *conversions,
                     *(
-                        f"st.global.v4.b32 [${{b64:row}}+{col * 2 + i * 4}], "
-                        f"{{{', '.join(packed[i:i + 4])}}};"
-                        for i in range(0, 32, 4)
+                        f"st.global.v8.b32 [${{b64:row}}+{col * 2 + i * 4}], "
+                        f"{{{', '.join(packed[i:i + 8])}}};"
+                        for i in range(0, 32, 8)
                     ),
                 ])
             template += textwrap.dedent(f"""\

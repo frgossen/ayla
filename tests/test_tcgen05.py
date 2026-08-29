@@ -262,6 +262,7 @@ def test_tcgen05_wide_tma_staging_lowering():
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 4
     assert "tcgen05.ld.sync.aligned.32x32b.x64.b32 {%f" in bf16_output_ptx
     assert "mov.b32 %f" not in bf16_output_ptx
+    assert bf16_output_ptx.count("st.global.v8.b32") == 8
 
 
 def test_tcgen05_cta_group2_lowering():
