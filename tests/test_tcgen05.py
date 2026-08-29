@@ -26,6 +26,7 @@ from ayla.gpu_dialect import (
     LockType,
     MoveOp,
     SmemTensorType,
+    TmaDescType,
     TileOp,
 )
 from ayla.ptx_runtime import make_ptx_launcher
@@ -325,6 +326,17 @@ def test_tcgen05_operand_l2_cache_hints():
     assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
     assert ptx.count("createpolicy.fractional.L2::evict_first") == 1
     assert ptx.count(".L2::cache_hint") == 4
+
+    promoted = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=128, output_n_tile=256, operand_stages=8,
+        lhs_l2_promotion="128B", rhs_l2_promotion="256B",
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in promoted.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+    assert input_descs[0].l2_promotion == "128B"
+    assert input_descs[1].l2_promotion == "256B"
 
 
 def test_tcgen05_gemm_cluster_a_multicast_lowering():

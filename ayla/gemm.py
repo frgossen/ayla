@@ -51,6 +51,8 @@ def blackwell_tcgen05_gemm_module(
     split_last_n_tile: bool = False,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
+    lhs_l2_promotion: str | None = None,
+    rhs_l2_promotion: str | None = None,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -104,6 +106,10 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("unsupported lhs_l2_cache_hint")
     if rhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
         raise ValueError("unsupported rhs_l2_cache_hint")
+    if lhs_l2_promotion not in (None, "64B", "128B", "256B"):
+        raise ValueError("unsupported lhs_l2_promotion")
+    if rhs_l2_promotion not in (None, "64B", "128B", "256B"):
+        raise ValueError("unsupported rhs_l2_promotion")
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -233,6 +239,8 @@ def blackwell_tcgen05_gemm_module(
                         "tma": True,
                         **({"l2_cache_hint": lhs_l2_cache_hint}
                            if lhs_l2_cache_hint else {}),
+                        **({"l2_promotion": lhs_l2_promotion}
+                           if lhs_l2_promotion else {}),
                         **({"multicast_mask": 0x3, "cluster_leader": True}
                            if cluster_multicast_a else {}),
                     },
@@ -243,6 +251,8 @@ def blackwell_tcgen05_gemm_module(
                         "tma": True,
                         **({"l2_cache_hint": rhs_l2_cache_hint}
                            if rhs_l2_cache_hint else {}),
+                        **({"l2_promotion": rhs_l2_promotion}
+                           if rhs_l2_promotion else {}),
                     },
                 ),
             ])
