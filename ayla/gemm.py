@@ -14,6 +14,7 @@ from .gpu_dialect import (
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
+    IndexModOp,
     KernelOp,
     LockType,
     MatmulOp,
@@ -238,6 +239,116 @@ def blackwell_tcgen05_gemm_module(
         body,
         grid_dim=(m // 128, n // output_n_tile, 1),
         block_dim=(128, 1, 1),
+        ptx_optimization_level=1,
+    )]), target=BLACKWELL)
+
+
+def blackwell_tcgen05_cta_group2_gemm_module(
+    *, m: int = 4096, n: int = 4096, k: int = 4096,
+) -> ModuleOp:
+    """Build a paired-CTA SM100 GEMM with a shared software pipeline.
+
+    Each neighboring CTA pair computes a 256x64 output region. Both CTAs run
+    the same TMA/MMA/store sequence; the single-thread issue mandated by
+    ``tcgen05.mma.cta_group::2`` is elected from the pair's even CTA.
+    """
+    if m % 256 or n % 64 or k % 64:
+        raise ValueError("group-2 tcgen05 GEMM dimensions must divide 256x64x64")
+
+    bf16 = BF16Type()
+    a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
+    bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
+    c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
+    block_ids = BlockIdsOp.build()
+    two = IndexConstantOp.build(2)
+    peer_rank = IndexModOp.build(block_ids.x, two.result())
+    a_block = TileOp.build(
+        a, [block_ids.x, 0],
+        GmemTensorType.build([128, k], bf16, strides=[k, 1]),
+    )
+    bt_block = TileOp.build(
+        bt, [block_ids.y, 0],
+        GmemTensorType.build([64, k], bf16, strides=[k, 1]),
+    )
+    c_block = TileOp.build(
+        c, [block_ids.x, block_ids.y],
+        GmemTensorType.build([128, 64], bf16, strides=[n, 1]),
+    )
+    lhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
+        [128, 64], bf16, swizzle="128B", attrs={"tcgen05_matrix": True},
+    ))
+    rhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
+        [32, 64], bf16, swizzle="128B", attrs={"tcgen05_matrix": True},
+    ))
+    accumulator = AllocOp.build_with_fresh_id(TmemTensorType.build(
+        [128, 64], F32Type(), attrs={"cta_group": 2},
+    ), init=0.0)
+    tma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
+    mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+    loop = ForOp.build(0, k // 64)
+    a_tile = TileOp.build(
+        a_block.result(), [0, loop.iv],
+        GmemTensorType.build([128, 64], bf16, strides=[k, 1]),
+    )
+    bt_tile = TileOp.build(
+        bt_block.result(), [peer_rank.result(), loop.iv],
+        GmemTensorType.build([32, 64], bf16, strides=[k, 1]),
+    )
+    loop.body.ops.extend([
+        a_tile,
+        bt_tile,
+        AsyncOp.build(tma_lock.result(), body=Block(ops=[
+            MoveOp.build(lhs_smem.result(), a_tile.result(), attrs={"tma": True}),
+            MoveOp.build(rhs_smem.result(), bt_tile.result(), attrs={"tma": True}),
+        ])),
+        AwaitOp.build(tma_lock.result()),
+    ])
+    mmas = []
+    for stage in range(4):
+        lhs_tile = TileOp.build(
+            lhs_smem.result(), [0, stage],
+            SmemTensorType.build(
+                [128, 16], bf16, strides=[64, 1], swizzle="128B",
+                attrs={"tcgen05_tma_layout": True},
+            ),
+        )
+        rhs_tile = TileOp.build(
+            rhs_smem.result(), [0, stage],
+            SmemTensorType.build(
+                [32, 16], bf16, strides=[64, 1], swizzle="128B",
+                attrs={"tcgen05_tma_layout": True},
+            ),
+        )
+        loop.body.ops.extend([lhs_tile, rhs_tile])
+        mmas.append(MatmulOp.build(
+            lhs_tile.result(), rhs_tile.result(), accumulator.result(),
+        ))
+    loop.body.ops.extend([
+        AsyncOp.build(mma_lock.result(), body=Block(ops=mmas)),
+        AwaitOp.build(mma_lock.result()),
+    ])
+    body = Block(arguments=[a, bt, c], ops=[
+        block_ids,
+        two,
+        peer_rank,
+        a_block,
+        bt_block,
+        c_block,
+        accumulator,
+        lhs_smem,
+        rhs_smem,
+        tma_lock,
+        mma_lock,
+        loop,
+        MoveOp.build(c_block.result(), accumulator.result()),
+        DeallocOp.build(accumulator.result()),
+    ])
+    return ModuleOp.build(Block(ops=[KernelOp.build(
+        "blackwell_tcgen05_cta_group2_4096",
+        body,
+        grid_dim=(m // 128, n // 64, 1),
+        block_dim=(128, 1, 1),
+        cluster_dim=(2, 1, 1),
         ptx_optimization_level=1,
     )]), target=BLACKWELL)
 

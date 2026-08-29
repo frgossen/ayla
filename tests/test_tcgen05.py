@@ -20,6 +20,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     AwaitOp,
     BF16Type,
+    BlockIdsOp,
     F32Type,
     GmemTensorType,
     LockType,
@@ -171,6 +172,62 @@ def _make_tcgen05_wide_tma_kernel(mma_tiles=4, n=64):
     )]), target=BLACKWELL))
 
 
+def _make_tcgen05_cta_group2_kernel():
+    bf16 = BF16Type()
+    a = Value(name="a", type=GmemTensorType.build((256, 16), bf16))
+    b = Value(name="b", type=GmemTensorType.build((64, 16), bf16))
+    c = Value(name="c", type=GmemTensorType.build((256, 64), F32Type()))
+    block_ids = BlockIdsOp.build()
+    a_tile = TileOp.build(
+        a, [block_ids.x, 0],
+        GmemTensorType.build((128, 16), bf16, strides=[16, 1]),
+    )
+    c_tile = TileOp.build(
+        c, [block_ids.x, 0],
+        GmemTensorType.build((128, 64), F32Type(), strides=[64, 1]),
+    )
+    b_tile = TileOp.build(
+        b, [block_ids.x, 0],
+        GmemTensorType.build((32, 16), bf16, strides=[16, 1]),
+    )
+    accumulator = AllocOp.build_with_fresh_id(TmemTensorType.build(
+        [128, 64], F32Type(), attrs={"cta_group": 2},
+    ), init=0.0)
+    lhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
+        [128, 16], bf16, swizzle="32B",
+        attrs={"tcgen05_layout": "lhs_128x16"},
+    ))
+    rhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
+        [64, 16], bf16, swizzle="128B",
+        attrs={"tcgen05_layout": "rhs_32x16_cta2"},
+    ))
+    mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+    mma = MatmulOp.build(
+        lhs_smem.result(), rhs_smem.result(), accumulator.result(),
+    )
+    body = Block(arguments=[a, b, c], ops=[
+        block_ids,
+        a_tile,
+        b_tile,
+        c_tile,
+        accumulator,
+        lhs_smem,
+        rhs_smem,
+        mma_lock,
+        MoveOp.build(lhs_smem.result(), a_tile.result()),
+        MoveOp.build(rhs_smem.result(), b_tile.result()),
+        AsyncOp.build(mma_lock.result(), body=Block(ops=[mma])),
+        AwaitOp.build(mma_lock.result()),
+        MoveOp.build(c_tile.result(), accumulator.result()),
+        DeallocOp.build(accumulator.result()),
+    ])
+    return make_ptx_kernel(ModuleOp.build(Block(ops=[KernelOp.build(
+        "tcgen05_cta_group2_smoke", body,
+        grid_dim=(2, 1, 1), block_dim=(128, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )]), target=BLACKWELL))
+
+
 def test_tcgen05_typed_ir_lowering():
     ptx = _make_tcgen05_kernel().ptx
 
@@ -200,6 +257,16 @@ def test_tcgen05_wide_tma_staging_lowering():
 
     assert ptx.count("cp.async.bulk.tensor.2d.shared::cluster.global") == 2
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 4
+
+
+def test_tcgen05_cta_group2_lowering():
+    ptx = _make_tcgen05_cta_group2_kernel().ptx
+
+    assert ".reqnctapercluster 2, 1, 1" in ptx
+    assert "tcgen05.alloc.cta_group::2" in ptx
+    assert "tcgen05.mma.cta_group::2.kind::f16" in ptx
+    assert "multicast::cluster" in ptx
+    assert "tcgen05.dealloc.cta_group::2" in ptx
 
 
 @requires_blackwell
@@ -244,6 +311,22 @@ def test_tcgen05_bf16_mma_with_wide_tma_staging(seed, n):
     a_tensor = torch.randn((128, 64), dtype=torch.bfloat16, device="cuda")
     b_tensor = torch.randn((n, 64), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty((128, n), dtype=torch.float32, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = a_tensor.float() @ b_tensor.float().T
+    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-2)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_bf16_mma_cta_group2(seed):
+    kernel = _make_tcgen05_cta_group2_kernel()
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((256, 16), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((64, 16), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((256, 64), dtype=torch.float32, device="cuda")
     make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
     torch.cuda.synchronize()
 

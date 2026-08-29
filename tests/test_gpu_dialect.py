@@ -89,6 +89,22 @@ def test_kernel_op():
         KernelOp.build("invalid", Block(), ptx_optimization_level=5)
 
 
+def test_kernel_cluster_dimension_roundtrip():
+    kernel = KernelOp.build(
+        "clustered", Block(), grid_dim=(2, 1, 1), block_dim=(32, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )
+
+    assert kernel.cluster_dim == (2, 1, 1)
+    assert_print_and_roundtrip(
+        kernel,
+        "kernel @clustered() grid_dim=[2, 1, 1] block_dim=[32, 1, 1] "
+        "cluster_dim=[2, 1, 1] {\n}",
+    )
+    with pytest.raises(ValueError, match="cluster_dim entries must be positive"):
+        KernelOp.build("invalid", Block(), cluster_dim=(0, 1, 1))
+
+
 def test_module_explicit_target():
     module = ModuleOp.build(Block(), target=BLACKWELL)
 

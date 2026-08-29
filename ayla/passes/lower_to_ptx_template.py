@@ -214,17 +214,21 @@ class LowerToPtxTemplate(LoweringPass):
             )
         if op.init not in (None, 0, 0.0):
             raise ValueError("tensor-memory allocation only supports zero init")
+        cta_group = int(result_type.attrs.get("cta_group", 1))
+        if cta_group not in (1, 2):
+            raise ValueError("tensor-memory cta_group must be 1 or 2")
         # tcgen05.alloc is warp-collective. Warp 0 briefly performs the required
-        # issue sequence; it is not assigned a persistent pipeline role.
+        # issue sequence in each participating CTA; it is not assigned a
+        # persistent pipeline role.
         template = textwrap.dedent(f"""\
             .shared .align 4 .b32 ${{smem:tmem_addr}}[1];
             mov.u32 ${{b32:tmem_tid}}, %tid.x;
             setp.lt.u32 ${{pred:tmem_warp0}}, ${{b32:tmem_tid}}, 32;
-            @${{pred:tmem_warp0}} tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {result_type.columns};
+            @${{pred:tmem_warp0}} tcgen05.alloc.cta_group::{cta_group}.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {result_type.columns};
             bar.sync 0;
             ld.shared.b32 ${{b32:result.dst.ptr}}, [${{smem:tmem_addr}}];
             bar.sync 0;
-            @${{pred:tmem_warp0}} tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+            @${{pred:tmem_warp0}} tcgen05.relinquish_alloc_permit.cta_group::{cta_group}.sync.aligned;
         """)
         if op.init is not None:
             if not (
@@ -273,11 +277,18 @@ class LowerToPtxTemplate(LoweringPass):
                 "tensor-memory deallocation requires a Blackwell target; "
                 f"got {self.target.architecture!r}"
             )
+        cta_group = int(value_type.attrs.get("cta_group", 1))
+        cluster_sync = (
+            "barrier.cluster.arrive.aligned;\n"
+            "barrier.cluster.wait.aligned;\n"
+            if cta_group == 2 else ""
+        )
         template = textwrap.dedent(f"""\
             bar.sync 0;
+            {cluster_sync}
             mov.u32 ${{b32:tmem_tid}}, %tid.x;
             setp.lt.u32 ${{pred:tmem_warp0}}, ${{b32:tmem_tid}}, 32;
-            @${{pred:tmem_warp0}} tcgen05.dealloc.cta_group::1.sync.aligned.b32 ${{b32:operand.src.ptr}}, {value_type.columns};
+            @${{pred:tmem_warp0}} tcgen05.dealloc.cta_group::{cta_group}.sync.aligned.b32 ${{b32:operand.src.ptr}}, {value_type.columns};
         """)
         new_op = PTXTemplateOp.build(
             operands=[value], result_types=[], template=template,
@@ -846,14 +857,20 @@ class LowerToPtxTemplate(LoweringPass):
             )
         for mm in mms:
             lhs_type, rhs_type, dst_type = mm.lhs.type, mm.rhs.type, mm.dst.type
+            mm_cta_group = int(dst_type.attrs.get("cta_group", 1))
+            logical_n = rhs_type.sizes[0]
+            if mm_cta_group == 2 and (
+                rhs_type.attrs.get("tcgen05_layout") != "rhs_32x16_cta2"
+            ):
+                logical_n *= 2
             supported = (
                 isinstance(lhs_type, SmemTensorType)
                 and isinstance(rhs_type, SmemTensorType)
                 and isinstance(dst_type, TmemTensorType)
                 and tuple(lhs_type.sizes) == (128, 16)
-                and rhs_type.sizes[0] in (64, 128, 256)
+                and rhs_type.sizes[0] in (32, 64, 128, 256)
                 and rhs_type.sizes[1] == 16
-                and tuple(dst_type.sizes) == (128, rhs_type.sizes[0])
+                and tuple(dst_type.sizes) == (128, logical_n)
                 and lhs_type.dtype.name == rhs_type.dtype.name == "bf16"
                 and dst_type.dtype.name == "f32"
                 and lhs_type.swizzle in ("32B", "128B")
@@ -863,7 +880,7 @@ class LowerToPtxTemplate(LoweringPass):
                 raise NotImplementedError(
                     "tcgen05 lowering currently supports "
                     "smem<128x16xbf16 swizzle=32B|128B> @ "
-                    "smem<64|128|256x16xbf16 swizzle=128B> -> "
+                    "smem<32|64|128|256x16xbf16 swizzle=128B> -> "
                     "tmem<128x64|128|256xf32>"
                 )
 
@@ -873,6 +890,12 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 async groups must share one accumulator"
             )
         lock = self.value_map[op.lock]
+        cta_group = int(mms[0].dst.type.attrs.get("cta_group", 1))
+        if cta_group not in (1, 2) or any(
+            int(mm.dst.type.attrs.get("cta_group", 1)) != cta_group
+            for mm in mms
+        ):
+            raise ValueError("tcgen05 async group requires one cta_group of 1 or 2")
         direct_tma_layout = bool(
             mms[0].rhs.type.attrs.get("tcgen05_tma_layout")
         )
@@ -885,7 +908,13 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 async groups cannot mix packed and direct-TMA RHS layouts"
             )
         n = mms[0].rhs.type.sizes[0]
-        idesc_value = (8 << 24) | ((n // 8) << 17) | 0x490
+        if cta_group == 2 and (
+            mms[0].rhs.type.attrs.get("tcgen05_layout")
+            != "rhs_32x16_cta2"
+        ):
+            n *= 2
+        m = 256 if cta_group == 2 else 128
+        idesc_value = ((m // 16) << 24) | ((n // 8) << 17) | 0x490
         if not direct_tma_layout:
             idesc_value |= 1 << 16
         idesc = f"0x{idesc_value:08x}"
@@ -895,8 +924,18 @@ class LowerToPtxTemplate(LoweringPass):
         # packed [K, N] cooperative layout.
         operands = [dst, lock]
         operand_names = ["dst", "lock"]
+        cluster_issue = ""
+        if cta_group == 2:
+            cluster_issue = textwrap.dedent("""\
+                barrier.cluster.arrive.aligned;
+                barrier.cluster.wait.aligned;
+                mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
+                and.b32 ${b32:cluster_parity}, ${b32:cluster_rank}, 1;
+                setp.eq.u32 ${pred:cluster_even}, ${b32:cluster_parity}, 0;
+            """)
         template = textwrap.dedent("""\
             fence.proxy.async.shared::cta;
+        """) + cluster_issue + textwrap.dedent("""\
             mov.u32 ${b32:tid}, %tid.x;
             shr.u32 ${b32:warp}, ${b32:tid}, 5;
             setp.eq.u32 ${pred:warp0}, ${b32:warp}, 0;
@@ -906,6 +945,11 @@ class LowerToPtxTemplate(LoweringPass):
             mov.b32 ${b32:disable}, 0;
             mov.pred ${pred:use_d}, -1;
         """).replace("__IDESC__", idesc)
+        if cta_group == 2:
+            template += "and.pred ${pred:issue}, ${pred:issue}, ${pred:cluster_even};\n"
+        disable_vector = ", ".join(
+            "${b32:disable}" for _ in range(4 * cta_group)
+        )
         for i, mm in enumerate(mms):
             lhs = self.value_map[mm.lhs]
             rhs = self.value_map[mm.rhs]
@@ -924,16 +968,23 @@ class LowerToPtxTemplate(LoweringPass):
                 cvt.u64.u32 ${{b64:rhs_desc{i}}}, ${{b32:rhs_addr{i}}};
                 or.b64 ${{b64:lhs_desc{i}}}, ${{b64:lhs_desc{i}}}, {lhs_desc_const};
                 or.b64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{i}}}, {rhs_desc_const};
-                @${{pred:issue}} tcgen05.mma.cta_group::1.kind::f16
+                @${{pred:issue}} tcgen05.mma.cta_group::{cta_group}.kind::f16
                     [${{b32:operand.dst.ptr}}], ${{b64:lhs_desc{i}}}, ${{b64:rhs_desc{i}}},
                     ${{b32:idesc}},
-                    {{${{b32:disable}}, ${{b32:disable}}, ${{b32:disable}}, ${{b32:disable}}}},
+                    {{{disable_vector}}},
                     ${{pred:use_d}};
             """)
-        template += textwrap.dedent("""\
-            @${pred:issue} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
-                [${b32:operand.lock.val}];
-        """)
+        if cta_group == 1:
+            template += textwrap.dedent("""\
+                @${pred:issue} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
+                    [${b32:operand.lock.val}];
+            """)
+        else:
+            template += textwrap.dedent("""\
+                mov.b16 ${b16:cta_mask}, 0x3;
+                @${pred:issue} tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
+                    [${b32:operand.lock.val}], ${b16:cta_mask};
+            """)
         new_op = PTXTemplateOp.build(
             operands=operands, result_types=[], template=template,
             operand_names=operand_names, result_names=[],
@@ -1423,6 +1474,41 @@ class LowerToPtxTemplate(LoweringPass):
                 xor.b32 ${b32:x3}, ${b32:x1}, ${b32:x2};
                 add.u32 ${b32:s}, ${b32:operand.dst.ptr}, ${b32:x3};
             """) + "\n" + loads + "\n"
+        elif layout == "rhs_32x16_cta2" and (
+            tuple(dst_type.sizes), tuple(src_type.sizes), dst_type.swizzle
+        ) == ((64, 16), (32, 16), "128B"):
+            row_stride = src_type.strides[0]
+            loads = "\n".join(
+                textwrap.dedent(f"""\
+                    add.u32 ${{b32:n}}, ${{b32:n_base}}, {i};
+                    mad.lo.u32 ${{b32:elem{i}}}, ${{b32:n}}, {row_stride}, ${{b32:k}};
+                    mad.wide.u32 ${{b64:g{i}}}, ${{b32:elem{i}}}, 2, ${{b64:operand.src.ptr}};
+                    ld.global.b16 ${{b16:v{i}}}, [${{b64:g{i}}}];
+                    st.shared.b16 [${{b32:s}}+{i * 2}], ${{b16:v{i}}};
+                """).rstrip()
+                for i in range(8)
+            )
+            # Group-2 MMA sources half of B's N columns from each peer CTA.
+            # Sixty-four threads populate the local half in the same physical
+            # positions used by the first 32 columns of rhs_64x16.
+            template = textwrap.dedent("""\
+                mov.u32 ${b32:tid}, %tid.x;
+                setp.ge.u32 ${pred:done}, ${b32:tid}, 64;
+                @${pred:done} bra ${label:end};
+                shr.u32 ${b32:k}, ${b32:tid}, 2;
+                and.b32 ${b32:n_group}, ${b32:tid}, 3;
+                shl.b32 ${b32:n_base}, ${b32:n_group}, 3;
+                shl.b32 ${b32:logical_tid}, ${b32:k}, 3;
+                or.b32 ${b32:logical_tid}, ${b32:logical_tid}, ${b32:n_group};
+                shl.b32 ${b32:x4}, ${b32:logical_tid}, 4;
+                and.b32 ${b32:x1}, ${b32:x4}, 2032;
+                shl.b32 ${b32:x2}, ${b32:logical_tid}, 1;
+                and.b32 ${b32:x2}, ${b32:x2}, 112;
+                xor.b32 ${b32:x3}, ${b32:x1}, ${b32:x2};
+                add.u32 ${b32:s}, ${b32:operand.dst.ptr}, ${b32:x3};
+            """) + "\n" + loads + textwrap.dedent("""\
+                ${label:end}:
+            """)
         else:
             raise NotImplementedError(
                 f"unsupported tcgen05 shared layout {layout!r}: "

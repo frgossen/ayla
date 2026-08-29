@@ -258,6 +258,7 @@ class PtxKernel:
     signature: list
     grid_dim: tuple[int, int, int]
     block_dim: tuple[int, int, int]
+    cluster_dim: tuple[int, int, int] | None = None
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
     target: PtxTarget | None = None
@@ -288,6 +289,13 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
     grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
+    if kernel.cluster_dim is not None and any(
+        grid % cluster for grid, cluster in zip(grid_dim, kernel.cluster_dim)
+    ):
+        raise ValueError(
+            f"grid_dim {grid_dim} must be divisible by cluster_dim "
+            f"{kernel.cluster_dim}"
+        )
     p = PtxPrinter()
     _emit_op(p, module)
     return PtxKernel(
@@ -296,6 +304,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         signature=kernel.signature,
         grid_dim=grid_dim,
         block_dim=kernel.block_dim,
+        cluster_dim=kernel.cluster_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
         target=target,
     )
@@ -387,6 +396,12 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
     p.write_line(")")
     block_dim = op.block_dim
     p.write_line(f".reqntid {block_dim[0]}, {block_dim[1]}, {block_dim[2]}")
+    if op.cluster_dim is not None:
+        p.write_line(".explicitcluster")
+        p.write_line(
+            f".reqnctapercluster {op.cluster_dim[0]}, "
+            f"{op.cluster_dim[1]}, {op.cluster_dim[2]}"
+        )
     p.write_line("{")
     with p.indented():
         decl_mark = p.mark()

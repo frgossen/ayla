@@ -267,7 +267,8 @@ static void launch_kernel(
     std::tuple<int, int, int> grid_dim,
     std::tuple<int, int, int> block_dim,
     py::list params,
-    int64_t shared_mem_bytes
+    int64_t shared_mem_bytes,
+    std::tuple<int, int, int> cluster_dim
 ) {
     auto fn = reinterpret_cast<CUfunction>(function_handle);
 
@@ -302,11 +303,34 @@ static void launch_kernel(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto [gx, gy, gz] = grid_dim;
     auto [bx, by, bz] = block_dim;
-    CU_CHECK(cuLaunchKernel(
-        fn, gx, gy, gz, bx, by, bz,
-        static_cast<unsigned int>(shared_mem_bytes),
-        stream, arg_ptrs.data(), /*extra=*/nullptr
-    ));
+    auto [cx, cy, cz] = cluster_dim;
+    if (cx > 0) {
+        CUlaunchAttribute attribute{};
+        attribute.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attribute.value.clusterDim.x = static_cast<unsigned int>(cx);
+        attribute.value.clusterDim.y = static_cast<unsigned int>(cy);
+        attribute.value.clusterDim.z = static_cast<unsigned int>(cz);
+        CUlaunchConfig config{};
+        config.gridDimX = gx;
+        config.gridDimY = gy;
+        config.gridDimZ = gz;
+        config.blockDimX = bx;
+        config.blockDimY = by;
+        config.blockDimZ = bz;
+        config.sharedMemBytes = static_cast<unsigned int>(shared_mem_bytes);
+        config.hStream = stream;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        CU_CHECK(cuLaunchKernelEx(
+            &config, fn, arg_ptrs.data(), /*extra=*/nullptr
+        ));
+    } else {
+        CU_CHECK(cuLaunchKernel(
+            fn, gx, gy, gz, bx, by, bz,
+            static_cast<unsigned int>(shared_mem_bytes),
+            stream, arg_ptrs.data(), /*extra=*/nullptr
+        ));
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -319,7 +343,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("grid_dim"),
           py::arg("block_dim"),
           py::arg("params"),
-          py::arg("shared_mem_bytes") = 0);
+          py::arg("shared_mem_bytes") = 0,
+          py::arg("cluster_dim") = std::make_tuple(0, 0, 0));
 }
 """
 
@@ -393,6 +418,7 @@ class PtxLauncher:
             self._kernel.block_dim,
             params,
             self._kernel.shared_mem_bytes,
+            self._kernel.cluster_dim or (0, 0, 0),
         )
 
     def _build_params(self, tensors):

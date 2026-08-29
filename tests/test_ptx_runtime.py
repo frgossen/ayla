@@ -118,6 +118,38 @@ def test_generated_blackwell_memory_kernel():
 
 
 @requires_cuda
+def test_generated_blackwell_cluster_kernel():
+    output_type = GmemTensorType.build((2,), F32Type())
+    output = Value(name="output", type=output_type)
+    write_rank = PTXTemplateOp.build(
+        [output], [],
+        template=textwrap.dedent("""\
+            mov.u32 ${b32:cta}, %ctaid.x;
+            mov.u32 ${b32:rank}, %cluster_ctarank;
+            cvt.rn.f32.u32 ${f32:value}, ${b32:rank};
+            mad.wide.u32 ${b64:address}, ${b32:cta}, 4, ${b64:operand.output.ptr};
+            st.global.f32 [${b64:address}], ${f32:value};
+        """),
+        operand_names=["output"],
+    )
+    kernel_op = KernelOp.build(
+        "blackwell_cluster", Block(arguments=[output], ops=[write_rank]),
+        grid_dim=(2, 1, 1), block_dim=(1, 1, 1), cluster_dim=(2, 1, 1),
+    )
+    kernel = make_ptx_kernel(
+        ModuleOp.build(Block(ops=[kernel_op]), target=BLACKWELL)
+    )
+    destination = torch.full((2,), -1.0, dtype=torch.float32, device="cuda")
+
+    make_ptx_launcher(kernel)(destination)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        destination, torch.tensor([0.0, 1.0], device="cuda")
+    )
+
+
+@requires_cuda
 def test_ptx_jit_failure_includes_driver_logs():
     bad_ptx = SIMPLE_ADD_PTX.replace(".target sm_70", ".target sm_999")
     buf_type = GmemTensorType.build((1,), F32Type())

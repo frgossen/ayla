@@ -2,6 +2,8 @@
 # flake8: noqa: E501
 import textwrap
 
+import pytest
+
 from ayla import (
     Block,
     GmemTensorType,
@@ -82,6 +84,29 @@ def test_codegen_materializes_block_dim_before_lowering():
     assert input_kernel.block_dim == (128, 1, 1)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
+
+
+def test_codegen_emits_cluster_launch_metadata():
+    kernel_op = KernelOp.build(
+        "clustered", Block(), grid_dim=(2, 1, 1), block_dim=(32, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )
+    kernel = make_ptx_kernel(ModuleOp.build(
+        Block(ops=[kernel_op]), target=BLACKWELL,
+    ))
+
+    assert kernel.cluster_dim == (2, 1, 1)
+    assert ".explicitcluster" in kernel.ptx
+    assert ".reqnctapercluster 2, 1, 1" in kernel.ptx
+
+    bad_kernel = KernelOp.build(
+        "bad_cluster", Block(), grid_dim=(3, 1, 1), block_dim=(32, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )
+    with pytest.raises(ValueError, match="must be divisible"):
+        make_ptx_kernel(ModuleOp.build(
+            Block(ops=[bad_kernel]), target=BLACKWELL,
+        ))
 
 
 def test_codegen_blackwell_target():
