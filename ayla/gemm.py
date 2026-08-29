@@ -452,7 +452,9 @@ def blackwell_tcgen05_gemm_module(
                 256 if output_n_tile in (232, 240, 248) else output_n_tile
             ),
         ),
-        init=0.0,
+        # Each persistent tile starts with an overwrite-mode MMA, so a one-time
+        # zero fill is both unnecessary for correctness and dead setup work.
+        init=None if persistent_n_pairs else 0.0,
     )
     if prefetch_lhs_next:
         direct_buffers = operand_stages // 4
