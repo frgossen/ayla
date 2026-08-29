@@ -232,14 +232,14 @@ class LowerToPtxTemplate(LoweringPass):
         """)
         if op.init is not None:
             if not (
-                result_type.sizes[0] == 128
+                result_type.sizes[0] in (64, 128)
                 and result_type.sizes[1] in (64, 128, 256)
                 and result_type.dtype.name == "f32"
                 and result_type.columns == result_type.sizes[1]
             ):
                 raise NotImplementedError(
                     "tensor-memory zero init currently supports "
-                    "tmem<128x64|128|256xf32>"
+                    "tmem<64|128x64|128|256xf32>"
                 )
             zeros = ", ".join("${b32:tmem_zero}" for _ in range(64))
             template += textwrap.dedent(f"""\
@@ -867,10 +867,11 @@ class LowerToPtxTemplate(LoweringPass):
                 isinstance(lhs_type, SmemTensorType)
                 and isinstance(rhs_type, SmemTensorType)
                 and isinstance(dst_type, TmemTensorType)
-                and tuple(lhs_type.sizes) == (128, 16)
+                and lhs_type.sizes[0] in (64, 128)
+                and lhs_type.sizes[1] == 16
                 and rhs_type.sizes[0] in (32, 64, 128, 256)
                 and rhs_type.sizes[1] == 16
-                and tuple(dst_type.sizes) == (128, logical_n)
+                and tuple(dst_type.sizes) == (lhs_type.sizes[0], logical_n)
                 and lhs_type.dtype.name == rhs_type.dtype.name == "bf16"
                 and dst_type.dtype.name == "f32"
                 and lhs_type.swizzle in ("32B", "128B")
@@ -879,9 +880,9 @@ class LowerToPtxTemplate(LoweringPass):
             if not supported:
                 raise NotImplementedError(
                     "tcgen05 lowering currently supports "
-                    "smem<128x16xbf16 swizzle=32B|128B> @ "
+                    "smem<64|128x16xbf16 swizzle=32B|128B> @ "
                     "smem<32|64|128|256x16xbf16 swizzle=128B> -> "
-                    "tmem<128x64|128|256xf32>"
+                    "tmem<64|128x64|128|256xf32>"
                 )
 
         dst = self.value_map[mms[0].dst]
@@ -913,7 +914,7 @@ class LowerToPtxTemplate(LoweringPass):
             != "rhs_32x16_cta2"
         ):
             n *= 2
-        m = 256 if cta_group == 2 else 128
+        m = 256 if cta_group == 2 else mms[0].lhs.type.sizes[0]
         idesc_value = ((m // 16) << 24) | ((n // 8) << 17) | 0x490
         if not direct_tma_layout:
             idesc_value |= 1 << 16
@@ -1048,7 +1049,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"got {self.target.architecture!r}"
             )
         if not (
-            src_type.sizes[0] == dst_type.sizes[0] == 128
+            src_type.sizes[0] == dst_type.sizes[0]
+            and src_type.sizes[0] in (64, 128)
             and src_type.sizes[1] == dst_type.sizes[1]
             and src_type.sizes[1] in (64, 128, 256)
             and src_type.dtype.name == "f32"
@@ -1057,27 +1059,46 @@ class LowerToPtxTemplate(LoweringPass):
         ):
             raise NotImplementedError(
                 "tcgen05 tmem-to-gmem move currently supports "
-                "128x64|128|256 f32 "
+                "64|128x64|128|256 f32 "
                 "tensor memory to row-strided f32/bf16 global memory"
             )
-        # Each warp owns 32 tensor-memory lanes. Process 64 columns at a time
-        # so the same register bank handles both 64- and 128-column outputs.
+        # M=128 uses all 32 lanes in each of the four tensor-memory datapaths.
+        # The non-warp-specialized M=64 Layout F instead uses lanes 0..15 in
+        # every datapath, so logical row = 16 * warp + lane. All four warps
+        # must still issue each collective tcgen05.ld; invalid half-warps only
+        # predicate off their global stores after the tensor-memory load.
+        # Process 64 columns at a time so the same register bank handles both
+        # 64- and 128-column outputs.
         row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
         value_type = "f32" if dst_type.dtype.name == "bf16" else "b32"
         values = [f"${{{value_type}:value{i}}}" for i in range(64)]
         load_values = ", ".join(values)
-        template = textwrap.dedent(f"""\
-            mov.u32 ${{b32:tid}}, %tid.x;
-            shr.u32 ${{b32:warp}}, ${{b32:tid}}, 5;
+        row_mapping = ""
+        store_predicate = ""
+        if src_type.sizes[0] == 64:
+            row_mapping = textwrap.dedent("""\
+                and.b32 ${b32:lane}, ${b32:tid}, 31;
+                shl.b32 ${b32:row_index}, ${b32:warp}, 4;
+                add.u32 ${b32:row_index}, ${b32:row_index}, ${b32:lane};
+                setp.lt.u32 ${pred:valid_row}, ${b32:lane}, 16;
+            """)
+            store_predicate = "@${pred:valid_row} "
+        else:
+            row_mapping = "mov.u32 ${b32:row_index}, ${b32:tid};\n"
+        template = textwrap.dedent("""\
+            mov.u32 ${b32:tid}, %tid.x;
+            shr.u32 ${b32:warp}, ${b32:tid}, 5;
+        """) + row_mapping + textwrap.dedent(f"""\
             shl.b32 ${{b32:lane_base}}, ${{b32:warp}}, 21;
             add.u32 ${{b32:taddr_row}}, ${{b32:operand.src.ptr}}, ${{b32:lane_base}};
-            mul.wide.u32 ${{b64:row_offset}}, ${{b32:tid}}, {row_stride_bytes};
+            mul.wide.u32 ${{b64:row_offset}}, ${{b32:row_index}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
         """)
         for col in range(0, src_type.sizes[1], 64):
             if dst_type.dtype.name == "f32":
                 stores = "\n".join(
-                    f"st.global.v4.b32 [${{b64:row}}+{col * 4 + i * 4}], "
+                    f"{store_predicate}st.global.v4.b32 "
+                    f"[${{b64:row}}+{col * 4 + i * 4}], "
                     f"{{{', '.join(values[i:i + 4])}}};"
                     for i in range(0, 64, 4)
                 )
@@ -1094,7 +1115,8 @@ class LowerToPtxTemplate(LoweringPass):
                 stores = "\n".join([
                     *conversions,
                     *(
-                        f"st.global.v8.b32 [${{b64:row}}+{col * 2 + i * 4}], "
+                        f"{store_predicate}st.global.v8.b32 "
+                        f"[${{b64:row}}+{col * 2 + i * 4}], "
                         f"{{{', '.join(packed[i:i + 8])}}};"
                         for i in range(0, 32, 8)
                     ),

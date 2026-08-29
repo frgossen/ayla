@@ -41,19 +41,22 @@ from .passes.unroll_loop import unroll_loop
 def blackwell_tcgen05_gemm_module(
     *, m: int = 4096, n: int = 4096, k: int = 4096,
     operand_stages: int = 4, tma_staging: str | None = "direct",
-    output_n_tile: int = 128,
+    output_m_tile: int = 128, output_n_tile: int = 128,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
-    Each CTA computes one 128xN output tile. All four warps cooperatively
+    Each CTA computes one MxN output tile. All four warps cooperatively
     stage both operands and read the tensor-memory accumulator; only the
     elected issue sequence required by ``tcgen05.mma`` is single-threaded.
     """
+    if output_m_tile not in (64, 128):
+        raise ValueError("output_m_tile must be 64 or 128")
     if output_n_tile not in (64, 128, 256):
         raise ValueError("output_n_tile must be 64, 128, or 256")
-    if m % 128 or n % output_n_tile or k % 16:
+    if m % output_m_tile or n % output_n_tile or k % 16:
         raise ValueError(
-            f"tcgen05 GEMM dimensions must divide 128x{output_n_tile}x16 tiles"
+            "tcgen05 GEMM dimensions must divide "
+            f"{output_m_tile}x{output_n_tile}x16 tiles"
         )
     if operand_stages < 1 or k % (16 * operand_stages):
         raise ValueError("K must divide the requested tcgen05 operand stages")
@@ -63,6 +66,8 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("direct TMA staging currently requires four K=16 stages")
     if output_n_tile != 64 and tma_staging != "direct":
         raise ValueError("wide output tiles currently require direct TMA staging")
+    if output_m_tile != 128 and tma_staging != "direct":
+        raise ValueError("M=64 output tiles currently require direct TMA staging")
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -71,7 +76,7 @@ def blackwell_tcgen05_gemm_module(
     block_ids = BlockIdsOp.build()
     a_block = TileOp.build(
         a, [block_ids.x, 0],
-        GmemTensorType.build([128, k], bf16, strides=[k, 1]),
+        GmemTensorType.build([output_m_tile, k], bf16, strides=[k, 1]),
     )
     bt_block = TileOp.build(
         bt, [block_ids.y, 0],
@@ -79,14 +84,16 @@ def blackwell_tcgen05_gemm_module(
     )
     c_block = TileOp.build(
         c, [block_ids.x, block_ids.y],
-        GmemTensorType.build([128, output_n_tile], bf16, strides=[n, 1]),
+        GmemTensorType.build(
+            [output_m_tile, output_n_tile], bf16, strides=[n, 1],
+        ),
     )
     accumulator = AllocOp.build_with_fresh_id(
-        TmemTensorType.build([128, output_n_tile], F32Type()), init=0.0,
+        TmemTensorType.build([output_m_tile, output_n_tile], F32Type()), init=0.0,
     )
     if tma_staging == "direct":
         lhs_smem = [AllocOp.build_with_fresh_id(SmemTensorType.build(
-            [128, 64], bf16, swizzle="128B",
+            [output_m_tile, 64], bf16, swizzle="128B",
             attrs={"tcgen05_matrix": True},
         ))]
         rhs_smem = [AllocOp.build_with_fresh_id(SmemTensorType.build(
@@ -125,7 +132,7 @@ def blackwell_tcgen05_gemm_module(
         loop = ForOp.build(0, k // 64)
         a_tile = TileOp.build(
             a_block.result(), [0, loop.iv],
-            GmemTensorType.build([128, 64], bf16, strides=[k, 1]),
+            GmemTensorType.build([output_m_tile, 64], bf16, strides=[k, 1]),
         )
         bt_tile = TileOp.build(
             bt_block.result(), [0, loop.iv],
@@ -152,7 +159,8 @@ def blackwell_tcgen05_gemm_module(
             lhs_tile = TileOp.build(
                 lhs_smem[0].result(), [0, stage],
                 SmemTensorType.build(
-                    [128, 16], bf16, strides=[64, 1], swizzle="128B",
+                    [output_m_tile, 16], bf16,
+                    strides=[64, 1], swizzle="128B",
                     attrs={"tcgen05_tma_layout": True},
                 ),
             )
@@ -237,7 +245,7 @@ def blackwell_tcgen05_gemm_module(
     return ModuleOp.build(Block(ops=[KernelOp.build(
         "blackwell_tcgen05_4096",
         body,
-        grid_dim=(m // 128, n // output_n_tile, 1),
+        grid_dim=(m // output_m_tile, n // output_n_tile, 1),
         block_dim=(128, 1, 1),
         ptx_optimization_level=1,
     )]), target=BLACKWELL)

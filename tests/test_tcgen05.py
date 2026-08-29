@@ -265,6 +265,18 @@ def test_tcgen05_wide_tma_staging_lowering():
     assert bf16_output_ptx.count("st.global.v8.b32") == 8
 
 
+def test_tcgen05_m64_tma_staging_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=64, output_m_tile=64,
+    ))
+
+    assert kernel.grid_dim == (2, 1, 1)
+    assert "mov.b32 %r" in kernel.ptx and "0x04200490" in kernel.ptx
+    assert "setp.lt.u32" in kernel.ptx
+    assert "and.b32" in kernel.ptx
+    assert "@%p" in kernel.ptx and "st.global.v8.b32" in kernel.ptx
+
+
 def test_tcgen05_cta_group2_lowering():
     ptx = _make_tcgen05_cta_group2_kernel().ptx
 
@@ -322,6 +334,25 @@ def test_tcgen05_bf16_mma_with_wide_tma_staging(seed, n):
 
     expected = a_tensor.float() @ b_tensor.float().T
     torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-2)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_m64_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=128, k=64, output_m_tile=64,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((64, 64), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((128, 64), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((64, 128), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
 
 
 @requires_blackwell
