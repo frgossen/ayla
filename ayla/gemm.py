@@ -47,6 +47,8 @@ def blackwell_tcgen05_gemm_module(
     cluster_multicast_a: bool = False,
     branch_tcgen05_issue: bool = True,
     transpose_cta_grid: bool = False,
+    lhs_l2_cache_hint: str | None = None,
+    rhs_l2_cache_hint: str | None = None,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -86,6 +88,10 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires N divisible by 256")
     if cluster_multicast_a and transpose_cta_grid:
         raise ValueError("cluster A multicast requires the default CTA grid order")
+    if lhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
+        raise ValueError("unsupported lhs_l2_cache_hint")
+    if rhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
+        raise ValueError("unsupported rhs_l2_cache_hint")
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -192,12 +198,19 @@ def blackwell_tcgen05_gemm_module(
                     lhs_smem[half].result(), a_tile.result(),
                     attrs={
                         "tma": True,
+                        **({"l2_cache_hint": lhs_l2_cache_hint}
+                           if lhs_l2_cache_hint else {}),
                         **({"multicast_mask": 0x3, "cluster_leader": True}
                            if cluster_multicast_a else {}),
                     },
                 ),
                 MoveOp.build(
-                    rhs_smem[half].result(), bt_tile.result(), attrs={"tma": True},
+                    rhs_smem[half].result(), bt_tile.result(),
+                    attrs={
+                        "tma": True,
+                        **({"l2_cache_hint": rhs_l2_cache_hint}
+                           if rhs_l2_cache_hint else {}),
+                    },
                 ),
             ])
         assert tma_lock is not None

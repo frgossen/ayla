@@ -294,6 +294,17 @@ def test_tcgen05_transposed_cta_grid_mapping():
     assert "%ctaid.x" in kernel.ptx and "%ctaid.y" in kernel.ptx
 
 
+def test_tcgen05_operand_l2_cache_hints():
+    ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=128, operand_stages=8,
+        lhs_l2_cache_hint="evict_last", rhs_l2_cache_hint="evict_first",
+    )).ptx
+
+    assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
+    assert ptx.count("createpolicy.fractional.L2::evict_first") == 1
+    assert ptx.count(".L2::cache_hint") == 4
+
+
 def test_tcgen05_gemm_cluster_a_multicast_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=64, cluster_multicast_a=True,
