@@ -55,6 +55,7 @@ def blackwell_tcgen05_gemm_module(
     split_n_tile: int | None = None,
     split_last_n_tile_rows: int | None = None,
     tail_n_tile: int | None = None,
+    balanced_n_tile: int | None = None,
     predicated_tail_stores: bool = False,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
@@ -85,7 +86,7 @@ def blackwell_tcgen05_gemm_module(
             "tcgen05 GEMM dimensions must divide the M and K tile sizes"
         )
     if tail_n_tile is None:
-        if n % output_n_tile:
+        if balanced_n_tile is None and n % output_n_tile:
             raise ValueError("N must divide the requested tcgen05 output tile")
     elif (
         not isinstance(tail_n_tile, int)
@@ -122,7 +123,7 @@ def blackwell_tcgen05_gemm_module(
         option is not None and option is not False
         for option in (
             split_last_n_tile, split_n_tile, split_last_n_tile_rows,
-            tail_n_tile,
+            tail_n_tile, balanced_n_tile,
         )
     ) > 1:
         raise ValueError(
@@ -157,6 +158,25 @@ def blackwell_tcgen05_gemm_module(
         )
     m_tiles = m // output_m_tile
     n_tiles = (n + output_n_tile - 1) // output_n_tile
+    balanced_wide_tiles = None
+    if balanced_n_tile is not None:
+        delta = output_n_tile - balanced_n_tile
+        extra = n - n_tiles * balanced_n_tile
+        if (
+            tma_staging != "direct"
+            or not transpose_cta_grid
+            or type(balanced_n_tile) is not int
+            or balanced_n_tile % 8
+            or not 8 <= balanced_n_tile < output_n_tile
+            or extra <= 0
+            or extra % delta
+            or not 0 < extra // delta < n_tiles
+        ):
+            raise ValueError(
+                "balanced_n_tile requires direct transposed-grid staging and "
+                "an exact mix of valid narrow/full N tiles"
+            )
+        balanced_wide_tiles = extra // delta
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
     ):
@@ -224,8 +244,61 @@ def blackwell_tcgen05_gemm_module(
     hybrid_n_width = None
     hybrid_split_rows = None
     hybrid_split_tile = None
+    hybrid_element_offsets = False
     hybrid_controls = None
-    if tail_n_tile is not None:
+    if balanced_n_tile is not None:
+        assert balanced_wide_tiles is not None
+        # Distribute wider tiles evenly with a prefix-count formula. For
+        # N4096 this maps eight N232 and ten N224 tiles into the same 18-CTA
+        # row as the retained N232/N152 launch, while avoiding a short tail.
+        narrow_width = IndexConstantOp.build(balanced_n_tile)
+        narrow_base = IndexMulOp.build(block_ids.x, narrow_width.result())
+        wide_count = IndexConstantOp.build(balanced_wide_tiles)
+        wide_product = IndexMulOp.build(block_ids.x, wide_count.result())
+        tile_count = IndexConstantOp.build(n_tiles)
+        wide_before = IndexDivOp.build(
+            wide_product.result(), tile_count.result(),
+        )
+        width_delta = IndexConstantOp.build(output_n_tile - balanced_n_tile)
+        wide_offset = IndexMulOp.build(
+            wide_before.result(), width_delta.result(),
+        )
+        n_offset = IndexAddOp.build(
+            narrow_base.result(), wide_offset.result(),
+        )
+        one = IndexConstantOp.build(1)
+        next_x = IndexAddOp.build(block_ids.x, one.result())
+        next_wide_product = IndexMulOp.build(
+            next_x.result(), wide_count.result(),
+        )
+        wide_after = IndexDivOp.build(
+            next_wide_product.result(), tile_count.result(),
+        )
+        minus_one = IndexConstantOp.build(-1)
+        neg_wide_before = IndexMulOp.build(
+            wide_before.result(), minus_one.result(),
+        )
+        is_wide = IndexAddOp.build(
+            wide_after.result(), neg_wide_before.result(),
+        )
+        neg_is_wide = IndexMulOp.build(
+            is_wide.result(), minus_one.result(),
+        )
+        narrow = IndexAddOp.build(one.result(), neg_is_wide.result())
+        zero = IndexConstantOp.build(0)
+        grid_index_ops.extend([
+            narrow_width, narrow_base, wide_count, wide_product, tile_count,
+            wide_before, width_delta, wide_offset, n_offset, one, next_x,
+            next_wide_product, wide_after, minus_one, neg_wide_before,
+            is_wide, neg_is_wide, narrow, zero,
+        ])
+        m_block_id = block_ids.y
+        n_block_id = n_offset.result()
+        hybrid_n_tiles = n_tiles
+        hybrid_n_width = balanced_n_tile
+        hybrid_element_offsets = True
+        hybrid_controls = [narrow.result(), zero.result()]
+    elif tail_n_tile is not None:
         # A final naturally narrow tile avoids duplicating a full N-wide TMA
         # operand solely to improve launch-wave balance.  Integer division is
         # CTA-uniform: blocks before the last produce zero and the tail block
@@ -294,12 +367,14 @@ def blackwell_tcgen05_gemm_module(
     bt_block = TileOp.build(
         bt, [n_block_id, 0],
         GmemTensorType.build([output_n_tile, k], bf16, strides=[k, 1]),
+        attrs={"element_offset_dims": [0]} if hybrid_element_offsets else None,
     )
     c_block = TileOp.build(
         c, [m_block_id, n_block_id],
         GmemTensorType.build(
             [output_m_tile, output_n_tile], bf16, strides=[n, 1],
         ),
+        attrs={"element_offset_dims": [1]} if hybrid_element_offsets else None,
     )
     accumulator = AllocOp.build_with_fresh_id(
         TmemTensorType.build(
@@ -369,6 +444,8 @@ def blackwell_tcgen05_gemm_module(
                    if hybrid_split_rows is not None else {}),
                 **({"hybrid_split_tile": hybrid_split_tile}
                    if hybrid_split_tile is not None else {}),
+                **({"hybrid_element_offsets": True}
+                   if hybrid_element_offsets else {}),
             }
             if hybrid_n_tiles is not None else None
         )
@@ -796,6 +873,8 @@ def blackwell_tcgen05_gemm_module(
                        if hybrid_split_rows is not None else {}),
                     **({"hybrid_split_tile": hybrid_split_tile}
                        if hybrid_split_tile is not None else {}),
+                    **({"hybrid_element_offsets": True}
+                       if hybrid_element_offsets else {}),
                 }
                 if hybrid_n_tiles is not None else None
             )
@@ -906,6 +985,8 @@ def blackwell_tcgen05_gemm_module(
                        if hybrid_split_rows is not None else {}),
                     **({"hybrid_split_tile": hybrid_split_tile}
                        if hybrid_split_tile is not None else {}),
+                    **({"hybrid_element_offsets": True}
+                       if hybrid_element_offsets else {}),
                 }
                 if hybrid_n_tiles is not None else None
             ),

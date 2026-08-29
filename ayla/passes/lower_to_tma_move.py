@@ -146,13 +146,18 @@ def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value
 
     for tile_op in reversed(tiles):
         result_sizes = list(tile_op.result().type.sizes)
+        element_offset_dims = set(
+            tile_op.attrs.get("element_offset_dims", [])
+        )
         for dim, idx in enumerate(tile_op.indices):
             if isinstance(idx, int):
                 const_op = IndexConstantOp.build(idx)
                 new_ops.append(const_op)
                 idx = const_op.result()
 
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
+            tile_size_op = IndexConstantOp.build(
+                1 if dim in element_offset_dims else result_sizes[dim]
+            )
             new_ops.append(tile_size_op)
             mul_op = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(mul_op)

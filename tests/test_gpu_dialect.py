@@ -28,6 +28,7 @@ from ayla.gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     TmemTensorType,
+    TileOp,
     gpu_dialect,
 )
 from ayla.targets import BLACKWELL, HOPPER
@@ -122,6 +123,30 @@ def test_partial_split_block_ids_roundtrip_and_validation():
     with pytest.raises(ValueError, match="0 < split_rows < m_tiles"):
         PartialSplitBlockIdsOp.build(
             m_tiles=32, n_tiles=16, split_rows=32,
+        )
+
+
+def test_tile_element_offset_dimensions_roundtrip_and_validation():
+    tensor_type = GmemTensorType.build((128, 256), F32Type())
+    tensor = Value(name="tensor", type=tensor_type)
+    offset = Value(name="offset", type=IndexType())
+    tile = TileOp.build(
+        tensor, [0, offset],
+        GmemTensorType.build((128, 32), F32Type(), strides=(256, 1)),
+        attrs={"element_offset_dims": [1]},
+    )
+
+    assert_print_and_roundtrip(
+        tile,
+        "%0: gmem<128x32xf32 strides=[256, 1]> = "
+        "tile(%tensor: gmem<128x256xf32>, 0, "
+        "%offset: index) attrs={element_offset_dims: [1]}",
+    )
+    with pytest.raises(ValueError, match="element_offset_dims"):
+        TileOp.build(
+            tensor, [0, offset],
+            GmemTensorType.build((128, 32), F32Type(), strides=(256, 1)),
+            attrs={"element_offset_dims": [2]},
         )
 
 

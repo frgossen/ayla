@@ -421,6 +421,33 @@ def test_tcgen05_n232_tail152_lowering():
     assert "st.global.v4.b32" in kernel.ptx
 
 
+def test_tcgen05_balanced_n232_n224_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+
+    assert kernel.grid_dim == (18, 1, 1)
+    assert input_descs[1].tile_sizes == (116, 64)
+    assert "0x083a0490" in kernel.ptx  # M128/N232
+    assert "0x08380490" in kernel.ptx  # M128/N224
+    assert "and.b64" in kernel.ptx
+
+    with pytest.raises(ValueError, match="balanced_n_tile"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=256,
+            output_n_tile=232, balanced_n_tile=220,
+            operand_stages=8, transpose_cta_grid=True,
+        )
+
+
 def test_tcgen05_next_lhs_prefetch_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=512, k=4096,
@@ -799,6 +826,29 @@ def test_tcgen05_next_rhs_prefetch_gemm(seed):
     a_tensor = torch.randn((128, 256), dtype=torch.bfloat16, device="cuda")
     b_tensor = torch.randn((512, 256), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty((128, 512), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_balanced_n232_n224_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((128, 256), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((4096, 256), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((128, 4096), dtype=torch.bfloat16, device="cuda")
     make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
     torch.cuda.synchronize()
 

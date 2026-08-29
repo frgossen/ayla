@@ -310,6 +310,11 @@ class MatmulOp(Op):
 class TileOp(Op):
     """Select a sub-region (view) of a buffer.
 
+    Indices normally count result-sized tiles. ``element_offset_dims`` may
+    name dimensions whose indices are already element offsets; this is useful
+    for irregular but CTA-uniform tilings that cannot be expressed as one
+    fixed tile stride.
+
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
     defined out-of-bounds behavior.
@@ -389,6 +394,18 @@ class TileOp(Op):
             assert list(arg_type.strides) == list(res_type.strides), (
                 f"TileOp: result strides {list(res_type.strides)} must "
                 f"match arg strides {list(arg_type.strides)}"
+            )
+        element_offset_dims = self.attrs.get("element_offset_dims", [])
+        if (
+            not isinstance(element_offset_dims, list)
+            or len(set(element_offset_dims)) != len(element_offset_dims)
+            or any(
+                type(dim) is not int or not 0 <= dim < len(self.indices)
+                for dim in element_offset_dims
+            )
+        ):
+            raise ValueError(
+                "TileOp element_offset_dims must be unique valid dimensions"
             )
 
     def print(self, p: Printer) -> None:

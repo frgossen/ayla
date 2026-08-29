@@ -197,6 +197,7 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(root_type, AddrMemTensorType)
         dtype_bytes = root_type.dtype.byte_size
         result_sizes = list(op.result().type.sizes)
+        element_offset_dims = set(op.attrs.get("element_offset_dims", []))
         layout = (
             physical_layout(root_type)
             if isinstance(root_type, SmemTensorType) else None
@@ -215,7 +216,9 @@ class LowerToPtxTemplate(LoweringPass):
             else:
                 idx = self.value_map[idx]
 
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
+            tile_size_op = IndexConstantOp.build(
+                1 if dim in element_offset_dims else result_sizes[dim]
+            )
             new_ops.append(tile_size_op)
             elem_off = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(elem_off)
@@ -1045,12 +1048,17 @@ class LowerToPtxTemplate(LoweringPass):
         hybrid_n_width = mms[0].attrs.get("hybrid_n_width")
         hybrid_split_rows = mms[0].attrs.get("hybrid_split_rows")
         hybrid_split_tile = mms[0].attrs.get("hybrid_split_tile")
+        hybrid_element_offsets = bool(
+            mms[0].attrs.get("hybrid_element_offsets")
+        )
         if any(
             (
                 mm.attrs.get("hybrid_n_tiles") != hybrid_n_tiles
                 or mm.attrs.get("hybrid_n_width") != hybrid_n_width
                 or mm.attrs.get("hybrid_split_rows") != hybrid_split_rows
                 or mm.attrs.get("hybrid_split_tile") != hybrid_split_tile
+                or bool(mm.attrs.get("hybrid_element_offsets"))
+                != hybrid_element_offsets
                 or mm.controls != mms[0].controls
             )
             for mm in mms[1:]
@@ -1097,7 +1105,11 @@ class LowerToPtxTemplate(LoweringPass):
                     "hybrid-N tcgen05 requires a direct-TMA group-1 "
                     "N232/N240/N248/N256 tile and a valid narrow width"
                 )
-            if hybrid_split_rows is not None or hybrid_split_tile is not None:
+            if (
+                hybrid_split_rows is not None
+                or hybrid_split_tile is not None
+                or hybrid_element_offsets
+            ):
                 if (
                     len(mms[0].controls) != 2
                     or (
@@ -1169,7 +1181,11 @@ class LowerToPtxTemplate(LoweringPass):
                 | ((hybrid_n_width // 8) << 17)
                 | 0x490
             )
-            if hybrid_split_rows is not None or hybrid_split_tile is not None:
+            if (
+                hybrid_split_rows is not None
+                or hybrid_split_tile is not None
+                or hybrid_element_offsets
+            ):
                 template += textwrap.dedent(f"""\
                     setp.ne.u32 ${{pred:narrow_n}}, ${{b32:operand.hybrid_narrow.val}}, 0;
                     mov.u32 ${{b32:rhs_half}}, ${{b32:operand.hybrid_half.val}};
@@ -1352,6 +1368,9 @@ class LowerToPtxTemplate(LoweringPass):
         predicated_tail_stores = bool(op.attrs.get("predicated_tail_stores"))
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
+        hybrid_element_offsets = bool(
+            op.attrs.get("hybrid_element_offsets")
+        )
         if hybrid_n_tiles is not None and (
             not isinstance(hybrid_n_tiles, int)
             or hybrid_n_tiles < 2
@@ -1373,7 +1392,9 @@ class LowerToPtxTemplate(LoweringPass):
                 "predicated tail stores require a hybrid-N M128 output"
             )
         if (
-            hybrid_split_rows is not None or hybrid_split_tile is not None
+            hybrid_split_rows is not None
+            or hybrid_split_tile is not None
+            or hybrid_element_offsets
         ) and (hybrid_n_tiles is None or len(op.indices) != 2):
             raise ValueError(
                 "controlled hybrid-N output requires narrow/half controls"
@@ -1382,6 +1403,7 @@ class LowerToPtxTemplate(LoweringPass):
             hybrid_n_tiles is not None
             and hybrid_split_rows is None
             and hybrid_split_tile is None
+            and not hybrid_element_offsets
             and op.indices
         ):
             raise ValueError("full-row hybrid-N output does not accept controls")
@@ -1423,15 +1445,25 @@ class LowerToPtxTemplate(LoweringPass):
             # parity branch so each tile gets maximally wide aligned stores:
             # even tiles use a trailing 16B edge, odd tiles use 16B edges
             # around aligned 32B interior transactions.
-            template += textwrap.dedent("""\
-                mov.u32 ${b32:alternating_bid}, %ctaid.x;
-                and.b32 ${b32:alternating_parity}, ${b32:alternating_bid}, 1;
-                setp.ne.u32 ${pred:alternating_odd}, ${b32:alternating_parity}, 0;
-            """)
+            if hybrid_element_offsets:
+                template += textwrap.dedent("""\
+                    and.b64 ${b64:alternating_alignment}, ${b64:row}, 16;
+                    setp.ne.u64 ${pred:alternating_odd}, ${b64:alternating_alignment}, 0;
+                """)
+            else:
+                template += textwrap.dedent("""\
+                    mov.u32 ${b32:alternating_bid}, %ctaid.x;
+                    and.b32 ${b32:alternating_parity}, ${b32:alternating_bid}, 1;
+                    setp.ne.u32 ${pred:alternating_odd}, ${b32:alternating_parity}, 0;
+                """)
         operands = [self.value_map[op.dst], self.value_map[op.src]]
         operand_names = ["dst", "src"]
         if hybrid_n_tiles is not None:
-            if hybrid_split_rows is not None or hybrid_split_tile is not None:
+            if (
+                hybrid_split_rows is not None
+                or hybrid_split_tile is not None
+                or hybrid_element_offsets
+            ):
                 narrow, half = (
                     self.value_map[value] for value in op.indices
                 )
@@ -1567,18 +1599,30 @@ class LowerToPtxTemplate(LoweringPass):
                             f"cvt.rn.bf16x2.f32 {packed_reg}, "
                             f"{values[i + 1]}, {values[i]};"
                         )
-                    narrow_groups = (
-                        [(0, 4)] + [
-                            (start, min(8, len(narrow_packed) - start))
-                            for start in range(4, len(narrow_packed), 8)
+                    narrow_even_groups = [
+                        (start, min(8, len(narrow_packed) - start))
+                        for start in range(0, len(narrow_packed), 8)
+                    ]
+                    narrow_odd_groups = [(0, 4)] + [
+                        (start, min(8, len(narrow_packed) - start))
+                        for start in range(4, len(narrow_packed), 8)
+                    ]
+                    if alternating_store_alignment and hybrid_element_offsets:
+                        narrow_stores = [
+                            f"@${{pred:alternating_odd}} bra "
+                            f"${{label:hybrid_partial_odd_{col}}};",
+                            *vector_stores(narrow_even_groups),
+                            f"bra ${{label:hybrid_partial_aligned_{col}}};",
+                            f"${{label:hybrid_partial_odd_{col}}}:",
+                            *vector_stores(narrow_odd_groups),
+                            f"${{label:hybrid_partial_aligned_{col}}}:",
                         ]
-                        if alternating_store_alignment else
-                        [
-                            (start, min(8, len(narrow_packed) - start))
-                            for start in range(0, len(narrow_packed), 8)
-                        ]
-                    )
-                    narrow_stores = vector_stores(narrow_groups)
+                    else:
+                        narrow_stores = vector_stores(
+                            narrow_odd_groups
+                            if alternating_store_alignment
+                            else narrow_even_groups
+                        )
                     stores = "\n".join([
                         f"@${{pred:hybrid_narrow}} bra ${{label:hybrid_partial_{col}}};",
                         stores,
