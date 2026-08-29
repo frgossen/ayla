@@ -1064,6 +1064,17 @@ class LowerToPtxTemplate(LoweringPass):
             for mm in mms[1:]
         ):
             raise ValueError("tcgen05 async groups must share hybrid-N controls")
+        overwrite_first = bool(
+            mms[0].attrs.get("overwrite_accumulator", False)
+        )
+        if any(
+            bool(mm.attrs.get("overwrite_accumulator", False))
+            for mm in mms[1:]
+        ):
+            raise ValueError(
+                "only the first tcgen05 matmul in an async group may "
+                "overwrite the accumulator"
+            )
         n = mms[0].rhs.type.sizes[0]
         if cta_group == 2 and (
             mms[0].rhs.type.attrs.get("tcgen05_layout")
@@ -1213,9 +1224,10 @@ class LowerToPtxTemplate(LoweringPass):
                 """).replace("__HALF_INSTRUCTION__", half_instruction)
         else:
             template += f"mov.b32 ${{b32:idesc}}, {idesc};\n"
-        template += textwrap.dedent("""\
-            mov.b32 ${b32:disable}, 0;
-            mov.pred ${pred:use_d}, -1;
+        initial_use_d = "0" if overwrite_first else "-1"
+        template += textwrap.dedent(f"""\
+            mov.b32 ${{b32:disable}}, 0;
+            mov.pred ${{pred:use_d}}, {initial_use_d};
         """)
         disable_vector = ", ".join(
             "${b32:disable}" for _ in range(4 * cta_group)
@@ -1273,6 +1285,8 @@ class LowerToPtxTemplate(LoweringPass):
                     {{{disable_vector}}},
                     ${{pred:use_d}};
             """)
+            if overwrite_first and i == 0:
+                template += "mov.pred ${pred:use_d}, -1;\n"
         if cta_group == 1:
             template += textwrap.dedent("""\
                 @${pred:issue} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64

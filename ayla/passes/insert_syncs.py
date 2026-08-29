@@ -222,7 +222,19 @@ def _analyze(
         header = live
         while True:
             live_out = _analyze_block(op.body.ops, header, targets)
-            joined = header.join(live_out)  # fold the back edge
+            backedge = live_out
+            if op.attrs.get("disjoint_grid_iterations"):
+                # The loop explicitly guarantees that grid-memory regions do
+                # not alias across iterations. Preserve those effects in the
+                # loop's live-out, but do not fold them onto the backedge and
+                # manufacture an impossible grid-wide synchronization need.
+                backedge = live_out.clone()
+                for buf, effects in backedge.concurrent_memory_effects.items():
+                    backedge.concurrent_memory_effects[buf] = {
+                        effect for effect in effects
+                        if effect.scope != CollectiveScope.GRID
+                    }
+            joined = header.join(backedge)  # fold the back edge
             if joined == header:
                 return live_out
             header = joined

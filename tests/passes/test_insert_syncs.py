@@ -76,6 +76,26 @@ def test_war_on_shared_buffer_gets_barrier():
 
 
 
+def test_disjoint_grid_loop_iterations_do_not_require_grid_barrier():
+    def make_module(disjoint: bool):
+        attrs = " attrs={disjoint_grid_iterations: True}" if disjoint else ""
+        return gpu_dialect.parse(textwrap.dedent(f"""\
+            module {{
+              kernel @test(%c: gmem<64x64xbf16>, %r: rmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+                for (%i: index = 0 to 2){attrs} {{
+                  move(%c: gmem<64x64xbf16>, %r: rmem<64x64xbf16>)
+                }}
+              }}
+            }}"""))
+
+    with pytest.raises(NotImplementedError, match="barrier GRID"):
+        insert_syncs(make_module(disjoint=False))
+
+    module = make_module(disjoint=True)
+    insert_syncs(module)
+    assert "barrier()" not in repr(module)
+
+
 def test_wgmma256_wg_pipeline_inserts_barriers():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

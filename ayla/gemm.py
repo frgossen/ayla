@@ -68,6 +68,7 @@ def blackwell_tcgen05_gemm_module(
     output_l1_cache_policy: str | None = None,
     output_l2_eviction_priority: str | None = None,
     output_tmem_load_shape: str = "32x32b",
+    persistent_n_pairs: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -180,6 +181,18 @@ def blackwell_tcgen05_gemm_module(
                 "an exact mix of valid narrow/full N tiles"
             )
         balanced_wide_tiles = extra // delta
+    if persistent_n_pairs and (
+        balanced_n_tile is None
+        or not transpose_cta_grid
+        or n_tiles % 2
+        or balanced_wide_tiles is None
+        or balanced_wide_tiles > n_tiles // 2
+        or (n_tiles - 2 * balanced_wide_tiles) % 2
+    ):
+        raise ValueError(
+            "persistent N pairing requires an even exact balanced-N launch "
+            "whose wide tiles can each pair with a narrow tile"
+        )
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
     ):
@@ -259,6 +272,67 @@ def blackwell_tcgen05_gemm_module(
     c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
     block_ids = BlockIdsOp.build()
     grid_index_ops = [block_ids]
+    persistent_loop = (
+        ForOp.build(0, 2, attrs={"disjoint_grid_iterations": True})
+        if persistent_n_pairs else None
+    )
+    logical_block_x = block_ids.x
+    if persistent_loop is not None:
+        assert balanced_wide_tiles is not None
+        pair_count = IndexConstantOp.build(n_tiles // 2)
+        threshold_bias = IndexConstantOp.build(
+            n_tiles // 2 - balanced_wide_tiles,
+        )
+        biased_pair = IndexAddOp.build(
+            block_ids.x, threshold_bias.result(),
+        )
+        leftover_pair = IndexDivOp.build(
+            biased_pair.result(), pair_count.result(),
+        )
+        doubled_pair = IndexMulOp.build(
+            block_ids.x, leftover_pair.result(),
+        )
+        first_tile = IndexAddOp.build(
+            block_ids.x, doubled_pair.result(),
+        )
+        wide_count = IndexConstantOp.build(balanced_wide_tiles)
+        second_base = IndexAddOp.build(
+            block_ids.x, wide_count.result(),
+        )
+        one = IndexConstantOp.build(1)
+        after_wide = IndexAddOp.build(block_ids.x, one.result())
+        minus_wide = IndexConstantOp.build(-balanced_wide_tiles)
+        leftover_distance = IndexAddOp.build(
+            after_wide.result(), minus_wide.result(),
+        )
+        leftover_adjustment = IndexMulOp.build(
+            leftover_pair.result(), leftover_distance.result(),
+        )
+        second_tile = IndexAddOp.build(
+            second_base.result(), leftover_adjustment.result(),
+        )
+        neg_one_pair = IndexConstantOp.build(-1)
+        neg_first_tile = IndexMulOp.build(
+            first_tile.result(), neg_one_pair.result(),
+        )
+        tile_delta = IndexAddOp.build(
+            second_tile.result(), neg_first_tile.result(),
+        )
+        iteration_delta = IndexMulOp.build(
+            persistent_loop.iv, tile_delta.result(),
+        )
+        paired_tile = IndexAddOp.build(
+            first_tile.result(), iteration_delta.result(),
+        )
+        grid_index_ops.extend([
+            pair_count, threshold_bias, biased_pair, leftover_pair,
+            doubled_pair, first_tile, wide_count, second_base, one,
+            after_wide, minus_wide, leftover_distance,
+            leftover_adjustment, second_tile,
+            neg_one_pair, neg_first_tile,
+            tile_delta, iteration_delta, paired_tile,
+        ])
+        logical_block_x = paired_tile.result()
     hybrid_n_tiles = None
     hybrid_n_width = None
     hybrid_split_rows = None
@@ -275,16 +349,16 @@ def blackwell_tcgen05_gemm_module(
         minus_one = IndexConstantOp.build(-1)
         tile_count = IndexConstantOp.build(n_tiles)
         full_width = IndexConstantOp.build(output_n_tile)
-        full_base = IndexMulOp.build(block_ids.x, full_width.result())
+        full_base = IndexMulOp.build(logical_block_x, full_width.result())
         threshold_bias = IndexConstantOp.build(n_tiles - balanced_wide_tiles)
-        biased_x = IndexAddOp.build(block_ids.x, threshold_bias.result())
+        biased_x = IndexAddOp.build(logical_block_x, threshold_bias.result())
         narrow = IndexDivOp.build(biased_x.result(), tile_count.result())
         wide_count = IndexConstantOp.build(balanced_wide_tiles)
         neg_wide_count = IndexMulOp.build(
             wide_count.result(), minus_one.result(),
         )
         after_wide = IndexAddOp.build(
-            block_ids.x, neg_wide_count.result(),
+            logical_block_x, neg_wide_count.result(),
         )
         narrow_distance = IndexMulOp.build(
             narrow.result(), after_wide.result(),
@@ -471,6 +545,7 @@ def blackwell_tcgen05_gemm_module(
             *,
             load_a0: bool,
             issue_next_a0: bool,
+            overwrite_first: bool = False,
         ) -> list:
             """Build one K128 step of the three-A-buffer software pipeline."""
             ops = []
@@ -569,9 +644,12 @@ def blackwell_tcgen05_gemm_module(
                     ),
                 )
                 ops.extend([lhs_tile, rhs_tile])
+                mma_attrs = dict(hybrid_attrs or {})
+                if overwrite_first and stage == 0:
+                    mma_attrs["overwrite_accumulator"] = True
                 mmas.append(MatmulOp.build(
                     lhs_tile.result(), rhs_tile.result(), accumulator.result(),
-                    attrs=hybrid_attrs, controls=hybrid_controls,
+                    attrs=mma_attrs or None, controls=hybrid_controls,
                 ))
             ops.append(AsyncOp.build(
                 mma_lock.result(), body=Block(ops=mmas),
@@ -646,6 +724,7 @@ def blackwell_tcgen05_gemm_module(
             first.result(),
             lhs_smem[0].result(), lhs_smem[1].result(), lhs_smem[2].result(),
             load_a0=True, issue_next_a0=True,
+            overwrite_first=persistent_n_pairs,
         ))
 
         iteration_count = k // 128
@@ -978,28 +1057,30 @@ def blackwell_tcgen05_gemm_module(
             *([second_tma_lock] if second_tma_lock is not None else []),
         ]
     )
-    body = Block(arguments=[a, bt, c], ops=[
-        *grid_index_ops,
-        a_block,
-        bt_block,
-        c_block,
-        *allocation_ops,
-        *mainloop_ops,
-        MoveOp.build(
-            c_block.result(), accumulator.result(),
-            indices=hybrid_controls,
-            attrs=(
+    output_move = MoveOp.build(
+        c_block.result(), accumulator.result(),
+        indices=hybrid_controls,
+        attrs=(
+            {
+                "hybrid_n_tiles": hybrid_n_tiles,
+                "hybrid_n_width": hybrid_n_width,
+                **({"predicated_tail_stores": True}
+                   if predicated_tail_stores else {}),
+                **({"hybrid_split_rows": hybrid_split_rows}
+                   if hybrid_split_rows is not None else {}),
+                **({"hybrid_split_tile": hybrid_split_tile}
+                   if hybrid_split_tile is not None else {}),
+                **({"hybrid_element_offsets": True}
+                   if hybrid_element_offsets else {}),
+                **({"l1_cache_policy": output_l1_cache_policy}
+                   if output_l1_cache_policy else {}),
+                **({"l2_eviction_priority": output_l2_eviction_priority}
+                   if output_l2_eviction_priority else {}),
+                **({"tmem_load_shape": output_tmem_load_shape}
+                   if output_tmem_load_shape != "32x32b" else {}),
+            }
+            if hybrid_n_tiles is not None else (
                 {
-                    "hybrid_n_tiles": hybrid_n_tiles,
-                    "hybrid_n_width": hybrid_n_width,
-                    **({"predicated_tail_stores": True}
-                       if predicated_tail_stores else {}),
-                    **({"hybrid_split_rows": hybrid_split_rows}
-                       if hybrid_split_rows is not None else {}),
-                    **({"hybrid_split_tile": hybrid_split_tile}
-                       if hybrid_split_tile is not None else {}),
-                    **({"hybrid_element_offsets": True}
-                       if hybrid_element_offsets else {}),
                     **({"l1_cache_policy": output_l1_cache_policy}
                        if output_l1_cache_policy else {}),
                     **({"l2_eviction_priority": output_l2_eviction_priority}
@@ -1007,26 +1088,48 @@ def blackwell_tcgen05_gemm_module(
                     **({"tmem_load_shape": output_tmem_load_shape}
                        if output_tmem_load_shape != "32x32b" else {}),
                 }
-                if hybrid_n_tiles is not None else (
-                    {
-                        **({"l1_cache_policy": output_l1_cache_policy}
-                           if output_l1_cache_policy else {}),
-                        **({"l2_eviction_priority": output_l2_eviction_priority}
-                           if output_l2_eviction_priority else {}),
-                        **({"tmem_load_shape": output_tmem_load_shape}
-                           if output_tmem_load_shape != "32x32b" else {}),
-                    }
-                    if (
-                        output_l1_cache_policy
-                        or output_l2_eviction_priority
-                        or output_tmem_load_shape != "32x32b"
-                    )
-                    else None
+                if (
+                    output_l1_cache_policy
+                    or output_l2_eviction_priority
+                    or output_tmem_load_shape != "32x32b"
                 )
-            ),
+                else None
+            )
         ),
-        DeallocOp.build(accumulator.result()),
-    ])
+    )
+    tile_ops = [
+        *grid_index_ops[1:],
+        a_block,
+        bt_block,
+        c_block,
+        *mainloop_ops,
+        output_move,
+    ]
+    if persistent_loop is not None:
+        # Logical N tiles are disjoint in global memory. The loop attribute
+        # communicates that fact to sync insertion while its normal backedge
+        # analysis still inserts barriers for reused shared/tensor memory.
+        persistent_loop.body.ops.extend(tile_ops)
+        body_ops = [
+            block_ids,
+            *allocation_ops,
+            persistent_loop,
+            DeallocOp.build(accumulator.result()),
+        ]
+    else:
+        # Preserve the original dominance/order: allocations precede the
+        # mainloop and output move in the non-persistent path.
+        body_ops = [
+            *grid_index_ops,
+            a_block,
+            bt_block,
+            c_block,
+            *allocation_ops,
+            *mainloop_ops,
+            output_move,
+            DeallocOp.build(accumulator.result()),
+        ]
+    body = Block(arguments=[a, bt, c], ops=body_ops)
     return ModuleOp.build(Block(ops=[KernelOp.build(
         "blackwell_tcgen05_4096",
         body,
@@ -1037,6 +1140,8 @@ def blackwell_tcgen05_gemm_module(
                 1,
             )
             if split_last_n_tile_rows is not None else
+            (n_tiles // 2, m_tiles, 1)
+            if persistent_n_pairs else
             (n_tiles + int(split_last_n_tile or split_n_tile is not None), m_tiles, 1)
             if transpose_cta_grid else
             (m_tiles, n_tiles, 1)

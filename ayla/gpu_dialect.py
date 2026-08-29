@@ -1463,7 +1463,13 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
 
 @gpu_dialect.register_op("for")
 class ForOp(Op):
-    """Sequential loop over a 1D range: for (iv = lb to ub [step s])."""
+    """Sequential loop over a 1D range: for (iv = lb to ub [step s]).
+
+    ``disjoint_grid_iterations`` may be set when every grid-memory access in
+    one iteration is disjoint from every other iteration. This is an explicit
+    aliasing assertion used by synchronization analysis; block-local effects
+    remain loop-carried.
+    """
 
     @classmethod
     def build(
