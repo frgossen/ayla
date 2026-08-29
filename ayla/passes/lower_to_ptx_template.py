@@ -296,13 +296,13 @@ class LowerToPtxTemplate(LoweringPass):
         if op.init is not None:
             if not (
                 result_type.sizes[0] in (64, 128)
-                and result_type.sizes[1] in (64, 128, 256)
+                and result_type.sizes[1] % 8 == 0
+                and 8 <= result_type.sizes[1] <= result_type.columns
                 and result_type.dtype.name == "f32"
-                and result_type.columns == result_type.sizes[1]
             ):
                 raise NotImplementedError(
                     "tensor-memory zero init currently supports "
-                    "tmem<64|128x64|128|256xf32>"
+                    "tmem<64|128x8..512xf32> with 8-column granularity"
                 )
             template += textwrap.dedent(f"""\
                 mov.u32 ${{b32:tmem_warp}}, ${{b32:tmem_tid}};
@@ -997,7 +997,8 @@ class LowerToPtxTemplate(LoweringPass):
                 and isinstance(dst_type, TmemTensorType)
                 and lhs_type.sizes[0] in (64, 128)
                 and lhs_type.sizes[1] == 16
-                and rhs_type.sizes[0] in (32, 64, 128, 256)
+                and rhs_type.sizes[0] % 8 == 0
+                and 8 <= rhs_type.sizes[0] <= 256
                 and rhs_type.sizes[1] == 16
                 and tuple(dst_type.sizes) == (lhs_type.sizes[0], logical_n)
                 and lhs_type.dtype.name == rhs_type.dtype.name == "bf16"
@@ -1009,8 +1010,8 @@ class LowerToPtxTemplate(LoweringPass):
                 raise NotImplementedError(
                     "tcgen05 lowering currently supports "
                     "smem<64|128x16xbf16 swizzle=32B|128B> @ "
-                    "smem<32|64|128|256x16xbf16 swizzle=128B> -> "
-                    "tmem<64|128x64|128|256xf32>"
+                    "smem<8..256x16xbf16 swizzle=128B> -> "
+                    "tmem<64|128x8..256xf32>"
                 )
 
         dst = self.value_map[mms[0].dst]
@@ -1084,7 +1085,7 @@ class LowerToPtxTemplate(LoweringPass):
                 not isinstance(hybrid_n_tiles, int)
                 or hybrid_n_tiles < 2
                 or cta_group != 1
-                or n != 256
+                or n not in (248, 256)
                 or not direct_tma_layout
             ):
                 raise ValueError(
@@ -1324,14 +1325,15 @@ class LowerToPtxTemplate(LoweringPass):
             src_type.sizes[0] == dst_type.sizes[0]
             and src_type.sizes[0] in (64, 128)
             and src_type.sizes[1] == dst_type.sizes[1]
-            and src_type.sizes[1] in (64, 128, 256)
+            and src_type.sizes[1] % 8 == 0
+            and 8 <= src_type.sizes[1] <= 256
             and src_type.dtype.name == "f32"
             and dst_type.dtype.name in ("f32", "bf16")
             and dst_type.strides[1] == 1
         ):
             raise NotImplementedError(
                 "tcgen05 tmem-to-gmem move currently supports "
-                "64|128x64|128|256 f32 "
+                "64|128x8..256 f32 with 8-column granularity "
                 "tensor memory to row-strided f32/bf16 global memory"
             )
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
@@ -1340,12 +1342,12 @@ class LowerToPtxTemplate(LoweringPass):
         if hybrid_n_tiles is not None and (
             not isinstance(hybrid_n_tiles, int)
             or hybrid_n_tiles < 2
-            or src_type.sizes[1] != 256
+            or src_type.sizes[1] not in (248, 256)
             or dst_type.dtype.name != "bf16"
         ):
             raise ValueError(
                 "hybrid-N output requires at least two N tiles and a "
-                "256-column BF16 output tile"
+                "248- or 256-column BF16 output tile"
             )
         if (
             hybrid_split_rows is not None or hybrid_split_tile is not None
@@ -1392,6 +1394,16 @@ class LowerToPtxTemplate(LoweringPass):
             mul.wide.u32 ${{b64:row_offset}}, ${{b32:row_index}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
         """)
+        if src_type.sizes[1] == 248:
+            # Adjacent N248 tiles start 496 bytes apart.  Use a CTA-uniform
+            # parity branch so each tile gets maximally wide aligned stores:
+            # even tiles use a trailing 16B edge, odd tiles use 16B edges
+            # around aligned 32B interior transactions.
+            template += textwrap.dedent("""\
+                mov.u32 ${b32:n248_bid}, %ctaid.x;
+                and.b32 ${b32:n248_parity}, ${b32:n248_bid}, 1;
+                setp.ne.u32 ${pred:n248_odd}, ${b32:n248_parity}, 0;
+            """)
         operands = [self.value_map[op.dst], self.value_map[op.src]]
         operand_names = ["dst", "src"]
         if hybrid_n_tiles is not None:
@@ -1427,32 +1439,58 @@ class LowerToPtxTemplate(LoweringPass):
                     "__SPLIT_START__", str(hybrid_n_tiles - 1),
                 ).replace("__HALF_INSTRUCTION__", half_instruction)
         for col in range(0, src_type.sizes[1], 64):
+            valid_cols = min(64, src_type.sizes[1] - col)
             if dst_type.dtype.name == "f32":
                 stores = "\n".join(
                     f"{store_predicate}st.global.v4.b32 "
                     f"[${{b64:row}}+{col * 4 + i * 4}], "
                     f"{{{', '.join(values[i:i + 4])}}};"
-                    for i in range(0, 64, 4)
+                    for i in range(0, valid_cols, 4)
                 )
             else:
                 conversions = []
                 packed = []
-                for i in range(0, 64, 2):
+                for i in range(0, valid_cols, 2):
                     packed_reg = f"${{b32:packed{i // 2}}}"
                     packed.append(packed_reg)
                     conversions.append(
                         f"cvt.rn.bf16x2.f32 {packed_reg}, "
                         f"{values[i + 1]}, {values[i]};"
                     )
-                stores = "\n".join([
-                    *conversions,
-                    *(
-                        f"{store_predicate}st.global.v8.b32 "
-                        f"[${{b64:row}}+{col * 2 + i * 4}], "
-                        f"{{{', '.join(packed[i:i + 8])}}};"
-                        for i in range(0, 32, 8)
-                    ),
-                ])
+                def vector_stores(starts_and_widths):
+                    return [
+                        f"{store_predicate}st.global.v{width}.b32 "
+                        f"[${{b64:row}}+{col * 2 + start * 4}], "
+                        f"{{{', '.join(packed[start:start + width])}}};"
+                        for start, width in starts_and_widths
+                    ]
+
+                if src_type.sizes[1] == 248:
+                    even_groups = [
+                        (start, min(8, len(packed) - start))
+                        for start in range(0, len(packed), 8)
+                    ]
+                    odd_groups = [(0, 4)] + [
+                        (start, min(8, len(packed) - start))
+                        for start in range(4, len(packed), 8)
+                    ]
+                    stores = "\n".join([
+                        *conversions,
+                        f"@${{pred:n248_odd}} bra ${{label:n248_odd_{col}}};",
+                        *vector_stores(even_groups),
+                        f"bra ${{label:n248_done_{col}}};",
+                        f"${{label:n248_odd_{col}}}:",
+                        *vector_stores(odd_groups),
+                        f"${{label:n248_done_{col}}}:",
+                    ])
+                else:
+                    stores = "\n".join([
+                        *conversions,
+                        *vector_stores([
+                            (start, min(8, len(packed) - start))
+                            for start in range(0, len(packed), 8)
+                        ]),
+                    ])
             template += textwrap.dedent(f"""\
                 add.u32 ${{b32:taddr_chunk}}, ${{b32:taddr_row}}, {col};
                 tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{load_values}}}, [${{b32:taddr_chunk}}];

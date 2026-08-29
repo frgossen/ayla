@@ -54,6 +54,7 @@ def blackwell_tcgen05_gemm_module(
     split_last_n_tile: bool = False,
     split_n_tile: int | None = None,
     split_last_n_tile_rows: int | None = None,
+    tail_n_tile: int | None = None,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
     lhs_l2_promotion: str | None = None,
@@ -74,12 +75,22 @@ def blackwell_tcgen05_gemm_module(
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
-    if output_n_tile not in (64, 128, 256):
-        raise ValueError("output_n_tile must be 64, 128, or 256")
-    if m % output_m_tile or n % output_n_tile or k % 16:
+    if output_n_tile not in (64, 128, 248, 256):
+        raise ValueError("output_n_tile must be 64, 128, 248, or 256")
+    if m % output_m_tile or k % 16:
         raise ValueError(
-            "tcgen05 GEMM dimensions must divide "
-            f"{output_m_tile}x{output_n_tile}x16 tiles"
+            "tcgen05 GEMM dimensions must divide the M and K tile sizes"
+        )
+    if tail_n_tile is None:
+        if n % output_n_tile:
+            raise ValueError("N must divide the requested tcgen05 output tile")
+    elif (
+        tail_n_tile != 128
+        or tail_n_tile >= output_n_tile
+        or n % output_n_tile != tail_n_tile
+    ):
+        raise ValueError(
+            "tail_n_tile must be 128 and match N's remainder"
         )
     if operand_stages < 1 or k % (16 * operand_stages):
         raise ValueError("K must divide the requested tcgen05 operand stages")
@@ -103,7 +114,10 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires the default CTA grid order")
     if sum(
         option is not None and option is not False
-        for option in (split_last_n_tile, split_n_tile, split_last_n_tile_rows)
+        for option in (
+            split_last_n_tile, split_n_tile, split_last_n_tile_rows,
+            tail_n_tile,
+        )
     ) > 1:
         raise ValueError(
             "choose one N-tile splitting mode"
@@ -123,8 +137,14 @@ def blackwell_tcgen05_gemm_module(
             "splitting the last N tile requires direct transposed-grid "
             "N=256 staging with at least two N tiles"
         )
+    if tail_n_tile is not None and (
+        tma_staging != "direct" or not transpose_cta_grid
+    ):
+        raise ValueError(
+            "a narrow N tail requires direct staging and a transposed CTA grid"
+        )
     m_tiles = m // output_m_tile
-    n_tiles = n // output_n_tile
+    n_tiles = (n + output_n_tile - 1) // output_n_tile
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
     ):
@@ -154,10 +174,11 @@ def blackwell_tcgen05_gemm_module(
             "split TMA barriers require direct eight-stage non-multicast staging"
         )
     if split_rhs_tma and (
-        tma_staging != "direct" or output_n_tile != 256
+        tma_staging != "direct" or output_n_tile not in (248, 256)
     ):
         raise ValueError(
-            "split RHS TMA transactions require direct N=256 staging"
+            "split RHS TMA transactions require direct N=256 staging or "
+            "direct N=248 staging"
         )
     if prefetch_lhs_next and (
         tma_staging != "direct"
@@ -173,11 +194,11 @@ def blackwell_tcgen05_gemm_module(
     if prefetch_rhs_next and (
         not prefetch_lhs_next
         or not split_rhs_tma
-        or output_n_tile != 256
+        or output_n_tile not in (248, 256)
     ):
         raise ValueError(
             "next-iteration RHS prefetch requires next-iteration LHS "
-            "prefetch and split direct N=256 RHS transactions"
+            "prefetch and split direct N=248/N=256 RHS transactions"
         )
 
     bf16 = BF16Type()
@@ -190,7 +211,21 @@ def blackwell_tcgen05_gemm_module(
     hybrid_split_rows = None
     hybrid_split_tile = None
     hybrid_controls = None
-    if split_last_n_tile_rows is not None:
+    if tail_n_tile is not None:
+        # A final naturally narrow tile avoids duplicating a full N-wide TMA
+        # operand solely to improve launch-wave balance.  Integer division is
+        # CTA-uniform: blocks before the last produce zero and the tail block
+        # produces one, while its half selector remains zero.
+        full_n_tiles = IndexConstantOp.build(n // output_n_tile)
+        narrow = IndexDivOp.build(block_ids.x, full_n_tiles.result())
+        zero = IndexConstantOp.build(0)
+        grid_index_ops.extend([full_n_tiles, narrow, zero])
+        m_block_id = block_ids.y
+        n_block_id = block_ids.x
+        hybrid_n_tiles = n_tiles
+        hybrid_split_tile = n_tiles - 1
+        hybrid_controls = [narrow.result(), zero.result()]
+    elif split_last_n_tile_rows is not None:
         # A linear mapping splits the last N256 tile only for a prefix of M
         # rows. This adds enough N128 CTAs to improve launch-wave balance while
         # avoiding the duplicated TMA work of splitting every row.
@@ -249,7 +284,11 @@ def blackwell_tcgen05_gemm_module(
         ),
     )
     accumulator = AllocOp.build_with_fresh_id(
-        TmemTensorType.build([output_m_tile, output_n_tile], F32Type()), init=0.0,
+        TmemTensorType.build(
+            [output_m_tile, output_n_tile], F32Type(),
+            columns=256 if output_n_tile == 248 else output_n_tile,
+        ),
+        init=0.0,
     )
     if prefetch_lhs_next:
         direct_buffers = operand_stages // 4
@@ -360,13 +399,15 @@ def blackwell_tcgen05_gemm_module(
                     bt_tile = TileOp.build(
                         bt_block.result(), [n_half, k_index],
                         GmemTensorType.build(
-                            [128, 64], bf16, strides=[k, 1],
+                            [output_n_tile // 2, 64], bf16,
+                            strides=[k, 1],
                         ),
                     )
                     rhs_tile = TileOp.build(
                         rhs_smem[bank].result(), [n_half, 0],
                         SmemTensorType.build(
-                            [128, 64], bf16, strides=[64, 1],
+                            [output_n_tile // 2, 64], bf16,
+                            strides=[64, 1],
                             swizzle="128B",
                             attrs={"tcgen05_matrix": True},
                         ),
@@ -461,13 +502,15 @@ def blackwell_tcgen05_gemm_module(
                         next_bt_tile = TileOp.build(
                             bt_block.result(), [n_half, next_k.result()],
                             GmemTensorType.build(
-                                [128, 64], bf16, strides=[k, 1],
+                                [output_n_tile // 2, 64], bf16,
+                                strides=[k, 1],
                             ),
                         )
                         next_rhs_tile = TileOp.build(
                             rhs_smem[0].result(), [n_half, 0],
                             SmemTensorType.build(
-                                [128, 64], bf16, strides=[64, 1],
+                                [output_n_tile // 2, 64], bf16,
+                                strides=[64, 1],
                                 swizzle="128B",
                                 attrs={"tcgen05_matrix": True},
                             ),
@@ -650,13 +693,15 @@ def blackwell_tcgen05_gemm_module(
                     bt_tile = TileOp.build(
                         bt_block.result(), [n_half, k_index],
                         GmemTensorType.build(
-                            [128, 64], bf16, strides=[k, 1],
+                            [output_n_tile // 2, 64], bf16,
+                            strides=[k, 1],
                         ),
                     )
                     rhs_tile = TileOp.build(
                         rhs_smem[half].result(), [n_half, 0],
                         SmemTensorType.build(
-                            [128, 64], bf16, strides=[64, 1],
+                            [output_n_tile // 2, 64], bf16,
+                            strides=[64, 1],
                             swizzle="128B",
                             attrs={"tcgen05_matrix": True},
                         ),
