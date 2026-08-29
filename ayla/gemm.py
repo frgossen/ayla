@@ -15,6 +15,7 @@ from .gpu_dialect import (
     IndexAddOp,
     IndexConstantOp,
     IndexModOp,
+    IndexMulOp,
     KernelOp,
     LockType,
     MatmulOp,
@@ -68,8 +69,10 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("K must divide the requested tcgen05 operand stages")
     if tma_staging not in (None, "repack", "direct"):
         raise ValueError("tma_staging must be None, 'repack', or 'direct'")
-    if tma_staging == "direct" and operand_stages != 4:
-        raise ValueError("direct TMA staging currently requires four K=16 stages")
+    if tma_staging == "direct" and operand_stages not in (4, 8):
+        raise ValueError(
+            "direct TMA staging currently requires four or eight K=16 stages"
+        )
     if output_n_tile != 64 and tma_staging != "direct":
         raise ValueError("wide output tiles currently require direct TMA staging")
     if output_m_tile != 128 and tma_staging != "direct":
@@ -104,14 +107,21 @@ def blackwell_tcgen05_gemm_module(
         TmemTensorType.build([output_m_tile, output_n_tile], F32Type()), init=0.0,
     )
     if tma_staging == "direct":
-        lhs_smem = [AllocOp.build_with_fresh_id(SmemTensorType.build(
-            [output_m_tile, 64], bf16, swizzle="128B",
-            attrs={"tcgen05_matrix": True},
-        ))]
-        rhs_smem = [AllocOp.build_with_fresh_id(SmemTensorType.build(
-            [output_n_tile, 64], bf16, swizzle="128B",
-            attrs={"tcgen05_matrix": True},
-        ))]
+        direct_buffers = operand_stages // 4
+        lhs_smem = [
+            AllocOp.build_with_fresh_id(SmemTensorType.build(
+                [output_m_tile, 64], bf16, swizzle="128B",
+                attrs={"tcgen05_matrix": True},
+            ))
+            for _ in range(direct_buffers)
+        ]
+        rhs_smem = [
+            AllocOp.build_with_fresh_id(SmemTensorType.build(
+                [output_n_tile, 64], bf16, swizzle="128B",
+                attrs={"tcgen05_matrix": True},
+            ))
+            for _ in range(direct_buffers)
+        ]
     else:
         lhs_smem = [
             AllocOp.build_with_fresh_id(SmemTensorType.build(
@@ -141,22 +151,40 @@ def blackwell_tcgen05_gemm_module(
         if tma_staging == "direct" else None
     )
     if tma_staging == "direct":
-        loop = ForOp.build(0, k // 64)
-        a_tile = TileOp.build(
-            a_block.result(), [0, loop.iv],
-            GmemTensorType.build([output_m_tile, 64], bf16, strides=[k, 1]),
-        )
-        bt_tile = TileOp.build(
-            bt_block.result(), [0, loop.iv],
-            GmemTensorType.build([output_n_tile, 64], bf16, strides=[k, 1]),
-        )
-        assert tma_lock is not None
-        loop.body.ops.extend([
-            a_tile,
-            bt_tile,
-            AsyncOp.build(tma_lock.result(), body=Block(ops=[
+        direct_k_tile = 16 * operand_stages
+        loop = ForOp.build(0, k // direct_k_tile)
+        load_prefix = []
+        load_moves = []
+        if operand_stages == 4:
+            k_indices = [loop.iv]
+        else:
+            buffer_count = operand_stages // 4
+            count = IndexConstantOp.build(buffer_count)
+            first_k = IndexMulOp.build(loop.iv, count.result())
+            load_prefix.extend([count, first_k])
+            k_indices = [first_k.result()]
+            for half in range(1, buffer_count):
+                increment = IndexConstantOp.build(half)
+                next_k = IndexAddOp.build(first_k.result(), increment.result())
+                load_prefix.extend([increment, next_k])
+                k_indices.append(next_k.result())
+        for half, k_index in enumerate(k_indices):
+            a_tile = TileOp.build(
+                a_block.result(), [0, k_index],
+                GmemTensorType.build(
+                    [output_m_tile, 64], bf16, strides=[k, 1],
+                ),
+            )
+            bt_tile = TileOp.build(
+                bt_block.result(), [0, k_index],
+                GmemTensorType.build(
+                    [output_n_tile, 64], bf16, strides=[k, 1],
+                ),
+            )
+            load_prefix.extend([a_tile, bt_tile])
+            load_moves.extend([
                 MoveOp.build(
-                    lhs_smem[0].result(), a_tile.result(),
+                    lhs_smem[half].result(), a_tile.result(),
                     attrs={
                         "tma": True,
                         **({"multicast_mask": 0x3, "cluster_leader": True}
@@ -164,16 +192,21 @@ def blackwell_tcgen05_gemm_module(
                     },
                 ),
                 MoveOp.build(
-                    rhs_smem[0].result(), bt_tile.result(),
-                    attrs={"tma": True},
+                    rhs_smem[half].result(), bt_tile.result(), attrs={"tma": True},
                 ),
-            ])),
+            ])
+        assert tma_lock is not None
+        loop.body.ops.extend([
+            *load_prefix,
+            AsyncOp.build(tma_lock.result(), body=Block(ops=load_moves)),
             AwaitOp.build(tma_lock.result()),
         ])
         mmas = []
-        for stage in range(4):
+        for stage in range(operand_stages):
+            buffer = stage // 4
+            buffer_stage = stage % 4
             lhs_tile = TileOp.build(
-                lhs_smem[0].result(), [0, stage],
+                lhs_smem[buffer].result(), [0, buffer_stage],
                 SmemTensorType.build(
                     [output_m_tile, 16], bf16,
                     strides=[64, 1], swizzle="128B",
@@ -181,7 +214,7 @@ def blackwell_tcgen05_gemm_module(
                 ),
             )
             rhs_tile = TileOp.build(
-                rhs_smem[0].result(), [0, stage],
+                rhs_smem[buffer].result(), [0, buffer_stage],
                 SmemTensorType.build(
                     [output_n_tile, 16], bf16,
                     strides=[64, 1], swizzle="128B",
