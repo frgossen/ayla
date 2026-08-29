@@ -296,27 +296,12 @@ def blackwell_tcgen05_gemm_module(
             block_ids.x, doubled_pair.result(),
         )
         wide_count = IndexConstantOp.build(balanced_wide_tiles)
-        second_base = IndexAddOp.build(
-            block_ids.x, wide_count.result(),
-        )
-        one = IndexConstantOp.build(1)
-        after_wide = IndexAddOp.build(block_ids.x, one.result())
-        minus_wide = IndexConstantOp.build(-balanced_wide_tiles)
-        leftover_distance = IndexAddOp.build(
-            after_wide.result(), minus_wide.result(),
-        )
-        leftover_adjustment = IndexMulOp.build(
-            leftover_pair.result(), leftover_distance.result(),
-        )
-        second_tile = IndexAddOp.build(
-            second_base.result(), leftover_adjustment.result(),
-        )
-        neg_one_pair = IndexConstantOp.build(-1)
-        neg_first_tile = IndexMulOp.build(
-            first_tile.result(), neg_one_pair.result(),
+        leftover_delta = IndexConstantOp.build(1 - balanced_wide_tiles)
+        delta_adjustment = IndexMulOp.build(
+            leftover_pair.result(), leftover_delta.result(),
         )
         tile_delta = IndexAddOp.build(
-            second_tile.result(), neg_first_tile.result(),
+            wide_count.result(), delta_adjustment.result(),
         )
         iteration_delta = IndexMulOp.build(
             persistent_loop.iv, tile_delta.result(),
@@ -326,11 +311,8 @@ def blackwell_tcgen05_gemm_module(
         )
         grid_index_ops.extend([
             pair_count, threshold_bias, biased_pair, leftover_pair,
-            doubled_pair, first_tile, wide_count, second_base, one,
-            after_wide, minus_wide, leftover_distance,
-            leftover_adjustment, second_tile,
-            neg_one_pair, neg_first_tile,
-            tile_delta, iteration_delta, paired_tile,
+            doubled_pair, first_tile, wide_count, leftover_delta,
+            delta_adjustment, tile_delta, iteration_delta, paired_tile,
         ])
         logical_block_x = paired_tile.result()
     hybrid_n_tiles = None
