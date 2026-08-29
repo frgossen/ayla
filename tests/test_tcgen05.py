@@ -598,10 +598,12 @@ def test_tcgen05_persistent_pair_reuses_lhs_in_reverse_k_order():
 
     # The two persistent phases are static, but both retain compact grouped
     # K loops. Phase two descends from K128 iteration 30 and reuses K64 banks
-    # 62/63, removing exactly two of the original 60 dynamic TMA requests.
+    # 62/63, removing exactly two of the original 60 dynamic TMA requests. A
+    # terminal half commit releases B0 for the second phase's early prefetch.
     assert "for (%0: index = 30 to 0 step -3)" in ptx
     assert ptx.count("setp.gt.s32") == 1
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 80
+    assert ptx.count("tcgen05.commit.cta_group::1") == 19
     assert ptx.count("cp.async.bulk.tensor.2d.shared::cluster.global") == 58
 
     with pytest.raises(ValueError, match="persistent LHS reuse requires"):

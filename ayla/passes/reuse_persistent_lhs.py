@@ -3,9 +3,11 @@
 The marked direct-TMA K128 pipeline computes its second output with descending
 K coordinates.  The first output leaves K[-2:] in two of the three LHS shared
 buffers; rotating only the second phase's buffer views lets it consume those
-resident banks and omit two 16 KiB TMA loads.  All warps keep the same software
-pipeline.  This pass runs after synchronization insertion, then unrolls only
-the two-iteration persistent loop so the existing loop-carried barriers remain
+resident banks and omit two 16 KiB TMA loads.  The terminal first-half
+completion also releases B0 early enough to prefetch the next output's first
+RHS bank across the remaining tensor work. All warps keep the same software
+pipeline. This pass runs after synchronization insertion, then unrolls only the
+two-iteration persistent loop so the existing loop-carried barriers remain
 explicit while the two phases can have different K order and buffer mapping.
 """
 from __future__ import annotations
@@ -14,11 +16,14 @@ from ..base.ir import Value, clone_op, iter_ops
 from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
+    AsyncCommitOp,
     AsyncOp,
+    AwaitOp,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
     IndexMulOp,
+    MatmulOp,
     ModuleOp,
     MoveOp,
     SmemTensorType,
@@ -266,6 +271,68 @@ class ReusePersistentLhs(Pass):
             if op.parent_block is None:
                 raise ValueError("persistent LHS reuse found a detached TMA")
             op.parent_block.ops.remove(op)
+
+        # The final K128 group did not previously need a partial completion.
+        # Add one after its first four MMAs, when B0 is dead, and use it to
+        # launch phase two's B0 while the final four MMAs and output-zero
+        # epilogue proceed. Every warp observes the same half-completion and
+        # continues through the same pipeline; only TMA's required thread-zero
+        # issuer performs the transfer.
+        output_zero_index = body.ops.index(outputs[0])
+        terminal_mma = next(
+            op for op in reversed(body.ops[:output_zero_index])
+            if isinstance(op, AsyncOp)
+            and sum(isinstance(inner, MatmulOp) for inner in op.body.ops) == 8
+        )
+        if any(
+            isinstance(inner, AsyncCommitOp) for inner in terminal_mma.body.ops
+        ):
+            raise ValueError(
+                "persistent LHS reuse expected an unsplit terminal MMA group"
+            )
+        phase_two_b0 = next(
+            op for op in phase_ops
+            if isinstance(op, AsyncOp)
+            and len([
+                inner for inner in op.body.ops
+                if isinstance(inner, TmaMoveOp)
+            ]) == 2
+        )
+        phase_two_mma = next(
+            op for op in phase_ops
+            if isinstance(op, AsyncOp)
+            and any(
+                isinstance(inner, AsyncCommitOp) for inner in op.body.ops
+            )
+        )
+        half_lock = next(
+            inner.lock for inner in phase_two_mma.body.ops
+            if isinstance(inner, AsyncCommitOp)
+        )
+        terminal_matmuls = [
+            inner for inner in terminal_mma.body.ops
+            if isinstance(inner, MatmulOp)
+        ]
+        fourth_mma = terminal_matmuls[3]
+        terminal_mma.body.ops.insert(
+            terminal_mma.body.ops.index(fourth_mma) + 1,
+            AsyncCommitOp.build(half_lock),
+        )
+
+        # Hoist the phase-two address/view setup with the transfer so every
+        # operand dominates its new issue point. These are pure CTA-uniform
+        # calculations and do not interact with output-zero's tensor data.
+        b0_index = body.ops.index(phase_two_b0)
+        setup = list(body.ops[output_zero_index + 1:b0_index])
+        del body.ops[output_zero_index + 1:b0_index]
+        terminal_index = body.ops.index(terminal_mma)
+        body.ops[terminal_index:terminal_index] = setup
+        body.ops.remove(phase_two_b0)
+        terminal_index = body.ops.index(terminal_mma)
+        body.ops[terminal_index + 1:terminal_index + 1] = [
+            AwaitOp.build(half_lock),
+            phase_two_b0,
+        ]
 
         return Canonicalize().run(module)
 
