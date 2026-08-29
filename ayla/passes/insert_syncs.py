@@ -247,6 +247,18 @@ def _analyze(
         # for t0's async work, so no arriving warp can lap the named barrier.
         live.named_barrier_ids_pending_await.pop(op.lock, None)
         return live
+    if isinstance(op, AsyncOp):
+        # A nested await is an explicit readiness checkpoint inside an async
+        # issue group. Model its input as completed before summarizing the
+        # group's effects; target lowering preserves the exact body position.
+        for body_op in op.body.ops:
+            if not isinstance(body_op, AwaitOp):
+                continue
+            for buf, effs in live.concurrent_memory_effects.items():
+                live.concurrent_memory_effects[buf] = {
+                    e for e in effs if e.pending_await != body_op.lock
+                }
+            live.named_barrier_ids_pending_await.pop(body_op.lock, None)
     effects = memory_effects(op)
     if effects is None:
         raise NotImplementedError(

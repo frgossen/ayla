@@ -2034,6 +2034,10 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
             for body_op in block.ops:
+                # An await nested in an async issue group is a readiness
+                # checkpoint, not part of that group's memory effects.
+                if isinstance(op, AsyncOp) and isinstance(body_op, AwaitOp):
+                    continue
                 body_effects = memory_effects(body_op)
                 if body_effects is None:
                     return None

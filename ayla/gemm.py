@@ -55,6 +55,7 @@ def blackwell_tcgen05_gemm_module(
     rhs_l2_cache_hint: str | None = None,
     lhs_l2_promotion: str | None = None,
     rhs_l2_promotion: str | None = None,
+    split_tma_barriers: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -129,6 +130,14 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("unsupported lhs_l2_promotion")
     if rhs_l2_promotion not in (None, "64B", "128B", "256B"):
         raise ValueError("unsupported rhs_l2_promotion")
+    if split_tma_barriers and (
+        tma_staging != "direct"
+        or operand_stages != 8
+        or cluster_multicast_a
+    ):
+        raise ValueError(
+            "split TMA barriers require direct eight-stage non-multicast staging"
+        )
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -234,11 +243,15 @@ def blackwell_tcgen05_gemm_module(
         AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
         if tma_staging == "direct" else None
     )
+    second_tma_lock = (
+        AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
+        if split_tma_barriers else None
+    )
     if tma_staging == "direct":
         direct_k_tile = 16 * operand_stages
         loop = ForOp.build(0, k // direct_k_tile)
         load_prefix = []
-        load_moves = []
+        load_groups = []
         if operand_stages == 4:
             k_indices = [loop.iv]
         else:
@@ -266,7 +279,7 @@ def blackwell_tcgen05_gemm_module(
                 ),
             )
             load_prefix.extend([a_tile, bt_tile])
-            load_moves.extend([
+            load_groups.append([
                 MoveOp.build(
                     lhs_smem[half].result(), a_tile.result(),
                     attrs={
@@ -291,13 +304,29 @@ def blackwell_tcgen05_gemm_module(
                 ),
             ])
         assert tma_lock is not None
-        loop.body.ops.extend([
-            *load_prefix,
-            AsyncOp.build(tma_lock.result(), body=Block(ops=load_moves)),
-            AwaitOp.build(tma_lock.result()),
-        ])
+        loop.body.ops.extend(load_prefix)
+        if split_tma_barriers:
+            assert second_tma_lock is not None and len(load_groups) == 2
+            loop.body.ops.extend([
+                AsyncOp.build(tma_lock.result(), body=Block(ops=load_groups[0])),
+                AsyncOp.build(
+                    second_tma_lock.result(), body=Block(ops=load_groups[1]),
+                ),
+                AwaitOp.build(tma_lock.result()),
+            ])
+        else:
+            loop.body.ops.extend([
+                AsyncOp.build(
+                    tma_lock.result(),
+                    body=Block(ops=[move for group in load_groups for move in group]),
+                ),
+                AwaitOp.build(tma_lock.result()),
+            ])
         mmas = []
         for stage in range(operand_stages):
+            if split_tma_barriers and stage == 4:
+                assert second_tma_lock is not None
+                mmas.append(AwaitOp.build(second_tma_lock.result()))
             buffer = stage // 4
             buffer_stage = stage % 4
             lhs_tile = TileOp.build(
@@ -397,6 +426,7 @@ def blackwell_tcgen05_gemm_module(
         *rhs_tma_smem,
         mma_lock,
         *([tma_lock] if tma_lock is not None else []),
+        *([second_tma_lock] if second_tma_lock is not None else []),
         loop,
         MoveOp.build(
             c_block.result(), accumulator.result(),

@@ -277,6 +277,35 @@ def test_tcgen05_k128_tma_staging_lowering():
     assert ".shared .align 1024 .b8" in ptx
 
 
+def test_tcgen05_split_tma_barriers_lowering():
+    ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=128,
+        output_n_tile=256, operand_stages=8,
+        split_tma_barriers=True,
+    )).ptx
+
+    assert ptx.count("mbarrier.arrive.expect_tx") == 2
+    assert ptx.count(", 49152;") == 2
+    assert ptx.count("mbarrier.try_wait.parity.acquire") == 3
+    first_wait = ptx.index("mbarrier.try_wait.parity.acquire")
+    mma_offsets = []
+    start = 0
+    for _ in range(8):
+        start = ptx.index("tcgen05.mma.cta_group::1.kind::f16", start)
+        mma_offsets.append(start)
+        start += 1
+    second_wait = ptx.index("mbarrier.try_wait.parity.acquire", first_wait + 1)
+    assert first_wait < mma_offsets[0] < mma_offsets[3]
+    assert mma_offsets[3] < second_wait < mma_offsets[4]
+
+    with pytest.raises(ValueError, match="split TMA barriers"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=256, k=64,
+            output_n_tile=256, operand_stages=4,
+            split_tma_barriers=True,
+        )
+
+
 def test_tcgen05_gemm_jit_optimization_level():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, ptx_optimization_level=4,

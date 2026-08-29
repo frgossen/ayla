@@ -647,9 +647,13 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(
                 f"lower_async: tma_move with lock kind {kind!r}"
             )
-        if body_ops and all(isinstance(o, MatmulOp) for o in body_ops):
+        if body_ops and all(isinstance(o, (MatmulOp, AwaitOp)) for o in body_ops):
             if op.lock.type.kind == "tcgen05":
                 return self._lower_async_matmul_tcgen05(op, body_ops)
+            if any(isinstance(o, AwaitOp) for o in body_ops):
+                raise NotImplementedError(
+                    "in-group input waits are currently supported only for tcgen05"
+                )
             return self._lower_async_matmul_wgmma(op, body_ops)
         raise NotImplementedError(
             f"lower_async: unsupported body ops "
@@ -879,7 +883,7 @@ class LowerToPtxTemplate(LoweringPass):
         return [new_op], []
 
     def _lower_async_matmul_tcgen05(
-        self, op: AsyncOp, mms: list[MatmulOp],
+        self, op: AsyncOp, body_ops: list[MatmulOp | AwaitOp],
     ) -> tuple[list[Op], list[object]]:
         """Lower the first supported SM100 BF16 tile to ``tcgen05.mma``.
 
@@ -894,6 +898,32 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 lowering requires a Blackwell target; "
                 f"got {self.target.architecture!r}"
             )
+        mms = [body_op for body_op in body_ops if isinstance(body_op, MatmulOp)]
+        input_waits = [
+            (index, body_op)
+            for index, body_op in enumerate(body_ops)
+            if isinstance(body_op, AwaitOp)
+        ]
+        if not mms:
+            raise ValueError("tcgen05 async group requires at least one matmul")
+        if input_waits:
+            wait_index, input_wait = input_waits[0]
+            matmuls_before_wait = sum(
+                isinstance(body_op, MatmulOp)
+                for body_op in body_ops[:wait_index]
+            )
+            if (
+                len(input_waits) != 1
+                or input_wait.lock.type.kind != "mbar"
+                or matmuls_before_wait == 0
+                or matmuls_before_wait == len(mms)
+            ):
+                raise ValueError(
+                    "tcgen05 async input wait requires one mbar await between matmuls"
+                )
+        else:
+            input_wait = None
+            matmuls_before_wait = None
         for mm in mms:
             lhs_type, rhs_type, dst_type = mm.lhs.type, mm.rhs.type, mm.dst.type
             mm_cta_group = int(dst_type.attrs.get("cta_group", 1))
@@ -975,6 +1005,9 @@ class LowerToPtxTemplate(LoweringPass):
         # packed [K, N] cooperative layout.
         operands = [dst, lock]
         operand_names = ["dst", "lock"]
+        if input_wait is not None:
+            operands.append(self.value_map[input_wait.lock])
+            operand_names.append("input_lock")
         if hybrid_n_tiles is not None:
             if (
                 not isinstance(hybrid_n_tiles, int)
@@ -1034,7 +1067,11 @@ class LowerToPtxTemplate(LoweringPass):
             # elected issue sequence. Skipping it in non-issuing lanes is not
             # a persistent producer/consumer role: every warp still follows
             # the same surrounding load, compute-wait, and store pipeline.
-            template += "@!${pred:issue} bra ${label:after_tcgen05_issue};\n"
+            branch_target = (
+                "before_tcgen05_input_wait"
+                if input_wait is not None else "after_tcgen05_issue"
+            )
+            template += f"@!${{pred:issue}} bra ${{label:{branch_target}}};\n"
         if hybrid_n_tiles is not None:
             narrow_idesc_value = ((m // 16) << 24) | ((128 // 8) << 17) | 0x490
             if hybrid_split_rows is not None:
@@ -1073,6 +1110,17 @@ class LowerToPtxTemplate(LoweringPass):
             "${b32:disable}" for _ in range(4 * cta_group)
         )
         for i, mm in enumerate(mms):
+            if input_wait is not None and i == matmuls_before_wait:
+                template += textwrap.dedent(r"""
+                    ${label:before_tcgen05_input_wait}:
+                    mov.u32 ${b32:input_wait_ticks}, 0x989680;
+                    ${label:tcgen05_input_wait}:
+                    mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:input_ready}, [${b32:operand.input_lock.val}], ${b32:operand.input_lock.parity}, ${b32:input_wait_ticks};
+                    @!${pred:input_ready} bra ${label:tcgen05_input_wait};
+                    xor.b32 ${b32:operand.input_lock.parity}, ${b32:operand.input_lock.parity}, 1;
+                    fence.proxy.async.shared::cta;
+                    @!${pred:issue} bra ${label:after_tcgen05_issue};
+                """)
             lhs = self.value_map[mm.lhs]
             rhs = self.value_map[mm.rhs]
             lhs_desc_const = (
@@ -1114,7 +1162,7 @@ class LowerToPtxTemplate(LoweringPass):
                 @${pred:issue} tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
                     [${b32:operand.lock.val}], ${b16:cta_mask};
             """)
-        if op.attrs.get("branch_elected_issue"):
+        if op.attrs.get("branch_elected_issue") or input_wait is not None:
             template += "${label:after_tcgen05_issue}:\n"
         new_op = PTXTemplateOp.build(
             operands=operands, result_types=[], template=template,
