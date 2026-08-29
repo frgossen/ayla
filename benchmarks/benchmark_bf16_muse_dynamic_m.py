@@ -121,7 +121,10 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
         axis.set_xlabel("M = flattened tokens (B×S)")
     axes[0][0].set_ylabel("Useful TFLOP/s")
     axes[0][-1].legend()
-    figure.suptitle("H100 BF16 Muse projections — Ayla advantage vs cuBLAS")
+    figure.suptitle(
+        f"{torch.cuda.get_device_name()} BF16 Muse projections — "
+        "Ayla advantage vs cuBLAS"
+    )
     figure.tight_layout(rect=(0, 0, 1, .94))
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=180)

@@ -25,7 +25,11 @@ import torch
 
 # Peak dense tensor-core TFLOPS by (exact GPU name, dtype).
 # GPU names must match torch.cuda.get_device_name() exactly.
-# Source: https://www.nvidia.com/en-us/data-center/h100/
+# Sources:
+# - H100: https://www.nvidia.com/en-us/data-center/h100/
+# - B200: https://www.nvidia.com/en-us/data-center/b200/
+#   NVIDIA specifies 2.25 PFLOP/s dense BF16 Tensor Core throughput (and
+#   4.5 PFLOP/s with structured sparsity); benchmark percentages use dense.
 _PEAK_DENSE_TC_TFLOPS = {
     ("NVIDIA H100", torch.float64): 67.0,  # FP64 Tensor Core (dense)
     (
@@ -36,6 +40,7 @@ _PEAK_DENSE_TC_TFLOPS = {
     ("NVIDIA H100", torch.float16): 989.5,  # spec says 1979 w/ sparsity
     ("NVIDIA H100", torch.float8_e4m3fn): 1979.0,  # spec says 3958 w/ sparsity
     ("NVIDIA H100", torch.float8_e5m2): 1979.0,  # spec says 3958 w/ sparsity
+    ("NVIDIA B200", torch.bfloat16): 2250.0,
 }
 
 

@@ -102,7 +102,8 @@ def _plot(rows: list[dict[str, object]]) -> None:
     axis.set_xlabel("Square matrix size")
     axis.set_ylabel("TFLOP/s")
     axis.set_title(
-        "H100 square BF16 GEMM — graph-captured, cache-hot\n"
+        f"{torch.cuda.get_device_name()} square BF16 GEMM — "
+        "graph-captured, cache-hot\n"
         "labels show throughput advantage vs cuBLAS"
     )
     axis.legend()
