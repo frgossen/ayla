@@ -11,5 +11,5 @@ def blackwell_tcgen05_4096_module():
         split_n_tile=0,
         lhs_l2_cache_hint="evict_first", rhs_l2_cache_hint="evict_last",
         lhs_l2_promotion="256B", rhs_l2_promotion="256B",
-        split_tma_barriers=True,
+        split_tma_barriers=True, split_rhs_tma=True,
     )

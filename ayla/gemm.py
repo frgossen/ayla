@@ -58,6 +58,7 @@ def blackwell_tcgen05_gemm_module(
     lhs_l2_promotion: str | None = None,
     rhs_l2_promotion: str | None = None,
     split_tma_barriers: bool = False,
+    split_rhs_tma: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -148,6 +149,12 @@ def blackwell_tcgen05_gemm_module(
     ):
         raise ValueError(
             "split TMA barriers require direct eight-stage non-multicast staging"
+        )
+    if split_rhs_tma and (
+        tma_staging != "direct" or output_n_tile != 256
+    ):
+        raise ValueError(
+            "split RHS TMA transactions require direct N=256 staging"
         )
 
     bf16 = BF16Type()
@@ -294,37 +301,65 @@ def blackwell_tcgen05_gemm_module(
                     [output_m_tile, 64], bf16, strides=[k, 1],
                 ),
             )
-            bt_tile = TileOp.build(
-                bt_block.result(), [0, k_index],
-                GmemTensorType.build(
-                    [output_n_tile, 64], bf16, strides=[k, 1],
-                ),
+            load_prefix.append(a_tile)
+            lhs_move = MoveOp.build(
+                lhs_smem[half].result(), a_tile.result(),
+                attrs={
+                    "tma": True,
+                    **({"l2_cache_hint": lhs_l2_cache_hint}
+                       if lhs_l2_cache_hint else {}),
+                    **({"l2_promotion": lhs_l2_promotion}
+                       if lhs_l2_promotion else {}),
+                    **({"multicast_mask": 0x3, "cluster_leader": True}
+                       if cluster_multicast_a else {}),
+                },
             )
-            load_prefix.extend([a_tile, bt_tile])
-            load_groups.append([
-                MoveOp.build(
-                    lhs_smem[half].result(), a_tile.result(),
-                    attrs={
-                        "tma": True,
-                        **({"l2_cache_hint": lhs_l2_cache_hint}
-                           if lhs_l2_cache_hint else {}),
-                        **({"l2_promotion": lhs_l2_promotion}
-                           if lhs_l2_promotion else {}),
-                        **({"multicast_mask": 0x3, "cluster_leader": True}
-                           if cluster_multicast_a else {}),
-                    },
-                ),
-                MoveOp.build(
+            rhs_move_attrs = {
+                "tma": True,
+                **({"l2_cache_hint": rhs_l2_cache_hint}
+                   if rhs_l2_cache_hint else {}),
+                **({"l2_promotion": rhs_l2_promotion}
+                   if rhs_l2_promotion else {}),
+            }
+            if split_rhs_tma:
+                # Two 16 KiB N128 requests complete slightly sooner than one
+                # 32 KiB N256 request on B200. They share the bank mbarrier,
+                # so the software pipeline and its synchronization are
+                # unchanged and all four warps still follow the same stages.
+                rhs_moves = []
+                for n_half in range(2):
+                    bt_tile = TileOp.build(
+                        bt_block.result(), [n_half, k_index],
+                        GmemTensorType.build(
+                            [128, 64], bf16, strides=[k, 1],
+                        ),
+                    )
+                    rhs_tile = TileOp.build(
+                        rhs_smem[half].result(), [n_half, 0],
+                        SmemTensorType.build(
+                            [128, 64], bf16, strides=[64, 1],
+                            swizzle="128B",
+                            attrs={"tcgen05_matrix": True},
+                        ),
+                    )
+                    load_prefix.extend([bt_tile, rhs_tile])
+                    rhs_moves.append(MoveOp.build(
+                        rhs_tile.result(), bt_tile.result(),
+                        attrs=rhs_move_attrs,
+                    ))
+            else:
+                bt_tile = TileOp.build(
+                    bt_block.result(), [0, k_index],
+                    GmemTensorType.build(
+                        [output_n_tile, 64], bf16, strides=[k, 1],
+                    ),
+                )
+                load_prefix.append(bt_tile)
+                rhs_moves = [MoveOp.build(
                     rhs_smem[half].result(), bt_tile.result(),
-                    attrs={
-                        "tma": True,
-                        **({"l2_cache_hint": rhs_l2_cache_hint}
-                           if rhs_l2_cache_hint else {}),
-                        **({"l2_promotion": rhs_l2_promotion}
-                           if rhs_l2_promotion else {}),
-                    },
-                ),
-            ])
+                    attrs=rhs_move_attrs,
+                )]
+            load_groups.append([lhs_move, *rhs_moves])
         assert tma_lock is not None
         loop.body.ops.extend(load_prefix)
         if split_tma_barriers:

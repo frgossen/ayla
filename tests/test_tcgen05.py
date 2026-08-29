@@ -309,6 +309,31 @@ def test_tcgen05_split_tma_barriers_lowering():
         )
 
 
+def test_tcgen05_split_rhs_tma_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=128,
+        output_n_tile=256, operand_stages=8,
+        split_tma_barriers=True, split_rhs_tma=True,
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+
+    assert kernel.ptx.count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global"
+    ) == 6
+    assert kernel.ptx.count(", 49152;") == 2
+    assert input_descs[0].tile_sizes == (128, 64)
+    assert input_descs[1].tile_sizes == (128, 64)
+
+    with pytest.raises(ValueError, match="direct N=256 staging"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=128, k=64,
+            output_n_tile=128, split_rhs_tma=True,
+        )
+
+
 def test_tcgen05_gemm_jit_optimization_level():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, ptx_optimization_level=4,
