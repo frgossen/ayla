@@ -33,6 +33,7 @@ from ..gpu_dialect import (
     MatmulOp,
     ModuleOp,
     MoveOp,
+    PartialSplitBlockIdsOp,
     PTXTemplateOp,
     PtrAddOp,
     PtrType,
@@ -45,6 +46,7 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WrmemTensorType,
+    IndexType,
     physical_layout,
     root_buffer,
 )
@@ -60,6 +62,43 @@ class LowerToPtxTemplate(LoweringPass):
         super().__init__()
         self.target = target
         self.cache_policy_values: dict[str, Value] = {}
+
+    @lowers(PartialSplitBlockIdsOp)
+    def lower_partial_split_block_ids(
+        self, op: PartialSplitBlockIdsOp,
+    ) -> tuple[list[Op], list[object]]:
+        split_stride = op.n_tiles + 1
+        split_extent = op.split_rows * split_stride
+        # Both regions are evaluated and selected uniformly by CTA. The tail
+        # subtraction may wrap for prefix CTAs, but those temporary values are
+        # discarded by selp; every divisor is a positive compile-time value.
+        template = textwrap.dedent(f"""\
+            mov.u32 ${{b32:bid}}, %ctaid.x;
+            setp.lt.u32 ${{pred:split_prefix}}, ${{b32:bid}}, {split_extent};
+            div.u32 ${{b32:prefix_m}}, ${{b32:bid}}, {split_stride};
+            rem.u32 ${{b32:prefix_local_n}}, ${{b32:bid}}, {split_stride};
+            min.u32 ${{b32:prefix_n}}, ${{b32:prefix_local_n}}, {op.n_tiles - 1};
+            setp.ge.u32 ${{pred:local_narrow}}, ${{b32:prefix_local_n}}, {op.n_tiles - 1};
+            and.pred ${{pred:narrow}}, ${{pred:split_prefix}}, ${{pred:local_narrow}};
+            selp.u32 ${{b32:result.narrow.val}}, 1, 0, ${{pred:narrow}};
+            mov.u32 ${{b32:result.half.val}}, 0;
+            @${{pred:narrow}} sub.u32 ${{b32:result.half.val}}, ${{b32:prefix_local_n}}, {op.n_tiles - 1};
+            sub.u32 ${{b32:tail_bid}}, ${{b32:bid}}, {split_extent};
+            div.u32 ${{b32:tail_m}}, ${{b32:tail_bid}}, {op.n_tiles};
+            add.u32 ${{b32:tail_m}}, ${{b32:tail_m}}, {op.split_rows};
+            rem.u32 ${{b32:tail_n}}, ${{b32:tail_bid}}, {op.n_tiles};
+            selp.u32 ${{b32:result.m.val}}, ${{b32:prefix_m}}, ${{b32:tail_m}}, ${{pred:split_prefix}};
+            selp.u32 ${{b32:result.n.val}}, ${{b32:prefix_n}}, ${{b32:tail_n}}, ${{pred:split_prefix}};
+        """)
+        new_op = PTXTemplateOp.build(
+            operands=[], result_types=[
+                IndexType(), IndexType(), IndexType(), IndexType(),
+            ],
+            template=template, operand_names=[],
+            result_names=["m", "n", "narrow", "half"],
+            description=str(op),
+        )
+        return [new_op], list(new_op.results)
 
     @lowers(KernelOp)
     def lower_kernel(
@@ -909,8 +948,13 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 async groups cannot mix packed and direct-TMA RHS layouts"
             )
         hybrid_n_tiles = mms[0].attrs.get("hybrid_n_tiles")
+        hybrid_split_rows = mms[0].attrs.get("hybrid_split_rows")
         if any(
-            mm.attrs.get("hybrid_n_tiles") != hybrid_n_tiles
+            (
+                mm.attrs.get("hybrid_n_tiles") != hybrid_n_tiles
+                or mm.attrs.get("hybrid_split_rows") != hybrid_split_rows
+                or mm.controls != mms[0].controls
+            )
             for mm in mms[1:]
         ):
             raise ValueError("tcgen05 async groups must share hybrid-N controls")
@@ -941,6 +985,25 @@ class LowerToPtxTemplate(LoweringPass):
             ):
                 raise ValueError(
                     "hybrid-N tcgen05 requires a direct-TMA group-1 N256 tile"
+                )
+            if hybrid_split_rows is not None:
+                if (
+                    type(hybrid_split_rows) is not int
+                    or hybrid_split_rows < 1
+                    or len(mms[0].controls) != 2
+                ):
+                    raise ValueError(
+                        "partial hybrid-N tcgen05 requires a positive split-row "
+                        "count and narrow/half controls"
+                    )
+                narrow, half = (
+                    self.value_map[value] for value in mms[0].controls
+                )
+                operands.extend([narrow, half])
+                operand_names.extend(["hybrid_narrow", "hybrid_half"])
+            elif mms[0].controls:
+                raise ValueError(
+                    "full-row hybrid-N tcgen05 does not accept controls"
                 )
             # The final physical N tile is represented by two CTAs. Both load
             # the same N256 B tile, then a uniform CTA predicate selects N128
@@ -974,23 +1037,32 @@ class LowerToPtxTemplate(LoweringPass):
             template += "@!${pred:issue} bra ${label:after_tcgen05_issue};\n"
         if hybrid_n_tiles is not None:
             narrow_idesc_value = ((m // 16) << 24) | ((128 // 8) << 17) | 0x490
-            half_instruction = (
-                f"shr.b32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
-                f"{hybrid_n_tiles.bit_length() - 1};"
-                if hybrid_n_tiles & (hybrid_n_tiles - 1) == 0
-                else (
-                    f"div.u32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
-                    f"{hybrid_n_tiles};"
+            if hybrid_split_rows is not None:
+                template += textwrap.dedent(f"""\
+                    setp.ne.u32 ${{pred:narrow_n}}, ${{b32:operand.hybrid_narrow.val}}, 0;
+                    mov.u32 ${{b32:rhs_half}}, ${{b32:operand.hybrid_half.val}};
+                    @!${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, {idesc};
+                    @${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, 0x{narrow_idesc_value:08x};
+                    shl.b32 ${{b32:rhs_half_offset}}, ${{b32:rhs_half}}, 14;
+                """)
+            else:
+                half_instruction = (
+                    f"shr.b32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                    f"{hybrid_n_tiles.bit_length() - 1};"
+                    if hybrid_n_tiles & (hybrid_n_tiles - 1) == 0
+                    else (
+                        f"div.u32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                        f"{hybrid_n_tiles};"
+                    )
                 )
-            )
-            template += textwrap.dedent(f"""\
-                mov.u32 ${{b32:hybrid_bid}}, %ctaid.x;
-                setp.ge.u32 ${{pred:narrow_n}}, ${{b32:hybrid_bid}}, {hybrid_n_tiles - 1};
-                @!${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, {idesc};
-                @${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, 0x{narrow_idesc_value:08x};
-                __HALF_INSTRUCTION__
-                shl.b32 ${{b32:rhs_half_offset}}, ${{b32:rhs_half}}, 14;
-            """).replace("__HALF_INSTRUCTION__", half_instruction)
+                template += textwrap.dedent(f"""\
+                    mov.u32 ${{b32:hybrid_bid}}, %ctaid.x;
+                    setp.ge.u32 ${{pred:narrow_n}}, ${{b32:hybrid_bid}}, {hybrid_n_tiles - 1};
+                    @!${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, {idesc};
+                    @${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, 0x{narrow_idesc_value:08x};
+                    __HALF_INSTRUCTION__
+                    shl.b32 ${{b32:rhs_half_offset}}, ${{b32:rhs_half}}, 14;
+                """).replace("__HALF_INSTRUCTION__", half_instruction)
         else:
             template += f"mov.b32 ${{b32:idesc}}, {idesc};\n"
         template += textwrap.dedent("""\
@@ -1121,6 +1193,7 @@ class LowerToPtxTemplate(LoweringPass):
                 "tensor memory to row-strided f32/bf16 global memory"
             )
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
+        hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         if hybrid_n_tiles is not None and (
             not isinstance(hybrid_n_tiles, int)
             or hybrid_n_tiles < 2
@@ -1131,6 +1204,22 @@ class LowerToPtxTemplate(LoweringPass):
                 "hybrid-N output requires at least two N tiles and a "
                 "256-column BF16 output tile"
             )
+        if hybrid_split_rows is not None and (
+            hybrid_n_tiles is None
+            or type(hybrid_split_rows) is not int
+            or hybrid_split_rows < 1
+            or len(op.indices) != 2
+        ):
+            raise ValueError(
+                "partial hybrid-N output requires a positive split-row count "
+                "and narrow/half controls"
+            )
+        if (
+            hybrid_n_tiles is not None
+            and hybrid_split_rows is None
+            and op.indices
+        ):
+            raise ValueError("full-row hybrid-N output does not accept controls")
         # M=128 uses all 32 lanes in each of the four tensor-memory datapaths.
         # The non-warp-specialized M=64 Layout F instead uses lanes 0..15 in
         # every datapath, so logical row = 16 * warp + lane. All four warps
@@ -1166,24 +1255,37 @@ class LowerToPtxTemplate(LoweringPass):
         operands = [self.value_map[op.dst], self.value_map[op.src]]
         operand_names = ["dst", "src"]
         if hybrid_n_tiles is not None:
-            half_instruction = (
-                f"shr.b32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
-                f"{hybrid_n_tiles.bit_length() - 1};"
-                if hybrid_n_tiles & (hybrid_n_tiles - 1) == 0
-                else (
-                    f"div.u32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
-                    f"{hybrid_n_tiles};"
+            if hybrid_split_rows is not None:
+                narrow, half = (
+                    self.value_map[value] for value in op.indices
                 )
-            )
-            template += textwrap.dedent("""\
-                mov.u32 ${b32:hybrid_bid}, %ctaid.x;
-                setp.ge.u32 ${pred:hybrid_narrow}, ${b32:hybrid_bid}, __SPLIT_START__;
-                __HALF_INSTRUCTION__
-                mul.wide.u32 ${b64:hybrid_col_offset}, ${b32:rhs_half}, 256;
-                add.u64 ${b64:row}, ${b64:row}, ${b64:hybrid_col_offset};
-            """).replace(
-                "__SPLIT_START__", str(hybrid_n_tiles - 1),
-            ).replace("__HALF_INSTRUCTION__", half_instruction)
+                operands.extend([narrow, half])
+                operand_names.extend(["hybrid_narrow", "hybrid_half"])
+                template += textwrap.dedent("""\
+                    setp.ne.u32 ${pred:hybrid_narrow}, ${b32:operand.hybrid_narrow.val}, 0;
+                    mov.u32 ${b32:rhs_half}, ${b32:operand.hybrid_half.val};
+                    mul.wide.u32 ${b64:hybrid_col_offset}, ${b32:rhs_half}, 256;
+                    add.u64 ${b64:row}, ${b64:row}, ${b64:hybrid_col_offset};
+                """)
+            else:
+                half_instruction = (
+                    f"shr.b32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                    f"{hybrid_n_tiles.bit_length() - 1};"
+                    if hybrid_n_tiles & (hybrid_n_tiles - 1) == 0
+                    else (
+                        f"div.u32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                        f"{hybrid_n_tiles};"
+                    )
+                )
+                template += textwrap.dedent("""\
+                    mov.u32 ${b32:hybrid_bid}, %ctaid.x;
+                    setp.ge.u32 ${pred:hybrid_narrow}, ${b32:hybrid_bid}, __SPLIT_START__;
+                    __HALF_INSTRUCTION__
+                    mul.wide.u32 ${b64:hybrid_col_offset}, ${b32:rhs_half}, 256;
+                    add.u64 ${b64:row}, ${b64:row}, ${b64:hybrid_col_offset};
+                """).replace(
+                    "__SPLIT_START__", str(hybrid_n_tiles - 1),
+                ).replace("__HALF_INSTRUCTION__", half_instruction)
         for col in range(0, src_type.sizes[1], 64):
             if dst_type.dtype.name == "f32":
                 stores = "\n".join(

@@ -22,6 +22,7 @@ from .gpu_dialect import (
     MatmulOp,
     ModuleOp,
     MoveOp,
+    PartialSplitBlockIdsOp,
     SmemTensorType,
     TileOp,
     TmemTensorType,
@@ -49,6 +50,7 @@ def blackwell_tcgen05_gemm_module(
     branch_tcgen05_issue: bool = True,
     transpose_cta_grid: bool = False,
     split_last_n_tile: bool = False,
+    split_last_n_tile_rows: int | None = None,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
     lhs_l2_promotion: str | None = None,
@@ -92,7 +94,14 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires N divisible by 256")
     if cluster_multicast_a and transpose_cta_grid:
         raise ValueError("cluster A multicast requires the default CTA grid order")
-    if split_last_n_tile and (
+    if split_last_n_tile and split_last_n_tile_rows is not None:
+        raise ValueError(
+            "choose either split_last_n_tile or split_last_n_tile_rows"
+        )
+    split_last_n_tile_enabled = (
+        split_last_n_tile or split_last_n_tile_rows is not None
+    )
+    if split_last_n_tile_enabled and (
         tma_staging != "direct"
         or output_n_tile != 256
         or not transpose_cta_grid
@@ -101,6 +110,16 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "splitting the last N tile requires direct transposed-grid "
             "N=256 staging with at least two N tiles"
+        )
+    m_tiles = m // output_m_tile
+    n_tiles = n // output_n_tile
+    if split_last_n_tile_rows is not None and (
+        type(split_last_n_tile_rows) is not int
+        or not 0 < split_last_n_tile_rows < m_tiles
+    ):
+        raise ValueError(
+            "split_last_n_tile_rows must be an integer strictly between "
+            "zero and the number of M tiles"
         )
     if lhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
         raise ValueError("unsupported lhs_l2_cache_hint")
@@ -116,15 +135,30 @@ def blackwell_tcgen05_gemm_module(
     bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
     c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
     block_ids = BlockIdsOp.build()
-    grid_index_ops = []
+    grid_index_ops = [block_ids]
     hybrid_n_tiles = None
-    if split_last_n_tile:
+    hybrid_split_rows = None
+    hybrid_controls = None
+    if split_last_n_tile_rows is not None:
+        # A linear mapping splits the last N256 tile only for a prefix of M
+        # rows. This adds enough N128 CTAs to improve launch-wave balance while
+        # avoiding the duplicated TMA work of splitting every row.
+        partial_ids = PartialSplitBlockIdsOp.build(
+            m_tiles=m_tiles, n_tiles=n_tiles,
+            split_rows=split_last_n_tile_rows,
+        )
+        grid_index_ops = [partial_ids]
+        m_block_id = partial_ids.m
+        n_block_id = partial_ids.n
+        hybrid_n_tiles = n_tiles
+        hybrid_split_rows = split_last_n_tile_rows
+        hybrid_controls = [partial_ids.narrow, partial_ids.half]
+    elif split_last_n_tile:
         # Split only the final N256 tile into two N128 CTAs. For a 4096-wide
         # output this changes 512 uniform CTAs into 544 mixed-width CTAs,
         # reducing the severe two-CTA/SM tail-wave imbalance. Every CTA still
         # executes the same load/compute/store pipeline; the uniform block id
         # only selects its tcgen05 N extent and output half.
-        n_tiles = n // output_n_tile
         n_tile_count = IndexConstantOp.build(n_tiles)
         half = IndexDivOp.build(block_ids.x, n_tile_count.result())
         minus_one = IndexConstantOp.build(-1)
@@ -283,10 +317,18 @@ def blackwell_tcgen05_gemm_module(
                 ),
             )
             loop.body.ops.extend([lhs_tile, rhs_tile])
+            hybrid_attrs = (
+                {
+                    "hybrid_n_tiles": hybrid_n_tiles,
+                    **({"hybrid_split_rows": hybrid_split_rows}
+                       if hybrid_split_rows is not None else {}),
+                }
+                if hybrid_n_tiles is not None else None
+            )
             mmas.append(MatmulOp.build(
                 lhs_tile.result(), rhs_tile.result(), accumulator.result(),
-                attrs={"hybrid_n_tiles": hybrid_n_tiles}
-                if hybrid_n_tiles is not None else None,
+                attrs=hybrid_attrs,
+                controls=hybrid_controls,
             ))
     else:
         loop = ForOp.build(0, k // 16, step=operand_stages)
@@ -344,7 +386,6 @@ def blackwell_tcgen05_gemm_module(
         AwaitOp.build(mma_lock.result()),
     ])
     body = Block(arguments=[a, bt, c], ops=[
-        block_ids,
         *grid_index_ops,
         a_block,
         bt_block,
@@ -359,8 +400,15 @@ def blackwell_tcgen05_gemm_module(
         loop,
         MoveOp.build(
             c_block.result(), accumulator.result(),
-            attrs={"hybrid_n_tiles": hybrid_n_tiles}
-            if hybrid_n_tiles is not None else None,
+            indices=hybrid_controls,
+            attrs=(
+                {
+                    "hybrid_n_tiles": hybrid_n_tiles,
+                    **({"hybrid_split_rows": hybrid_split_rows}
+                       if hybrid_split_rows is not None else {}),
+                }
+                if hybrid_n_tiles is not None else None
+            ),
         ),
         DeallocOp.build(accumulator.result()),
     ])
@@ -368,9 +416,15 @@ def blackwell_tcgen05_gemm_module(
         "blackwell_tcgen05_4096",
         body,
         grid_dim=(
-            (n // output_n_tile + int(split_last_n_tile), m // output_m_tile, 1)
+            (
+                m_tiles * n_tiles + split_last_n_tile_rows,
+                1,
+                1,
+            )
+            if split_last_n_tile_rows is not None else
+            (n_tiles + int(split_last_n_tile), m_tiles, 1)
             if transpose_cta_grid else
-            (m // output_m_tile, n // output_n_tile, 1)
+            (m_tiles, n_tiles, 1)
         ),
         block_dim=(128, 1, 1),
         cluster_dim=(1, 2, 1) if cluster_multicast_a else None,

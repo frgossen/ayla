@@ -111,7 +111,10 @@ class LowerToAsync(LoweringPass):
             kind = "wgmma"
         else:
             return None
-        matmul = MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs)
+        controls = [self.value_map[value] for value in op.controls]
+        matmul = MatmulOp.build(
+            lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs, controls=controls,
+        )
         return self._wrap(matmul, kind, op.attrs)
 
 

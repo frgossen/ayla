@@ -8,7 +8,7 @@ from .registry import register
 def blackwell_tcgen05_4096_module():
     return blackwell_tcgen05_gemm_module(
         operand_stages=8, output_n_tile=256, transpose_cta_grid=True,
-        split_last_n_tile=True,
+        split_last_n_tile_rows=24,
         lhs_l2_cache_hint="evict_first", rhs_l2_cache_hint="evict_last",
         lhs_l2_promotion="256B", rhs_l2_promotion="256B",
     )

@@ -21,6 +21,7 @@ from ayla.gpu_dialect import (
     IndexType,
     LockType,
     MoveOp,
+    PartialSplitBlockIdsOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
@@ -103,6 +104,23 @@ def test_kernel_cluster_dimension_roundtrip():
     )
     with pytest.raises(ValueError, match="cluster_dim entries must be positive"):
         KernelOp.build("invalid", Block(), cluster_dim=(0, 1, 1))
+
+
+def test_partial_split_block_ids_roundtrip_and_validation():
+    op = PartialSplitBlockIdsOp.build(
+        m_tiles=32, n_tiles=16, split_rows=24,
+    )
+
+    assert_print_and_roundtrip(
+        op,
+        "%split_m: index, %split_n: index, %split_narrow: index, "
+        "%split_half: index = partial_split_block_ids() "
+        "attrs={m_tiles: 32, n_tiles: 16, split_rows: 24}",
+    )
+    with pytest.raises(ValueError, match="0 < split_rows < m_tiles"):
+        PartialSplitBlockIdsOp.build(
+            m_tiles=32, n_tiles=16, split_rows=32,
+        )
 
 
 def test_module_explicit_target():

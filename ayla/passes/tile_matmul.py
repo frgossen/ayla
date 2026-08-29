@@ -210,7 +210,10 @@ class TileMatmul(LoweringPass):
         )
         body_ops.extend(ops)
         body_ops.append(
-            MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs),
+            MatmulOp.build(
+                lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs,
+                controls=[self.value_map[value] for value in op.controls],
+            ),
         )
 
         for iv, ub, level, label in zip(

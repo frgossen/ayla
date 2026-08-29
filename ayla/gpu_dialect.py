@@ -270,12 +270,13 @@ class MatmulOp(Op):
         dst: Value,
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
+        controls: list[Value] | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if init is not None:
             a["init"] = init
         return cls(
-            operands=[lhs, rhs, dst], results=[], attrs=a,
+            operands=[lhs, rhs, dst, *(controls or [])], results=[], attrs=a,
         )
 
     @property
@@ -289,6 +290,11 @@ class MatmulOp(Op):
     @property
     def dst(self) -> Value:
         return self.operands[2]
+
+    @property
+    def controls(self) -> list[Value]:
+        """Optional CTA-uniform controls consumed by target lowering."""
+        return self.operands[3:]
 
     @property
     def init(self) -> float | int | None:
@@ -1590,6 +1596,87 @@ class BlockIdsOp(Op):
         return self.results[2]
 
 
+@gpu_dialect.register_op("partial_split_block_ids")
+class PartialSplitBlockIdsOp(Op):
+    """Map a linear CTA id while splitting one N tile in some M rows.
+
+    The first ``split_rows`` M rows contain ``n_tiles - 1`` full-width N
+    tiles followed by two half-width CTAs for the final tile. Remaining rows
+    contain ``n_tiles`` full-width tiles. The operation returns logical M/N
+    tile indices plus CTA-uniform narrow/half controls consumed by the
+    architecture-specific tensor-core lowering.
+    """
+
+    def __post_init__(self) -> None:  # type: ignore[override]
+        super().__post_init__()
+        if self.operands or len(self.results) != 4 or any(
+            not isinstance(result.type, IndexType) for result in self.results
+        ):
+            raise ValueError(
+                "partial_split_block_ids requires no operands and four index results"
+            )
+        m_tiles = self.attrs.get("m_tiles")
+        n_tiles = self.attrs.get("n_tiles")
+        split_rows = self.attrs.get("split_rows")
+        if not all(type(value) is int for value in (m_tiles, n_tiles, split_rows)):
+            raise ValueError(
+                "partial_split_block_ids attributes must be integers"
+            )
+        if m_tiles < 2 or n_tiles < 2 or not 0 < split_rows < m_tiles:
+            raise ValueError(
+                "partial_split_block_ids requires m_tiles/n_tiles >= 2 and "
+                "0 < split_rows < m_tiles"
+            )
+
+    @classmethod
+    def build(
+        cls, *, m_tiles: int, n_tiles: int, split_rows: int,
+    ) -> "PartialSplitBlockIdsOp":
+        idx = IndexType()
+        return cls(
+            operands=[],
+            results=[
+                Value(name="split_m", type=idx),
+                Value(name="split_n", type=idx),
+                Value(name="split_narrow", type=idx),
+                Value(name="split_half", type=idx),
+            ],
+            attrs={
+                "m_tiles": m_tiles,
+                "n_tiles": n_tiles,
+                "split_rows": split_rows,
+            },
+        )
+
+    @property
+    def m(self) -> Value:
+        return self.results[0]
+
+    @property
+    def n(self) -> Value:
+        return self.results[1]
+
+    @property
+    def narrow(self) -> Value:
+        return self.results[2]
+
+    @property
+    def half(self) -> Value:
+        return self.results[3]
+
+    @property
+    def m_tiles(self) -> int:
+        return self.attrs["m_tiles"]  # type: ignore[return-value]
+
+    @property
+    def n_tiles(self) -> int:
+        return self.attrs["n_tiles"]  # type: ignore[return-value]
+
+    @property
+    def split_rows(self) -> int:
+        return self.attrs["split_rows"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("warp_group_id")
 class WarpGroupIdOp(Op):
     """Produce the 3D warp group index within the block."""
@@ -1967,6 +2054,7 @@ def is_side_effect_free(op: Op) -> bool:
         return op.init is None and not isinstance(op.result().type, TmemTensorType)
     return isinstance(op, (
         BlockIdsOp,
+        PartialSplitBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,
         IndexDivOp,

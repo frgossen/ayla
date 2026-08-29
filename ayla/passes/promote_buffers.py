@@ -38,6 +38,7 @@ from ..gpu_dialect import (
     MatmulOp,
     ModuleOp,
     MoveOp,
+    PartialSplitBlockIdsOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -81,7 +82,7 @@ def _collective_level(value: Value) -> str:
     if isinstance(defn, Block):
         return "block"
 
-    if isinstance(defn, BlockIdsOp):
+    if isinstance(defn, (BlockIdsOp, PartialSplitBlockIdsOp)):
         return "block"
     if isinstance(defn, WarpGroupIdOp):
         return "wg"
@@ -513,7 +514,9 @@ class PromoteBuffers(LoweringPass):
             init = None
 
         matmul = MatmulOp.build(
-            lhs=new_lhs, rhs=new_rhs, dst=new_dst, init=init, attrs=op.extra_attrs
+            lhs=new_lhs, rhs=new_rhs, dst=new_dst, init=init,
+            attrs=op.extra_attrs,
+            controls=[self.value_map[value] for value in op.controls],
         )
 
         post_ops = []
