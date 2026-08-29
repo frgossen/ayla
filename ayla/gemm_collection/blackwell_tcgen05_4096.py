@@ -9,6 +9,7 @@ def blackwell_tcgen05_4096_module():
     return blackwell_tcgen05_gemm_module(
         operand_stages=8, output_n_tile=232, transpose_cta_grid=True,
         balanced_n_tile=224,
+        ptx_optimization_level=4,
         lhs_l2_cache_hint="evict_first", rhs_l2_cache_hint="evict_last",
         lhs_l2_promotion="256B", rhs_l2_promotion="256B",
         split_tma_barriers=True, split_rhs_tma=True,
