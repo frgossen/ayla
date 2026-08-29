@@ -23,6 +23,7 @@ from .gpu_dialect import (
     ModuleOp,
     MoveOp,
     PartialSplitBlockIdsOp,
+    SplitNBlockIdOp,
     SmemTensorType,
     TileOp,
     TmemTensorType,
@@ -50,6 +51,7 @@ def blackwell_tcgen05_gemm_module(
     branch_tcgen05_issue: bool = True,
     transpose_cta_grid: bool = False,
     split_last_n_tile: bool = False,
+    split_n_tile: int | None = None,
     split_last_n_tile_rows: int | None = None,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
@@ -95,12 +97,17 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires N divisible by 256")
     if cluster_multicast_a and transpose_cta_grid:
         raise ValueError("cluster A multicast requires the default CTA grid order")
-    if split_last_n_tile and split_last_n_tile_rows is not None:
+    if sum(
+        option is not None and option is not False
+        for option in (split_last_n_tile, split_n_tile, split_last_n_tile_rows)
+    ) > 1:
         raise ValueError(
-            "choose either split_last_n_tile or split_last_n_tile_rows"
+            "choose one N-tile splitting mode"
         )
     split_last_n_tile_enabled = (
-        split_last_n_tile or split_last_n_tile_rows is not None
+        split_last_n_tile
+        or split_n_tile is not None
+        or split_last_n_tile_rows is not None
     )
     if split_last_n_tile_enabled and (
         tma_staging != "direct"
@@ -114,6 +121,10 @@ def blackwell_tcgen05_gemm_module(
         )
     m_tiles = m // output_m_tile
     n_tiles = n // output_n_tile
+    if split_n_tile is not None and (
+        type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
+    ):
+        raise ValueError("split_n_tile must select an existing logical N tile")
     if split_last_n_tile_rows is not None and (
         type(split_last_n_tile_rows) is not int
         or not 0 < split_last_n_tile_rows < m_tiles
@@ -147,6 +158,7 @@ def blackwell_tcgen05_gemm_module(
     grid_index_ops = [block_ids]
     hybrid_n_tiles = None
     hybrid_split_rows = None
+    hybrid_split_tile = None
     hybrid_controls = None
     if split_last_n_tile_rows is not None:
         # A linear mapping splits the last N256 tile only for a prefix of M
@@ -162,6 +174,16 @@ def blackwell_tcgen05_gemm_module(
         hybrid_n_tiles = n_tiles
         hybrid_split_rows = split_last_n_tile_rows
         hybrid_controls = [partial_ids.narrow, partial_ids.half]
+    elif split_n_tile is not None:
+        split_ids = SplitNBlockIdOp.build(
+            n_tiles=n_tiles, split_tile=split_n_tile,
+        )
+        grid_index_ops.append(split_ids)
+        m_block_id = block_ids.y
+        n_block_id = split_ids.n
+        hybrid_n_tiles = n_tiles
+        hybrid_split_tile = split_n_tile
+        hybrid_controls = [split_ids.narrow, split_ids.half]
     elif split_last_n_tile:
         # Split only the final N256 tile into two N128 CTAs. For a 4096-wide
         # output this changes 512 uniform CTAs into 544 mixed-width CTAs,
@@ -351,6 +373,8 @@ def blackwell_tcgen05_gemm_module(
                     "hybrid_n_tiles": hybrid_n_tiles,
                     **({"hybrid_split_rows": hybrid_split_rows}
                        if hybrid_split_rows is not None else {}),
+                    **({"hybrid_split_tile": hybrid_split_tile}
+                       if hybrid_split_tile is not None else {}),
                 }
                 if hybrid_n_tiles is not None else None
             )
@@ -436,6 +460,8 @@ def blackwell_tcgen05_gemm_module(
                     "hybrid_n_tiles": hybrid_n_tiles,
                     **({"hybrid_split_rows": hybrid_split_rows}
                        if hybrid_split_rows is not None else {}),
+                    **({"hybrid_split_tile": hybrid_split_tile}
+                       if hybrid_split_tile is not None else {}),
                 }
                 if hybrid_n_tiles is not None else None
             ),
@@ -452,7 +478,7 @@ def blackwell_tcgen05_gemm_module(
                 1,
             )
             if split_last_n_tile_rows is not None else
-            (n_tiles + int(split_last_n_tile), m_tiles, 1)
+            (n_tiles + int(split_last_n_tile or split_n_tile is not None), m_tiles, 1)
             if transpose_cta_grid else
             (m_tiles, n_tiles, 1)
         ),

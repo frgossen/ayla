@@ -349,6 +349,26 @@ def test_tcgen05_split_last_n_tile_lowering():
         )
 
 
+def test_tcgen05_selected_n_tile_split_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=128,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+    ))
+
+    assert kernel.grid_dim == (17, 1, 1)
+    assert "setp.gt.u32" in kernel.ptx and ", 0;" in kernel.ptx
+    assert "0x08400490" in kernel.ptx
+    assert "0x08200490" in kernel.ptx
+
+    with pytest.raises(ValueError, match="existing logical N tile"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=128,
+            output_n_tile=256, operand_stages=8,
+            transpose_cta_grid=True, split_n_tile=16,
+        )
+
+
 def test_tcgen05_partial_split_last_n_tile_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=4096, n=4096, k=128,

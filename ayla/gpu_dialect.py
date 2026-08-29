@@ -1677,6 +1677,66 @@ class PartialSplitBlockIdsOp(Op):
         return self.attrs["split_rows"]  # type: ignore[return-value]
 
 
+@gpu_dialect.register_op("split_n_block_id")
+class SplitNBlockIdOp(Op):
+    """Map ``blockIdx.x`` while splitting one logical N tile into two.
+
+    Returns the logical N tile plus CTA-uniform ``narrow`` and ``half``
+    controls. Physical x indices before the selected tile map directly; the
+    selected pair maps to its two N128 halves; later indices shift down by one.
+    """
+
+    def __post_init__(self) -> None:  # type: ignore[override]
+        super().__post_init__()
+        if self.operands or len(self.results) != 3 or any(
+            not isinstance(result.type, IndexType) for result in self.results
+        ):
+            raise ValueError(
+                "split_n_block_id requires no operands and three index results"
+            )
+        n_tiles = self.attrs.get("n_tiles")
+        split_tile = self.attrs.get("split_tile")
+        if not all(type(value) is int for value in (n_tiles, split_tile)):
+            raise ValueError("split_n_block_id attributes must be integers")
+        if n_tiles < 2 or not 0 <= split_tile < n_tiles:
+            raise ValueError(
+                "split_n_block_id requires n_tiles >= 2 and a valid split_tile"
+            )
+
+    @classmethod
+    def build(cls, *, n_tiles: int, split_tile: int) -> "SplitNBlockIdOp":
+        idx = IndexType()
+        return cls(
+            operands=[],
+            results=[
+                Value(name="split_n", type=idx),
+                Value(name="split_narrow", type=idx),
+                Value(name="split_half", type=idx),
+            ],
+            attrs={"n_tiles": n_tiles, "split_tile": split_tile},
+        )
+
+    @property
+    def n(self) -> Value:
+        return self.results[0]
+
+    @property
+    def narrow(self) -> Value:
+        return self.results[1]
+
+    @property
+    def half(self) -> Value:
+        return self.results[2]
+
+    @property
+    def n_tiles(self) -> int:
+        return self.attrs["n_tiles"]  # type: ignore[return-value]
+
+    @property
+    def split_tile(self) -> int:
+        return self.attrs["split_tile"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("warp_group_id")
 class WarpGroupIdOp(Op):
     """Produce the 3D warp group index within the block."""
@@ -2059,6 +2119,7 @@ def is_side_effect_free(op: Op) -> bool:
     return isinstance(op, (
         BlockIdsOp,
         PartialSplitBlockIdsOp,
+        SplitNBlockIdOp,
         IndexAddOp,
         IndexConstantOp,
         IndexDivOp,

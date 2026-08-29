@@ -34,6 +34,7 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     PartialSplitBlockIdsOp,
+    SplitNBlockIdOp,
     PTXTemplateOp,
     PtrAddOp,
     PtrType,
@@ -96,6 +97,28 @@ class LowerToPtxTemplate(LoweringPass):
             ],
             template=template, operand_names=[],
             result_names=["m", "n", "narrow", "half"],
+            description=str(op),
+        )
+        return [new_op], list(new_op.results)
+
+    @lowers(SplitNBlockIdOp)
+    def lower_split_n_block_id(
+        self, op: SplitNBlockIdOp,
+    ) -> tuple[list[Op], list[object]]:
+        template = textwrap.dedent(f"""\
+            mov.u32 ${{b32:bid}}, %ctaid.x;
+            setp.gt.u32 ${{pred:after_split}}, ${{b32:bid}}, {op.split_tile};
+            selp.u32 ${{b32:skip}}, 1, 0, ${{pred:after_split}};
+            sub.u32 ${{b32:result.n.val}}, ${{b32:bid}}, ${{b32:skip}};
+            setp.eq.u32 ${{pred:narrow}}, ${{b32:result.n.val}}, {op.split_tile};
+            selp.u32 ${{b32:result.narrow.val}}, 1, 0, ${{pred:narrow}};
+            sub.u32 ${{b32:result.half.val}}, ${{b32:bid}}, {op.split_tile};
+            @!${{pred:narrow}} mov.u32 ${{b32:result.half.val}}, 0;
+        """)
+        index = IndexType()
+        new_op = PTXTemplateOp.build(
+            operands=[], result_types=[index, index, index], template=template,
+            operand_names=[], result_names=["n", "narrow", "half"],
             description=str(op),
         )
         return [new_op], list(new_op.results)
@@ -982,10 +1005,12 @@ class LowerToPtxTemplate(LoweringPass):
             )
         hybrid_n_tiles = mms[0].attrs.get("hybrid_n_tiles")
         hybrid_split_rows = mms[0].attrs.get("hybrid_split_rows")
+        hybrid_split_tile = mms[0].attrs.get("hybrid_split_tile")
         if any(
             (
                 mm.attrs.get("hybrid_n_tiles") != hybrid_n_tiles
                 or mm.attrs.get("hybrid_split_rows") != hybrid_split_rows
+                or mm.attrs.get("hybrid_split_tile") != hybrid_split_tile
                 or mm.controls != mms[0].controls
             )
             for mm in mms[1:]
@@ -1022,15 +1047,27 @@ class LowerToPtxTemplate(LoweringPass):
                 raise ValueError(
                     "hybrid-N tcgen05 requires a direct-TMA group-1 N256 tile"
                 )
-            if hybrid_split_rows is not None:
+            if hybrid_split_rows is not None or hybrid_split_tile is not None:
                 if (
-                    type(hybrid_split_rows) is not int
-                    or hybrid_split_rows < 1
-                    or len(mms[0].controls) != 2
+                    len(mms[0].controls) != 2
+                    or (
+                        hybrid_split_rows is not None
+                        and (
+                            type(hybrid_split_rows) is not int
+                            or hybrid_split_rows < 1
+                        )
+                    )
+                    or (
+                        hybrid_split_tile is not None
+                        and (
+                            type(hybrid_split_tile) is not int
+                            or not 0 <= hybrid_split_tile < hybrid_n_tiles
+                        )
+                    )
                 ):
                     raise ValueError(
-                        "partial hybrid-N tcgen05 requires a positive split-row "
-                        "count and narrow/half controls"
+                        "controlled hybrid-N tcgen05 requires valid split "
+                        "attributes and narrow/half controls"
                     )
                 narrow, half = (
                     self.value_map[value] for value in mms[0].controls
@@ -1077,7 +1114,7 @@ class LowerToPtxTemplate(LoweringPass):
             template += f"@!${{pred:issue}} bra ${{label:{branch_target}}};\n"
         if hybrid_n_tiles is not None:
             narrow_idesc_value = ((m // 16) << 24) | ((128 // 8) << 17) | 0x490
-            if hybrid_split_rows is not None:
+            if hybrid_split_rows is not None or hybrid_split_tile is not None:
                 template += textwrap.dedent(f"""\
                     setp.ne.u32 ${{pred:narrow_n}}, ${{b32:operand.hybrid_narrow.val}}, 0;
                     mov.u32 ${{b32:rhs_half}}, ${{b32:operand.hybrid_half.val}};
@@ -1245,6 +1282,7 @@ class LowerToPtxTemplate(LoweringPass):
             )
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
+        hybrid_split_tile = op.attrs.get("hybrid_split_tile")
         if hybrid_n_tiles is not None and (
             not isinstance(hybrid_n_tiles, int)
             or hybrid_n_tiles < 2
@@ -1255,19 +1293,16 @@ class LowerToPtxTemplate(LoweringPass):
                 "hybrid-N output requires at least two N tiles and a "
                 "256-column BF16 output tile"
             )
-        if hybrid_split_rows is not None and (
-            hybrid_n_tiles is None
-            or type(hybrid_split_rows) is not int
-            or hybrid_split_rows < 1
-            or len(op.indices) != 2
-        ):
+        if (
+            hybrid_split_rows is not None or hybrid_split_tile is not None
+        ) and (hybrid_n_tiles is None or len(op.indices) != 2):
             raise ValueError(
-                "partial hybrid-N output requires a positive split-row count "
-                "and narrow/half controls"
+                "controlled hybrid-N output requires narrow/half controls"
             )
         if (
             hybrid_n_tiles is not None
             and hybrid_split_rows is None
+            and hybrid_split_tile is None
             and op.indices
         ):
             raise ValueError("full-row hybrid-N output does not accept controls")
@@ -1306,7 +1341,7 @@ class LowerToPtxTemplate(LoweringPass):
         operands = [self.value_map[op.dst], self.value_map[op.src]]
         operand_names = ["dst", "src"]
         if hybrid_n_tiles is not None:
-            if hybrid_split_rows is not None:
+            if hybrid_split_rows is not None or hybrid_split_tile is not None:
                 narrow, half = (
                     self.value_map[value] for value in op.indices
                 )

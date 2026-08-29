@@ -22,6 +22,7 @@ from ayla.gpu_dialect import (
     LockType,
     MoveOp,
     PartialSplitBlockIdsOp,
+    SplitNBlockIdOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
@@ -121,6 +122,18 @@ def test_partial_split_block_ids_roundtrip_and_validation():
         PartialSplitBlockIdsOp.build(
             m_tiles=32, n_tiles=16, split_rows=32,
         )
+
+
+def test_split_n_block_id_roundtrip_and_validation():
+    op = SplitNBlockIdOp.build(n_tiles=16, split_tile=0)
+
+    assert_print_and_roundtrip(
+        op,
+        "%split_n: index, %split_narrow: index, %split_half: index = "
+        "split_n_block_id() attrs={n_tiles: 16, split_tile: 0}",
+    )
+    with pytest.raises(ValueError, match="valid split_tile"):
+        SplitNBlockIdOp.build(n_tiles=16, split_tile=16)
 
 
 def test_module_explicit_target():
