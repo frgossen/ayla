@@ -248,49 +248,43 @@ def blackwell_tcgen05_gemm_module(
     hybrid_controls = None
     if balanced_n_tile is not None:
         assert balanced_wide_tiles is not None
-        # Distribute wider tiles evenly with a prefix-count formula. For
-        # N4096 this maps eight N232 and ten N224 tiles into the same 18-CTA
-        # row as the retained N232/N152 launch, while avoiding a short tail.
-        narrow_width = IndexConstantOp.build(balanced_n_tile)
-        narrow_base = IndexMulOp.build(block_ids.x, narrow_width.result())
-        wide_count = IndexConstantOp.build(balanced_wide_tiles)
-        wide_product = IndexMulOp.build(block_ids.x, wide_count.result())
-        tile_count = IndexConstantOp.build(n_tiles)
-        wide_before = IndexDivOp.build(
-            wide_product.result(), tile_count.result(),
-        )
+        # Put the wider CTAs first, then derive one CTA-uniform narrow flag and
+        # element offset for the remaining blocks. For N4096 this maps eight
+        # N232 and ten N224 tiles into the same 18-CTA row as the retained
+        # N232/N152 launch while avoiding a short tail.
         width_delta = IndexConstantOp.build(output_n_tile - balanced_n_tile)
-        wide_offset = IndexMulOp.build(
-            wide_before.result(), width_delta.result(),
+        minus_one = IndexConstantOp.build(-1)
+        tile_count = IndexConstantOp.build(n_tiles)
+        full_width = IndexConstantOp.build(output_n_tile)
+        full_base = IndexMulOp.build(block_ids.x, full_width.result())
+        threshold_bias = IndexConstantOp.build(n_tiles - balanced_wide_tiles)
+        biased_x = IndexAddOp.build(block_ids.x, threshold_bias.result())
+        narrow = IndexDivOp.build(biased_x.result(), tile_count.result())
+        wide_count = IndexConstantOp.build(balanced_wide_tiles)
+        neg_wide_count = IndexMulOp.build(
+            wide_count.result(), minus_one.result(),
+        )
+        after_wide = IndexAddOp.build(
+            block_ids.x, neg_wide_count.result(),
+        )
+        narrow_distance = IndexMulOp.build(
+            narrow.result(), after_wide.result(),
+        )
+        adjustment = IndexMulOp.build(
+            narrow_distance.result(), width_delta.result(),
+        )
+        neg_adjustment = IndexMulOp.build(
+            adjustment.result(), minus_one.result(),
         )
         n_offset = IndexAddOp.build(
-            narrow_base.result(), wide_offset.result(),
+            full_base.result(), neg_adjustment.result(),
         )
-        one = IndexConstantOp.build(1)
-        next_x = IndexAddOp.build(block_ids.x, one.result())
-        next_wide_product = IndexMulOp.build(
-            next_x.result(), wide_count.result(),
-        )
-        wide_after = IndexDivOp.build(
-            next_wide_product.result(), tile_count.result(),
-        )
-        minus_one = IndexConstantOp.build(-1)
-        neg_wide_before = IndexMulOp.build(
-            wide_before.result(), minus_one.result(),
-        )
-        is_wide = IndexAddOp.build(
-            wide_after.result(), neg_wide_before.result(),
-        )
-        neg_is_wide = IndexMulOp.build(
-            is_wide.result(), minus_one.result(),
-        )
-        narrow = IndexAddOp.build(one.result(), neg_is_wide.result())
         zero = IndexConstantOp.build(0)
         grid_index_ops.extend([
-            narrow_width, narrow_base, wide_count, wide_product, tile_count,
-            wide_before, width_delta, wide_offset, n_offset, one, next_x,
-            next_wide_product, wide_after, minus_one, neg_wide_before,
-            is_wide, neg_is_wide, narrow, zero,
+            width_delta, minus_one, tile_count, full_width, full_base,
+            threshold_bias, biased_x, narrow, wide_count, neg_wide_count,
+            after_wide, narrow_distance, adjustment, neg_adjustment,
+            n_offset, zero,
         ])
         m_block_id = block_ids.y
         n_block_id = n_offset.result()
