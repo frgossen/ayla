@@ -908,6 +908,12 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(
                 "tcgen05 async groups cannot mix packed and direct-TMA RHS layouts"
             )
+        hybrid_n_tiles = mms[0].attrs.get("hybrid_n_tiles")
+        if any(
+            mm.attrs.get("hybrid_n_tiles") != hybrid_n_tiles
+            for mm in mms[1:]
+        ):
+            raise ValueError("tcgen05 async groups must share hybrid-N controls")
         n = mms[0].rhs.type.sizes[0]
         if cta_group == 2 and (
             mms[0].rhs.type.attrs.get("tcgen05_layout")
@@ -925,6 +931,21 @@ class LowerToPtxTemplate(LoweringPass):
         # packed [K, N] cooperative layout.
         operands = [dst, lock]
         operand_names = ["dst", "lock"]
+        if hybrid_n_tiles is not None:
+            if (
+                not isinstance(hybrid_n_tiles, int)
+                or hybrid_n_tiles < 2
+                or cta_group != 1
+                or n != 256
+                or not direct_tma_layout
+            ):
+                raise ValueError(
+                    "hybrid-N tcgen05 requires a direct-TMA group-1 N256 tile"
+                )
+            # The final physical N tile is represented by two CTAs. Both load
+            # the same N256 B tile, then a uniform CTA predicate selects N128
+            # MMA width and the corresponding 16 KiB shared-memory half. This
+            # is launch-wave balancing, not persistent warp specialization.
         cluster_issue = ""
         if cta_group == 2:
             cluster_issue = textwrap.dedent("""\
@@ -951,11 +972,31 @@ class LowerToPtxTemplate(LoweringPass):
             # a persistent producer/consumer role: every warp still follows
             # the same surrounding load, compute-wait, and store pipeline.
             template += "@!${pred:issue} bra ${label:after_tcgen05_issue};\n"
+        if hybrid_n_tiles is not None:
+            narrow_idesc_value = ((m // 16) << 24) | ((128 // 8) << 17) | 0x490
+            half_instruction = (
+                f"shr.b32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                f"{hybrid_n_tiles.bit_length() - 1};"
+                if hybrid_n_tiles & (hybrid_n_tiles - 1) == 0
+                else (
+                    f"div.u32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                    f"{hybrid_n_tiles};"
+                )
+            )
+            template += textwrap.dedent(f"""\
+                mov.u32 ${{b32:hybrid_bid}}, %ctaid.x;
+                setp.ge.u32 ${{pred:narrow_n}}, ${{b32:hybrid_bid}}, {hybrid_n_tiles - 1};
+                @!${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, {idesc};
+                @${{pred:narrow_n}} mov.b32 ${{b32:idesc}}, 0x{narrow_idesc_value:08x};
+                __HALF_INSTRUCTION__
+                shl.b32 ${{b32:rhs_half_offset}}, ${{b32:rhs_half}}, 14;
+            """).replace("__HALF_INSTRUCTION__", half_instruction)
+        else:
+            template += f"mov.b32 ${{b32:idesc}}, {idesc};\n"
         template += textwrap.dedent("""\
-            mov.b32 ${b32:idesc}, __IDESC__;
             mov.b32 ${b32:disable}, 0;
             mov.pred ${pred:use_d}, -1;
-        """).replace("__IDESC__", idesc)
+        """)
         disable_vector = ", ".join(
             "${b32:disable}" for _ in range(4 * cta_group)
         )
@@ -970,10 +1011,17 @@ class LowerToPtxTemplate(LoweringPass):
             rhs_desc_const = "0x4000404000000000"
             operands.extend([lhs, rhs])
             operand_names.extend([f"lhs{i}", f"rhs{i}"])
+            rhs_ptr = f"${{b32:operand.rhs{i}.ptr}}"
+            if hybrid_n_tiles is not None:
+                template += (
+                    f"add.u32 ${{b32:rhs_ptr{i}}}, {rhs_ptr}, "
+                    "${b32:rhs_half_offset};\n"
+                )
+                rhs_ptr = f"${{b32:rhs_ptr{i}}}"
             template += textwrap.dedent(f"""\
                 bfe.u32 ${{b32:lhs_addr{i}}}, ${{b32:operand.lhs{i}.ptr}}, 4, 14;
                 cvt.u64.u32 ${{b64:lhs_desc{i}}}, ${{b32:lhs_addr{i}}};
-                bfe.u32 ${{b32:rhs_addr{i}}}, ${{b32:operand.rhs{i}.ptr}}, 4, 14;
+                bfe.u32 ${{b32:rhs_addr{i}}}, {rhs_ptr}, 4, 14;
                 cvt.u64.u32 ${{b64:rhs_desc{i}}}, ${{b32:rhs_addr{i}}};
                 or.b64 ${{b64:lhs_desc{i}}}, ${{b64:lhs_desc{i}}}, {lhs_desc_const};
                 or.b64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{i}}}, {rhs_desc_const};
@@ -1072,6 +1120,17 @@ class LowerToPtxTemplate(LoweringPass):
                 "64|128x64|128|256 f32 "
                 "tensor memory to row-strided f32/bf16 global memory"
             )
+        hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
+        if hybrid_n_tiles is not None and (
+            not isinstance(hybrid_n_tiles, int)
+            or hybrid_n_tiles < 2
+            or src_type.sizes[1] != 256
+            or dst_type.dtype.name != "bf16"
+        ):
+            raise ValueError(
+                "hybrid-N output requires at least two N tiles and a "
+                "256-column BF16 output tile"
+            )
         # M=128 uses all 32 lanes in each of the four tensor-memory datapaths.
         # The non-warp-specialized M=64 Layout F instead uses lanes 0..15 in
         # every datapath, so logical row = 16 * warp + lane. All four warps
@@ -1104,6 +1163,27 @@ class LowerToPtxTemplate(LoweringPass):
             mul.wide.u32 ${{b64:row_offset}}, ${{b32:row_index}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
         """)
+        operands = [self.value_map[op.dst], self.value_map[op.src]]
+        operand_names = ["dst", "src"]
+        if hybrid_n_tiles is not None:
+            half_instruction = (
+                f"shr.b32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                f"{hybrid_n_tiles.bit_length() - 1};"
+                if hybrid_n_tiles & (hybrid_n_tiles - 1) == 0
+                else (
+                    f"div.u32 ${{b32:rhs_half}}, ${{b32:hybrid_bid}}, "
+                    f"{hybrid_n_tiles};"
+                )
+            )
+            template += textwrap.dedent("""\
+                mov.u32 ${b32:hybrid_bid}, %ctaid.x;
+                setp.ge.u32 ${pred:hybrid_narrow}, ${b32:hybrid_bid}, __SPLIT_START__;
+                __HALF_INSTRUCTION__
+                mul.wide.u32 ${b64:hybrid_col_offset}, ${b32:rhs_half}, 256;
+                add.u64 ${b64:row}, ${b64:row}, ${b64:hybrid_col_offset};
+            """).replace(
+                "__SPLIT_START__", str(hybrid_n_tiles - 1),
+            ).replace("__HALF_INSTRUCTION__", half_instruction)
         for col in range(0, src_type.sizes[1], 64):
             if dst_type.dtype.name == "f32":
                 stores = "\n".join(
@@ -1137,10 +1217,16 @@ class LowerToPtxTemplate(LoweringPass):
                 tcgen05.wait::ld.sync.aligned;
                 {stores}
             """)
+            if hybrid_n_tiles is not None and col == 64:
+                template += (
+                    "@${pred:hybrid_narrow} bra ${label:hybrid_n_done};\n"
+                )
+        if hybrid_n_tiles is not None:
+            template += "${label:hybrid_n_done}:\n"
         new_op = PTXTemplateOp.build(
-            operands=[self.value_map[op.dst], self.value_map[op.src]],
+            operands=operands,
             result_types=[], template=template,
-            operand_names=["dst", "src"], result_names=[],
+            operand_names=operand_names, result_names=[],
             description=str(op),
         )
         return [new_op], []

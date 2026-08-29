@@ -294,6 +294,28 @@ def test_tcgen05_transposed_cta_grid_mapping():
     assert "%ctaid.x" in kernel.ptx and "%ctaid.y" in kernel.ptx
 
 
+def test_tcgen05_split_last_n_tile_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=128,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_last_n_tile=True,
+    ))
+
+    assert kernel.grid_dim == (17, 1, 1)
+    assert "0x08400490" in kernel.ptx
+    assert "0x08200490" in kernel.ptx
+    assert "shl.b32" in kernel.ptx
+    assert "setp.ge.u32" in kernel.ptx
+    assert "hybrid_n_done" not in kernel.ptx
+
+    with pytest.raises(ValueError, match="splitting the last N tile"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=256, k=128,
+            output_n_tile=128, operand_stages=8,
+            transpose_cta_grid=True, split_last_n_tile=True,
+        )
+
+
 def test_tcgen05_operand_l2_cache_hints():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=128, operand_stages=8,

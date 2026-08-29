@@ -14,6 +14,7 @@ from .gpu_dialect import (
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
+    IndexDivOp,
     IndexModOp,
     IndexMulOp,
     KernelOp,
@@ -47,6 +48,7 @@ def blackwell_tcgen05_gemm_module(
     cluster_multicast_a: bool = False,
     branch_tcgen05_issue: bool = True,
     transpose_cta_grid: bool = False,
+    split_last_n_tile: bool = False,
     lhs_l2_cache_hint: str | None = None,
     rhs_l2_cache_hint: str | None = None,
 ) -> ModuleOp:
@@ -88,6 +90,16 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires N divisible by 256")
     if cluster_multicast_a and transpose_cta_grid:
         raise ValueError("cluster A multicast requires the default CTA grid order")
+    if split_last_n_tile and (
+        tma_staging != "direct"
+        or output_n_tile != 256
+        or not transpose_cta_grid
+        or n // output_n_tile < 2
+    ):
+        raise ValueError(
+            "splitting the last N tile requires direct transposed-grid "
+            "N=256 staging with at least two N tiles"
+        )
     if lhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
         raise ValueError("unsupported lhs_l2_cache_hint")
     if rhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
@@ -98,8 +110,29 @@ def blackwell_tcgen05_gemm_module(
     bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
     c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
     block_ids = BlockIdsOp.build()
-    m_block_id = block_ids.y if transpose_cta_grid else block_ids.x
-    n_block_id = block_ids.x if transpose_cta_grid else block_ids.y
+    grid_index_ops = []
+    hybrid_n_tiles = None
+    if split_last_n_tile:
+        # Split only the final N256 tile into two N128 CTAs. For a 4096-wide
+        # output this changes 512 uniform CTAs into 544 mixed-width CTAs,
+        # reducing the severe two-CTA/SM tail-wave imbalance. Every CTA still
+        # executes the same load/compute/store pipeline; the uniform block id
+        # only selects its tcgen05 N extent and output half.
+        n_tiles = n // output_n_tile
+        n_tile_count = IndexConstantOp.build(n_tiles)
+        half = IndexDivOp.build(block_ids.x, n_tile_count.result())
+        minus_one = IndexConstantOp.build(-1)
+        neg_half = IndexMulOp.build(half.result(), minus_one.result())
+        logical_n = IndexAddOp.build(block_ids.x, neg_half.result())
+        grid_index_ops.extend([
+            n_tile_count, half, minus_one, neg_half, logical_n,
+        ])
+        m_block_id = block_ids.y
+        n_block_id = logical_n.result()
+        hybrid_n_tiles = n_tiles
+    else:
+        m_block_id = block_ids.y if transpose_cta_grid else block_ids.x
+        n_block_id = block_ids.x if transpose_cta_grid else block_ids.y
     a_block = TileOp.build(
         a, [m_block_id, 0],
         GmemTensorType.build([output_m_tile, k], bf16, strides=[k, 1]),
@@ -242,6 +275,8 @@ def blackwell_tcgen05_gemm_module(
             loop.body.ops.extend([lhs_tile, rhs_tile])
             mmas.append(MatmulOp.build(
                 lhs_tile.result(), rhs_tile.result(), accumulator.result(),
+                attrs={"hybrid_n_tiles": hybrid_n_tiles}
+                if hybrid_n_tiles is not None else None,
             ))
     else:
         loop = ForOp.build(0, k // 16, step=operand_stages)
@@ -300,6 +335,7 @@ def blackwell_tcgen05_gemm_module(
     ])
     body = Block(arguments=[a, bt, c], ops=[
         block_ids,
+        *grid_index_ops,
         a_block,
         bt_block,
         c_block,
@@ -311,14 +347,18 @@ def blackwell_tcgen05_gemm_module(
         mma_lock,
         *([tma_lock] if tma_lock is not None else []),
         loop,
-        MoveOp.build(c_block.result(), accumulator.result()),
+        MoveOp.build(
+            c_block.result(), accumulator.result(),
+            attrs={"hybrid_n_tiles": hybrid_n_tiles}
+            if hybrid_n_tiles is not None else None,
+        ),
         DeallocOp.build(accumulator.result()),
     ])
     return ModuleOp.build(Block(ops=[KernelOp.build(
         "blackwell_tcgen05_4096",
         body,
         grid_dim=(
-            (n // output_n_tile, m // output_m_tile, 1)
+            (n // output_n_tile + int(split_last_n_tile), m // output_m_tile, 1)
             if transpose_cta_grid else
             (m // output_m_tile, n // output_n_tile, 1)
         ),
