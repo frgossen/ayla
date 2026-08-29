@@ -1063,7 +1063,8 @@ class LowerToPtxTemplate(LoweringPass):
         # Each warp owns 32 tensor-memory lanes. Process 64 columns at a time
         # so the same register bank handles both 64- and 128-column outputs.
         row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
-        values = [f"${{b32:value{i}}}" for i in range(64)]
+        value_type = "f32" if dst_type.dtype.name == "bf16" else "b32"
+        values = [f"${{{value_type}:value{i}}}" for i in range(64)]
         load_values = ", ".join(values)
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:tid}}, %tid.x;
@@ -1086,12 +1087,10 @@ class LowerToPtxTemplate(LoweringPass):
                 for i in range(0, 64, 2):
                     packed_reg = f"${{b32:packed{i // 2}}}"
                     packed.append(packed_reg)
-                    conversions.extend([
-                        f"mov.b32 ${{f32:f{i}}}, {values[i]};",
-                        f"mov.b32 ${{f32:f{i + 1}}}, {values[i + 1]};",
+                    conversions.append(
                         f"cvt.rn.bf16x2.f32 {packed_reg}, "
-                        f"${{f32:f{i + 1}}}, ${{f32:f{i}}};",
-                    ])
+                        f"{values[i + 1]}, {values[i]};"
+                    )
                 stores = "\n".join([
                     *conversions,
                     *(

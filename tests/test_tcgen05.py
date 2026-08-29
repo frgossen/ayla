@@ -254,9 +254,14 @@ def test_tcgen05_gemm_tma_staging_lowering():
 
 def test_tcgen05_wide_tma_staging_lowering():
     ptx = _make_tcgen05_wide_tma_kernel().ptx
+    bf16_output_ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=64,
+    )).ptx
 
     assert ptx.count("cp.async.bulk.tensor.2d.shared::cluster.global") == 2
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 4
+    assert "tcgen05.ld.sync.aligned.32x32b.x64.b32 {%f" in bf16_output_ptx
+    assert "mov.b32 %f" not in bf16_output_ptx
 
 
 def test_tcgen05_cta_group2_lowering():
