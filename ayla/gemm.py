@@ -69,12 +69,16 @@ def blackwell_tcgen05_gemm_module(
     output_l2_eviction_priority: str | None = None,
     output_tmem_load_shape: str = "32x32b",
     persistent_n_pairs: bool = False,
+    lean_bookkeeping: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
     Each CTA computes one MxN output tile. All four warps cooperatively
     stage both operands and read the tensor-memory accumulator; only the
     elected issue sequence required by ``tcgen05.mma`` is single-threaded.
+    ``lean_bookkeeping`` preserves that shared software pipeline while
+    reusing its statically elected thread-zero predicate, deriving adjacent
+    K16 descriptors, and joining the already-overlapped next-A0/B0 completion.
     With ``cluster_multicast_a``, paired CTAs still execute this same pipeline;
     cluster rank 0 only performs the instruction-mandated issue of their shared
     A transaction, while each CTA independently loads B and computes its tile.
@@ -264,6 +268,16 @@ def blackwell_tcgen05_gemm_module(
             "next-iteration RHS prefetch requires next-iteration LHS "
             "prefetch and split direct N=232/N=240/N=248/N=256 RHS "
             "transactions"
+        )
+    if lean_bookkeeping and (
+        not prefetch_rhs_next
+        or not branch_tcgen05_issue
+        or tma_staging != "direct"
+        or operand_stages != 8
+    ):
+        raise ValueError(
+            "lean bookkeeping requires the branched direct K128 pipeline "
+            "with next-iteration LHS and RHS prefetch"
         )
 
     bf16 = BF16Type()
@@ -479,8 +493,9 @@ def blackwell_tcgen05_gemm_module(
         second_tma_lock = AllocOp.build_with_fresh_id(
             LockType.build(kind="mbar")
         )
-        prefetch_tma_lock = AllocOp.build_with_fresh_id(
-            LockType.build(kind="mbar")
+        prefetch_tma_lock = (
+            None if lean_bookkeeping else
+            AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
         )
         half_mma_lock = (
             AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
@@ -490,8 +505,11 @@ def blackwell_tcgen05_gemm_module(
     if tma_staging == "direct" and prefetch_lhs_next:
         assert tma_lock is not None
         assert second_tma_lock is not None
-        assert prefetch_tma_lock is not None
         assert len(lhs_smem) == 3 and len(rhs_smem) == 2
+
+        issue_attrs = (
+            {"issue_by_thread_zero": True} if lean_bookkeeping else {}
+        )
 
         lhs_move_attrs = {
             "tma": True,
@@ -591,14 +609,18 @@ def blackwell_tcgen05_gemm_module(
             if bank_moves[0]:
                 ops.append(AsyncOp.build(
                     tma_lock.result(), body=Block(ops=bank_moves[0]),
+                    attrs=issue_attrs,
                 ))
             ops.append(AsyncOp.build(
                 second_tma_lock.result(), body=Block(ops=bank_moves[1]),
+                attrs=issue_attrs,
             ))
             if not load_a0:
                 # The A0 tile was launched after the prior iteration's tcgen
                 # commit. Every warp observes its completion before use.
-                ops.append(AwaitOp.build(prefetch_tma_lock.result()))
+                if not lean_bookkeeping:
+                    assert prefetch_tma_lock is not None
+                    ops.append(AwaitOp.build(prefetch_tma_lock.result()))
             ops.append(AwaitOp.build(tma_lock.result()))
 
             mmas = []
@@ -635,10 +657,16 @@ def blackwell_tcgen05_gemm_module(
                     lhs_tile.result(), rhs_tile.result(), accumulator.result(),
                     attrs=mma_attrs or None, controls=hybrid_controls,
                 ))
+            mma_attrs = {
+                **issue_attrs,
+                **({"derive_tcgen05_descriptors": True}
+                   if lean_bookkeeping else {}),
+                **({"branch_elected_issue": True}
+                   if branch_tcgen05_issue else {}),
+            }
             ops.append(AsyncOp.build(
                 mma_lock.result(), body=Block(ops=mmas),
-                attrs={"branch_elected_issue": True}
-                if branch_tcgen05_issue else None,
+                attrs=mma_attrs,
             ))
 
             if issue_next_a0:
@@ -655,11 +683,23 @@ def blackwell_tcgen05_gemm_module(
                     next_k,
                     next_a_tile,
                     AsyncOp.build(
-                        prefetch_tma_lock.result(),
+                        (
+                            tma_lock.result() if lean_bookkeeping else
+                            prefetch_tma_lock.result()
+                        ),
                         body=Block(ops=[MoveOp.build(
                             free_buffer, next_a_tile.result(),
                             attrs=lhs_move_attrs,
                         )]),
+                        attrs={
+                            **issue_attrs,
+                            # A TMA transaction may name an initialized but
+                            # not-yet-armed mbarrier. B0 later supplies the one
+                            # arrive whose expected byte count covers both
+                            # transactions; no warp gains a persistent role.
+                            **({"defer_tma_arrival": True}
+                               if lean_bookkeeping else {}),
+                        },
                     ),
                 ])
                 if prefetch_rhs_next:
@@ -695,6 +735,11 @@ def blackwell_tcgen05_gemm_module(
                         ))
                     ops.append(AsyncOp.build(
                         tma_lock.result(), body=Block(ops=next_rhs_moves),
+                        attrs={
+                            **issue_attrs,
+                            **({"tma_extra_expected_bytes": 16384}
+                               if lean_bookkeeping else {}),
+                        },
                     ))
             ops.append(AwaitOp.build(mma_lock.result()))
             return ops
@@ -1133,6 +1178,8 @@ def blackwell_tcgen05_gemm_module(
         block_dim=(128, 1, 1),
         cluster_dim=(1, 2, 1) if cluster_multicast_a else None,
         ptx_optimization_level=ptx_optimization_level,
+        attrs={"hoist_thread_zero_issue": True}
+        if lean_bookkeeping else None,
     )]), target=BLACKWELL)
 
 

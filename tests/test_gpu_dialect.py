@@ -23,6 +23,7 @@ from ayla.gpu_dialect import (
     LockType,
     MoveOp,
     PartialSplitBlockIdsOp,
+    PredicateType,
     SplitNBlockIdOp,
     SmemTensorType,
     TmaDescType,
@@ -108,6 +109,18 @@ def test_kernel_cluster_dimension_roundtrip():
     )
     with pytest.raises(ValueError, match="cluster_dim entries must be positive"):
         KernelOp.build("invalid", Block(), cluster_dim=(0, 1, 1))
+
+
+def test_predicate_type_roundtrip():
+    op = PTXTemplateOp.build(
+        [], [PredicateType()],
+        template="setp.eq.u32 ${pred:result[0].val}, 0, 0;\n",
+    )
+    assert_print_and_roundtrip(
+        op,
+        "%0: predicate = ptx_template() attrs={template: "
+        '"setp.eq.u32 ${pred:result[0].val}, 0, 0;\\n"}',
+    )
 
 
 def test_partial_split_block_ids_roundtrip_and_validation():

@@ -583,6 +583,70 @@ def test_tcgen05_persistent_balanced_n_pairs_lowering():
         make_ptx_kernel(invalid)
 
 
+def test_tcgen05_lean_bookkeeping_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+    ))
+    ptx = kernel.ptx
+
+    # One predicate, formed next to the required warp-collective tmem alloc,
+    # serves every instruction-mandated single-thread issue site. The four
+    # non-root descriptors in each K64 bank are integer recurrences from the
+    # root descriptor, and next A0/B0 share one 45 KiB completion phase.
+    assert ptx.count("elect.sync") == 0
+    assert ptx.count(".shared .align 8 .b64") == 4
+    assert ptx.count("mbarrier.arrive.expect_tx") == 4
+    assert ptx.count("], 46080;") == 4
+    assert ptx.count("], 16384;") == 0
+    assert ptx.count("add.u64") == 35
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 16
+
+    with pytest.raises(ValueError, match="lean bookkeeping requires"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=256,
+            output_n_tile=232, balanced_n_tile=224,
+            operand_stages=8, transpose_cta_grid=True,
+            split_tma_barriers=True, split_rhs_tma=True,
+            prefetch_lhs_next=True, prefetch_rhs_next=False,
+            persistent_n_pairs=True, lean_bookkeeping=True,
+        )
+
+    invalid_arrival = blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        persistent_n_pairs=True, lean_bookkeeping=True,
+    )
+    deferred = next(
+        op for op in iter_ops(invalid_arrival)
+        if isinstance(op, AsyncOp) and op.attrs.get("defer_tma_arrival")
+    )
+    deferred.attrs["tma_extra_expected_bytes"] = 1
+    with pytest.raises(ValueError, match="deferred TMA arrival"):
+        make_ptx_kernel(invalid_arrival)
+
+    invalid_descriptors = blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=64,
+        output_n_tile=128, operand_stages=4,
+    )
+    mma_group = next(
+        op for op in iter_ops(invalid_descriptors)
+        if isinstance(op, AsyncOp)
+        and any(isinstance(body_op, MatmulOp) for body_op in op.body.ops)
+    )
+    mma_group.attrs["derive_tcgen05_descriptors"] = True
+    with pytest.raises(ValueError, match="eight direct-TMA matmuls"):
+        make_ptx_kernel(invalid_descriptors)
+
+
 def test_tcgen05_next_lhs_prefetch_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=512, k=4096,

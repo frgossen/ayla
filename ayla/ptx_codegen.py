@@ -19,6 +19,7 @@ from .gpu_dialect import (
     ForOp,
     LockType,
     ModuleOp,
+    PredicateType,
     PTXTemplateOp,
     PtrAddOp,
     PtrType,
@@ -138,6 +139,11 @@ def map_type_to_registers(type):
     if isinstance(type, IndexType):
         return TypeRegisterMapping(
             member_register_types=PtxType.B32,
+            member_names="val",
+        )
+    if isinstance(type, PredicateType):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.PRED,
             member_names="val",
         )
     if isinstance(type, TmaDescType):

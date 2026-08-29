@@ -17,4 +17,5 @@ def blackwell_tcgen05_4096_module():
         output_l2_eviction_priority="evict_first",
         output_tmem_load_shape="16x32bx2",
         persistent_n_pairs=True,
+        lean_bookkeeping=True,
     )

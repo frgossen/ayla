@@ -35,6 +35,7 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     PartialSplitBlockIdsOp,
+    PredicateType,
     SplitNBlockIdOp,
     PTXTemplateOp,
     PtrAddOp,
@@ -64,6 +65,8 @@ class LowerToPtxTemplate(LoweringPass):
         super().__init__()
         self.target = target
         self.cache_policy_values: dict[str, Value] = {}
+        self.hoist_thread_zero_issue = False
+        self.thread_zero_issuer: Value | None = None
 
     @lowers(PartialSplitBlockIdsOp)
     def lower_partial_split_block_ids(
@@ -128,6 +131,10 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
+        self.hoist_thread_zero_issue = bool(
+            op.attrs.get("hoist_thread_zero_issue")
+        )
+        self.thread_zero_issuer = None
         # TODO: Materialize cache policies in an earlier pass, potentially
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({
@@ -154,6 +161,10 @@ class LowerToPtxTemplate(LoweringPass):
             op.body.ops.insert(0, policy_op)
             self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
         self.lower_block(op.body)
+        if self.hoist_thread_zero_issue and self.thread_zero_issuer is None:
+            raise ValueError(
+                "hoisted thread-zero issue requires tensor-memory allocation"
+            )
         return [op], []
 
     def _tma_instruction(
@@ -286,9 +297,23 @@ class LowerToPtxTemplate(LoweringPass):
         # tcgen05.alloc is warp-collective. Warp 0 briefly performs the required
         # issue sequence in each participating CTA; it is not assigned a
         # persistent pipeline role.
+        result_types: list = [result_type]
+        result_names = ["dst"]
+        issuer_line = ""
+        if self.hoist_thread_zero_issue:
+            # Reuse the tid read already required by warp-collective tmem
+            # allocation. Thread zero is only the ISA-mandated instruction
+            # issuer; all warps still execute the same surrounding pipeline.
+            result_types.append(PredicateType())
+            result_names.append("thread_zero")
+            issuer_line = (
+                "setp.eq.u32 ${pred:result.thread_zero.val}, "
+                "${b32:tmem_tid}, 0;\n"
+            )
         template = textwrap.dedent(f"""\
             .shared .align 4 .b32 ${{smem:tmem_addr}}[1];
             mov.u32 ${{b32:tmem_tid}}, %tid.x;
+            {issuer_line}
             setp.lt.u32 ${{pred:tmem_warp0}}, ${{b32:tmem_tid}}, 32;
             @${{pred:tmem_warp0}} tcgen05.alloc.cta_group::{cta_group}.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {result_type.columns};
             bar.sync 0;
@@ -329,9 +354,11 @@ class LowerToPtxTemplate(LoweringPass):
                 fence.proxy.async.shared::cta;
             """)
         new_op = PTXTemplateOp.build(
-            operands=[], result_types=[result_type], template=template,
-            operand_names=[], result_names=["dst"], description=str(op),
+            operands=[], result_types=result_types, template=template,
+            operand_names=[], result_names=result_names, description=str(op),
         )
+        if self.hoist_thread_zero_issue:
+            self.thread_zero_issuer = new_op.results[1]
         return [new_op], [new_op.result()]
 
     @lowers(DeallocOp)
@@ -1092,6 +1119,20 @@ class LowerToPtxTemplate(LoweringPass):
         # packed [K, N] cooperative layout.
         operands = [dst, lock]
         operand_names = ["dst", "lock"]
+        issue_by_thread_zero = bool(op.attrs.get("issue_by_thread_zero"))
+        if issue_by_thread_zero:
+            if cta_group != 1:
+                raise NotImplementedError(
+                    "hoisted thread-zero tcgen05 issue currently supports "
+                    "only cta_group 1"
+                )
+            if self.thread_zero_issuer is None:
+                raise ValueError(
+                    "thread-zero tcgen05 issue requires a hoisted issuer "
+                    "predicate"
+                )
+            operands.append(self.thread_zero_issuer)
+            operand_names.append("issuer")
         if input_wait is not None:
             operands.append(self.value_map[input_wait.lock])
             operand_names.append("input_lock")
@@ -1166,13 +1207,15 @@ class LowerToPtxTemplate(LoweringPass):
             """)
         template = textwrap.dedent("""\
             fence.proxy.async.shared::cta;
-        """) + cluster_issue + textwrap.dedent("""\
-            mov.u32 ${b32:tid}, %tid.x;
-            shr.u32 ${b32:warp}, ${b32:tid}, 5;
-            setp.eq.u32 ${pred:warp0}, ${b32:warp}, 0;
-            elect.sync ${b32:elected_lane}|${pred:elected}, -1;
-            and.pred ${pred:issue}, ${pred:warp0}, ${pred:elected};
-        """)
+        """) + cluster_issue
+        if not issue_by_thread_zero:
+            template += textwrap.dedent("""\
+                mov.u32 ${b32:tid}, %tid.x;
+                shr.u32 ${b32:warp}, ${b32:tid}, 5;
+                setp.eq.u32 ${pred:warp0}, ${b32:warp}, 0;
+                elect.sync ${b32:elected_lane}|${pred:elected}, -1;
+                and.pred ${pred:issue}, ${pred:warp0}, ${pred:elected};
+            """)
         if cta_group == 2:
             template += "and.pred ${pred:issue}, ${pred:issue}, ${pred:cluster_even};\n"
         if op.attrs.get("branch_elected_issue"):
@@ -1232,6 +1275,13 @@ class LowerToPtxTemplate(LoweringPass):
         disable_vector = ", ".join(
             "${b32:disable}" for _ in range(4 * cta_group)
         )
+        derive_descriptors = bool(
+            op.attrs.get("derive_tcgen05_descriptors")
+        )
+        if derive_descriptors and (not direct_tma_layout or len(mms) != 8):
+            raise ValueError(
+                "derived tcgen05 descriptors require eight direct-TMA matmuls"
+            )
         mma_index = 0
         for body_op in body_ops:
             if isinstance(body_op, AsyncCommitOp):
@@ -1255,30 +1305,66 @@ class LowerToPtxTemplate(LoweringPass):
             mm = body_op
             i = mma_index
             mma_index += 1
-            lhs = self.value_map[mm.lhs]
-            rhs = self.value_map[mm.rhs]
-            lhs_desc_const = (
-                "0xc000401000000000"
-                if mm.lhs.type.swizzle == "32B"
-                else "0x4000404000000000"
-            )
-            rhs_desc_const = "0x4000404000000000"
-            operands.extend([lhs, rhs])
-            operand_names.extend([f"lhs{i}", f"rhs{i}"])
-            rhs_ptr = f"${{b32:operand.rhs{i}.ptr}}"
-            if hybrid_n_tiles is not None:
-                template += (
-                    f"add.u32 ${{b32:rhs_ptr{i}}}, {rhs_ptr}, "
-                    "${b32:rhs_half_offset};\n"
+            descriptor_root = i - i % 4
+            if derive_descriptors and i != descriptor_root:
+                root_mm = mms[descriptor_root]
+                lhs_tile = mm.lhs.definition
+                rhs_tile = mm.rhs.definition
+                root_lhs_tile = root_mm.lhs.definition
+                root_rhs_tile = root_mm.rhs.definition
+                if not all(isinstance(tile, TileOp) for tile in (
+                    lhs_tile, rhs_tile, root_lhs_tile, root_rhs_tile,
+                )):
+                    raise ValueError(
+                        "derived tcgen05 descriptors require tiled operands"
+                    )
+                stage = i % 4
+                if (
+                    lhs_tile.indices != [0, stage]
+                    or rhs_tile.indices != [0, stage]
+                    or root_lhs_tile.indices != [0, 0]
+                    or root_rhs_tile.indices != [0, 0]
+                    or root_buffer(mm.lhs) is not root_buffer(root_mm.lhs)
+                    or root_buffer(mm.rhs) is not root_buffer(root_mm.rhs)
+                ):
+                    raise ValueError(
+                        "derived tcgen05 descriptors require contiguous K16 "
+                        "stages within each K64 operand bank"
+                    )
+                increment = 2 * stage
+                # A direct-TMA K16 tile advances by 32 shared-memory bytes;
+                # tcgen05 descriptors encode addresses in 16-byte units.
+                template += textwrap.dedent(f"""\
+                    add.u64 ${{b64:lhs_desc{i}}}, ${{b64:lhs_desc{descriptor_root}}}, {increment};
+                    add.u64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{descriptor_root}}}, {increment};
+                """)
+            else:
+                lhs = self.value_map[mm.lhs]
+                rhs = self.value_map[mm.rhs]
+                lhs_desc_const = (
+                    "0xc000401000000000"
+                    if mm.lhs.type.swizzle == "32B"
+                    else "0x4000404000000000"
                 )
-                rhs_ptr = f"${{b32:rhs_ptr{i}}}"
+                rhs_desc_const = "0x4000404000000000"
+                operands.extend([lhs, rhs])
+                operand_names.extend([f"lhs{i}", f"rhs{i}"])
+                rhs_ptr = f"${{b32:operand.rhs{i}.ptr}}"
+                if hybrid_n_tiles is not None:
+                    template += (
+                        f"add.u32 ${{b32:rhs_ptr{i}}}, {rhs_ptr}, "
+                        "${b32:rhs_half_offset};\n"
+                    )
+                    rhs_ptr = f"${{b32:rhs_ptr{i}}}"
+                template += textwrap.dedent(f"""\
+                    bfe.u32 ${{b32:lhs_addr{i}}}, ${{b32:operand.lhs{i}.ptr}}, 4, 14;
+                    cvt.u64.u32 ${{b64:lhs_desc{i}}}, ${{b32:lhs_addr{i}}};
+                    bfe.u32 ${{b32:rhs_addr{i}}}, {rhs_ptr}, 4, 14;
+                    cvt.u64.u32 ${{b64:rhs_desc{i}}}, ${{b32:rhs_addr{i}}};
+                    or.b64 ${{b64:lhs_desc{i}}}, ${{b64:lhs_desc{i}}}, {lhs_desc_const};
+                    or.b64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{i}}}, {rhs_desc_const};
+                """)
             template += textwrap.dedent(f"""\
-                bfe.u32 ${{b32:lhs_addr{i}}}, ${{b32:operand.lhs{i}.ptr}}, 4, 14;
-                cvt.u64.u32 ${{b64:lhs_desc{i}}}, ${{b32:lhs_addr{i}}};
-                bfe.u32 ${{b32:rhs_addr{i}}}, {rhs_ptr}, 4, 14;
-                cvt.u64.u32 ${{b64:rhs_desc{i}}}, ${{b32:rhs_addr{i}}};
-                or.b64 ${{b64:lhs_desc{i}}}, ${{b64:lhs_desc{i}}}, {lhs_desc_const};
-                or.b64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{i}}}, {rhs_desc_const};
                 @${{pred:issue}} tcgen05.mma.cta_group::{cta_group}.kind::f16
                     [${{b32:operand.dst.ptr}}], ${{b64:lhs_desc{i}}}, ${{b64:rhs_desc{i}}},
                     ${{b32:idesc}},
@@ -1300,6 +1386,10 @@ class LowerToPtxTemplate(LoweringPass):
             """)
         if op.attrs.get("branch_elected_issue") or input_wait is not None:
             template += "${label:after_tcgen05_issue}:\n"
+        if issue_by_thread_zero:
+            template = template.replace(
+                "${pred:issue}", "${pred:operand.issuer.val}"
+            )
         new_op = PTXTemplateOp.build(
             operands=operands, result_types=[], template=template,
             operand_names=operand_names, result_names=[],
@@ -2793,6 +2883,22 @@ class LowerToPtxTemplate(LoweringPass):
 
         operands: list[Value] = [lock_value]
         operand_names: list[str] = ["lock"]
+        issue_by_thread_zero = bool(op.attrs.get("issue_by_thread_zero"))
+        if issue_by_thread_zero:
+            if self.thread_zero_issuer is None:
+                raise ValueError(
+                    "thread-zero TMA issue requires a hoisted issuer predicate"
+                )
+            operands.append(self.thread_zero_issuer)
+            operand_names.append("issuer")
+        defer_arrival = bool(op.attrs.get("defer_tma_arrival"))
+        extra_expected_bytes = op.attrs.get("tma_extra_expected_bytes", 0)
+        if type(extra_expected_bytes) is not int or extra_expected_bytes < 0:
+            raise ValueError("tma_extra_expected_bytes must be nonnegative")
+        if defer_arrival and extra_expected_bytes:
+            raise ValueError(
+                "a deferred TMA arrival cannot also add expected bytes"
+            )
         total_bytes = 0
         load_lines: list[str] = []
         has_cluster_leader_load = any(
@@ -2855,6 +2961,24 @@ class LowerToPtxTemplate(LoweringPass):
         # in the cluster must rendezvous before the elected CTA can overwrite it.
         # On the first iteration this same rendezvous makes every remote
         # mbarrier initialization visible before the multicast transaction.
+        total_bytes += extra_expected_bytes
+        issuer_lines = (
+            ["@!${pred:operand.issuer.val} bra ${label:after_load};"]
+            if issue_by_thread_zero else
+            [
+                "mov.u32 ${b32:tid_x}, %tid.x;",
+                "mov.u32 ${b32:tid_y}, %tid.y;",
+                "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
+                "mov.u32 ${b32:tid_z}, %tid.z;",
+                "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};",
+                "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
+                "@${pred:not_t0} bra ${label:after_load};",
+            ]
+        )
+        arrival_lines = [] if defer_arrival else [
+            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
+            f"[${{b32:operand.lock.val}}], {total_bytes};",
+        ]
         lines = [
             *(
                 [
@@ -2863,13 +2987,7 @@ class LowerToPtxTemplate(LoweringPass):
                 ]
                 if has_cluster_leader_load else []
             ),
-            "mov.u32 ${b32:tid_x}, %tid.x;",
-            "mov.u32 ${b32:tid_y}, %tid.y;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
-            "mov.u32 ${b32:tid_z}, %tid.z;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};",
-            "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
-            "@${pred:not_t0} bra ${label:after_load};",
+            *issuer_lines,
             *(
                 [
                     "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;",
@@ -2878,8 +2996,7 @@ class LowerToPtxTemplate(LoweringPass):
                 if has_cluster_leader_load else []
             ),
             *load_lines,
-            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
-            f"[${{b32:operand.lock.val}}], {total_bytes};",
+            *arrival_lines,
             "${label:after_load}:",
         ]
         template = "\n".join(lines) + "\n"

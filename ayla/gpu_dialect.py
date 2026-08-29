@@ -1575,6 +1575,11 @@ class IndexType(Type):
     pass
 
 
+@gpu_dialect.register_type("predicate")
+class PredicateType(Type):
+    """A scalar PTX predicate used by target-specific lowering."""
+
+
 @gpu_dialect.register_type("f16")
 class F16Type(Type):
     byte_size = 2
