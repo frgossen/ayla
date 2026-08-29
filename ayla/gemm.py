@@ -75,8 +75,8 @@ def blackwell_tcgen05_gemm_module(
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
-    if output_n_tile not in (64, 128, 248, 256):
-        raise ValueError("output_n_tile must be 64, 128, 248, or 256")
+    if output_n_tile not in (64, 128, 240, 248, 256):
+        raise ValueError("output_n_tile must be 64, 128, 240, 248, or 256")
     if m % output_m_tile or k % 16:
         raise ValueError(
             "tcgen05 GEMM dimensions must divide the M and K tile sizes"
@@ -85,12 +85,15 @@ def blackwell_tcgen05_gemm_module(
         if n % output_n_tile:
             raise ValueError("N must divide the requested tcgen05 output tile")
     elif (
-        tail_n_tile != 128
+        not isinstance(tail_n_tile, int)
+        or tail_n_tile % 8
+        or tail_n_tile < 8
         or tail_n_tile >= output_n_tile
         or n % output_n_tile != tail_n_tile
     ):
         raise ValueError(
-            "tail_n_tile must be 128 and match N's remainder"
+            "tail_n_tile must be a positive 8-column multiple smaller than "
+            "the output tile and match N's remainder"
         )
     if operand_stages < 1 or k % (16 * operand_stages):
         raise ValueError("K must divide the requested tcgen05 operand stages")
@@ -174,11 +177,11 @@ def blackwell_tcgen05_gemm_module(
             "split TMA barriers require direct eight-stage non-multicast staging"
         )
     if split_rhs_tma and (
-        tma_staging != "direct" or output_n_tile not in (248, 256)
+        tma_staging != "direct" or output_n_tile not in (240, 248, 256)
     ):
         raise ValueError(
-            "split RHS TMA transactions require direct N=256 staging or "
-            "direct N=248 staging"
+            "split RHS TMA transactions require direct N=240/N=248/N=256 "
+            "staging"
         )
     if prefetch_lhs_next and (
         tma_staging != "direct"
@@ -194,11 +197,11 @@ def blackwell_tcgen05_gemm_module(
     if prefetch_rhs_next and (
         not prefetch_lhs_next
         or not split_rhs_tma
-        or output_n_tile not in (248, 256)
+        or output_n_tile not in (240, 248, 256)
     ):
         raise ValueError(
             "next-iteration RHS prefetch requires next-iteration LHS "
-            "prefetch and split direct N=248/N=256 RHS transactions"
+            "prefetch and split direct N=240/N=248/N=256 RHS transactions"
         )
 
     bf16 = BF16Type()
@@ -208,6 +211,7 @@ def blackwell_tcgen05_gemm_module(
     block_ids = BlockIdsOp.build()
     grid_index_ops = [block_ids]
     hybrid_n_tiles = None
+    hybrid_n_width = None
     hybrid_split_rows = None
     hybrid_split_tile = None
     hybrid_controls = None
@@ -223,6 +227,7 @@ def blackwell_tcgen05_gemm_module(
         m_block_id = block_ids.y
         n_block_id = block_ids.x
         hybrid_n_tiles = n_tiles
+        hybrid_n_width = tail_n_tile
         hybrid_split_tile = n_tiles - 1
         hybrid_controls = [narrow.result(), zero.result()]
     elif split_last_n_tile_rows is not None:
@@ -237,6 +242,7 @@ def blackwell_tcgen05_gemm_module(
         m_block_id = partial_ids.m
         n_block_id = partial_ids.n
         hybrid_n_tiles = n_tiles
+        hybrid_n_width = output_n_tile // 2
         hybrid_split_rows = split_last_n_tile_rows
         hybrid_controls = [partial_ids.narrow, partial_ids.half]
     elif split_n_tile is not None:
@@ -247,6 +253,7 @@ def blackwell_tcgen05_gemm_module(
         m_block_id = block_ids.y
         n_block_id = split_ids.n
         hybrid_n_tiles = n_tiles
+        hybrid_n_width = output_n_tile // 2
         hybrid_split_tile = split_n_tile
         hybrid_controls = [split_ids.narrow, split_ids.half]
     elif split_last_n_tile:
@@ -266,6 +273,7 @@ def blackwell_tcgen05_gemm_module(
         m_block_id = block_ids.y
         n_block_id = logical_n.result()
         hybrid_n_tiles = n_tiles
+        hybrid_n_width = output_n_tile // 2
     else:
         m_block_id = block_ids.y if transpose_cta_grid else block_ids.x
         n_block_id = block_ids.x if transpose_cta_grid else block_ids.y
@@ -286,7 +294,7 @@ def blackwell_tcgen05_gemm_module(
     accumulator = AllocOp.build_with_fresh_id(
         TmemTensorType.build(
             [output_m_tile, output_n_tile], F32Type(),
-            columns=256 if output_n_tile == 248 else output_n_tile,
+            columns=256 if output_n_tile in (240, 248) else output_n_tile,
         ),
         init=0.0,
     )
@@ -344,6 +352,7 @@ def blackwell_tcgen05_gemm_module(
         hybrid_attrs = (
             {
                 "hybrid_n_tiles": hybrid_n_tiles,
+                "hybrid_n_width": hybrid_n_width,
                 **({"hybrid_split_rows": hybrid_split_rows}
                    if hybrid_split_rows is not None else {}),
                 **({"hybrid_split_tile": hybrid_split_tile}
@@ -684,10 +693,10 @@ def blackwell_tcgen05_gemm_module(
                    if rhs_l2_promotion else {}),
             }
             if split_rhs_tma:
-                # Two 16 KiB N128 requests complete slightly sooner than one
-                # 32 KiB N256 request on B200. They share the bank mbarrier,
-                # so the software pipeline and its synchronization are
-                # unchanged and all four warps still follow the same stages.
+                # Two half-width requests complete sooner than one wide
+                # request on B200. They share the bank mbarrier, so the
+                # software pipeline and its synchronization are unchanged and
+                # all four warps still follow the same stages.
                 rhs_moves = []
                 for n_half in range(2):
                     bt_tile = TileOp.build(
@@ -770,6 +779,7 @@ def blackwell_tcgen05_gemm_module(
             hybrid_attrs = (
                 {
                     "hybrid_n_tiles": hybrid_n_tiles,
+                    "hybrid_n_width": hybrid_n_width,
                     **({"hybrid_split_rows": hybrid_split_rows}
                        if hybrid_split_rows is not None else {}),
                     **({"hybrid_split_tile": hybrid_split_tile}
@@ -877,6 +887,7 @@ def blackwell_tcgen05_gemm_module(
             attrs=(
                 {
                     "hybrid_n_tiles": hybrid_n_tiles,
+                    "hybrid_n_width": hybrid_n_width,
                     **({"hybrid_split_rows": hybrid_split_rows}
                        if hybrid_split_rows is not None else {}),
                     **({"hybrid_split_tile": hybrid_split_tile}

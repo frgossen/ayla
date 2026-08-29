@@ -329,7 +329,7 @@ def test_tcgen05_split_rhs_tma_lowering():
     assert input_descs[0].tile_sizes == (128, 64)
     assert input_descs[1].tile_sizes == (128, 64)
 
-    with pytest.raises(ValueError, match="direct N=256 staging"):
+    with pytest.raises(ValueError, match="direct N=240/N=248/N=256 staging"):
         blackwell_tcgen05_gemm_module(
             m=128, n=128, k=64,
             output_n_tile=128, split_rhs_tma=True,
@@ -358,12 +358,34 @@ def test_tcgen05_n248_tail_lowering():
     assert "st.global.v8.b32" in kernel.ptx
     assert "st.global.v4.b32" in kernel.ptx
 
-    with pytest.raises(ValueError, match="must be 128"):
+    with pytest.raises(ValueError, match="positive 8-column multiple"):
         blackwell_tcgen05_gemm_module(
             m=128, n=4096, k=256,
-            output_n_tile=248, tail_n_tile=64,
+            output_n_tile=248, tail_n_tile=66,
             transpose_cta_grid=True,
         )
+
+
+def test_tcgen05_n240_tail16_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=240, tail_n_tile=16,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+
+    assert kernel.grid_dim == (18, 1, 1)
+    assert input_descs[1].tile_sizes == (120, 64)
+    assert "0x083c0490" in kernel.ptx  # M128/N240
+    assert "0x08040490" in kernel.ptx  # M128/N16 tail
+    # Fifteen stores cover the full N240 tile; the sixteenth is the N16
+    # partial-chunk path selected only by the tail CTA.
+    assert kernel.ptx.count("st.global.v8.b32") == 16
 
 
 def test_tcgen05_next_lhs_prefetch_lowering():

@@ -1042,11 +1042,13 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 async groups cannot mix packed and direct-TMA RHS layouts"
             )
         hybrid_n_tiles = mms[0].attrs.get("hybrid_n_tiles")
+        hybrid_n_width = mms[0].attrs.get("hybrid_n_width")
         hybrid_split_rows = mms[0].attrs.get("hybrid_split_rows")
         hybrid_split_tile = mms[0].attrs.get("hybrid_split_tile")
         if any(
             (
                 mm.attrs.get("hybrid_n_tiles") != hybrid_n_tiles
+                or mm.attrs.get("hybrid_n_width") != hybrid_n_width
                 or mm.attrs.get("hybrid_split_rows") != hybrid_split_rows
                 or mm.attrs.get("hybrid_split_tile") != hybrid_split_tile
                 or mm.controls != mms[0].controls
@@ -1085,11 +1087,15 @@ class LowerToPtxTemplate(LoweringPass):
                 not isinstance(hybrid_n_tiles, int)
                 or hybrid_n_tiles < 2
                 or cta_group != 1
-                or n not in (248, 256)
+                or n not in (240, 248, 256)
+                or not isinstance(hybrid_n_width, int)
+                or hybrid_n_width % 8
+                or not 8 <= hybrid_n_width < n
                 or not direct_tma_layout
             ):
                 raise ValueError(
-                    "hybrid-N tcgen05 requires a direct-TMA group-1 N256 tile"
+                    "hybrid-N tcgen05 requires a direct-TMA group-1 "
+                    "N240/N248/N256 tile and a valid narrow width"
                 )
             if hybrid_split_rows is not None or hybrid_split_tile is not None:
                 if (
@@ -1157,7 +1163,12 @@ class LowerToPtxTemplate(LoweringPass):
             )
             template += f"@!${{pred:issue}} bra ${{label:{branch_target}}};\n"
         if hybrid_n_tiles is not None:
-            narrow_idesc_value = ((m // 16) << 24) | ((128 // 8) << 17) | 0x490
+            assert isinstance(hybrid_n_width, int)
+            narrow_idesc_value = (
+                ((m // 16) << 24)
+                | ((hybrid_n_width // 8) << 17)
+                | 0x490
+            )
             if hybrid_split_rows is not None or hybrid_split_tile is not None:
                 template += textwrap.dedent(f"""\
                     setp.ne.u32 ${{pred:narrow_n}}, ${{b32:operand.hybrid_narrow.val}}, 0;
@@ -1337,17 +1348,22 @@ class LowerToPtxTemplate(LoweringPass):
                 "tensor memory to row-strided f32/bf16 global memory"
             )
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
+        hybrid_n_width = op.attrs.get("hybrid_n_width")
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
         if hybrid_n_tiles is not None and (
             not isinstance(hybrid_n_tiles, int)
             or hybrid_n_tiles < 2
-            or src_type.sizes[1] not in (248, 256)
+            or src_type.sizes[1] not in (240, 248, 256)
+            or not isinstance(hybrid_n_width, int)
+            or hybrid_n_width % 8
+            or not 8 <= hybrid_n_width < src_type.sizes[1]
             or dst_type.dtype.name != "bf16"
         ):
             raise ValueError(
                 "hybrid-N output requires at least two N tiles and a "
-                "248- or 256-column BF16 output tile"
+                "240-, 248-, or 256-column BF16 output tile with a valid "
+                "narrow width"
             )
         if (
             hybrid_split_rows is not None or hybrid_split_tile is not None
@@ -1491,13 +1507,46 @@ class LowerToPtxTemplate(LoweringPass):
                             for start in range(0, len(packed), 8)
                         ]),
                     ])
+                if (
+                    isinstance(hybrid_n_width, int)
+                    and col < hybrid_n_width < col + valid_cols
+                ):
+                    narrow_cols = hybrid_n_width - col
+                    narrow_conversions = []
+                    narrow_packed = []
+                    for i in range(0, narrow_cols, 2):
+                        packed_reg = f"${{b32:packed{i // 2}}}"
+                        narrow_packed.append(packed_reg)
+                        narrow_conversions.append(
+                            f"cvt.rn.bf16x2.f32 {packed_reg}, "
+                            f"{values[i + 1]}, {values[i]};"
+                        )
+                    narrow_stores = [
+                        f"{store_predicate}st.global.v{min(8, len(narrow_packed) - start)}.b32 "
+                        f"[${{b64:row}}+{col * 2 + start * 4}], "
+                        f"{{{', '.join(narrow_packed[start:start + 8])}}};"
+                        for start in range(0, len(narrow_packed), 8)
+                    ]
+                    stores = "\n".join([
+                        f"@${{pred:hybrid_narrow}} bra ${{label:hybrid_partial_{col}}};",
+                        stores,
+                        f"bra ${{label:hybrid_partial_done_{col}}};",
+                        f"${{label:hybrid_partial_{col}}}:",
+                        *narrow_conversions,
+                        *narrow_stores,
+                        f"${{label:hybrid_partial_done_{col}}}:",
+                    ])
             template += textwrap.dedent(f"""\
                 add.u32 ${{b32:taddr_chunk}}, ${{b32:taddr_row}}, {col};
                 tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{load_values}}}, [${{b32:taddr_chunk}}];
                 tcgen05.wait::ld.sync.aligned;
                 {stores}
             """)
-            if hybrid_n_tiles is not None and col == 64:
+            if (
+                hybrid_n_tiles is not None
+                and isinstance(hybrid_n_width, int)
+                and col + valid_cols >= hybrid_n_width
+            ):
                 template += (
                     "@${pred:hybrid_narrow} bra ${label:hybrid_n_done};\n"
                 )
