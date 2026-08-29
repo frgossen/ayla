@@ -13,7 +13,9 @@ from ayla import (
     Value,
     make_ptx_kernel,
 )
-from ayla.gpu_dialect import gpu_dialect, BlockIdsOp, ThreadIdsOp, F32Type
+from ayla.gpu_dialect import (
+    gpu_dialect, BlockIdsOp, F32Type, ForOp, ThreadIdsOp,
+)
 from ayla.targets import BLACKWELL
 
 
@@ -84,6 +86,21 @@ def test_codegen_materializes_block_dim_before_lowering():
     assert input_kernel.block_dim == (128, 1, 1)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
+
+
+def test_codegen_descending_loop_uses_greater_than_backedge():
+    loop = ForOp.build(4, 0, -1)
+    loop.body.ops.append(PTXTemplateOp.build([], [], template="nop;\n"))
+    kernel_op = KernelOp.build(
+        "descending", Block(ops=[loop]),
+        grid_dim=(1, 1, 1), block_dim=(32, 1, 1),
+    )
+
+    ptx = make_ptx_kernel(ModuleOp.build(Block(ops=[kernel_op]))).ptx
+
+    assert "add.s32" in ptx and ", -1;" in ptx
+    assert "setp.gt.s32" in ptx
+    assert "setp.lt.s32" not in ptx
 
 
 def test_codegen_emits_cluster_launch_metadata():

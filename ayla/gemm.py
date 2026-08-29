@@ -70,6 +70,7 @@ def blackwell_tcgen05_gemm_module(
     output_tmem_load_shape: str = "32x32b",
     persistent_n_pairs: bool = False,
     lean_bookkeeping: bool = False,
+    reuse_persistent_lhs: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -79,6 +80,11 @@ def blackwell_tcgen05_gemm_module(
     ``lean_bookkeeping`` preserves that shared software pipeline while
     reusing its statically elected thread-zero predicate, deriving adjacent
     K16 descriptors, and joining the already-overlapped next-A0/B0 completion.
+    ``reuse_persistent_lhs`` unrolls a two-output persistent pair after sync
+    insertion and traverses the second output's K dimension backward, so its
+    first two A banks are the resident final banks from the first output. All
+    four warps still execute the same pipeline; only K order and buffer reuse
+    differ between the two static phases.
     With ``cluster_multicast_a``, paired CTAs still execute this same pipeline;
     cluster rank 0 only performs the instruction-mandated issue of their shared
     A transaction, while each CTA independently loads B and computes its tile.
@@ -279,6 +285,17 @@ def blackwell_tcgen05_gemm_module(
             "lean bookkeeping requires the branched direct K128 pipeline "
             "with next-iteration LHS and RHS prefetch"
         )
+    if reuse_persistent_lhs and (
+        not persistent_n_pairs
+        or not lean_bookkeeping
+        or output_m_tile != 128
+        or k // 128 < 5
+        or (k // 128) % 3 != 2
+    ):
+        raise ValueError(
+            "persistent LHS reuse requires lean persistent N pairs with M128 "
+            "and a K128 iteration count congruent to two modulo three"
+        )
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -287,7 +304,10 @@ def blackwell_tcgen05_gemm_module(
     block_ids = BlockIdsOp.build()
     grid_index_ops = [block_ids]
     persistent_loop = (
-        ForOp.build(0, 2, attrs={"disjoint_grid_iterations": True})
+        ForOp.build(0, 2, attrs={
+            "disjoint_grid_iterations": True,
+            **({"reuse_lhs_reverse_k": True} if reuse_persistent_lhs else {}),
+        })
         if persistent_n_pairs else None
     )
     logical_block_x = block_ids.x

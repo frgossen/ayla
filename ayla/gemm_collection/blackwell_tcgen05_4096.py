@@ -18,4 +18,5 @@ def blackwell_tcgen05_4096_module():
         output_tmem_load_shape="16x32bx2",
         persistent_n_pairs=True,
         lean_bookkeeping=True,
+        reuse_persistent_lhs=True,
     )

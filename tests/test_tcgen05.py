@@ -583,6 +583,40 @@ def test_tcgen05_persistent_balanced_n_pairs_lowering():
         make_ptx_kernel(invalid)
 
 
+def test_tcgen05_persistent_pair_reuses_lhs_in_reverse_k_order():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=4096,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+        reuse_persistent_lhs=True,
+    ))
+    ptx = kernel.ptx
+
+    # The two persistent phases are static, but both retain compact grouped
+    # K loops. Phase two descends from K128 iteration 30 and reuses K64 banks
+    # 62/63, removing exactly two of the original 60 dynamic TMA requests.
+    assert "for (%0: index = 30 to 0 step -3)" in ptx
+    assert ptx.count("setp.gt.s32") == 1
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 80
+    assert ptx.count("cp.async.bulk.tensor.2d.shared::cluster.global") == 58
+
+    with pytest.raises(ValueError, match="persistent LHS reuse requires"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=4096,
+            output_n_tile=232, balanced_n_tile=224,
+            operand_stages=8, transpose_cta_grid=True,
+            split_tma_barriers=True, split_rhs_tma=True,
+            prefetch_lhs_next=True, prefetch_rhs_next=True,
+            output_tmem_load_shape="16x32bx2",
+            persistent_n_pairs=False, lean_bookkeeping=True,
+            reuse_persistent_lhs=True,
+        )
+
+
 def test_tcgen05_lean_bookkeeping_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=4096, k=256,

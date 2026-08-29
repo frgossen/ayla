@@ -39,6 +39,7 @@ from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
+from .passes.reuse_persistent_lhs import ReusePersistentLhs
 from .base.pipeline import Pipeline
 from .targets import PtxTarget
 
@@ -52,6 +53,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
+        self.add_pass(ReusePersistentLhs())
         self.add_pass(LowerToPtxTemplate(target))
         self.add_pass(Canonicalize())
 
@@ -368,7 +370,8 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     _emit_block(p, op.body)
     p.write_line(f"// END: `{_op_description(p, op)}`")
     p.write_line(f"add.s32 {iv_reg}, {iv_reg}, {op.step};")
-    p.write_line(f"setp.lt.s32 {pred}, {iv_reg}, {op.ub};")
+    comparison = "lt" if op.step > 0 else "gt"
+    p.write_line(f"setp.{comparison}.s32 {pred}, {iv_reg}, {op.ub};")
     p.write_line(f"@{pred} bra {label};")
     p.write_newline_once()
 
