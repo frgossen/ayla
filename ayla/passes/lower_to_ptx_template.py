@@ -14,6 +14,7 @@ import textwrap
 from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
+    AsyncCommitOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
@@ -673,9 +674,16 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(
                 f"lower_async: tma_move with lock kind {kind!r}"
             )
-        if body_ops and all(isinstance(o, (MatmulOp, AwaitOp)) for o in body_ops):
+        if body_ops and all(
+            isinstance(o, (MatmulOp, AwaitOp, AsyncCommitOp)) for o in body_ops
+        ):
             if op.lock.type.kind == "tcgen05":
                 return self._lower_async_matmul_tcgen05(op, body_ops)
+            if any(isinstance(o, AsyncCommitOp) for o in body_ops):
+                raise NotImplementedError(
+                    "in-group partial commits are currently supported only "
+                    "for tcgen05"
+                )
             if any(isinstance(o, AwaitOp) for o in body_ops):
                 raise NotImplementedError(
                     "in-group input waits are currently supported only for tcgen05"
@@ -909,7 +917,8 @@ class LowerToPtxTemplate(LoweringPass):
         return [new_op], []
 
     def _lower_async_matmul_tcgen05(
-        self, op: AsyncOp, body_ops: list[MatmulOp | AwaitOp],
+        self, op: AsyncOp,
+        body_ops: list[MatmulOp | AwaitOp | AsyncCommitOp],
     ) -> tuple[list[Op], list[object]]:
         """Lower the first supported SM100 BF16 tile to ``tcgen05.mma``.
 
@@ -929,6 +938,11 @@ class LowerToPtxTemplate(LoweringPass):
             (index, body_op)
             for index, body_op in enumerate(body_ops)
             if isinstance(body_op, AwaitOp)
+        ]
+        partial_commits = [
+            (index, body_op)
+            for index, body_op in enumerate(body_ops)
+            if isinstance(body_op, AsyncCommitOp)
         ]
         if not mms:
             raise ValueError("tcgen05 async group requires at least one matmul")
@@ -950,6 +964,25 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             input_wait = None
             matmuls_before_wait = None
+        previous_commit_position = 0
+        commit_locks = {op.lock}
+        for commit_index, commit in partial_commits:
+            commit_position = sum(
+                isinstance(body_op, MatmulOp)
+                for body_op in body_ops[:commit_index]
+            )
+            if (
+                commit.lock.type.kind != "tcgen05"
+                or commit.lock in commit_locks
+                or commit_position <= previous_commit_position
+                or commit_position == len(mms)
+            ):
+                raise ValueError(
+                    "tcgen05 partial commits require distinct tcgen05 locks "
+                    "at strictly increasing positions between matmuls"
+                )
+            previous_commit_position = commit_position
+            commit_locks.add(commit.lock)
         for mm in mms:
             lhs_type, rhs_type, dst_type = mm.lhs.type, mm.rhs.type, mm.dst.type
             mm_cta_group = int(dst_type.attrs.get("cta_group", 1))
@@ -992,6 +1025,10 @@ class LowerToPtxTemplate(LoweringPass):
             for mm in mms
         ):
             raise ValueError("tcgen05 async group requires one cta_group of 1 or 2")
+        if partial_commits and cta_group != 1:
+            raise NotImplementedError(
+                "tcgen05 partial commits currently support only cta_group 1"
+            )
         direct_tma_layout = bool(
             mms[0].rhs.type.attrs.get("tcgen05_tma_layout")
         )
@@ -1036,6 +1073,12 @@ class LowerToPtxTemplate(LoweringPass):
         if input_wait is not None:
             operands.append(self.value_map[input_wait.lock])
             operand_names.append("input_lock")
+        commit_names: dict[AsyncCommitOp, str] = {}
+        for index, (_, commit) in enumerate(partial_commits):
+            name = f"partial_lock{index}"
+            operands.append(self.value_map[commit.lock])
+            operand_names.append(name)
+            commit_names[commit] = name
         if hybrid_n_tiles is not None:
             if (
                 not isinstance(hybrid_n_tiles, int)
@@ -1149,8 +1192,15 @@ class LowerToPtxTemplate(LoweringPass):
         disable_vector = ", ".join(
             "${b32:disable}" for _ in range(4 * cta_group)
         )
-        for i, mm in enumerate(mms):
-            if input_wait is not None and i == matmuls_before_wait:
+        mma_index = 0
+        for body_op in body_ops:
+            if isinstance(body_op, AsyncCommitOp):
+                template += textwrap.dedent(f"""\
+                    @${{pred:issue}} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
+                        [${{b32:operand.{commit_names[body_op]}.val}}];
+                """)
+                continue
+            if isinstance(body_op, AwaitOp):
                 template += textwrap.dedent(r"""
                     ${label:before_tcgen05_input_wait}:
                     mov.u32 ${b32:input_wait_ticks}, 0x989680;
@@ -1161,6 +1211,10 @@ class LowerToPtxTemplate(LoweringPass):
                     fence.proxy.async.shared::cta;
                     @!${pred:issue} bra ${label:after_tcgen05_issue};
                 """)
+                continue
+            mm = body_op
+            i = mma_index
+            mma_index += 1
             lhs = self.value_map[mm.lhs]
             rhs = self.value_map[mm.rhs]
             lhs_desc_const = (

@@ -1,4 +1,5 @@
 from .gpu_dialect import (
+    AsyncCommitOp,
     AsyncOp,
     DeallocOp,
     GmemTensorType,
@@ -19,6 +20,7 @@ from .ptx_codegen import PtxPrinter, PtxKernel, make_ptx_kernel
 from .targets import BLACKWELL, HOPPER, PtxTarget
 
 __all__ = [
+    "AsyncCommitOp",
     "AsyncOp",
     "Block",
     "DeallocOp",

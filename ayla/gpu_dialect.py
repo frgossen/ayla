@@ -680,6 +680,30 @@ class AwaitOp(Op):
         self.operands[0] = value
 
 
+@gpu_dialect.register_op("async_commit")
+class AsyncCommitOp(Op):
+    """Commit work issued earlier in an enclosing async group.
+
+    The enclosing :class:`AsyncOp` still commits its final segment to its own
+    lock.  This marker splits the issue stream at its body position and signals
+    the preceding segment on ``lock``, allowing that segment to be awaited
+    independently without duplicating the surrounding issue sequence.
+    """
+
+    @classmethod
+    def build(
+        cls, lock: Value, attrs: dict[str, object] | None = None,
+    ) -> "AsyncCommitOp":
+        assert isinstance(lock.type, LockType), (
+            f"AsyncCommitOp: expected LockType; got {lock.type}"
+        )
+        return cls(operands=[lock], results=[], attrs=attrs or {})
+
+    @property
+    def lock(self) -> Value:
+        return self.operands[0]
+
+
 @gpu_dialect.register_op("barrier")
 class BarrierOp(Op):
     """A rendezvous / synchronization point across a set of threads.
@@ -711,7 +735,9 @@ class AsyncOp(Op):
     Wraps a body block of ops that run asynchronously under one ``lock``. The
     lock is the only operand — what an async op carries beyond the plain op(s)
     it wraps — while the work ops inside keep their own (matmul/move) operands.
-    Completion is signalled elsewhere by ``await(%lock)``.
+    Completion is signalled elsewhere by ``await(%lock)``. An
+    :class:`AsyncCommitOp` inside the body may split off a completed prefix onto
+    another lock while the enclosing lock continues to cover the final segment.
     """
 
     @classmethod
@@ -2063,11 +2089,30 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     if isinstance(op, ConvertOp):
         return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
                 ("R", root_buffer(op.src), CollectiveScope.THREAD)]
+    if isinstance(op, AsyncCommitOp):
+        # A commit covers the segment since the previous commit in its
+        # enclosing async body.  Expose those effects through its lock so an
+        # await can retire only that segment while later work remains live.
+        parent = op.parent_block.parent_op if op.parent_block is not None else None
+        if not isinstance(parent, AsyncOp):
+            return []
+        effects = []
+        for body_op in reversed(parent.body.ops[:parent.body.ops.index(op)]):
+            if isinstance(body_op, AsyncCommitOp):
+                break
+            if isinstance(body_op, AwaitOp):
+                continue
+            body_effects = memory_effects(body_op)
+            if body_effects is None:
+                return None
+            effects[:0] = body_effects
+        return effects
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
         peers = [
-            u for u in op.lock.users() if isinstance(u, (AsyncOp, TmaMoveOp))
+            u for u in op.lock.users()
+            if isinstance(u, (AsyncOp, AsyncCommitOp, TmaMoveOp))
         ]
         if not peers:
             return None
@@ -2096,7 +2141,9 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             for body_op in block.ops:
                 # An await nested in an async issue group is a readiness
                 # checkpoint, not part of that group's memory effects.
-                if isinstance(op, AsyncOp) and isinstance(body_op, AwaitOp):
+                if isinstance(op, AsyncOp) and isinstance(
+                    body_op, (AwaitOp, AsyncCommitOp)
+                ):
                     continue
                 body_effects = memory_effects(body_op)
                 if body_effects is None:

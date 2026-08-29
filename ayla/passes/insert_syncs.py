@@ -5,6 +5,7 @@ import dataclasses
 import enum
 
 from ..gpu_dialect import (
+    AsyncCommitOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
@@ -340,13 +341,44 @@ def _analyze(
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for
     # a later barrier to order.
-    async_scope = (
-        _async_collective_scope(op.lock) if isinstance(op, AsyncOp) else None
-    )
-    for (k, b, s) in effects:
-        pending = op.lock if async_scope is not None and s.leq(async_scope) else None
-        effect = ConcurrentMemoryEffect(k, s, pending)
-        live.concurrent_memory_effects.setdefault(b, set()).add(effect)
+    if isinstance(op, AsyncOp) and any(
+        isinstance(body_op, AsyncCommitOp) for body_op in op.body.ops
+    ):
+        # A partial commit gives each preceding segment its own completion
+        # lock.  Keep later segments pending on the enclosing async lock so an
+        # early await can safely release only the buffers read by the prefix.
+        segment_effects: list[tuple[str, Value, CollectiveScope]] = []
+        effect_groups: list[
+            tuple[Value, list[tuple[str, Value, CollectiveScope]]]
+        ] = []
+        for body_op in op.body.ops:
+            if isinstance(body_op, AwaitOp):
+                continue
+            if isinstance(body_op, AsyncCommitOp):
+                effect_groups.append((body_op.lock, segment_effects))
+                segment_effects = []
+                continue
+            body_effects = memory_effects(body_op)
+            assert body_effects is not None
+            segment_effects.extend(body_effects)
+        effect_groups.append((op.lock, segment_effects))
+        for group_lock, group_effects in effect_groups:
+            async_scope = _async_collective_scope(group_lock)
+            for k, b, s in group_effects:
+                pending = group_lock if s.leq(async_scope) else None
+                live.concurrent_memory_effects.setdefault(b, set()).add(
+                    ConcurrentMemoryEffect(k, s, pending)
+                )
+    else:
+        async_scope = (
+            _async_collective_scope(op.lock) if isinstance(op, AsyncOp) else None
+        )
+        for (k, b, s) in effects:
+            pending = (
+                op.lock if async_scope is not None and s.leq(async_scope) else None
+            )
+            effect = ConcurrentMemoryEffect(k, s, pending)
+            live.concurrent_memory_effects.setdefault(b, set()).add(effect)
     return live
 
 

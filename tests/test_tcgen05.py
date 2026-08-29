@@ -14,9 +14,11 @@ from ayla import (
     Value,
     make_ptx_kernel,
 )
+from ayla.base.ir import iter_ops
 from ayla.gemm import blackwell_tcgen05_gemm_module
 from ayla.gpu_dialect import (
     AllocOp,
+    AsyncCommitOp,
     AsyncOp,
     AwaitOp,
     BF16Type,
@@ -365,6 +367,71 @@ def test_tcgen05_next_lhs_prefetch_lowering():
         )
 
 
+def test_tcgen05_next_rhs_prefetch_lowering():
+    module = blackwell_tcgen05_gemm_module(
+        m=128, n=512, k=256,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    )
+    assert any(
+        isinstance(op, AsyncCommitOp)
+        for op in iter_ops(module)
+    )
+    ptx = make_ptx_kernel(module).ptx
+
+    # Five barriers still fit before the 1 KiB-aligned operands. The first
+    # iteration issues B0 normally, then one partial tcgen commit lets the next
+    # iteration's two B0 requests overlap the second four MMAs.
+    assert ptx.count(".shared .align 8 .b64") == 5
+    assert ptx.count("tcgen05.commit.cta_group::1") == 3
+    assert ptx.count("mbarrier.arrive.expect_tx") == 5
+    assert ptx.count("], 32768;") == 1
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 16
+    first_partial_commit = ptx.index("tcgen05.commit.cta_group::1")
+    overlapped_b0_arrive = ptx.index("], 32768;")
+    assert "bar.sync" not in ptx[first_partial_commit:overlapped_b0_arrive]
+
+    with pytest.raises(ValueError, match="next-iteration RHS prefetch"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=512, k=256,
+            output_n_tile=256, operand_stages=8,
+            split_tma_barriers=True, split_rhs_tma=True,
+            prefetch_rhs_next=True,
+        )
+
+
+@pytest.mark.parametrize("invalid", ["kind", "position"])
+def test_tcgen05_partial_commit_verifier(invalid):
+    module = blackwell_tcgen05_gemm_module(
+        m=128, n=512, k=256,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    )
+    commit = next(
+        op for op in iter_ops(module) if isinstance(op, AsyncCommitOp)
+    )
+    if invalid == "kind":
+        mbar_lock = next(
+            op.result() for op in iter_ops(module)
+            if isinstance(op, AllocOp)
+            and isinstance(op.result().type, LockType)
+            and op.result().type.kind == "mbar"
+        )
+        commit.operands[0] = mbar_lock
+    else:
+        assert commit.parent_block is not None
+        body = commit.parent_block.ops
+        body.remove(commit)
+        body.insert(0, commit)
+
+    with pytest.raises(ValueError, match="partial commits"):
+        make_ptx_kernel(module)
+
+
 def test_tcgen05_gemm_jit_optimization_level():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, ptx_optimization_level=4,
@@ -618,6 +685,29 @@ def test_tcgen05_next_lhs_prefetch_gemm(seed):
         transpose_cta_grid=True, split_n_tile=0,
         split_tma_barriers=True, split_rhs_tma=True,
         prefetch_lhs_next=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((128, 256), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((512, 256), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((128, 512), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_next_rhs_prefetch_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=512, k=256,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
     ))
 
     torch.manual_seed(seed)

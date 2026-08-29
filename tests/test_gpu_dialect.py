@@ -14,6 +14,7 @@ from ayla import (
 )
 from ayla.gpu_dialect import (
     AddrMemTensorType,
+    AsyncCommitOp,
     AsyncOp,
     DeallocOp,
     F32Type,
@@ -198,6 +199,14 @@ def test_async_op():
           matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>)
         }""")  # noqa: E501
     assert_print_and_roundtrip(op, expected)
+
+
+def test_async_commit_op():
+    lock = Value(name="lock", type=LockType.build(kind="tcgen05"))
+    op = AsyncCommitOp.build(lock)
+    assert_print_and_roundtrip(
+        op, "async_commit(%lock: lock<tcgen05>)",
+    )
 
 
 def test_async_op_single_move():

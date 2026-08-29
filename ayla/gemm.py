@@ -4,6 +4,7 @@ import textwrap
 from .base.ir import Block, Value
 from .gpu_dialect import (
     AllocOp,
+    AsyncCommitOp,
     AsyncOp,
     AwaitOp,
     BF16Type,
@@ -60,6 +61,7 @@ def blackwell_tcgen05_gemm_module(
     split_tma_barriers: bool = False,
     split_rhs_tma: bool = False,
     prefetch_lhs_next: bool = False,
+    prefetch_rhs_next: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -168,6 +170,15 @@ def blackwell_tcgen05_gemm_module(
             "next-iteration LHS prefetch requires direct eight-stage split-"
             "barrier staging, no cluster multicast, and at least K=256"
         )
+    if prefetch_rhs_next and (
+        not prefetch_lhs_next
+        or not split_rhs_tma
+        or output_n_tile != 256
+    ):
+        raise ValueError(
+            "next-iteration RHS prefetch requires next-iteration LHS "
+            "prefetch and split direct N=256 RHS transactions"
+        )
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -266,6 +277,10 @@ def blackwell_tcgen05_gemm_module(
         prefetch_tma_lock = AllocOp.build_with_fresh_id(
             LockType.build(kind="mbar")
         )
+        half_mma_lock = (
+            AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+            if prefetch_rhs_next else None
+        )
     mainloop_ops = []
     if tma_staging == "direct" and prefetch_lhs_next:
         assert tma_lock is not None
@@ -339,6 +354,8 @@ def blackwell_tcgen05_gemm_module(
             for bank, k_index in enumerate(
                 (first_k.result(), second_k.result())
             ):
+                if bank == 0 and prefetch_rhs_next and not load_a0:
+                    continue
                 for n_half in range(2):
                     bt_tile = TileOp.build(
                         bt_block.result(), [n_half, k_index],
@@ -360,14 +377,13 @@ def blackwell_tcgen05_gemm_module(
                         attrs=rhs_move_attrs,
                     ))
 
-            ops.extend([
-                AsyncOp.build(
+            if bank_moves[0]:
+                ops.append(AsyncOp.build(
                     tma_lock.result(), body=Block(ops=bank_moves[0]),
-                ),
-                AsyncOp.build(
-                    second_tma_lock.result(), body=Block(ops=bank_moves[1]),
-                ),
-            ])
+                ))
+            ops.append(AsyncOp.build(
+                second_tma_lock.result(), body=Block(ops=bank_moves[1]),
+            ))
             if not load_a0:
                 # The A0 tile was launched after the prior iteration's tcgen
                 # commit. Every warp observes its completion before use.
@@ -377,6 +393,9 @@ def blackwell_tcgen05_gemm_module(
             mmas = []
             for stage in range(operand_stages):
                 if stage == 4:
+                    if prefetch_rhs_next and issue_next_a0:
+                        assert half_mma_lock is not None
+                        mmas.append(AsyncCommitOp.build(half_mma_lock.result()))
                     mmas.append(AwaitOp.build(second_tma_lock.result()))
                 bank = stage // 4
                 buffer_stage = stage % 4
@@ -429,6 +448,38 @@ def blackwell_tcgen05_gemm_module(
                         )]),
                     ),
                 ])
+                if prefetch_rhs_next:
+                    assert half_mma_lock is not None
+                    # Once MMAs 1-4 complete, B0 is dead for this iteration.
+                    # Refill it for the next K128 step while MMAs 5-8 consume
+                    # B1. Every warp observes the same completion wait and
+                    # software-pipeline order; only TMA's required leader
+                    # issues the two copies.
+                    ops.append(AwaitOp.build(half_mma_lock.result()))
+                    next_rhs_moves = []
+                    for n_half in range(2):
+                        next_bt_tile = TileOp.build(
+                            bt_block.result(), [n_half, next_k.result()],
+                            GmemTensorType.build(
+                                [128, 64], bf16, strides=[k, 1],
+                            ),
+                        )
+                        next_rhs_tile = TileOp.build(
+                            rhs_smem[0].result(), [n_half, 0],
+                            SmemTensorType.build(
+                                [128, 64], bf16, strides=[64, 1],
+                                swizzle="128B",
+                                attrs={"tcgen05_matrix": True},
+                            ),
+                        )
+                        ops.extend([next_bt_tile, next_rhs_tile])
+                        next_rhs_moves.append(MoveOp.build(
+                            next_rhs_tile.result(), next_bt_tile.result(),
+                            attrs=rhs_move_attrs,
+                        ))
+                    ops.append(AsyncOp.build(
+                        tma_lock.result(), body=Block(ops=next_rhs_moves),
+                    ))
             ops.append(AwaitOp.build(mma_lock.result()))
             return ops
 
@@ -750,6 +801,7 @@ def blackwell_tcgen05_gemm_module(
             *([tma_lock] if tma_lock is not None else []),
             *([second_tma_lock] if second_tma_lock is not None else []),
             *([prefetch_tma_lock] if prefetch_tma_lock is not None else []),
+            *([half_mma_lock] if half_mma_lock is not None else []),
             *lhs_smem,
             *rhs_smem,
             *lhs_tma_smem,
