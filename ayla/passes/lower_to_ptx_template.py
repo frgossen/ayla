@@ -1368,6 +1368,7 @@ class LowerToPtxTemplate(LoweringPass):
         predicated_tail_stores = bool(op.attrs.get("predicated_tail_stores"))
         l1_cache_policy = op.attrs.get("l1_cache_policy")
         l2_eviction_priority = op.attrs.get("l2_eviction_priority")
+        tmem_load_shape = op.attrs.get("tmem_load_shape", "32x32b")
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
         hybrid_element_offsets = bool(
@@ -1404,6 +1405,11 @@ class LowerToPtxTemplate(LoweringPass):
                 f"unsupported output L2 eviction priority "
                 f"{l2_eviction_priority!r}"
             )
+        if tmem_load_shape not in ("32x32b", "16x32bx2"):
+            raise ValueError(
+                f"unsupported tensor-memory output load shape "
+                f"{tmem_load_shape!r}"
+            )
         if (
             l1_cache_policy is not None or l2_eviction_priority is not None
         ) and dst_type.dtype.name != "bf16":
@@ -1426,6 +1432,25 @@ class LowerToPtxTemplate(LoweringPass):
             and op.indices
         ):
             raise ValueError("full-row hybrid-N output does not accept controls")
+        if tmem_load_shape == "16x32bx2":
+            if not (
+                tuple(src_type.sizes) == (128, 232)
+                and dst_type.dtype.name == "bf16"
+                and hybrid_n_tiles is not None
+                and hybrid_n_width == 224
+                and hybrid_element_offsets
+                and hybrid_split_rows is None
+                and hybrid_split_tile is None
+                and not predicated_tail_stores
+                and len(op.indices) == 2
+            ):
+                raise ValueError(
+                    "16x32bx2 tensor-memory output loads currently require "
+                    "balanced M128/N232/N224 BF16 output"
+                )
+            return self._lower_move_tmem_to_gmem_16x32bx2(
+                op, l1_cache_policy, l2_eviction_priority,
+            )
         # M=128 uses all 32 lanes in each of the four tensor-memory datapaths.
         # The non-warp-specialized M=64 Layout F instead uses lanes 0..15 in
         # every datapath, so logical row = 16 * warp + lane. All four warps
@@ -1689,6 +1714,172 @@ class LowerToPtxTemplate(LoweringPass):
             operands=operands,
             result_types=[], template=template,
             operand_names=operand_names, result_names=[],
+            description=str(op),
+        )
+        return [new_op], []
+
+    def _lower_move_tmem_to_gmem_16x32bx2(
+        self,
+        op: MoveOp,
+        l1_cache_policy: str | None,
+        l2_eviction_priority: str | None,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower the balanced BF16 epilogue with paired half-warps.
+
+        ``tcgen05.ld.16x32bx2.x16`` maps lanes 0/16, 1/17, ... to
+        adjacent 16-column halves of the same tensor-memory row.  Each lane
+        converts its half to one 32-byte vector, so the paired lanes write a
+        contiguous 64-byte output span.  All four warps execute both 16-row
+        groups; this changes only the data layout and does not specialize
+        warps into persistent roles.
+        """
+        dst_type = op.dst.type
+        assert isinstance(dst_type, GmemTensorType)
+        row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
+        l1 = (
+            f".L1::{l1_cache_policy}"
+            if l1_cache_policy is not None else ""
+        )
+        l2 = (
+            f".L2::{l2_eviction_priority}"
+            if l2_eviction_priority is not None else ""
+        )
+
+        values16 = [f"${{f32:value{i}}}" for i in range(16)]
+        packed8 = [f"${{b32:packed{i}}}" for i in range(8)]
+        values4 = values16[:4]
+        packed2 = packed8[:2]
+
+        def conversions(count: int) -> list[str]:
+            return [
+                f"cvt.rn.bf16x2.f32 {packed8[index]}, "
+                f"{values16[2 * index + 1]}, {values16[2 * index]};"
+                for index in range(count // 2)
+            ]
+
+        def full_chunk(col: int) -> list[str]:
+            return [
+                f"add.u32 ${{b32:taddr_chunk}}, "
+                f"${{b32:taddr_group}}, {col};",
+                "tcgen05.ld.sync.aligned.16x32bx2.x16.b32 "
+                f"{{{', '.join(values16)}}}, "
+                "[${b32:taddr_chunk}], 16;",
+                "tcgen05.wait::ld.sync.aligned;",
+                *conversions(16),
+                f"st.global{l1}{l2}.v8.b32 "
+                f"[${{b64:lane_row}}+{col * 2}], "
+                f"{{{', '.join(packed8)}}};",
+            ]
+
+        def edge_chunk(col: int) -> list[str]:
+            return [
+                f"add.u32 ${{b32:taddr_chunk}}, "
+                f"${{b32:taddr_group}}, {col};",
+                "tcgen05.ld.sync.aligned.16x32bx2.x4.b32 "
+                f"{{{', '.join(values4)}}}, "
+                "[${b32:taddr_chunk}], 4;",
+                "tcgen05.wait::ld.sync.aligned;",
+                *conversions(4),
+                f"st.global{l1}.v2.b32 "
+                f"[${{b64:lane_row}}+{col * 2}], "
+                f"{{{', '.join(packed2)}}};",
+            ]
+
+        def group_loop(
+            name: str,
+            full_cols: range,
+            edge_col: int | None,
+            edge_first: bool,
+        ) -> list[str]:
+            lines = [
+                f"${{label:paired_{name}}}:",
+                "mov.u32 ${b32:row_group}, 0;",
+                f"${{label:paired_{name}_group}}:",
+            ]
+            if edge_first:
+                lines.extend([
+                    "and.b32 ${b32:lane_offset}, ${b32:tid}, 16;",
+                    "shr.u32 ${b32:lane_offset}, "
+                    "${b32:lane_offset}, 1;",
+                    "cvt.u64.u32 ${b64:lane_offset64}, "
+                    "${b32:lane_offset};",
+                    "add.u64 ${b64:lane_row}, ${b64:row}, "
+                    "${b64:lane_offset64};",
+                    *edge_chunk(edge_col if edge_col is not None else 0),
+                ])
+            lines.extend([
+                "and.b32 ${b32:lane_offset}, ${b32:tid}, 16;",
+                "shl.b32 ${b32:lane_offset}, ${b32:lane_offset}, 1;",
+                "cvt.u64.u32 ${b64:lane_offset64}, "
+                "${b32:lane_offset};",
+                "add.u64 ${b64:lane_row}, ${b64:row}, "
+                "${b64:lane_offset64};",
+            ])
+            for col in full_cols:
+                lines.extend(full_chunk(col))
+            if edge_col is not None and not edge_first:
+                lines.extend([
+                    "and.b32 ${b32:lane_offset}, ${b32:tid}, 16;",
+                    "shr.u32 ${b32:lane_offset}, "
+                    "${b32:lane_offset}, 1;",
+                    "cvt.u64.u32 ${b64:lane_offset64}, "
+                    "${b32:lane_offset};",
+                    "add.u64 ${b64:lane_row}, ${b64:row}, "
+                    "${b64:lane_offset64};",
+                    *edge_chunk(edge_col),
+                ])
+            lines.extend([
+                "setp.ne.u32 ${pred:second_row_group}, "
+                "${b32:row_group}, 0;",
+                "@${pred:second_row_group} bra ${label:paired_done};",
+                "mov.u32 ${b32:row_group}, 1;",
+                # A 32-bit TMEM value advances one logical row per 1 << 16.
+                "add.u32 ${b32:taddr_group}, "
+                "${b32:taddr_group}, 1048576;",
+                f"add.u64 ${{b64:row}}, ${{b64:row}}, "
+                f"{16 * row_stride_bytes};",
+                f"bra ${{label:paired_{name}_group}};",
+            ])
+            return lines
+
+        narrow, half = (self.value_map[value] for value in op.indices)
+        template_lines = [
+            "mov.u32 ${b32:tid}, %tid.x;",
+            "shr.u32 ${b32:warp}, ${b32:tid}, 5;",
+            "and.b32 ${b32:lane15}, ${b32:tid}, 15;",
+            "shl.b32 ${b32:row_index}, ${b32:warp}, 5;",
+            "add.u32 ${b32:row_index}, ${b32:row_index}, "
+            "${b32:lane15};",
+            "shl.b32 ${b32:taddr_group}, ${b32:warp}, 21;",
+            "add.u32 ${b32:taddr_group}, ${b32:operand.src.ptr}, "
+            "${b32:taddr_group};",
+            f"mul.wide.u32 ${{b64:row_offset}}, "
+            f"${{b32:row_index}}, {row_stride_bytes};",
+            "add.u64 ${b64:row}, ${b64:operand.dst.ptr}, "
+            "${b64:row_offset};",
+            "mul.wide.u32 ${b64:hybrid_col_offset}, "
+            "${b32:operand.hybrid_half.val}, 256;",
+            "add.u64 ${b64:row}, ${b64:row}, "
+            "${b64:hybrid_col_offset};",
+            "and.b64 ${b64:alignment}, ${b64:row}, 16;",
+            "setp.ne.u64 ${pred:odd_alignment}, "
+            "${b64:alignment}, 0;",
+            "setp.ne.u32 ${pred:narrow}, "
+            "${b32:operand.hybrid_narrow.val}, 0;",
+            "@${pred:narrow} bra ${label:paired_narrow};",
+            "@${pred:odd_alignment} bra ${label:paired_odd};",
+            "bra ${label:paired_even};",
+            *group_loop("narrow", range(0, 224, 32), None, False),
+            *group_loop("even", range(0, 224, 32), 224, False),
+            *group_loop("odd", range(8, 232, 32), 0, True),
+            "${label:paired_done}:",
+        ]
+        new_op = PTXTemplateOp.build(
+            operands=[self.value_map[op.dst], self.value_map[op.src], narrow, half],
+            result_types=[],
+            template="\n".join(template_lines) + "\n",
+            operand_names=["dst", "src", "hybrid_narrow", "hybrid_half"],
+            result_names=[],
             description=str(op),
         )
         return [new_op], []

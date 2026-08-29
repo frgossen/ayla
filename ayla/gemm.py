@@ -67,6 +67,7 @@ def blackwell_tcgen05_gemm_module(
     prefetch_rhs_next: bool = False,
     output_l1_cache_policy: str | None = None,
     output_l2_eviction_priority: str | None = None,
+    output_tmem_load_shape: str = "32x32b",
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -205,6 +206,16 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("unsupported output_l1_cache_policy")
     if output_l2_eviction_priority not in (None, "evict_first", "evict_last"):
         raise ValueError("unsupported output_l2_eviction_priority")
+    if output_tmem_load_shape not in ("32x32b", "16x32bx2"):
+        raise ValueError("unsupported output_tmem_load_shape")
+    if output_tmem_load_shape == "16x32bx2" and (
+        output_m_tile != 128
+        or output_n_tile != 232
+        or balanced_n_tile != 224
+    ):
+        raise ValueError(
+            "16x32bx2 output requires balanced M128/N232/N224 tiles"
+        )
     if split_tma_barriers and (
         tma_staging != "direct"
         or operand_stages != 8
@@ -993,6 +1004,8 @@ def blackwell_tcgen05_gemm_module(
                        if output_l1_cache_policy else {}),
                     **({"l2_eviction_priority": output_l2_eviction_priority}
                        if output_l2_eviction_priority else {}),
+                    **({"tmem_load_shape": output_tmem_load_shape}
+                       if output_tmem_load_shape != "32x32b" else {}),
                 }
                 if hybrid_n_tiles is not None else (
                     {
@@ -1000,8 +1013,14 @@ def blackwell_tcgen05_gemm_module(
                            if output_l1_cache_policy else {}),
                         **({"l2_eviction_priority": output_l2_eviction_priority}
                            if output_l2_eviction_priority else {}),
+                        **({"tmem_load_shape": output_tmem_load_shape}
+                           if output_tmem_load_shape != "32x32b" else {}),
                     }
-                    if output_l1_cache_policy or output_l2_eviction_priority
+                    if (
+                        output_l1_cache_policy
+                        or output_l2_eviction_priority
+                        or output_tmem_load_shape != "32x32b"
+                    )
                     else None
                 )
             ),

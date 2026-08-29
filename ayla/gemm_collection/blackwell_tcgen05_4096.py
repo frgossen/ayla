@@ -15,4 +15,5 @@ def blackwell_tcgen05_4096_module():
         prefetch_lhs_next=True, prefetch_rhs_next=True,
         output_l1_cache_policy="no_allocate",
         output_l2_eviction_priority="evict_first",
+        output_tmem_load_shape="16x32bx2",
     )

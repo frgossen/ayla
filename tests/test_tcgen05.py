@@ -470,6 +470,28 @@ def test_tcgen05_balanced_n232_n224_lowering():
         "st.global.L1::no_allocate.v4.b32"
     ) == 10
 
+    paired = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_l1_cache_policy="no_allocate",
+        output_l2_eviction_priority="evict_first",
+        output_tmem_load_shape="16x32bx2",
+    ))
+    assert paired.ptx.count(
+        "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+    ) == 21
+    assert paired.ptx.count(
+        "tcgen05.ld.sync.aligned.16x32bx2.x4.b32"
+    ) == 2
+    assert "tcgen05.ld.sync.aligned.32x32b.x64.b32" not in paired.ptx
+    assert paired.ptx.count(
+        "st.global.L1::no_allocate.L2::evict_first.v8.b32"
+    ) == 21
+    assert paired.ptx.count("st.global.L1::no_allocate.v2.b32") == 2
+
     with pytest.raises(ValueError, match="balanced_n_tile"):
         blackwell_tcgen05_gemm_module(
             m=128, n=4096, k=256,
@@ -491,6 +513,22 @@ def test_tcgen05_balanced_n232_n224_lowering():
             output_n_tile=232, balanced_n_tile=224,
             operand_stages=8, transpose_cta_grid=True,
             output_l1_cache_policy="streaming",
+        )
+
+    with pytest.raises(ValueError, match="output_tmem_load_shape"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=256,
+            output_n_tile=232, balanced_n_tile=224,
+            operand_stages=8, transpose_cta_grid=True,
+            output_tmem_load_shape="16x64b",
+        )
+
+    with pytest.raises(ValueError, match="16x32bx2 output"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=256,
+            output_n_tile=232, balanced_n_tile=216,
+            operand_stages=8, transpose_cta_grid=True,
+            output_tmem_load_shape="16x32bx2",
         )
 
 
