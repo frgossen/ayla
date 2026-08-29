@@ -273,6 +273,24 @@ def test_tcgen05_gemm_jit_optimization_level():
     assert kernel.ptx_optimization_level == 4
 
 
+def test_tcgen05_gemm_cluster_a_multicast_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=64, cluster_multicast_a=True,
+    ))
+
+    assert kernel.grid_dim == (1, 2, 1)
+    assert kernel.cluster_dim == (1, 2, 1)
+    assert ".reqnctapercluster 1, 2, 1" in kernel.ptx
+    assert kernel.ptx.count("barrier.cluster.arrive.aligned") == 1
+    assert kernel.ptx.count("barrier.cluster.wait.aligned") == 1
+    assert kernel.ptx.count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global."
+        "mbarrier::complete_tx::bytes.multicast::cluster"
+    ) == 1
+    assert "mov.u32 %r" in kernel.ptx and "%cluster_ctarank" in kernel.ptx
+    assert "setp.eq.u32" in kernel.ptx
+
+
 def test_tcgen05_m64_tma_staging_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, output_m_tile=64,

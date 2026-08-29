@@ -43,12 +43,16 @@ def blackwell_tcgen05_gemm_module(
     operand_stages: int = 4, tma_staging: str | None = "direct",
     output_m_tile: int = 128, output_n_tile: int = 128,
     ptx_optimization_level: int | None = 1,
+    cluster_multicast_a: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
     Each CTA computes one MxN output tile. All four warps cooperatively
     stage both operands and read the tensor-memory accumulator; only the
     elected issue sequence required by ``tcgen05.mma`` is single-threaded.
+    With ``cluster_multicast_a``, paired CTAs still execute this same pipeline;
+    cluster rank 0 only performs the instruction-mandated issue of their shared
+    A transaction, while each CTA independently loads B and computes its tile.
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
@@ -69,6 +73,12 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("wide output tiles currently require direct TMA staging")
     if output_m_tile != 128 and tma_staging != "direct":
         raise ValueError("M=64 output tiles currently require direct TMA staging")
+    if cluster_multicast_a and (
+        tma_staging != "direct" or output_m_tile != 128 or output_n_tile != 128
+    ):
+        raise ValueError("cluster A multicast requires direct M=128/N=128 tiles")
+    if cluster_multicast_a and n % 256:
+        raise ValueError("cluster A multicast requires N divisible by 256")
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -146,7 +156,11 @@ def blackwell_tcgen05_gemm_module(
             AsyncOp.build(tma_lock.result(), body=Block(ops=[
                 MoveOp.build(
                     lhs_smem[0].result(), a_tile.result(),
-                    attrs={"tma": True},
+                    attrs={
+                        "tma": True,
+                        **({"multicast_mask": 0x3, "cluster_leader": True}
+                           if cluster_multicast_a else {}),
+                    },
                 ),
                 MoveOp.build(
                     rhs_smem[0].result(), bt_tile.result(),
@@ -248,6 +262,7 @@ def blackwell_tcgen05_gemm_module(
         body,
         grid_dim=(m // output_m_tile, n // output_n_tile, 1),
         block_dim=(128, 1, 1),
+        cluster_dim=(1, 2, 1) if cluster_multicast_a else None,
         ptx_optimization_level=ptx_optimization_level,
     )]), target=BLACKWELL)
 

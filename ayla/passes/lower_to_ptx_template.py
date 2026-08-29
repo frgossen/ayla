@@ -2032,6 +2032,9 @@ class LowerToPtxTemplate(LoweringPass):
         operand_names: list[str] = ["lock"]
         total_bytes = 0
         load_lines: list[str] = []
+        has_cluster_leader_load = any(
+            tma.attrs.get("cluster_leader") for tma in tmas
+        )
         for i, tma in enumerate(tmas):
             dst_value = self.value_map[tma.dst]
             desc_value = self.value_map[tma.src]
@@ -2054,25 +2057,49 @@ class LowerToPtxTemplate(LoweringPass):
             tensor_rank = len(coordinates)
             indices = ", ".join(coordinates)
             load_lines.extend(coordinate_lines)
-            load_lines.append(self._tma_instruction(
-                tma,
+            multicast_mask = tma.attrs.get("multicast_mask")
+            opcode = (
                 f"cp.async.bulk.tensor.{tensor_rank}d.shared::cluster.global."
-                "mbarrier::complete_tx::bytes",
+                "mbarrier::complete_tx::bytes"
+            )
+            arguments = (
                 f"[${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
-                f"[${{b32:operand.lock.val}}]",
+                f"[${{b32:operand.lock.val}}]"
+            )
+            if multicast_mask is not None:
+                opcode += ".multicast::cluster"
+                arguments += f", 0x{int(multicast_mask):x}"
+            instruction = self._tma_instruction(
+                tma,
+                opcode,
+                arguments,
                 operands,
                 operand_names,
                 f"cache_policy{i}",
-            ))
+            )
+            if tma.attrs.get("cluster_leader"):
+                instruction = "@${pred:cluster_leader} " + instruction
+            load_lines.append(instruction)
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
         # the byte count are interpolated, so we avoid f-string/dedent brace and
         # multi-line-indent pitfalls by joining a line list.
         #
         # The buffer-reuse WAR (t0's reload vs prior readers of the smem tile) is
-        # handled by insert_syncs, which emits a barrier before this async.
+        # handled by insert_syncs, which emits a CTA barrier before this async.
+        # A multicast destination also belongs to neighboring CTAs, so all CTAs
+        # in the cluster must rendezvous before the elected CTA can overwrite it.
+        # On the first iteration this same rendezvous makes every remote
+        # mbarrier initialization visible before the multicast transaction.
         lines = [
+            *(
+                [
+                    "barrier.cluster.arrive.aligned;",
+                    "barrier.cluster.wait.aligned;",
+                ]
+                if has_cluster_leader_load else []
+            ),
             "mov.u32 ${b32:tid_x}, %tid.x;",
             "mov.u32 ${b32:tid_y}, %tid.y;",
             "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
@@ -2080,6 +2107,13 @@ class LowerToPtxTemplate(LoweringPass):
             "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};",
             "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
             "@${pred:not_t0} bra ${label:after_load};",
+            *(
+                [
+                    "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;",
+                    "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;",
+                ]
+                if has_cluster_leader_load else []
+            ),
             *load_lines,
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
             f"[${{b32:operand.lock.val}}], {total_bytes};",
