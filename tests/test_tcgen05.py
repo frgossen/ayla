@@ -284,6 +284,16 @@ def test_tcgen05_gemm_jit_optimization_level():
     assert kernel.ptx_optimization_level == 4
 
 
+def test_tcgen05_transposed_cta_grid_mapping():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=64, transpose_cta_grid=True,
+    ))
+
+    assert kernel.grid_dim == (2, 1, 1)
+    assert "mov.u32" in kernel.ptx
+    assert "%ctaid.x" in kernel.ptx and "%ctaid.y" in kernel.ptx
+
+
 def test_tcgen05_gemm_cluster_a_multicast_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=64, cluster_multicast_a=True,

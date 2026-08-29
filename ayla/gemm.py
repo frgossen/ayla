@@ -46,6 +46,7 @@ def blackwell_tcgen05_gemm_module(
     ptx_optimization_level: int | None = 1,
     cluster_multicast_a: bool = False,
     branch_tcgen05_issue: bool = True,
+    transpose_cta_grid: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -83,22 +84,26 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires direct M=128/N=128 tiles")
     if cluster_multicast_a and n % 256:
         raise ValueError("cluster A multicast requires N divisible by 256")
+    if cluster_multicast_a and transpose_cta_grid:
+        raise ValueError("cluster A multicast requires the default CTA grid order")
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
     bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
     c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
     block_ids = BlockIdsOp.build()
+    m_block_id = block_ids.y if transpose_cta_grid else block_ids.x
+    n_block_id = block_ids.x if transpose_cta_grid else block_ids.y
     a_block = TileOp.build(
-        a, [block_ids.x, 0],
+        a, [m_block_id, 0],
         GmemTensorType.build([output_m_tile, k], bf16, strides=[k, 1]),
     )
     bt_block = TileOp.build(
-        bt, [block_ids.y, 0],
+        bt, [n_block_id, 0],
         GmemTensorType.build([output_n_tile, k], bf16, strides=[k, 1]),
     )
     c_block = TileOp.build(
-        c, [block_ids.x, block_ids.y],
+        c, [m_block_id, n_block_id],
         GmemTensorType.build(
             [output_m_tile, output_n_tile], bf16, strides=[n, 1],
         ),
@@ -299,7 +304,11 @@ def blackwell_tcgen05_gemm_module(
     return ModuleOp.build(Block(ops=[KernelOp.build(
         "blackwell_tcgen05_4096",
         body,
-        grid_dim=(m // output_m_tile, n // output_n_tile, 1),
+        grid_dim=(
+            (n // output_n_tile, m // output_m_tile, 1)
+            if transpose_cta_grid else
+            (m // output_m_tile, n // output_n_tile, 1)
+        ),
         block_dim=(128, 1, 1),
         cluster_dim=(1, 2, 1) if cluster_multicast_a else None,
         ptx_optimization_level=ptx_optimization_level,
