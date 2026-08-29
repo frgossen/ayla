@@ -1366,6 +1366,7 @@ class LowerToPtxTemplate(LoweringPass):
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
         hybrid_n_width = op.attrs.get("hybrid_n_width")
         predicated_tail_stores = bool(op.attrs.get("predicated_tail_stores"))
+        l2_eviction_priority = op.attrs.get("l2_eviction_priority")
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
         hybrid_element_offsets = bool(
@@ -1390,6 +1391,15 @@ class LowerToPtxTemplate(LoweringPass):
         ):
             raise ValueError(
                 "predicated tail stores require a hybrid-N M128 output"
+            )
+        if l2_eviction_priority not in (None, "evict_first", "evict_last"):
+            raise ValueError(
+                f"unsupported output L2 eviction priority "
+                f"{l2_eviction_priority!r}"
+            )
+        if l2_eviction_priority is not None and dst_type.dtype.name != "bf16":
+            raise ValueError(
+                "output L2 eviction priority currently requires BF16 stores"
             )
         if (
             hybrid_split_rows is not None
@@ -1517,12 +1527,23 @@ class LowerToPtxTemplate(LoweringPass):
                     starts_and_widths,
                     predicate=store_predicate,
                 ):
-                    return [
-                        f"{predicate}st.global.v{width}.b32 "
-                        f"[${{b64:row}}+{col * 2 + start * 4}], "
-                        f"{{{', '.join(packed[start:start + width])}}};"
-                        for start, width in starts_and_widths
-                    ]
+                    stores = []
+                    for start, width in starts_and_widths:
+                        # PTX 8.8 permits the inline L2 eviction-priority
+                        # qualifier for v8.b32 stores on sm_100+. Narrow v4
+                        # edge stores keep the ordinary opcode because that
+                        # encoding is not supported for them.
+                        l2_qualifier = (
+                            f".L2::{l2_eviction_priority}"
+                            if l2_eviction_priority is not None and width == 8
+                            else ""
+                        )
+                        stores.append(
+                            f"{predicate}st.global{l2_qualifier}.v{width}.b32 "
+                            f"[${{b64:row}}+{col * 2 + start * 4}], "
+                            f"{{{', '.join(packed[start:start + width])}}};"
+                        )
+                    return stores
 
                 if alternating_store_alignment:
                     even_groups = [
