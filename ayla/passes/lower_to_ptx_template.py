@@ -228,12 +228,14 @@ class LowerToPtxTemplate(LoweringPass):
         """)
         if op.init is not None:
             if not (
-                tuple(result_type.sizes) == (128, 64)
+                result_type.sizes[0] == 128
+                and result_type.sizes[1] in (64, 128, 256)
                 and result_type.dtype.name == "f32"
-                and result_type.columns == 64
+                and result_type.columns == result_type.sizes[1]
             ):
                 raise NotImplementedError(
-                    "tensor-memory zero init currently supports tmem<128x64xf32>"
+                    "tensor-memory zero init currently supports "
+                    "tmem<128x64|128|256xf32>"
                 )
             zeros = ", ".join("${b32:tmem_zero}" for _ in range(64))
             template += textwrap.dedent(f"""\
@@ -242,8 +244,14 @@ class LowerToPtxTemplate(LoweringPass):
                 shl.b32 ${{b32:tmem_lane_base}}, ${{b32:tmem_warp}}, 21;
                 add.u32 ${{b32:tmem_warp_addr}}, ${{b32:result.dst.ptr}}, ${{b32:tmem_lane_base}};
                 mov.b32 ${{b32:tmem_zero}}, 0;
-                tcgen05.st.sync.aligned.32x32b.x64.b32 [${{b32:tmem_warp_addr}}], {{{zeros}}};
-                tcgen05.wait::st.sync.aligned;
+            """)
+            for col in range(0, result_type.columns, 64):
+                template += textwrap.dedent(f"""\
+                    add.u32 ${{b32:tmem_chunk_addr}}, ${{b32:tmem_warp_addr}}, {col};
+                    tcgen05.st.sync.aligned.32x32b.x64.b32 [${{b32:tmem_chunk_addr}}], {{{zeros}}};
+                    tcgen05.wait::st.sync.aligned;
+                """)
+            template += textwrap.dedent("""\
                 bar.sync 0;
                 fence.proxy.async.shared::cta;
             """)
@@ -371,6 +379,7 @@ class LowerToPtxTemplate(LoweringPass):
         alignment = (
             1024
             if smem_type.attrs.get("tcgen05_layout") is not None
+            or smem_type.attrs.get("tcgen05_matrix")
             or (
                 smem_type.swizzle is not None
                 and physical_layout(smem_type) is not None
@@ -835,38 +844,57 @@ class LowerToPtxTemplate(LoweringPass):
                 "tcgen05 lowering requires a Blackwell target; "
                 f"got {self.target.architecture!r}"
             )
-        if len(mms) != 1:
-            raise NotImplementedError(
-                "tcgen05 lowering currently supports one matmul per async group"
+        for mm in mms:
+            lhs_type, rhs_type, dst_type = mm.lhs.type, mm.rhs.type, mm.dst.type
+            supported = (
+                isinstance(lhs_type, SmemTensorType)
+                and isinstance(rhs_type, SmemTensorType)
+                and isinstance(dst_type, TmemTensorType)
+                and tuple(lhs_type.sizes) == (128, 16)
+                and rhs_type.sizes[0] in (64, 128, 256)
+                and rhs_type.sizes[1] == 16
+                and tuple(dst_type.sizes) == (128, rhs_type.sizes[0])
+                and lhs_type.dtype.name == rhs_type.dtype.name == "bf16"
+                and dst_type.dtype.name == "f32"
+                and lhs_type.swizzle in ("32B", "128B")
+                and rhs_type.swizzle == "128B"
             )
-        mm = mms[0]
-        lhs_type, rhs_type, dst_type = mm.lhs.type, mm.rhs.type, mm.dst.type
-        supported = (
-            isinstance(lhs_type, SmemTensorType)
-            and isinstance(rhs_type, SmemTensorType)
-            and isinstance(dst_type, TmemTensorType)
-            and tuple(lhs_type.sizes) == (128, 16)
-            and tuple(rhs_type.sizes) == (64, 16)
-            and tuple(dst_type.sizes) == (128, 64)
-            and lhs_type.dtype.name == rhs_type.dtype.name == "bf16"
-            and dst_type.dtype.name == "f32"
-            and lhs_type.swizzle == "32B"
-            and rhs_type.swizzle == "128B"
-        )
-        if not supported:
-            raise NotImplementedError(
-                "tcgen05 lowering currently supports "
-                "smem<128x16xbf16 swizzle=32B> @ "
-                "smem<64x16xbf16 swizzle=128B> -> tmem<128x64xf32>"
-            )
+            if not supported:
+                raise NotImplementedError(
+                    "tcgen05 lowering currently supports "
+                    "smem<128x16xbf16 swizzle=32B|128B> @ "
+                    "smem<64|128|256x16xbf16 swizzle=128B> -> "
+                    "tmem<128x64|128|256xf32>"
+                )
 
-        lhs = self.value_map[mm.lhs]
-        rhs = self.value_map[mm.rhs]
-        dst = self.value_map[mm.dst]
+        dst = self.value_map[mms[0].dst]
+        if any(self.value_map[mm.dst] is not dst for mm in mms[1:]):
+            raise NotImplementedError(
+                "tcgen05 async groups must share one accumulator"
+            )
         lock = self.value_map[op.lock]
-        # Descriptor constants encode the proven compact SM100 layouts used by
-        # the cooperative staging path in the end-to-end test. The instruction
-        # descriptor is f32 D, bf16 A/B, M=128, N=64, dense, no transpose.
+        direct_tma_layout = bool(
+            mms[0].rhs.type.attrs.get("tcgen05_tma_layout")
+        )
+        if any(
+            bool(mm.rhs.type.attrs.get("tcgen05_tma_layout"))
+            != direct_tma_layout
+            for mm in mms
+        ):
+            raise NotImplementedError(
+                "tcgen05 async groups cannot mix packed and direct-TMA RHS layouts"
+            )
+        n = mms[0].rhs.type.sizes[0]
+        idesc_value = (8 << 24) | ((n // 8) << 17) | 0x490
+        if not direct_tma_layout:
+            idesc_value |= 1 << 16
+        idesc = f"0x{idesc_value:08x}"
+        # Descriptor constants encode the compact SM100 layouts used by the
+        # cooperative staging path. Direct TMA staging retains the source's
+        # [N, K] physical orientation, so its B-major bit differs from the
+        # packed [K, N] cooperative layout.
+        operands = [dst, lock]
+        operand_names = ["dst", "lock"]
         template = textwrap.dedent("""\
             fence.proxy.async.shared::cta;
             mov.u32 ${b32:tid}, %tid.x;
@@ -874,28 +902,41 @@ class LowerToPtxTemplate(LoweringPass):
             setp.eq.u32 ${pred:warp0}, ${b32:warp}, 0;
             elect.sync ${b32:elected_lane}|${pred:elected}, -1;
             and.pred ${pred:issue}, ${pred:warp0}, ${pred:elected};
-            bfe.u32 ${b32:lhs_addr}, ${b32:operand.lhs.ptr}, 4, 14;
-            cvt.u64.u32 ${b64:lhs_desc}, ${b32:lhs_addr};
-            bfe.u32 ${b32:rhs_addr}, ${b32:operand.rhs.ptr}, 4, 14;
-            cvt.u64.u32 ${b64:rhs_desc}, ${b32:rhs_addr};
-            or.b64 ${b64:lhs_desc}, ${b64:lhs_desc}, 0xc000401000000000;
-            or.b64 ${b64:rhs_desc}, ${b64:rhs_desc}, 0x4000404000000000;
-            mov.b32 ${b32:idesc}, 0x08110490;
+            mov.b32 ${b32:idesc}, __IDESC__;
             mov.b32 ${b32:disable}, 0;
-            mov.pred ${pred:use_d}, """ + (
-                "-1" if mm.attrs.get("accumulate", True) else "0"
-            ) + textwrap.dedent(""";
-            @${pred:issue} tcgen05.mma.cta_group::1.kind::f16
-                [${b32:operand.dst.ptr}], ${b64:lhs_desc}, ${b64:rhs_desc},
-                ${b32:idesc},
-                {${b32:disable}, ${b32:disable}, ${b32:disable}, ${b32:disable}},
-                ${pred:use_d};
+            mov.pred ${pred:use_d}, -1;
+        """).replace("__IDESC__", idesc)
+        for i, mm in enumerate(mms):
+            lhs = self.value_map[mm.lhs]
+            rhs = self.value_map[mm.rhs]
+            lhs_desc_const = (
+                "0xc000401000000000"
+                if mm.lhs.type.swizzle == "32B"
+                else "0x4000404000000000"
+            )
+            rhs_desc_const = "0x4000404000000000"
+            operands.extend([lhs, rhs])
+            operand_names.extend([f"lhs{i}", f"rhs{i}"])
+            template += textwrap.dedent(f"""\
+                bfe.u32 ${{b32:lhs_addr{i}}}, ${{b32:operand.lhs{i}.ptr}}, 4, 14;
+                cvt.u64.u32 ${{b64:lhs_desc{i}}}, ${{b32:lhs_addr{i}}};
+                bfe.u32 ${{b32:rhs_addr{i}}}, ${{b32:operand.rhs{i}.ptr}}, 4, 14;
+                cvt.u64.u32 ${{b64:rhs_desc{i}}}, ${{b32:rhs_addr{i}}};
+                or.b64 ${{b64:lhs_desc{i}}}, ${{b64:lhs_desc{i}}}, {lhs_desc_const};
+                or.b64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{i}}}, {rhs_desc_const};
+                @${{pred:issue}} tcgen05.mma.cta_group::1.kind::f16
+                    [${{b32:operand.dst.ptr}}], ${{b64:lhs_desc{i}}}, ${{b64:rhs_desc{i}}},
+                    ${{b32:idesc}},
+                    {{${{b32:disable}}, ${{b32:disable}}, ${{b32:disable}}, ${{b32:disable}}}},
+                    ${{pred:use_d}};
+            """)
+        template += textwrap.dedent("""\
             @${pred:issue} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
                 [${b32:operand.lock.val}];
-        """))
+        """)
         new_op = PTXTemplateOp.build(
-            operands=[lhs, rhs, dst, lock], result_types=[], template=template,
-            operand_names=["lhs", "rhs", "dst", "lock"], result_names=[],
+            operands=operands, result_types=[], template=template,
+            operand_names=operand_names, result_names=[],
             description=str(op),
         )
         return [new_op], []
@@ -914,6 +955,17 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_move_smem_rmem(op)
         if {type(dst_type), type(src_type)} == {SmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_smem(op)
+        if (
+            isinstance(dst_type, SmemTensorType)
+            and isinstance(src_type, SmemTensorType)
+            and dst_type.attrs.get("tcgen05_layout") is not None
+        ):
+            return self._lower_move_to_smem_tcgen05(
+                op,
+                self.value_map[op.dst],
+                self.value_map[op.src],
+                dst_type.attrs["tcgen05_layout"],
+            )
         if isinstance(dst_type, WrmemTensorType) and isinstance(src_type, SmemTensorType) and dst_type.layout == "mma":
             return self._lower_move_smem_to_wrmem_mma(op)
         if isinstance(dst_type, SmemTensorType) and isinstance(src_type, WrmemTensorType) and src_type.layout == "mma":
@@ -945,47 +997,23 @@ class LowerToPtxTemplate(LoweringPass):
                 f"got {self.target.architecture!r}"
             )
         if not (
-            tuple(src_type.sizes) == (128, 64)
-            and tuple(dst_type.sizes) == (128, 64)
+            src_type.sizes[0] == dst_type.sizes[0] == 128
+            and src_type.sizes[1] == dst_type.sizes[1]
+            and src_type.sizes[1] in (64, 128, 256)
             and src_type.dtype.name == "f32"
             and dst_type.dtype.name in ("f32", "bf16")
             and dst_type.strides[1] == 1
         ):
             raise NotImplementedError(
-                "tcgen05 tmem-to-gmem move currently supports 128x64 f32 "
+                "tcgen05 tmem-to-gmem move currently supports "
+                "128x64|128|256 f32 "
                 "tensor memory to row-strided f32/bf16 global memory"
             )
-        # Each warp owns 32 tensor-memory lanes. Load all 64 columns in one
-        # collective operation, then use wide stores within each output row.
+        # Each warp owns 32 tensor-memory lanes. Process 64 columns at a time
+        # so the same register bank handles both 64- and 128-column outputs.
         row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
         values = [f"${{b32:value{i}}}" for i in range(64)]
         load_values = ", ".join(values)
-        if dst_type.dtype.name == "f32":
-            stores = "\n".join(
-                f"st.global.v4.b32 [${{b64:row}}+{i * 4}], "
-                f"{{{', '.join(values[i:i + 4])}}};"
-                for i in range(0, 64, 4)
-            )
-        else:
-            conversions = []
-            packed = []
-            for i in range(0, 64, 2):
-                packed_reg = f"${{b32:packed{i // 2}}}"
-                packed.append(packed_reg)
-                conversions.extend([
-                    f"mov.b32 ${{f32:f{i}}}, {values[i]};",
-                    f"mov.b32 ${{f32:f{i + 1}}}, {values[i + 1]};",
-                    f"cvt.rn.bf16x2.f32 {packed_reg}, "
-                    f"${{f32:f{i + 1}}}, ${{f32:f{i}}};",
-                ])
-            stores = "\n".join([
-                *conversions,
-                *(
-                    f"st.global.v4.b32 [${{b64:row}}+{i * 4}], "
-                    f"{{{', '.join(packed[i:i + 4])}}};"
-                    for i in range(0, 32, 4)
-                ),
-            ])
         template = textwrap.dedent(f"""\
             mov.u32 ${{b32:tid}}, %tid.x;
             shr.u32 ${{b32:warp}}, ${{b32:tid}}, 5;
@@ -993,10 +1021,40 @@ class LowerToPtxTemplate(LoweringPass):
             add.u32 ${{b32:taddr_row}}, ${{b32:operand.src.ptr}}, ${{b32:lane_base}};
             mul.wide.u32 ${{b64:row_offset}}, ${{b32:tid}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
-            tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{load_values}}}, [${{b32:taddr_row}}];
-            tcgen05.wait::ld.sync.aligned;
-            {stores}
         """)
+        for col in range(0, src_type.sizes[1], 64):
+            if dst_type.dtype.name == "f32":
+                stores = "\n".join(
+                    f"st.global.v4.b32 [${{b64:row}}+{col * 4 + i * 4}], "
+                    f"{{{', '.join(values[i:i + 4])}}};"
+                    for i in range(0, 64, 4)
+                )
+            else:
+                conversions = []
+                packed = []
+                for i in range(0, 64, 2):
+                    packed_reg = f"${{b32:packed{i // 2}}}"
+                    packed.append(packed_reg)
+                    conversions.extend([
+                        f"mov.b32 ${{f32:f{i}}}, {values[i]};",
+                        f"mov.b32 ${{f32:f{i + 1}}}, {values[i + 1]};",
+                        f"cvt.rn.bf16x2.f32 {packed_reg}, "
+                        f"${{f32:f{i + 1}}}, ${{f32:f{i}}};",
+                    ])
+                stores = "\n".join([
+                    *conversions,
+                    *(
+                        f"st.global.v4.b32 [${{b64:row}}+{col * 2 + i * 4}], "
+                        f"{{{', '.join(packed[i:i + 4])}}};"
+                        for i in range(0, 32, 4)
+                    ),
+                ])
+            template += textwrap.dedent(f"""\
+                add.u32 ${{b32:taddr_chunk}}, ${{b32:taddr_row}}, {col};
+                tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{load_values}}}, [${{b32:taddr_chunk}}];
+                tcgen05.wait::ld.sync.aligned;
+                {stores}
+            """)
         new_op = PTXTemplateOp.build(
             operands=[self.value_map[op.dst], self.value_map[op.src]],
             result_types=[], template=template,
@@ -1197,7 +1255,7 @@ class LowerToPtxTemplate(LoweringPass):
                 raise NotImplementedError(
                     "tcgen05 shared layouts currently support loads only"
                 )
-            return self._lower_move_gmem_to_smem_tcgen05(
+            return self._lower_move_to_smem_tcgen05(
                 op, dst_value, src_value, tcgen05_layout,
             )
         gmem_label = "src" if is_load else "dst"
@@ -1270,7 +1328,7 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], []
 
-    def _lower_move_gmem_to_smem_tcgen05(
+    def _lower_move_to_smem_tcgen05(
         self,
         op: MoveOp,
         dst: Value,
@@ -1290,22 +1348,34 @@ class LowerToPtxTemplate(LoweringPass):
             )
         dst_type, src_type = op.dst.type, op.src.type
         assert isinstance(dst_type, SmemTensorType)
-        assert isinstance(src_type, GmemTensorType)
+        assert isinstance(src_type, (GmemTensorType, SmemTensorType))
+        source_space = "global" if isinstance(src_type, GmemTensorType) else "shared"
+        source_ptr_type = "b64" if isinstance(src_type, GmemTensorType) else "b32"
         if layout == "lhs_128x16" and (
             tuple(dst_type.sizes), tuple(src_type.sizes), dst_type.swizzle
         ) == ((128, 16), (128, 16), "32B"):
             row_stride = src_type.strides[0]
             second_half_bytes = 64 * row_stride * src_type.dtype.byte_size
+            if source_space == "global":
+                addresses = textwrap.dedent(f"""\
+                    mad.wide.u32 ${{b64:g0}}, ${{b32:elem}}, 2, ${{b64:operand.src.ptr}};
+                    add.s64 ${{b64:g1}}, ${{b64:g0}}, {second_half_bytes};
+                """)
+            else:
+                addresses = textwrap.dedent(f"""\
+                    mul.lo.u32 ${{b32:byte_offset}}, ${{b32:elem}}, 2;
+                    add.u32 ${{b32:g0}}, ${{b32:operand.src.ptr}}, ${{b32:byte_offset}};
+                    add.u32 ${{b32:g1}}, ${{b32:g0}}, {second_half_bytes};
+                """)
             template = textwrap.dedent(f"""\
                 mov.u32 ${{b32:tid}}, %tid.x;
                 shr.u32 ${{b32:row}}, ${{b32:tid}}, 1;
                 and.b32 ${{b32:half}}, ${{b32:tid}}, 1;
                 shl.b32 ${{b32:half}}, ${{b32:half}}, 3;
                 mad.lo.u32 ${{b32:elem}}, ${{b32:row}}, {row_stride}, ${{b32:half}};
-                mad.wide.u32 ${{b64:g0}}, ${{b32:elem}}, 2, ${{b64:operand.src.ptr}};
-                add.s64 ${{b64:g1}}, ${{b64:g0}}, {second_half_bytes};
-                ld.global.v4.b32 {{${{b32:v0}}, ${{b32:v1}}, ${{b32:v2}}, ${{b32:v3}}}}, [${{b64:g0}}];
-                ld.global.v4.b32 {{${{b32:v4}}, ${{b32:v5}}, ${{b32:v6}}, ${{b32:v7}}}}, [${{b64:g1}}];
+                {addresses}
+                ld.{source_space}.v4.b32 {{${{b32:v0}}, ${{b32:v1}}, ${{b32:v2}}, ${{b32:v3}}}}, [${{{source_ptr_type}:g0}}];
+                ld.{source_space}.v4.b32 {{${{b32:v4}}, ${{b32:v5}}, ${{b32:v6}}, ${{b32:v7}}}}, [${{{source_ptr_type}:g1}}];
                 shl.b32 ${{b32:x4}}, ${{b32:tid}}, 4;
                 and.b32 ${{b32:x1}}, ${{b32:x4}}, 1904;
                 bfe.s32 ${{b32:x2}}, ${{b32:tid}}, 3, 1;
@@ -1321,13 +1391,24 @@ class LowerToPtxTemplate(LoweringPass):
         ) == ((64, 16), (64, 16), "128B"):
             row_stride = src_type.strides[0]
             loads = "\n".join(
-                textwrap.dedent(f"""\
-                    add.u32 ${{b32:n}}, ${{b32:n_base}}, {i};
-                    mad.lo.u32 ${{b32:elem{i}}}, ${{b32:n}}, {row_stride}, ${{b32:k}};
-                    mad.wide.u32 ${{b64:g{i}}}, ${{b32:elem{i}}}, 2, ${{b64:operand.src.ptr}};
-                    ld.global.b16 ${{b16:v{i}}}, [${{b64:g{i}}}];
-                    st.shared.b16 [${{b32:s}}+{i * 2}], ${{b16:v{i}}};
-                """).rstrip()
+                (
+                    textwrap.dedent(f"""\
+                        add.u32 ${{b32:n}}, ${{b32:n_base}}, {i};
+                        mad.lo.u32 ${{b32:elem{i}}}, ${{b32:n}}, {row_stride}, ${{b32:k}};
+                        mad.wide.u32 ${{b64:g{i}}}, ${{b32:elem{i}}}, 2, ${{b64:operand.src.ptr}};
+                        ld.global.b16 ${{b16:v{i}}}, [${{b64:g{i}}}];
+                        st.shared.b16 [${{b32:s}}+{i * 2}], ${{b16:v{i}}};
+                    """)
+                    if source_space == "global"
+                    else textwrap.dedent(f"""\
+                        add.u32 ${{b32:n}}, ${{b32:n_base}}, {i};
+                        mad.lo.u32 ${{b32:elem{i}}}, ${{b32:n}}, {row_stride}, ${{b32:k}};
+                        mul.lo.u32 ${{b32:byte{i}}}, ${{b32:elem{i}}}, 2;
+                        add.u32 ${{b32:g{i}}}, ${{b32:operand.src.ptr}}, ${{b32:byte{i}}};
+                        ld.shared.b16 ${{b16:v{i}}}, [${{b32:g{i}}}];
+                        st.shared.b16 [${{b32:s}}+{i * 2}], ${{b16:v{i}}};
+                    """)
+                ).rstrip()
                 for i in range(8)
             )
             template = textwrap.dedent("""\
