@@ -291,6 +291,18 @@ def test_tcgen05_gemm_cluster_a_multicast_lowering():
     assert "setp.eq.u32" in kernel.ptx
 
 
+def test_tcgen05_gemm_branches_nonissuers_around_issue_sequence():
+    ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=64,
+    )).ptx
+
+    branch = ptx.index("bra $L")
+    descriptor = ptx.index("mov.b32", branch)
+    mma = ptx.index("tcgen05.mma.cta_group::1", descriptor)
+    join = ptx.index("$L", mma)
+    assert branch < descriptor < mma < join
+
+
 def test_tcgen05_m64_tma_staging_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, output_m_tile=64,

@@ -942,12 +942,20 @@ class LowerToPtxTemplate(LoweringPass):
             setp.eq.u32 ${pred:warp0}, ${b32:warp}, 0;
             elect.sync ${b32:elected_lane}|${pred:elected}, -1;
             and.pred ${pred:issue}, ${pred:warp0}, ${pred:elected};
+        """)
+        if cta_group == 2:
+            template += "and.pred ${pred:issue}, ${pred:issue}, ${pred:cluster_even};\n"
+        if op.attrs.get("branch_elected_issue"):
+            # Descriptor construction belongs to the instruction-mandated
+            # elected issue sequence. Skipping it in non-issuing lanes is not
+            # a persistent producer/consumer role: every warp still follows
+            # the same surrounding load, compute-wait, and store pipeline.
+            template += "@!${pred:issue} bra ${label:after_tcgen05_issue};\n"
+        template += textwrap.dedent("""\
             mov.b32 ${b32:idesc}, __IDESC__;
             mov.b32 ${b32:disable}, 0;
             mov.pred ${pred:use_d}, -1;
         """).replace("__IDESC__", idesc)
-        if cta_group == 2:
-            template += "and.pred ${pred:issue}, ${pred:issue}, ${pred:cluster_even};\n"
         disable_vector = ", ".join(
             "${b32:disable}" for _ in range(4 * cta_group)
         )
@@ -986,6 +994,8 @@ class LowerToPtxTemplate(LoweringPass):
                 @${pred:issue} tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
                     [${b32:operand.lock.val}], ${b16:cta_mask};
             """)
+        if op.attrs.get("branch_elected_issue"):
+            template += "${label:after_tcgen05_issue}:\n"
         new_op = PTXTemplateOp.build(
             operands=operands, result_types=[], template=template,
             operand_names=operand_names, result_names=[],

@@ -44,6 +44,7 @@ def blackwell_tcgen05_gemm_module(
     output_m_tile: int = 128, output_n_tile: int = 128,
     ptx_optimization_level: int | None = 1,
     cluster_multicast_a: bool = False,
+    branch_tcgen05_issue: bool = True,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -238,7 +239,12 @@ def blackwell_tcgen05_gemm_module(
                 accumulator.result(),
             ))
     loop.body.ops.extend([
-        AsyncOp.build(mma_lock.result(), body=Block(ops=mmas)),
+        AsyncOp.build(
+            mma_lock.result(),
+            body=Block(ops=mmas),
+            attrs={"branch_elected_issue": True}
+            if branch_tcgen05_issue else None,
+        ),
         AwaitOp.build(mma_lock.result()),
     ])
     body = Block(arguments=[a, bt, c], ops=[
