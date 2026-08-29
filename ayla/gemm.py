@@ -65,6 +65,7 @@ def blackwell_tcgen05_gemm_module(
     split_rhs_tma: bool = False,
     prefetch_lhs_next: bool = False,
     prefetch_rhs_next: bool = False,
+    output_l1_cache_policy: str | None = None,
     output_l2_eviction_priority: str | None = None,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
@@ -198,6 +199,10 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("unsupported lhs_l2_promotion")
     if rhs_l2_promotion not in (None, "64B", "128B", "256B"):
         raise ValueError("unsupported rhs_l2_promotion")
+    if output_l1_cache_policy not in (
+        None, "no_allocate", "evict_first", "evict_last",
+    ):
+        raise ValueError("unsupported output_l1_cache_policy")
     if output_l2_eviction_priority not in (None, "evict_first", "evict_last"):
         raise ValueError("unsupported output_l2_eviction_priority")
     if split_tma_barriers and (
@@ -984,12 +989,20 @@ def blackwell_tcgen05_gemm_module(
                        if hybrid_split_tile is not None else {}),
                     **({"hybrid_element_offsets": True}
                        if hybrid_element_offsets else {}),
+                    **({"l1_cache_policy": output_l1_cache_policy}
+                       if output_l1_cache_policy else {}),
                     **({"l2_eviction_priority": output_l2_eviction_priority}
                        if output_l2_eviction_priority else {}),
                 }
                 if hybrid_n_tiles is not None else (
-                    {"l2_eviction_priority": output_l2_eviction_priority}
-                    if output_l2_eviction_priority else None
+                    {
+                        **({"l1_cache_policy": output_l1_cache_policy}
+                           if output_l1_cache_policy else {}),
+                        **({"l2_eviction_priority": output_l2_eviction_priority}
+                           if output_l2_eviction_priority else {}),
+                    }
+                    if output_l1_cache_policy or output_l2_eviction_priority
+                    else None
                 )
             ),
         ),

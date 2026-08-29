@@ -1366,6 +1366,7 @@ class LowerToPtxTemplate(LoweringPass):
         hybrid_n_tiles = op.attrs.get("hybrid_n_tiles")
         hybrid_n_width = op.attrs.get("hybrid_n_width")
         predicated_tail_stores = bool(op.attrs.get("predicated_tail_stores"))
+        l1_cache_policy = op.attrs.get("l1_cache_policy")
         l2_eviction_priority = op.attrs.get("l2_eviction_priority")
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
@@ -1392,14 +1393,22 @@ class LowerToPtxTemplate(LoweringPass):
             raise ValueError(
                 "predicated tail stores require a hybrid-N M128 output"
             )
+        if l1_cache_policy not in (
+            None, "no_allocate", "evict_first", "evict_last",
+        ):
+            raise ValueError(
+                f"unsupported output L1 cache policy {l1_cache_policy!r}"
+            )
         if l2_eviction_priority not in (None, "evict_first", "evict_last"):
             raise ValueError(
                 f"unsupported output L2 eviction priority "
                 f"{l2_eviction_priority!r}"
             )
-        if l2_eviction_priority is not None and dst_type.dtype.name != "bf16":
+        if (
+            l1_cache_policy is not None or l2_eviction_priority is not None
+        ) and dst_type.dtype.name != "bf16":
             raise ValueError(
-                "output L2 eviction priority currently requires BF16 stores"
+                "output cache policy currently requires BF16 stores"
             )
         if (
             hybrid_split_rows is not None
@@ -1532,14 +1541,20 @@ class LowerToPtxTemplate(LoweringPass):
                         # PTX 8.8 permits the inline L2 eviction-priority
                         # qualifier for v8.b32 stores on sm_100+. Narrow v4
                         # edge stores keep the ordinary opcode because that
-                        # encoding is not supported for them.
+                        # L2 encoding is not supported for them. L1 policies
+                        # are legal for both vector widths.
+                        l1_qualifier = (
+                            f".L1::{l1_cache_policy}"
+                            if l1_cache_policy is not None else ""
+                        )
                         l2_qualifier = (
                             f".L2::{l2_eviction_priority}"
                             if l2_eviction_priority is not None and width == 8
                             else ""
                         )
                         stores.append(
-                            f"{predicate}st.global{l2_qualifier}.v{width}.b32 "
+                            f"{predicate}st.global{l1_qualifier}"
+                            f"{l2_qualifier}.v{width}.b32 "
                             f"[${{b64:row}}+{col * 2 + start * 4}], "
                             f"{{{', '.join(packed[start:start + width])}}};"
                         )

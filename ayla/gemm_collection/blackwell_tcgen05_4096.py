@@ -13,5 +13,6 @@ def blackwell_tcgen05_4096_module():
         lhs_l2_promotion="256B", rhs_l2_promotion="256B",
         split_tma_barriers=True, split_rhs_tma=True,
         prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_l1_cache_policy="no_allocate",
         output_l2_eviction_priority="evict_first",
     )
