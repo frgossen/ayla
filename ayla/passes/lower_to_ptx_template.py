@@ -280,7 +280,6 @@ class LowerToPtxTemplate(LoweringPass):
                     "tensor-memory zero init currently supports "
                     "tmem<64|128x64|128|256xf32>"
                 )
-            zeros = ", ".join("${b32:tmem_zero}" for _ in range(64))
             template += textwrap.dedent(f"""\
                 mov.u32 ${{b32:tmem_warp}}, ${{b32:tmem_tid}};
                 shr.u32 ${{b32:tmem_warp}}, ${{b32:tmem_warp}}, 5;
@@ -288,10 +287,14 @@ class LowerToPtxTemplate(LoweringPass):
                 add.u32 ${{b32:tmem_warp_addr}}, ${{b32:result.dst.ptr}}, ${{b32:tmem_lane_base}};
                 mov.b32 ${{b32:tmem_zero}}, 0;
             """)
-            for col in range(0, result_type.columns, 64):
+            for col in range(0, result_type.columns, 128):
+                width = min(128, result_type.columns - col)
+                zeros = ", ".join(
+                    "${b32:tmem_zero}" for _ in range(width)
+                )
                 template += textwrap.dedent(f"""\
                     add.u32 ${{b32:tmem_chunk_addr}}, ${{b32:tmem_warp_addr}}, {col};
-                    tcgen05.st.sync.aligned.32x32b.x64.b32 [${{b32:tmem_chunk_addr}}], {{{zeros}}};
+                    tcgen05.st.sync.aligned.32x32b.x{width}.b32 [${{b32:tmem_chunk_addr}}], {{{zeros}}};
                     tcgen05.wait::st.sync.aligned;
                 """)
             template += textwrap.dedent("""\

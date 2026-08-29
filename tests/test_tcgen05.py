@@ -233,6 +233,7 @@ def test_tcgen05_typed_ir_lowering():
     ptx = _make_tcgen05_kernel().ptx
 
     assert "tcgen05.alloc.cta_group::1" in ptx
+    assert "tcgen05.st.sync.aligned.32x32b.x64.b32" in ptx
     assert "tcgen05.mma.cta_group::1.kind::f16" in ptx
     assert "tcgen05.commit.cta_group::1.mbarrier::arrive::one" in ptx
     assert "mbarrier.try_wait.parity" in ptx
@@ -275,6 +276,7 @@ def test_tcgen05_k128_tma_staging_lowering():
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 8
     assert ptx.count("0x4000404000000000") == 16
     assert ".shared .align 1024 .b8" in ptx
+    assert ptx.count("tcgen05.st.sync.aligned.32x32b.x128.b32") == 1
 
 
 def test_tcgen05_split_tma_barriers_lowering():
@@ -285,6 +287,7 @@ def test_tcgen05_split_tma_barriers_lowering():
     )).ptx
 
     assert ptx.count("mbarrier.arrive.expect_tx") == 2
+    assert ptx.count("tcgen05.st.sync.aligned.32x32b.x128.b32") == 2
     assert ptx.count(", 49152;") == 2
     assert ptx.count("mbarrier.try_wait.parity.acquire") == 3
     first_wait = ptx.index("mbarrier.try_wait.parity.acquire")
