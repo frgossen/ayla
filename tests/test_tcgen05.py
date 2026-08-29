@@ -334,6 +334,37 @@ def test_tcgen05_split_rhs_tma_lowering():
         )
 
 
+def test_tcgen05_next_lhs_prefetch_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=512, k=4096,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True,
+    ))
+    ptx = kernel.ptx
+
+    # Three 16 KiB A buffers plus two 32 KiB B buffers stay at the exact
+    # two-CTA shared-memory boundary by placing the four barriers before them.
+    assert ptx.count(".shared .align 1024 .b8") == 5
+    first_barrier = ptx.index(".shared .align 8 .b64")
+    first_operand = ptx.index(".shared .align 1024 .b8")
+    assert first_barrier < first_operand
+    assert ptx.count("mbarrier.arrive.expect_tx") == 14
+    assert ptx.count("], 16384;") == 4
+    assert ptx.count("], 32768;") == 4
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 40
+    assert "for (" in ptx and "step 3" in ptx
+
+    with pytest.raises(ValueError, match="next-iteration LHS prefetch"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=512, k=256,
+            output_n_tile=256, operand_stages=8,
+            transpose_cta_grid=True, split_n_tile=0,
+            prefetch_lhs_next=True,
+        )
+
+
 def test_tcgen05_gemm_jit_optimization_level():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, ptx_optimization_level=4,
@@ -570,6 +601,29 @@ def test_tcgen05_k128_gemm(seed):
     a_tensor = torch.randn((128, 128), dtype=torch.bfloat16, device="cuda")
     b_tensor = torch.randn((128, 128), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty((128, 128), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_next_lhs_prefetch_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=512, k=256,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((128, 256), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((512, 256), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((128, 512), dtype=torch.bfloat16, device="cuda")
     make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
     torch.cuda.synchronize()
 

@@ -59,6 +59,7 @@ def blackwell_tcgen05_gemm_module(
     rhs_l2_promotion: str | None = None,
     split_tma_barriers: bool = False,
     split_rhs_tma: bool = False,
+    prefetch_lhs_next: bool = False,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -156,6 +157,17 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "split RHS TMA transactions require direct N=256 staging"
         )
+    if prefetch_lhs_next and (
+        tma_staging != "direct"
+        or operand_stages != 8
+        or not split_tma_barriers
+        or cluster_multicast_a
+        or k < 256
+    ):
+        raise ValueError(
+            "next-iteration LHS prefetch requires direct eight-stage split-"
+            "barrier staging, no cluster multicast, and at least K=256"
+        )
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -228,14 +240,268 @@ def blackwell_tcgen05_gemm_module(
     accumulator = AllocOp.build_with_fresh_id(
         TmemTensorType.build([output_m_tile, output_n_tile], F32Type()), init=0.0,
     )
-    if tma_staging == "direct":
+    if prefetch_lhs_next:
         direct_buffers = operand_stages // 4
         lhs_smem = [
             AllocOp.build_with_fresh_id(SmemTensorType.build(
                 [output_m_tile, 64], bf16, swizzle="128B",
                 attrs={"tcgen05_matrix": True},
             ))
+            for _ in range(direct_buffers + 1)
+        ]
+        rhs_smem = [
+            AllocOp.build_with_fresh_id(SmemTensorType.build(
+                [output_n_tile, 64], bf16, swizzle="128B",
+                attrs={"tcgen05_matrix": True},
+            ))
             for _ in range(direct_buffers)
+        ]
+        lhs_tma_smem = []
+        rhs_tma_smem = []
+        mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+        tma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
+        second_tma_lock = AllocOp.build_with_fresh_id(
+            LockType.build(kind="mbar")
+        )
+        prefetch_tma_lock = AllocOp.build_with_fresh_id(
+            LockType.build(kind="mbar")
+        )
+    mainloop_ops = []
+    if tma_staging == "direct" and prefetch_lhs_next:
+        assert tma_lock is not None
+        assert second_tma_lock is not None
+        assert prefetch_tma_lock is not None
+        assert len(lhs_smem) == 3 and len(rhs_smem) == 2
+
+        lhs_move_attrs = {
+            "tma": True,
+            **({"l2_cache_hint": lhs_l2_cache_hint}
+               if lhs_l2_cache_hint else {}),
+            **({"l2_promotion": lhs_l2_promotion}
+               if lhs_l2_promotion else {}),
+        }
+        rhs_move_attrs = {
+            "tma": True,
+            **({"l2_cache_hint": rhs_l2_cache_hint}
+               if rhs_l2_cache_hint else {}),
+            **({"l2_promotion": rhs_l2_promotion}
+               if rhs_l2_promotion else {}),
+        }
+        hybrid_attrs = (
+            {
+                "hybrid_n_tiles": hybrid_n_tiles,
+                **({"hybrid_split_rows": hybrid_split_rows}
+                   if hybrid_split_rows is not None else {}),
+                **({"hybrid_split_tile": hybrid_split_tile}
+                   if hybrid_split_tile is not None else {}),
+            }
+            if hybrid_n_tiles is not None else None
+        )
+
+        def prefetch_iteration(
+            iteration: Value,
+            a0_buffer: Value,
+            a1_buffer: Value,
+            free_buffer: Value,
+            *,
+            load_a0: bool,
+            issue_next_a0: bool,
+        ) -> list:
+            """Build one K128 step of the three-A-buffer software pipeline."""
+            ops = []
+            two = IndexConstantOp.build(2)
+            first_k = IndexMulOp.build(iteration, two.result())
+            one = IndexConstantOp.build(1)
+            second_k = IndexAddOp.build(first_k.result(), one.result())
+            ops.extend([two, first_k, one, second_k])
+
+            lhs0_tile = TileOp.build(
+                a_block.result(), [0, first_k.result()],
+                GmemTensorType.build(
+                    [output_m_tile, 64], bf16, strides=[k, 1],
+                ),
+            )
+            lhs1_tile = TileOp.build(
+                a_block.result(), [0, second_k.result()],
+                GmemTensorType.build(
+                    [output_m_tile, 64], bf16, strides=[k, 1],
+                ),
+            )
+            ops.extend([lhs0_tile, lhs1_tile])
+            bank_moves = [[], [MoveOp.build(
+                a1_buffer, lhs1_tile.result(), attrs=lhs_move_attrs,
+            )]]
+            if load_a0:
+                bank_moves[0].append(MoveOp.build(
+                    a0_buffer, lhs0_tile.result(), attrs=lhs_move_attrs,
+                ))
+
+            for bank, k_index in enumerate(
+                (first_k.result(), second_k.result())
+            ):
+                for n_half in range(2):
+                    bt_tile = TileOp.build(
+                        bt_block.result(), [n_half, k_index],
+                        GmemTensorType.build(
+                            [128, 64], bf16, strides=[k, 1],
+                        ),
+                    )
+                    rhs_tile = TileOp.build(
+                        rhs_smem[bank].result(), [n_half, 0],
+                        SmemTensorType.build(
+                            [128, 64], bf16, strides=[64, 1],
+                            swizzle="128B",
+                            attrs={"tcgen05_matrix": True},
+                        ),
+                    )
+                    ops.extend([bt_tile, rhs_tile])
+                    bank_moves[bank].append(MoveOp.build(
+                        rhs_tile.result(), bt_tile.result(),
+                        attrs=rhs_move_attrs,
+                    ))
+
+            ops.extend([
+                AsyncOp.build(
+                    tma_lock.result(), body=Block(ops=bank_moves[0]),
+                ),
+                AsyncOp.build(
+                    second_tma_lock.result(), body=Block(ops=bank_moves[1]),
+                ),
+            ])
+            if not load_a0:
+                # The A0 tile was launched after the prior iteration's tcgen
+                # commit. Every warp observes its completion before use.
+                ops.append(AwaitOp.build(prefetch_tma_lock.result()))
+            ops.append(AwaitOp.build(tma_lock.result()))
+
+            mmas = []
+            for stage in range(operand_stages):
+                if stage == 4:
+                    mmas.append(AwaitOp.build(second_tma_lock.result()))
+                bank = stage // 4
+                buffer_stage = stage % 4
+                lhs_tile = TileOp.build(
+                    a0_buffer if bank == 0 else a1_buffer,
+                    [0, buffer_stage],
+                    SmemTensorType.build(
+                        [output_m_tile, 16], bf16,
+                        strides=[64, 1], swizzle="128B",
+                        attrs={"tcgen05_tma_layout": True},
+                    ),
+                )
+                rhs_tile = TileOp.build(
+                    rhs_smem[bank].result(), [0, buffer_stage],
+                    SmemTensorType.build(
+                        [output_n_tile, 16], bf16,
+                        strides=[64, 1], swizzle="128B",
+                        attrs={"tcgen05_tma_layout": True},
+                    ),
+                )
+                ops.extend([lhs_tile, rhs_tile])
+                mmas.append(MatmulOp.build(
+                    lhs_tile.result(), rhs_tile.result(), accumulator.result(),
+                    attrs=hybrid_attrs, controls=hybrid_controls,
+                ))
+            ops.append(AsyncOp.build(
+                mma_lock.result(), body=Block(ops=mmas),
+                attrs={"branch_elected_issue": True}
+                if branch_tcgen05_issue else None,
+            ))
+
+            if issue_next_a0:
+                next_offset = IndexConstantOp.build(2)
+                next_k = IndexAddOp.build(first_k.result(), next_offset.result())
+                next_a_tile = TileOp.build(
+                    a_block.result(), [0, next_k.result()],
+                    GmemTensorType.build(
+                        [output_m_tile, 64], bf16, strides=[k, 1],
+                    ),
+                )
+                ops.extend([
+                    next_offset,
+                    next_k,
+                    next_a_tile,
+                    AsyncOp.build(
+                        prefetch_tma_lock.result(),
+                        body=Block(ops=[MoveOp.build(
+                            free_buffer, next_a_tile.result(),
+                            attrs=lhs_move_attrs,
+                        )]),
+                    ),
+                ])
+            ops.append(AwaitOp.build(mma_lock.result()))
+            return ops
+
+        # Peel the first and last K128 iterations. The middle 30 iterations are
+        # grouped in threes, making the cyclic buffer choice static while
+        # keeping the emitted loop compact enough for ptxas.
+        first = IndexConstantOp.build(0)
+        mainloop_ops.append(first)
+        mainloop_ops.extend(prefetch_iteration(
+            first.result(),
+            lhs_smem[0].result(), lhs_smem[1].result(), lhs_smem[2].result(),
+            load_a0=True, issue_next_a0=True,
+        ))
+
+        iteration_count = k // 128
+        middle_count = iteration_count - 2
+        grouped_middle_count = middle_count - middle_count % 3
+        grouped_middle_end = 1 + grouped_middle_count
+        middle = ForOp.build(1, grouped_middle_end, step=3)
+        middle.attrs["label"] = "prefetch_lhs_middle"
+        phases = (
+            (lhs_smem[2].result(), lhs_smem[0].result(), lhs_smem[1].result()),
+            (lhs_smem[1].result(), lhs_smem[2].result(), lhs_smem[0].result()),
+            (lhs_smem[0].result(), lhs_smem[1].result(), lhs_smem[2].result()),
+        )
+        for offset, buffers in enumerate(phases):
+            if offset == 0:
+                iteration = middle.iv
+            else:
+                offset_op = IndexConstantOp.build(offset)
+                iteration_op = IndexAddOp.build(middle.iv, offset_op.result())
+                middle.body.ops.extend([offset_op, iteration_op])
+                iteration = iteration_op.result()
+            middle.body.ops.extend(prefetch_iteration(
+                iteration, *buffers, load_a0=False, issue_next_a0=True,
+            ))
+        mainloop_ops.append(middle)
+
+        for iteration_value in range(grouped_middle_end, iteration_count - 1):
+            iteration = IndexConstantOp.build(iteration_value)
+            mainloop_ops.append(iteration)
+            buffers = (
+                (lhs_smem[0].result(), lhs_smem[1].result(), lhs_smem[2].result()),
+                (lhs_smem[2].result(), lhs_smem[0].result(), lhs_smem[1].result()),
+                (lhs_smem[1].result(), lhs_smem[2].result(), lhs_smem[0].result()),
+            )[iteration_value % 3]
+            mainloop_ops.extend(prefetch_iteration(
+                iteration.result(), *buffers,
+                load_a0=False, issue_next_a0=True,
+            ))
+
+        last = IndexConstantOp.build(iteration_count - 1)
+        mainloop_ops.append(last)
+        # k/128 is constrained to at least two; 31 mod 3 is one for the
+        # selected 4096 kernel, and the generic mapping below handles any tail.
+        last_phase = (iteration_count - 1) % 3
+        last_buffers = (
+            (lhs_smem[0].result(), lhs_smem[1].result(), lhs_smem[2].result()),
+            (lhs_smem[2].result(), lhs_smem[0].result(), lhs_smem[1].result()),
+            (lhs_smem[1].result(), lhs_smem[2].result(), lhs_smem[0].result()),
+        )[last_phase]
+        mainloop_ops.extend(prefetch_iteration(
+            last.result(), *last_buffers,
+            load_a0=False, issue_next_a0=False,
+        ))
+    elif tma_staging == "direct":
+        direct_buffers = operand_stages // 4
+        lhs_smem = [
+            AllocOp.build_with_fresh_id(SmemTensorType.build(
+                [output_m_tile, 64], bf16, swizzle="128B",
+                attrs={"tcgen05_matrix": True},
+            ))
+            for _ in range(direct_buffers + int(prefetch_lhs_next))
         ]
         rhs_smem = [
             AllocOp.build_with_fresh_id(SmemTensorType.build(
@@ -267,16 +533,18 @@ def blackwell_tcgen05_gemm_module(
         AllocOp.build_with_fresh_id(SmemTensorType.build([64, 16], bf16))
         for _ in range(operand_stages)
     ] if tma_staging == "repack" else []
-    mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
-    tma_lock = (
-        AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
-        if tma_staging == "direct" else None
-    )
-    second_tma_lock = (
-        AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
-        if split_tma_barriers else None
-    )
-    if tma_staging == "direct":
+    if not prefetch_lhs_next:
+        mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+        tma_lock = (
+            AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
+            if tma_staging == "direct" else None
+        )
+        second_tma_lock = (
+            AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
+            if split_tma_barriers else None
+        )
+        prefetch_tma_lock = None
+    if tma_staging == "direct" and not prefetch_lhs_next:
         direct_k_tile = 16 * operand_stages
         loop = ForOp.build(0, k // direct_k_tile)
         load_prefix = []
@@ -418,7 +686,7 @@ def blackwell_tcgen05_gemm_module(
                 attrs=hybrid_attrs,
                 controls=hybrid_controls,
             ))
-    else:
+    elif tma_staging != "direct":
         loop = ForOp.build(0, k // 16, step=operand_stages)
         mmas = []
         for stage in range(operand_stages):
@@ -464,29 +732,48 @@ def blackwell_tcgen05_gemm_module(
                 lhs_smem[stage].result(), rhs_smem[stage].result(),
                 accumulator.result(),
             ))
-    loop.body.ops.extend([
-        AsyncOp.build(
-            mma_lock.result(),
-            body=Block(ops=mmas),
-            attrs={"branch_elected_issue": True}
-            if branch_tcgen05_issue else None,
-        ),
-        AwaitOp.build(mma_lock.result()),
-    ])
+    if not prefetch_lhs_next:
+        loop.body.ops.extend([
+            AsyncOp.build(
+                mma_lock.result(),
+                body=Block(ops=mmas),
+                attrs={"branch_elected_issue": True}
+                if branch_tcgen05_issue else None,
+            ),
+            AwaitOp.build(mma_lock.result()),
+        ])
+        mainloop_ops = [loop]
+    allocation_ops = (
+        [
+            accumulator,
+            mma_lock,
+            *([tma_lock] if tma_lock is not None else []),
+            *([second_tma_lock] if second_tma_lock is not None else []),
+            *([prefetch_tma_lock] if prefetch_tma_lock is not None else []),
+            *lhs_smem,
+            *rhs_smem,
+            *lhs_tma_smem,
+            *rhs_tma_smem,
+        ]
+        if prefetch_lhs_next else
+        [
+            accumulator,
+            *lhs_smem,
+            *rhs_smem,
+            *lhs_tma_smem,
+            *rhs_tma_smem,
+            mma_lock,
+            *([tma_lock] if tma_lock is not None else []),
+            *([second_tma_lock] if second_tma_lock is not None else []),
+        ]
+    )
     body = Block(arguments=[a, bt, c], ops=[
         *grid_index_ops,
         a_block,
         bt_block,
         c_block,
-        accumulator,
-        *lhs_smem,
-        *rhs_smem,
-        *lhs_tma_smem,
-        *rhs_tma_smem,
-        mma_lock,
-        *([tma_lock] if tma_lock is not None else []),
-        *([second_tma_lock] if second_tma_lock is not None else []),
-        loop,
+        *allocation_ops,
+        *mainloop_ops,
         MoveOp.build(
             c_block.result(), accumulator.result(),
             indices=hybrid_controls,
