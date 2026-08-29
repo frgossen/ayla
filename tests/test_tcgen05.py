@@ -329,7 +329,7 @@ def test_tcgen05_split_rhs_tma_lowering():
     assert input_descs[0].tile_sizes == (128, 64)
     assert input_descs[1].tile_sizes == (128, 64)
 
-    with pytest.raises(ValueError, match="direct N=240/N=248/N=256 staging"):
+    with pytest.raises(ValueError, match="direct N=232/N=240/N=248/N=256"):
         blackwell_tcgen05_gemm_module(
             m=128, n=128, k=64,
             output_n_tile=128, split_rhs_tma=True,
@@ -398,6 +398,27 @@ def test_tcgen05_n240_tail16_lowering():
     ))
     assert predicated.ptx.count("st.global.v8.b32") == 15
     assert "@!" in predicated.ptx
+
+
+def test_tcgen05_n232_tail152_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=256,
+        output_n_tile=232, tail_n_tile=152,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    ))
+    input_descs = {
+        typ.arg_idx: typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
+    }
+
+    assert kernel.grid_dim == (18, 1, 1)
+    assert input_descs[1].tile_sizes == (116, 64)
+    assert "0x083a0490" in kernel.ptx  # M128/N232
+    assert "0x08260490" in kernel.ptx  # M128/N152 tail
+    assert "st.global.v8.b32" in kernel.ptx
+    assert "st.global.v4.b32" in kernel.ptx
 
 
 def test_tcgen05_next_lhs_prefetch_lowering():

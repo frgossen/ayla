@@ -1087,7 +1087,7 @@ class LowerToPtxTemplate(LoweringPass):
                 not isinstance(hybrid_n_tiles, int)
                 or hybrid_n_tiles < 2
                 or cta_group != 1
-                or n not in (240, 248, 256)
+                or n not in (232, 240, 248, 256)
                 or not isinstance(hybrid_n_width, int)
                 or hybrid_n_width % 8
                 or not 8 <= hybrid_n_width < n
@@ -1095,7 +1095,7 @@ class LowerToPtxTemplate(LoweringPass):
             ):
                 raise ValueError(
                     "hybrid-N tcgen05 requires a direct-TMA group-1 "
-                    "N240/N248/N256 tile and a valid narrow width"
+                    "N232/N240/N248/N256 tile and a valid narrow width"
                 )
             if hybrid_split_rows is not None or hybrid_split_tile is not None:
                 if (
@@ -1355,7 +1355,7 @@ class LowerToPtxTemplate(LoweringPass):
         if hybrid_n_tiles is not None and (
             not isinstance(hybrid_n_tiles, int)
             or hybrid_n_tiles < 2
-            or src_type.sizes[1] not in (240, 248, 256)
+            or src_type.sizes[1] not in (232, 240, 248, 256)
             or not isinstance(hybrid_n_width, int)
             or hybrid_n_width % 8
             or not 8 <= hybrid_n_width < src_type.sizes[1]
@@ -1363,8 +1363,8 @@ class LowerToPtxTemplate(LoweringPass):
         ):
             raise ValueError(
                 "hybrid-N output requires at least two N tiles and a "
-                "240-, 248-, or 256-column BF16 output tile with a valid "
-                "narrow width"
+                "232-, 240-, 248-, or 256-column BF16 output tile with a "
+                "valid narrow width"
             )
         if predicated_tail_stores and (
             hybrid_n_tiles is None or src_type.sizes[0] != 128
@@ -1417,15 +1417,16 @@ class LowerToPtxTemplate(LoweringPass):
             mul.wide.u32 ${{b64:row_offset}}, ${{b32:row_index}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
         """)
-        if src_type.sizes[1] == 248:
-            # Adjacent N248 tiles start 496 bytes apart.  Use a CTA-uniform
+        alternating_store_alignment = src_type.sizes[1] in (232, 248)
+        if alternating_store_alignment:
+            # N232/N248 tiles have 16-byte-odd strides. Use a CTA-uniform
             # parity branch so each tile gets maximally wide aligned stores:
             # even tiles use a trailing 16B edge, odd tiles use 16B edges
             # around aligned 32B interior transactions.
             template += textwrap.dedent("""\
-                mov.u32 ${b32:n248_bid}, %ctaid.x;
-                and.b32 ${b32:n248_parity}, ${b32:n248_bid}, 1;
-                setp.ne.u32 ${pred:n248_odd}, ${b32:n248_parity}, 0;
+                mov.u32 ${b32:alternating_bid}, %ctaid.x;
+                and.b32 ${b32:alternating_parity}, ${b32:alternating_bid}, 1;
+                setp.ne.u32 ${pred:alternating_odd}, ${b32:alternating_parity}, 0;
             """)
         operands = [self.value_map[op.dst], self.value_map[op.src]]
         operand_names = ["dst", "src"]
@@ -1491,7 +1492,7 @@ class LowerToPtxTemplate(LoweringPass):
                         for start, width in starts_and_widths
                     ]
 
-                if src_type.sizes[1] == 248:
+                if alternating_store_alignment:
                     even_groups = [
                         (start, min(8, len(packed) - start))
                         for start in range(0, len(packed), 8)
@@ -1502,12 +1503,12 @@ class LowerToPtxTemplate(LoweringPass):
                     ]
                     stores = "\n".join([
                         *conversions,
-                        f"@${{pred:n248_odd}} bra ${{label:n248_odd_{col}}};",
+                        f"@${{pred:alternating_odd}} bra ${{label:alternating_odd_{col}}};",
                         *vector_stores(even_groups),
-                        f"bra ${{label:n248_done_{col}}};",
-                        f"${{label:n248_odd_{col}}}:",
+                        f"bra ${{label:alternating_done_{col}}};",
+                        f"${{label:alternating_odd_{col}}}:",
                         *vector_stores(odd_groups),
-                        f"${{label:n248_done_{col}}}:",
+                        f"${{label:alternating_done_{col}}}:",
                     ])
                 else:
                     groups = [
@@ -1566,12 +1567,18 @@ class LowerToPtxTemplate(LoweringPass):
                             f"cvt.rn.bf16x2.f32 {packed_reg}, "
                             f"{values[i + 1]}, {values[i]};"
                         )
-                    narrow_stores = [
-                        f"{store_predicate}st.global.v{min(8, len(narrow_packed) - start)}.b32 "
-                        f"[${{b64:row}}+{col * 2 + start * 4}], "
-                        f"{{{', '.join(narrow_packed[start:start + 8])}}};"
-                        for start in range(0, len(narrow_packed), 8)
-                    ]
+                    narrow_groups = (
+                        [(0, 4)] + [
+                            (start, min(8, len(narrow_packed) - start))
+                            for start in range(4, len(narrow_packed), 8)
+                        ]
+                        if alternating_store_alignment else
+                        [
+                            (start, min(8, len(narrow_packed) - start))
+                            for start in range(0, len(narrow_packed), 8)
+                        ]
+                    )
+                    narrow_stores = vector_stores(narrow_groups)
                     stores = "\n".join([
                         f"@${{pred:hybrid_narrow}} bra ${{label:hybrid_partial_{col}}};",
                         stores,

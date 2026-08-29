@@ -76,8 +76,10 @@ def blackwell_tcgen05_gemm_module(
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
-    if output_n_tile not in (64, 128, 240, 248, 256):
-        raise ValueError("output_n_tile must be 64, 128, 240, 248, or 256")
+    if output_n_tile not in (64, 128, 232, 240, 248, 256):
+        raise ValueError(
+            "output_n_tile must be 64, 128, 232, 240, 248, or 256"
+        )
     if m % output_m_tile or k % 16:
         raise ValueError(
             "tcgen05 GEMM dimensions must divide the M and K tile sizes"
@@ -184,11 +186,11 @@ def blackwell_tcgen05_gemm_module(
             "split TMA barriers require direct eight-stage non-multicast staging"
         )
     if split_rhs_tma and (
-        tma_staging != "direct" or output_n_tile not in (240, 248, 256)
+        tma_staging != "direct" or output_n_tile not in (232, 240, 248, 256)
     ):
         raise ValueError(
-            "split RHS TMA transactions require direct N=240/N=248/N=256 "
-            "staging"
+            "split RHS TMA transactions require direct N=232/N=240/N=248/"
+            "N=256 staging"
         )
     if prefetch_lhs_next and (
         tma_staging != "direct"
@@ -204,11 +206,12 @@ def blackwell_tcgen05_gemm_module(
     if prefetch_rhs_next and (
         not prefetch_lhs_next
         or not split_rhs_tma
-        or output_n_tile not in (240, 248, 256)
+        or output_n_tile not in (232, 240, 248, 256)
     ):
         raise ValueError(
             "next-iteration RHS prefetch requires next-iteration LHS "
-            "prefetch and split direct N=240/N=248/N=256 RHS transactions"
+            "prefetch and split direct N=232/N=240/N=248/N=256 RHS "
+            "transactions"
         )
 
     bf16 = BF16Type()
@@ -301,7 +304,9 @@ def blackwell_tcgen05_gemm_module(
     accumulator = AllocOp.build_with_fresh_id(
         TmemTensorType.build(
             [output_m_tile, output_n_tile], F32Type(),
-            columns=256 if output_n_tile in (240, 248) else output_n_tile,
+            columns=(
+                256 if output_n_tile in (232, 240, 248) else output_n_tile
+            ),
         ),
         init=0.0,
     )
