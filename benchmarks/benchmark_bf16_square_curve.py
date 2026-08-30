@@ -106,7 +106,7 @@ def _blackwell_module(size: int) -> ModuleOp:
     if size == 512:
         return blackwell_tcgen05_gemm_module(
             output_m_tile=64, output_n_tile=32,
-            operand_stages=32, **common,
+            operand_stages=32, derive_tcgen05_descriptors=True, **common,
         )
     if size == 1024:
         return blackwell_tcgen05_gemm_module(
