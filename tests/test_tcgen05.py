@@ -281,6 +281,24 @@ def test_tcgen05_k128_tma_staging_lowering():
     assert ptx.count("tcgen05.st.sync.aligned.32x32b.x128.b32") == 1
 
 
+@pytest.mark.parametrize("stages", [16, 32])
+def test_tcgen05_derives_descriptors_for_long_direct_groups(stages):
+    ordinary = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=512,
+        output_m_tile=64, output_n_tile=64, operand_stages=stages,
+    )).ptx
+    derived = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=512,
+        output_m_tile=64, output_n_tile=64, operand_stages=stages,
+        derive_tcgen05_descriptors=True,
+    )).ptx
+
+    assert derived.count("tcgen05.mma.cta_group::1.kind::f16") == stages
+    assert derived.count("0x4000404000000000") == stages // 2
+    assert derived.count("add.u64") > ordinary.count("add.u64")
+    assert len(derived) < len(ordinary)
+
+
 def test_tcgen05_split_tma_barriers_lowering():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=128,
@@ -752,7 +770,10 @@ def test_tcgen05_lean_bookkeeping_lowering():
         and any(isinstance(body_op, MatmulOp) for body_op in op.body.ops)
     )
     mma_group.attrs["derive_tcgen05_descriptors"] = True
-    with pytest.raises(ValueError, match="eight direct-TMA matmuls"):
+    mma_group.body.ops.remove(next(
+        op for op in reversed(mma_group.body.ops) if isinstance(op, MatmulOp)
+    ))
+    with pytest.raises(ValueError, match="complete four-MMA"):
         make_ptx_kernel(invalid_descriptors)
 
 

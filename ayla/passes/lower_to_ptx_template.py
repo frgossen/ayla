@@ -1278,9 +1278,12 @@ class LowerToPtxTemplate(LoweringPass):
         derive_descriptors = bool(
             op.attrs.get("derive_tcgen05_descriptors")
         )
-        if derive_descriptors and (not direct_tma_layout or len(mms) != 8):
+        if derive_descriptors and (
+            not direct_tma_layout or len(mms) < 4 or len(mms) % 4
+        ):
             raise ValueError(
-                "derived tcgen05 descriptors require eight direct-TMA matmuls"
+                "derived tcgen05 descriptors require complete four-MMA "
+                "direct-TMA banks"
             )
         mma_index = 0
         for body_op in body_ops:

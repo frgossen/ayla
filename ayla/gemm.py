@@ -50,6 +50,7 @@ def blackwell_tcgen05_gemm_module(
     ptx_optimization_level: int | None = 1,
     cluster_multicast_a: bool = False,
     branch_tcgen05_issue: bool = True,
+    derive_tcgen05_descriptors: bool = False,
     transpose_cta_grid: bool = False,
     split_last_n_tile: bool = False,
     split_n_tile: int | None = None,
@@ -250,6 +251,13 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "16x32bx2 output requires M128 with exact N256 or balanced "
             "N232/N224 tiles"
+        )
+    if derive_tcgen05_descriptors and (
+        tma_staging != "direct" or prefetch_lhs_next
+    ):
+        raise ValueError(
+            "derived tcgen05 descriptors require the direct non-prefetched "
+            "pipeline"
         )
     if split_tma_barriers and (
         tma_staging != "direct"
@@ -1153,8 +1161,12 @@ def blackwell_tcgen05_gemm_module(
             AsyncOp.build(
                 mma_lock.result(),
                 body=Block(ops=mmas),
-                attrs={"branch_elected_issue": True}
-                if branch_tcgen05_issue else None,
+                attrs={
+                    **({"derive_tcgen05_descriptors": True}
+                       if derive_tcgen05_descriptors else {}),
+                    **({"branch_elected_issue": True}
+                       if branch_tcgen05_issue else {}),
+                } or None,
             ),
             AwaitOp.build(mma_lock.result()),
         ])
