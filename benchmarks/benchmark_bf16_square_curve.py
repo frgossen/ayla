@@ -114,6 +114,7 @@ def _blackwell_module(size: int) -> ModuleOp:
             output_m_tile=64, output_n_tile=64,
             operand_stages=16, derive_tcgen05_descriptors=True,
             prefetch_next_banks=1, ptx_optimization_level=2,
+            overwrite_first_mma=True,
             output_tmem_load_shape="16x32bx2",
             **{
                 **common,

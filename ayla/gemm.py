@@ -71,6 +71,7 @@ def blackwell_tcgen05_gemm_module(
     output_l1_cache_policy: str | None = None,
     output_l2_eviction_priority: str | None = None,
     output_tmem_load_shape: str = "32x32b",
+    overwrite_first_mma: bool = False,
     persistent_n_pairs: bool = False,
     persistent_m_pairs: bool = False,
     lean_bookkeeping: bool = False,
@@ -278,6 +279,18 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "16x32bx2 output requires exact M64/N32/N64, M128/N128/N256, "
             "or balanced M128/N232/N224 tiles"
+        )
+    if overwrite_first_mma and (
+        tma_staging != "direct"
+        or not (
+            prefetch_lhs_next
+            or prefetch_next_banks
+            or k == 16 * operand_stages
+        )
+    ):
+        raise ValueError(
+            "first-MMA overwrite requires a statically identifiable first "
+            "direct-TMA iteration"
         )
     if derive_tcgen05_descriptors and (
         tma_staging != "direct" or prefetch_lhs_next
@@ -642,7 +655,7 @@ def blackwell_tcgen05_gemm_module(
         ),
         # Each persistent tile starts with an overwrite-mode MMA, so a one-time
         # zero fill is both unnecessary for correctness and dead setup work.
-        init=None if persistent_n_pairs else 0.0,
+        init=None if persistent_n_pairs or overwrite_first_mma else 0.0,
     )
     if prefetch_lhs_next:
         direct_buffers = operand_stages // 4
@@ -927,7 +940,7 @@ def blackwell_tcgen05_gemm_module(
             first.result(),
             lhs_smem[0].result(), lhs_smem[1].result(), lhs_smem[2].result(),
             load_a0=True, issue_next_a0=True,
-            overwrite_first=persistent_n_pairs,
+            overwrite_first=persistent_n_pairs or overwrite_first_mma,
         ))
 
         iteration_count = k // 128
@@ -1168,7 +1181,10 @@ def blackwell_tcgen05_gemm_module(
                 mainloop_ops.extend([lhs_tile, rhs_tile])
                 mma_attrs = (
                     {"overwrite_accumulator": True}
-                    if persistent_n_pairs and iteration == 0 and stage == 0
+                    if (
+                        (persistent_n_pairs or overwrite_first_mma)
+                        and iteration == 0 and stage == 0
+                    )
                     else None
                 )
                 mmas.append(MatmulOp.build(
@@ -1337,10 +1353,12 @@ def blackwell_tcgen05_gemm_module(
                 }
                 if hybrid_n_tiles is not None else None
             )
+            mma_attrs = dict(hybrid_attrs or {})
+            if overwrite_first_mma and k == direct_k_tile and stage == 0:
+                mma_attrs["overwrite_accumulator"] = True
             mmas.append(MatmulOp.build(
                 lhs_tile.result(), rhs_tile.result(), accumulator.result(),
-                attrs=hybrid_attrs,
-                controls=hybrid_controls,
+                attrs=mma_attrs or None, controls=hybrid_controls,
             ))
     elif tma_staging != "direct":
         loop = ForOp.build(0, k // 16, step=operand_stages)

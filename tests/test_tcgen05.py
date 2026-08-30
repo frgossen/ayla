@@ -352,6 +352,30 @@ def test_tcgen05_prefetched_persistent_pairs_overwrite_each_output():
     assert overwrite < first_mma < restore
 
 
+def test_tcgen05_overwrites_fresh_accumulator_on_first_static_mma():
+    module = blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True, prefetch_next_banks=1,
+        overwrite_first_mma=True,
+    )
+    accumulator = next(
+        op for op in iter_ops(module)
+        if isinstance(op, AllocOp)
+        and isinstance(op.result().type, TmemTensorType)
+    )
+    assert accumulator.init is None
+    first_mma = next(op for op in iter_ops(module) if isinstance(op, MatmulOp))
+    assert first_mma.attrs["overwrite_accumulator"] is True
+
+    with pytest.raises(ValueError, match="statically identifiable"):
+        blackwell_tcgen05_gemm_module(
+            m=64, n=64, k=1024,
+            output_m_tile=64, output_n_tile=64, operand_stages=4,
+            overwrite_first_mma=True,
+        )
+
+
 def test_tcgen05_split_tma_barriers_lowering():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=128,
