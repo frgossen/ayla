@@ -386,9 +386,9 @@ def test_tcgen05_batches_lock_initialization_sync():
 
     assert ptx.count("mbarrier.init.shared::cta.b64") == 4
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    # Tensor-memory/issuer setup contributes three rendezvous; the lock batch
+    # Tensor-memory/issuer setup contributes two rendezvous; the lock batch
     # contributes only its final one instead of one per lock.
-    assert ptx[:ptx.index("cp.async.bulk.tensor")].count("bar.sync 0;") == 4
+    assert ptx[:ptx.index("cp.async.bulk.tensor")].count("bar.sync 0;") == 3
 
 
 def test_tcgen05_overlaps_deallocation_with_final_m64_store():

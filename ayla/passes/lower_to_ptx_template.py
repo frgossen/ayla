@@ -318,7 +318,10 @@ class LowerToPtxTemplate(LoweringPass):
             @${{pred:tmem_warp0}} tcgen05.alloc.cta_group::{cta_group}.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {result_type.columns};
             bar.sync 0;
             ld.shared.b32 ${{b32:result.dst.ptr}}, [${{smem:tmem_addr}}];
-            bar.sync 0;
+            // Relinquishing the right to make further allocations does not
+            // invalidate this allocation or its address. Once warp 0 has
+            // loaded that address, it need not wait for the other warps to
+            // load theirs before executing the warp-collective relinquish.
             @${{pred:tmem_warp0}} tcgen05.relinquish_alloc_permit.cta_group::{cta_group}.sync.aligned;
         """)
         if op.init is not None:
