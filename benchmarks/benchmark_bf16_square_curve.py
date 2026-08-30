@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 
+import common as benchmark_common
 from ayla import ModuleOp
 from ayla.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
@@ -219,7 +220,15 @@ def main() -> int:
         "--sizes", nargs="+", type=int,
         help="run only the listed configured square sizes",
     )
+    parser.add_argument(
+        "--graph-launches", type=int,
+        help="launches captured per timed graph replay",
+    )
     args = parser.parse_args()
+    if args.graph_launches is not None:
+        if args.graph_launches < 1:
+            raise SystemExit("--graph-launches must be positive")
+        benchmark_common._GRAPH_LAUNCHES = args.graph_launches
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
