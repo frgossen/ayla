@@ -24,6 +24,7 @@ from ayla.gpu_dialect import (
     BF16Type,
     BlockIdsOp,
     F32Type,
+    ForOp,
     GmemTensorType,
     LockType,
     MoveOp,
@@ -297,6 +298,22 @@ def test_tcgen05_derives_descriptors_for_long_direct_groups(stages):
     assert derived.count("0x4000404000000000") == stages // 2
     assert derived.count("add.u64") > ordinary.count("add.u64")
     assert len(derived) < len(ordinary)
+
+
+def test_tcgen05_unrolls_direct_mainloop():
+    module = blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True, unroll_direct_mainloop=True,
+    )
+    direct_loops = [
+        op for op in iter_ops(module)
+        if isinstance(op, ForOp)
+        and op.attrs.get("label") == "tcgen05_direct_k"
+    ]
+    assert len(direct_loops) == 1 and direct_loops[0].trip_count == 0
+    ptx = make_ptx_kernel(module).ptx
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 64
 
 
 def test_tcgen05_split_tma_barriers_lowering():

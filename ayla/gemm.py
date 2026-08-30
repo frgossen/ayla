@@ -51,6 +51,7 @@ def blackwell_tcgen05_gemm_module(
     cluster_multicast_a: bool = False,
     branch_tcgen05_issue: bool = True,
     derive_tcgen05_descriptors: bool = False,
+    unroll_direct_mainloop: bool = False,
     transpose_cta_grid: bool = False,
     split_last_n_tile: bool = False,
     split_n_tile: int | None = None,
@@ -258,6 +259,13 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "derived tcgen05 descriptors require the direct non-prefetched "
             "pipeline"
+        )
+    if unroll_direct_mainloop and (
+        tma_staging != "direct" or prefetch_lhs_next
+    ):
+        raise ValueError(
+            "direct mainloop unrolling requires the non-prefetched direct "
+            "TMA pipeline"
         )
     if split_tma_barriers and (
         tma_staging != "direct"
@@ -966,6 +974,7 @@ def blackwell_tcgen05_gemm_module(
     if tma_staging == "direct" and not prefetch_lhs_next:
         direct_k_tile = 16 * operand_stages
         loop = ForOp.build(0, k // direct_k_tile)
+        loop.attrs["label"] = "tcgen05_direct_k"
         load_prefix = []
         load_groups = []
         if operand_stages == 4:
@@ -1269,7 +1278,7 @@ def blackwell_tcgen05_gemm_module(
             DeallocOp.build(accumulator.result()),
         ]
     body = Block(arguments=[a, bt, c], ops=body_ops)
-    return ModuleOp.build(Block(ops=[KernelOp.build(
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
         "blackwell_tcgen05_4096",
         body,
         grid_dim=(
@@ -1291,6 +1300,13 @@ def blackwell_tcgen05_gemm_module(
         attrs={"hoist_thread_zero_issue": True}
         if lean_bookkeeping else None,
     )]), target=BLACKWELL)
+    if unroll_direct_mainloop:
+        module = unroll_loop(
+            module,
+            unroll_factor=k // (16 * operand_stages) + 1,
+            label_filter="tcgen05_direct_k",
+        )
+    return module
 
 
 def blackwell_tcgen05_cta_group2_gemm_module(
