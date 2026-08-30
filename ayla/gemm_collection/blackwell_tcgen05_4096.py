@@ -19,4 +19,5 @@ def blackwell_tcgen05_4096_module():
         persistent_n_pairs=True,
         lean_bookkeeping=True,
         reuse_persistent_lhs=True,
+        resident_phase_order_split=148,
     )

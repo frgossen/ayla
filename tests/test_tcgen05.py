@@ -619,6 +619,37 @@ def test_tcgen05_persistent_pair_reuses_lhs_in_reverse_k_order():
         )
 
 
+def test_tcgen05_persistent_pair_resident_phase_order_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=4096, n=4096, k=4096,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+        reuse_persistent_lhs=True,
+        resident_phase_order_split=148,
+    ))
+    ptx = kernel.ptx
+
+    assert kernel.grid_dim == (9, 32, 1)
+    assert "// 148" in ptx
+    assert ptx.count("div.u32") >= 4
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 80
+    assert ptx.count("cp.async.bulk.tensor.2d.shared::cluster.global") == 58
+
+    with pytest.raises(ValueError, match="resident phase-order splitting"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=4096, k=256,
+            output_n_tile=232, balanced_n_tile=224,
+            operand_stages=8, transpose_cta_grid=True,
+            split_tma_barriers=True, split_rhs_tma=True,
+            prefetch_lhs_next=True, prefetch_rhs_next=True,
+            resident_phase_order_split=4,
+        )
+
+
 def test_tcgen05_lean_bookkeeping_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=4096, k=256,

@@ -71,6 +71,7 @@ def blackwell_tcgen05_gemm_module(
     persistent_n_pairs: bool = False,
     lean_bookkeeping: bool = False,
     reuse_persistent_lhs: bool = False,
+    resident_phase_order_split: int | None = None,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -85,6 +86,10 @@ def blackwell_tcgen05_gemm_module(
     first two A banks are the resident final banks from the first output. All
     four warps still execute the same pipeline; only K order and buffer reuse
     differ between the two static phases.
+    ``resident_phase_order_split`` reverses the two logical N tiles for the
+    suffix of the linear CTA launch. On B200, splitting at the 148-SM boundary
+    gives likely co-resident CTAs opposite wide/narrow phase order without
+    assigning either CTA or any warp a persistent producer/consumer role.
     With ``cluster_multicast_a``, paired CTAs still execute this same pipeline;
     cluster rank 0 only performs the instruction-mandated issue of their shared
     A transaction, while each CTA independently loads B and computes its tile.
@@ -296,6 +301,16 @@ def blackwell_tcgen05_gemm_module(
             "persistent LHS reuse requires lean persistent N pairs with M128 "
             "and a K128 iteration count congruent to two modulo three"
         )
+    persistent_ctas = m_tiles * (n_tiles // 2)
+    if resident_phase_order_split is not None and (
+        type(resident_phase_order_split) is not int
+        or not persistent_n_pairs
+        or not persistent_ctas // 2 <= resident_phase_order_split < persistent_ctas
+    ):
+        raise ValueError(
+            "resident phase-order splitting requires persistent N pairs and "
+            "an integer split in the upper half of the linear CTA launch"
+        )
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
@@ -337,8 +352,35 @@ def blackwell_tcgen05_gemm_module(
         tile_delta = IndexAddOp.build(
             wide_count.result(), delta_adjustment.result(),
         )
+        pair_iteration = persistent_loop.iv
+        phase_order_ops = []
+        if resident_phase_order_split is not None:
+            # The quotient is binary because validation places the split in
+            # the upper half of the launch. Adding it to the two-iteration IV
+            # modulo two reverses the phase order. Reversing the final
+            # narrow/narrow pair is harmless and avoids another predicate.
+            linear_y = IndexMulOp.build(block_ids.y, pair_count.result())
+            linear_cta = IndexAddOp.build(
+                linear_y.result(), block_ids.x,
+            )
+            phase_split = IndexConstantOp.build(resident_phase_order_split)
+            second_resident = IndexDivOp.build(
+                linear_cta.result(), phase_split.result(),
+            )
+            two = IndexConstantOp.build(2)
+            shifted_iteration = IndexAddOp.build(
+                persistent_loop.iv, second_resident.result(),
+            )
+            selected_iteration = IndexModOp.build(
+                shifted_iteration.result(), two.result(),
+            )
+            pair_iteration = selected_iteration.result()
+            phase_order_ops = [
+                linear_y, linear_cta, phase_split, second_resident,
+                two, shifted_iteration, selected_iteration,
+            ]
         iteration_delta = IndexMulOp.build(
-            persistent_loop.iv, tile_delta.result(),
+            pair_iteration, tile_delta.result(),
         )
         paired_tile = IndexAddOp.build(
             first_tile.result(), iteration_delta.result(),
@@ -346,7 +388,8 @@ def blackwell_tcgen05_gemm_module(
         grid_index_ops.extend([
             pair_count, threshold_bias, biased_pair, leftover_pair,
             doubled_pair, first_tile, wide_count, leftover_delta,
-            delta_adjustment, tile_delta, iteration_delta, paired_tile,
+            delta_adjustment, tile_delta, *phase_order_ops,
+            iteration_delta, paired_tile,
         ])
         logical_block_x = paired_tile.result()
     hybrid_n_tiles = None
