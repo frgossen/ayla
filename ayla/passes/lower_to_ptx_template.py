@@ -405,6 +405,9 @@ class LowerToPtxTemplate(LoweringPass):
         defer_init_sync = op.attrs.get("defer_init_sync", False)
         if type(defer_init_sync) is not bool:
             raise ValueError("defer_init_sync must be a boolean")
+        arrival_count = lock_type.attrs.get("arrival_count", 1)
+        if type(arrival_count) is not int or arrival_count < 1:
+            raise ValueError("lock arrival_count must be a positive integer")
         release = (
             "" if defer_init_sync else
             "fence.mbarrier_init.release.cluster;"
@@ -421,7 +424,7 @@ class LowerToPtxTemplate(LoweringPass):
             or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
             setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
             @${{pred:not_t0}} bra ${{label:after_init}};
-            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], 1;
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrival_count};
             {release}
             ${{label:after_init}}:
             {rendezvous}
@@ -1071,6 +1074,22 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(
                 "tcgen05 partial commits currently support only cta_group 1"
             )
+        completion_masks = {
+            value.type.attrs.get("multicast_mask")
+            for value in (op.lock, *(commit.lock for _, commit in partial_commits))
+            if value.type.attrs.get("multicast_mask") is not None
+        }
+        if any(type(mask) is not int or not 0 < mask < (1 << 16)
+               for mask in completion_masks):
+            raise ValueError(
+                "tcgen05 completion multicast masks must be 16-bit integers"
+            )
+        if len(completion_masks) > 1 or (completion_masks and cta_group != 1):
+            raise ValueError(
+                "tcgen05 async groups require one group-1 completion "
+                "multicast mask"
+            )
+        completion_mask = next(iter(completion_masks), None)
         direct_tma_layout = bool(
             mms[0].rhs.type.attrs.get("tcgen05_tma_layout")
         )
@@ -1229,6 +1248,11 @@ class LowerToPtxTemplate(LoweringPass):
             """)
         if cta_group == 2:
             template += "and.pred ${pred:issue}, ${pred:issue}, ${pred:cluster_even};\n"
+        if completion_mask is not None:
+            template += (
+                f"mov.b16 ${{b16:completion_mask}}, "
+                f"0x{completion_mask:x};\n"
+            )
         if op.attrs.get("branch_elected_issue"):
             # Descriptor construction belongs to the instruction-mandated
             # elected issue sequence. Skipping it in non-issuing lanes is not
@@ -1299,10 +1323,22 @@ class LowerToPtxTemplate(LoweringPass):
         mma_index = 0
         for body_op in body_ops:
             if isinstance(body_op, AsyncCommitOp):
-                template += textwrap.dedent(f"""\
-                    @${{pred:issue}} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
-                        [${{b32:operand.{commit_names[body_op]}.val}}];
-                """)
+                partial_multicast = body_op.lock.type.attrs.get("multicast_mask")
+                opcode = (
+                    "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+                    "shared::cluster"
+                    + (".multicast::cluster" if partial_multicast is not None else "")
+                    + ".b64"
+                )
+                mask_operand = (
+                    ", ${b16:completion_mask}"
+                    if partial_multicast is not None else ""
+                )
+                template += (
+                    f"@${{pred:issue}} {opcode}\n"
+                    f"    [${{b32:operand.{commit_names[body_op]}.val}}]"
+                    f"{mask_operand};\n"
+                )
                 continue
             if isinstance(body_op, AwaitOp):
                 template += textwrap.dedent(r"""
@@ -1388,10 +1424,20 @@ class LowerToPtxTemplate(LoweringPass):
             if overwrite_first and i == 0:
                 template += "mov.pred ${pred:use_d}, -1;\n"
         if cta_group == 1:
-            template += textwrap.dedent("""\
-                @${pred:issue} tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
-                    [${b32:operand.lock.val}];
-            """)
+            opcode = (
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+                "shared::cluster"
+                + (".multicast::cluster" if completion_mask is not None else "")
+                + ".b64"
+            )
+            mask_operand = (
+                ", ${b16:completion_mask}"
+                if completion_mask is not None else ""
+            )
+            template += (
+                f"@${{pred:issue}} {opcode}\n"
+                f"    [${{b32:operand.lock.val}}]{mask_operand};\n"
+            )
         else:
             template += textwrap.dedent("""\
                 mov.b16 ${b16:cta_mask}, 0x3;
@@ -2132,6 +2178,11 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
+        elif scope == "cluster":
+            template = (
+                "barrier.cluster.arrive.aligned;\n"
+                "barrier.cluster.wait.aligned;\n"
+            )
         elif scope == "block_leader":
             # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
             # insert_syncs (unique among concurrently-live block-leader barriers).
@@ -2163,13 +2214,19 @@ class LowerToPtxTemplate(LoweringPass):
         # Materializing the optional hint in a virtual register lets ptxas
         # select the compact fused wait; an immediate or test_wait expands
         # into substantially more phase-check, sleep, or yield instructions.
+        after_thread_sync = lock.type.attrs.get("after_thread_sync", False)
+        if type(after_thread_sync) is not bool:
+            raise ValueError("lock after_thread_sync must be a boolean")
+        fence = (
+            "fence.proxy.async.shared::cta;\n" if after_thread_sync else ""
+        )
         template = textwrap.dedent(r"""
             mov.u32 ${b32:ticks}, 0x989680;
             ${label:wait}:
             mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity}, ${b32:ticks};
             @!${pred:mbar_done} bra ${label:wait};
             xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;
-        """)
+        """) + fence
         new_op = PTXTemplateOp.build(
             operands=[lock],
             result_types=[],
@@ -3018,6 +3075,9 @@ class LowerToPtxTemplate(LoweringPass):
         has_cluster_leader_load = any(
             tma.attrs.get("cluster_leader") for tma in tmas
         )
+        has_cluster_rank_load = any(
+            tma.attrs.get("cluster_issuer_rank") is not None for tma in tmas
+        )
         for i, tma in enumerate(tmas):
             dst_value = self.value_map[tma.dst]
             desc_value = self.value_map[tma.src]
@@ -3063,6 +3123,24 @@ class LowerToPtxTemplate(LoweringPass):
             )
             if tma.attrs.get("cluster_leader"):
                 instruction = "@${pred:cluster_leader} " + instruction
+            cluster_issuer_rank = tma.attrs.get("cluster_issuer_rank")
+            if cluster_issuer_rank is not None:
+                if (
+                    type(cluster_issuer_rank) is not int
+                    or not 0 <= cluster_issuer_rank < 16
+                    or tma.attrs.get("cluster_leader")
+                    or multicast_mask is None
+                ):
+                    raise ValueError(
+                        "cluster_issuer_rank requires a multicast TMA load, "
+                        "must be an integer from zero through fifteen, and "
+                        "cannot be combined with cluster_leader"
+                    )
+                load_lines.append(
+                    f"setp.eq.u32 ${{pred:cluster_issuer{i}}}, "
+                    f"${{b32:cluster_rank}}, {cluster_issuer_rank};"
+                )
+                instruction = f"@${{pred:cluster_issuer{i}}} " + instruction
             load_lines.append(instruction)
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
@@ -3108,6 +3186,10 @@ class LowerToPtxTemplate(LoweringPass):
                     "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;",
                 ]
                 if has_cluster_leader_load else []
+            ),
+            *(
+                ["mov.u32 ${b32:cluster_rank}, %cluster_ctarank;"]
+                if has_cluster_rank_load else []
             ),
             *load_lines,
             *arrival_lines,

@@ -1,5 +1,7 @@
 """Focused Blackwell tensor-core bring-up tests."""
 
+import re
+
 import pytest
 import torch
 
@@ -1180,6 +1182,36 @@ def test_tcgen05_gemm_cluster_a_multicast_lowering():
     assert "setp.eq.u32" in kernel.ptx
 
 
+def test_tcgen05_gemm_cluster_b_multicast_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=256, n=512, k=1024,
+        output_m_tile=128, output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, persistent_n_pairs=True,
+        cluster_multicast_b=True,
+        output_tmem_load_shape="16x32bx2",
+    ))
+
+    assert kernel.grid_dim == (1, 2, 1)
+    assert kernel.cluster_dim == (1, 2, 1)
+    assert ".reqnctapercluster 1, 2, 1" in kernel.ptx
+    assert kernel.ptx.count("barrier.cluster.arrive.aligned") == 1
+    assert kernel.ptx.count("mbarrier.init.shared::cta.b64") == 4
+    assert len(re.findall(
+        r"mbarrier\.init\.shared::cta\.b64 \[%r\d+\], 2;", kernel.ptx,
+    )) == 2
+    assert kernel.ptx.count(
+        "mbarrier::complete_tx::bytes.multicast::cluster"
+    ) == 20
+    assert kernel.ptx.count(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+        "shared::cluster.multicast::cluster.b64"
+    ) == 9
+    assert "setp.eq.u32" in kernel.ptx and "%cluster_ctarank" in kernel.ptx
+
+
 def test_tcgen05_gemm_branches_nonissuers_around_issue_sequence():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64,
@@ -1509,6 +1541,32 @@ def test_tcgen05_persistent_exact_n256_pairs_gemm(seed):
     a_tensor = torch.randn((128, 1024), dtype=torch.bfloat16, device="cuda")
     b_tensor = torch.randn((1024, 1024), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty((128, 1024), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_cluster_b_multicast_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=256, n=512, k=1024,
+        output_m_tile=128, output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, persistent_n_pairs=True,
+        cluster_multicast_b=True,
+        output_tmem_load_shape="16x32bx2",
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((256, 1024), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((512, 1024), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((256, 512), dtype=torch.bfloat16, device="cuda")
     make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
     torch.cuda.synchronize()
 

@@ -729,7 +729,8 @@ class BarrierOp(Op):
     across its participating threads.
 
     The ``scope`` attribute records the participant set the sync spans, one of:
-    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``, ``grid``.
+    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
+    ``cluster``, ``grid``.
     """
 
     @classmethod

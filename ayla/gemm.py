@@ -7,6 +7,7 @@ from .gpu_dialect import (
     AsyncCommitOp,
     AsyncOp,
     AwaitOp,
+    BarrierOp,
     BF16Type,
     BlockIdsOp,
     DeallocOp,
@@ -49,6 +50,7 @@ def blackwell_tcgen05_gemm_module(
     output_m_tile: int = 128, output_n_tile: int = 128,
     ptx_optimization_level: int | None = 1,
     cluster_multicast_a: bool = False,
+    cluster_multicast_b: bool = False,
     branch_tcgen05_issue: bool = True,
     derive_tcgen05_descriptors: bool = False,
     unroll_direct_mainloop: bool = False,
@@ -103,6 +105,10 @@ def blackwell_tcgen05_gemm_module(
     With ``cluster_multicast_a``, paired CTAs still execute this same pipeline;
     cluster rank 0 only performs the instruction-mandated issue of their shared
     A transaction, while each CTA independently loads B and computes its tile.
+    ``cluster_multicast_b`` instead pairs adjacent M CTAs. Each CTA issues one
+    half of every split RHS transfer to both cluster members, and both CTAs
+    multicast tensor-completion arrivals before either reuses the shared RHS
+    buffers. This is symmetric CTA cooperation, not warp specialization.
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
@@ -148,6 +154,8 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("cluster A multicast requires N divisible by 256")
     if cluster_multicast_a and transpose_cta_grid:
         raise ValueError("cluster A multicast requires the default CTA grid order")
+    if cluster_multicast_a and cluster_multicast_b:
+        raise ValueError("choose at most one cluster multicast operand")
     if sum(
         option is not None and option is not False
         for option in (
@@ -239,6 +247,25 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "persistent M pairing requires persistent N pairs and an even "
             "M-tile count without resident phase-order splitting"
+        )
+    if cluster_multicast_b and (
+        tma_staging != "direct"
+        or output_m_tile != 128
+        or output_n_tile != 256
+        or not transpose_cta_grid
+        or not persistent_n_pairs
+        or persistent_m_pairs
+        or operand_stages != 8
+        or not split_tma_barriers
+        or not split_rhs_tma
+        or not prefetch_lhs_next
+        or not prefetch_rhs_next
+        or not lean_bookkeeping
+        or m_tiles % 2
+    ):
+        raise ValueError(
+            "cluster B multicast requires even-M, transposed M128/N256/K128 "
+            "persistent pairs with split RHS and lean A/B prefetch"
         )
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
@@ -689,7 +716,17 @@ def blackwell_tcgen05_gemm_module(
         ]
         lhs_tma_smem = []
         rhs_tma_smem = []
-        mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+        cluster_completion_attrs = (
+            {
+                "arrival_count": 2,
+                "multicast_mask": 0x3,
+                "after_thread_sync": True,
+            }
+            if cluster_multicast_b else None
+        )
+        mma_lock = AllocOp.build_with_fresh_id(LockType.build(
+            kind="tcgen05", attrs=cluster_completion_attrs,
+        ))
         tma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
         second_tma_lock = AllocOp.build_with_fresh_id(
             LockType.build(kind="mbar")
@@ -699,7 +736,9 @@ def blackwell_tcgen05_gemm_module(
             AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
         )
         half_mma_lock = (
-            AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
+            AllocOp.build_with_fresh_id(LockType.build(
+                kind="tcgen05", attrs=cluster_completion_attrs,
+            ))
             if prefetch_rhs_next else None
         )
     mainloop_ops = []
@@ -726,6 +765,18 @@ def blackwell_tcgen05_gemm_module(
             **({"l2_promotion": rhs_l2_promotion}
                if rhs_l2_promotion else {}),
         }
+
+        def rhs_attrs(n_half: int) -> dict[str, object]:
+            return {
+                **rhs_move_attrs,
+                **(
+                    {
+                        "multicast_mask": 0x3,
+                        "cluster_issuer_rank": n_half,
+                    }
+                    if cluster_multicast_b else {}
+                ),
+            }
         hybrid_attrs = (
             {
                 "hybrid_n_tiles": hybrid_n_tiles,
@@ -804,7 +855,7 @@ def blackwell_tcgen05_gemm_module(
                     ops.extend([bt_tile, rhs_tile])
                     bank_moves[bank].append(MoveOp.build(
                         rhs_tile.result(), bt_tile.result(),
-                        attrs=rhs_move_attrs,
+                        attrs=rhs_attrs(n_half),
                     ))
 
             if bank_moves[0]:
@@ -932,7 +983,7 @@ def blackwell_tcgen05_gemm_module(
                         ops.extend([next_bt_tile, next_rhs_tile])
                         next_rhs_moves.append(MoveOp.build(
                             next_rhs_tile.result(), next_bt_tile.result(),
-                            attrs=rhs_move_attrs,
+                            attrs=rhs_attrs(n_half),
                         ))
                     ops.append(AsyncOp.build(
                         tma_lock.result(), body=Block(ops=next_rhs_moves),
@@ -1545,6 +1596,8 @@ def blackwell_tcgen05_gemm_module(
             body_ops = [
                 block_ids,
                 *allocation_ops,
+                *([BarrierOp.build(scope="cluster")]
+                  if cluster_multicast_b else []),
                 persistent_m_loop,
                 *deallocation_ops,
             ]
@@ -1552,6 +1605,8 @@ def blackwell_tcgen05_gemm_module(
             body_ops = [
                 block_ids,
                 *allocation_ops,
+                *([BarrierOp.build(scope="cluster")]
+                  if cluster_multicast_b else []),
                 persistent_loop,
                 *deallocation_ops,
             ]
@@ -1590,7 +1645,8 @@ def blackwell_tcgen05_gemm_module(
             (m_tiles, n_tiles, 1)
         ),
         block_dim=(128, 1, 1),
-        cluster_dim=(1, 2, 1) if cluster_multicast_a else None,
+        cluster_dim=(1, 2, 1)
+        if cluster_multicast_a or cluster_multicast_b else None,
         ptx_optimization_level=ptx_optimization_level,
         attrs={"hoist_thread_zero_issue": True}
         if lean_bookkeeping or prefetch_next_banks else None,

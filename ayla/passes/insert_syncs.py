@@ -248,6 +248,11 @@ def _analyze(
         # TODO: gate on a kernel attribute marking the IR hazard-free or
         # already synced instead.
         return live
+    if isinstance(op, BarrierOp):
+        # Explicit synchronization is already a complete ordering operation.
+        # Its current users place it before any cross-CTA dataflow, so no
+        # additional hazard-derived barrier is needed around it.
+        return live
     if isinstance(op, AwaitOp):
         # Clear every effect pending on this lock -- only the ones this await fully
         # orders were made pending on it (see the async handling below). Effects it
