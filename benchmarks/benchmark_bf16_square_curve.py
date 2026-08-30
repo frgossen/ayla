@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from argparse import ArgumentParser
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -209,12 +210,28 @@ def _plot(rows: list[dict[str, object]]) -> None:
 
 
 def main() -> int:
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--reverse", action="store_true",
+        help="benchmark cuBLAS before Ayla at each size",
+    )
+    parser.add_argument(
+        "--sizes", nargs="+", type=int,
+        help="run only the listed configured square sizes",
+    )
+    args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
     blackwell = torch.cuda.get_device_capability()[0] >= 10
     rows = []
-    for size, (build, config_name) in configs_for_device().items():
+    selected = configs_for_device()
+    if args.sizes is not None:
+        unknown = sorted(set(args.sizes) - set(selected))
+        if unknown:
+            raise SystemExit(f"unconfigured square sizes: {unknown}")
+        selected = {size: selected[size] for size in args.sizes}
+    for size, (build, config_name) in selected.items():
         print(f"size={size}: build {config_name}", flush=True)
         ayla_op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
         ayla_config = BenchGemmConfig(
@@ -241,8 +258,13 @@ def main() -> int:
                 "cuBLAS", size, size, size, torch_mm_nt, torch.bfloat16,
             ),
         ]
-        ayla_result, torch_result = run(configs)
-        print_results([ayla_result, torch_result])
+        if args.reverse:
+            configs.reverse()
+        results = run(configs)
+        by_label = {result.label.split(" ", 1)[0]: result for result in results}
+        ayla_result = by_label["Ayla"]
+        torch_result = by_label["cuBLAS"]
+        print_results(results)
         rows.append({
             "size": size,
             "config": config_name,
