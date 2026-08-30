@@ -136,6 +136,15 @@ def _blackwell_module(size: int) -> ModuleOp:
         )
     if size == 4096:
         return blackwell_tcgen05_4096_module()
+    if size == 16384:
+        return blackwell_tcgen05_gemm_module(
+            output_m_tile=128, output_n_tile=256,
+            operand_stages=8, split_tma_barriers=True,
+            split_rhs_tma=True, prefetch_lhs_next=True,
+            prefetch_rhs_next=True, lean_bookkeeping=True,
+            output_tmem_load_shape="16x32bx2",
+            **common,
+        )
     return blackwell_tcgen05_gemm_module(
         output_m_tile=128, output_n_tile=232, balanced_n_tile=224,
         operand_stages=8, split_tma_barriers=True,
@@ -155,7 +164,7 @@ BLACKWELL_CONFIG_NAMES = {
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
-    16384: "tcgen05_balanced_persistent_forward_k",
+    16384: "tcgen05_m128n256_k128_paired_epilogue",
 }
 
 
