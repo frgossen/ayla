@@ -318,6 +318,38 @@ def test_tcgen05_unrolls_direct_mainloop():
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 64
 
 
+def test_tcgen05_overlaps_initial_tma_with_tensor_memory_setup():
+    module = blackwell_tcgen05_gemm_module(
+        m=512, n=512, k=512,
+        output_m_tile=64, output_n_tile=32, operand_stages=32,
+        derive_tcgen05_descriptors=True,
+        overlap_initial_tma_setup=True,
+    )
+    assert not any(
+        isinstance(op, ForOp)
+        and op.attrs.get("label") == "tcgen05_direct_k"
+        for op in iter_ops(module)
+    )
+
+    ptx = make_ptx_kernel(module).ptx
+    first_tma = ptx.index("cp.async.bulk.tensor.2d.shared::cluster.global")
+    tmem_alloc = ptx.index("tcgen05.alloc.cta_group::1")
+    tma_wait = ptx.index("mbarrier.try_wait.parity.acquire")
+    first_mma = ptx.index("tcgen05.mma.cta_group::1")
+    assert first_tma < tmem_alloc < tma_wait < first_mma
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 32
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        blackwell_tcgen05_gemm_module(overlap_initial_tma_setup=1)
+    with pytest.raises(ValueError, match="one non-persistent direct"):
+        blackwell_tcgen05_gemm_module(
+            m=64, n=64, k=1024,
+            output_m_tile=64, output_n_tile=64, operand_stages=16,
+            prefetch_next_banks=1,
+            overlap_initial_tma_setup=True,
+        )
+
+
 def test_tcgen05_prefetches_next_k256_banks():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=64, n=64, k=1024,

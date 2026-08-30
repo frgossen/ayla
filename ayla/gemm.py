@@ -44,6 +44,88 @@ from .passes.tile_matmul import tile_matmul
 from .passes.unroll_loop import unroll_loop
 
 
+def _overlap_initial_tma_with_tmem_setup(module: ModuleOp) -> ModuleOp:
+    """Issue a one-shot direct TMA group before tensor-memory setup.
+
+    The input transfer depends on shared operand buffers and its mbarrier, but
+    not on the accumulator or tcgen completion barrier. Moving those latter
+    allocations between issue and wait hides their setup latency while all
+    threads retain the same load/compute/store pipeline.
+    """
+    if len(module.body.ops) != 1 or not isinstance(module.body.ops[0], KernelOp):
+        raise ValueError("initial TMA overlap requires one kernel")
+    kernel = module.body.ops[0]
+    ops = kernel.body.ops
+    accumulator_index = next(
+        index for index, op in enumerate(ops)
+        if (
+            isinstance(op, AllocOp)
+            and isinstance(op.result().type, TmemTensorType)
+        )
+    )
+    mma_lock_index = next(
+        index for index, op in enumerate(ops)
+        if (
+            isinstance(op, AllocOp)
+            and isinstance(op.result().type, LockType)
+            and op.result().type.kind == "tcgen05"
+        )
+    )
+    tma_lock_index = next(
+        index for index, op in enumerate(ops)
+        if (
+            isinstance(op, AllocOp)
+            and isinstance(op.result().type, LockType)
+            and op.result().type.kind == "mbar"
+        )
+    )
+    initial_tma_index = next(
+        index for index, op in enumerate(ops)
+        if (
+            index > tma_lock_index
+            and isinstance(op, AsyncOp)
+            and op.lock is ops[tma_lock_index].result()
+        )
+    )
+    if not (
+        accumulator_index < mma_lock_index < tma_lock_index < initial_tma_index
+    ):
+        raise ValueError("unexpected one-shot direct-TMA operation order")
+    shared_allocations = ops[accumulator_index + 1:mma_lock_index]
+    if not shared_allocations or not all(
+        isinstance(op, AllocOp)
+        and isinstance(op.result().type, SmemTensorType)
+        for op in shared_allocations
+    ):
+        raise ValueError("initial TMA overlap requires contiguous shared buffers")
+    tma_issue_ops = ops[tma_lock_index + 1:initial_tma_index + 1]
+    dead_mainloops = [
+        op for op in tma_issue_ops
+        if (
+            isinstance(op, ForOp)
+            and op.attrs.get("label") == "tcgen05_direct_k"
+            and op.trip_count == 0
+        )
+    ]
+    if len(dead_mainloops) != 1:
+        raise ValueError("initial TMA overlap requires one unrolled direct loop")
+    # The unroller deliberately leaves an empty main loop for Folding. Remove
+    # it before moving the live tcgen lock allocation: later passes recurse
+    # through loop bodies even when the trip count is zero, and its cloned dead
+    # MMA would otherwise appear to use the lock before its allocation.
+    tma_issue_ops = [op for op in tma_issue_ops if op not in dead_mainloops]
+    kernel.body.ops = [
+        *ops[:accumulator_index],
+        *shared_allocations,
+        ops[tma_lock_index],
+        *tma_issue_ops,
+        ops[accumulator_index],
+        ops[mma_lock_index],
+        *ops[initial_tma_index + 1:],
+    ]
+    return module
+
+
 def blackwell_tcgen05_gemm_module(
     *, m: int = 4096, n: int = 4096, k: int = 4096,
     operand_stages: int = 4, tma_staging: str | None = "direct",
@@ -76,6 +158,7 @@ def blackwell_tcgen05_gemm_module(
     overlap_tmem_deallocation: bool = False,
     overwrite_first_mma: bool = False,
     batch_lock_initialization: bool = False,
+    overlap_initial_tma_setup: bool = False,
     persistent_n_pairs: bool = False,
     persistent_m_pairs: bool = False,
     lean_bookkeeping: bool = False,
@@ -311,6 +394,8 @@ def blackwell_tcgen05_gemm_module(
         )
     if type(overlap_tmem_deallocation) is not bool:
         raise ValueError("overlap_tmem_deallocation must be a boolean")
+    if type(overlap_initial_tma_setup) is not bool:
+        raise ValueError("overlap_initial_tma_setup must be a boolean")
     if overlap_tmem_deallocation and (
         output_tmem_load_shape != "16x32bx2"
         or output_m_tile != 64
@@ -320,6 +405,19 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "overlapped tensor-memory deallocation requires a non-persistent "
             "paired M64/N32 or M64/N64 output"
+        )
+    if overlap_initial_tma_setup and (
+        tma_staging != "direct"
+        or k != 16 * operand_stages
+        or prefetch_lhs_next
+        or prefetch_next_banks
+        or split_tma_barriers
+        or persistent_n_pairs
+        or batch_lock_initialization
+    ):
+        raise ValueError(
+            "initial TMA/setup overlap requires one non-persistent direct "
+            "operand group with ordinary lock initialization"
         )
     if overwrite_first_mma and (
         tma_staging != "direct"
@@ -1651,12 +1749,17 @@ def blackwell_tcgen05_gemm_module(
         attrs={"hoist_thread_zero_issue": True}
         if lean_bookkeeping or prefetch_next_banks else None,
     )]), target=BLACKWELL)
-    if unroll_direct_mainloop and not prefetch_next_banks:
+    if (
+        (unroll_direct_mainloop or overlap_initial_tma_setup)
+        and not prefetch_next_banks
+    ):
         module = unroll_loop(
             module,
             unroll_factor=k // (16 * operand_stages) + 1,
             label_filter="tcgen05_direct_k",
         )
+    if overlap_initial_tma_setup:
+        module = _overlap_initial_tma_with_tmem_setup(module)
     return module
 
 
