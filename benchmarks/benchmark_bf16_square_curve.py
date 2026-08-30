@@ -143,6 +143,7 @@ def _blackwell_module(size: int) -> ModuleOp:
             split_rhs_tma=True, prefetch_lhs_next=True,
             prefetch_rhs_next=True, lean_bookkeeping=True,
             output_tmem_load_shape="16x32bx2",
+            persistent_n_pairs=True,
             **common,
         )
     return blackwell_tcgen05_gemm_module(
@@ -164,7 +165,7 @@ BLACKWELL_CONFIG_NAMES = {
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
-    16384: "tcgen05_m128n256_k128_paired_epilogue",
+    16384: "tcgen05_m128n256_k128_persistent_pair",
 }
 
 

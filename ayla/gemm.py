@@ -204,20 +204,29 @@ def blackwell_tcgen05_gemm_module(
             )
         balanced_wide_tiles = extra // delta
     if persistent_n_pairs and (
-        balanced_n_tile is None
-        or not transpose_cta_grid
-        or balanced_wide_tiles is None
+        not transpose_cta_grid
         or (
-            n_tiles % 2 == 0
+            balanced_n_tile is None
+            and n_tiles % 2
+        )
+        or (
+            balanced_n_tile is not None
             and (
-                balanced_wide_tiles > n_tiles // 2
-                or (n_tiles - 2 * balanced_wide_tiles) % 2
+                balanced_wide_tiles is None
+                or (
+                    n_tiles % 2 == 0
+                    and (
+                        balanced_wide_tiles > n_tiles // 2
+                        or (n_tiles - 2 * balanced_wide_tiles) % 2
+                    )
+                )
             )
         )
     ):
         raise ValueError(
-            "persistent N pairing requires an exact balanced-N launch; even "
-            "launches must pair each wide tile with a narrow tile"
+            "persistent N pairing requires a transposed exact even-width "
+            "launch or a balanced-N launch whose even rows pair every wide "
+            "tile with a narrow tile"
         )
     if persistent_m_pairs and (
         not persistent_n_pairs
@@ -345,13 +354,14 @@ def blackwell_tcgen05_gemm_module(
         )
     if reuse_persistent_lhs and (
         not persistent_n_pairs
+        or balanced_n_tile is None
         or not lean_bookkeeping
         or output_m_tile != 128
         or k // 128 < 5
     ):
         raise ValueError(
-            "persistent LHS reuse requires lean persistent N pairs with M128 "
-            "and at least five K128 iterations"
+            "persistent LHS reuse requires lean balanced persistent N pairs "
+            "with M128 and at least five K128 iterations"
         )
     persistent_ctas = m_tiles * ((n_tiles + 1) // 2)
     if resident_phase_order_split is not None and (
@@ -384,10 +394,16 @@ def blackwell_tcgen05_gemm_module(
     logical_block_x = block_ids.x
     logical_block_y = block_ids.y
     if persistent_loop is not None:
-        assert balanced_wide_tiles is not None
         pair_count = IndexConstantOp.build((n_tiles + 1) // 2)
         pair_mapping_ops = [pair_count]
-        if n_tiles % 2:
+        if balanced_n_tile is None:
+            two = IndexConstantOp.build(2)
+            first_tile = IndexMulOp.build(block_ids.x, two.result())
+            tile_delta = IndexConstantOp.build(1)
+            first_tile_value = first_tile.result()
+            pair_mapping_ops.extend([two, first_tile, tile_delta])
+        elif n_tiles % 2:
+            assert balanced_wide_tiles is not None
             # Pair [0, pair_count-2] with the upper half and let the final CTA
             # recompute its own tile. This covers an odd row without an OOB
             # access or a second CTA racing the same output; the redundant
@@ -409,6 +425,7 @@ def blackwell_tcgen05_gemm_module(
                 active_delta, tile_delta,
             ])
         else:
+            assert balanced_wide_tiles is not None
             threshold_bias = IndexConstantOp.build(
                 n_tiles // 2 - balanced_wide_tiles,
             )
@@ -596,8 +613,8 @@ def blackwell_tcgen05_gemm_module(
         hybrid_n_tiles = n_tiles
         hybrid_n_width = output_n_tile // 2
     else:
-        m_block_id = block_ids.y if transpose_cta_grid else block_ids.x
-        n_block_id = block_ids.x if transpose_cta_grid else block_ids.y
+        m_block_id = logical_block_y if transpose_cta_grid else logical_block_x
+        n_block_id = logical_block_x if transpose_cta_grid else logical_block_y
     a_block = TileOp.build(
         a, [m_block_id, 0],
         GmemTensorType.build([output_m_tile, k], bf16, strides=[k, 1]),
