@@ -247,12 +247,13 @@ def blackwell_tcgen05_gemm_module(
         output_m_tile != 128
         or (
             (output_n_tile, balanced_n_tile) != (232, 224)
+            and (output_n_tile, balanced_n_tile) != (128, None)
             and (output_n_tile, balanced_n_tile) != (256, None)
         )
     ):
         raise ValueError(
-            "16x32bx2 output requires M128 with exact N256 or balanced "
-            "N232/N224 tiles"
+            "16x32bx2 output requires M128 with exact N128/N256 or "
+            "balanced N232/N224 tiles"
         )
     if derive_tcgen05_descriptors and (
         tma_staging != "direct" or prefetch_lhs_next

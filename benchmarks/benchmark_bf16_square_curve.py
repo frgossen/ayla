@@ -120,6 +120,7 @@ def _blackwell_module(size: int) -> ModuleOp:
             operand_stages=8, split_tma_barriers=True,
             split_rhs_tma=True, prefetch_lhs_next=True,
             prefetch_rhs_next=True, lean_bookkeeping=True,
+            output_tmem_load_shape="16x32bx2",
             **common,
         )
     if size == 4096:

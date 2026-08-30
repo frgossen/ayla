@@ -1549,19 +1549,20 @@ class LowerToPtxTemplate(LoweringPass):
                 and hybrid_split_tile is None
                 and len(op.indices) == 2
             )
-            exact_n256 = (
-                tuple(src_type.sizes) == (128, 256)
+            exact = (
+                tuple(src_type.sizes) in ((128, 128), (128, 256))
                 and hybrid_n_tiles is None
                 and not op.indices
             )
             if not (
                 dst_type.dtype.name == "bf16"
                 and not predicated_tail_stores
-                and (balanced or exact_n256)
+                and (balanced or exact)
             ):
                 raise ValueError(
                     "16x32bx2 tensor-memory output loads currently require "
-                    "exact M128/N256 or balanced M128/N232/N224 BF16 output"
+                    "exact M128/N128 or M128/N256, or balanced "
+                    "M128/N232/N224 BF16 output"
                 )
             return self._lower_move_tmem_to_gmem_16x32bx2(
                 op, l1_cache_policy, l2_eviction_priority,
@@ -2002,7 +2003,8 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             template_lines.extend(
                 group_loop(
-                    "n256", range(0, 256, 32), None, False,
+                    f"n{dst_type.sizes[1]}",
+                    range(0, dst_type.sizes[1], 32), None, False,
                 )
             )
         template_lines.append("${label:paired_done}:")

@@ -1042,6 +1042,16 @@ def test_tcgen05_gemm_branches_nonissuers_around_issue_sequence():
     assert branch < descriptor < mma < join
 
 
+def test_tcgen05_exact_n128_paired_epilogue_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=128, k=128,
+        output_n_tile=128, operand_stages=8,
+        output_tmem_load_shape="16x32bx2",
+    ))
+    assert kernel.ptx.count("tcgen05.ld.sync.aligned.16x32bx2.x16.b32") == 4
+    assert "tcgen05.ld.sync.aligned.16x32bx2.x4.b32" not in kernel.ptx
+
+
 def test_tcgen05_m64_tma_staging_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64, output_m_tile=64,
