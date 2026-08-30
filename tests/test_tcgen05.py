@@ -316,6 +316,23 @@ def test_tcgen05_unrolls_direct_mainloop():
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 64
 
 
+def test_tcgen05_prefetches_next_k256_banks():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True,
+        prefetch_next_banks=2,
+    ))
+    ptx = kernel.ptx
+
+    assert ptx.count("elect.sync") == 0
+    assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 64
+    assert ptx.count("tcgen05.commit.cta_group::1") == 10
+    assert ptx.count("mbarrier.arrive.expect_tx") == 12
+    assert ptx.count(", 16384;") == 8
+    assert ptx.count(", 32768;") == 4
+
+
 def test_tcgen05_split_tma_barriers_lowering():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=128,
