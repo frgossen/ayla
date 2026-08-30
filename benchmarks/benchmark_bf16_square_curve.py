@@ -12,6 +12,10 @@ import torch
 from ayla import ModuleOp
 from ayla.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    blackwell_tcgen05_gemm_module,
+)
+from ayla.gemm_collection.blackwell_tcgen05_4096 import (
+    blackwell_tcgen05_4096_module,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -38,7 +42,7 @@ def _square_module(size: int, **config: object) -> ModuleOp:
     )
 
 
-CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
+HOPPER_CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
     512: (partial(_square_module, 512, operand_stages=2), "m128n256_k64_s2"),
     1024: (
         partial(
@@ -88,6 +92,68 @@ CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
 }
 
 
+def _blackwell_module(size: int) -> ModuleOp:
+    common = {
+        "m": size, "n": size, "k": size,
+        "transpose_cta_grid": True,
+        "lhs_l2_cache_hint": "evict_last",
+        "rhs_l2_cache_hint": "evict_last",
+        "lhs_l2_promotion": "256B",
+        "rhs_l2_promotion": "256B",
+        "output_l1_cache_policy": "no_allocate",
+        "output_l2_eviction_priority": "evict_first",
+    }
+    if size == 512:
+        return blackwell_tcgen05_gemm_module(
+            output_m_tile=64, output_n_tile=32,
+            operand_stages=32, **common,
+        )
+    if size == 1024:
+        return blackwell_tcgen05_gemm_module(
+            output_m_tile=64, output_n_tile=64,
+            operand_stages=16, **common,
+        )
+    if size == 2048:
+        return blackwell_tcgen05_gemm_module(
+            output_m_tile=128, output_n_tile=128,
+            operand_stages=8, split_tma_barriers=True,
+            split_rhs_tma=True, prefetch_lhs_next=True,
+            prefetch_rhs_next=True, lean_bookkeeping=True,
+            **common,
+        )
+    if size == 4096:
+        return blackwell_tcgen05_4096_module()
+    return blackwell_tcgen05_gemm_module(
+        output_m_tile=128, output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, split_tma_barriers=True,
+        split_rhs_tma=True, prefetch_lhs_next=True,
+        prefetch_rhs_next=True, lean_bookkeeping=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True,
+        reuse_persistent_lhs=size == 8192,
+        **common,
+    )
+
+
+BLACKWELL_CONFIG_NAMES = {
+    512: "tcgen05_m64n32_k512",
+    1024: "tcgen05_m64n64_k256",
+    2048: "tcgen05_m128n128_k128_prefetch",
+    4096: "tcgen05_balanced_persistent_phase_split",
+    8192: "tcgen05_balanced_persistent_lhs_reuse",
+    16384: "tcgen05_balanced_persistent_forward_k",
+}
+
+
+def configs_for_device() -> dict[int, tuple[Callable[[], ModuleOp], str]]:
+    if torch.cuda.get_device_capability()[0] >= 10:
+        return {
+            size: (partial(_blackwell_module, size), name)
+            for size, name in BLACKWELL_CONFIG_NAMES.items()
+        }
+    return HOPPER_CONFIGS
+
+
 def _plot(rows: list[dict[str, object]]) -> None:
     import matplotlib.pyplot as plt
 
@@ -116,14 +182,29 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
+    blackwell = torch.cuda.get_device_capability()[0] >= 10
     rows = []
-    for size, (build, config_name) in CONFIGS.items():
+    for size, (build, config_name) in configs_for_device().items():
         print(f"size={size}: build {config_name}", flush=True)
         ayla_op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
         ayla_config = BenchGemmConfig(
             "Ayla", size, size, size, ayla_op, torch.bfloat16,
         )
-        assert_against_torch(ayla_config)
+        if blackwell:
+            for seed in (42, 43, 44):
+                max_abs, relative_rms = assert_against_torch(
+                    ayla_config,
+                    seed=seed,
+                    max_abs_error=2.0,
+                    max_relative_rms_error=0.001,
+                )
+                print(
+                    f"size={size} seed={seed} max_abs={max_abs:.6f} "
+                    f"relative_rms={relative_rms:.9f}",
+                    flush=True,
+                )
+        else:
+            assert_against_torch(ayla_config)
         configs = [
             ayla_config,
             BenchGemmConfig(
