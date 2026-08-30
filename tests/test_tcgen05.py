@@ -1270,6 +1270,57 @@ def test_tcgen05_gemm_cluster_b_multicast_lowering():
     assert "setp.eq.u32" in kernel.ptx and "%cluster_ctarank" in kernel.ptx
 
 
+def test_tcgen05_gemm_cluster_b4_multicast_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=512, n=512, k=1024,
+        output_m_tile=128, output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, persistent_n_pairs=True,
+        cluster_multicast_b=True, cluster_multicast_b_ctas=4,
+        output_tmem_load_shape="16x32bx2",
+    ))
+
+    assert kernel.grid_dim == (1, 4, 1)
+    assert kernel.cluster_dim == (1, 4, 1)
+    assert ".reqnctapercluster 1, 4, 1" in kernel.ptx
+    assert kernel.ptx.count("barrier.cluster.arrive.aligned") == 1
+    assert len(re.findall(
+        r"mbarrier\.init\.shared::cta\.b64 \[%r\d+\], 4;", kernel.ptx,
+    )) == 2
+    assert "0xf" in kernel.ptx
+    for rank in range(4):
+        assert f", {rank};" in kernel.ptx
+
+
+def test_tcgen05_gemm_cluster_b8_multicast_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=1024, n=512, k=1024,
+        output_m_tile=128, output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, persistent_n_pairs=True,
+        cluster_multicast_b=True, cluster_multicast_b_ctas=8,
+        cluster_multicast_b_issuers=4,
+        output_tmem_load_shape="16x32bx2",
+    ))
+
+    assert kernel.grid_dim == (1, 8, 1)
+    assert kernel.cluster_dim == (1, 8, 1)
+    assert ".reqnctapercluster 1, 8, 1" in kernel.ptx
+    assert len(re.findall(
+        r"mbarrier\.init\.shared::cta\.b64 \[%r\d+\], 8;", kernel.ptx,
+    )) == 2
+    assert "0xff" in kernel.ptx
+    assert kernel.ptx.count(
+        "mbarrier::complete_tx::bytes.multicast::cluster"
+    ) == 40
+    for rank in range(4):
+        assert f", {rank};" in kernel.ptx
+
+
 def test_tcgen05_gemm_branches_nonissuers_around_issue_sequence():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=128, k=64,
