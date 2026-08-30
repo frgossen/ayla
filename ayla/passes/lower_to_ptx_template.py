@@ -1090,6 +1090,7 @@ class LowerToPtxTemplate(LoweringPass):
                 "multicast mask"
             )
         completion_mask = next(iter(completion_masks), None)
+        final_completion_mask = op.lock.type.attrs.get("multicast_mask")
         direct_tma_layout = bool(
             mms[0].rhs.type.attrs.get("tcgen05_tma_layout")
         )
@@ -1427,12 +1428,15 @@ class LowerToPtxTemplate(LoweringPass):
             opcode = (
                 "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
                 "shared::cluster"
-                + (".multicast::cluster" if completion_mask is not None else "")
+                + (
+                    ".multicast::cluster"
+                    if final_completion_mask is not None else ""
+                )
                 + ".b64"
             )
             mask_operand = (
                 ", ${b16:completion_mask}"
-                if completion_mask is not None else ""
+                if final_completion_mask is not None else ""
             )
             template += (
                 f"@${{pred:issue}} {opcode}\n"

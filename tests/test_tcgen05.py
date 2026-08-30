@@ -1061,6 +1061,32 @@ def test_tcgen05_next_rhs_prefetch_lowering():
         )
 
 
+def test_tcgen05_partial_commit_completion_mode_is_per_lock():
+    module = blackwell_tcgen05_gemm_module(
+        m=128, n=512, k=256,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True, split_n_tile=0,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+    )
+    commit = next(
+        op for op in iter_ops(module) if isinstance(op, AsyncCommitOp)
+    )
+    commit.lock.type.attrs.update({"arrival_count": 2, "multicast_mask": 0x3})
+
+    ptx = make_ptx_kernel(module).ptx
+    multicast = (
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+        "shared::cluster.multicast::cluster.b64"
+    )
+    local = (
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+        "shared::cluster.b64"
+    )
+    assert ptx.count(multicast) == 1
+    assert ptx.count(local) == 2
+
+
 @pytest.mark.parametrize("invalid", ["kind", "position"])
 def test_tcgen05_partial_commit_verifier(invalid):
     module = blackwell_tcgen05_gemm_module(
