@@ -121,7 +121,11 @@ def _blackwell_module(size: int) -> ModuleOp:
             split_rhs_tma=True, prefetch_lhs_next=True,
             prefetch_rhs_next=True, lean_bookkeeping=True,
             output_tmem_load_shape="16x32bx2",
-            **common,
+            **{
+                **common,
+                "lhs_l2_cache_hint": None,
+                "rhs_l2_cache_hint": None,
+            },
         )
     if size == 4096:
         return blackwell_tcgen05_4096_module()
@@ -140,7 +144,7 @@ def _blackwell_module(size: int) -> ModuleOp:
 BLACKWELL_CONFIG_NAMES = {
     512: "tcgen05_m64n32_k512",
     1024: "tcgen05_m64n64_k256_prefetch_bank",
-    2048: "tcgen05_m128n128_k128_prefetch",
+    2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_lhs_reuse",
     16384: "tcgen05_balanced_persistent_forward_k",
