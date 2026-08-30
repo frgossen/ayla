@@ -376,6 +376,21 @@ def test_tcgen05_overwrites_fresh_accumulator_on_first_static_mma():
         )
 
 
+def test_tcgen05_batches_lock_initialization_sync():
+    ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True, prefetch_next_banks=1,
+        batch_lock_initialization=True,
+    )).ptx
+
+    assert ptx.count("mbarrier.init.shared::cta.b64") == 4
+    assert ptx.count("fence.mbarrier_init.release.cluster") == 1
+    # Tensor-memory/issuer setup contributes three rendezvous; the lock batch
+    # contributes only its final one instead of one per lock.
+    assert ptx[:ptx.index("cp.async.bulk.tensor")].count("bar.sync 0;") == 4
+
+
 def test_tcgen05_split_tma_barriers_lowering():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=128,

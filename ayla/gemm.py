@@ -72,6 +72,7 @@ def blackwell_tcgen05_gemm_module(
     output_l2_eviction_priority: str | None = None,
     output_tmem_load_shape: str = "32x32b",
     overwrite_first_mma: bool = False,
+    batch_lock_initialization: bool = False,
     persistent_n_pairs: bool = False,
     persistent_m_pairs: bool = False,
     lean_bookkeeping: bool = False,
@@ -1450,6 +1451,20 @@ def blackwell_tcgen05_gemm_module(
             *bank_mma_locks,
         ]
     )
+    if batch_lock_initialization:
+        lock_allocations = [
+            op for op in allocation_ops
+            if isinstance(op.result().type, LockType)
+        ]
+        if len(lock_allocations) < 2:
+            raise ValueError(
+                "batched lock initialization requires at least two locks"
+            )
+        # The elected thread initializes these locks in program order. The
+        # final allocation publishes the whole batch with one release fence
+        # and one CTA rendezvous before any asynchronous use.
+        for lock_allocation in lock_allocations[:-1]:
+            lock_allocation.attrs["defer_init_sync"] = True
     output_move = MoveOp.build(
         c_block.result(), accumulator.result(),
         indices=hybrid_controls,

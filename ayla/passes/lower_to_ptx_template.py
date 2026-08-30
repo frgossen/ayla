@@ -399,21 +399,29 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(lock_type, LockType)
         if lock_type.kind not in ("mbar", "tcgen05"):
             return [], [None]
-        template = textwrap.dedent("""\
-            .shared .align 8 .b64 ${smem:bar}[1];
-            mov.u32 ${b32:result.dst.val}, ${smem:bar};
-            mov.u32 ${b32:result.dst.parity}, 0;
-            mov.u32 ${b32:tid_x}, %tid.x;
-            mov.u32 ${b32:tid_y}, %tid.y;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
-            mov.u32 ${b32:tid_z}, %tid.z;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
-            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
-            @${pred:not_t0} bra ${label:after_init};
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
-            fence.mbarrier_init.release.cluster;
-            ${label:after_init}:
-            bar.sync 0;
+        defer_init_sync = op.attrs.get("defer_init_sync", False)
+        if type(defer_init_sync) is not bool:
+            raise ValueError("defer_init_sync must be a boolean")
+        release = (
+            "" if defer_init_sync else
+            "fence.mbarrier_init.release.cluster;"
+        )
+        rendezvous = "" if defer_init_sync else "bar.sync 0;"
+        template = textwrap.dedent(f"""\
+            .shared .align 8 .b64 ${{smem:bar}}[1];
+            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:result.dst.parity}}, 0;
+            mov.u32 ${{b32:tid_x}}, %tid.x;
+            mov.u32 ${{b32:tid_y}}, %tid.y;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+            mov.u32 ${{b32:tid_z}}, %tid.z;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+            @${{pred:not_t0}} bra ${{label:after_init}};
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], 1;
+            {release}
+            ${{label:after_init}}:
+            {rendezvous}
         """)
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
