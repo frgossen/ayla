@@ -554,6 +554,16 @@ def test_tcgen05_balanced_n232_n224_lowering():
     ) == 8
     assert exact_n256_paired.ptx.count("st.global.v8.b32") == 8
 
+    exact_m64n64_paired = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=256,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        output_tmem_load_shape="16x32bx2",
+    ))
+    assert exact_m64n64_paired.ptx.count(
+        "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+    ) == 2
+    assert exact_m64n64_paired.ptx.count("st.global.v8.b32") == 2
+
     with pytest.raises(ValueError, match="balanced_n_tile"):
         blackwell_tcgen05_gemm_module(
             m=128, n=4096, k=256,

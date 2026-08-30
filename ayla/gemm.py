@@ -265,17 +265,19 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("unsupported output_l2_eviction_priority")
     if output_tmem_load_shape not in ("32x32b", "16x32bx2"):
         raise ValueError("unsupported output_tmem_load_shape")
-    if output_tmem_load_shape == "16x32bx2" and (
-        output_m_tile != 128
+    if output_tmem_load_shape == "16x32bx2" and not (
+        (output_m_tile == 64 and output_n_tile in (32, 64)
+         and balanced_n_tile is None)
         or (
-            (output_n_tile, balanced_n_tile) != (232, 224)
-            and (output_n_tile, balanced_n_tile) != (128, None)
-            and (output_n_tile, balanced_n_tile) != (256, None)
+            output_m_tile == 128
+            and (output_n_tile, balanced_n_tile) in (
+                (128, None), (232, 224), (256, None),
+            )
         )
     ):
         raise ValueError(
-            "16x32bx2 output requires M128 with exact N128/N256 or "
-            "balanced N232/N224 tiles"
+            "16x32bx2 output requires exact M64/N32/N64, M128/N128/N256, "
+            "or balanced M128/N232/N224 tiles"
         )
     if derive_tcgen05_descriptors and (
         tma_staging != "direct" or prefetch_lhs_next

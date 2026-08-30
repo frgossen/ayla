@@ -114,6 +114,7 @@ def _blackwell_module(size: int) -> ModuleOp:
             output_m_tile=64, output_n_tile=64,
             operand_stages=16, derive_tcgen05_descriptors=True,
             prefetch_next_banks=1, ptx_optimization_level=2,
+            output_tmem_load_shape="16x32bx2",
             **{
                 **common,
                 "lhs_l2_cache_hint": None,
@@ -161,7 +162,7 @@ def _blackwell_module(size: int) -> ModuleOp:
 
 BLACKWELL_CONFIG_NAMES = {
     512: "tcgen05_m64n32_k512_o2",
-    1024: "tcgen05_m64n64_k256_prefetch_bank_o2",
+    1024: "tcgen05_m64n64_k256_prefetch_bank_paired_o2",
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",

@@ -1550,7 +1550,9 @@ class LowerToPtxTemplate(LoweringPass):
                 and len(op.indices) == 2
             )
             exact = (
-                tuple(src_type.sizes) in ((128, 128), (128, 256))
+                tuple(src_type.sizes) in (
+                    (64, 32), (64, 64), (128, 128), (128, 256),
+                )
                 and hybrid_n_tiles is None
                 and not op.indices
             )
@@ -1561,7 +1563,7 @@ class LowerToPtxTemplate(LoweringPass):
             ):
                 raise ValueError(
                     "16x32bx2 tensor-memory output loads currently require "
-                    "exact M128/N128 or M128/N256, or balanced "
+                    "exact M64/N32/N64, M128/N128/N256, or balanced "
                     "M128/N232/N224 BF16 output"
                 )
             return self._lower_move_tmem_to_gmem_16x32bx2(
@@ -1904,6 +1906,41 @@ class LowerToPtxTemplate(LoweringPass):
                 f"[${{b64:lane_row}}+{col * 2}], "
                 f"{{{', '.join(packed2)}}};",
             ]
+
+        if dst_type.sizes[0] == 64:
+            # Layout F stores 16 logical rows in each tensor-memory datapath.
+            # The x2 shape pairs lanes 0/16, 1/17, ... as adjacent 16-column
+            # halves of the same row, so all four warps cooperatively cover
+            # M64 without the inactive half-lanes required by 32x32b loads.
+            template_lines = [
+                "mov.u32 ${b32:tid}, %tid.x;",
+                "shr.u32 ${b32:warp}, ${b32:tid}, 5;",
+                "and.b32 ${b32:lane15}, ${b32:tid}, 15;",
+                "shl.b32 ${b32:row_index}, ${b32:warp}, 4;",
+                "add.u32 ${b32:row_index}, ${b32:row_index}, "
+                "${b32:lane15};",
+                "shl.b32 ${b32:taddr_group}, ${b32:warp}, 21;",
+                "add.u32 ${b32:taddr_group}, ${b32:operand.src.ptr}, "
+                "${b32:taddr_group};",
+                f"mul.wide.u32 ${{b64:row_offset}}, "
+                f"${{b32:row_index}}, {row_stride_bytes};",
+                "add.u64 ${b64:row}, ${b64:operand.dst.ptr}, "
+                "${b64:row_offset};",
+                "and.b32 ${b32:lane_offset}, ${b32:tid}, 16;",
+                "shl.b32 ${b32:lane_offset}, ${b32:lane_offset}, 1;",
+                "cvt.u64.u32 ${b64:lane_offset64}, ${b32:lane_offset};",
+                "add.u64 ${b64:lane_row}, ${b64:row}, "
+                "${b64:lane_offset64};",
+            ]
+            for col in range(0, dst_type.sizes[1], 32):
+                template_lines.extend(full_chunk(col))
+            new_op = PTXTemplateOp.build(
+                operands=[self.value_map[op.dst], self.value_map[op.src]],
+                result_types=[], template="\n".join(template_lines) + "\n",
+                operand_names=["dst", "src"], result_names=[],
+                description=str(op),
+            )
+            return [new_op], []
 
         def group_loop(
             name: str,
