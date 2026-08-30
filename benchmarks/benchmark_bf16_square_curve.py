@@ -106,7 +106,8 @@ def _blackwell_module(size: int) -> ModuleOp:
     if size == 512:
         return blackwell_tcgen05_gemm_module(
             output_m_tile=64, output_n_tile=32,
-            operand_stages=32, derive_tcgen05_descriptors=True, **common,
+            operand_stages=32, derive_tcgen05_descriptors=True,
+            ptx_optimization_level=2, **common,
         )
     if size == 1024:
         return blackwell_tcgen05_gemm_module(
@@ -143,7 +144,7 @@ def _blackwell_module(size: int) -> ModuleOp:
 
 
 BLACKWELL_CONFIG_NAMES = {
-    512: "tcgen05_m64n32_k512",
+    512: "tcgen05_m64n32_k512_o2",
     1024: "tcgen05_m64n64_k256_prefetch_bank_o2",
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
