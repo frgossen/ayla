@@ -1166,8 +1166,14 @@ def blackwell_tcgen05_gemm_module(
                     ),
                 )
                 mainloop_ops.extend([lhs_tile, rhs_tile])
+                mma_attrs = (
+                    {"overwrite_accumulator": True}
+                    if persistent_n_pairs and iteration == 0 and stage == 0
+                    else None
+                )
                 mmas.append(MatmulOp.build(
                     lhs_tile.result(), rhs_tile.result(), accumulator.result(),
+                    attrs=mma_attrs,
                 ))
             mainloop_ops.append(AsyncOp.build(
                 mma_lock.result(), body=Block(ops=mmas),

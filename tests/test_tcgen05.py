@@ -333,6 +333,25 @@ def test_tcgen05_prefetches_next_k256_banks():
     assert ptx.count(", 32768;") == 4
 
 
+def test_tcgen05_prefetched_persistent_pairs_overwrite_each_output():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=128, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True, prefetch_next_banks=1,
+        transpose_cta_grid=True, persistent_n_pairs=True,
+        output_tmem_load_shape="16x32bx2",
+    ))
+    ptx = kernel.ptx
+
+    assert kernel.grid_dim == (1, 1, 1)
+    overwrite = ptx.index("mov.pred")
+    first_mma = ptx.index("tcgen05.mma.cta_group::1", overwrite)
+    restore = ptx.index("mov.pred", overwrite + 1)
+    assert ptx[overwrite:ptx.index("\n", overwrite)].endswith(", 0;")
+    assert ptx[restore:ptx.index("\n", restore)].endswith(", -1;")
+    assert overwrite < first_mma < restore
+
+
 def test_tcgen05_split_tma_barriers_lowering():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=128,
