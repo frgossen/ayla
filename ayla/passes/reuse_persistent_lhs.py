@@ -81,14 +81,18 @@ class ReusePersistentLhs(Pass):
         module = Canonicalize().run(module)
 
         kernel = module.body.ops[0]
-        body = kernel.body
         outputs = [
-            op for op in body.ops
+            op for op in _walk_ops(kernel.body.ops)
             if isinstance(op, MoveOp) and isinstance(op.src.type, TmemTensorType)
         ]
         if len(outputs) != 2:
             raise ValueError(
                 "persistent LHS reuse requires exactly two tensor-memory outputs"
+            )
+        body = outputs[0].parent_block
+        if body is None or outputs[1].parent_block is not body:
+            raise ValueError(
+                "persistent LHS reuse requires both outputs in one loop body"
             )
         phase_start = body.ops.index(outputs[0]) + 1
         phase_end = body.ops.index(outputs[1])
@@ -116,7 +120,7 @@ class ReusePersistentLhs(Pass):
             )
 
         lhs_allocs = [
-            op.result() for op in body.ops
+            op.result() for op in kernel.body.ops
             if isinstance(op, AllocOp)
             and isinstance(op.result().type, SmemTensorType)
             and tuple(op.result().type.sizes) == (128, 64)

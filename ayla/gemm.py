@@ -72,6 +72,7 @@ def blackwell_tcgen05_gemm_module(
     output_l2_eviction_priority: str | None = None,
     output_tmem_load_shape: str = "32x32b",
     persistent_n_pairs: bool = False,
+    persistent_m_pairs: bool = False,
     lean_bookkeeping: bool = False,
     reuse_persistent_lhs: bool = False,
     resident_phase_order_split: int | None = None,
@@ -89,6 +90,9 @@ def blackwell_tcgen05_gemm_module(
     first two A banks are the resident final banks from the first output. All
     four warps still execute the same pipeline; only K order and buffer reuse
     differ between the two static phases.
+    ``persistent_m_pairs`` nests that shared two-N pipeline across two M tile
+    rows. It reuses the same tensor/shared allocations without assigning
+    durable roles to any warp and reduces multi-wave launch overhead.
     ``resident_phase_order_split`` reverses the two logical N tiles for the
     suffix of the linear CTA launch. On B200, splitting at the 148-SM boundary
     gives likely co-resident CTAs opposite wide/narrow phase order without
@@ -214,6 +218,15 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "persistent N pairing requires an exact balanced-N launch; even "
             "launches must pair each wide tile with a narrow tile"
+        )
+    if persistent_m_pairs and (
+        not persistent_n_pairs
+        or m_tiles % 2
+        or resident_phase_order_split is not None
+    ):
+        raise ValueError(
+            "persistent M pairing requires persistent N pairs and an even "
+            "M-tile count without resident phase-order splitting"
         )
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
@@ -364,7 +377,12 @@ def blackwell_tcgen05_gemm_module(
         })
         if persistent_n_pairs else None
     )
+    persistent_m_loop = (
+        ForOp.build(0, 2, attrs={"disjoint_grid_iterations": True})
+        if persistent_m_pairs else None
+    )
     logical_block_x = block_ids.x
+    logical_block_y = block_ids.y
     if persistent_loop is not None:
         assert balanced_wide_tiles is not None
         pair_count = IndexConstantOp.build((n_tiles + 1) // 2)
@@ -458,6 +476,14 @@ def blackwell_tcgen05_gemm_module(
             iteration_delta, paired_tile,
         ])
         logical_block_x = paired_tile.result()
+        if persistent_m_loop is not None:
+            two = IndexConstantOp.build(2)
+            paired_m_base = IndexMulOp.build(block_ids.y, two.result())
+            paired_m_tile = IndexAddOp.build(
+                paired_m_base.result(), persistent_m_loop.iv,
+            )
+            grid_index_ops.extend([two, paired_m_base, paired_m_tile])
+            logical_block_y = paired_m_tile.result()
     hybrid_n_tiles = None
     hybrid_n_width = None
     hybrid_split_rows = None
@@ -504,7 +530,7 @@ def blackwell_tcgen05_gemm_module(
             after_wide, narrow_distance, adjustment, neg_adjustment,
             n_offset, zero,
         ])
-        m_block_id = block_ids.y
+        m_block_id = logical_block_y
         n_block_id = n_offset.result()
         hybrid_n_tiles = n_tiles
         hybrid_n_width = balanced_n_tile
@@ -1434,12 +1460,21 @@ def blackwell_tcgen05_gemm_module(
         # communicates that fact to sync insertion while its normal backedge
         # analysis still inserts barriers for reused shared/tensor memory.
         persistent_loop.body.ops.extend(tile_ops)
-        body_ops = [
-            block_ids,
-            *allocation_ops,
-            persistent_loop,
-            DeallocOp.build(accumulator.result()),
-        ]
+        if persistent_m_loop is not None:
+            persistent_m_loop.body.ops.append(persistent_loop)
+            body_ops = [
+                block_ids,
+                *allocation_ops,
+                persistent_m_loop,
+                DeallocOp.build(accumulator.result()),
+            ]
+        else:
+            body_ops = [
+                block_ids,
+                *allocation_ops,
+                persistent_loop,
+                DeallocOp.build(accumulator.result()),
+            ]
     else:
         # Preserve the original dominance/order: allocations precede the
         # mainloop and output move in the non-persistent path.
@@ -1464,7 +1499,11 @@ def blackwell_tcgen05_gemm_module(
                 1,
             )
             if split_last_n_tile_rows is not None else
-            ((n_tiles + 1) // 2, m_tiles, 1)
+            (
+                (n_tiles + 1) // 2,
+                m_tiles // (2 if persistent_m_pairs else 1),
+                1,
+            )
             if persistent_n_pairs else
             (n_tiles + int(split_last_n_tile or split_n_tile is not None), m_tiles, 1)
             if transpose_cta_grid else
