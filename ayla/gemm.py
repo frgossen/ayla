@@ -71,6 +71,7 @@ def blackwell_tcgen05_gemm_module(
     output_l1_cache_policy: str | None = None,
     output_l2_eviction_priority: str | None = None,
     output_tmem_load_shape: str = "32x32b",
+    overlap_tmem_deallocation: bool = False,
     overwrite_first_mma: bool = False,
     batch_lock_initialization: bool = False,
     persistent_n_pairs: bool = False,
@@ -280,6 +281,18 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "16x32bx2 output requires exact M64/N32/N64, M128/N128/N256, "
             "or balanced M128/N232/N224 tiles"
+        )
+    if type(overlap_tmem_deallocation) is not bool:
+        raise ValueError("overlap_tmem_deallocation must be a boolean")
+    if overlap_tmem_deallocation and (
+        output_tmem_load_shape != "16x32bx2"
+        or output_m_tile != 64
+        or output_n_tile not in (32, 64)
+        or persistent_n_pairs
+    ):
+        raise ValueError(
+            "overlapped tensor-memory deallocation requires a non-persistent "
+            "paired M64/N32 or M64/N64 output"
         )
     if overwrite_first_mma and (
         tma_staging != "direct"
@@ -1486,6 +1499,8 @@ def blackwell_tcgen05_gemm_module(
                    if output_l2_eviction_priority else {}),
                 **({"tmem_load_shape": output_tmem_load_shape}
                    if output_tmem_load_shape != "32x32b" else {}),
+                **({"dealloc_tmem_before_final_store": True}
+                   if overlap_tmem_deallocation else {}),
             }
             if hybrid_n_tiles is not None else (
                 {
@@ -1495,11 +1510,14 @@ def blackwell_tcgen05_gemm_module(
                        if output_l2_eviction_priority else {}),
                     **({"tmem_load_shape": output_tmem_load_shape}
                        if output_tmem_load_shape != "32x32b" else {}),
+                    **({"dealloc_tmem_before_final_store": True}
+                       if overlap_tmem_deallocation else {}),
                 }
                 if (
                     output_l1_cache_policy
                     or output_l2_eviction_priority
                     or output_tmem_load_shape != "32x32b"
+                    or overlap_tmem_deallocation
                 )
                 else None
             )
@@ -1513,6 +1531,10 @@ def blackwell_tcgen05_gemm_module(
         *mainloop_ops,
         output_move,
     ]
+    deallocation_ops = (
+        [] if overlap_tmem_deallocation
+        else [DeallocOp.build(accumulator.result())]
+    )
     if persistent_loop is not None:
         # Logical N tiles are disjoint in global memory. The loop attribute
         # communicates that fact to sync insertion while its normal backedge
@@ -1524,14 +1546,14 @@ def blackwell_tcgen05_gemm_module(
                 block_ids,
                 *allocation_ops,
                 persistent_m_loop,
-                DeallocOp.build(accumulator.result()),
+                *deallocation_ops,
             ]
         else:
             body_ops = [
                 block_ids,
                 *allocation_ops,
                 persistent_loop,
-                DeallocOp.build(accumulator.result()),
+                *deallocation_ops,
             ]
     else:
         # Preserve the original dominance/order: allocations precede the
@@ -1544,7 +1566,7 @@ def blackwell_tcgen05_gemm_module(
             *allocation_ops,
             *mainloop_ops,
             output_move,
-            DeallocOp.build(accumulator.result()),
+            *deallocation_ops,
         ]
     body = Block(arguments=[a, bt, c], ops=body_ops)
     module = ModuleOp.build(Block(ops=[KernelOp.build(

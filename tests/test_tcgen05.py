@@ -391,6 +391,30 @@ def test_tcgen05_batches_lock_initialization_sync():
     assert ptx[:ptx.index("cp.async.bulk.tensor")].count("bar.sync 0;") == 4
 
 
+def test_tcgen05_overlaps_deallocation_with_final_m64_store():
+    ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True, prefetch_next_banks=1,
+        output_tmem_load_shape="16x32bx2",
+        overlap_tmem_deallocation=True,
+    )).ptx
+
+    final_load = ptx.rfind("tcgen05.ld.sync.aligned.16x32bx2")
+    dealloc = ptx.index("tcgen05.dealloc.cta_group::1", final_load)
+    final_store = ptx.index("st.global", dealloc)
+    assert final_load < dealloc < final_store
+    assert ptx.count("tcgen05.dealloc.cta_group::1") == 1
+
+    with pytest.raises(ValueError, match="overlapped tensor-memory"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=128, k=256,
+            output_m_tile=128, output_n_tile=128, operand_stages=8,
+            output_tmem_load_shape="16x32bx2",
+            overlap_tmem_deallocation=True,
+        )
+
+
 def test_tcgen05_split_tma_barriers_lowering():
     ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=128,

@@ -1484,6 +1484,9 @@ class LowerToPtxTemplate(LoweringPass):
         l1_cache_policy = op.attrs.get("l1_cache_policy")
         l2_eviction_priority = op.attrs.get("l2_eviction_priority")
         tmem_load_shape = op.attrs.get("tmem_load_shape", "32x32b")
+        dealloc_tmem_before_final_store = op.attrs.get(
+            "dealloc_tmem_before_final_store", False,
+        )
         hybrid_split_rows = op.attrs.get("hybrid_split_rows")
         hybrid_split_tile = op.attrs.get("hybrid_split_tile")
         hybrid_element_offsets = bool(
@@ -1524,6 +1527,19 @@ class LowerToPtxTemplate(LoweringPass):
             raise ValueError(
                 f"unsupported tensor-memory output load shape "
                 f"{tmem_load_shape!r}"
+            )
+        if type(dealloc_tmem_before_final_store) is not bool:
+            raise ValueError(
+                "dealloc_tmem_before_final_store must be a boolean"
+            )
+        if dealloc_tmem_before_final_store and not (
+            tmem_load_shape == "16x32bx2"
+            and tuple(src_type.sizes) in ((64, 32), (64, 64))
+            and not op.indices
+        ):
+            raise ValueError(
+                "early tensor-memory deallocation requires an exact paired "
+                "M64/N32 or M64/N64 output"
             )
         if (
             l1_cache_policy is not None or l2_eviction_priority is not None
@@ -1576,6 +1592,7 @@ class LowerToPtxTemplate(LoweringPass):
                 )
             return self._lower_move_tmem_to_gmem_16x32bx2(
                 op, l1_cache_policy, l2_eviction_priority,
+                dealloc_tmem_before_final_store,
             )
         # M=128 uses all 32 lanes in each of the four tensor-memory datapaths.
         # The non-warp-specialized M=64 Layout F instead uses lanes 0..15 in
@@ -1853,6 +1870,7 @@ class LowerToPtxTemplate(LoweringPass):
         op: MoveOp,
         l1_cache_policy: str | None,
         l2_eviction_priority: str | None,
+        dealloc_tmem_before_final_store: bool,
     ) -> tuple[list[Op], list[object]]:
         """Lower the balanced BF16 epilogue with paired half-warps.
 
@@ -1887,7 +1905,20 @@ class LowerToPtxTemplate(LoweringPass):
                 for index in range(count // 2)
             ]
 
-        def full_chunk(col: int) -> list[str]:
+        def full_chunk(col: int, *, release_tmem: bool = False) -> list[str]:
+            release = []
+            if release_tmem:
+                # Every warp has completed its final synchronous tensor-memory
+                # load before this rendezvous. Warp 0 can release the allocation
+                # while the other warps convert and store their register-held
+                # values; no warp is assigned a persistent pipeline role.
+                release = [
+                    "bar.sync 0;",
+                    "setp.lt.u32 ${pred:tmem_warp0}, ${b32:tid}, 32;",
+                    "@${pred:tmem_warp0} "
+                    "tcgen05.dealloc.cta_group::1.sync.aligned.b32 "
+                    f"${{b32:operand.src.ptr}}, {dst_type.sizes[1]};",
+                ]
             return [
                 f"add.u32 ${{b32:taddr_chunk}}, "
                 f"${{b32:taddr_group}}, {col};",
@@ -1895,6 +1926,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"{{{', '.join(values16)}}}, "
                 "[${b32:taddr_chunk}], 16;",
                 "tcgen05.wait::ld.sync.aligned;",
+                *release,
                 *conversions(16),
                 f"st.global{l1}{l2}.v8.b32 "
                 f"[${{b64:lane_row}}+{col * 2}], "
@@ -1941,7 +1973,13 @@ class LowerToPtxTemplate(LoweringPass):
                 "${b64:lane_offset64};",
             ]
             for col in range(0, dst_type.sizes[1], 32):
-                template_lines.extend(full_chunk(col))
+                template_lines.extend(full_chunk(
+                    col,
+                    release_tmem=(
+                        dealloc_tmem_before_final_store
+                        and col + 32 == dst_type.sizes[1]
+                    ),
+                ))
             new_op = PTXTemplateOp.build(
                 operands=[self.value_map[op.dst], self.value_map[op.src]],
                 result_types=[], template="\n".join(template_lines) + "\n",

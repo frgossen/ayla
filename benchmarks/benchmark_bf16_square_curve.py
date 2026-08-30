@@ -116,6 +116,7 @@ def _blackwell_module(size: int) -> ModuleOp:
             prefetch_next_banks=1, ptx_optimization_level=2,
             overwrite_first_mma=True,
             batch_lock_initialization=True,
+            overlap_tmem_deallocation=True,
             output_tmem_load_shape="16x32bx2",
             **{
                 **common,
