@@ -113,7 +113,12 @@ def _blackwell_module(size: int) -> ModuleOp:
         return blackwell_tcgen05_gemm_module(
             output_m_tile=64, output_n_tile=64,
             operand_stages=16, derive_tcgen05_descriptors=True,
-            prefetch_next_banks=1, ptx_optimization_level=2, **common,
+            prefetch_next_banks=1, ptx_optimization_level=2,
+            **{
+                **common,
+                "lhs_l2_cache_hint": None,
+                "rhs_l2_cache_hint": None,
+            },
         )
     if size == 2048:
         return blackwell_tcgen05_gemm_module(
