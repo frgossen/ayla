@@ -329,10 +329,10 @@ def test_tcgen05_split_rhs_tma_lowering():
     assert input_descs[0].tile_sizes == (128, 64)
     assert input_descs[1].tile_sizes == (128, 64)
 
-    with pytest.raises(ValueError, match="direct N=232/N=240/N=248/N=256"):
+    with pytest.raises(ValueError, match="require direct"):
         blackwell_tcgen05_gemm_module(
             m=128, n=128, k=64,
-            output_n_tile=128, split_rhs_tma=True,
+            output_n_tile=128, tma_staging=None, split_rhs_tma=True,
         )
 
 
@@ -492,6 +492,16 @@ def test_tcgen05_balanced_n232_n224_lowering():
     ) == 21
     assert paired.ptx.count("st.global.L1::no_allocate.v2.b32") == 2
 
+    exact_n256_paired = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=256,
+        output_n_tile=256, operand_stages=8,
+        output_tmem_load_shape="16x32bx2",
+    ))
+    assert exact_n256_paired.ptx.count(
+        "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+    ) == 8
+    assert exact_n256_paired.ptx.count("st.global.v8.b32") == 8
+
     with pytest.raises(ValueError, match="balanced_n_tile"):
         blackwell_tcgen05_gemm_module(
             m=128, n=4096, k=256,
@@ -617,6 +627,38 @@ def test_tcgen05_persistent_pair_reuses_lhs_in_reverse_k_order():
             persistent_n_pairs=False, lean_bookkeeping=True,
             reuse_persistent_lhs=True,
         )
+
+
+@pytest.mark.parametrize("k", [1024, 1152, 1280])
+def test_tcgen05_persistent_lhs_reuse_supports_all_k128_phases(k):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=k,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+        reuse_persistent_lhs=True,
+    ))
+
+    assert kernel.grid_dim == (9, 1, 1)
+    assert "persistent_reverse_k_pair" not in kernel.ptx
+
+
+def test_tcgen05_odd_balanced_n_pairs_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=688, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+    ))
+
+    assert kernel.grid_dim == (2, 1, 1)
+    assert kernel.ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 16
 
 
 def test_tcgen05_persistent_pair_resident_phase_order_lowering():
@@ -957,6 +999,21 @@ def test_tcgen05_m64_tma_staging_lowering():
     assert "@%p" in kernel.ptx and "st.global.v8.b32" in kernel.ptx
 
 
+@pytest.mark.parametrize("stages", [8, 16, 32])
+def test_tcgen05_narrow_tma_staging_lowering(stages):
+    n = 32
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=n, k=512, output_m_tile=64, output_n_tile=n,
+        operand_stages=stages, split_tma_barriers=stages == 8,
+    ))
+
+    assert kernel.grid_dim == (1, 1, 1)
+    assert f"0x{((4 << 24) | ((n // 8) << 17) | 0x490):08x}" in kernel.ptx
+    assert f"tcgen05.ld.sync.aligned.32x32b.x{n}.b32" in kernel.ptx
+    assert "tcgen05.ld.sync.aligned.32x32b.x64.b32" not in kernel.ptx
+    assert f"st.global.v{min(8, n // 2)}.b32" in kernel.ptx
+
+
 def test_tcgen05_cta_group2_lowering():
     ptx = _make_tcgen05_cta_group2_kernel().ptx
 
@@ -1027,6 +1084,78 @@ def test_tcgen05_m64_gemm(seed):
     a_tensor = torch.randn((64, 64), dtype=torch.bfloat16, device="cuda")
     b_tensor = torch.randn((128, 64), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty((64, 128), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed,stages", [(0, 8), (1, 16), (7, 32)])
+def test_tcgen05_m64_narrow_gemm(seed, stages):
+    n = 32
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=n, k=512, output_m_tile=64, output_n_tile=n,
+        operand_stages=stages, split_tma_barriers=stages == 8,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((64, 512), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((n, 512), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((64, n), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_odd_persistent_pair_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=688, k=256,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((128, 256), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((688, 256), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((128, 688), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed,k", [(0, 1024), (1, 1152), (7, 1280)])
+def test_tcgen05_generalized_persistent_lhs_reuse_gemm(seed, k):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=128, n=4096, k=k,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, lean_bookkeeping=True,
+        reuse_persistent_lhs=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((128, k), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((4096, k), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((128, 4096), dtype=torch.bfloat16, device="cuda")
     make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
     torch.cuda.synchronize()
 

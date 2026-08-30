@@ -1537,20 +1537,28 @@ class LowerToPtxTemplate(LoweringPass):
         ):
             raise ValueError("full-row hybrid-N output does not accept controls")
         if tmem_load_shape == "16x32bx2":
-            if not (
+            balanced = (
                 tuple(src_type.sizes) == (128, 232)
-                and dst_type.dtype.name == "bf16"
                 and hybrid_n_tiles is not None
                 and hybrid_n_width == 224
                 and hybrid_element_offsets
                 and hybrid_split_rows is None
                 and hybrid_split_tile is None
-                and not predicated_tail_stores
                 and len(op.indices) == 2
+            )
+            exact_n256 = (
+                tuple(src_type.sizes) == (128, 256)
+                and hybrid_n_tiles is None
+                and not op.indices
+            )
+            if not (
+                dst_type.dtype.name == "bf16"
+                and not predicated_tail_stores
+                and (balanced or exact_n256)
             ):
                 raise ValueError(
                     "16x32bx2 tensor-memory output loads currently require "
-                    "balanced M128/N232/N224 BF16 output"
+                    "exact M128/N256 or balanced M128/N232/N224 BF16 output"
                 )
             return self._lower_move_tmem_to_gmem_16x32bx2(
                 op, l1_cache_policy, l2_eviction_priority,
@@ -1564,7 +1572,11 @@ class LowerToPtxTemplate(LoweringPass):
         # 64- and 128-column outputs.
         row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
         value_type = "f32" if dst_type.dtype.name == "bf16" else "b32"
-        values = [f"${{{value_type}:value{i}}}" for i in range(64)]
+        load_width = min(
+            64,
+            1 << (src_type.sizes[1] - 1).bit_length(),
+        )
+        values = [f"${{{value_type}:value{i}}}" for i in range(load_width)]
         load_values = ", ".join(values)
         row_mapping = ""
         store_predicate = ""
@@ -1799,7 +1811,7 @@ class LowerToPtxTemplate(LoweringPass):
                     ])
             template += textwrap.dedent(f"""\
                 add.u32 ${{b32:taddr_chunk}}, ${{b32:taddr_row}}, {col};
-                tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{load_values}}}, [${{b32:taddr_chunk}}];
+                tcgen05.ld.sync.aligned.32x32b.x{load_width}.b32 {{{load_values}}}, [${{b32:taddr_chunk}}];
                 tcgen05.wait::ld.sync.aligned;
                 {stores}
             """)
@@ -1946,7 +1958,6 @@ class LowerToPtxTemplate(LoweringPass):
             ])
             return lines
 
-        narrow, half = (self.value_map[value] for value in op.indices)
         template_lines = [
             "mov.u32 ${b32:tid}, %tid.x;",
             "shr.u32 ${b32:warp}, ${b32:tid}, 5;",
@@ -1961,28 +1972,42 @@ class LowerToPtxTemplate(LoweringPass):
             f"${{b32:row_index}}, {row_stride_bytes};",
             "add.u64 ${b64:row}, ${b64:operand.dst.ptr}, "
             "${b64:row_offset};",
-            "mul.wide.u32 ${b64:hybrid_col_offset}, "
-            "${b32:operand.hybrid_half.val}, 256;",
-            "add.u64 ${b64:row}, ${b64:row}, "
-            "${b64:hybrid_col_offset};",
-            "and.b64 ${b64:alignment}, ${b64:row}, 16;",
-            "setp.ne.u64 ${pred:odd_alignment}, "
-            "${b64:alignment}, 0;",
-            "setp.ne.u32 ${pred:narrow}, "
-            "${b32:operand.hybrid_narrow.val}, 0;",
-            "@${pred:narrow} bra ${label:paired_narrow};",
-            "@${pred:odd_alignment} bra ${label:paired_odd};",
-            "bra ${label:paired_even};",
-            *group_loop("narrow", range(0, 224, 32), None, False),
-            *group_loop("even", range(0, 224, 32), 224, False),
-            *group_loop("odd", range(8, 232, 32), 0, True),
-            "${label:paired_done}:",
         ]
+        operands = [self.value_map[op.dst], self.value_map[op.src]]
+        operand_names = ["dst", "src"]
+        if op.indices:
+            narrow, half = (self.value_map[value] for value in op.indices)
+            operands.extend([narrow, half])
+            operand_names.extend(["hybrid_narrow", "hybrid_half"])
+            template_lines.extend([
+                "mul.wide.u32 ${b64:hybrid_col_offset}, "
+                "${b32:operand.hybrid_half.val}, 256;",
+                "add.u64 ${b64:row}, ${b64:row}, "
+                "${b64:hybrid_col_offset};",
+                "and.b64 ${b64:alignment}, ${b64:row}, 16;",
+                "setp.ne.u64 ${pred:odd_alignment}, "
+                "${b64:alignment}, 0;",
+                "setp.ne.u32 ${pred:narrow}, "
+                "${b32:operand.hybrid_narrow.val}, 0;",
+                "@${pred:narrow} bra ${label:paired_narrow};",
+                "@${pred:odd_alignment} bra ${label:paired_odd};",
+                "bra ${label:paired_even};",
+                *group_loop("narrow", range(0, 224, 32), None, False),
+                *group_loop("even", range(0, 224, 32), 224, False),
+                *group_loop("odd", range(8, 232, 32), 0, True),
+            ])
+        else:
+            template_lines.extend(
+                group_loop(
+                    "n256", range(0, 256, 32), None, False,
+                )
+            )
+        template_lines.append("${label:paired_done}:")
         new_op = PTXTemplateOp.build(
-            operands=[self.value_map[op.dst], self.value_map[op.src], narrow, half],
+            operands=operands,
             result_types=[],
             template="\n".join(template_lines) + "\n",
-            operand_names=["dst", "src", "hybrid_narrow", "hybrid_half"],
+            operand_names=operand_names,
             result_names=[],
             description=str(op),
         )
@@ -2505,8 +2530,6 @@ class LowerToPtxTemplate(LoweringPass):
             description=str(op),
         )
         return [new_op], []
-
-
 
     def _lower_move_wrmem_wgmma(
         self, op: MoveOp,

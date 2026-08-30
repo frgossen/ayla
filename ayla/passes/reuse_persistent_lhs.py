@@ -105,11 +105,14 @@ class ReusePersistentLhs(Pass):
             raise ValueError(
                 "persistent LHS reuse requires the grouped K128 middle loop"
             )
-        iteration_count = middle.ub + 1
-        if middle.lb != 1 or iteration_count < 5 or iteration_count % 3 != 2:
+        iteration_count = middle.attrs.get("iteration_count")
+        if (
+            not isinstance(iteration_count, int)
+            or middle.lb != 1
+            or iteration_count < 5
+        ):
             raise ValueError(
-                "persistent LHS reuse requires K128 iteration count congruent "
-                "to two modulo three"
+                "persistent LHS reuse requires at least five K128 iterations"
             )
 
         lhs_allocs = [
@@ -142,7 +145,12 @@ class ReusePersistentLhs(Pass):
             op for op in tma_moves
             if root_buffer(smem_operand(op)) in rhs_allocs
         ]
-        if len(a_tmas) != 10 or len(b_tmas) != 20 or len(rhs_allocs) != 2:
+        tail_iterations = (iteration_count - 2) % 3 + 1
+        if (
+            len(a_tmas) != 8 + 2 * tail_iterations
+            or len(b_tmas) != 16 + 4 * tail_iterations
+            or len(rhs_allocs) != 2
+        ):
             raise ValueError(
                 "persistent LHS reuse requires the three-A/two-split-B K128 "
                 "prefetch pipeline"
@@ -168,7 +176,10 @@ class ReusePersistentLhs(Pass):
         prefix_b, middle_b, suffix_b = partition(b_tmas)
         if [len(values) for values in (
             prefix_a, middle_a, suffix_a, prefix_b, middle_b, suffix_b,
-        )] != [3, 6, 1, 6, 12, 2]:
+        )] != [
+            3, 6, 2 * tail_iterations - 1,
+            6, 12, 4 * tail_iterations - 2,
+        ]:
             raise ValueError("persistent LHS reuse found an unexpected TMA schedule")
 
         def set_coordinate(op: TmaMoveOp, coordinate: int) -> None:
@@ -189,7 +200,20 @@ class ReusePersistentLhs(Pass):
             strict=True,
         ):
             set_coordinate(op, coordinate)
-        for op, coordinate in zip(suffix_a, [1], strict=True):
+        suffix_a_coordinates = []
+        suffix_b_coordinates = []
+        for target in reversed(range(tail_iterations)):
+            if target:
+                suffix_a_coordinates.extend([2 * target + 1, 2 * target - 2])
+                suffix_b_coordinates.extend(
+                    [2 * target + 1] * 2 + [2 * target - 2] * 2
+                )
+            else:
+                suffix_a_coordinates.append(1)
+                suffix_b_coordinates.extend([1, 1])
+        for op, coordinate in zip(
+            suffix_a, suffix_a_coordinates, strict=True,
+        ):
             set_coordinate(op, coordinate)
         for op, coordinate in zip(
             prefix_b,
@@ -199,12 +223,14 @@ class ReusePersistentLhs(Pass):
             strict=True,
         ):
             set_coordinate(op, coordinate)
-        for op, coordinate in zip(suffix_b, [1, 1], strict=True):
+        for op, coordinate in zip(
+            suffix_b, suffix_b_coordinates, strict=True,
+        ):
             set_coordinate(op, coordinate)
 
         middle.attrs.update({
             "lb": iteration_count - 2,
-            "ub": 0,
+            "ub": tail_iterations - 1,
             "step": -3,
         })
         scale = IndexConstantOp.build(128)
@@ -231,11 +257,14 @@ class ReusePersistentLhs(Pass):
         ):
             set_middle_offset(op, offset)
 
-        replacement: dict[Value, Value] = {
-            lhs_allocs[0]: lhs_allocs[2],
-            lhs_allocs[1]: lhs_allocs[0],
-            lhs_allocs[2]: lhs_allocs[1],
-        }
+        terminal_buffers = (
+            (lhs_allocs[0], lhs_allocs[1], lhs_allocs[2]),
+            (lhs_allocs[2], lhs_allocs[0], lhs_allocs[1]),
+            (lhs_allocs[1], lhs_allocs[2], lhs_allocs[0]),
+        )[(iteration_count - 1) % 3]
+        replacement: dict[Value, Value] = dict(zip(
+            lhs_allocs, terminal_buffers, strict=True,
+        ))
         rotated_views: dict[Value, Value] = {}
 
         def rotate_view(value: Value, anchor) -> Value:

@@ -96,9 +96,9 @@ def blackwell_tcgen05_gemm_module(
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
-    if output_n_tile not in (64, 128, 232, 240, 248, 256):
+    if output_n_tile not in (32, 64, 128, 232, 240, 248, 256):
         raise ValueError(
-            "output_n_tile must be 64, 128, 232, 240, 248, or 256"
+            "output_n_tile must be 32, 64, 128, 232, 240, 248, or 256"
         )
     if m % output_m_tile or k % 16:
         raise ValueError(
@@ -122,11 +122,11 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("K must divide the requested tcgen05 operand stages")
     if tma_staging not in (None, "repack", "direct"):
         raise ValueError("tma_staging must be None, 'repack', or 'direct'")
-    if tma_staging == "direct" and operand_stages not in (4, 8):
+    if tma_staging == "direct" and operand_stages not in (4, 8, 16, 32):
         raise ValueError(
-            "direct TMA staging currently requires four or eight K=16 stages"
+            "direct TMA staging currently requires 4, 8, 16, or 32 K=16 stages"
         )
-    if output_n_tile != 64 and tma_staging != "direct":
+    if output_n_tile not in (32, 64) and tma_staging != "direct":
         raise ValueError("wide output tiles currently require direct TMA staging")
     if output_m_tile != 128 and tma_staging != "direct":
         raise ValueError("M=64 output tiles currently require direct TMA staging")
@@ -199,14 +199,18 @@ def blackwell_tcgen05_gemm_module(
     if persistent_n_pairs and (
         balanced_n_tile is None
         or not transpose_cta_grid
-        or n_tiles % 2
         or balanced_wide_tiles is None
-        or balanced_wide_tiles > n_tiles // 2
-        or (n_tiles - 2 * balanced_wide_tiles) % 2
+        or (
+            n_tiles % 2 == 0
+            and (
+                balanced_wide_tiles > n_tiles // 2
+                or (n_tiles - 2 * balanced_wide_tiles) % 2
+            )
+        )
     ):
         raise ValueError(
-            "persistent N pairing requires an even exact balanced-N launch "
-            "whose wide tiles can each pair with a narrow tile"
+            "persistent N pairing requires an exact balanced-N launch; even "
+            "launches must pair each wide tile with a narrow tile"
         )
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
@@ -238,11 +242,14 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("unsupported output_tmem_load_shape")
     if output_tmem_load_shape == "16x32bx2" and (
         output_m_tile != 128
-        or output_n_tile != 232
-        or balanced_n_tile != 224
+        or (
+            (output_n_tile, balanced_n_tile) != (232, 224)
+            and (output_n_tile, balanced_n_tile) != (256, None)
+        )
     ):
         raise ValueError(
-            "16x32bx2 output requires balanced M128/N232/N224 tiles"
+            "16x32bx2 output requires M128 with exact N256 or balanced "
+            "N232/N224 tiles"
         )
     if split_tma_barriers and (
         tma_staging != "direct"
@@ -253,11 +260,12 @@ def blackwell_tcgen05_gemm_module(
             "split TMA barriers require direct eight-stage non-multicast staging"
         )
     if split_rhs_tma and (
-        tma_staging != "direct" or output_n_tile not in (232, 240, 248, 256)
+        tma_staging != "direct"
+        or output_n_tile not in (32, 64, 128, 232, 240, 248, 256)
     ):
         raise ValueError(
-            "split RHS TMA transactions require direct N=232/N=240/N=248/"
-            "N=256 staging"
+            "split RHS TMA transactions require direct N=32/N=64/N=128/"
+            "N=232/N=240/N=248/N=256 staging"
         )
     if prefetch_lhs_next and (
         tma_staging != "direct"
@@ -273,12 +281,12 @@ def blackwell_tcgen05_gemm_module(
     if prefetch_rhs_next and (
         not prefetch_lhs_next
         or not split_rhs_tma
-        or output_n_tile not in (232, 240, 248, 256)
+        or output_n_tile not in (32, 64, 128, 232, 240, 248, 256)
     ):
         raise ValueError(
             "next-iteration RHS prefetch requires next-iteration LHS "
-            "prefetch and split direct N=232/N=240/N=248/N=256 RHS "
-            "transactions"
+            "prefetch and split direct N=32/N=64/N=128/N=232/N=240/"
+            "N=248/N=256 RHS transactions"
         )
     if lean_bookkeeping and (
         not prefetch_rhs_next
@@ -295,13 +303,12 @@ def blackwell_tcgen05_gemm_module(
         or not lean_bookkeeping
         or output_m_tile != 128
         or k // 128 < 5
-        or (k // 128) % 3 != 2
     ):
         raise ValueError(
             "persistent LHS reuse requires lean persistent N pairs with M128 "
-            "and a K128 iteration count congruent to two modulo three"
+            "and at least five K128 iterations"
         )
-    persistent_ctas = m_tiles * (n_tiles // 2)
+    persistent_ctas = m_tiles * ((n_tiles + 1) // 2)
     if resident_phase_order_split is not None and (
         type(resident_phase_order_split) is not int
         or not persistent_n_pairs
@@ -328,30 +335,59 @@ def blackwell_tcgen05_gemm_module(
     logical_block_x = block_ids.x
     if persistent_loop is not None:
         assert balanced_wide_tiles is not None
-        pair_count = IndexConstantOp.build(n_tiles // 2)
-        threshold_bias = IndexConstantOp.build(
-            n_tiles // 2 - balanced_wide_tiles,
-        )
-        biased_pair = IndexAddOp.build(
-            block_ids.x, threshold_bias.result(),
-        )
-        leftover_pair = IndexDivOp.build(
-            biased_pair.result(), pair_count.result(),
-        )
-        doubled_pair = IndexMulOp.build(
-            block_ids.x, leftover_pair.result(),
-        )
-        first_tile = IndexAddOp.build(
-            block_ids.x, doubled_pair.result(),
-        )
-        wide_count = IndexConstantOp.build(balanced_wide_tiles)
-        leftover_delta = IndexConstantOp.build(1 - balanced_wide_tiles)
-        delta_adjustment = IndexMulOp.build(
-            leftover_pair.result(), leftover_delta.result(),
-        )
-        tile_delta = IndexAddOp.build(
-            wide_count.result(), delta_adjustment.result(),
-        )
+        pair_count = IndexConstantOp.build((n_tiles + 1) // 2)
+        pair_mapping_ops = [pair_count]
+        if n_tiles % 2:
+            # Pair [0, pair_count-2] with the upper half and let the final CTA
+            # recompute its own tile. This covers an odd row without an OOB
+            # access or a second CTA racing the same output; the redundant
+            # work is one tile per M row.
+            one = IndexConstantOp.build(1)
+            last_numerator = IndexAddOp.build(block_ids.x, one.result())
+            is_last = IndexDivOp.build(
+                last_numerator.result(), pair_count.result(),
+            )
+            neg_one = IndexConstantOp.build(-1)
+            neg_last = IndexMulOp.build(is_last.result(), neg_one.result())
+            active_delta = IndexAddOp.build(one.result(), neg_last.result())
+            tile_delta = IndexMulOp.build(
+                pair_count.result(), active_delta.result(),
+            )
+            first_tile_value = block_ids.x
+            pair_mapping_ops.extend([
+                one, last_numerator, is_last, neg_one, neg_last,
+                active_delta, tile_delta,
+            ])
+        else:
+            threshold_bias = IndexConstantOp.build(
+                n_tiles // 2 - balanced_wide_tiles,
+            )
+            biased_pair = IndexAddOp.build(
+                block_ids.x, threshold_bias.result(),
+            )
+            leftover_pair = IndexDivOp.build(
+                biased_pair.result(), pair_count.result(),
+            )
+            doubled_pair = IndexMulOp.build(
+                block_ids.x, leftover_pair.result(),
+            )
+            first_tile = IndexAddOp.build(
+                block_ids.x, doubled_pair.result(),
+            )
+            first_tile_value = first_tile.result()
+            wide_count = IndexConstantOp.build(balanced_wide_tiles)
+            leftover_delta = IndexConstantOp.build(1 - balanced_wide_tiles)
+            delta_adjustment = IndexMulOp.build(
+                leftover_pair.result(), leftover_delta.result(),
+            )
+            tile_delta = IndexAddOp.build(
+                wide_count.result(), delta_adjustment.result(),
+            )
+            pair_mapping_ops.extend([
+                threshold_bias, biased_pair, leftover_pair, doubled_pair,
+                first_tile, wide_count, leftover_delta, delta_adjustment,
+                tile_delta,
+            ])
         pair_iteration = persistent_loop.iv
         phase_order_ops = []
         if resident_phase_order_split is not None:
@@ -383,12 +419,10 @@ def blackwell_tcgen05_gemm_module(
             pair_iteration, tile_delta.result(),
         )
         paired_tile = IndexAddOp.build(
-            first_tile.result(), iteration_delta.result(),
+            first_tile_value, iteration_delta.result(),
         )
         grid_index_ops.extend([
-            pair_count, threshold_bias, biased_pair, leftover_pair,
-            doubled_pair, first_tile, wide_count, leftover_delta,
-            delta_adjustment, tile_delta, *phase_order_ops,
+            *pair_mapping_ops, *phase_order_ops,
             iteration_delta, paired_tile,
         ])
         logical_block_x = paired_tile.result()
@@ -825,6 +859,7 @@ def blackwell_tcgen05_gemm_module(
         grouped_middle_end = 1 + grouped_middle_count
         middle = ForOp.build(1, grouped_middle_end, step=3)
         middle.attrs["label"] = "prefetch_lhs_middle"
+        middle.attrs["iteration_count"] = iteration_count
         phases = (
             (lhs_smem[2].result(), lhs_smem[0].result(), lhs_smem[1].result()),
             (lhs_smem[1].result(), lhs_smem[2].result(), lhs_smem[0].result()),
@@ -1232,7 +1267,7 @@ def blackwell_tcgen05_gemm_module(
                 1,
             )
             if split_last_n_tile_rows is not None else
-            (n_tiles // 2, m_tiles, 1)
+            ((n_tiles + 1) // 2, m_tiles, 1)
             if persistent_n_pairs else
             (n_tiles + int(split_last_n_tile or split_n_tile is not None), m_tiles, 1)
             if transpose_cta_grid else
