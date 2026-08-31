@@ -140,6 +140,7 @@ def blackwell_tcgen05_gemm_module(
     derive_tcgen05_descriptors: bool = False,
     unroll_direct_mainloop: bool = False,
     prefetch_next_banks: int = 0,
+    overlap_k256_rest_wait: bool = False,
     transpose_cta_grid: bool = False,
     split_last_n_tile: bool = False,
     split_n_tile: int | None = None,
@@ -178,6 +179,9 @@ def blackwell_tcgen05_gemm_module(
     ``lean_bookkeeping`` preserves that shared software pipeline while
     reusing its statically elected thread-zero predicate, deriving adjacent
     K16 descriptors, and joining the already-overlapped next-A0/B0 completion.
+    ``overlap_k256_rest_wait`` keeps the non-prefetched K64-bank transfers at
+    their early issue point, then moves their joined readiness wait behind the
+    prefetched banks' MMAs inside the same elected tensor issue group.
     ``reuse_persistent_lhs`` unrolls a two-output persistent pair after sync
     insertion and traverses the second output's K dimension backward, so its
     first two A banks are the resident final banks from the first output. All
@@ -509,6 +513,12 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "next-bank prefetch requires direct non-split K256 staging, no "
             "cluster multicast, and at least two iterations"
+        )
+    if type(overlap_k256_rest_wait) is not bool or (
+        overlap_k256_rest_wait and not prefetch_next_banks
+    ):
+        raise ValueError(
+            "overlapped K256 rest wait requires prefetched banks"
         )
     if split_tma_barriers and (
         tma_staging != "direct"
@@ -1430,7 +1440,10 @@ def blackwell_tcgen05_gemm_module(
                     attrs={"issue_by_thread_zero": True},
                 ),
                 *(AwaitOp.build(lock.result()) for lock in bank_tma_locks),
-                AwaitOp.build(tma_lock.result()),
+                *(
+                    [] if overlap_k256_rest_wait
+                    else [AwaitOp.build(tma_lock.result())]
+                ),
             ])
             mmas = []
             for stage in range(16):
@@ -1442,6 +1455,11 @@ def blackwell_tcgen05_gemm_module(
                     mmas.append(AsyncCommitOp.build(
                         bank_mma_locks[stage // 4 - 1].result(),
                     ))
+                if (
+                    overlap_k256_rest_wait
+                    and stage == 4 * prefetch_next_banks
+                ):
+                    mmas.append(AwaitOp.build(tma_lock.result()))
                 bank = stage // 4
                 buffer_stage = stage % 4
                 lhs_tile = TileOp.build(

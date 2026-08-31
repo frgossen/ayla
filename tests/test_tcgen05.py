@@ -368,6 +368,25 @@ def test_tcgen05_prefetches_next_k256_banks():
     assert ptx.count(", 32768;") == 4
 
 
+def test_tcgen05_overlaps_k256_rest_wait_after_prefetched_banks():
+    ptx = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=1024,
+        output_m_tile=64, output_n_tile=64, operand_stages=16,
+        derive_tcgen05_descriptors=True,
+        prefetch_next_banks=2, overlap_k256_rest_wait=True,
+    )).ptx
+
+    group_start = ptx.index("async(%0: lock<tcgen05>")
+    group_end = ptx.index("await(%0: lock<tcgen05>", group_start)
+    group = ptx[group_start:group_end]
+    rest_wait = group.index("mbarrier.try_wait.parity.acquire")
+    assert group[:rest_wait].count("tcgen05.mma.cta_group::1") == 8
+    assert group[rest_wait:].count("tcgen05.mma.cta_group::1") == 8
+
+    with pytest.raises(ValueError, match="requires prefetched banks"):
+        blackwell_tcgen05_gemm_module(overlap_k256_rest_wait=True)
+
+
 def test_tcgen05_prefetched_persistent_pairs_overwrite_each_output():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=64, n=128, k=1024,

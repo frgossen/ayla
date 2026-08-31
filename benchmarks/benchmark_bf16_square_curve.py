@@ -116,7 +116,8 @@ def _blackwell_module(size: int) -> ModuleOp:
         return blackwell_tcgen05_gemm_module(
             output_m_tile=64, output_n_tile=64,
             operand_stages=16, derive_tcgen05_descriptors=True,
-            prefetch_next_banks=1, ptx_optimization_level=2,
+            prefetch_next_banks=2, overlap_k256_rest_wait=True,
+            ptx_optimization_level=2,
             overwrite_first_mma=True,
             batch_lock_initialization=True,
             overlap_tmem_deallocation=True,
@@ -178,7 +179,7 @@ def _blackwell_module(size: int) -> ModuleOp:
 
 BLACKWELL_CONFIG_NAMES = {
     512: "tcgen05_m64n32_k512_early_tma_o2",
-    1024: "tcgen05_m64n64_k256_prefetch_bank_paired_o2",
+    1024: "tcgen05_m64n64_k256_prefetch_bank2_overlap_paired_o2",
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_rhs_reuse_b_major",
