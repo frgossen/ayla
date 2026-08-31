@@ -14,8 +14,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from ayla import torch_inductor
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 import glimmer_block  # noqa: E402
@@ -33,16 +31,9 @@ TOKENS = 8
 UNWRITTEN_OUTPUT = 3
 
 
-@pytest.fixture
-def backend():
-    """ayla claiming `aten.mm` for the duration of a test."""
-    torch_inductor.install()
-    yield
-    torch_inductor.uninstall()
-
-
 @requires_cuda
-def test_glimmer_block_compiles_through_the_backend(backend):
+@pytest.mark.usefixtures("ayla_installed")
+def test_glimmer_block_compiles_through_the_backend():
     import torch._inductor.config as inductor_config
     from torch._inductor.utils import run_and_get_code
 
