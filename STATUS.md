@@ -166,6 +166,10 @@ Finally, replacing either current tensor-completion acquire barrier with PTX
 correctness launches but faulted during the first sustained graph replay. The
 acquire waits therefore encode real cross-thread buffer/tensor-memory lifetime
 ordering, not merely conservative syntax that can be removed for speed.
+Polling either completion bank from one lane and publishing through a CTA
+barrier was safe but 1.7-4.0% slower. Separating the retained joined A0/B0 TMA
+completion into two shorter waits was also neutral in both orders, so neither
+poll participation nor the earlier barrier-coalescing choice is the hidden cap.
 
 ## What has worked
 
