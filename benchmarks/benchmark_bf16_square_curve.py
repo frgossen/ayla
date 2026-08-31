@@ -177,25 +177,25 @@ BLACKWELL_CONFIG_NAMES = {
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
-    16384: "tcgen05_m128n256_k128_7x_n_band_o1",
+    16384: "tcgen05_m128n256_k128_7x_m_band_b_major_o1",
 }
 
 
 def _blackwell_16384_banded_op() -> Callable:
-    """Run seven cache-sized N bands into one strided output tensor."""
+    """Run seven cache-sized M bands with immediate RHS-tile reuse."""
     size = 16384
-    tile_counts = (10, 9, 9, 9, 9, 9, 9)
+    tile_counts = (19, 19, 18, 18, 18, 18, 18)
     launchers = {
         tiles: make_ptx_launcher(make_ptx_kernel(
             blackwell_tcgen05_gemm_module(
-                m=size, n=tiles * 256, k=size,
+                m=tiles * 128, n=size, k=size,
                 output_m_tile=128, output_n_tile=256,
                 operand_stages=8, split_tma_barriers=True,
                 split_rhs_tma=True, prefetch_lhs_next=True,
                 prefetch_rhs_next=True, lean_bookkeeping=True,
                 output_tmem_load_shape="16x32bx2",
                 overwrite_first_mma=True,
-                transpose_cta_grid=True,
+                transpose_cta_grid=False,
                 lhs_l2_cache_hint="evict_last",
                 rhs_l2_cache_hint="evict_last",
                 lhs_l2_promotion="256B",
@@ -218,13 +218,13 @@ def _blackwell_16384_banded_op() -> Callable:
             )
         start = 0
         for tiles in tile_counts:
-            band_n = tiles * 256
+            band_m = tiles * 128
             launchers[tiles](
-                a,
-                bt.narrow(0, start, band_n),
-                output.narrow(1, start, band_n),
+                a.narrow(0, start, band_m),
+                bt,
+                output.narrow(0, start, band_m),
             )
-            start += band_n
+            start += band_m
         return output
 
     return op
