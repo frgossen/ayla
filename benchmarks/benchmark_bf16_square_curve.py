@@ -177,14 +177,18 @@ BLACKWELL_CONFIG_NAMES = {
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
-    16384: "tcgen05_m128n256_k128_7x_m_band_b_major_o1",
+    16384: "tcgen05_m128n256_k128_7x_m_band_29wave_b_major_o1",
 }
 
 
 def _blackwell_16384_banded_op() -> Callable:
     """Run seven cache-sized M bands with immediate RHS-tile reuse."""
     size = 16384
-    tile_counts = (19, 19, 18, 18, 18, 18, 18)
+    # With 148 SMs and two resident CTAs per SM, M18 bands occupy 3.89 waves.
+    # One M21 leader plus five M18 and one M17 band covers all 128 M tiles in
+    # 29 aggregate waves; the balanced M19/M18 split needs 30 because both M19
+    # launches spill into a mostly empty fifth wave.
+    tile_counts = (21, 18, 18, 18, 18, 18, 17)
     launchers = {
         tiles: make_ptx_launcher(make_ptx_kernel(
             blackwell_tcgen05_gemm_module(
