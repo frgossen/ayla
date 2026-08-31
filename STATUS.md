@@ -18,9 +18,13 @@ at 16384, and reaches 86.7% of cuBLAS by geometric mean over 512-16384. The
 4096 result is still marginal: three independent gate runs were +3.4%, +5.6%,
 and +4.8%, so it has not met the required +5% in all three runs.
 
-Environment: NVIDIA B200 (CC 10.0), driver 580.82.07, installed CUDA toolkit
-12.8, PyTorch 2.13.0+cu130 / CUDA runtime 13.0. Reported peak percentages use
-NVIDIA's published 2.25 PFLOP/s dense BF16 B200 peak.
+Environment: NVIDIA B200 (CC 10.0), driver 580.82.07, PyTorch 2.13.0+cu130 /
+CUDA runtime 13.0. CUDA 13.0.3 is installed at `/usr/local/cuda-13.0`, while
+the default `/usr/local/cuda` symlink still selects CUDA 12.8.2. Ayla emits
+PTX 9.0 for `sm_100a`; CUDA 13's `ptxas` accepts 9.0 and rejects 9.1 as newer
+than its supported ISA, so the retained path is using the latest locally
+available PTX version. Reported peak percentages use NVIDIA's published 2.25
+PFLOP/s dense BF16 B200 peak.
 
 ## Current best square-curve performance
 
@@ -77,6 +81,32 @@ producer/consumer split (`tid.x < 128`). That warp-specialized structure is
 explicitly prohibited for this Ayla experiment, so it is useful as a hardware
 efficiency reference but cannot be copied directly.
 
+### Holistic local-minimum audit
+
+The latest source-correlated comparison does not point to occupancy, spills,
+or DRAM bandwidth as a hidden cap. At 8192, Ayla has 7.96 active warps/SM
+versus cuBLAS's 6.00, an 85.18% versus 72.38% L2 hit rate, and zero spilling,
+but executes 44.93M scheduler-level instructions versus 16.33M while reaching
+86.68% versus 94.93% tensor activity. About 83% of Ayla's sampled non-issued
+cycles are long-scoreboard stalls; the corresponding cuBLAS share is about
+93%, but cuBLAS's two-CTA MMA and warp-specialized producer/consumer pipeline
+perform more tensor work per control instruction.
+
+This excess is not primarily caused by the retained four-output shape policy.
+A fresh exact-N256 single-output control executes 43.26M instructions and
+reaches 88.00% compute throughput—essentially the same profile as the retained
+44.93M/88.17% kernel. Focused graph timing sometimes favored exact N256, but
+paired medians were only +0.98% to +1.27% with 4.6-5.1% dispersion; it is not a
+stable replacement. The older A-major/LHS-reuse 2x2 schedule was consistently
+about 3.5% slower, while removing split readiness and prefetching cost 14-22%.
+Thus the retained topology is not masking a faster simple baseline; the main
+remaining cap is the uniform pipeline's per-K128 readiness/completion protocol.
+
+A direct fast-path experiment that tested each barrier before entering the
+blocking wait loop was also neutral (best paired result +0.10% forward and
++0.05% reverse). The next useful work must change the amount of useful tensor
+work hidden behind those dependencies, not merely reshape their polling code.
+
 ## What has worked
 
 - Explicit Blackwell target configuration and native `tcgen05`/tensor-memory
@@ -112,8 +142,9 @@ or dependency depth, not excess DRAM traffic.
 - Re-run the full collection and final clean verification once the performance
   policy is final.
 - Continue with dependency-changing experiments aimed at TMA readiness and
-  tensor completion latency; cache hints, output tuning, and simple barrier
-  removal have been exhausted for the current kernels.
+  tensor completion latency; cache hints, output tuning, simple barrier
+  removal, and a nonblocking-before-blocking wait fast path have been exhausted
+  for the current kernels.
 
 Profiler evidence: [512 Ayla](.benchmarks/2026-08-30-tcgen05-512-early-tma-gpu6.ncu-rep),
 [1024 Ayla](.benchmarks/2026-08-31-tcgen05-1024-bank2-overlap-gpu6.ncu-rep),
