@@ -15,15 +15,19 @@ square curve passes three correctness seeds at every configured size.
 Performance is not yet at the acceptance gates. In the latest complete curve,
 Ayla beats `torch.mm`/cuBLAS by 5.13% at 4096, trails by 7.28% at 8192 and 4.30%
 at 16384, and reaches 86.7% of cuBLAS by geometric mean over 512-16384. The
-4096 result is still marginal: three independent gate runs were +3.4%, +5.6%,
-and +4.8%, so it has not met the required +5% in all three runs.
+4096 result is still marginal. A fresh three-process, alternating-order recheck
+produced +5.29%, +6.74%, and +3.89%; the kernel is consistently ahead, but it
+still has not met the required +5% in all three independent runs.
 
 Environment: NVIDIA B200 (CC 10.0), driver 580.82.07, PyTorch 2.13.0+cu130 /
 CUDA runtime 13.0. CUDA 13.0.3 is installed at `/usr/local/cuda-13.0`, while
 the default `/usr/local/cuda` symlink still selects CUDA 12.8.2. Ayla emits
 PTX 9.0 for `sm_100a`; CUDA 13's `ptxas` accepts 9.0 and rejects 9.1 as newer
 than its supported ISA, so the retained path is using the latest locally
-available PTX version. Reported peak percentages use NVIDIA's published 2.25
+available PTX version. Compiling the exact current 8192 source offline with
+CUDA 13.0.3 `ptxas -O1` was bit-identical and changed paired throughput by only
++0.04% versus the driver's O1 JIT, ruling out the available compiler path as a
+hidden performance cap. Reported peak percentages use NVIDIA's published 2.25
 PFLOP/s dense BF16 B200 peak.
 
 ## Current best square-curve performance
@@ -44,9 +48,9 @@ it was not overridden by an Ayla-specific benchmark choice.
 
 Raw timing evidence: [complete curve](.benchmarks/2026-08-31-bf16-square-curve-2048-cluster-y2-gpu6-forward.txt),
 [CSV](.benchmarks/2026-08-31-bf16-square-curve-2048-cluster-y2-gpu6-forward.csv),
-and independent 4096 gate [run 1](.benchmarks/2026-08-31-bf16-square-4096-current-gate-run1-gpu6-forward.txt),
-[run 2](.benchmarks/2026-08-31-bf16-square-4096-current-gate-run2-gpu6-reverse.txt),
-and [run 3](.benchmarks/2026-08-31-bf16-square-4096-current-gate-run3-gpu6-forward.txt).
+and the latest independent 4096 gate [run 1](.benchmarks/2026-08-31-bf16-square-4096-reaudit-run1-gpu6-forward.txt),
+[run 2](.benchmarks/2026-08-31-bf16-square-4096-reaudit-run2-gpu6-reverse.txt),
+and [run 3](.benchmarks/2026-08-31-bf16-square-4096-reaudit-run3-gpu6-forward.txt).
 
 ## Profiler comparison
 
@@ -161,6 +165,12 @@ programmatic-dependent-launch prototype, which allowed only the prior band's
 tail/epilogue to overlap the next band, changed from +0.86% forward to -0.17%
 reverse and was likewise rejected as order noise.
 
+The same launch-level question was tested at 8192 by splitting the retained
+1.95-wave grid into two 0.97-wave M bands. Ordinary serialization lost 0.64%,
+and programmatic dependent launch recovered only about 0.15%, leaving it 0.49%
+behind the monolithic grid. Thus neither large-shape winner is being capped by
+an avoidable whole-grid tail bubble.
+
 Finally, replacing either current tensor-completion acquire barrier with PTX
 9.0's relaxed wait plus `tcgen05.fence::after_thread_sync` passed three isolated
 correctness launches but faulted during the first sustained graph replay. The
@@ -170,6 +180,8 @@ Polling either completion bank from one lane and publishing through a CTA
 barrier was safe but 1.7-4.0% slower. Separating the retained joined A0/B0 TMA
 completion into two shorter waits was also neutral in both orders, so neither
 poll participation nor the earlier barrier-coalescing choice is the hidden cap.
+Relaxing only TMA-readiness waits while retaining their async-proxy fences was
+also neutral to within 0.08%, excluding acquire-fence cost itself.
 
 ## What has worked
 
