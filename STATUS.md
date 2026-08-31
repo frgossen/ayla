@@ -149,6 +149,13 @@ during the tensor interval delayed the critical RHS refill. Deeper lookahead
 within the same uniform pipeline is therefore not automatically beneficial;
 the overlap engine is already contended where the retained schedule places it.
 
+The six-launch 16384 M-band policy was also checked as a possible scheduling
+local minimum. Running the bands in concurrent pairs produced a tempting 3.7%
+gain at graph depth 8, but at the production depth it lost in both preparation
+orders (999/1009 versus 1011/1024 TFLOP/s for serial). Serial cache-sized
+banding is therefore retained; the short-run concurrency result was not a
+stable source of parallelism or cross-band reuse.
+
 ## What has worked
 
 - Explicit Blackwell target configuration and native `tcgen05`/tensor-memory
