@@ -1,6 +1,6 @@
 # Ayla B200 port status
 
-Snapshot: 2026-08-31, source commit `db0a22b` (`Support M128 two-CTA Blackwell GEMM`).
+Snapshot: 2026-08-31, source commit `56ad7ae` (`Update B200 performance audit`).
 `B200_PORT.md` remains the canonical experiment log; this file is the compact
 performance summary requested for the current state.
 
@@ -115,6 +115,16 @@ its M256-total six-stage collective is the topology Ayla had already tested at
 roughly 654 TFLOP/s without warp specialization. Thus neither an older shape
 choice nor a missing legal `tcgen05` geometry explains the remaining gap.
 
+The conspicuous cuBLAS epilogue sequence—wide tensor-memory loads, `STSM`, then
+TMA output—was also reproduced with PTX 9.0 on an exact M128/N256 control while
+reusing dead operand buffers, so shared-memory occupancy did not change. It was
+bit-exact for three seeds and reduced executed instructions from 43.26M to
+39.84M, but lost 3.8-4.9% in both timing orders; NCU showed compute throughput
+falling from 88.00% to 85.69% and no-eligible cycles rising from 92.77% to
+93.70%. Double-buffering the TMA output did not recover the loss. The opcode
+difference is therefore coupled to cuBLAS's prohibited producer/consumer and
+two-CTA topology, rather than a standalone epilogue optimization Ayla omitted.
+
 ## What has worked
 
 - Explicit Blackwell target configuration and native `tcgen05`/tensor-memory
@@ -150,9 +160,9 @@ or dependency depth, not excess DRAM traffic.
 - Re-run the full collection and final clean verification once the performance
   policy is final.
 - Continue with dependency-changing experiments aimed at TMA readiness and
-  tensor completion latency; cache hints, output tuning, simple barrier
-  removal, and a nonblocking-before-blocking wait fast path have been exhausted
-  for the current kernels.
+  tensor completion latency; cache hints, direct versus wide/TMA output,
+  simple barrier removal, and a nonblocking-before-blocking wait fast path have
+  been exhausted for the current kernels.
 
 Profiler evidence: [512 Ayla](.benchmarks/2026-08-30-tcgen05-512-early-tma-gpu6.ncu-rep),
 [1024 Ayla](.benchmarks/2026-08-31-tcgen05-1024-bank2-overlap-gpu6.ncu-rep),
