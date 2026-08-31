@@ -154,7 +154,7 @@ def _blackwell_module(size: int) -> ModuleOp:
             cluster_multicast_b=True,
             cluster_multicast_b_ctas=8,
             cluster_multicast_b_issuers=4,
-            ptx_optimization_level=2,
+            ptx_optimization_level=1,
             **common,
         )
     return blackwell_tcgen05_gemm_module(
@@ -176,7 +176,7 @@ BLACKWELL_CONFIG_NAMES = {
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
-    16384: "tcgen05_m128n256_k128_persistent_pair_cluster_b8_i4_o2",
+    16384: "tcgen05_m128n256_k128_persistent_pair_cluster_b8_i4_o1",
 }
 
 
