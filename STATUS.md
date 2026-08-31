@@ -1,6 +1,6 @@
 # Ayla B200 port status
 
-Snapshot: 2026-08-31, source commit `0c0f9fb` (`Record wide epilogue audit`).
+Snapshot: 2026-08-31, source commit `716b098` (`Record band-concurrency audit`).
 `B200_PORT.md` remains the canonical experiment log; this file is the compact
 performance summary requested for the current state.
 
@@ -154,7 +154,18 @@ local minimum. Running the bands in concurrent pairs produced a tempting 3.7%
 gain at graph depth 8, but at the production depth it lost in both preparation
 orders (999/1009 versus 1011/1024 TFLOP/s for serial). Serial cache-sized
 banding is therefore retained; the short-run concurrency result was not a
-stable source of parallelism or cross-band reuse.
+stable source of parallelism or cross-band reuse. Splitting every band in half
+while keeping the same combined A footprint also lost 4.0%, ruling out hidden
+grid concurrency independently of the original band size. A narrower
+programmatic-dependent-launch prototype, which allowed only the prior band's
+tail/epilogue to overlap the next band, changed from +0.86% forward to -0.17%
+reverse and was likewise rejected as order noise.
+
+Finally, replacing either current tensor-completion acquire barrier with PTX
+9.0's relaxed wait plus `tcgen05.fence::after_thread_sync` passed three isolated
+correctness launches but faulted during the first sustained graph replay. The
+acquire waits therefore encode real cross-thread buffer/tensor-memory lifetime
+ordering, not merely conservative syntax that can be removed for speed.
 
 ## What has worked
 
