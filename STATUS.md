@@ -141,6 +141,14 @@ bit-exact and improved its non-collector control by 0.7-1.2%, but still ran
 18-20% behind exact N256. Thus fixed issue ownership and the absence of a B
 collector are not the optimizations capping the retained wide kernel.
 
+Likewise, narrowing to N192 to fit a fourth LHS buffer made it possible to
+prefetch both A banks for the following K128 group while preserving two-CTA
+residency. That exact control cut static TMA and wait sites by roughly 43%, but
+was 8.3% slower than the matching three-LHS-buffer N192 kernel: extra TMA work
+during the tensor interval delayed the critical RHS refill. Deeper lookahead
+within the same uniform pipeline is therefore not automatically beneficial;
+the overlap engine is already contended where the retained schedule places it.
+
 ## What has worked
 
 - Explicit Blackwell target configuration and native `tcgen05`/tensor-memory
