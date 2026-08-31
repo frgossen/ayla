@@ -1,6 +1,6 @@
 # Ayla B200 port status
 
-Snapshot: 2026-08-31, source commit `56ad7ae` (`Update B200 performance audit`).
+Snapshot: 2026-08-31, source commit `0c0f9fb` (`Record wide epilogue audit`).
 `B200_PORT.md` remains the canonical experiment log; this file is the compact
 performance summary requested for the current state.
 
@@ -102,6 +102,14 @@ about 3.5% slower, while removing split readiness and prefetching cost 14-22%.
 Thus the retained topology is not masking a faster simple baseline; the main
 remaining cap is the uniform pipeline's per-K128 readiness/completion protocol.
 
+The dynamic SASS mix makes that distinction concrete. In the retained 8192
+capture, Ayla executes about 1.18M group-1 `UTCHMMA` instructions, 3.82M
+`SYNCS...TRYWAIT` instructions, and 6.83M branches; cuBLAS executes about
+0.52M `UTCHMMA.2CTA`, 3.12M `TRYWAIT`, and 3.50M branches. The lower cuBLAS
+counts come from doing roughly twice the tensor work per collective MMA and
+amortizing readiness over a six-stage producer/consumer pipeline—not from a
+newer PTX encoding that Ayla has failed to request.
+
 A direct fast-path experiment that tested each barrier before entering the
 blocking wait loop was also neutral (best paired result +0.10% forward and
 +0.05% reverse). The next useful work must change the amount of useful tensor
@@ -124,6 +132,14 @@ falling from 88.00% to 85.69% and no-eligible cycles rising from 92.77% to
 93.70%. Double-buffering the TMA output did not recover the loss. The opcode
 difference is therefore coupled to cuBLAS's prohibited producer/consumer and
 two-CTA topology, rather than a standalone epilogue optimization Ayla omitted.
+
+Two further controls rule out hidden issuer and collector wins. Rotating the
+legal TMA issuer among warps was exact but 1.7% slower; moving tensor issue away
+from the layout-owning warp trapped as an illegal instruction. A two-output
+M128/N128 path using PTX 9.0 B-operand `fill`/`lastuse` collectors was also
+bit-exact and improved its non-collector control by 0.7-1.2%, but still ran
+18-20% behind exact N256. Thus fixed issue ownership and the absence of a B
+collector are not the optimizations capping the retained wide kernel.
 
 ## What has worked
 
