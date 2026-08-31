@@ -39,7 +39,7 @@ from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
-from .passes.reuse_persistent_lhs import ReusePersistentLhs
+from .passes.reuse_persistent_lhs import ReusePersistentLhs, ReusePersistentRhs
 from .base.pipeline import Pipeline
 from .targets import PtxTarget
 
@@ -54,6 +54,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
         self.add_pass(ReusePersistentLhs())
+        self.add_pass(ReusePersistentRhs())
         self.add_pass(LowerToPtxTemplate(target))
         self.add_pass(Canonicalize())
 

@@ -166,6 +166,7 @@ def blackwell_tcgen05_gemm_module(
     persistent_m_pairs: bool = False,
     lean_bookkeeping: bool = False,
     reuse_persistent_lhs: bool = False,
+    reuse_persistent_rhs: bool = False,
     resident_phase_order_split: int | None = None,
     output_row_stride: int | None = None,
 ) -> ModuleOp:
@@ -182,6 +183,10 @@ def blackwell_tcgen05_gemm_module(
     first two A banks are the resident final banks from the first output. All
     four warps still execute the same pipeline; only K order and buffer reuse
     differ between the two static phases.
+    ``reuse_persistent_rhs`` instead makes the adjacent-M pair the inner loop,
+    reverses its second output's K traversal, and retains the final two RHS
+    banks across that pair. The enclosing adjacent-N loop remains uniform
+    across all four warps.
     ``persistent_m_pairs`` nests that shared two-N pipeline across two M tile
     rows. It reuses the same tensor/shared allocations without assigning
     durable roles to any warp and reduces multi-wave launch overhead.
@@ -563,6 +568,19 @@ def blackwell_tcgen05_gemm_module(
             "persistent LHS reuse requires lean balanced persistent N pairs "
             "with M128 and at least five K128 iterations"
         )
+    if reuse_persistent_rhs and (
+        not persistent_n_pairs
+        or not persistent_m_pairs
+        or balanced_n_tile is None
+        or not lean_bookkeeping
+        or output_m_tile != 128
+        or k // 128 < 5
+        or reuse_persistent_lhs
+    ):
+        raise ValueError(
+            "persistent RHS reuse requires lean balanced persistent M and N "
+            "pairs with M128, at least five K128 iterations, and no LHS reuse"
+        )
     persistent_ctas = m_tiles * ((n_tiles + 1) // 2)
     if resident_phase_order_split is not None and (
         type(resident_phase_order_split) is not int
@@ -606,7 +624,11 @@ def blackwell_tcgen05_gemm_module(
         if persistent_n_pairs else None
     )
     persistent_m_loop = (
-        ForOp.build(0, 2, attrs={"disjoint_grid_iterations": True})
+        ForOp.build(0, 2, attrs={
+            "disjoint_grid_iterations": True,
+            **({"reuse_rhs_reverse_k": True}
+               if reuse_persistent_rhs else {}),
+        })
         if persistent_m_pairs else None
     )
     logical_block_x = block_ids.x
@@ -1769,18 +1791,25 @@ def blackwell_tcgen05_gemm_module(
         # Logical N tiles are disjoint in global memory. The loop attribute
         # communicates that fact to sync insertion while its normal backedge
         # analysis still inserts barriers for reused shared/tensor memory.
-        persistent_loop.body.ops.extend(tile_ops)
         if persistent_m_loop is not None:
-            persistent_m_loop.body.ops.append(persistent_loop)
+            if reuse_persistent_rhs:
+                persistent_m_loop.body.ops.extend(tile_ops)
+                persistent_loop.body.ops.append(persistent_m_loop)
+                nested_loop = persistent_loop
+            else:
+                persistent_loop.body.ops.extend(tile_ops)
+                persistent_m_loop.body.ops.append(persistent_loop)
+                nested_loop = persistent_m_loop
             body_ops = [
                 block_ids,
                 *allocation_ops,
                 *([BarrierOp.build(scope="cluster")]
                   if cluster_multicast_b else []),
-                persistent_m_loop,
+                nested_loop,
                 *deallocation_ops,
             ]
         else:
+            persistent_loop.body.ops.extend(tile_ops)
             body_ops = [
                 block_ids,
                 *allocation_ops,

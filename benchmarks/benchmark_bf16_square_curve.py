@@ -166,7 +166,7 @@ def _blackwell_module(size: int) -> ModuleOp:
         output_tmem_load_shape="16x32bx2",
         persistent_n_pairs=True,
         persistent_m_pairs=size == 8192,
-        reuse_persistent_lhs=size == 8192,
+        reuse_persistent_rhs=size == 8192,
         **common,
     )
 
@@ -176,7 +176,7 @@ BLACKWELL_CONFIG_NAMES = {
     1024: "tcgen05_m64n64_k256_prefetch_bank_paired_o2",
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
-    8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
+    8192: "tcgen05_balanced_persistent_2x2_rhs_reuse",
     16384: "tcgen05_m128n256_k128_6x_m_band_28wave_b_major_o1",
 }
 

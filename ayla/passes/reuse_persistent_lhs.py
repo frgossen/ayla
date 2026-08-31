@@ -1,4 +1,4 @@
-"""Reuse the final LHS banks across a two-output persistent GEMM pair.
+"""Reuse final operand banks across a two-output persistent GEMM pair.
 
 The marked direct-TMA K128 pipeline computes its second output with descending
 K coordinates.  The first output leaves K[-2:] in two of the three LHS shared
@@ -9,6 +9,10 @@ RHS bank across the remaining tensor work. All warps keep the same software
 pipeline. This pass runs after synchronization insertion, then unrolls only the
 two-iteration persistent loop so the existing loop-carried barriers remain
 explicit while the two phases can have different K order and buffer mapping.
+
+The symmetric RHS transform makes an adjacent-M pair the inner loop and keeps
+the final two RHS banks for its reverse-K second output. It removes four split
+RHS transactions without changing warp roles or shared-memory allocation.
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ from .unroll_loop import unroll_loop
 
 
 _MARKER = "reuse_lhs_reverse_k"
+_RHS_MARKER = "reuse_rhs_reverse_k"
 
 
 def _walk_ops(ops):
@@ -366,6 +371,220 @@ class ReusePersistentLhs(Pass):
             AwaitOp.build(half_lock),
             phase_two_b0,
         ]
+
+        return Canonicalize().run(module)
+
+
+class ReusePersistentRhs(Pass):
+    """Apply reverse-K RHS reuse to an inner adjacent-M persistent pair."""
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        marked = [
+            op for op in iter_ops(module)
+            if isinstance(op, ForOp) and op.attrs.get(_RHS_MARKER)
+        ]
+        if not marked:
+            return module
+        if len(marked) != 1 or marked[0].trip_count != 2:
+            raise ValueError(
+                "persistent RHS reuse requires one two-iteration marked loop"
+            )
+        marked[0].attrs["label"] = "persistent_rhs_reverse_k_pair"
+        module = unroll_loop(
+            module, unroll_factor=3,
+            label_filter="persistent_rhs_reverse_k_pair",
+        )
+        module = Canonicalize().run(module)
+
+        kernel = module.body.ops[0]
+        outputs = [
+            op for op in _walk_ops(kernel.body.ops)
+            if isinstance(op, MoveOp) and isinstance(op.src.type, TmemTensorType)
+        ]
+        if len(outputs) != 2:
+            raise ValueError(
+                "persistent RHS reuse requires exactly two tensor-memory outputs"
+            )
+        body = outputs[0].parent_block
+        if body is None or outputs[1].parent_block is not body:
+            raise ValueError(
+                "persistent RHS reuse requires both outputs in one loop body"
+            )
+        phase_start = body.ops.index(outputs[0]) + 1
+        phase_end = body.ops.index(outputs[1])
+        phase_ops = list(body.ops[phase_start:phase_end])
+        middle = next(
+            (
+                op for op in phase_ops
+                if isinstance(op, ForOp)
+                and op.attrs.get("label") == "prefetch_lhs_middle_tail1"
+            ),
+            None,
+        )
+        if middle is None or middle.step != 3:
+            raise ValueError(
+                "persistent RHS reuse requires the grouped K128 middle loop"
+            )
+        iteration_count = middle.attrs.get("iteration_count")
+        if (
+            not isinstance(iteration_count, int)
+            or middle.lb != 1
+            or iteration_count < 5
+        ):
+            raise ValueError(
+                "persistent RHS reuse requires at least five K128 iterations"
+            )
+
+        lhs_allocs = [
+            op.result() for op in kernel.body.ops
+            if isinstance(op, AllocOp)
+            and isinstance(op.result().type, SmemTensorType)
+            and tuple(op.result().type.sizes) == (128, 64)
+        ]
+        if len(lhs_allocs) != 3:
+            raise ValueError(
+                "persistent RHS reuse requires three M128xK64 shared buffers"
+            )
+
+        def smem_operand(op: TmaMoveOp) -> Value:
+            return op.dst if isinstance(op.dst.type, SmemTensorType) else op.src
+
+        tma_moves = [
+            op for op in _walk_ops(phase_ops) if isinstance(op, TmaMoveOp)
+        ]
+        a_tmas = [
+            op for op in tma_moves
+            if root_buffer(smem_operand(op)) in lhs_allocs
+        ]
+        rhs_allocs = {
+            root_buffer(smem_operand(op))
+            for op in tma_moves
+            if tuple(smem_operand(op).type.sizes) != (128, 64)
+        }
+        b_tmas = [
+            op for op in tma_moves
+            if root_buffer(smem_operand(op)) in rhs_allocs
+        ]
+        tail_iterations = (iteration_count - 2) % 3 + 1
+        if (
+            len(a_tmas) != 8 + 2 * tail_iterations
+            or len(b_tmas) != 16 + 4 * tail_iterations
+            or len(rhs_allocs) != 2
+        ):
+            raise ValueError(
+                "persistent RHS reuse requires the three-A/two-split-B K128 "
+                "prefetch pipeline"
+            )
+
+        middle_ops = set(_walk_ops(middle.body.ops))
+
+        def partition(tmas):
+            prefix = [
+                op for op in tmas
+                if op not in middle_ops
+                and body.ops.index(_anchor(op)) < body.ops.index(middle)
+            ]
+            within = [op for op in tmas if op in middle_ops]
+            suffix = [
+                op for op in tmas
+                if op not in middle_ops
+                and body.ops.index(_anchor(op)) > body.ops.index(middle)
+            ]
+            return prefix, within, suffix
+
+        prefix_a, middle_a, suffix_a = partition(a_tmas)
+        prefix_b, middle_b, suffix_b = partition(b_tmas)
+        if [len(values) for values in (
+            prefix_a, middle_a, suffix_a, prefix_b, middle_b, suffix_b,
+        )] != [
+            3, 6, 2 * tail_iterations - 1,
+            6, 12, 4 * tail_iterations - 2,
+        ]:
+            raise ValueError("persistent RHS reuse found an unexpected TMA schedule")
+
+        def set_coordinate(op: TmaMoveOp, coordinate: int) -> None:
+            anchor = _anchor(op)
+            constant = IndexConstantOp.build(coordinate * 64)
+            anchor.parent_block.ops.insert(
+                anchor.parent_block.ops.index(anchor), constant,
+            )
+            if len(op.indices) != 2:
+                raise ValueError("persistent RHS reuse requires rank-two TMA")
+            op.operands[3] = constant.result()
+
+        last_iteration = iteration_count - 1
+        for op, coordinate in zip(
+            prefix_a,
+            [2 * last_iteration, 2 * last_iteration + 1,
+             2 * last_iteration - 2],
+            strict=True,
+        ):
+            set_coordinate(op, coordinate)
+        suffix_a_coordinates = []
+        suffix_b_coordinates = []
+        for target in reversed(range(tail_iterations)):
+            if target:
+                suffix_a_coordinates.extend([2 * target + 1, 2 * target - 2])
+                suffix_b_coordinates.extend(
+                    [2 * target + 1] * 2 + [2 * target - 2] * 2
+                )
+            else:
+                suffix_a_coordinates.append(1)
+                suffix_b_coordinates.extend([1, 1])
+        for op, coordinate in zip(
+            suffix_a, suffix_a_coordinates, strict=True,
+        ):
+            set_coordinate(op, coordinate)
+        for op, coordinate in zip(
+            prefix_b,
+            [2 * last_iteration, 2 * last_iteration,
+             2 * last_iteration + 1, 2 * last_iteration + 1,
+             2 * last_iteration - 2, 2 * last_iteration - 2],
+            strict=True,
+        ):
+            set_coordinate(op, coordinate)
+        for op, coordinate in zip(
+            suffix_b, suffix_b_coordinates, strict=True,
+        ):
+            set_coordinate(op, coordinate)
+
+        middle.attrs.update({
+            "lb": iteration_count - 2,
+            "ub": tail_iterations - 1,
+            "step": -3,
+        })
+        scale = IndexConstantOp.build(128)
+        base = IndexMulOp.build(middle.iv, scale.result())
+        middle.body.ops[0:0] = [scale, base]
+
+        def set_middle_offset(op: TmaMoveOp, offset: int) -> None:
+            anchor = _anchor(op)
+            if anchor.parent_block is not middle.body:
+                raise ValueError("persistent RHS reuse lost middle-loop dominance")
+            constant = IndexConstantOp.build(offset * 64)
+            coordinate = IndexAddOp.build(base.result(), constant.result())
+            index = middle.body.ops.index(anchor)
+            middle.body.ops[index:index] = [constant, coordinate]
+            op.operands[3] = coordinate.result()
+
+        a_offsets = [1, -2, -1, -4, -3, -6]
+        for op, offset in zip(middle_a, a_offsets, strict=True):
+            set_middle_offset(op, offset)
+        for op, offset in zip(
+            middle_b,
+            [offset for offset in a_offsets for _ in range(2)],
+            strict=True,
+        ):
+            set_middle_offset(op, offset)
+
+        # The first output leaves its final K128 RHS pair in B0/B1. The
+        # reverse traversal consumes those same banks first for the adjacent M
+        # output, so only its A0/A1 transfers remain in the two initial TMA
+        # groups. All warps continue through the same readiness waits.
+        for op in b_tmas[:4]:
+            if op.parent_block is None:
+                raise ValueError("persistent RHS reuse found a detached TMA")
+            op.parent_block.ops.remove(op)
 
         return Canonicalize().run(module)
 

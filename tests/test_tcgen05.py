@@ -886,6 +886,22 @@ def test_tcgen05_persistent_m_and_n_pairs_lowering():
     assert reused.grid_dim == (9, 2, 1)
     assert reused.ptx.count("cp.async.bulk.tensor.2d.shared::cluster.global") == 58
 
+    rhs_reused = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=512, n=4096, k=1024,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, persistent_m_pairs=True,
+        lean_bookkeeping=True, reuse_persistent_rhs=True,
+    ))
+    assert rhs_reused.grid_dim == (9, 2, 1)
+    assert rhs_reused.ptx.count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global"
+    ) == 56
+    assert "for (%0: index = 6 to 0 step -3)" in rhs_reused.ptx
+
     with pytest.raises(ValueError, match="persistent M pairing"):
         blackwell_tcgen05_gemm_module(
             m=128, n=4096, k=256,
@@ -894,6 +910,17 @@ def test_tcgen05_persistent_m_and_n_pairs_lowering():
             split_tma_barriers=True, split_rhs_tma=True,
             prefetch_lhs_next=True, prefetch_rhs_next=True,
             persistent_n_pairs=True, persistent_m_pairs=True,
+        )
+
+    with pytest.raises(ValueError, match="persistent RHS reuse requires"):
+        blackwell_tcgen05_gemm_module(
+            m=512, n=4096, k=1024,
+            output_n_tile=232, balanced_n_tile=224,
+            operand_stages=8, transpose_cta_grid=True,
+            split_tma_barriers=True, split_rhs_tma=True,
+            prefetch_lhs_next=True, prefetch_rhs_next=True,
+            persistent_n_pairs=True, persistent_m_pairs=False,
+            lean_bookkeeping=True, reuse_persistent_rhs=True,
         )
 
 
@@ -1637,6 +1664,32 @@ def test_tcgen05_generalized_persistent_lhs_reuse_gemm(seed, k):
     a_tensor = torch.randn((128, k), dtype=torch.bfloat16, device="cuda")
     b_tensor = torch.randn((4096, k), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty((128, 4096), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed,k", [(0, 1024), (1, 1152), (7, 1280)])
+def test_tcgen05_generalized_persistent_rhs_reuse_gemm(seed, k):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=256, n=4096, k=k,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, persistent_m_pairs=True,
+        lean_bookkeeping=True, reuse_persistent_rhs=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((256, k), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((4096, k), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((256, 4096), dtype=torch.bfloat16, device="cuda")
     make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
     torch.cuda.synchronize()
 
