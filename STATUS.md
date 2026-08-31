@@ -230,6 +230,9 @@ or dependency depth, not excess DRAM traffic.
   over the complete 512-16384 curve.
 - Re-run the full collection and final clean verification once the performance
   policy is final.
+- New GPU work is temporarily paused by an NVIDIA driver/NVLink failure: NVML
+  queries are stuck and kernel logs show Xid 31 MMU faults plus GSP/NVLink
+  errors. Recovery details are recorded in `BLOCKERS.md`.
 - Continue with dependency-changing experiments aimed at TMA readiness and
   tensor completion latency; cache hints, direct versus wide/TMA output,
   simple barrier removal, and a nonblocking-before-blocking wait fast path have
