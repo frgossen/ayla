@@ -409,6 +409,11 @@ class LowerToPtxTemplate(LoweringPass):
         if type(arrival_count) is not int or arrival_count < 1:
             raise ValueError("lock arrival_count must be a positive integer")
         completion_issuers = lock_type.attrs.get("cluster_completion_issuers")
+        completion_mask_owner = lock_type.attrs.get(
+            "cluster_completion_mask_owner", False,
+        )
+        if type(completion_mask_owner) is not bool:
+            raise ValueError("cluster completion mask owner must be a boolean")
         if completion_issuers is not None and (
             type(completion_issuers) is not int
             or not 0 < completion_issuers < arrival_count <= 16
@@ -419,10 +424,22 @@ class LowerToPtxTemplate(LoweringPass):
         dynamic_arrival = ""
         arrival_operand = str(arrival_count)
         if completion_issuers is not None:
-            dynamic_arrival = textwrap.dedent(f"""\
-                mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
-                setp.lt.u32 ${{pred:completion_issuer}}, ${{b32:cluster_rank}}, {completion_issuers};
-                selp.b32 ${{b32:arrival_count}}, {arrival_count}, 1, ${{pred:completion_issuer}};
+            if completion_mask_owner:
+                issuer_mask = (1 << completion_issuers) - 1
+                dynamic_arrival = textwrap.dedent(f"""\
+                    .reg .b16 %ayla_cluster_completion_mask;
+                    .reg .b32 %ayla_cluster_completion_rank;
+                    .reg .b32 %ayla_cluster_completion_mask32;
+                    .reg .pred %ayla_cluster_completion_issuer;
+                    mov.u32 %ayla_cluster_completion_rank, %cluster_ctarank;
+                    setp.lt.u32 %ayla_cluster_completion_issuer, %ayla_cluster_completion_rank, {completion_issuers};
+                    mov.u32 %ayla_cluster_completion_mask32, 1;
+                    shl.b32 %ayla_cluster_completion_mask32, %ayla_cluster_completion_mask32, %ayla_cluster_completion_rank;
+                    or.b32 %ayla_cluster_completion_mask32, %ayla_cluster_completion_mask32, 0x{issuer_mask:x};
+                    cvt.u16.u32 %ayla_cluster_completion_mask, %ayla_cluster_completion_mask32;
+                """)
+            dynamic_arrival += textwrap.dedent(f"""\
+                selp.b32 ${{b32:arrival_count}}, {arrival_count}, 1, %ayla_cluster_completion_issuer;
             """)
             arrival_operand = "${b32:arrival_count}"
         release = (
@@ -1286,14 +1303,7 @@ class LowerToPtxTemplate(LoweringPass):
                     f"0x{completion_mask:x};\n"
                 )
             else:
-                issuer_mask = (1 << completion_issuers) - 1
-                template += textwrap.dedent(f"""\
-                    mov.u32 ${{b32:completion_rank}}, %cluster_ctarank;
-                    mov.u32 ${{b32:local_completion_mask}}, 1;
-                    shl.b32 ${{b32:local_completion_mask}}, ${{b32:local_completion_mask}}, ${{b32:completion_rank}};
-                    or.b32 ${{b32:completion_mask32}}, ${{b32:local_completion_mask}}, 0x{issuer_mask:x};
-                    cvt.u16.u32 ${{b16:completion_mask}}, ${{b32:completion_mask32}};
-                """)
+                template += "mov.b16 ${b16:completion_mask}, %ayla_cluster_completion_mask;\n"
         if op.attrs.get("branch_elected_issue"):
             # Descriptor construction belongs to the instruction-mandated
             # elected issue sequence. Skipping it in non-issuing lanes is not

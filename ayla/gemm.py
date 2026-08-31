@@ -882,7 +882,13 @@ def blackwell_tcgen05_gemm_module(
             if cluster_multicast_b else None
         )
         mma_lock = AllocOp.build_with_fresh_id(LockType.build(
-            kind="tcgen05", attrs=cluster_completion_attrs,
+            kind="tcgen05", attrs={
+                **(cluster_completion_attrs or {}),
+                **(
+                    {"cluster_completion_mask_owner": True}
+                    if cluster_completion_issuers_only else {}
+                ),
+            } or None,
         ))
         tma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
         second_tma_lock = AllocOp.build_with_fresh_id(

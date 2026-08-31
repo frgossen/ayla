@@ -1415,7 +1415,13 @@ def test_tcgen05_gemm_cluster_b16_single_output_lowering():
         output_tmem_load_shape="16x32bx2",
     )).ptx
     assert issuer_only.count("selp.b32") >= 2
-    assert issuer_only.count("shl.b32") >= 2
+    assert issuer_only.count(
+        ".reg .b16 %ayla_cluster_completion_mask;"
+    ) == 1
+    assert issuer_only.count(
+        "mov.u32 %ayla_cluster_completion_rank, %cluster_ctarank;"
+    ) == 1
+    assert issuer_only.count("shl.b32") >= 1
     assert "0xf;" in issuer_only
 
     with pytest.raises(ValueError, match="issuer-only cluster completion"):
