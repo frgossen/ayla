@@ -337,11 +337,11 @@ def blackwell_tcgen05_gemm_module(
         )
     if (
         type(cluster_multicast_b_ctas) is not int
-        or cluster_multicast_b_ctas not in (2, 4, 8)
+        or cluster_multicast_b_ctas not in (2, 4, 8, 16)
         or (not cluster_multicast_b and cluster_multicast_b_ctas != 2)
     ):
         raise ValueError(
-            "cluster_multicast_b_ctas must be 2, 4, or 8 and requires cluster B "
+            "cluster_multicast_b_ctas must be 2, 4, 8, or 16 and requires cluster B "
             "multicast"
         )
     cluster_b_issuers = (

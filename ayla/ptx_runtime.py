@@ -305,6 +305,14 @@ static void launch_kernel(
     auto [bx, by, bz] = block_dim;
     auto [cx, cy, cz] = cluster_dim;
     if (cx > 0) {
+        if (cx * cy * cz > 8) {
+            // CUDA's portable cluster limit is eight CTAs. Hopper and
+            // Blackwell can expose larger target-specific clusters, but the
+            // driver requires an explicit function opt-in before launch.
+            CU_CHECK(cuFuncSetAttribute(
+                fn, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1
+            ));
+        }
         CUlaunchAttribute attribute{};
         attribute.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
         attribute.value.clusterDim.x = static_cast<unsigned int>(cx);

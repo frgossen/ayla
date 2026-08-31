@@ -122,8 +122,9 @@ def test_generated_blackwell_memory_kernel():
 
 
 @requires_blackwell
-def test_generated_blackwell_cluster_kernel():
-    output_type = GmemTensorType.build((2,), F32Type())
+@pytest.mark.parametrize("cluster_size", [2, 16])
+def test_generated_blackwell_cluster_kernel(cluster_size):
+    output_type = GmemTensorType.build((cluster_size,), F32Type())
     output = Value(name="output", type=output_type)
     write_rank = PTXTemplateOp.build(
         [output], [],
@@ -138,18 +139,22 @@ def test_generated_blackwell_cluster_kernel():
     )
     kernel_op = KernelOp.build(
         "blackwell_cluster", Block(arguments=[output], ops=[write_rank]),
-        grid_dim=(2, 1, 1), block_dim=(1, 1, 1), cluster_dim=(2, 1, 1),
+        grid_dim=(cluster_size, 1, 1), block_dim=(1, 1, 1),
+        cluster_dim=(cluster_size, 1, 1),
     )
     kernel = make_ptx_kernel(
         ModuleOp.build(Block(ops=[kernel_op]), target=BLACKWELL)
     )
-    destination = torch.full((2,), -1.0, dtype=torch.float32, device="cuda")
+    destination = torch.full(
+        (cluster_size,), -1.0, dtype=torch.float32, device="cuda",
+    )
 
     make_ptx_launcher(kernel)(destination)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
-        destination, torch.tensor([0.0, 1.0], device="cuda")
+        destination,
+        torch.arange(cluster_size, dtype=torch.float32, device="cuda"),
     )
 
 
