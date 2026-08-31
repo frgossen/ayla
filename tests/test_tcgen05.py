@@ -902,6 +902,21 @@ def test_tcgen05_persistent_m_and_n_pairs_lowering():
     ) == 56
     assert "for (%0: index = 6 to 0 step -3)" in rhs_reused.ptx
 
+    rhs_reused_b_major = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=512, n=4096, k=1024,
+        output_n_tile=232, balanced_n_tile=224,
+        operand_stages=8, transpose_cta_grid=False,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        output_tmem_load_shape="16x32bx2",
+        persistent_n_pairs=True, persistent_m_pairs=True,
+        lean_bookkeeping=True, reuse_persistent_rhs=True,
+    ))
+    assert rhs_reused_b_major.grid_dim == (2, 9, 1)
+    assert rhs_reused_b_major.ptx.count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global"
+    ) == 56
+
     with pytest.raises(ValueError, match="persistent M pairing"):
         blackwell_tcgen05_gemm_module(
             m=128, n=4096, k=256,
@@ -1673,12 +1688,15 @@ def test_tcgen05_generalized_persistent_lhs_reuse_gemm(seed, k):
 
 
 @requires_blackwell
+@pytest.mark.parametrize("transpose_cta_grid", [True, False])
 @pytest.mark.parametrize("seed,k", [(0, 1024), (1, 1152), (7, 1280)])
-def test_tcgen05_generalized_persistent_rhs_reuse_gemm(seed, k):
+def test_tcgen05_generalized_persistent_rhs_reuse_gemm(
+    seed, k, transpose_cta_grid,
+):
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=256, n=4096, k=k,
         output_n_tile=232, balanced_n_tile=224,
-        operand_stages=8, transpose_cta_grid=True,
+        operand_stages=8, transpose_cta_grid=transpose_cta_grid,
         split_tma_barriers=True, split_rhs_tma=True,
         prefetch_lhs_next=True, prefetch_rhs_next=True,
         output_tmem_load_shape="16x32bx2",

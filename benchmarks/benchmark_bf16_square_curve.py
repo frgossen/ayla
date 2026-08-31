@@ -158,6 +158,11 @@ def _blackwell_module(size: int) -> ModuleOp:
             ptx_optimization_level=1,
             **common,
         )
+    if size == 8192:
+        # RHS-reuse makes adjacent M-pair CTAs consume the same B tiles.
+        # Put M pairs on physical X so consecutive launch slots reinforce
+        # that locality while preserving the same logical persistent loops.
+        common["transpose_cta_grid"] = False
     return blackwell_tcgen05_gemm_module(
         output_m_tile=128, output_n_tile=232, balanced_n_tile=224,
         operand_stages=8, split_tma_barriers=True,
@@ -176,7 +181,7 @@ BLACKWELL_CONFIG_NAMES = {
     1024: "tcgen05_m64n64_k256_prefetch_bank_paired_o2",
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
-    8192: "tcgen05_balanced_persistent_2x2_rhs_reuse",
+    8192: "tcgen05_balanced_persistent_2x2_rhs_reuse_b_major",
     16384: "tcgen05_m128n256_k128_6x_m_band_28wave_b_major_o1",
 }
 

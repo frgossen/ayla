@@ -297,7 +297,7 @@ def blackwell_tcgen05_gemm_module(
         extra = n - n_tiles * balanced_n_tile
         if (
             tma_staging != "direct"
-            or not transpose_cta_grid
+            or (not transpose_cta_grid and not persistent_n_pairs)
             or type(balanced_n_tile) is not int
             or balanced_n_tile % 8
             or not 8 <= balanced_n_tile < output_n_tile
@@ -306,13 +306,13 @@ def blackwell_tcgen05_gemm_module(
             or not 0 < extra // delta < n_tiles
         ):
             raise ValueError(
-                "balanced_n_tile requires direct transposed-grid staging and "
-                "an exact mix of valid narrow/full N tiles"
+                "balanced_n_tile requires direct staging, a transposed grid "
+                "unless persistent pairing supplies the logical axes, and an "
+                "exact mix of valid narrow/full N tiles"
             )
         balanced_wide_tiles = extra // delta
     if persistent_n_pairs and (
-        not transpose_cta_grid
-        or (
+        (
             balanced_n_tile is None
             and n_tiles % 2
         )
@@ -331,9 +331,9 @@ def blackwell_tcgen05_gemm_module(
         )
     ):
         raise ValueError(
-            "persistent N pairing requires a transposed exact even-width "
-            "launch or a balanced-N launch whose even rows pair every wide "
-            "tile with a narrow tile"
+            "persistent N pairing requires an exact even-width launch or a "
+            "balanced-N launch whose even rows pair every wide tile with a "
+            "narrow tile"
         )
     if persistent_m_pairs and (
         not persistent_n_pairs
@@ -585,6 +585,7 @@ def blackwell_tcgen05_gemm_module(
     if resident_phase_order_split is not None and (
         type(resident_phase_order_split) is not int
         or not persistent_n_pairs
+        or not transpose_cta_grid
         or not persistent_ctas // 2 <= resident_phase_order_split < persistent_ctas
     ):
         raise ValueError(
@@ -634,11 +635,13 @@ def blackwell_tcgen05_gemm_module(
     logical_block_x = block_ids.x
     logical_block_y = block_ids.y
     if persistent_loop is not None:
+        pair_block_id = block_ids.x if transpose_cta_grid else block_ids.y
+        m_grid_id = block_ids.y if transpose_cta_grid else block_ids.x
         pair_count = IndexConstantOp.build((n_tiles + 1) // 2)
         pair_mapping_ops = [pair_count]
         if balanced_n_tile is None:
             two = IndexConstantOp.build(2)
-            first_tile = IndexMulOp.build(block_ids.x, two.result())
+            first_tile = IndexMulOp.build(pair_block_id, two.result())
             tile_delta = IndexConstantOp.build(1)
             first_tile_value = first_tile.result()
             pair_mapping_ops.extend([two, first_tile, tile_delta])
@@ -649,7 +652,7 @@ def blackwell_tcgen05_gemm_module(
             # access or a second CTA racing the same output; the redundant
             # work is one tile per M row.
             one = IndexConstantOp.build(1)
-            last_numerator = IndexAddOp.build(block_ids.x, one.result())
+            last_numerator = IndexAddOp.build(pair_block_id, one.result())
             is_last = IndexDivOp.build(
                 last_numerator.result(), pair_count.result(),
             )
@@ -659,7 +662,7 @@ def blackwell_tcgen05_gemm_module(
             tile_delta = IndexMulOp.build(
                 pair_count.result(), active_delta.result(),
             )
-            first_tile_value = block_ids.x
+            first_tile_value = pair_block_id
             pair_mapping_ops.extend([
                 one, last_numerator, is_last, neg_one, neg_last,
                 active_delta, tile_delta,
@@ -670,16 +673,16 @@ def blackwell_tcgen05_gemm_module(
                 n_tiles // 2 - balanced_wide_tiles,
             )
             biased_pair = IndexAddOp.build(
-                block_ids.x, threshold_bias.result(),
+                pair_block_id, threshold_bias.result(),
             )
             leftover_pair = IndexDivOp.build(
                 biased_pair.result(), pair_count.result(),
             )
             doubled_pair = IndexMulOp.build(
-                block_ids.x, leftover_pair.result(),
+                pair_block_id, leftover_pair.result(),
             )
             first_tile = IndexAddOp.build(
-                block_ids.x, doubled_pair.result(),
+                pair_block_id, doubled_pair.result(),
             )
             first_tile_value = first_tile.result()
             wide_count = IndexConstantOp.build(balanced_wide_tiles)
@@ -733,9 +736,10 @@ def blackwell_tcgen05_gemm_module(
             iteration_delta, paired_tile,
         ])
         logical_block_x = paired_tile.result()
+        logical_block_y = m_grid_id
         if persistent_m_loop is not None:
             two = IndexConstantOp.build(2)
-            paired_m_base = IndexMulOp.build(block_ids.y, two.result())
+            paired_m_base = IndexMulOp.build(m_grid_id, two.result())
             paired_m_tile = IndexAddOp.build(
                 paired_m_base.result(), persistent_m_loop.iv,
             )
@@ -853,8 +857,14 @@ def blackwell_tcgen05_gemm_module(
         hybrid_n_tiles = n_tiles
         hybrid_n_width = output_n_tile // 2
     else:
-        m_block_id = logical_block_y if transpose_cta_grid else logical_block_x
-        n_block_id = logical_block_x if transpose_cta_grid else logical_block_y
+        if persistent_loop is not None:
+            # Persistent pairing establishes logical N/M coordinates above;
+            # ``transpose_cta_grid`` controls only their physical launch axes.
+            m_block_id = logical_block_y
+            n_block_id = logical_block_x
+        else:
+            m_block_id = logical_block_y if transpose_cta_grid else logical_block_x
+            n_block_id = logical_block_x if transpose_cta_grid else logical_block_y
     a_block = TileOp.build(
         a, [m_block_id, 0],
         GmemTensorType.build([output_m_tile, k], bf16, strides=[k, 1]),
@@ -1845,9 +1855,17 @@ def blackwell_tcgen05_gemm_module(
             )
             if split_last_n_tile_rows is not None else
             (
-                (n_tiles + 1) // 2,
-                m_tiles // (2 if persistent_m_pairs else 1),
-                1,
+                (
+                    (n_tiles + 1) // 2,
+                    m_tiles // (2 if persistent_m_pairs else 1),
+                    1,
+                )
+                if transpose_cta_grid else
+                (
+                    m_tiles // (2 if persistent_m_pairs else 1),
+                    (n_tiles + 1) // 2,
+                    1,
+                )
             )
             if persistent_n_pairs else
             (n_tiles + int(split_last_n_tile or split_n_tile is not None), m_tiles, 1)
