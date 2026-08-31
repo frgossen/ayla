@@ -8,9 +8,6 @@ import os
 import time
 from pathlib import Path
 
-# Compilation timing should not silently hit NVIDIA's on-disk PTX cache.
-os.environ.setdefault("CUDA_CACHE_DISABLE", "1")
-
 import torch
 
 from ayla.gemm import auto_matmul_4096_wgmma256_wg_tma_store_module
@@ -23,6 +20,8 @@ def _milliseconds(start: float) -> float:
 
 
 def _compile(m: int, n: int, k: int) -> dict[str, int | float]:
+    # TODO: Integrate stage timing into the standard benchmark so compilation
+    # time can be measured for every registered kernel, not just this builder.
     start = time.perf_counter()
     module = auto_matmul_4096_wgmma256_wg_tma_store_module(
         m=m, n=n, k=k,
@@ -35,7 +34,7 @@ def _compile(m: int, n: int, k: int) -> dict[str, int | float]:
 
     start = time.perf_counter()
     launcher = make_ptx_launcher(kernel)
-    launcher.warmup()
+    launcher.ensure_loaded()
     load_ms = _milliseconds(start)
 
     return {
@@ -50,6 +49,9 @@ def _compile(m: int, n: int, k: int) -> dict[str, int | float]:
 
 
 def main() -> int:
+    # Compilation timing should not silently hit NVIDIA's on-disk PTX cache.
+    os.environ.setdefault("CUDA_CACHE_DISABLE", "1")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--shape", nargs=3, type=int, action="append", metavar=("M", "N", "K"),
