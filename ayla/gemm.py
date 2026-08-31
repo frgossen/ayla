@@ -365,7 +365,7 @@ def blackwell_tcgen05_gemm_module(
         or output_m_tile != 128
         or output_n_tile != 256
         or not transpose_cta_grid
-        or not persistent_n_pairs
+        or (not persistent_n_pairs and not overwrite_first_mma)
         or persistent_m_pairs
         or operand_stages != 8
         or not split_tma_barriers
@@ -377,7 +377,8 @@ def blackwell_tcgen05_gemm_module(
     ):
         raise ValueError(
             "cluster B multicast requires even-M, transposed M128/N256/K128 "
-            "persistent pairs with split RHS and lean A/B prefetch"
+            "persistent pairs or first-MMA overwrite with split RHS and lean "
+            "A/B prefetch"
         )
     if split_n_tile is not None and (
         type(split_n_tile) is not int or not 0 <= split_n_tile < n_tiles
@@ -1762,6 +1763,8 @@ def blackwell_tcgen05_gemm_module(
             bt_block,
             c_block,
             *allocation_ops,
+            *([BarrierOp.build(scope="cluster")]
+              if cluster_multicast_b else []),
             *mainloop_ops,
             output_move,
             *deallocation_ops,
