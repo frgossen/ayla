@@ -1304,7 +1304,8 @@ class LowerToPtxTemplate(LoweringPass):
                 )
             else:
                 template += "mov.b16 ${b16:completion_mask}, %ayla_cluster_completion_mask;\n"
-        if op.attrs.get("branch_elected_issue"):
+        branch_elected_issue = bool(op.attrs.get("branch_elected_issue"))
+        if branch_elected_issue:
             # Descriptor construction belongs to the instruction-mandated
             # elected issue sequence. Skipping it in non-issuing lanes is not
             # a persistent producer/consumer role: every warp still follows
@@ -1314,6 +1315,12 @@ class LowerToPtxTemplate(LoweringPass):
                 if input_wait is not None else "after_tcgen05_issue"
             )
             template += f"@!${{pred:issue}} bra ${{label:{branch_target}}};\n"
+        # The elected-issue entry branch dominates every MMA in this async
+        # group. If an input wait temporarily reconverges the CTA, its
+        # post-wait branch re-establishes the same fact before later MMAs.
+        # Avoid carrying a redundant predicate guard on the tensor instruction
+        # itself; the brief elected-thread sequence remains unchanged.
+        mma_issue_guard = "" if branch_elected_issue else "@${pred:issue} "
         if hybrid_n_tiles is not None:
             assert isinstance(hybrid_n_width, int)
             narrow_idesc_value = (
@@ -1466,7 +1473,7 @@ class LowerToPtxTemplate(LoweringPass):
                     or.b64 ${{b64:rhs_desc{i}}}, ${{b64:rhs_desc{i}}}, {rhs_desc_const};
                 """)
             template += textwrap.dedent(f"""\
-                @${{pred:issue}} tcgen05.mma.cta_group::{cta_group}.kind::f16
+                {mma_issue_guard}tcgen05.mma.cta_group::{cta_group}.kind::f16
                     [${{b32:operand.dst.ptr}}], ${{b64:lhs_desc{i}}}, ${{b64:rhs_desc{i}}},
                     ${{b32:idesc}},
                     {{{disable_vector}}},

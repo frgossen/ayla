@@ -240,6 +240,7 @@ def test_tcgen05_typed_ir_lowering():
     assert "tcgen05.alloc.cta_group::1" in ptx
     assert "tcgen05.st.sync.aligned.32x32b.x64.b32" in ptx
     assert "tcgen05.mma.cta_group::1.kind::f16" in ptx
+    assert re.search(r"@%p\d+ tcgen05\.mma\.cta_group::1", ptx)
     assert "tcgen05.commit.cta_group::1.mbarrier::arrive::one" in ptx
     assert "mbarrier.try_wait.parity" in ptx
     assert "tcgen05.ld.sync.aligned.32x32b.x64.b32" in ptx
@@ -993,6 +994,9 @@ def test_tcgen05_lean_bookkeeping_lowering():
     assert ptx.count("], 16384;") == 0
     assert ptx.count("add.u64") == 35
     assert ptx.count("tcgen05.mma.cta_group::1.kind::f16") == 16
+    assert not re.search(r"@%p\d+ tcgen05\.mma\.cta_group::1", ptx)
+    assert "\n  tcgen05.mma.cta_group::1.kind::f16" in ptx
+    assert re.search(r"@%p\d+ tcgen05\.commit\.cta_group::1", ptx)
 
     with pytest.raises(ValueError, match="lean bookkeeping requires"):
         blackwell_tcgen05_gemm_module(
