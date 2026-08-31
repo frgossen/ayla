@@ -30,11 +30,6 @@ class TileMatmul(LoweringPass):
 
     Nesting order is outer→inner along the list.
 
-    When ``collective=True``, the iteration space is derived from
-    ``dim_size / tile_size`` as usual and kernel constraints are set,
-    but no tile ops, loops, or id ops are emitted — the matmul passes
-    through with its original shapes.
-
     ``allow_partial`` permits a non-divisible block-level tile by rounding the
     grid dimension up. Addressing remains full-tile; callers must use memory
     operations with defined out-of-bounds behavior, such as TMA.
@@ -47,23 +42,16 @@ class TileMatmul(LoweringPass):
         tile_levels: list[str],
         tile_labels: list[str | None],
         label_filter: str | None = None,
-        collective: bool = False,
         allow_partial: bool = False,
     ) -> None:
         super().__init__()
         self.label_filter = label_filter
-        self.collective = collective
         self.allow_partial = allow_partial
         if not (len(tile_dims) == len(tile_sizes) == len(tile_levels) == len(tile_labels)):
             raise ValueError(
                 f"TileMatmul: tile_dims, tile_sizes, tile_levels, tile_labels "
                 f"must have the same length; got {len(tile_dims)}, "
                 f"{len(tile_sizes)}, {len(tile_levels)}, {len(tile_labels)}"
-            )
-        if collective and "for" in tile_levels:
-            raise ValueError(
-                "TileMatmul: 'for' tile_level is not supported in "
-                "collective mode — collective tiling does not emit loops"
             )
         self.tile_dims = list(tile_dims)
         self.tile_sizes = list(tile_sizes)
@@ -141,11 +129,6 @@ class TileMatmul(LoweringPass):
             ubs.append(ub)
             self._accumulate_constraint(tile_level, ub)
             sizes_by_dim[tile_dim] = tile_size
-
-        if self.collective:
-            return None
-
-        # -- Non-collective: emit id ops, tile ops, and for-loops. --
 
         new_ops: list[Op] = []
         block_ids_op: BlockIdsOp | None = None
@@ -347,11 +330,10 @@ def tile_matmul(
     tile_levels: list[str],
     tile_labels: list[str | None],
     label_filter: str | None = None,
-    collective: bool = False,
     allow_partial: bool = False,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
         tile_dims, tile_sizes, tile_levels, tile_labels,
-        label_filter, collective, allow_partial,
+        label_filter, allow_partial,
     ).run(module)
