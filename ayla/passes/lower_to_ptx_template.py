@@ -408,6 +408,23 @@ class LowerToPtxTemplate(LoweringPass):
         arrival_count = lock_type.attrs.get("arrival_count", 1)
         if type(arrival_count) is not int or arrival_count < 1:
             raise ValueError("lock arrival_count must be a positive integer")
+        completion_issuers = lock_type.attrs.get("cluster_completion_issuers")
+        if completion_issuers is not None and (
+            type(completion_issuers) is not int
+            or not 0 < completion_issuers < arrival_count <= 16
+        ):
+            raise ValueError(
+                "cluster completion issuers must be fewer than the arrival count"
+            )
+        dynamic_arrival = ""
+        arrival_operand = str(arrival_count)
+        if completion_issuers is not None:
+            dynamic_arrival = textwrap.dedent(f"""\
+                mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
+                setp.lt.u32 ${{pred:completion_issuer}}, ${{b32:cluster_rank}}, {completion_issuers};
+                selp.b32 ${{b32:arrival_count}}, {arrival_count}, 1, ${{pred:completion_issuer}};
+            """)
+            arrival_operand = "${b32:arrival_count}"
         release = (
             "" if defer_init_sync else
             "fence.mbarrier_init.release.cluster;"
@@ -424,7 +441,8 @@ class LowerToPtxTemplate(LoweringPass):
             or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
             setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
             @${{pred:not_t0}} bra ${{label:after_init}};
-            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrival_count};
+            {dynamic_arrival}
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrival_operand};
             {release}
             ${{label:after_init}}:
             {rendezvous}
@@ -1090,6 +1108,18 @@ class LowerToPtxTemplate(LoweringPass):
                 "multicast mask"
             )
         completion_mask = next(iter(completion_masks), None)
+        completion_issuer_counts = {
+            value.type.attrs.get("cluster_completion_issuers")
+            for value in (op.lock, *(commit.lock for _, commit in partial_commits))
+            if value.type.attrs.get("cluster_completion_issuers") is not None
+        }
+        if len(completion_issuer_counts) > 1 or (
+            completion_issuer_counts and completion_mask is None
+        ):
+            raise ValueError(
+                "tcgen05 async groups require one issuer-only completion policy"
+            )
+        completion_issuers = next(iter(completion_issuer_counts), None)
         final_completion_mask = op.lock.type.attrs.get("multicast_mask")
         direct_tma_layout = bool(
             mms[0].rhs.type.attrs.get("tcgen05_tma_layout")
@@ -1250,10 +1280,20 @@ class LowerToPtxTemplate(LoweringPass):
         if cta_group == 2:
             template += "and.pred ${pred:issue}, ${pred:issue}, ${pred:cluster_even};\n"
         if completion_mask is not None:
-            template += (
-                f"mov.b16 ${{b16:completion_mask}}, "
-                f"0x{completion_mask:x};\n"
-            )
+            if completion_issuers is None:
+                template += (
+                    f"mov.b16 ${{b16:completion_mask}}, "
+                    f"0x{completion_mask:x};\n"
+                )
+            else:
+                issuer_mask = (1 << completion_issuers) - 1
+                template += textwrap.dedent(f"""\
+                    mov.u32 ${{b32:completion_rank}}, %cluster_ctarank;
+                    mov.u32 ${{b32:local_completion_mask}}, 1;
+                    shl.b32 ${{b32:local_completion_mask}}, ${{b32:local_completion_mask}}, ${{b32:completion_rank}};
+                    or.b32 ${{b32:completion_mask32}}, ${{b32:local_completion_mask}}, 0x{issuer_mask:x};
+                    cvt.u16.u32 ${{b16:completion_mask}}, ${{b32:completion_mask32}};
+                """)
         if op.attrs.get("branch_elected_issue"):
             # Descriptor construction belongs to the instruction-mandated
             # elected issue sequence. Skipping it in non-issuing lanes is not

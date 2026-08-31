@@ -135,6 +135,7 @@ def blackwell_tcgen05_gemm_module(
     cluster_multicast_b: bool = False,
     cluster_multicast_b_ctas: int = 2,
     cluster_multicast_b_issuers: int | None = None,
+    cluster_completion_issuers_only: bool = False,
     branch_tcgen05_issue: bool = True,
     derive_tcgen05_descriptors: bool = False,
     unroll_direct_mainloop: bool = False,
@@ -196,6 +197,8 @@ def blackwell_tcgen05_gemm_module(
     completion before any member reuses the shared RHS buffers. The rank
     predicates only implement TMA's required elected-issuer sequence; no warp
     is assigned a durable producer or consumer role.
+    ``cluster_completion_issuers_only`` keeps the multicast-issuing CTA ranks
+    collective while nonissuers receive only their own tensor completion.
     """
     if output_m_tile not in (64, 128):
         raise ValueError("output_m_tile must be 64 or 128")
@@ -359,6 +362,18 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError(
             "cluster_multicast_b_issuers must be a power-of-two divisor of "
             "the cluster size and requires cluster B multicast"
+        )
+    if (
+        type(cluster_completion_issuers_only) is not bool
+        or cluster_completion_issuers_only
+        and (
+            not cluster_multicast_b
+            or cluster_b_issuers == cluster_multicast_b_ctas
+        )
+    ):
+        raise ValueError(
+            "issuer-only cluster completion requires cluster B multicast "
+            "with fewer issuers than CTAs"
         )
     if cluster_multicast_b and (
         tma_staging != "direct"
@@ -859,6 +874,10 @@ def blackwell_tcgen05_gemm_module(
                 "arrival_count": cluster_multicast_b_ctas,
                 "multicast_mask": (1 << cluster_multicast_b_ctas) - 1,
                 "after_thread_sync": True,
+                **(
+                    {"cluster_completion_issuers": cluster_b_issuers}
+                    if cluster_completion_issuers_only else {}
+                ),
             }
             if cluster_multicast_b else None
         )
