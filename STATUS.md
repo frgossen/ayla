@@ -183,6 +183,19 @@ poll participation nor the earlier barrier-coalescing choice is the hidden cap.
 Relaxing only TMA-readiness waits while retaining their async-proxy fences was
 also neutral to within 0.08%, excluding acquire-fence cost itself.
 
+A current-state 4096 factorial also reopened the two older structural choices
+rather than assuming they remained optimal. Removing reverse-K LHS reuse cost
+about 1.1-1.5% in both execution orders, and removing only the 148-CTA resident
+phase split cost about 0.2-0.5%. The complete retained combination remained
+fastest, so those earlier choices are not masking the missing stable margin.
+
+The retained 16384 M23-band pipeline was similarly ablated from the current
+source. Removing compact bookkeeping cost about 11%; removing RHS lookahead
+cost about 28%; and reverting to the simpler split- or fused-readiness
+pipelines cost about 25-29%. These are large causal losses, not selection noise,
+so the present synchronization stack should be treated as the base for a new
+dependency design rather than dismantled piecemeal.
+
 ## What has worked
 
 - Explicit Blackwell target configuration and native `tcgen05`/tensor-memory
