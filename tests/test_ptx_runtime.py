@@ -79,6 +79,7 @@ def test_cwise_add():
         block_dim=(block, 1, 1),
     )
     ptx_launcher = make_ptx_launcher(kernel)
+    ptx_launcher.ensure_loaded()
     ptx_launcher(a, b, c)
 
     torch.cuda.synchronize()

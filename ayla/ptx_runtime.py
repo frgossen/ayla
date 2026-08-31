@@ -332,7 +332,8 @@ class PtxLauncher:
                 self._arg_to_tensor[i] = ti
                 ti += 1
 
-    def _ensure_loaded(self):
+    def ensure_loaded(self) -> None:
+        """Load and JIT-compile the PTX without launching the kernel."""
         if self._module is None:
             self._ext = _get_ext()
             self._module = self._ext.module_load_data(
@@ -353,7 +354,7 @@ class PtxLauncher:
         return self._kernel.signature
 
     def __call__(self, *tensors) -> None:
-        self._ensure_loaded()
+        self.ensure_loaded()
         params = self._build_params(tensors)
         self._assert_params(params)
         self._ext.launch_kernel(
