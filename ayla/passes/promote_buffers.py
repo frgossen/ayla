@@ -212,7 +212,7 @@ class PromoteBuffers(LoweringPass):
         Use TMA for the move. A WRMEM destination is written back through a
         block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
-        Non-coherent cache hint for gmem→rmem loads.
+        Non-coherent cache hint for scalar gmem→rmem loads.
     physical_layout : dict or None
         Physical layout attrs for promoted shared-memory buffers.
     move_attrs : dict[str, dict[str, object]] or None
@@ -307,7 +307,7 @@ class PromoteBuffers(LoweringPass):
             attrs["label"] = f"{matmul_label}_{operand_name}_{self.target_type}"
         if self.tma:
             attrs["tma"] = True
-        if self.nc and allow_nc:
+        if self.nc and allow_nc and not self.tma:
             attrs["nc"] = True
         attrs.update(self.move_attrs.get(operand_name, {}))
         return attrs

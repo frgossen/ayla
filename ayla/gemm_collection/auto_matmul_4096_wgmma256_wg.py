@@ -50,7 +50,7 @@ def auto_matmul_4096_wgmma256_wg_module():
     module = promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None,
-        tma=True, nc=True, label_filter="mm",
+        tma=True, label_filter="mm",
     )
     module = tile_matmul(
         module,
