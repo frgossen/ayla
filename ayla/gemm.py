@@ -1921,17 +1921,43 @@ def blackwell_tcgen05_gemm_module(
 
 def blackwell_tcgen05_cta_group2_gemm_module(
     *, m: int = 4096, n: int = 4096, k: int = 4096,
+    output_m_tile: int = 256, output_n_tile: int = 64,
+    operand_stages: int = 4,
+    lhs_l2_cache_hint: str | None = None,
+    rhs_l2_cache_hint: str | None = None,
+    lhs_l2_promotion: str | None = None,
+    rhs_l2_promotion: str | None = None,
 ) -> ModuleOp:
     """Build a paired-CTA SM100 GEMM with a shared software pipeline.
 
-    Each neighboring CTA pair computes a 256x64 output region. Both CTAs run
-    the same TMA/MMA/store sequence; the single-thread issue mandated by
-    ``tcgen05.mma.cta_group::2`` is elected from the pair's even CTA.
+    Each neighboring CTA pair computes one ``output_m_tile`` by
+    ``output_n_tile`` region. Both CTAs run the same TMA/MMA/store sequence;
+    the single-thread issue mandated by ``tcgen05.mma.cta_group::2`` is
+    elected from the pair's even CTA.
     """
-    if m % 256 or n % 64 or k % 64:
-        raise ValueError("group-2 tcgen05 GEMM dimensions must divide 256x64x64")
+    if output_m_tile not in (128, 256):
+        raise ValueError("group-2 output M tile must be 128 or 256")
+    if output_n_tile % 16 or not 16 <= output_n_tile <= 256:
+        raise ValueError("group-2 output N tile must be a multiple of 16 through 256")
+    if operand_stages not in (4, 8, 16):
+        raise ValueError("group-2 operand stages must be 4, 8, or 16")
+    if m % output_m_tile or n % output_n_tile or k % (16 * operand_stages):
+        raise ValueError(
+            "group-2 dimensions must divide the requested M/N/K tiles"
+        )
+    if lhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
+        raise ValueError("unsupported lhs L2 cache hint")
+    if rhs_l2_cache_hint not in (None, "evict_first", "evict_last"):
+        raise ValueError("unsupported rhs L2 cache hint")
+    if lhs_l2_promotion not in (None, "64B", "128B", "256B"):
+        raise ValueError("unsupported lhs L2 promotion")
+    if rhs_l2_promotion not in (None, "64B", "128B", "256B"):
+        raise ValueError("unsupported rhs L2 promotion")
 
     bf16 = BF16Type()
+    local_m = output_m_tile // 2
+    local_n = output_n_tile // 2
+    banks = operand_stages // 4
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
     bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
     c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
@@ -1940,58 +1966,93 @@ def blackwell_tcgen05_cta_group2_gemm_module(
     peer_rank = IndexModOp.build(block_ids.x, two.result())
     a_block = TileOp.build(
         a, [block_ids.x, 0],
-        GmemTensorType.build([128, k], bf16, strides=[k, 1]),
+        GmemTensorType.build([local_m, k], bf16, strides=[k, 1]),
     )
     bt_block = TileOp.build(
         bt, [block_ids.y, 0],
-        GmemTensorType.build([64, k], bf16, strides=[k, 1]),
+        GmemTensorType.build([output_n_tile, k], bf16, strides=[k, 1]),
     )
     c_block = TileOp.build(
         c, [block_ids.x, block_ids.y],
-        GmemTensorType.build([128, 64], bf16, strides=[n, 1]),
+        GmemTensorType.build([local_m, output_n_tile], bf16, strides=[n, 1]),
     )
-    lhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
-        [128, 64], bf16, swizzle="128B", attrs={"tcgen05_matrix": True},
-    ))
-    rhs_smem = AllocOp.build_with_fresh_id(SmemTensorType.build(
-        [32, 64], bf16, swizzle="128B", attrs={"tcgen05_matrix": True},
-    ))
+    lhs_smem = [
+        AllocOp.build_with_fresh_id(SmemTensorType.build(
+            [local_m, 64], bf16, swizzle="128B",
+            attrs={"tcgen05_matrix": True},
+        ))
+        for _ in range(banks)
+    ]
+    rhs_smem = [
+        AllocOp.build_with_fresh_id(SmemTensorType.build(
+            [local_n, 64], bf16, swizzle="128B",
+            attrs={"tcgen05_matrix": True},
+        ))
+        for _ in range(banks)
+    ]
     accumulator = AllocOp.build_with_fresh_id(TmemTensorType.build(
-        [128, 64], F32Type(), attrs={"cta_group": 2},
+        [local_m, output_n_tile], F32Type(), attrs={"cta_group": 2},
     ), init=0.0)
     tma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="mbar"))
     mma_lock = AllocOp.build_with_fresh_id(LockType.build(kind="tcgen05"))
-    loop = ForOp.build(0, k // 64)
-    a_tile = TileOp.build(
-        a_block.result(), [0, loop.iv],
-        GmemTensorType.build([128, 64], bf16, strides=[k, 1]),
-    )
-    bt_tile = TileOp.build(
-        bt_block.result(), [peer_rank.result(), loop.iv],
-        GmemTensorType.build([32, 64], bf16, strides=[k, 1]),
-    )
+    loop = ForOp.build(0, k // (16 * operand_stages))
+    bank_count = IndexConstantOp.build(banks)
+    first_bank = IndexMulOp.build(loop.iv, bank_count.result())
+    loop.body.ops.extend([bank_count, first_bank])
+    load_ops = []
+    mmas = []
+    for bank in range(banks):
+        if bank == 0:
+            bank_index = first_bank.result()
+        else:
+            offset = IndexConstantOp.build(bank)
+            bank_index_op = IndexAddOp.build(first_bank.result(), offset.result())
+            loop.body.ops.extend([offset, bank_index_op])
+            bank_index = bank_index_op.result()
+        a_tile = TileOp.build(
+            a_block.result(), [0, bank_index],
+            GmemTensorType.build([local_m, 64], bf16, strides=[k, 1]),
+        )
+        bt_tile = TileOp.build(
+            bt_block.result(), [peer_rank.result(), bank_index],
+            GmemTensorType.build([local_n, 64], bf16, strides=[k, 1]),
+        )
+        loop.body.ops.extend([a_tile, bt_tile])
+        lhs_attrs = {
+            "tma": True,
+            **({"l2_cache_hint": lhs_l2_cache_hint}
+               if lhs_l2_cache_hint else {}),
+            **({"l2_promotion": lhs_l2_promotion}
+               if lhs_l2_promotion else {}),
+        }
+        rhs_attrs = {
+            "tma": True,
+            **({"l2_cache_hint": rhs_l2_cache_hint}
+               if rhs_l2_cache_hint else {}),
+            **({"l2_promotion": rhs_l2_promotion}
+               if rhs_l2_promotion else {}),
+        }
+        load_ops.extend([
+            MoveOp.build(lhs_smem[bank].result(), a_tile.result(), attrs=lhs_attrs),
+            MoveOp.build(rhs_smem[bank].result(), bt_tile.result(), attrs=rhs_attrs),
+        ])
     loop.body.ops.extend([
-        a_tile,
-        bt_tile,
-        AsyncOp.build(tma_lock.result(), body=Block(ops=[
-            MoveOp.build(lhs_smem.result(), a_tile.result(), attrs={"tma": True}),
-            MoveOp.build(rhs_smem.result(), bt_tile.result(), attrs={"tma": True}),
-        ])),
+        AsyncOp.build(tma_lock.result(), body=Block(ops=load_ops)),
         AwaitOp.build(tma_lock.result()),
     ])
-    mmas = []
-    for stage in range(4):
+    for stage in range(operand_stages):
+        bank = stage // 4
         lhs_tile = TileOp.build(
-            lhs_smem.result(), [0, stage],
+            lhs_smem[bank].result(), [0, stage % 4],
             SmemTensorType.build(
-                [128, 16], bf16, strides=[64, 1], swizzle="128B",
+                [local_m, 16], bf16, strides=[64, 1], swizzle="128B",
                 attrs={"tcgen05_tma_layout": True},
             ),
         )
         rhs_tile = TileOp.build(
-            rhs_smem.result(), [0, stage],
+            rhs_smem[bank].result(), [0, stage % 4],
             SmemTensorType.build(
-                [32, 16], bf16, strides=[64, 1], swizzle="128B",
+                [local_n, 16], bf16, strides=[64, 1], swizzle="128B",
                 attrs={"tcgen05_tma_layout": True},
             ),
         )
@@ -2000,7 +2061,13 @@ def blackwell_tcgen05_cta_group2_gemm_module(
             lhs_tile.result(), rhs_tile.result(), accumulator.result(),
         ))
     loop.body.ops.extend([
-        AsyncOp.build(mma_lock.result(), body=Block(ops=mmas)),
+        AsyncOp.build(
+            mma_lock.result(), body=Block(ops=mmas),
+            attrs={
+                "branch_elected_issue": True,
+                "derive_tcgen05_descriptors": True,
+            },
+        ),
         AwaitOp.build(mma_lock.result()),
     ])
     body = Block(arguments=[a, bt, c], ops=[
@@ -2011,8 +2078,8 @@ def blackwell_tcgen05_cta_group2_gemm_module(
         bt_block,
         c_block,
         accumulator,
-        lhs_smem,
-        rhs_smem,
+        *lhs_smem,
+        *rhs_smem,
         tma_lock,
         mma_lock,
         loop,
@@ -2022,7 +2089,7 @@ def blackwell_tcgen05_cta_group2_gemm_module(
     return ModuleOp.build(Block(ops=[KernelOp.build(
         "blackwell_tcgen05_cta_group2_4096",
         body,
-        grid_dim=(m // 128, n // 64, 1),
+        grid_dim=(m // local_m, n // output_n_tile, 1),
         block_dim=(128, 1, 1),
         cluster_dim=(2, 1, 1),
         ptx_optimization_level=1,

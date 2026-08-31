@@ -1186,7 +1186,10 @@ class LowerToPtxTemplate(LoweringPass):
             != "rhs_32x16_cta2"
         ):
             n *= 2
-        m = 256 if cta_group == 2 else mms[0].lhs.type.sizes[0]
+        # A group-2 instruction concatenates the peer CTAs' local M slices.
+        # Each CTA may contribute either 64 or 128 rows, yielding the native
+        # M128 or M256 collective shapes documented for dense BF16 UMMA.
+        m = mms[0].lhs.type.sizes[0] * cta_group
         idesc_value = ((m // 16) << 24) | ((n // 8) << 17) | 0x490
         if not direct_tma_layout:
             idesc_value |= 1 << 16
@@ -1705,23 +1708,42 @@ class LowerToPtxTemplate(LoweringPass):
                 dealloc_tmem_before_final_store,
             )
         # M=128 uses all 32 lanes in each of the four tensor-memory datapaths.
-        # The non-warp-specialized M=64 Layout F instead uses lanes 0..15 in
-        # every datapath, so logical row = 16 * warp + lane. All four warps
-        # must still issue each collective tcgen05.ld; invalid half-warps only
-        # predicate off their global stores after the tensor-memory load.
-        # Process 64 columns at a time so the same register bank handles both
-        # 64- and 128-column outputs.
+        # A 1-SM M64 Layout F instead uses lanes 0..15 in every datapath. A
+        # 2-SM M128 instruction has a different CTA-local M64 "2x2" layout:
+        # datapaths 0/1 hold rows 0..63 for the first N half, while datapaths
+        # 2/3 hold the same rows for the second N half. This is the
+        # TmemAllocMode::Interleaved mapping in CUTLASS's SM100 fragment traits.
+        # All four warps still follow the same collective load/store sequence.
+        cta_group = int(src_type.attrs.get("cta_group", 1))
+        group2_m64 = cta_group == 2 and src_type.sizes[0] == 64
         row_stride_bytes = dst_type.strides[0] * dst_type.dtype.byte_size
         value_type = "f32" if dst_type.dtype.name == "bf16" else "b32"
+        physical_columns = (
+            src_type.sizes[1] // 2 if group2_m64 else src_type.sizes[1]
+        )
         load_width = min(
             64,
-            1 << (src_type.sizes[1] - 1).bit_length(),
+            1 << (physical_columns - 1).bit_length(),
         )
         values = [f"${{{value_type}:value{i}}}" for i in range(load_width)]
         load_values = ", ".join(values)
         row_mapping = ""
         store_predicate = ""
-        if src_type.sizes[0] == 64:
+        column_mapping = ""
+        if group2_m64:
+            row_mapping = textwrap.dedent("""\
+                // 2-SM M128 accumulator: 2x2 TMEM datapath mapping.
+                and.b32 ${b32:lane}, ${b32:tid}, 31;
+                and.b32 ${b32:row_half}, ${b32:warp}, 1;
+                shl.b32 ${b32:row_index}, ${b32:row_half}, 5;
+                add.u32 ${b32:row_index}, ${b32:row_index}, ${b32:lane};
+            """)
+            column_mapping = textwrap.dedent(f"""\
+                shr.u32 ${{b32:column_half}}, ${{b32:warp}}, 1;
+                mul.wide.u32 ${{b64:column_offset}}, ${{b32:column_half}}, {physical_columns * dst_type.dtype.byte_size};
+                add.u64 ${{b64:row}}, ${{b64:row}}, ${{b64:column_offset}};
+            """)
+        elif src_type.sizes[0] == 64:
             row_mapping = textwrap.dedent("""\
                 and.b32 ${b32:lane}, ${b32:tid}, 31;
                 shl.b32 ${b32:row_index}, ${b32:warp}, 4;
@@ -1739,7 +1761,7 @@ class LowerToPtxTemplate(LoweringPass):
             add.u32 ${{b32:taddr_row}}, ${{b32:operand.src.ptr}}, ${{b32:lane_base}};
             mul.wide.u32 ${{b64:row_offset}}, ${{b32:row_index}}, {row_stride_bytes};
             add.u64 ${{b64:row}}, ${{b64:operand.dst.ptr}}, ${{b64:row_offset}};
-        """)
+        """) + column_mapping
         alternating_store_alignment = src_type.sizes[1] in (232, 248)
         if alternating_store_alignment:
             # N232/N248 tiles have 16-byte-odd strides. Use a CTA-uniform
@@ -1795,8 +1817,8 @@ class LowerToPtxTemplate(LoweringPass):
                 """).replace(
                     "__SPLIT_START__", str(hybrid_n_tiles - 1),
                 ).replace("__HALF_INSTRUCTION__", half_instruction)
-        for col in range(0, src_type.sizes[1], 64):
-            valid_cols = min(64, src_type.sizes[1] - col)
+        for col in range(0, physical_columns, 64):
+            valid_cols = min(64, physical_columns - col)
             if dst_type.dtype.name == "f32":
                 stores = "\n".join(
                     f"{store_predicate}st.global.v4.b32 "

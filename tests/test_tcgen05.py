@@ -17,7 +17,10 @@ from ayla import (
     make_ptx_kernel,
 )
 from ayla.base.ir import iter_ops
-from ayla.gemm import blackwell_tcgen05_gemm_module
+from ayla.gemm import (
+    blackwell_tcgen05_cta_group2_gemm_module,
+    blackwell_tcgen05_gemm_module,
+)
 from ayla.gpu_dialect import (
     AllocOp,
     AsyncCommitOp,
@@ -1613,6 +1616,46 @@ def test_tcgen05_cta_group2_lowering():
     assert "tcgen05.mma.cta_group::2.kind::f16" in ptx
     assert "multicast::cluster" in ptx
     assert "tcgen05.dealloc.cta_group::2" in ptx
+
+
+def test_tcgen05_cta_group2_m128_n256_k128_lowering():
+    kernel = make_ptx_kernel(blackwell_tcgen05_cta_group2_gemm_module(
+        m=128, n=256, k=128,
+        output_m_tile=128, output_n_tile=256, operand_stages=8,
+    ))
+
+    assert kernel.grid_dim == (2, 1, 1)
+    assert kernel.cluster_dim == (2, 1, 1)
+    assert kernel.ptx.count("tcgen05.mma.cta_group::2.kind::f16") == 8
+    assert "0x08400490" in kernel.ptx  # M128/N256
+    assert "2-SM M128 accumulator: 2x2 TMEM datapath mapping" in kernel.ptx
+
+
+@requires_blackwell
+def test_tcgen05_cta_group2_m128_n256_k128_gemm():
+    kernel = make_ptx_kernel(blackwell_tcgen05_cta_group2_gemm_module(
+        m=256, n=256, k=128,
+        output_m_tile=128, output_n_tile=256, operand_stages=8,
+    ))
+    launcher = make_ptx_launcher(kernel)
+
+    for seed in (0, 1, 7):
+        torch.manual_seed(seed)
+        a_tensor = torch.randn(
+            (256, 128), dtype=torch.bfloat16, device="cuda",
+        )
+        b_tensor = torch.randn(
+            (256, 128), dtype=torch.bfloat16, device="cuda",
+        )
+        actual = torch.empty(
+            (256, 256), dtype=torch.bfloat16, device="cuda",
+        )
+        launcher(a_tensor, b_tensor, actual)
+        torch.cuda.synchronize()
+
+        expected = a_tensor @ b_tensor.T
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
 
 
 @requires_blackwell
