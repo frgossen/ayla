@@ -1200,8 +1200,14 @@ def blackwell_tcgen05_gemm_module(
                         tma_lock.result(), body=Block(ops=next_rhs_moves),
                         attrs={
                             **issue_attrs,
-                            **({"tma_extra_expected_bytes": 16384}
-                               if lean_bookkeeping else {}),
+                            **(
+                                {
+                                    "tma_extra_expected_bytes": (
+                                        output_m_tile * 64 * bf16.byte_size
+                                    ),
+                                }
+                                if lean_bookkeeping else {}
+                            ),
                         },
                     ))
             ops.append(AwaitOp.build(mma_lock.result()))

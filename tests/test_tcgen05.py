@@ -1037,6 +1037,51 @@ def test_tcgen05_lean_bookkeeping_lowering():
         make_ptx_kernel(invalid_descriptors)
 
 
+def test_tcgen05_m64_lean_bookkeeping_deferred_bytes():
+    module = blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=256,
+        output_m_tile=64, output_n_tile=64,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, overwrite_first_mma=True,
+    )
+
+    joined = [
+        op for op in iter_ops(module)
+        if isinstance(op, AsyncOp)
+        and "tma_extra_expected_bytes" in op.attrs
+    ]
+    assert joined
+    assert {
+        op.attrs["tma_extra_expected_bytes"] for op in joined
+    } == {64 * 64 * 2}
+
+
+@requires_blackwell
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_tcgen05_m64_lean_bookkeeping_gemm(seed):
+    kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
+        m=64, n=64, k=256,
+        output_m_tile=64, output_n_tile=64,
+        operand_stages=8, transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, overwrite_first_mma=True,
+    ))
+
+    torch.manual_seed(seed)
+    a_tensor = torch.randn((64, 256), dtype=torch.bfloat16, device="cuda")
+    b_tensor = torch.randn((64, 256), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty((64, 64), dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(kernel)(a_tensor, b_tensor, actual)
+    torch.cuda.synchronize()
+
+    expected = torch.mm(a_tensor, b_tensor.T)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2.0)
+
+
 def test_tcgen05_next_lhs_prefetch_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=512, k=4096,
