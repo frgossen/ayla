@@ -1087,6 +1087,27 @@ def test_tcgen05_partial_commit_completion_mode_is_per_lock():
     assert ptx.count(local) == 2
 
 
+def test_tcgen05_cluster_phase_order_split_requires_cluster_alignment():
+    common = dict(
+        m=2048, n=1024, k=256,
+        output_n_tile=256, operand_stages=8,
+        transpose_cta_grid=True,
+        split_tma_barriers=True, split_rhs_tma=True,
+        prefetch_lhs_next=True, prefetch_rhs_next=True,
+        lean_bookkeeping=True, persistent_n_pairs=True,
+        cluster_multicast_b=True,
+        cluster_multicast_b_ctas=8,
+        cluster_multicast_b_issuers=4,
+    )
+    with pytest.raises(ValueError, match="complete CTA-cluster row"):
+        blackwell_tcgen05_gemm_module(
+            **common, resident_phase_order_split=20,
+        )
+    blackwell_tcgen05_gemm_module(
+        **common, resident_phase_order_split=16,
+    )
+
+
 @pytest.mark.parametrize("invalid", ["kind", "position"])
 def test_tcgen05_partial_commit_verifier(invalid):
     module = blackwell_tcgen05_gemm_module(

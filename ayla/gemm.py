@@ -556,6 +556,16 @@ def blackwell_tcgen05_gemm_module(
             "resident phase-order splitting requires persistent N pairs and "
             "an integer split in the upper half of the linear CTA launch"
         )
+    if (
+        resident_phase_order_split is not None
+        and cluster_multicast_b
+        and resident_phase_order_split
+        % (((n_tiles + 1) // 2) * cluster_multicast_b_ctas)
+    ):
+        raise ValueError(
+            "cluster B phase-order splitting must align to a complete "
+            "CTA-cluster row"
+        )
 
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
