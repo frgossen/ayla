@@ -167,6 +167,7 @@ def blackwell_tcgen05_gemm_module(
     lean_bookkeeping: bool = False,
     reuse_persistent_lhs: bool = False,
     resident_phase_order_split: int | None = None,
+    output_row_stride: int | None = None,
 ) -> ModuleOp:
     """Build the first native SM100 BF16 GEMM pipeline.
 
@@ -586,7 +587,15 @@ def blackwell_tcgen05_gemm_module(
     bf16 = BF16Type()
     a = Value(name="a", type=GmemTensorType.build([m, k], bf16))
     bt = Value(name="bt", type=GmemTensorType.build([n, k], bf16))
-    c = Value(name="c", type=GmemTensorType.build([m, n], bf16))
+    if output_row_stride is not None and output_row_stride < n:
+        raise ValueError("output_row_stride must be at least n")
+    c = Value(
+        name="c",
+        type=GmemTensorType.build(
+            [m, n], bf16,
+            strides=[output_row_stride or n, 1],
+        ),
+    )
     block_ids = BlockIdsOp.build()
     grid_index_ops = [block_ids]
     persistent_loop = (
@@ -836,7 +845,8 @@ def blackwell_tcgen05_gemm_module(
     c_block = TileOp.build(
         c, [m_block_id, n_block_id],
         GmemTensorType.build(
-            [output_m_tile, output_n_tile], bf16, strides=[n, 1],
+            [output_m_tile, output_n_tile], bf16,
+            strides=[output_row_stride or n, 1],
         ),
         attrs={"element_offset_dims": [1]} if hybrid_element_offsets else None,
     )

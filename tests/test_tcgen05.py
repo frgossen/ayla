@@ -1243,6 +1243,22 @@ def test_tcgen05_operand_l2_cache_hints():
     assert input_descs[1].l2_promotion == "256B"
 
 
+def test_tcgen05_strided_output():
+    module = blackwell_tcgen05_gemm_module(
+        m=128, n=256, k=128,
+        output_n_tile=256, operand_stages=8,
+        output_row_stride=512,
+    )
+
+    assert "gmem<128x256xbf16 strides=[512, 1]>" in str(module)
+    with pytest.raises(ValueError, match="at least n"):
+        blackwell_tcgen05_gemm_module(
+            m=128, n=256, k=128,
+            output_n_tile=256, operand_stages=8,
+            output_row_stride=128,
+        )
+
+
 def test_tcgen05_gemm_cluster_a_multicast_lowering():
     kernel = make_ptx_kernel(blackwell_tcgen05_gemm_module(
         m=128, n=256, k=64, cluster_multicast_a=True,

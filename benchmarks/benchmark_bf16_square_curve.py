@@ -177,8 +177,57 @@ BLACKWELL_CONFIG_NAMES = {
     2048: "tcgen05_m128n128_k128_prefetch_no_l2_hints_o3",
     4096: "tcgen05_balanced_persistent_phase_split",
     8192: "tcgen05_balanced_persistent_2x2_lhs_reuse",
-    16384: "tcgen05_m128n256_k128_single_cluster_b16_i2_local_o1",
+    16384: "tcgen05_m128n256_k128_7x_n_band_o1",
 }
+
+
+def _blackwell_16384_banded_op() -> Callable:
+    """Run seven cache-sized N bands into one strided output tensor."""
+    size = 16384
+    tile_counts = (10, 9, 9, 9, 9, 9, 9)
+    launchers = {
+        tiles: make_ptx_launcher(make_ptx_kernel(
+            blackwell_tcgen05_gemm_module(
+                m=size, n=tiles * 256, k=size,
+                output_m_tile=128, output_n_tile=256,
+                operand_stages=8, split_tma_barriers=True,
+                split_rhs_tma=True, prefetch_lhs_next=True,
+                prefetch_rhs_next=True, lean_bookkeeping=True,
+                output_tmem_load_shape="16x32bx2",
+                overwrite_first_mma=True,
+                transpose_cta_grid=True,
+                lhs_l2_cache_hint="evict_last",
+                rhs_l2_cache_hint="evict_last",
+                lhs_l2_promotion="256B",
+                rhs_l2_promotion="256B",
+                output_l1_cache_policy="no_allocate",
+                output_l2_eviction_priority="evict_first",
+                ptx_optimization_level=1,
+                output_row_stride=size,
+            )
+        ))
+        for tiles in set(tile_counts)
+    }
+    output = None
+
+    def op(a: torch.Tensor, bt: torch.Tensor) -> torch.Tensor:
+        nonlocal output
+        if output is None:
+            output = torch.empty(
+                (size, size), dtype=a.dtype, device=a.device,
+            )
+        start = 0
+        for tiles in tile_counts:
+            band_n = tiles * 256
+            launchers[tiles](
+                a,
+                bt.narrow(0, start, band_n),
+                output.narrow(1, start, band_n),
+            )
+            start += band_n
+        return output
+
+    return op
 
 
 def configs_for_device() -> dict[int, tuple[Callable[[], ModuleOp], str]]:
@@ -246,7 +295,11 @@ def main() -> int:
         selected = {size: selected[size] for size in args.sizes}
     for size, (build, config_name) in selected.items():
         print(f"size={size}: build {config_name}", flush=True)
-        ayla_op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
+        ayla_op = (
+            _blackwell_16384_banded_op()
+            if blackwell and size == 16384 else
+            out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
+        )
         ayla_config = BenchGemmConfig(
             "Ayla", size, size, size, ayla_op, torch.bfloat16,
         )
