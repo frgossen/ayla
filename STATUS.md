@@ -1,6 +1,6 @@
 # Ayla B200 port status
 
-Snapshot: 2026-08-31, source commit `1ebd778` (`Cluster adjacent 2048 GEMM rows`).
+Snapshot: 2026-08-31, source commit `db0a22b` (`Support M128 two-CTA Blackwell GEMM`).
 `B200_PORT.md` remains the canonical experiment log; this file is the compact
 performance summary requested for the current state.
 
@@ -9,7 +9,7 @@ performance summary requested for the current state.
 Ayla now has a correct, explicit Blackwell path (`PTX 9.0`, `sm_100a`, TMA,
 `tcgen05`, tensor-memory allocation/deallocation, cluster launch metadata, and
 CUDA JIT diagnostics) while retaining the Hopper path. The full current suite
-passes on B200 (`242 passed, 38 target-aware skipped`), and the production
+passes on B200 (`244 passed, 38 target-aware skipped`), and the production
 square curve passes three correctness seeds at every configured size.
 
 Performance is not yet at the acceptance gates. In the latest complete curve,
@@ -106,6 +106,14 @@ A direct fast-path experiment that tested each barrier before entering the
 blocking wait loop was also neutral (best paired result +0.10% forward and
 +0.05% reverse). The next useful work must change the amount of useful tensor
 work hidden behind those dependencies, not merely reshape their polling code.
+
+A follow-up implemented the other legal dense 2-SM shape, M128-total/N256,
+using current CUTLASS's 2x2 TMEM mapping. It is exact, but even its K256 form
+reached only 747 TFLOP/s versus 1,222 for retained Ayla and 1,340 for cuBLAS in
+the same run. Also, cuBLAS's `128x256 ... 2cta` name denotes its per-CTA slice:
+its M256-total six-stage collective is the topology Ayla had already tested at
+roughly 654 TFLOP/s without warp specialization. Thus neither an older shape
+choice nor a missing legal `tcgen05` geometry explains the remaining gap.
 
 ## What has worked
 
