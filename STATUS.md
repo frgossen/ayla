@@ -196,6 +196,20 @@ pipelines cost about 25-29%. These are large causal losses, not selection noise,
 so the present synchronization stack should be treated as the base for a new
 dependency design rather than dismantled piecemeal.
 
+A new launch-level direction is ready for runtime validation. PTX 9.0
+`clusterlaunchcontrol.try_cancel` loops now wrap both the complete retained
+8192 CTA body and a simpler exact-N256 body, allowing a finishing CTA to steal
+an unlaunched tile while all four warps retain the same TMA/tensor-core
+pipeline. CUDA 13 assembles both to Blackwell's `UGETNEXTWORKID`: the retained
+form keeps 78 registers, while dynamically persistent exact N256 uses 54
+registers versus 50 normally; both have zero spills and unchanged rounded
+shared-memory allocation. The same exact-N256 wrapper also assembles unchanged
+for the production 16384 M23 band, so both large-shape comparisons are queued.
+The fixed SASS cost is 40 instructions on each exact kernel (56 on the larger
+retained body), small relative to their 1,104-1,376-instruction tile bodies.
+Correctness and paired timing remain pending until the recorded driver/NVLink
+fault is cleared.
+
 ## What has worked
 
 - Explicit Blackwell target configuration and native `tcgen05`/tensor-memory
