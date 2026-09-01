@@ -12,10 +12,7 @@ import torch
 from ayla.gpu_dialect import F32Type, GmemTensorType
 from ayla.ptx_codegen import PtxKernel
 from ayla.ptx_runtime import make_ptx_launcher
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="no CUDA"
-)
+from tests.testing_utils import requires_cuda
 
 
 # c[i] = a[i] + b[i]; assumes grid_x * block_x == len(a).

@@ -11,12 +11,9 @@ from ayla.passes.pipeline_loop import pipeline_loop
 from ayla.passes.promote_buffers import promote_buffers
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
+from tests.testing_utils import requires_cuda
 from ayla.passes.tile_matmul import tile_matmul
 from ayla.passes.unroll_loop import unroll_loop
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="no CUDA"
-)
 
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(

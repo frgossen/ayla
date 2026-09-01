@@ -8,7 +8,7 @@ from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
 from ayla.base.ir import find_ops
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
-from ayla.testing import assert_contains_in_order
+from tests.testing_utils import assert_contains_in_order
 
 
 def _lower_barrier(scope: str) -> str:

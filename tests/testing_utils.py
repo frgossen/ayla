@@ -1,4 +1,17 @@
-"""Shared test utilities."""
+"""Helpers shared across the test suite.
+
+Deliberately not part of the ayla package: `pyproject.toml` ships `ayla*` and
+excludes `tests*`, so anything pytest-flavoured belongs here rather than in
+the wheel. Fixtures and hooks go in `conftest.py` instead -- importing from a
+conftest is not something pytest supports.
+"""
+import pytest
+import torch
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="no CUDA"
+)
 
 
 def assert_contains_in_order(text: str, *fragments: str) -> None:

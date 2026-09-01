@@ -8,21 +8,7 @@ import torch
 import torch._inductor.config as inductor_config
 from torch._inductor.utils import run_and_get_code
 
-from ayla import torch_inductor
-
-
-# TODO: Duplicated in every test module -- this belongs in `ayla.testing`.
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="no CUDA"
-)
-
-
-@pytest.fixture
-def ayla_installed():
-    """ayla claiming `aten.mm` for the duration of a test."""
-    torch_inductor.install()
-    yield
-    torch_inductor.uninstall()
+from tests.testing_utils import requires_cuda
 
 
 @requires_cuda
