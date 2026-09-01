@@ -117,36 +117,45 @@ def test_lhs_l2_promotion_reaches_tma_descriptor():
 @requires_cuda
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize(
-    "op,dtype",
+    "op,dtype,epilogue",
     [
-        pytest.param(lambda a, b: torch.mm(a, b.t()), F32, id="torch.mm"),
-        pytest.param(ayla.naive_matmul_4096_loop, F32, id="naive_matmul_4096_loop"),
-        pytest.param(ayla.loop_4x4_matmul_4096, F32, id="loop_4x4_matmul_4096"),
-        pytest.param(ayla.loop_8x8_matmul_4096, F32, id="loop_8x8_matmul_4096"),
-        pytest.param(ayla.tma_matmul_4096, F32, id="tma_matmul_4096"),
-        pytest.param(ayla.pranjalssh_4096, BF16, id="pranjalssh_4096"),
-        pytest.param(ayla.pranjalssh_4096_pipelined, BF16, id="pranjalssh_4096_pipelined"),
-        pytest.param(ayla.auto_matmul_4096, BF16, id="auto_matmul_4096"),
-        pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, id="auto_matmul_4096_wgmma256_wg"),
+        pytest.param(lambda a, b: torch.mm(a, b.t()), F32, None, id="torch.mm"),
+        pytest.param(ayla.naive_matmul_4096_loop, F32, None, id="naive_matmul_4096_loop"),
+        pytest.param(ayla.loop_4x4_matmul_4096, F32, None, id="loop_4x4_matmul_4096"),
+        pytest.param(ayla.loop_8x8_matmul_4096, F32, None, id="loop_8x8_matmul_4096"),
+        pytest.param(ayla.tma_matmul_4096, F32, None, id="tma_matmul_4096"),
+        pytest.param(ayla.pranjalssh_4096, BF16, None, id="pranjalssh_4096"),
+        pytest.param(ayla.pranjalssh_4096_pipelined, BF16, None, id="pranjalssh_4096_pipelined"),
+        pytest.param(ayla.auto_matmul_4096, BF16, None, id="auto_matmul_4096"),
+        pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, None, id="auto_matmul_4096_wgmma256_wg"),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
             BF16,
+            None,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             BF16,
+            None,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
         ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
             BF16,
+            None,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
-        pytest.param(ayla.fastcu_5_1, BF16, id="fastcu_5_1"),
+        pytest.param(ayla.fastcu_5_1, BF16, None, id="fastcu_5_1"),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_sigmoid,
+            BF16,
+            torch.sigmoid,
+            id="auto_matmul_4096_wgmma256_wg_sigmoid",
+        ),
     ],
 )
-def test_gemm_correctness(op, dtype, seed):
+def test_gemm_correctness(op, dtype, epilogue, seed):
     torch.manual_seed(seed)
     a = torch.randn(4096, 4096, dtype=dtype, device="cuda")
     b = torch.randn(4096, 4096, dtype=dtype, device="cuda")
@@ -156,14 +165,23 @@ def test_gemm_correctness(op, dtype, seed):
     assert c.dtype == dtype
     assert c.shape == (4096, 4096)
 
-    ref = torch.mm(a.float(), b.float().t()).to(dtype)
+    ref = torch.mm(a.float(), b.float().t())
+    if epilogue is not None:
+        ref = epilogue(ref)
+    ref = ref.to(dtype)
 
     print(f"\n{op} c[0:64, 0:64]:")
     print(c[0:64, 0:64])
     print(f"\n{op} ref[0:64, 0:64]:")
     print(ref[0:64, 0:64])
 
-    atol = 1e-3 if dtype == torch.float32 else 2.0
+    # The bf16 tolerance is sized for a raw 4096-deep accumulation. An
+    # epilogue bounds the output -- sigmoid to [0, 1] -- so that tolerance
+    # would accept anything; what is left is the epilogue's own error.
+    if epilogue is not None:
+        atol = 2e-2
+    else:
+        atol = 1e-3 if dtype == torch.float32 else 2.0
     assert torch.isfinite(c).all(), f"{op}: output contains NaN or Inf"
     assert torch.allclose(
         c, ref, atol=atol
