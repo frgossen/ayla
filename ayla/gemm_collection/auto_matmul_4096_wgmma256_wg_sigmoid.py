@@ -15,7 +15,7 @@ from ..passes.unroll_loop import unroll_loop
 from .registry import register
 
 
-@register
+@register(epilogue=("sigmoid",))
 def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     """auto_matmul_4096_wgmma256_wg with sigmoid applied to the result.
 

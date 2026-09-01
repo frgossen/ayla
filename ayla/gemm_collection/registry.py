@@ -24,6 +24,7 @@ nothing here needs updating.
 
 from __future__ import annotations
 
+import functools
 import inspect
 from dataclasses import dataclass
 from typing import Callable
@@ -52,6 +53,7 @@ class GemmKernel:
     k: int
     n: int
     dtype: torch.dtype
+    epilogue: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -63,13 +65,18 @@ class GemmKernel:
         k: int | None = None,
         n: int | None = None,
         dtype: torch.dtype | None = None,
+        epilogue: tuple[str, ...] | None = (),
     ) -> bool:
-        """Whether this kernel runs that GEMM. ``None`` matches anything."""
+        """Whether this kernel computes that. ``None`` matches anything.
+
+        ``epilogue`` defaults to ``()``, so unsaid means a plain GEMM.
+        """
         return (
             (m is None or m == self.m)
             and (k is None or k == self.k)
             and (n is None or n == self.n)
             and (dtype is None or dtype == self.dtype)
+            and (epilogue is None or tuple(epilogue) == self.epilogue)
         )
 
 
@@ -115,7 +122,11 @@ def _gemm_dims(kernel) -> tuple[int, int, int, torch.dtype]:
     return int(m), int(k), int(n), dtypes.pop()
 
 
-def register(builder: Callable[[], object]) -> Callable[[], object]:
+def register(
+    builder: Callable[[], object] | None = None,
+    *,
+    epilogue: tuple[str, ...] = (),
+) -> Callable[..., object]:
     """Build and register the kernel a builder produces, at import time.
 
     Decorating runs the builder immediately -- which compiles the kernel, adds
@@ -124,6 +135,13 @@ def register(builder: Callable[[], object]) -> Callable[[], object]:
 
         @register
         def auto_matmul_4096_module():
+            ...
+
+    ``epilogue`` names the element-wise functions applied to the result. It
+    has to be declared -- by the time this runs it has lowered into PTX::
+
+        @register(epilogue=("sigmoid",))
+        def auto_matmul_4096_wgmma256_wg_sigmoid_module():
             ...
 
     The builder takes no arguments: one builder is one kernel. A module that can
@@ -135,6 +153,9 @@ def register(builder: Callable[[], object]) -> Callable[[], object]:
     Shape and dtype are not declared either -- they are read off the built
     kernel, so there is nothing to keep in sync.
     """
+    if builder is None:
+        return functools.partial(register, epilogue=epilogue)
+
     if inspect.signature(builder).parameters:
         raise TypeError(
             f"{builder.__name__}: @register builders take no arguments; give each "
@@ -148,7 +169,12 @@ def register(builder: Callable[[], object]) -> Callable[[], object]:
     m, k, n, dtype = _gemm_dims(kernel)
 
     op = make_torch_custom_call(make_ptx_launcher(kernel), list(_MATMUL_OPERANDS))
-    _KERNELS.append(GemmKernel(name=kernel.name, op=op, m=m, k=k, n=n, dtype=dtype))
+    _KERNELS.append(
+        GemmKernel(
+            name=kernel.name, op=op, m=m, k=k, n=n, dtype=dtype,
+            epilogue=tuple(epilogue),
+        )
+    )
     return builder
 
 
@@ -157,6 +183,14 @@ def query(
     k: int | None = None,
     n: int | None = None,
     dtype: torch.dtype | None = None,
+    epilogue: tuple[str, ...] | None = (),
 ) -> list[GemmKernel]:
-    """The kernels that can run this GEMM. ``None`` leaves a field unconstrained."""
-    return [kernel for kernel in _KERNELS if kernel.matches(m, k, n, dtype)]
+    """The kernels that compute this. ``None`` leaves a field unconstrained.
+
+    ``epilogue`` defaults to a plain GEMM, so a caller asking what can run a
+    matmul is never handed one that also applies a sigmoid. ``None`` for every
+    kernel of the shape, whatever it computes.
+    """
+    return [
+        kernel for kernel in _KERNELS if kernel.matches(m, k, n, dtype, epilogue)
+    ]

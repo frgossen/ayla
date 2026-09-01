@@ -57,3 +57,12 @@ def test_registered_kernels_match_their_op_names():
         assert kernel.label == f"ayla.{kernel.name}"
         # make_torch_custom_call hands back the overload, not the packet.
         assert getattr(torch.ops.ayla, kernel.name).default is kernel.op
+
+
+def test_query_defaults_to_a_plain_gemm():
+    """A fused kernel offered here could win on time and return the wrong values."""
+    shape = dict(m=4096, k=4096, n=4096, dtype=torch.bfloat16)
+    assert all(k.epilogue == () for k in query(**shape))
+    fused = query(**shape, epilogue=("sigmoid",))
+    assert [k.name for k in fused] == ["auto_matmul_4096_wgmma256_wg_sigmoid"]
+    assert len(query(**shape, epilogue=None)) == len(query(**shape)) + len(fused)
