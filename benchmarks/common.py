@@ -55,7 +55,7 @@ class BenchGemmConfig:
 
 
 @dataclass
-class BenchResult:
+class BenchGemmResult:
     label: str
     rounds: int   # timed event-pairs (the sample count for median/stdev/min/max)
     iters: int    # launches averaged within each round
@@ -74,6 +74,7 @@ class BenchResult:
 # is attributed to one implementation but not the other.
 _WARMUP_S = 0.5        # clock-ramp warmup budget...
 _WARMUP_ITERS = 100    # ...capped at this many launches (survive slow kernels)
+_GRAPH_WARMUP = 3      # launches on the capture stream before recording
 _GRAPH_LAUNCHES = 4
 _MIN_RUN_TIME_S = 0.5
 _MAX_ROUNDS = 200
@@ -129,6 +130,24 @@ def assert_against_torch(
 def _capture_graph(
     run: Callable, stream: torch.cuda.Stream,
 ) -> torch.cuda.CUDAGraph:
+    """Record `run` into a graph that can be replayed.
+
+    The launches before recording are not about clock ramp -- that is the
+    caller's business, and :func:`_prepare` budgets for it. They are for
+    anything a call does only once, allocating a workspace or initialising a
+    handle: that has to happen before recording starts, or it lands inside the
+    graph and is replayed forever after.
+
+    `_prepare` already warms enough to cover that. Doing it here as well costs
+    three launches and makes the function correct to call on its own, which is
+    what a caller wants if it ramps the clocks by replaying the graph rather
+    than by calling through Python.
+    """
+    with torch.cuda.stream(stream):
+        for _ in range(_GRAPH_WARMUP):
+            run()
+    stream.synchronize()
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph):
         for _ in range(_GRAPH_LAUNCHES):
@@ -185,13 +204,13 @@ def _prepare(
     return graph, max(_time_graph(graph, stream), 1e-3)
 
 
-def _result(cfg: BenchGemmConfig, times_ms: list[float]) -> BenchResult:
+def _result(cfg: BenchGemmConfig, times_ms: list[float]) -> BenchGemmResult:
     n = len(times_ms)
     min_ms = min(times_ms)
     median_ms = statistics.median(times_ms)
     # Median throughput is more stable than selecting the luckiest round.
     tflops = cfg.flops / (median_ms / 1e3) / 1e12
-    return BenchResult(
+    return BenchGemmResult(
         label=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})",
         rounds=n,
         iters=_GRAPH_LAUNCHES,
@@ -205,7 +224,7 @@ def _result(cfg: BenchGemmConfig, times_ms: list[float]) -> BenchResult:
 
 
 def _populate_percentages(
-    configs: list[BenchGemmConfig], results: list[BenchResult]
+    configs: list[BenchGemmConfig], results: list[BenchGemmResult]
 ) -> None:
     torch_mm_tflops = next(
         (
@@ -247,12 +266,12 @@ def _align(f) -> str:
     return "<" if _is_str_field(f) else ">"
 
 
-def _format_field(r: BenchResult, f, label_width: int) -> str:
+def _format_field(r: BenchGemmResult, f, label_width: int) -> str:
     value = _format_value(getattr(r, f.name), f.name)
     return f"{value:{_align(f)}{_width(f, label_width)}s}"
 
 
-def _print(r: BenchResult, label_width: int, with_header: bool = False) -> None:
+def _print(r: BenchGemmResult, label_width: int, with_header: bool = False) -> None:
     fields = dataclasses.fields(r)
     if with_header:
         print(
@@ -265,7 +284,7 @@ def _print(r: BenchResult, label_width: int, with_header: bool = False) -> None:
     )
 
 
-def run(configs: list[BenchGemmConfig]) -> list[BenchResult]:
+def run(configs: list[BenchGemmConfig]) -> list[BenchGemmResult]:
     """Time configs in rotating order on one stream and shared shape inputs."""
     if not configs:
         return []
@@ -311,7 +330,7 @@ def run(configs: list[BenchGemmConfig]) -> list[BenchResult]:
     return results
 
 
-def print_results(results: list[BenchResult]) -> None:
+def print_results(results: list[BenchGemmResult]) -> None:
     """Print the results as a table, sized to the widest label."""
     label_width = max((len(result.label) for result in results), default=len("label"))
     for i, result in enumerate(results):
