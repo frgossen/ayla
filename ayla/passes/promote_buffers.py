@@ -34,6 +34,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    KernelOp,
     LaneIdOp,
     MatmulOp,
     ModuleOp,
@@ -44,6 +45,7 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
     WrmemTensorType,
+    is_elementwise,
 )
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
@@ -240,12 +242,14 @@ class PromoteBuffers(LoweringPass):
         writeback_buffers: int = 1,
         tma_load_slices: dict[str, int] | None = None,
         label_filter: str | None = None,
+        epilogue_label_filter: str | None = None,
     ) -> None:
         super().__init__()
         self.target_type = target_type
         self.target_dtype = target_dtype
         self.operand_names = set(operands)
         self.label_filter = label_filter
+        self.epilogue_label_filter = epilogue_label_filter
         self.swizzle = swizzle
         self.layout = layout
         self.warps = warps
@@ -488,13 +492,70 @@ class PromoteBuffers(LoweringPass):
         new_ops.append(move)
         return new_ops, []
 
-    @lowers(MatmulOp)
-    def lower_matmul(self, op: MatmulOp):
-        if self.label_filter is not None and op.attrs.get("label") != self.label_filter:
-            return None
-        lhs = self.value_map[op.lhs]
-        rhs = self.value_map[op.rhs]
-        dst = self.value_map[op.dst]
+    @lowers(KernelOp)
+    def lower_kernel(self, op: KernelOp):
+        for block in op.blocks:
+            self._rewrite_block(block)
+        return [op], []
+
+    def _rewrite_block(self, block: Block) -> None:
+        """Replace each matmul, and the epilogue behind it, with its promotion.
+
+        Nested blocks first, so a matmul inside a loop is promoted before the
+        loop holding it is rebuilt.
+        """
+        for op in block.ops:
+            for nested in op.blocks:
+                self._rewrite_block(nested)
+
+        ops = list(block.ops)
+        new_ops: list[Op] = []
+        i = 0
+        while i < len(ops):
+            op = ops[i]
+            if not self._promotes(op):
+                new_ops.append(op)
+                i += 1
+                continue
+            epilogue = self._epilogue(ops, i)
+            new_ops.extend(self._promote(op, epilogue))
+            i += 1 + len(epilogue)
+        block.ops = new_ops
+
+    def _promotes(self, op: Op) -> bool:
+        return isinstance(op, MatmulOp) and (
+            self.label_filter is None
+            or op.attrs.get("label") == self.label_filter
+        )
+
+    def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
+        """The ops directly behind ``ops[hero]`` that promote with it.
+
+        Contiguous only, and each has to earn its place: element-wise, selected
+        by ``epilogue_label_filter``, and in place over the destination.
+        Anything else ends the run -- an op left where it is must not be
+        stepped over, or moving what follows past it would reorder the two.
+
+        Element-wise alone would be too weak a test, which is why the filter
+        has to name them: promotion leaves a `convert` behind every
+        accumulator, and a `convert` is element-wise.
+        """
+        if self.epilogue_label_filter is None:
+            return []
+        found: list[Op] = []
+        dst = ops[hero].dst
+        for op in ops[hero + 1:]:
+            if not is_elementwise(op):
+                break
+            if op.attrs.get("label") != self.epilogue_label_filter:
+                break
+            if len(op.operands) != 2 or not all(v is dst for v in op.operands):
+                break
+            found.append(op)
+        return found
+
+    def _promote(self, op: MatmulOp, epilogue: list[Op]) -> list[Op]:
+        lhs, rhs, dst = op.operands
 
         label = op.attrs.get("label")
         pre_ops = []
@@ -516,12 +577,18 @@ class PromoteBuffers(LoweringPass):
             lhs=new_lhs, rhs=new_rhs, dst=new_dst, init=init, attrs=op.extra_attrs
         )
 
-        post_ops = []
+        # The epilogue runs on the promoted buffer, before it is written back:
+        # that is the whole point of promoting the destination, and it is only
+        # reachable here because the ops behind the matmul came along.
+        post_ops = [
+            type(e)(operands=[new_dst, new_dst], results=[], attrs=e.attrs)
+            for e in epilogue
+        ]
         if "dst" in self.operand_names:
             ops, _ = self._build_operand_writeback(dst, new_dst, "dst", label)
             post_ops.extend(ops)
 
-        return pre_ops + [matmul] + post_ops, []
+        return pre_ops + [matmul] + post_ops
 
 
 def promote_buffers(
@@ -541,6 +608,7 @@ def promote_buffers(
     writeback_buffers: int = 1,
     tma_load_slices: dict[str, int] | None = None,
     label_filter: str | None = None,
+    epilogue_label_filter: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
     return PromoteBuffers(
@@ -558,4 +626,5 @@ def promote_buffers(
         writeback_buffers=writeback_buffers,
         tma_load_slices=tma_load_slices,
         label_filter=label_filter,
+        epilogue_label_filter=epilogue_label_filter,
     ).run(module)

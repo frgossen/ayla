@@ -230,3 +230,38 @@ def test_promote_smem_with_warp_group_dependent_lhs():
           }
         }""")
     assert text == expected
+
+
+def test_epilogue_runs_on_the_promoted_accumulator():
+    """The epilogue moves onto the buffer, ahead of the writeback.
+
+    Left where it was it would read the destination back out of gmem after the
+    store -- correct, but a round trip for a value that was just in registers.
+    Promoting the destination is what makes fusing it possible, so the ops
+    behind the matmul are promoted with it.
+    """
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
+            elementwise(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) attrs={fn: "sigmoid", label: "epilogue"}
+          }
+        }"""))  # noqa: E501
+
+    module = promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, label_filter="mm",
+        epilogue_label_filter="epilogue",
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
+            elementwise(%0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
+            %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            move(%c: gmem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+          }
+        }""")  # noqa: E501
