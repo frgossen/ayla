@@ -1,8 +1,4 @@
-"""Tests for the TorchInductor backend.
-
-TODO: Rename to `tests/test_torch_compile.py` when `ayla/torch_inductor.py`
-becomes `ayla/torch_compile.py`.
-"""
+"""Tests for the torch.compile backend."""
 import pytest
 import torch
 import torch._inductor.config as inductor_config

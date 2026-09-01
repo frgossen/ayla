@@ -1,17 +1,13 @@
 """Route matmuls that ayla has a kernel for through ayla, under torch.compile.
 
-TODO: Rename this module to ``ayla/torch_compile.py``, and the test with it.
-Inductor is the seam it hooks, but ``torch.compile`` is what a caller is
-reaching for -- ``benchmarks/bench_torch_compile.py`` already reads that way.
-
 Installs a lowering for ``aten.mm`` that claims a matmul only when the
 collection actually holds a kernel for that exact static shape and dtype.
 Everything else returns ``None``, which falls through to Inductor's own
 lowering -- so coverage is declared by what is in the registry, not by this
 file.
 
-    from ayla import torch_inductor
-    torch_inductor.install()
+    from ayla import torch_compile
+    torch_compile.install()
 
 Every kernel matching the shape becomes an autotuning candidate, alongside
 Inductor's own choices, so the fastest one wins rather than the first one
