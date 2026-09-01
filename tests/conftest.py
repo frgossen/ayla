@@ -22,8 +22,8 @@ def ayla_installed():
     """ayla claiming `aten.mm` for the duration of a test."""
     # Imported here rather than at module scope: conftest is loaded for every
     # run, and pulling in `torch._inductor` costs a second and a half.
-    from ayla import torch_inductor
+    from ayla import torch_compile
 
-    torch_inductor.install()
+    torch_compile.install()
     yield
-    torch_inductor.uninstall()
+    torch_compile.uninstall()
