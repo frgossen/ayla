@@ -417,6 +417,52 @@ class ConvertOp(Op):
         return self.operands[1]
 
 
+@gpu_dialect.register_op("elementwise")
+class ElementwiseOp(Op):
+    """One scalar function over each element: elementwise(dst, src).
+
+    ``fn`` names the function -- an attribute, not an op each, since exp,
+    tanh, relu and the rest differ only in the instructions they lower to.
+
+    Passing the same value as both operands computes in place.
+
+    TODO: generalize to several sources and destinations. One of each admits
+    only unary functions -- add, mul and select need more than one input, and
+    a lowering may want to produce more than one value at a time.
+    """
+
+    FUNCTIONS: ClassVar[tuple[str, ...]] = ("sigmoid",)
+
+    @classmethod
+    def build(
+        cls,
+        dst: Value,
+        src: Value,
+        fn: str,
+        attrs: dict[str, object] | None = None,
+    ) -> "ElementwiseOp":
+        if fn not in cls.FUNCTIONS:
+            raise ValueError(
+                f"elementwise: unknown fn {fn!r}; expected one of "
+                f"{', '.join(cls.FUNCTIONS)}"
+            )
+        return cls(
+            operands=[dst, src], results=[], attrs={"fn": fn, **(attrs or {})},
+        )
+
+    @property
+    def dst(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def src(self) -> Value:
+        return self.operands[1]
+
+    @property
+    def fn(self) -> str:
+        return self.attrs["fn"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("alloc")
 class AllocOp(Op):
     """Allocate a register- or shared-memory tensor.
@@ -1792,7 +1838,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
                 ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
                 ("R", dst, CollectiveScope.THREAD),
                 ("W", dst, CollectiveScope.THREAD)]
-    if isinstance(op, ConvertOp):
+    if isinstance(op, (ConvertOp, ElementwiseOp)):
         return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
                 ("R", root_buffer(op.src), CollectiveScope.THREAD)]
     if isinstance(op, AwaitOp):
@@ -1856,6 +1902,19 @@ def is_side_effect_free(op: Op) -> bool:
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,
+    ))
+
+
+def is_elementwise(op: Op) -> bool:
+    """Applies one scalar function to each element, independently.
+
+    Element i of the result depends on element i of the input and nothing else,
+    so the op carries no cross-element dependency: it can be split along any
+    axis, fused with another of its kind, or applied to a tile in place.
+    """
+    return isinstance(op, (
+        ConvertOp,
+        ElementwiseOp,
     ))
 
 

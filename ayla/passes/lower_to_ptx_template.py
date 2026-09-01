@@ -35,6 +35,7 @@ from ..gpu_dialect import (
     PTXTemplateOp,
     PtrAddOp,
     PtrType,
+    ElementwiseOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -48,6 +49,25 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass, lowers
+
+
+def _lower_elementwise_sigmoid_ptx(dst: str, src: str) -> str:
+    """1 / (1 + exp(-x)) for one element, into ``dst``.
+
+    The hardware exponential is base 2, so exp(-x) is ex2 of -x * log2(e)
+    (0fBFB8AA3B).
+
+    TODO: cheaper arrangements to evaluate -- exp2 -> fma -> rcp -> mul, and
+    tanh.approx.f32, which gives sigmoid in two instructions via
+    0.5 * (1 + tanh(x/2)). Both trade accuracy, so they want to be separate
+    fns a caller can ask for rather than a silent swap.
+    """
+    return (
+        f"mul.f32 {dst}, {src}, 0fBFB8AA3B;\n"
+        f"ex2.approx.f32 {dst}, {dst};\n"
+        f"add.f32 {dst}, {dst}, 0f3F800000;\n"
+        f"rcp.approx.f32 {dst}, {dst};\n"
+    )
 
 
 class LowerToPtxTemplate(LoweringPass):
@@ -341,6 +361,72 @@ class LowerToPtxTemplate(LoweringPass):
                 f"${{b32:operand.dst.r{dst_reg}}}, "
                 f"${{f32:operand.src.r{i + 1}}}, "
                 f"${{f32:operand.src.r{i}}};\n"
+            )
+
+        new_op = PTXTemplateOp.build(
+            operands=[dst_value, src_value],
+            result_types=[],
+            template=template,
+            operand_names=["dst", "src"],
+            result_names=[],
+            description=str(op),
+        )
+        return [new_op], []
+
+    @lowers(ElementwiseOp)
+    def lower_elementwise(
+        self, op: ElementwiseOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Lower an element-wise op on wrmem tensors, one function per element.
+
+        dst doubles as the scratch register, so the same tensor as both
+        operands computes in place.
+
+        TODO: schedule this better. Per-element sequences are emitted back to
+        back, so each element's `mul` waits on the previous element's `rcp`;
+        grouping by instruction would expose the independence. Unrolling
+        several at a time would also let a packed consumer take the group --
+        a following cvt.rn.bf16x2.f32 wants pairs, so N*2 is the natural step,
+        and lower_convert already emits that way while this path does not.
+
+        What is unresolved is who decides. If kernels are written on top of
+        deliberately plain ops, plain is the right default here and the knob
+        belongs in the pass options, where whoever writes the kernel can ask
+        for it. If the compiler is meant to find the schedule itself, it
+        belongs in this function. The granularity argues for the first: N*2 is
+        only the right unroll because of what consumes the result, which this
+        function cannot see.
+        """
+        dst_value = self.value_map[op.dst]
+        src_value = self.value_map[op.src]
+        dst_type = dst_value.type
+        src_type = src_value.type
+
+        if not (isinstance(src_type, WrmemTensorType)
+                and isinstance(dst_type, WrmemTensorType)):
+            raise NotImplementedError(
+                f"lower_elementwise: only wrmem supported; got "
+                f"{src_type} -> {dst_type}"
+            )
+        assert tuple(src_type.sizes) == tuple(dst_type.sizes)
+        assert src_type.warps == dst_type.warps
+        if not (isinstance(src_type.dtype, F32Type)
+                and isinstance(dst_type.dtype, F32Type)):
+            raise NotImplementedError(
+                f"lower_elementwise: unsupported {src_type.dtype} -> "
+                f"{dst_type.dtype}"
+            )
+        if op.fn == "sigmoid":
+            emit = _lower_elementwise_sigmoid_ptx
+        else:
+            raise NotImplementedError(
+                f"lower_elementwise: unsupported fn {op.fn!r}"
+            )
+
+        template = ""
+        for i in range(src_type.num_elements_per_thread):
+            template += emit(
+                f"${{f32:operand.dst.r{i}}}", f"${{f32:operand.src.r{i}}}",
             )
 
         new_op = PTXTemplateOp.build(
