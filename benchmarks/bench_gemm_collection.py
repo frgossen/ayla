@@ -8,7 +8,7 @@ import re
 import ayla.gemm_collection  # noqa: F401 -- registers torch.ops.ayla.*
 import torch
 
-from common import BenchGemmConfig, print_results, run, torch_mm_nt
+from common import GemmBenchConfig, print_results, run, torch_mm_nt
 
 
 def main() -> None:
@@ -23,7 +23,7 @@ def main() -> None:
         raise SystemExit("CUDA required")
 
     configs = [
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="torch.mm.bf16",
             m=4096,
             n=4096,
@@ -31,7 +31,7 @@ def main() -> None:
             op=torch_mm_nt,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.pranjalssh",
             m=4096,
             n=4096,
@@ -39,7 +39,7 @@ def main() -> None:
             op=torch.ops.ayla.pranjalssh_4096,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.pranjalssh_pipelined (prev best)",
             m=4096,
             n=4096,
@@ -47,7 +47,7 @@ def main() -> None:
             op=torch.ops.ayla.pranjalssh_4096_pipelined,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.auto_matmul (wgmma128)",
             m=4096,
             n=4096,
@@ -55,7 +55,7 @@ def main() -> None:
             op=torch.ops.ayla.auto_matmul_4096,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.auto_matmul (wgmma256 wg)",
             m=4096,
             n=4096,
@@ -63,7 +63,7 @@ def main() -> None:
             op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.auto_matmul (wgmma256 wg, TMA store K=3)",
             m=4096,
             n=4096,
@@ -71,7 +71,7 @@ def main() -> None:
             op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.auto_matmul (wgmma256 wg, TMA store K=3, 2 tiles/CTA)",
             m=4096,
             n=4096,
@@ -79,7 +79,7 @@ def main() -> None:
             op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label=(
                 "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, "
                 "2 tiles/CTA)"
@@ -93,7 +93,7 @@ def main() -> None:
             ),
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label=(
                 "ayla.auto_matmul (wgmma256 wg, PTX JIT O1, packed shared "
                 "allocations, A promote 256B, split output, 4 tiles/CTA, "
@@ -108,7 +108,7 @@ def main() -> None:
             ),
             dtype=torch.bfloat16,
         ),
-        BenchGemmConfig(
+        GemmBenchConfig(
             label="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,
             n=4096,

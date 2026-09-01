@@ -16,7 +16,7 @@ from ayla.gemm import (
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from common import (
-    BenchGemmConfig,
+    GemmBenchConfig,
     assert_against_torch,
     out_parameter_op,
     plot_tflops_curve,
@@ -119,13 +119,13 @@ def main() -> int:
     for size, (build, config_name) in CONFIGS.items():
         print(f"size={size}: build {config_name}", flush=True)
         ayla_op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
-        ayla_config = BenchGemmConfig(
+        ayla_config = GemmBenchConfig(
             "Ayla", size, size, size, ayla_op, torch.bfloat16,
         )
         assert_against_torch(ayla_config)
         configs = [
             ayla_config,
-            BenchGemmConfig(
+            GemmBenchConfig(
                 "cuBLAS", size, size, size, torch_mm_nt, torch.bfloat16,
             ),
         ]

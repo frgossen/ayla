@@ -15,7 +15,7 @@ from ayla.gemm import (
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from common import (
-    BenchGemmConfig,
+    GemmBenchConfig,
     assert_against_torch,
     out_parameter_op,
     plot_tflops_curve,
@@ -74,7 +74,7 @@ def _default_config(m: int) -> str:
     return "four_tile_k3_split2"
 
 
-def _ayla_config(matmul: MatmulConfig) -> tuple[BenchGemmConfig, str]:
+def _ayla_config(matmul: MatmulConfig) -> tuple[GemmBenchConfig, str]:
     config_name = _default_config(matmul.m)
     module = auto_matmul_4096_wgmma256_wg_tma_store_module(
         m=matmul.m,
@@ -84,7 +84,7 @@ def _ayla_config(matmul: MatmulConfig) -> tuple[BenchGemmConfig, str]:
     )
     op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
     return (
-        BenchGemmConfig(
+        GemmBenchConfig(
             f"Ayla {matmul.label}", matmul.m, matmul.n, matmul.k, op,
             torch.bfloat16,
         ),
@@ -154,7 +154,7 @@ def main() -> int:
             )
             configs = [
                 ayla_config,
-                BenchGemmConfig(
+                GemmBenchConfig(
                     "cuBLAS", matmul.m, matmul.n, matmul.k, torch_mm_nt,
                     torch.bfloat16,
                 ),
