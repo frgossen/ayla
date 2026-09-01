@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from ..gpu_dialect import (
     BlockIdsOp,
     ForOp,
@@ -10,6 +12,7 @@ from ..gpu_dialect import (
     ThreadIdsOp,
     TileOp,
     WarpGroupIdOp,
+    is_elementwise,
 )
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
@@ -30,6 +33,17 @@ class TileMatmul(LoweringPass):
 
     Nesting order is outer→inner along the list.
 
+    The matmul is the hero: the dims name *its* axes, and everything else the
+    tiling touches is found from it. ``epilogue_label_filter`` opts
+    element-wise ops that consume its destination into the same tiling, so
+    they are cut to the same tile rather than left reading the whole tensor.
+    Left ``None``, no op is drawn in and only the matmul is tiled.
+
+    An epilogue joins every loop whose dim it shares and stays outside every
+    loop it does not: it has M and N but no K, so tiling K puts the matmul in
+    a loop and leaves the epilogue after it, running once per tile rather than
+    once per K step.
+
     ``allow_partial`` permits a non-divisible block-level tile by rounding the
     grid dimension up. Addressing remains full-tile; callers must use memory
     operations with defined out-of-bounds behavior, such as TMA.
@@ -42,10 +56,12 @@ class TileMatmul(LoweringPass):
         tile_levels: list[str],
         tile_labels: list[str | None],
         label_filter: str | None = None,
+        epilogue_label_filter: str | None = None,
         allow_partial: bool = False,
     ) -> None:
         super().__init__()
         self.label_filter = label_filter
+        self.epilogue_label_filter = epilogue_label_filter
         self.allow_partial = allow_partial
         if not (len(tile_dims) == len(tile_sizes) == len(tile_levels) == len(tile_labels)):
             raise ValueError(
@@ -73,7 +89,7 @@ class TileMatmul(LoweringPass):
         self.block_dim_constraints = [None, None, None]
         self.num_warp_groups_constraints = [None]
         for block in op.blocks:
-            self.lower_block(block)
+            self._rewrite_block(block)
         op.grid_dim = _resolve_launch_dim_constraints(
             op.grid_dim, self.grid_dim_constraints,
         )
@@ -85,18 +101,60 @@ class TileMatmul(LoweringPass):
         )
         return [op], []
 
-    @lowers(MatmulOp)
-    def lower_matmul(
-        self, op: MatmulOp,
-    ) -> tuple[list[Op], list[object]] | None:
-        if not self.tile_dims:
-            return None
-        if self.label_filter is not None and op.attrs.get("label") != self.label_filter:
-            return None
+    def _rewrite_block(self, block: Block) -> None:
+        """Replace each hero and the epilogue behind it with a tiled region.
 
-        lhs = self.value_map[op.lhs]
-        rhs = self.value_map[op.rhs]
-        dst = self.value_map[op.dst]
+        Nested blocks first, so a matmul already inside a loop from an earlier
+        tiling is rewritten before the loop holding it is rebuilt.
+        """
+        for op in block.ops:
+            for nested in op.blocks:
+                self._rewrite_block(nested)
+
+        ops = list(block.ops)
+        new_ops: list[Op] = []
+        i = 0
+        while i < len(ops):
+            op = ops[i]
+            if not self._is_hero(op):
+                new_ops.append(op)
+                i += 1
+                continue
+            epilogue = self._epilogue(ops, i)
+            new_ops.extend(self._tile(op, epilogue))
+            i += 1 + len(epilogue)
+        block.ops = new_ops
+
+    def _is_hero(self, op: Op) -> bool:
+        return isinstance(op, MatmulOp) and _label_matches(self.label_filter, op)
+
+    def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
+        """The ops directly behind ``ops[hero]`` that its tiling should absorb.
+
+        Contiguous only, and each has to earn its place: element-wise, opted
+        in by ``epilogue_label_filter``, and reading the hero's destination.
+        Anything else ends the run -- an op left where it is must not be
+        stepped over, or absorbing what follows would reorder the two.
+        """
+        found: list[Op] = []
+        dst = ops[hero].dst
+        i = hero + 1
+        while i < len(ops):
+            op = ops[i]
+            if self.epilogue_label_filter is None or not is_elementwise(op):
+                break
+            if not _label_matches(self.epilogue_label_filter, op):
+                break
+            # In place over the hero's destination is the only shape supported:
+            # one operand pattern, one set of dims, no broadcast to reason about.
+            if len(op.operands) != 2 or not all(v is dst for v in op.operands):
+                break
+            found.append(op)
+            i += 1
+        return found
+
+    def _tile(self, hero: MatmulOp, epilogue: list[Op]) -> list[Op]:
+        lhs, rhs, dst = hero.operands
 
         sizes_by_dim = {
             "M": lhs.type.sizes[0],
@@ -129,6 +187,7 @@ class TileMatmul(LoweringPass):
             ubs.append(ub)
             self._accumulate_constraint(tile_level, ub)
             sizes_by_dim[tile_dim] = tile_size
+
 
         new_ops: list[Op] = []
         block_ids_op: BlockIdsOp | None = None
@@ -170,6 +229,16 @@ class TileMatmul(LoweringPass):
                     f"TileMatmul: unexpected tile_level {tile_level!r}"
                 )
 
+        # The outermost loop over a dim the epilogue does not have. It belongs
+        # after that one, and so outside every loop nested in it.
+        outside_of = min(
+            (
+                i for i, dim in enumerate(self.tile_dims)
+                if dim not in ("M", "N") and self.tile_levels[i] == "for"
+            ),
+            default=None,
+        )
+
         body_ops: list[Op] = []
         ops, lhs = _build_tile_op(
             lhs, ["M", "K"],
@@ -185,18 +254,33 @@ class TileMatmul(LoweringPass):
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
-        ops, dst = _build_tile_op(
+        dst_ops, dst = _build_tile_op(
             dst, ["M", "N"],
             tile_dims=self.tile_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
-        body_ops.extend(ops)
+        # The destination is cut by M and N, never by K, so its tile stands
+        # outside the loops over K -- the same place the epilogue stands, and
+        # where it has to be for an epilogue there to name it. Only that far:
+        # M may be a `for` level too, and the tile reads its iv.
+        hoist_dst = outside_of is not None
+        if not hoist_dst:
+            body_ops.extend(dst_ops)
         body_ops.append(
-            MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs),
+            MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=hero.attrs),
         )
 
-        for iv, ub, level, label in zip(
+        tiled_epilogue = [
+            type(op)(operands=[dst, dst], results=[], attrs=op.attrs)
+            for op in epilogue
+        ]
+        if outside_of is None:
+            body_ops.extend(tiled_epilogue)
+            tiled_epilogue = []
+
+        for i, iv, ub, level, label in zip(
+            reversed(range(len(self.tile_levels))),
             reversed(ivs), reversed(ubs), reversed(self.tile_levels),
             reversed(self.tile_labels),
         ):
@@ -205,8 +289,15 @@ class TileMatmul(LoweringPass):
             body = Block(arguments=[iv], ops=body_ops)
             attrs = {"label": label} if label is not None else None
             body_ops = [ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)]
+            if i == outside_of:
+                if hoist_dst:
+                    body_ops[:0] = dst_ops
+                body_ops.extend(tiled_epilogue)
+                tiled_epilogue = []
+
+        assert not tiled_epilogue, "TileMatmul: epilogue was never placed"
         new_ops.extend(body_ops)
-        return new_ops, []
+        return new_ops
 
     def _accumulate_constraint(self, tile_level: str, ub: int) -> None:
         if tile_level == "for":
@@ -330,10 +421,18 @@ def tile_matmul(
     tile_levels: list[str],
     tile_labels: list[str | None],
     label_filter: str | None = None,
+    epilogue_label_filter: str | None = None,
     allow_partial: bool = False,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
         tile_dims, tile_sizes, tile_levels, tile_labels,
-        label_filter, allow_partial,
+        label_filter, epilogue_label_filter, allow_partial,
     ).run(module)
+
+
+def _label_matches(label_filter: str | None, op: Op) -> bool:
+    if label_filter is None:
+        return True
+    label = op.attrs.get("label")
+    return isinstance(label, str) and bool(re.fullmatch(label_filter, label))
