@@ -11,7 +11,7 @@ from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
 )
-from ayla.testing import assert_contains_in_order
+from tests.testing_utils import assert_contains_in_order
 
 
 def test_block_leader_barrier_requires_whole_warps():

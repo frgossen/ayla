@@ -10,9 +10,8 @@ from ayla.gemm import (
 )
 from ayla.gpu_dialect import TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
+from tests.testing_utils import requires_cuda
 
-
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 
 F32 = torch.float32
 BF16 = torch.bfloat16
