@@ -11,7 +11,7 @@ import textwrap
 
 from ..base.ir import Value
 from ..gpu_dialect import PTXTemplateOp, TmaDescType, gpu_dialect
-from .registry import register
+from .registry import register_gemm
 
 FASTCU_MATMUL_5_1_TEMPLATE = r'''.reg .pred 	%Kp<19>;
 	.reg .b16 	%Krs<129>;
@@ -1242,7 +1242,7 @@ $L__BB0_20:
 '''
 
 
-@register
+@register_gemm
 def fastcu_5_1_module():
     """4096x4096 bf16 matmul from pranjalssh/fast.cu ``matmul_5_1``.
 

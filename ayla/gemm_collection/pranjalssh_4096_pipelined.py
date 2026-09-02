@@ -2,10 +2,10 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from .registry import register
+from .registry import register_gemm
 
 
-@register
+@register_gemm
 def pranjalssh_4096_pipelined_module():
     module_str = textwrap.dedent("""\
         module {

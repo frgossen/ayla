@@ -12,10 +12,11 @@ from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
 from ..passes.tile_matmul import tile_matmul
 from ..passes.unroll_loop import unroll_loop
+from ..torch_custom_call import OperandKind
 from .registry import register
 
 
-@register
+@register(OperandKind.R, OperandKind.R, OperandKind.RESULT)
 def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     """auto_matmul_4096_wgmma256_wg with sigmoid applied to the result.
 

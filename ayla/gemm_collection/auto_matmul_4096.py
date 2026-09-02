@@ -12,10 +12,10 @@ from ..passes.promote_buffers import promote_buffers
 from ..passes.schedule_async import schedule_async
 from ..passes.tile_matmul import tile_matmul
 from ..passes.unroll_loop import unroll_loop
-from .registry import register
+from .registry import register_gemm
 
 
-@register
+@register_gemm
 def auto_matmul_4096_module():
     """4096x4096 bf16 matmul built from high-level tiling passes (wgmma m64n128k16).
 

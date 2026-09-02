@@ -2,10 +2,10 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from .registry import register
+from .registry import register_gemm
 
 
-@register
+@register_gemm
 def naive_matmul_4096_loop_module():
     """Naive per-thread 4096x4096 f32 matmul using tile + move + fma."""
     module_str = textwrap.dedent("""\
