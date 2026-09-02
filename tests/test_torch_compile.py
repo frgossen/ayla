@@ -40,3 +40,32 @@ def test_a_matmul_goes_through_ayla_iff_covered(shape, claimed):
         assert "reinterpret_tensor" in code
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
+def test_a_biased_matmul_goes_through_ayla():
+    """A ``Linear`` with a bias reaches Inductor as addmm, and ayla claims it.
+
+    Worth its own test: the collection covering the shape is not enough if the
+    op carrying it is one we never registered for.
+    """
+    torch.manual_seed(0)
+    m = k = n = 4096
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda")
+
+    def fn(x, w, bias):
+        return torch.nn.functional.linear(x, w, bias)
+
+    expected = fn(x, w, bias)
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        compiled = torch.compile(fn, dynamic=False)
+        actual, (code,) = run_and_get_code(compiled, x, w, bias)
+
+    assert "extern_kernels.ayla_" in code
+    # ayla displaced the built-in path rather than sitting beside it.
+    assert "extern_kernels.addmm(" not in code
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
