@@ -2,12 +2,12 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from .registry import register
+from .registry import register_gemm
 
 
 # Based on https://github.com/pranjalssh/fast.cu/blob/main/examples/matmul/matmul_3.cuh
 # BM=128, BN=128, BK=64, 128 threads.
-@register
+@register_gemm
 def loop_8x8_matmul_4096_module():
     return gpu_dialect.parse(textwrap.dedent("""\
         module {

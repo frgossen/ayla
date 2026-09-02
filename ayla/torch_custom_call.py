@@ -67,8 +67,9 @@ def make_torch_custom_call(
     signature_mapping: list[OperandKind],
     *,
     namespace: str = DEFAULT_NAMESPACE,
+    name: str | None = None,
 ) -> torch._ops.OpOverload:
-    op_name = launcher.name
+    op_name = name or launcher.name
     schema = _make_schema(op_name, signature_mapping)
 
     lib = _get_library(namespace)

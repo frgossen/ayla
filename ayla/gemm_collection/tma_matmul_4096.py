@@ -2,10 +2,10 @@
 import textwrap
 
 from ..gpu_dialect import gpu_dialect
-from .registry import register
+from .registry import register_gemm
 
 
-@register
+@register_gemm
 def tma_matmul_4096_module():
     """4096x4096 f32 matmul using TMA loads.
 
