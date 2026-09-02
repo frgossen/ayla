@@ -16,6 +16,10 @@ from ..torch_custom_call import OperandKind
 from .registry import register
 
 
+@register(
+    OperandKind.R, OperandKind.R, OperandKind.RW,
+    op_name="auto_matmul_4096_wgmma256_wg_sigmoid_out",
+)
 @register(OperandKind.R, OperandKind.R, OperandKind.RESULT)
 def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     """auto_matmul_4096_wgmma256_wg with sigmoid applied to the result.
