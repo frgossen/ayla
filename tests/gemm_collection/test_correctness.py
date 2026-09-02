@@ -141,6 +141,12 @@ def test_lhs_l2_promotion_reaches_tma_descriptor():
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles",
         ),
         pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2,
+            BF16,
+            None,
+            id="auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2",
+        ),
+        pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2,
             BF16,
             None,
@@ -191,3 +197,28 @@ def test_gemm_correctness(op, dtype, epilogue, seed):
     c.fill_(float("nan"))
     a.fill_(float("nan"))
     b.fill_(float("nan"))
+
+
+def test_every_registered_kernel_is_covered():
+    """Nothing lands in the collection without a case above.
+
+    That list is hand-written, so a new kernel is exercised only if whoever
+    added it remembered to. `register` validates nothing about the kernel it
+    builds, which leaves these cases as the only thing between a faulty one
+    and the collection.
+    """
+    parametrize = next(
+        mark for mark in test_gemm_correctness.pytestmark
+        if mark.args and mark.args[0] == "op,dtype,epilogue"
+    )
+    covered = {param.id for param in parametrize.args[1]}
+    registered = {
+        name
+        for name in dir(ayla)
+        if isinstance(getattr(ayla, name), torch._ops.OpOverloadPacket)
+        # The destination-passing forms take a buffer to write into, so
+        # `op(a, b)` is the wrong shape for them; the torch.compile backend
+        # covers those where it uses them.
+        and getattr(ayla, name).default._schema.returns
+    }
+    assert registered <= covered, f"not exercised: {sorted(registered - covered)}"
