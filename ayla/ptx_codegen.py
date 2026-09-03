@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import pytree
-from .base.ir import Op, Printer, Value
+from .base.ir import Op, Printer, Value, find_ops
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
+    BarrierOp,
     BlockIdsOp,
     ForOp,
     GmemTensorType,
@@ -267,6 +268,7 @@ class PtxKernel:
     block_dim: tuple[int, int, int]
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
+    requires_resident_grid: bool = False
 
 
 def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
@@ -286,6 +288,10 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
+    requires_resident_grid = any(
+        isinstance(op, BarrierOp) and op.scope == "grid"
+        for op in find_ops(kernel, lambda op: isinstance(op, BarrierOp))
+    )
 
     module = PtxLoweringPipeline().run(module)
 
@@ -302,6 +308,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         grid_dim=grid_dim,
         block_dim=block_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
+        requires_resident_grid=requires_resident_grid,
     )
 
 

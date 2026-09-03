@@ -192,11 +192,17 @@ class LowerToPtxTemplate(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
+        self.grid_size: int | None = None
 
     @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
+        self.grid_size = (
+            None
+            if all(dim is None for dim in op.grid_dim)
+            else math.prod(dim if dim is not None else 1 for dim in op.grid_dim)
+        )
         # TODO: Materialize cache policies in an earlier pass, potentially
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({
@@ -945,6 +951,8 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower a cross-thread ordering fence."""
         scope = op.attrs.get("scope")
+        operands: list[Value] = []
+        operand_names: list[str] = []
         if scope == "thread":
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
@@ -960,15 +968,45 @@ class LowerToPtxTemplate(LoweringPass):
                 @${{pred:bl_w0}} bar.sync {bar_id}, {num_threads};
                 @!${{pred:bl_w0}} bar.arrive {bar_id}, {num_threads};
                 """)
+        elif scope == "grid":
+            if op.sync is None:
+                raise ValueError("grid barrier requires a synchronization buffer")
+            if self.grid_size is None:
+                raise ValueError(
+                    "grid barrier requires a resolved enclosing kernel grid"
+                )
+            sync = self.value_map[op.sync]
+            assert isinstance(sync, Value)
+            template = textwrap.dedent(f"""\
+                mov.u32 ${{b32:grid_tid}}, %tid.x;
+                setp.ne.u32 ${{pred:grid_not_leader}}, ${{b32:grid_tid}}, 0;
+                @${{pred:grid_not_leader}} bra ${{label:grid_after_leader}};
+                ld.acquire.gpu.global.u32 ${{b32:grid_sense}}, [${{b64:operand.sync.ptr}}+4];
+                atom.acq_rel.gpu.global.inc.u32 ${{b32:grid_ticket}}, [${{b64:operand.sync.ptr}}], {self.grid_size - 1};
+                setp.eq.u32 ${{pred:grid_last}}, ${{b32:grid_ticket}}, {self.grid_size - 1};
+                @!${{pred:grid_last}} bra ${{label:grid_wait}};
+                xor.b32 ${{b32:grid_seen}}, ${{b32:grid_sense}}, 1;
+                st.release.gpu.global.u32 [${{b64:operand.sync.ptr}}+4], ${{b32:grid_seen}};
+                bra ${{label:grid_done}};
+                ${{label:grid_wait}}:
+                ld.acquire.gpu.global.u32 ${{b32:grid_seen}}, [${{b64:operand.sync.ptr}}+4];
+                setp.eq.u32 ${{pred:grid_spinning}}, ${{b32:grid_seen}}, ${{b32:grid_sense}};
+                @${{pred:grid_spinning}} bra ${{label:grid_wait}};
+                ${{label:grid_done}}:
+                ${{label:grid_after_leader}}:
+                bar.sync 0;
+                """)
+            operands = [sync]
+            operand_names = ["sync"]
         else:
             raise NotImplementedError(
                 f"lower_barrier: unsupported barrier scope {scope!r}"
             )
         new_op = PTXTemplateOp.build(
-            operands=[],
+            operands=operands,
             result_types=[],
             template=template,
-            operand_names=[],
+            operand_names=operand_names,
             result_names=[],
             description=str(op),
         )

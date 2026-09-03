@@ -49,3 +49,27 @@ def test_ptx_lowering_verification_rejects_dynamic_shapes():
 def test_ptx_codegen_verifies_static_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
         make_ptx_kernel(_dynamic_matmul_module())
+
+
+def test_verification_rejects_parsed_grid_barrier_without_sync():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            barrier() attrs={scope: "grid"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="grid scope requires one sync operand"):
+        verify_gpu_dialect(module)
+
+
+def test_verification_rejects_undersized_grid_barrier_sync():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%sync: gmem<1xf32>) {
+            barrier(%sync: gmem<1xf32>) attrs={scope: "grid"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="at least 8 bytes"):
+        verify_gpu_dialect(module)

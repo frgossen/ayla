@@ -694,8 +694,9 @@ class AwaitOp(Op):
 class BarrierOp(Op):
     """A rendezvous / synchronization point across a set of threads.
 
-    Carries no data and has no lock — it only establishes a happens-before
-    across its participating threads.
+    It only establishes a happens-before across its participating threads.
+    Hardware-backed scopes need no operand; a software grid barrier carries
+    the global-memory synchronization buffer used by its lowering.
 
     The ``scope`` attribute records the participant set the sync spans, one of:
     ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``, ``grid``.
@@ -705,13 +706,23 @@ class BarrierOp(Op):
     def build(
         cls,
         scope: str = "block",
+        sync: Value | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "BarrierOp":
-        return cls(operands=[], results=[], attrs={"scope": scope, **(attrs or {})})
+        if attrs is not None and "scope" in attrs:
+            raise ValueError("BarrierOp: pass scope as an explicit argument")
+        return cls(
+            operands=[] if sync is None else [sync],
+            results=[], attrs={"scope": scope, **(attrs or {})},
+        )
 
     @property
     def scope(self) -> str:
         return self.attrs["scope"]  # type: ignore[return-value]
+
+    @property
+    def sync(self) -> Value | None:
+        return self.operands[0] if self.operands else None
 
 
 @gpu_dialect.register_op("if")

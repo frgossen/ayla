@@ -41,12 +41,17 @@ def test_preexisting_barrier_updates_dataflow_state():
         )))
 
     # Scheduling passes may author structural barriers before InsertSyncs. The
-    # grid barrier discharges the effect, so the pass must not insert another.
+    # grid barrier discharges that effect and gets an explicit block arrival
+    # before its leader-issued software protocol.
     module = gpu_dialect.parse(textwrap.dedent(
         source.replace("__SCOPE__", "grid"),
     ))
     insert_syncs(module)
-    assert repr(module).count("barrier()") == 1
+    assert_contains_in_order(
+        repr(module),
+        'barrier() attrs={scope: "block"}',
+        'barrier() attrs={scope: "grid"}',
+    )
 
 
 def test_war_on_shared_buffer_gets_barrier():

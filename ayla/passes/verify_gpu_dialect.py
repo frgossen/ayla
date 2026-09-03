@@ -5,7 +5,14 @@ from enum import Enum, auto
 
 from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
-from ..gpu_dialect import MatmulOp, MemTensorType, ModuleOp, TmaDescType
+from ..gpu_dialect import (
+    BarrierOp,
+    GmemTensorType,
+    MatmulOp,
+    MemTensorType,
+    ModuleOp,
+    TmaDescType,
+)
 
 
 class VerificationStage(Enum):
@@ -29,6 +36,25 @@ class VerifyGpuDialect(VerificationPass):
         self, stage: VerificationStage = VerificationStage.DEFAULT,
     ) -> None:
         super().__init__(stage)
+
+    @verifies(BarrierOp)
+    def _verify_barrier(self, op: BarrierOp) -> None:
+        scope = op.attrs.get("scope")
+        expected_operands = 1 if scope == "grid" else 0
+        if len(op.operands) != expected_operands:
+            requirement = "one sync operand" if expected_operands else "no operands"
+            raise ValueError(f"BarrierOp: {scope} scope requires {requirement}")
+        if scope == "grid":
+            sync_type = op.operands[0].type
+            if not isinstance(sync_type, GmemTensorType):
+                raise ValueError("BarrierOp: grid sync must be global memory")
+            if (
+                sync_type.num_elements is not None
+                and sync_type.num_elements * sync_type.dtype.byte_size < 8
+            ):
+                raise ValueError(
+                    "BarrierOp: grid sync must contain at least 8 bytes"
+                )
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:

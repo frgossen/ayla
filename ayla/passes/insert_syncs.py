@@ -4,6 +4,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 
+from ..base.ir import Block, Op, Value, find_op
+from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
@@ -17,8 +19,6 @@ from ..gpu_dialect import (
     is_side_effect_free,
     memory_effects,
 )
-from ..base.ir import Block, Op, Value, find_op
-from ..base.pipeline import Pass
 
 
 class BarrierScope(enum.IntEnum):
@@ -252,6 +252,11 @@ def _analyze(
             scope = BarrierScope[op.scope.upper()]
         except KeyError as error:
             raise ValueError(f"unknown barrier scope {op.scope!r}") from error
+        # Only thread 0 executes the software grid protocol. Rendezvous the CTA
+        # first so it cannot publish arrival before every thread has completed
+        # its pre-barrier work.
+        if scope == BarrierScope.GRID:
+            targets[op] = BarrierTarget(BarrierScope.BLOCK)
         return _after_barrier(live, scope)
     if is_side_effect_free(op):
         return live
