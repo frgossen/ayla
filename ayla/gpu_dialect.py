@@ -400,22 +400,27 @@ class TileOp(Op):
 
 @gpu_dialect.register_op("elementwise")
 class ElementwiseOp(Op):
-    """One scalar function over each element: elementwise(dst, src).
+    """One scalar function over each element.
 
     ``fn`` names the function -- an attribute, not an op each, since exp,
     tanh, relu and the rest differ only in the instructions they lower to.
 
     Source and destination types may differ. ``convert`` performs only the
     element-wise dtype conversion; other functions may convert their result
-    to the destination dtype implicitly. Passing the same value as both
-    operands computes in place.
+    to the destination dtype implicitly. Unary functions use
+    ``elementwise(dst, src)`` and binary functions use
+    ``elementwise(dst, lhs, rhs)``. Passing the same value as destination and
+    source computes in place.
 
-    TODO: generalize to several sources and destinations. One of each admits
-    only unary functions -- add, mul and select need more than one input, and
-    a lowering may want to produce more than one value at a time.
+    TODO: generalize to several destinations.
     """
 
-    FUNCTIONS: ClassVar[tuple[str, ...]] = ("convert", "sigmoid")
+    # Function name -> (number of sources, number of destinations).
+    FUNCTION_ARITIES: ClassVar[dict[str, tuple[int, int]]] = {
+        "convert": (1, 1),
+        "sigmoid": (1, 1),
+        "mul": (2, 1),
+    }
 
     @classmethod
     def build(
@@ -423,15 +428,27 @@ class ElementwiseOp(Op):
         dst: Value,
         src: Value,
         fn: str,
+        rhs: Value | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "ElementwiseOp":
-        if fn not in cls.FUNCTIONS:
+        arity = cls.FUNCTION_ARITIES.get(fn)
+        if arity is None:
             raise ValueError(
                 f"elementwise: unknown fn {fn!r}; expected one of "
-                f"{', '.join(cls.FUNCTIONS)}"
+                f"{', '.join(cls.FUNCTION_ARITIES)}"
+            )
+        sources = [src] + ([] if rhs is None else [rhs])
+        expected_sources, expected_destinations = arity
+        actual_arity = (len(sources), 1)
+        if actual_arity != arity:
+            raise ValueError(
+                f"elementwise: {fn} expects {expected_sources} source and "
+                f"{expected_destinations} destination operand(s); got "
+                f"{actual_arity[0]} and {actual_arity[1]}"
             )
         return cls(
-            operands=[dst, src], results=[], attrs={"fn": fn, **(attrs or {})},
+            operands=[dst, *sources], results=[],
+            attrs={"fn": fn, **(attrs or {})},
         )
 
     @property
@@ -441,6 +458,10 @@ class ElementwiseOp(Op):
     @property
     def src(self) -> Value:
         return self.operands[1]
+
+    @property
+    def srcs(self) -> list[Value]:
+        return self.operands[1:]
 
     @property
     def fn(self) -> str:
@@ -1953,8 +1974,11 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
                 ("R", dst, CollectiveScope.THREAD),
                 ("W", dst, CollectiveScope.THREAD)]
     if isinstance(op, ElementwiseOp):
-        return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
-                ("R", root_buffer(op.src), CollectiveScope.THREAD)]
+        return [
+            ("W", root_buffer(op.dst), CollectiveScope.THREAD),
+            *(("R", root_buffer(src), CollectiveScope.THREAD)
+              for src in op.srcs),
+        ]
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.

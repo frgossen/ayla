@@ -17,6 +17,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BarrierOp,
     BF16Type,
+    ElementwiseOp,
     F32Type,
     ForOp,
     IfOp,
@@ -29,6 +30,7 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    WrmemTensorType,
     gpu_dialect,
     root_buffer,
 )
@@ -182,6 +184,20 @@ def test_index_lt_op():
         IndexLtOp.build(not_index, rhs)
     with pytest.raises(AssertionError, match="expected IndexType rhs"):
         IndexLtOp.build(lhs, not_index)
+
+
+def test_elementwise_mul_requires_two_sources():
+    typ = WrmemTensorType.build(
+        (64, 64), F32Type(), warps=4, layout="wgmma_layout_0",
+    )
+    dst = Value(name="dst", type=typ)
+    lhs = Value(name="lhs", type=typ)
+    rhs = Value(name="rhs", type=typ)
+
+    op = ElementwiseOp.build(dst, lhs, "mul", rhs=rhs)
+    assert op.srcs == [lhs, rhs]
+    with pytest.raises(ValueError, match="expects 2 source"):
+        ElementwiseOp.build(dst, lhs, "mul")
 
 
 def test_async_op():

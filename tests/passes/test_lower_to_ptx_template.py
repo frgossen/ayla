@@ -346,3 +346,23 @@ def test_lower_elementwise_uses_root_registers_for_wrmem_view():
         rcp.approx.f32 ${f32:operand.dst.r96}, ${f32:operand.dst.r96};
         mul.f32 ${f32:operand.dst.r97}, ${f32:operand.src.r97}, 0fBFB8AA3B;
     """)
+def test_lower_elementwise_mul():
+    w = 'wrmem<16x8xf32 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %lhs: {w} = alloc() attrs={{id: 0}}
+            %rhs: {w} = alloc() attrs={{id: 1}}
+            elementwise(%lhs: {w}, %lhs: {w}, %rhs: {w}) attrs={{fn: "mul"}}
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda o: isinstance(o, PTXTemplateOp)
+    )[-1].attrs["template"]
+    assert template == "".join(
+        f"mul.f32 ${{f32:operand.dst.r{reg}}}, "
+        f"${{f32:operand.src.r{reg}}}, ${{f32:operand.rhs.r{reg}}};\n"
+        for reg in range(4)
+    )
