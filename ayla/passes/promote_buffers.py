@@ -19,6 +19,8 @@ Example — promote lhs/rhs to smem::
 
 from __future__ import annotations
 
+from ..base.ir import Block, Op, Value, clone_type
+from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
@@ -46,8 +48,6 @@ from ..gpu_dialect import (
     WrmemTensorType,
     is_elementwise,
 )
-from ..base.ir import Block, Op, Value, clone_type
-from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
 
 
@@ -221,6 +221,10 @@ class PromoteBuffers(LoweringPass):
         Extra move attributes by operand, such as a TMA ``l2_cache_hint``.
     writeback_slices, writeback_buffers : int
         Number of TMA output slices and SMEM staging arenas.
+    unsafe_reuse_smem : bool
+        Mark shared allocations by their asserted compute/writeback lifetime
+        so a later arena-packing pass may overlay their storage. This is unsafe:
+        no analysis verifies that differently named groups are non-overlapping.
     tma_load_slices : dict[str, int] or None
         Leading-dimension TMA load slices by operand.
     """
@@ -240,6 +244,7 @@ class PromoteBuffers(LoweringPass):
         move_attrs: dict[str, dict[str, object]] | None = None,
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
+        unsafe_reuse_smem: bool = False,
         tma_load_slices: dict[str, int] | None = None,
         label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
@@ -257,6 +262,7 @@ class PromoteBuffers(LoweringPass):
             move_attrs=dict(move_attrs or {}),
             writeback_slices=writeback_slices,
             writeback_buffers=writeback_buffers,
+            unsafe_reuse_smem=unsafe_reuse_smem,
             tma_load_slices=dict(tma_load_slices or {}),
             label_filter=label_filter,
             epilogue_label_filter=epilogue_label_filter,
@@ -303,7 +309,12 @@ class PromoteBuffers(LoweringPass):
         """The label identifying the buffer promoted for one matmul operand."""
         if matmul_label is None:
             return {}
-        return {"label": f"{matmul_label}_{operand_name}_{self.target_type}"}
+        attrs: dict[str, object] = {
+            "label": f"{matmul_label}_{operand_name}_{self.target_type}",
+        }
+        if self.unsafe_reuse_smem and self.target_type == "smem":
+            attrs["reuse_group"] = f"{matmul_label}_compute"
+        return attrs
 
     def _build_move_attrs(
         self, matmul_label: str | None, operand_name: str, allow_nc: bool = True
@@ -433,8 +444,12 @@ class PromoteBuffers(LoweringPass):
         smem_type = self._build_smem_type(
             smem_sizes, block_dst.type.dtype,
         )
+        attrs = (
+            {"reuse_group": f"{matmul_label}_writeback"}
+            if self.unsafe_reuse_smem and matmul_label is not None else None
+        )
         smems = [
-            AllocOp.build_with_fresh_id(smem_type)
+            AllocOp.build_with_fresh_id(smem_type, attrs=attrs)
             for _ in range(self.writeback_buffers)
         ]
         new_ops: list[Op] = list(smems)
@@ -641,6 +656,7 @@ def promote_buffers(
     move_attrs: dict[str, dict[str, object]] | None = None,
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
+    unsafe_reuse_smem: bool = False,
     tma_load_slices: dict[str, int] | None = None,
     label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
@@ -659,6 +675,7 @@ def promote_buffers(
         move_attrs=move_attrs,
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
+        unsafe_reuse_smem=unsafe_reuse_smem,
         tma_load_slices=tma_load_slices,
         label_filter=label_filter,
         epilogue_label_filter=epilogue_label_filter,

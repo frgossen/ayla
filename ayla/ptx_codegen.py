@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import pytree
+from .base.ir import Op, Printer, Value
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdsOp,
+    ForOp,
     GmemTensorType,
+    IfOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
@@ -17,30 +20,28 @@ from .gpu_dialect import (
     IndexModOp,
     IndexMulOp,
     IndexType,
-    IfOp,
     KernelOp,
-    ForOp,
+    LaneIdOp,
     LockType,
     ModuleOp,
-    PTXTemplateOp,
+    PredicateType,
     PtrAddOp,
     PtrType,
-    PredicateType,
+    PTXTemplateOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
     TmaDescType,
     ToPtrOp,
-    LaneIdOp,
     WarpGroupIdOp,
     WrmemTensorType,
 )
-from .base.ir import Op, Printer, Value
 from .passes.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
-from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
+from .passes.lower_to_tma_move import LowerToTmaMove
+from .passes.pack_smem_allocs import ReuseSmemAllocs
 from .passes.verify_gpu_dialect import VerificationStage, VerifyGpuDialect
 
 
@@ -56,6 +57,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
+        self.add_pass(ReuseSmemAllocs())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(Canonicalize())
 

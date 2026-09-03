@@ -1,7 +1,8 @@
 """Tests for the promote_buffers pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import AllocOp, gpu_dialect
 from ayla.passes.promote_buffers import promote_buffers
 
 
@@ -58,6 +59,41 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
             move(%5: gmem<64x128xbf16 strides=[256, 1]>, %3: smem<64x128xbf16>) attrs={label: "mm_dst_tma", tma: True}
           }
         }""")
+
+
+def test_promotions_can_mark_unsafe_smem_reuse_groups():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
+          }
+        }"""))
+    promote_buffers(
+        module, target_type="smem", operands=["lhs", "rhs"],
+        swizzle="128B", tma=True, unsafe_reuse_smem=True, label_filter="mm",
+    )
+    assert {
+        op.attrs.get("reuse_group")
+        for op in find_ops(module, lambda op: isinstance(op, AllocOp))
+    } == {"mm_compute"}
+
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
+          }
+        }"""))
+    promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True,
+        writeback_slices=2, writeback_buffers=2, unsafe_reuse_smem=True,
+        label_filter="mm",
+    )
+    assert {
+        op.attrs.get("reuse_group")
+        for op in find_ops(module, lambda op: isinstance(op, AllocOp))
+        if op.attrs.get("reuse_group") is not None
+    } == {"mm_writeback"}
 
 
 def test_wrmem_tma_writeback_propagates_destination_move_attrs():
