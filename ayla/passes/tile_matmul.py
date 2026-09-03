@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
@@ -257,21 +259,21 @@ class TileMatmul(LoweringPass):
         )
 
         body_ops: list[Op] = []
-        ops, lhs = _build_tile_op(
+        ops, lhs = build_tile_ops(
             lhs, ["M", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
-        ops, rhs = _build_tile_op(
+        ops, rhs = build_tile_ops(
             rhs, ["N", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
-        dst_ops, dst = _build_tile_op(
+        dst_ops, dst = build_tile_ops(
             dst, ["M", "N"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
@@ -364,6 +366,36 @@ class TileMatmul(LoweringPass):
             )
 
 
+def build_persistent_grid(
+    *,
+    logical_tiles: int,
+    resident_blocks: int,
+    build_tile: Callable[[Value], list[Op]],
+) -> list[Op]:
+    """Map a logical 1D iteration space onto a fixed block grid."""
+    if logical_tiles <= 0 or resident_blocks <= 0:
+        raise ValueError("logical_tiles and resident_blocks must be positive")
+    block_ids = BlockIdsOp.build()
+    waves = (logical_tiles + resident_blocks - 1) // resident_blocks
+
+    def guarded(linear: Value) -> list[Op]:
+        body = build_tile(linear)
+        if logical_tiles % resident_blocks == 0:
+            return body
+        limit = IndexConstantOp.build(logical_tiles)
+        condition = IndexLtOp.build(linear, limit.result())
+        return [limit, condition, IfOp.build(condition.result(), Block(ops=body))]
+
+    loop = ForOp.build(0, waves)
+    grid = IndexConstantOp.build(resident_blocks)
+    offset = IndexMulOp.build(loop.iv, grid.result())
+    linear = IndexAddOp.build(block_ids.x, offset.result())
+    loop.body.ops = [grid, offset, linear, *guarded(linear.result())]
+    if waves > 1:
+        loop.body.append(BarrierOp.build("block"))
+    return [block_ids, loop]
+
+
 def _resolve_launch_dim_constraints(
     a_list: list[int | None], b_list: list[int | None],
 ) -> list[int | None]:
@@ -388,7 +420,7 @@ def _resolve_launch_dim_constraints(
     return result
 
 
-def _build_tile_op(
+def build_tile_ops(
     arg: Value,
     dim_names: list[str],
     *,
@@ -403,11 +435,11 @@ def _build_tile_op(
     multiple times (e.g. K=64 then K=16).
     """
     assert len(dim_names) == len(arg.type.sizes), (
-        f"_build_tile_op: dim_names ({dim_names}) must have one entry "
+        f"build_tile_ops: dim_names ({dim_names}) must have one entry "
         f"per arg dim ({arg.type.sizes})"
     )
     assert len(op_dims) == len(tile_idxs) == len(tile_sizes), (
-        "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the "
+        "build_tile_ops: op_dims, tile_idxs, tile_sizes must have the "
         "same length"
     )
     name_to_idx = {n: i for i, n in enumerate(dim_names)}
@@ -499,30 +531,19 @@ def tile_persistent_matmul(
     tiles_m = outer.trip_count
     tiles_n = inner.trip_count
     logical_tiles = tiles_m * tiles_n
-    block_ids = BlockIdsOp.build()
-    waves = (logical_tiles + resident_blocks - 1) // resident_blocks
-    loop = ForOp.build(0, waves)
-    grid = IndexConstantOp.build(resident_blocks)
-    offset = IndexMulOp.build(loop.iv, grid.result())
-    linear = IndexAddOp.build(block_ids.x, offset.result())
-    tile_count_n = IndexConstantOp.build(tiles_n)
-    tile_m = IndexDivOp.build(linear.result(), tile_count_n.result())
-    tile_n = IndexModOp.build(linear.result(), tile_count_n.result())
-    vmap = {outer.iv: tile_m.result(), inner.iv: tile_n.result()}
-    tiled_ops = [clone_op(op, vmap) for op in inner.body.ops]
-    tile_body: list[Op] = [tile_count_n, tile_m, tile_n, *tiled_ops]
-    loop.body.ops = [grid, offset, linear]
-    if logical_tiles % resident_blocks:
-        limit = IndexConstantOp.build(logical_tiles)
-        condition = IndexLtOp.build(linear.result(), limit.result())
-        loop.body.ops.extend([
-            limit, condition,
-            IfOp.build(condition.result(), Block(ops=tile_body)),
-        ])
-    else:
-        loop.body.ops.extend(tile_body)
-    if waves > 1:
-        loop.body.append(BarrierOp.build("block"))
-    kernel.body.ops[hero_index:hero_index + 1] = [block_ids, loop]
+
+    def build_tile(linear: Value) -> list[Op]:
+        tile_count_n = IndexConstantOp.build(tiles_n)
+        tile_m = IndexDivOp.build(linear, tile_count_n.result())
+        tile_n = IndexModOp.build(linear, tile_count_n.result())
+        vmap = {outer.iv: tile_m.result(), inner.iv: tile_n.result()}
+        tiled_ops = [clone_op(op, vmap) for op in inner.body.ops]
+        return [tile_count_n, tile_m, tile_n, *tiled_ops]
+
+    kernel.body.ops[hero_index:hero_index + 1] = build_persistent_grid(
+        logical_tiles=logical_tiles,
+        resident_blocks=resident_blocks,
+        build_tile=build_tile,
+    )
     kernel.grid_dim = grid_dim
     return module
