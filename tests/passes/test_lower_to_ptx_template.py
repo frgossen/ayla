@@ -130,9 +130,33 @@ def test_lower_tile_uses_the_reinterpreted_view_strides():
     assert tile.byte_offset.definition.value == 32
 
 
-def test_lower_barrier_unsupported_scope_raises():
-    with pytest.raises(NotImplementedError):
-        _lower_barrier("grid")
+def test_grid_barrier_requires_a_sync_buffer():
+    with pytest.raises(ValueError, match="synchronization buffer"):
+        module = gpu_dialect.parse(textwrap.dedent("""\
+            module {
+              kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+                barrier() attrs={scope: "grid"}
+              }
+            }"""))
+        lower_to_ptx_template(module)
+
+
+def test_grid_barrier_uses_last_arriver_to_release_waiters():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%sync: gmem<2xf32>) grid_dim=[8, 1, 1] block_dim=[128, 1, 1] {
+            barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}
+          }
+        }"""))
+    lower_to_ptx_template(module)
+    template = find_ops(
+        module, lambda op: isinstance(op, PTXTemplateOp),
+    )[0].attrs["template"]
+    assert template.count("bar.sync 0;") == 2
+    assert "atom.acq_rel.gpu.global.inc.u32" in template
+    assert "setp.eq.u32 ${pred:grid_last}, ${b32:grid_ticket}, 7;" in template
+    assert "cp.async.bulk.wait_group" not in template
+    assert "grid_count_wait" not in template
 
 
 def test_lower_tma_load_with_l2_cache_hint():
