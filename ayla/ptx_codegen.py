@@ -259,24 +259,12 @@ class PtxKernel:
     ptx_optimization_level: int | None = None
 
 
-def _resolve_block_dim(kernel: KernelOp) -> None:
-    """Materialize the kernel's PTX launch dimensions."""
-    if all(dim is None for dim in kernel.block_dim):
-        raise ValueError(
-            f"make_ptx_kernel: block_dim is entirely unset: {kernel.block_dim}"
-        )
-    kernel.block_dim = tuple(
-        dim if dim is not None else 1 for dim in kernel.block_dim
-    )
-
-
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
     top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    _resolve_block_dim(kernel)
 
     module = PtxLoweringPipeline().run(module)
 

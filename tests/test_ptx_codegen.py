@@ -69,7 +69,7 @@ def test_codegen_cwise_add():
         }""")
 
 
-def test_codegen_materializes_block_dim_before_lowering():
+def test_lowering_materializes_implicit_block_dimensions():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, None, None] num_warp_groups=1 {

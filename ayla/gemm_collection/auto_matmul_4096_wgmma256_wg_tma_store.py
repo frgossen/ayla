@@ -1,7 +1,7 @@
 """Registered variants of the configurable pipelined TMA GEMM."""
 
-from ..gemm import auto_matmul_4096_wgmma256_wg_tma_store_module
 from ..passes.pack_smem_allocs import pack_smem_allocs
+from .gemm import auto_matmul_4096_wgmma256_wg_tma_store_module
 from .registry import register_gemm
 
 

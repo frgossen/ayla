@@ -1,25 +1,24 @@
-"""Configurable GEMM module builders."""
+"""Configurable GEMM module builders used by collection entries."""
 import textwrap
 
-from .base.pipeline import Pipeline
-from .gpu_dialect import ModuleOp, gpu_dialect
-from .passes.canonicalize import Canonicalize
-from .passes.fuse_async import FuseAsync
-from .passes.licm import LICM
-from .passes.lower_to_async import LowerToAsync
-from .passes.multi_buffer import MultiBuffer
-from .passes.pipeline_loop import PipelineLoop
-from .passes.promote_buffers import PromoteBuffers
-from .passes.schedule_async import ScheduleAsync
-from .passes.tile_matmul import TileMatmul
-from .passes.unroll_loop import UnrollLoop
+from ..base.ir import find_ops
+from ..base.pipeline import Pipeline
+from ..gpu_dialect import KernelOp, MatmulOp, ModuleOp, gpu_dialect
+from ..passes.canonicalize import Canonicalize
+from ..passes.fuse_async import FuseAsync
+from ..passes.licm import LICM
+from ..passes.lower_to_async import LowerToAsync
+from ..passes.multi_buffer import MultiBuffer
+from ..passes.pipeline_loop import PipelineLoop
+from ..passes.promote_buffers import PromoteBuffers
+from ..passes.schedule_async import ScheduleAsync
+from ..passes.tile_matmul import TileMatmul
+from ..passes.unroll_loop import UnrollLoop
 
 
-def auto_matmul_4096_wgmma256_wg_tma_store_module(
-    *, problem_size: int = 4096,
-    m: int | None = None,
-    n: int | None = None,
-    k: int | None = None,
+def schedule_matmul(
+    module: ModuleOp,
+    *,
     output_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
@@ -35,62 +34,49 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
-    ptx_optimization_level: int | None = None,
 ) -> ModuleOp:
+    """Apply the configurable WGMMA schedule to one concrete matmul.
+
+    Keeping scheduling separate from module construction lets the JIT first
+    specialize a dynamic template, then reuse the static collection's passes.
+    """
+    [kernel] = module.body.ops
+    if not isinstance(kernel, KernelOp):
+        raise ValueError("schedule_matmul requires exactly one kernel")
+    matmuls = find_ops(module, lambda op: isinstance(op, MatmulOp))
+    if len(matmuls) != 1:
+        raise ValueError("schedule_matmul requires exactly one matmul")
+    matmul = matmuls[0]
+    m, k = matmul.lhs.type.sizes
+    n, rhs_k = matmul.rhs.type.sizes
+    if None in (m, n, k, rhs_k):
+        raise ValueError("schedule_matmul requires static dimensions")
+    if rhs_k != k:
+        raise ValueError("matmul reduction dimensions must match")
+    m, n, k = int(m), int(n), int(k)
+
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
-    m = problem_size if m is None else m
-    n = problem_size if n is None else n
-    k = problem_size if k is None else k
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (128, 192):
         raise ValueError("output_m_tile must be 128 or 192")
     if output_m_tile == 192 and output_tiles_per_cta != 1:
         raise ValueError("M=192 currently requires one output tile per CTA")
-    if output_n_tile not in (256, 384):
-        raise ValueError("output_n_tile must be 256 or 384")
+    if output_n_tile not in (64, 208, 256, 384):
+        raise ValueError("output_n_tile must be 64, 208, 256, or 384")
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
     if warpgroup_n_tile is None:
-        warpgroup_n_tile = output_n_tile if output_n_tile == 256 else 128
+        warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     if output_n_tile % warpgroup_n_tile:
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix"):
         raise ValueError("output_store must be 'scalar' or 'stmatrix'")
     if output_store == "scalar":
         output_tma_inner_size = None
-    problem_name = (
-        str(problem_size)
-        if m == n == k == problem_size
-        else f"m{m}_n{n}_k{k}"
-    )
-    name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
-    if operand_k_tile != 64:
-        name += f"_ktile{operand_k_tile}"
-    if output_m_tile != 128:
-        name += f"_m{output_m_tile}"
-    if output_n_tile != 256:
-        name += f"_n{output_n_tile}"
-    if warpgroup_n_tile not in (128, 256):
-        name += f"_wg{warpgroup_n_tile}"
-    if output_tiles_per_cta != 1:
-        name += f"_{output_tiles_per_cta}tiles"
-    if output_slices != 1:
-        name += f"_split{output_slices}"
-    if output_store_buffers != 1:
-        name += f"_dbuf{output_store_buffers}"
-    if output_store == "scalar":
-        name += "_pre_stsm"
     m_blocks = (m + output_m_tile - 1) // output_m_tile
     grid_x = (m_blocks + output_tiles_per_cta - 1) // output_tiles_per_cta
-    grid_y = (n + output_n_tile - 1) // output_n_tile
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
-        module {{
-          kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) grid_dim=[{grid_x}, {grid_y}, 1] attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
-            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
-          }}
-        }}"""))
     pipeline = Pipeline()
     if output_tiles_per_cta == 1:
         pipeline.add_pass(TileMatmul(
@@ -116,7 +102,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             ),
         ))
     wg_dim, wg_size = (
-        ("M", 64) if output_n_tile == 256
+        ("M", 64) if output_n_tile <= 256
         else ("N", warpgroup_n_tile)
     )
     pipeline.add_pass(TileMatmul(
@@ -205,3 +191,78 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     return pipeline.run(module)
+
+
+def auto_matmul_4096_wgmma256_wg_tma_store_module(
+    *, problem_size: int = 4096,
+    m: int | None = None,
+    n: int | None = None,
+    k: int | None = None,
+    output_tiles_per_cta: int = 1,
+    output_m_tile: int = 128,
+    output_n_tile: int = 256,
+    warpgroup_n_tile: int | None = None,
+    operand_stages: int = 3,
+    operand_k_tile: int = 64,
+    output_slices: int = 1,
+    output_store_buffers: int = 1,
+    output_tma_inner_size: int | None = 128,
+    output_store: str = "stmatrix",
+    operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    ptx_optimization_level: int | None = None,
+) -> ModuleOp:
+    """Build and schedule a static BF16 GEMM module."""
+    m = problem_size if m is None else m
+    n = problem_size if n is None else n
+    k = problem_size if k is None else k
+    if min(m, n, k) <= 0:
+        raise ValueError("problem dimensions must be positive")
+    problem_name = (
+        str(problem_size)
+        if m == n == k == problem_size
+        else f"m{m}_n{n}_k{k}"
+    )
+    resolved_warpgroup_n_tile = warpgroup_n_tile
+    if resolved_warpgroup_n_tile is None:
+        resolved_warpgroup_n_tile = (
+            output_n_tile if output_n_tile <= 256 else 128
+        )
+    name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
+    if operand_k_tile != 64:
+        name += f"_ktile{operand_k_tile}"
+    if output_m_tile != 128:
+        name += f"_m{output_m_tile}"
+    if output_n_tile != 256:
+        name += f"_n{output_n_tile}"
+    if resolved_warpgroup_n_tile not in (128, 256):
+        name += f"_wg{resolved_warpgroup_n_tile}"
+    if output_tiles_per_cta != 1:
+        name += f"_{output_tiles_per_cta}tiles"
+    if output_slices != 1:
+        name += f"_split{output_slices}"
+    if output_store_buffers != 1:
+        name += f"_dbuf{output_store_buffers}"
+    if output_store == "scalar":
+        name += "_pre_stsm"
+
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
+            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
+          }}
+        }}"""))
+    assert isinstance(module, ModuleOp)
+    return schedule_matmul(
+        module,
+        output_tiles_per_cta=output_tiles_per_cta,
+        output_m_tile=output_m_tile,
+        output_n_tile=output_n_tile,
+        warpgroup_n_tile=resolved_warpgroup_n_tile,
+        operand_stages=operand_stages,
+        operand_k_tile=operand_k_tile,
+        output_slices=output_slices,
+        output_store_buffers=output_store_buffers,
+        output_tma_inner_size=output_tma_inner_size,
+        output_store=output_store,
+        operand_move_attrs=operand_move_attrs,
+    )

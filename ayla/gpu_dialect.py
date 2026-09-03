@@ -141,8 +141,10 @@ class KernelOp(Op):
 
     @property
     def num_threads(self) -> int:
-        """Number of threads in the resolved block dimensions."""
-        return math.prod(self.block_dim)  # type: ignore[arg-type]
+        """Number of threads, treating unused block axes as one."""
+        return math.prod(
+            dim if dim is not None else 1 for dim in self.block_dim
+        )
 
     @property
     def extra_attrs(self) -> dict[str, object]:
