@@ -169,6 +169,7 @@ class TileMatmul(LoweringPass):
 
         # Compute iteration bounds and accumulate kernel constraints.
         ubs: list[int] = []
+        tiled = list(hero.attrs.get("tiled", ()))
         for op_dim, tile_size, iteration_binding in zip(
             self.op_dims, self.tile_sizes, self.iteration_bindings,
         ):
@@ -194,7 +195,11 @@ class TileMatmul(LoweringPass):
             ub = (op_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
             self._accumulate_constraint(iteration_binding, ub)
+            if iteration_binding != "for" and iteration_binding not in tiled:
+                tiled.append(iteration_binding)
             sizes_by_dim[op_dim] = tile_size
+        if tiled:
+            hero.attrs["tiled"] = tiled
 
 
         new_ops: list[Op] = []

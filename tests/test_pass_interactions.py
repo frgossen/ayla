@@ -192,7 +192,7 @@ TILED_IR = textwrap.dedent("""\
         %wgx: index, %wgy: index, %wgz: index = warp_group_id()
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={init: 0.0, label: "mm"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={init: 0.0, label: "mm", tiled: ["block.x", "block.y", "wg.x"]}
         elementwise(%5: gmem<64x256xbf16 strides=[4096, 1]>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={fn: "sigmoid", label: "epilogue"}
       }
     }""")
@@ -209,7 +209,7 @@ PROMOTED_IR = textwrap.dedent("""\
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
         %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
-        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm", tiled: ["block.x", "block.y", "wg.x"]}
         %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
         elementwise(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
         move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}

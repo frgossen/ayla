@@ -8,6 +8,7 @@ from ayla.gpu_dialect import (
     BarrierOp,
     ForOp,
     IfOp,
+    MatmulOp,
     TileOp,
     gpu_dialect,
 )
@@ -65,6 +66,8 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
     assert 'for (%outm: index = 0 to 2) attrs={label: "outm"}' in text
     assert "tile(%a: gmem<4096x16xbf16>, %outm: index, 0)" in text
     assert "tile(%0: gmem<2048x16xbf16>, %bx: index, 0)" in text
+    [matmul] = find_ops(module, lambda op: isinstance(op, MatmulOp))
+    assert matmul.attrs["tiled"] == ["block.x"]
 
 
 def test_warp_group_tiling_sets_block_dim():
@@ -84,6 +87,8 @@ def test_warp_group_tiling_sets_block_dim():
     [kernel] = module.body.ops
     assert kernel.block_dim == (256, 1, 1)
     assert kernel.num_warp_groups == 2
+    [matmul] = find_ops(module, lambda op: isinstance(op, MatmulOp))
+    assert matmul.attrs["tiled"] == ["wg.x"]
 
 
 def test_partial_block_tile_rounds_up_the_grid():
@@ -134,7 +139,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
               %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
               %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
               %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) attrs={label: "mm"}
+              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) attrs={label: "mm", tiled: ["block.x"]}
             }
             elementwise(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
           }
