@@ -4,10 +4,12 @@ import textwrap
 from ..base.ir import find_ops_of_type
 from ..base.pipeline import Pipeline
 from ..gpu_dialect import (
+    CollectiveAxis,
     CollectiveLevel,
     KernelOp,
     MatmulOp,
     ModuleOp,
+    WrmemTensorType,
     gpu_dialect,
 )
 from ..passes.canonicalize import Canonicalize
@@ -44,13 +46,23 @@ def schedule_tiled_matmul(
         op for op in find_ops_of_type(module, MatmulOp)
         if op.attrs.get("label") == label
     ]
-    if not matmuls:
-        raise ValueError(f"no matmul found with label {label!r}")
-    if not all(
-        CollectiveLevel.BLOCK in op.collective.values()
-        for op in matmuls
+    if len(matmuls) != 1:
+        raise ValueError(
+            f"expected exactly one matmul labelled {label!r}; "
+            f"found {len(matmuls)}"
+    )
+    [matmul] = matmuls
+    collective_levels = matmul.collective.values()
+    already_wg_tiled = (
+        matmul.collective_level(CollectiveAxis.X) == CollectiveLevel.WG
+    )
+    if (
+        not already_wg_tiled
+        and CollectiveLevel.BLOCK not in collective_levels
     ):
-        raise ValueError(f"matmuls labelled {label!r} must already be block-tiled")
+        raise ValueError(f"matmul labelled {label!r} must already be block-tiled")
+    if already_wg_tiled:
+        assert isinstance(matmul.dst.type, WrmemTensorType)
     if warpgroup_n_tile is None:
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     wg_dim, wg_size = (
@@ -62,31 +74,32 @@ def schedule_tiled_matmul(
     kk_label = f"{loop_label_prefix}_kk" if loop_label_prefix else "kk"
 
     pipeline = Pipeline()
-    pipeline.add_pass(TileMatmul(
-        op_dims=[wg_dim], tile_sizes=[wg_size],
-        iteration_bindings=["wg.x"], for_loop_labels=[None],
-        op_label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
-        allow_partial_tiles=(wg_dim == "M" and output_m_tile % wg_size != 0),
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="wrmem", operands=["dst"], swizzle=None,
-        layout="wgmma_layout_0", warps=4, tma=True,
-        physical_layout=(
-            {
-                "swizzle": "128B",
-                "block_width": 64,
-                "order": "block_major",
-            }
-            if output_tma_inner_size is not None else None
-        ),
-        writeback_slices=output_slices,
-        writeback_buffers=output_store_buffers,
-        move_attrs=operand_move_attrs,
-        target_dtype="f32", label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
-        unsafe_reuse_smem=unsafe_reuse_smem,
-    ))
+    if not already_wg_tiled:
+        pipeline.add_pass(TileMatmul(
+            op_dims=[wg_dim], tile_sizes=[wg_size],
+            iteration_bindings=["wg.x"], for_loop_labels=[None],
+            op_label_filter=label,
+            epilogue_label_filter=epilogue_label_filter,
+            allow_partial_tiles=(wg_dim == "M" and output_m_tile % wg_size != 0),
+        ))
+        pipeline.add_pass(PromoteBuffers(
+            target_type="wrmem", operands=["dst"], swizzle=None,
+            layout="wgmma_layout_0", warps=4, tma=True,
+            physical_layout=(
+                {
+                    "swizzle": "128B",
+                    "block_width": 64,
+                    "order": "block_major",
+                }
+                if output_tma_inner_size is not None else None
+            ),
+            writeback_slices=output_slices,
+            writeback_buffers=output_store_buffers,
+            move_attrs=operand_move_attrs,
+            target_dtype="f32", label_filter=label,
+            epilogue_label_filter=epilogue_label_filter,
+            unsafe_reuse_smem=unsafe_reuse_smem,
+        ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[operand_k_tile],
         iteration_bindings=["for"], for_loop_labels=[k_label],

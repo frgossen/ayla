@@ -282,21 +282,21 @@ class TileMatmul(LoweringPass):
         )
 
         body_ops: list[Op] = []
-        ops, lhs = _build_tile_op(
+        ops, lhs = build_tile_ops(
             lhs, ["M", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
-        ops, rhs = _build_tile_op(
+        ops, rhs = build_tile_ops(
             rhs, ["N", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
-        dst_ops, dst = _build_tile_op(
+        dst_ops, dst = build_tile_ops(
             dst, ["M", "N"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
@@ -436,7 +436,7 @@ def _resolve_launch_dim_constraints(
     return result
 
 
-def _build_tile_op(
+def build_tile_ops(
     arg: Value,
     dim_names: list[str],
     *,
@@ -451,11 +451,11 @@ def _build_tile_op(
     multiple times (e.g. K=64 then K=16).
     """
     assert len(dim_names) == len(arg.type.sizes), (
-        f"_build_tile_op: dim_names ({dim_names}) must have one entry "
+        f"build_tile_ops: dim_names ({dim_names}) must have one entry "
         f"per arg dim ({arg.type.sizes})"
     )
     assert len(op_dims) == len(tile_idxs) == len(tile_sizes), (
-        "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the "
+        "build_tile_ops: op_dims, tile_idxs, tile_sizes must have the "
         "same length"
     )
     name_to_idx = {n: i for i, n in enumerate(dim_names)}
