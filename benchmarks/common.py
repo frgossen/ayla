@@ -141,6 +141,18 @@ def out_parameter_op(launcher: Callable) -> Callable:
     return op
 
 
+def error_metrics(
+    actual: torch.Tensor, expected: torch.Tensor,
+) -> tuple[float, float]:
+    """Return maximum absolute error and relative root-mean-square error."""
+    difference = actual.float() - expected.float()
+    max_abs = float(difference.abs().max())
+    relative_rms = float(difference.square().mean().sqrt()) / float(
+        expected.float().square().mean().sqrt()
+    )
+    return max_abs, relative_rms
+
+
 def assert_against_torch(
     cfg: GemmBenchConfig,
     *,
@@ -155,11 +167,7 @@ def assert_against_torch(
     actual = cfg.compute(a, bt)
     expected = torch_mm_nt(a, bt)
     torch.cuda.synchronize()
-    difference = actual.float() - expected.float()
-    max_abs = float(difference.abs().max())
-    relative_rms = float(difference.square().mean().sqrt()) / float(
-        expected.float().square().mean().sqrt()
-    )
+    max_abs, relative_rms = error_metrics(actual, expected)
     if max_abs > max_abs_error or relative_rms > max_relative_rms_error:
         raise RuntimeError(
             f"{cfg.name}: max abs {max_abs}, relative RMS {relative_rms}"
