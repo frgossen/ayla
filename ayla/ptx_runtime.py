@@ -85,6 +85,26 @@ static uintptr_t module_get_function(
     return reinterpret_cast<uintptr_t>(fn);
 }
 
+static int max_resident_grid_blocks(
+    uintptr_t function_handle,
+    int block_size,
+    int64_t dynamic_shared_mem_bytes
+) {
+    auto fn = reinterpret_cast<CUfunction>(function_handle);
+    int blocks_per_sm = 0;
+    CU_CHECK(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, fn, block_size,
+        static_cast<size_t>(dynamic_shared_mem_bytes)
+    ));
+    CUdevice device;
+    CU_CHECK(cuCtxGetDevice(&device));
+    int multiprocessors = 0;
+    CU_CHECK(cuDeviceGetAttribute(
+        &multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device
+    ));
+    return blocks_per_sm * multiprocessors;
+}
+
 static CUtensorMapL2promotion parse_l2_promotion(
     const std::string& l2_promotion
 ) {
@@ -283,6 +303,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ptx"), py::arg("optimization_level") = -1);
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
+    m.def("max_resident_grid_blocks", &max_resident_grid_blocks);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -344,6 +365,27 @@ class PtxLauncher:
             self._function = self._ext.module_get_function(
                 self._module, self._kernel.name,
             )
+            if self._kernel.requires_resident_grid:
+                block_size = (
+                    self._kernel.block_dim[0]
+                    * self._kernel.block_dim[1]
+                    * self._kernel.block_dim[2]
+                )
+                capacity = self._ext.max_resident_grid_blocks(
+                    self._function, block_size,
+                    self._kernel.shared_mem_bytes,
+                )
+                grid_size = (
+                    self._kernel.grid_dim[0]
+                    * self._kernel.grid_dim[1]
+                    * self._kernel.grid_dim[2]
+                )
+                if grid_size > capacity:
+                    raise RuntimeError(
+                        f"kernel {self._kernel.name!r} has a software grid "
+                        f"barrier requiring {grid_size} resident blocks, but "
+                        f"this device can keep at most {capacity} resident"
+                    )
 
     @property
     def name(self):

@@ -6,6 +6,7 @@ result.
 """
 import textwrap
 
+import pytest
 import torch
 
 from ayla.base.ir import Block, Value
@@ -128,3 +129,19 @@ def test_cluster_block_ids_and_barrier_reach_the_launch():
     torch.cuda.synchronize()
 
     assert actual.cpu().tolist() == [0.0, 1.0]
+
+
+@requires_cuda
+def test_resident_grid_rejects_more_blocks_than_can_be_active():
+    buf_type = GmemTensorType.build((1,), F32Type())
+    kernel = PtxKernel(
+        ptx=SIMPLE_ADD_PTX,
+        name="cwise_add",
+        signature=[buf_type, buf_type, buf_type],
+        grid_dim=(1_000_000, 1, 1),
+        block_dim=(256, 1, 1),
+        requires_resident_grid=True,
+    )
+
+    with pytest.raises(RuntimeError, match="requiring 1000000 resident blocks"):
+        make_ptx_launcher(kernel).ensure_loaded()
