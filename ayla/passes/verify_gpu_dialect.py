@@ -13,6 +13,7 @@ from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
+    GmemTensorType,
     KernelOp,
     MatmulOp,
     MemTensorType,
@@ -117,15 +118,29 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(BarrierOp)
     def _verify_barrier(self, op: BarrierOp) -> None:
-        if op.scope != "cluster":
-            return
-        kernel = _ancestor_kernel(op)
-        if kernel is None or not any(
-            dim is not None for dim in kernel.cluster_dim
-        ):
-            raise ValueError(
-                "cluster barrier requires an enclosing clustered kernel"
-            )
+        expected_operands = 1 if op.scope == "grid" else 0
+        if len(op.operands) != expected_operands:
+            requirement = "one sync operand" if expected_operands else "no operands"
+            raise ValueError(f"BarrierOp: {op.scope} scope requires {requirement}")
+        if op.scope == "grid":
+            sync_type = op.operands[0].type
+            if not isinstance(sync_type, GmemTensorType):
+                raise ValueError("BarrierOp: grid sync must be global memory")
+            if (
+                sync_type.num_elements is not None
+                and sync_type.num_elements * sync_type.dtype.byte_size < 8
+            ):
+                raise ValueError(
+                    "BarrierOp: grid sync must contain at least 8 bytes"
+                )
+        elif op.scope == "cluster":
+            kernel = _ancestor_kernel(op)
+            if kernel is None or not any(
+                dim is not None for dim in kernel.cluster_dim
+            ):
+                raise ValueError(
+                    "cluster barrier requires an enclosing clustered kernel"
+                )
 
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:

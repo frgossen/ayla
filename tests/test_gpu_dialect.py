@@ -17,6 +17,7 @@ from ayla import (
 from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    BarrierOp,
     BF16Type,
     BarrierOp,
     ClusterBlockIdsOp,
@@ -294,6 +295,18 @@ def test_if_op():
 
     with pytest.raises(AssertionError, match="expected PredicateType"):
         IfOp.build(Value(name="i", type=IndexType()), Block())
+
+
+def test_barrier_op():
+    sync = Value(name="sync", type=GmemTensorType.build((2,), F32Type()))
+    barrier = BarrierOp.build("grid", sync=sync)
+
+    assert_print_and_roundtrip(
+        barrier,
+        'barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}',
+    )
+    with pytest.raises(ValueError, match="scope as an explicit argument"):
+        BarrierOp.build(attrs={"scope": "grid"})
 
 
 def test_index_lt_op():

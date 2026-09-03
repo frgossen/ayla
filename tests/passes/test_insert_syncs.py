@@ -10,7 +10,7 @@ from ayla.analysis.sync import (
     _barrier_covers,
     _barrier_scope,
 )
-from ayla.gpu_dialect import CollectiveScope, gpu_dialect
+from ayla.gpu_dialect import CollectiveScope, KernelOp, gpu_dialect
 from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
@@ -53,12 +53,15 @@ def test_preexisting_barrier_updates_dataflow_state():
         )))
 
     # Scheduling passes may author structural barriers before InsertSyncs. The
-    # grid barrier discharges the effect, so the pass must not insert another.
+    # grid barrier discharges that effect, so the pass must not insert another.
     module = gpu_dialect.parse(textwrap.dedent(
         source.replace("__SCOPE__", "grid"),
     ))
     insert_syncs(module)
-    assert repr(module).count("barrier()") == 1
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    assert kernel.requires_resident_grid
+    assert repr(module).count("barrier(") == 1
 
 
 def test_war_on_shared_buffer_gets_barrier():
