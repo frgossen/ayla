@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from ..base.ir import Block, Op, Value, clone_op, clone_type
+from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
+    BarrierOp,
     BlockIdsOp,
     ForOp,
+    IfOp,
+    IndexAddOp,
+    IndexConstantOp,
+    IndexDivOp,
+    IndexLtOp,
+    IndexModOp,
+    IndexMulOp,
     IndexType,
     KernelOp,
     MatmulOp,
@@ -12,8 +22,6 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     is_elementwise,
 )
-from ..base.ir import Block, Op, Value, clone_type
-from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
 
 
@@ -435,3 +443,81 @@ def tile_matmul(
         op_dims, tile_sizes, iteration_bindings, for_loop_labels,
         op_label_filter, epilogue_label_filter, allow_partial_tiles,
     ).run(module)
+def tile_persistent_matmul(
+    module: ModuleOp,
+    *,
+    m_tile: int,
+    n_tile: int,
+    resident_blocks: int,
+    label_filter: str | None = None,
+    epilogue_label_filter: str | None = None,
+) -> ModuleOp:
+    """Tile one top-level matmul over a fixed, grid-stride block population."""
+    if resident_blocks <= 0:
+        raise ValueError("resident_blocks must be positive")
+    if len(module.body.ops) != 1 or not isinstance(module.body.ops[0], KernelOp):
+        raise ValueError(
+            "tile_persistent_matmul requires a single-kernel module"
+        )
+    kernel = module.body.ops[0]
+    heroes = [
+        (i, op) for i, op in enumerate(kernel.body.ops)
+        if isinstance(op, MatmulOp) and label_matches(op, label_filter)
+    ]
+    if not heroes:
+        return module
+    if len(heroes) != 1:
+        raise ValueError("tile_persistent_matmul requires exactly one matmul")
+    [(hero_index, hero)] = heroes
+    if "block.x" in hero.attrs.get("tiled", ()):
+        return module
+    grid_dim = _resolve_launch_dim_constraints(
+        list(kernel.grid_dim), [resident_blocks, 1, 1],
+    )
+    hero.attrs["tiled"] = [*hero.attrs.get("tiled", ()), "block.x"]
+
+    module = tile_matmul(
+        module,
+        op_dims=["M", "N"],
+        tile_sizes=[m_tile, n_tile],
+        iteration_bindings=["for", "for"],
+        for_loop_labels=[None, None],
+        op_label_filter=label_filter,
+        epilogue_label_filter=epilogue_label_filter,
+        allow_partial_tiles=True,
+    )
+    outer = kernel.body.ops[hero_index]
+    assert isinstance(outer, ForOp)
+    [inner] = outer.body.ops
+    assert isinstance(inner, ForOp)
+
+    tiles_m = outer.trip_count
+    tiles_n = inner.trip_count
+    logical_tiles = tiles_m * tiles_n
+    block_ids = BlockIdsOp.build()
+    waves = (logical_tiles + resident_blocks - 1) // resident_blocks
+    loop = ForOp.build(0, waves)
+    grid = IndexConstantOp.build(resident_blocks)
+    offset = IndexMulOp.build(loop.iv, grid.result())
+    linear = IndexAddOp.build(block_ids.x, offset.result())
+    tile_count_n = IndexConstantOp.build(tiles_n)
+    tile_m = IndexDivOp.build(linear.result(), tile_count_n.result())
+    tile_n = IndexModOp.build(linear.result(), tile_count_n.result())
+    vmap = {outer.iv: tile_m.result(), inner.iv: tile_n.result()}
+    tiled_ops = [clone_op(op, vmap) for op in inner.body.ops]
+    tile_body: list[Op] = [tile_count_n, tile_m, tile_n, *tiled_ops]
+    loop.body.ops = [grid, offset, linear]
+    if logical_tiles % resident_blocks:
+        limit = IndexConstantOp.build(logical_tiles)
+        condition = IndexLtOp.build(linear.result(), limit.result())
+        loop.body.ops.extend([
+            limit, condition,
+            IfOp.build(condition.result(), Block(ops=tile_body)),
+        ])
+    else:
+        loop.body.ops.extend(tile_body)
+    if waves > 1:
+        loop.body.append(BarrierOp.build("block"))
+    kernel.body.ops[hero_index:hero_index + 1] = [block_ids, loop]
+    kernel.grid_dim = grid_dim
+    return module
