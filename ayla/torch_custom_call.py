@@ -3,6 +3,7 @@ eager torch and visible to ``torch.compile`` / ``torch.export``.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
 
 import torch
@@ -68,6 +69,7 @@ def make_torch_custom_call(
     *,
     namespace: str = DEFAULT_NAMESPACE,
     name: str | None = None,
+    infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> torch._ops.OpOverload:
     op_name = name or launcher.name
     schema = _make_schema(op_name, signature_mapping)
@@ -75,27 +77,62 @@ def make_torch_custom_call(
     lib = _get_library(namespace)
     lib.define(schema)
 
-    def cuda_impl(*input_tensors: torch.Tensor):
-        kernel_args = []
-        output_tensors = []
-        in_idx = 0
-        device = input_tensors[0].device if input_tensors else torch.device("cuda")
-        for kind, arg_type in zip(signature_mapping, launcher.signature):
-            if kind == OperandKind.R or kind == OperandKind.RW:
-                kernel_args.append(input_tensors[in_idx])
-                in_idx += 1
-            elif kind == OperandKind.RESULT:
-                t = torch.empty(arg_type.sizes, dtype=to_torch_dtype(arg_type.dtype), device=device)
-                output_tensors.append(t)
-                kernel_args.append(t)
+    def allocate_results(*input_tensors: torch.Tensor) -> list[torch.Tensor]:
+        result_types = [
+            arg_type
+            for kind, arg_type in zip(signature_mapping, launcher.signature)
+            if kind == OperandKind.RESULT
+        ]
+        result_shapes = (
+            [arg_type.sizes for arg_type in result_types]
+            if infer_result_shapes is None
+            else infer_result_shapes(*input_tensors)
+        )
+        if len(result_shapes) != len(result_types):
+            raise ValueError(
+                f"{op_name}: expected {len(result_types)} result shapes, "
+                f"got {len(result_shapes)}"
+            )
+        device = (
+            input_tensors[0].device
+            if input_tensors else torch.device("cuda")
+        )
+        return [
+            torch.empty(
+                shape,
+                dtype=to_torch_dtype(arg_type.dtype),
+                device=device,
+            )
+            for arg_type, shape in zip(result_types, result_shapes, strict=True)
+        ]
 
-        launcher(*kernel_args)
-
+    def pack_results(output_tensors: list[torch.Tensor]):
         if len(output_tensors) == 1:
             return output_tensors[0]
         if output_tensors:
             return tuple(output_tensors)
 
+    def cuda_impl(*input_tensors: torch.Tensor):
+        kernel_args = []
+        output_tensors = allocate_results(*input_tensors)
+        in_idx = 0
+        result_idx = 0
+        for kind in signature_mapping:
+            if kind == OperandKind.R or kind == OperandKind.RW:
+                kernel_args.append(input_tensors[in_idx])
+                in_idx += 1
+            elif kind == OperandKind.RESULT:
+                kernel_args.append(output_tensors[result_idx])
+                result_idx += 1
+
+        launcher(*kernel_args)
+        return pack_results(output_tensors)
+
     lib.impl(op_name, cuda_impl, "CUDA")
+
+    def meta_impl(*input_tensors: torch.Tensor):
+        return pack_results(allocate_results(*input_tensors))
+
+    lib.impl(op_name, meta_impl, "Meta")
 
     return getattr(getattr(torch.ops, namespace), op_name).default
