@@ -17,6 +17,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     F32Type,
     ForOp,
+    IfOp,
     IndexType,
     LockType,
     MoveOp,
@@ -112,6 +113,18 @@ def test_for_loop():
           generic(%0: index)
         }""")
     assert_print_and_roundtrip(op, expected)
+
+
+def test_if_op():
+    index = Value(name="i", type=IndexType())
+    op = IfOp.build(index, 7, "lt", Block())
+    assert_print_and_roundtrip(op, textwrap.dedent("""\
+        if(%i: index) attrs={comparison: "lt", rhs: 7} {
+        ^bb0:
+        }"""))
+
+    with pytest.raises(ValueError, match="unsupported comparison"):
+        IfOp.build(index, 7, "invalid")
 
 
 def test_async_op():

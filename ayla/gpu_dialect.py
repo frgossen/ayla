@@ -676,6 +676,44 @@ class BarrierOp(Op):
         return self.attrs["scope"]  # type: ignore[return-value]
 
 
+@gpu_dialect.register_op("if")
+class IfOp(Op):
+    """Execute a region when an index comparison is true."""
+
+    COMPARISONS: ClassVar[tuple[str, ...]] = (
+        "eq", "ne", "lt", "le", "gt", "ge",
+    )
+
+    @classmethod
+    def build(
+        cls, lhs: Value, rhs: int, comparison: str,
+        body: Block | None = None,
+    ) -> "IfOp":
+        if comparison not in cls.COMPARISONS:
+            raise ValueError(f"unsupported comparison {comparison!r}")
+        return cls(
+            operands=[lhs], results=[],
+            attrs={"rhs": rhs, "comparison": comparison},
+            blocks=[body or Block()],
+        )
+
+    @property
+    def lhs(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def rhs(self) -> int:
+        return self.attrs["rhs"]  # type: ignore[return-value]
+
+    @property
+    def comparison(self) -> str:
+        return self.attrs["comparison"]  # type: ignore[return-value]
+
+    @property
+    def body(self) -> Block:
+        return self.blocks[0]
+
+
 @gpu_dialect.register_op("async")
 class AsyncOp(Op):
     """A group of async work issued together and completed by one ``await``.
@@ -1872,7 +1910,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             else _type_collective_scope(buf.type)
         )
         return [("W", root_buffer(buf), scope)]
-    if isinstance(op, (ForOp, AsyncOp)):
+    if isinstance(op, (ForOp, IfOp, AsyncOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
             for body_op in block.ops:

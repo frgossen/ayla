@@ -11,7 +11,14 @@ from ayla import (
     Value,
     make_ptx_kernel,
 )
-from ayla.gpu_dialect import gpu_dialect, BlockIdsOp, ThreadIdsOp, F32Type
+from ayla.gpu_dialect import (
+    BlockIdsOp,
+    F32Type,
+    IfOp,
+    IndexConstantOp,
+    ThreadIdsOp,
+    gpu_dialect,
+)
 
 
 def test_codegen_cwise_add():
@@ -81,6 +88,22 @@ def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
     assert input_kernel.block_dim == (128, None, None)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
+
+
+def test_codegen_if_branches_over_its_body():
+    index = IndexConstantOp.build(3)
+    guarded_value = IndexConstantOp.build(1)
+    conditional = IfOp.build(
+        index.result(), 4, "lt", Block(ops=[guarded_value]),
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "conditional", Block(ops=[index, conditional]),
+        grid_dim=(1, 1, 1), block_dim=(32, 1, 1),
+    )]))
+
+    ptx = make_ptx_kernel(module).ptx
+    assert "setp.ge.u32" in ptx
+    assert "@%p0 bra" in ptx
 
 
 def test_codegen_naive_matmul_4096():

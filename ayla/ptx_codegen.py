@@ -16,6 +16,7 @@ from .gpu_dialect import (
     IndexModOp,
     IndexMulOp,
     IndexType,
+    IfOp,
     KernelOp,
     ForOp,
     LockType,
@@ -298,6 +299,8 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
 def _emit_op(p: PtxPrinter, op: Op) -> None:
     if isinstance(op, ForOp):
         _emit_for(p, op)
+    elif isinstance(op, IfOp):
+        _emit_if(p, op)
     elif isinstance(op, PTXTemplateOp):
         _emit_ptx_template(p, op)
     elif isinstance(op, ThreadIdsOp):
@@ -346,6 +349,20 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     p.write_line(f"setp.lt.s32 {pred}, {iv_reg}, {op.ub};")
     p.write_line(f"@{pred} bra {label};")
     p.write_newline_once()
+
+
+def _emit_if(p: PtxPrinter, op: IfOp) -> None:
+    complement = {
+        "eq": "ne", "ne": "eq", "lt": "ge",
+        "le": "gt", "gt": "le", "ge": "lt",
+    }[op.comparison]
+    lhs = p.unique_ptx_names_for_value(op.lhs)
+    done = p.unique_ptx_names(op, PtxType.LABEL)
+    pred = p.unique_ptx_names((op, "pred"), PtxType.PRED)
+    p.write_line(f"setp.{complement}.u32 {pred}, {lhs}, {op.rhs};")
+    p.write_line(f"@{pred} bra {done};")
+    _emit_block(p, op.body)
+    p.write_line(f"{done}:")
 
 
 def _emit_module(
