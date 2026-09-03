@@ -76,12 +76,20 @@ class Parser:
     def read_shape(self, with_dtype: bool = True):
         """Read `NxMx...` or `NxMx...xDTYPE`.
 
+        A ``?`` dimension is represented as ``None``.
+
         Returns `(sizes, dtype)` if `with_dtype` is True, else just `sizes`.
         """
-        sizes: list[int] = []
-        while self.can_read_int():
-            sizes.append(self.read_int())
-            if not self.can_read_literal("x"):
+        sizes: list[int | None] = []
+        while True:
+            if self.can_read_literal("?"):
+                self.read_literal("?")
+                sizes.append(None)
+            elif self.can_read_int():
+                sizes.append(self.read_int())
+            else:
+                break
+            if not with_dtype and not self.can_read_literal("x"):
                 break
             self.read_literal("x")
         if with_dtype:
@@ -287,4 +295,3 @@ class Parser:
         result = self.type_parse_fns[prefix](prefix, self)
         self.skip_whitespace()
         return result
-
