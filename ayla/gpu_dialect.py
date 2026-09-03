@@ -502,6 +502,44 @@ class AllocOp(Op):
         return {k: v for k, v in self.attrs.items() if k != "init"}
 
 
+@gpu_dialect.register_op("reinterpret")
+class ReinterpretOp(Op):
+    """Reinterpret a typed region at a byte offset into existing storage.
+
+    The operation does not allocate, convert, or move data. Its result aliases
+    ``storage`` and may describe part of it with a different tensor shape,
+    dtype, or physical layout. Only shared-memory storage and result types are
+    supported today.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        storage: Value,
+        type: Type,
+        byte_offset: int = 0,
+    ) -> "ReinterpretOp":
+        if not isinstance(storage.type, SmemTensorType):
+            raise ValueError("reinterpret: storage must be shared memory")
+        if not isinstance(type, SmemTensorType):
+            raise ValueError("reinterpret: result must be shared memory")
+        if not isinstance(byte_offset, int) or byte_offset < 0:
+            raise ValueError("reinterpret: byte_offset must be non-negative")
+        return cls(
+            operands=[storage],
+            results=[Value(name=None, type=type)],
+            attrs={"byte_offset": byte_offset},
+        )
+
+    @property
+    def storage(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def byte_offset(self) -> int:
+        return self.attrs["byte_offset"]  # type: ignore[return-value]
+
+
 @gpu_dialect.register_op("move")
 class MoveOp(Op):
     """Move data into a destination, with optional indices."""
@@ -1768,13 +1806,16 @@ class LaneIdOp(Op):
 
 
 def root_buffer(value: Value) -> Value:
-    """Walk back through TileOps to the underlying SSA root.
+    """Walk back through storage views and tiles to the underlying SSA root.
 
-    For an alloc / kernel-arg / non-tile value this returns the
-    value itself.
+    For an allocation, kernel argument, or other non-view value, this returns
+    the value itself.
     """
-    while isinstance(value.definition, TileOp):
-        value = value.definition.arg
+    while isinstance(value.definition, (ReinterpretOp, TileOp)):
+        if isinstance(value.definition, ReinterpretOp):
+            value = value.definition.storage
+        else:
+            value = value.definition.arg
     if isinstance(value.definition, SelectOp):
         # Returning the select would claim it is a buffer of its own, distinct
         # from the cases it actually aliases -- the unsafe direction, since a
@@ -1862,9 +1903,9 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     """Best-effort memory effect summary for ``op``.
 
     Returns a list of ``(kind, root, scope)`` tuples where ``kind`` is ``"R"`` or
-    ``"W"``, ``root`` is the underlying alloc/arg (after stripping tile views via
-    ``root_buffer``), and ``scope`` is the :class:`CollectiveScope` at which the
-    access is independent of concurrent threads.
+    ``"W"``, ``root`` is the underlying alloc/arg (after stripping views via
+    ``root_buffer``), and ``scope`` is the :class:`CollectiveScope` at which
+    the access is independent of concurrent threads.
 
     Returns ``None`` for ops we don't know how to model; callers must treat that
     as a worst-case conflict.
@@ -1961,6 +2002,7 @@ def is_side_effect_free(op: Op) -> bool:
         LaneIdOp,
         PtrAddOp,
         SelectOp,
+        ReinterpretOp,
         ThreadIdsOp,
         TileOp,
         ToPtrOp,

@@ -4,8 +4,15 @@ import textwrap
 
 import pytest
 
-from ayla.gpu_dialect import gpu_dialect, PTXTemplateOp
 from ayla.base.ir import find_ops
+from ayla.gpu_dialect import (
+    IndexConstantOp,
+    PtrAddOp,
+    PTXTemplateOp,
+    ReinterpretOp,
+    ToPtrOp,
+    gpu_dialect,
+)
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
@@ -43,6 +50,47 @@ def test_lower_barrier_block_leader_is_named_barrier():
         @${pred:bl_w0} bar.sync 1, 128;
         @!${pred:bl_w0} bar.arrive 1, 128;
         """)
+
+
+def test_lower_smem_arena_and_reinterpret():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %arena: smem<64x64xbf16> = alloc() attrs={allocation_alignment: 1024, allocation_bytes: 12288, id: 0}
+            %reinterpret: smem<32x64xbf16> = reinterpret(%arena: smem<64x64xbf16>) attrs={byte_offset: 8192}
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    templates = [
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    ]
+    assert sum(".shared" in template for template in templates) == 1
+    assert ".shared .align 1024" in templates[0]
+    assert "[12288]" in templates[0]
+    assert len(templates) == 1
+    [reinterpret] = find_ops(module, lambda op: isinstance(op, PtrAddOp))
+    assert isinstance(reinterpret.ptr.definition, ToPtrOp)
+    assert isinstance(reinterpret.byte_offset.definition, IndexConstantOp)
+    assert reinterpret.byte_offset.definition.value == 8192
+    assert not find_ops(module, lambda op: isinstance(op, ReinterpretOp))
+
+
+def test_lower_zero_offset_reinterpret_is_elided():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %arena: smem<64x64xbf16> = alloc() attrs={id: 0}
+            %reinterpret: smem<32x64xbf16> = reinterpret(%arena: smem<64x64xbf16>) attrs={byte_offset: 0}
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+
+    assert not find_ops(module, lambda op: isinstance(
+        op, (ReinterpretOp, ToPtrOp, PtrAddOp),
+    ))
 
 
 def test_lower_barrier_unsupported_scope_raises():

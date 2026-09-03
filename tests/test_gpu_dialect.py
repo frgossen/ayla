@@ -15,6 +15,7 @@ from ayla import (
 from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    BF16Type,
     F32Type,
     ForOp,
     IfOp,
@@ -23,10 +24,12 @@ from ayla.gpu_dialect import (
     LockType,
     MoveOp,
     PredicateType,
+    ReinterpretOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
     gpu_dialect,
+    root_buffer,
 )
 
 
@@ -34,6 +37,29 @@ def assert_print_and_roundtrip(op, expected):
     text = repr(op)
     assert text == expected
     assert repr(gpu_dialect.parse(text)) == text
+
+
+def test_reinterpret_op():
+    storage_type = SmemTensorType.build((64, 64), BF16Type())
+    view_type = SmemTensorType.build((32, 64), BF16Type())
+    storage = Value(name="storage", type=storage_type)
+    reinterpret = ReinterpretOp.build(storage, view_type, byte_offset=8192)
+
+    assert reinterpret.storage is storage
+    assert reinterpret.byte_offset == 8192
+    assert root_buffer(reinterpret.result()) is storage
+    assert_print_and_roundtrip(
+        reinterpret,
+        "%0: smem<32x64xbf16> = reinterpret(%storage: smem<64x64xbf16>) "
+        "attrs={byte_offset: 8192}",
+    )
+
+    with pytest.raises(ValueError, match="byte_offset"):
+        ReinterpretOp.build(storage, view_type, byte_offset=-1)
+    with pytest.raises(ValueError, match="storage"):
+        ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
+    with pytest.raises(ValueError, match="result"):
+        ReinterpretOp.build(storage, F32Type())
 
 
 def test_matmul_program():
