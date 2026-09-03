@@ -52,6 +52,17 @@ from ..gpu_dialect import (
 )
 
 
+def _lower_mul_registers(
+    dst_regs: list[str], lhs_regs: list[str], rhs_regs: list[str],
+) -> str:
+    return "".join(
+        f"mul.f32 {dst}, {lhs}, {rhs};\n"
+        for dst, lhs, rhs in zip(
+            dst_regs, lhs_regs, rhs_regs, strict=True,
+        )
+    )
+
+
 def _lower_elementwise_sigmoid_ptx(
     dst_regs: list[str], src_regs: list[str],
 ) -> str:
@@ -181,8 +192,19 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
     return template
 
 
+def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
+    if not all(isinstance(value.type.dtype, F32Type) for value in op.operands):
+        raise NotImplementedError("lower_elementwise: mul supports only f32")
+    return _lower_mul_registers(
+        _elementwise_operand_regs(op.dst, "dst"),
+        _elementwise_operand_regs(op.src(0), "lhs"),
+        _elementwise_operand_regs(op.src(1), "rhs"),
+    )
+
+
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
+    "mul": _lower_mul_elementwise_ptx,
     "sigmoid": _lower_sigmoid_elementwise_ptx,
 }
 
@@ -494,24 +516,23 @@ class LowerToPtxTemplate(LoweringPass):
         in the source dtype and a supported conversion writes the result to the
         destination dtype.
         """
-        if op.num_srcs != 1:
-            raise NotImplementedError(
-                "lower_elementwise: only unary functions are supported"
-            )
-        src = op.src(0)
         dst_value = self.value_map[op.dst]
-        src_value = self.value_map[src]
         dst_type = op.dst.type
-        src_type = src.type
+        srcs = [op.src(i) for i in range(op.num_srcs)]
+        source_values = [self.value_map[src] for src in srcs]
 
-        if not (isinstance(src_type, WrmemTensorType)
-                and isinstance(dst_type, WrmemTensorType)):
+        if not isinstance(dst_type, WrmemTensorType):
             raise NotImplementedError(
-                f"lower_elementwise: only wrmem supported; got "
-                f"{src_type} -> {dst_type}"
+                f"lower_elementwise: destination must be wrmem; got {dst_type}"
             )
-        assert tuple(src_type.sizes) == tuple(dst_type.sizes)
-        assert src_type.warps == dst_type.warps
+        for src in srcs:
+            src_type = src.type
+            if not isinstance(src_type, WrmemTensorType):
+                raise NotImplementedError(
+                    f"lower_elementwise: source must be wrmem; got {src_type}"
+                )
+            assert tuple(src_type.sizes) == tuple(dst_type.sizes)
+            assert src_type.warps == dst_type.warps
         lower = _ELEMENTWISE_LOWERERS.get(op.fn)
         if lower is None:
             raise NotImplementedError(
@@ -519,11 +540,12 @@ class LowerToPtxTemplate(LoweringPass):
             )
         template = lower(op)
 
+        source_names = ["src"] if len(source_values) == 1 else ["lhs", "rhs"]
         new_op = PTXTemplateOp.build(
-            operands=[dst_value, src_value],
+            operands=[dst_value, *source_values],
             result_types=[],
             template=template,
-            operand_names=["dst", "src"],
+            operand_names=["dst", *source_names],
             result_names=[],
             description=str(op),
         )
