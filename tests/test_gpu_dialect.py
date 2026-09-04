@@ -206,17 +206,23 @@ def test_canonical_strides():
 def test_dynamic_gmem_shape_roundtrips_and_defers_static_properties():
     t = GmemTensorType.build([None, 64], F32Type())
 
-    assert repr(t) == "gmem<?x64xf32>"
-    parsed = gpu_dialect.parse(
-        "module { kernel @k(%a: gmem<?x64xf32>) { } }"
-    )
-    assert repr(parsed.body.ops[0].signature[0]) == repr(t)
+    module = ModuleOp.build(Block(ops=[
+        KernelOp.build("k", Block(arguments=[Value(name="a", type=t)])),
+    ]))
+    expected = textwrap.dedent("""\
+        module {
+          kernel @k(%a: gmem<?x64xf32>) {
+          }
+        }""")
+    assert_print_and_roundtrip(module, expected)
+
     assert t.is_dynamic
     assert t.strides == (64, 1)
     assert t.num_elements is None
 
     trailing_dynamic = GmemTensorType.build([64, None], F32Type())
     assert trailing_dynamic.strides == (None, 1)
+
 
 def test_naive_matmul_4096_module():
     module_str = textwrap.dedent(f"""\
