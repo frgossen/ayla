@@ -16,7 +16,7 @@ from ayla.gemm import (
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from common import (
-    GemmBenchConfig,
+    gemm_bench_config,
     assert_against_torch,
     out_parameter_op,
     plot_tflops_curve,
@@ -112,6 +112,9 @@ def _plot(rows: list[dict[str, object]]) -> None:
 
 
 def main() -> int:
+    # Every config in this file wants tf32 matmuls; it used to be a
+    # per-config field that nothing ever set to False.
+    torch.backends.cuda.matmul.allow_tf32 = True
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
@@ -119,14 +122,16 @@ def main() -> int:
     for size, (build, config_name) in CONFIGS.items():
         print(f"size={size}: build {config_name}", flush=True)
         ayla_op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(build())))
-        ayla_config = GemmBenchConfig(
-            "Ayla", size, size, size, ayla_op, torch.bfloat16,
+        ayla_config = gemm_bench_config(
+            name="Ayla", m=size, n=size, k=size,
+            compute=ayla_op, dtype=torch.bfloat16,
         )
         assert_against_torch(ayla_config)
         configs = [
             ayla_config,
-            GemmBenchConfig(
-                "cuBLAS", size, size, size, torch_mm_nt, torch.bfloat16,
+            gemm_bench_config(
+                name="cuBLAS", m=size, n=size, k=size,
+                compute=torch_mm_nt, dtype=torch.bfloat16,
             ),
         ]
         ayla_result, torch_result = run(configs)
