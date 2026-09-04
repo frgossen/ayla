@@ -1576,9 +1576,9 @@ def _resolve_val_str(v, prec, val_str):
 
 def _binop_expr_str(op, operand, prec, parent_prec, val_str):
     """Helper for binary index op expr_str with precedence."""
-    l = _resolve_val_str(op.lhs, prec, val_str)
-    r = _resolve_val_str(op.rhs, prec + 1, val_str)
-    s = f"{l} {operand} {r}"
+    lhs = _resolve_val_str(op.lhs, prec, val_str)
+    rhs = _resolve_val_str(op.rhs, prec + 1, val_str)
+    s = f"{lhs} {operand} {rhs}"
     if parent_prec > prec:
         s = f"({s})"
     return s

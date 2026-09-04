@@ -31,7 +31,6 @@ from ..gpu_dialect import (
     effective_operands,
     is_side_effect_free,
     memory_effects,
-    root_buffer,
 )
 from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers

@@ -2,7 +2,6 @@
 import json
 import textwrap
 
-import pytest
 import torch
 
 from ayla.gpu_dialect import gpu_dialect

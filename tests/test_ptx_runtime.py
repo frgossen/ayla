@@ -6,7 +6,6 @@ result.
 """
 import textwrap
 
-import pytest
 import torch
 
 from ayla.gpu_dialect import F32Type, GmemTensorType

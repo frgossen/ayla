@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 bench = ["matplotlib"]
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["ayla*"]
@@ -23,6 +23,13 @@ exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
 
 # ---------------------------------------------------------------------------
 # pixi environment management (formerly pixi.toml). Name/version/description,
@@ -47,4 +54,5 @@ default = ["dev", "bench"]
 [tool.pixi.tasks]
 install = { cmd = "pip install torch --index-url https://download.pytorch.org/whl/cu128 && pip install -e ." }
 test = "pytest"
+lint = "ruff check"
 bench = "python benchmarks/bench_gemm_collection.py"

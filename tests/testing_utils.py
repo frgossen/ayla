@@ -21,7 +21,7 @@ def assert_contains_in_order(text: str, *fragments: str) -> None:
     Lines are stripped and matched in sequence — arbitrary lines may appear
     between fragments and between lines within a fragment.
     """
-    lines = [l.strip() for l in text.splitlines()]
+    lines = [line.strip() for line in text.splitlines()]
     pos = 0
     for fragment in fragments:
         for expected_line in fragment.strip().splitlines():

@@ -87,15 +87,15 @@ $L__BB0_2:
 	mov.u32 	%Kr48, _ZZN4M5_115matmulKernel5_1ILi128ELi256ELi64ELi384ELi3EEEviiiP13__nv_bfloat16PK14CUtensorMap_stS5_E5empty;
 	mov.u32 	%Kr53, 1;
 	// begin inline asm
-	mbarrier.arrive.shared::cta.b64                             %Krd10,  [%Kr48], %Kr53;    // 2. 
+	mbarrier.arrive.shared::cta.b64                             %Krd10,  [%Kr48], %Kr53;    // 2.
 	// end inline asm
 	add.s32 	%Kr50, %Kr48, 8;
 	// begin inline asm
-	mbarrier.arrive.shared::cta.b64                             %Krd11,  [%Kr50], %Kr53;    // 2. 
+	mbarrier.arrive.shared::cta.b64                             %Krd11,  [%Kr50], %Kr53;    // 2.
 	// end inline asm
 	add.s32 	%Kr52, %Kr48, 16;
 	// begin inline asm
-	mbarrier.arrive.shared::cta.b64                             %Krd12,  [%Kr52], %Kr53;    // 2. 
+	mbarrier.arrive.shared::cta.b64                             %Krd12,  [%Kr52], %Kr53;    // 2.
 	// end inline asm
 	setp.lt.s32 	%Kp3, %Kr24, 64;
 	mov.f32 	%Kf1793, 0f00000000;
@@ -241,7 +241,7 @@ $L__BB0_5:
 	add.s32 	%Kr56, %Kr60, %Kr59;
 	mov.u32 	%Kr57, 1;
 	// begin inline asm
-	mbarrier.arrive.shared::cta.b64                             %Krd13,  [%Kr56], %Kr57;    // 2. 
+	mbarrier.arrive.shared::cta.b64                             %Krd13,  [%Kr56], %Kr57;    // 2.
 	// end inline asm
 	// begin inline asm
 	mov.u64 %Krd14, %globaltimer;
@@ -386,7 +386,7 @@ wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 {%Kf1920,   %Kf1919,   %Kf
 	// end inline asm
 	add.s32 	%Kr63, %Kr48, %Kr59;
 	// begin inline asm
-	mbarrier.arrive.shared::cta.b64                             %Krd24,  [%Kr63], %Kr64;    // 2. 
+	mbarrier.arrive.shared::cta.b64                             %Krd24,  [%Kr63], %Kr64;    // 2.
 	// end inline asm
 	add.s32 	%Kr153, %Kr7, 1;
 	add.s32 	%Kr152, %Kr152, 1;
@@ -1157,7 +1157,7 @@ $L__BB0_17:
 	add.s32 	%Kr126, %Kr130, %Kr129;
 	mov.u32 	%Kr127, 1;
 	// begin inline asm
-	mbarrier.arrive.shared::cta.b64                             %Krd113,  [%Kr126], %Kr127;    // 2. 
+	mbarrier.arrive.shared::cta.b64                             %Krd113,  [%Kr126], %Kr127;    // 2.
 	// end inline asm
 	// begin inline asm
 	mov.u64 %Krd114, %globaltimer;
@@ -1231,7 +1231,7 @@ $L__BB0_19:
 	cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%Kr137], [%Krd9, {%Kr138, %Kr14}], [%Kr141];
 	// end inline asm
 	// begin inline asm
-	mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %Krd118, [%Kr141], %Kr142; // 8. 
+	mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %Krd118, [%Kr141], %Kr142; // 8.
 	// end inline asm
 	add.s32 	%Kr156, %Kr17, 1;
 	add.s32 	%Kr155, %Kr155, 1;
