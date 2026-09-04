@@ -15,3 +15,17 @@ def reset_alloc_ids():
     it -- importing the kernel collection alone burns over a hundred.
     """
     AllocOp._id_counter = itertools.count()
+
+
+@pytest.fixture
+def ayla_installed():
+    """ayla claiming `aten.mm` for the duration of a test."""
+    # Imported here: conftest is loaded for every run, and this builds the
+    # whole kernel collection.
+    from ayla import torch_compile
+
+    torch_compile.install()
+    try:
+        yield
+    finally:
+        torch_compile.uninstall()
