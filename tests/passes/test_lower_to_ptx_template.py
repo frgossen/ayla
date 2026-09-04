@@ -144,8 +144,14 @@ def test_grid_barrier_uses_last_arriver_to_release_waiters():
     assert template.count("bar.sync 0;") == 2
     assert "atom.acq_rel.gpu.global.inc.u32" in template
     assert "setp.eq.u32 ${pred:grid_last}, ${b32:grid_ticket}, 7;" in template
-    assert "cp.async.bulk.wait_group" not in template
     assert "grid_count_wait" not in template
+    assert_contains_in_order(
+        template,
+        "@${pred:grid_not_leader} bra ${label:grid_after_leader};",
+        "cp.async.bulk.wait_group 0;",
+        "atom.acq_rel.gpu.global.inc.u32 ${b32:grid_ticket}, "
+        "[${b64:operand.sync.ptr}], 7;",
+    )
 
 
 def test_lower_tma_load_with_l2_cache_hint():
