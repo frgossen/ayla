@@ -78,14 +78,13 @@ def auto_matmul_4096_module():
         unroll_factor=4,
         label_filter=r"l_iter\d+",
     ))
-    for _ in range(4):
+    for _ in range(2):
         pipeline.add_pass(LICM())
         pipeline.add_pass(Canonicalize())
     pipeline.add_pass(LowerToAsync())
     pipeline.add_pass(FuseAsync())
-    for _ in range(4):
-        pipeline.add_pass(LICM())
-        pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(LICM())
+    pipeline.add_pass(Canonicalize())
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     return pipeline.run(module)

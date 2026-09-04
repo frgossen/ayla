@@ -90,9 +90,8 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     # while load and await are still adjacent (post-pipeline the await moves to
     # the loop top and can't be remapped to the fused lock).
     pipeline.add_pass(FuseAsync())
-    for _ in range(4):
-        pipeline.add_pass(LICM())
-        pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(LICM())
+    pipeline.add_pass(Canonicalize())
 
     pipeline.add_pass(PipelineLoop(
         label_filter_loop="k",
@@ -105,7 +104,7 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     ))
     pipeline.add_pass(FuseAsync())
 
-    for _ in range(4):
+    for _ in range(2):
         pipeline.add_pass(LICM())
         pipeline.add_pass(Canonicalize())
 
