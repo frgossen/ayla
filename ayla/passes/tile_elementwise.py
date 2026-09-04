@@ -4,7 +4,15 @@ from __future__ import annotations
 from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..base.pipeline import op_label_matches
-from ..gpu_dialect import ConvertOp, ElementwiseOp, ForOp, IndexType, ModuleOp, TileOp
+from ..gpu_dialect import (
+    ConvertOp,
+    ElementwiseOp,
+    ForOp,
+    IndexType,
+    ModuleOp,
+    MoveOp,
+    TileOp,
+)
 
 
 class TileElementwise(LoweringPass):
@@ -52,13 +60,18 @@ class TileElementwise(LoweringPass):
         self.tile_labels = list(tile_labels)
         self.label_filter = label_filter
 
-    @lowers(ConvertOp, ElementwiseOp)
+    @lowers(ConvertOp, ElementwiseOp, MoveOp)
     def lower_elementwise(
-        self, op: ConvertOp | ElementwiseOp,
+        self, op: ConvertOp | ElementwiseOp | MoveOp,
     ) -> tuple[list[Op], list[object]] | None:
+        if isinstance(op, MoveOp) and self.label_filter is None:
+            return None
         if not op_label_matches(op, self.label_filter):
             return None
-
+        if isinstance(op, MoveOp) and op.indices:
+            raise ValueError(
+                "TileElementwise cannot tile an indexed move"
+            )
         shapes = [list(value.type.sizes) for value in op.operands]
         rank = len(shapes[0])
         if any(len(shape) != rank for shape in shapes[1:]):

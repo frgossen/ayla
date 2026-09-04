@@ -407,8 +407,13 @@ class ConvertOp(Op):
     """
 
     @classmethod
-    def build(cls, dst: Value, src: Value) -> "ConvertOp":
-        return cls(operands=[dst, src], results=[])
+    def build(
+        cls,
+        dst: Value,
+        src: Value,
+        attrs: dict[str, object] | None = None,
+    ) -> "ConvertOp":
+        return cls(operands=[dst, src], results=[], attrs=attrs or {})
 
     @property
     def dst(self) -> Value:

@@ -3,7 +3,7 @@ import textwrap
 import pytest
 
 from ayla.base.ir import find_ops
-from ayla.gpu_dialect import ConvertOp, ForOp, TileOp, gpu_dialect
+from ayla.gpu_dialect import ConvertOp, ForOp, MoveOp, TileOp, gpu_dialect
 from ayla.passes.tile_elementwise import tile_elementwise
 
 
@@ -131,3 +131,42 @@ def test_rejects_parallel_iteration_binding():
             tile_levels=["block.x"], tile_labels=[None],
             label_filter="epilogue",
         )
+
+
+def test_tiles_an_explicitly_selected_move():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @epilogue(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
+            move(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "writeback"}
+          }
+        }"""))  # noqa: E501
+
+    tile_elementwise(
+        module,
+        tile_dims=[1], tile_sizes=[64],
+        tile_levels=["for"], tile_labels=["outn"],
+        label_filter="writeback",
+    )
+
+    assert len(find_ops(module, lambda op: isinstance(op, ForOp))) == 1
+    [move] = find_ops(module, lambda op: isinstance(op, MoveOp))
+    assert tuple(move.dst.type.sizes) == (64, 64)
+    assert tuple(move.src.type.sizes) == (64, 64)
+
+
+def test_does_not_tile_moves_without_an_explicit_label_filter():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @epilogue(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
+            move(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    tile_elementwise(
+        module,
+        tile_dims=[1], tile_sizes=[64],
+        tile_levels=["for"], tile_labels=["outn"],
+    )
+
+    assert not find_ops(module, lambda op: isinstance(op, TileOp))
+    assert len(find_ops(module, lambda op: isinstance(op, MoveOp))) == 1
