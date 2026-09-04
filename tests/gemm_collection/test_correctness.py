@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch.ops import ayla
 
+from ayla.base.ir import find_ops
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
@@ -12,7 +13,16 @@ from ayla.gemm_collection.dynamic_m import (
     _dynamic_m_schedule_heuristic,
     make_dynamic_m_matmul,
 )
-from ayla.gpu_dialect import TmaDescType
+from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_sigmoid import (
+    auto_matmul_4096_wgmma256_wg_sigmoid_module,
+)
+from ayla.gpu_dialect import (
+    ElementwiseOp,
+    ForOp,
+    TileOp,
+    TmaDescType,
+    WrmemTensorType,
+)
 from ayla.ptx_codegen import make_ptx_kernel
 from tests.testing_utils import requires_cuda
 
@@ -157,6 +167,47 @@ def test_dynamic_m_gemm_specializes_distinct_shapes():
         out = op(lhs, rhs)
         torch.cuda.synchronize()
         assert torch.equal(out, torch.mm(lhs, rhs.T))
+
+
+def test_sigmoid_output_tiles_lower_to_ptx():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_sigmoid_module()
+    )
+    lines = kernel.ptx.splitlines()
+
+    def at(pattern):
+        return [i for i, line in enumerate(lines) if pattern in line]
+
+    sigmoids = at("ex2.approx")
+    converts = at("cvt.rn.bf16x2.f32")
+    stores = at("cp.async.bulk.tensor.3d.global.shared")
+    # Four output-M iterations each contain four fully unrolled 64-column
+    # slices, with 32 f32 values (16 packed outputs) per thread and slice.
+    assert len(sigmoids) == 4 * 4 * 32
+    assert len(converts) == 4 * 4 * 16
+    assert len(stores) == 16
+
+
+def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
+    module = auto_matmul_4096_wgmma256_wg_sigmoid_module()
+
+    loops = find_ops(module, lambda op: isinstance(op, ForOp))
+    assert all(loop.attrs.get("label") != "outn" for loop in loops)
+    wrmem_tiles = [
+        op for op in find_ops(module, lambda op: isinstance(op, TileOp))
+        if isinstance(op.result().type, WrmemTensorType)
+    ]
+    assert wrmem_tiles
+    assert all(None not in tile.static_indices for tile in wrmem_tiles)
+
+    epilogues = find_ops(module, lambda op: isinstance(op, ElementwiseOp))
+    assert [op.attrs.get("label") for op in epilogues[:4]] == [
+        "epi_iter0_iter0",
+        "epi_iter1_iter0",
+        "epi_iter2_iter0",
+        "epi_iter3_iter0",
+    ]
+    assert len(epilogues) == 16
 
 
 @requires_cuda
