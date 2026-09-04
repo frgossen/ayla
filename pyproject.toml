@@ -47,4 +47,4 @@ default = ["dev", "bench"]
 [tool.pixi.tasks]
 install = { cmd = "pip install torch --index-url https://download.pytorch.org/whl/cu128 && pip install -e ." }
 test = "pytest"
-bench = "python benchmarks/bench_gemm_collection.py"
+bench = "python -m benchmarks.bench_gemm_collection"

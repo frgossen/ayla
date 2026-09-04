@@ -12,7 +12,7 @@ and aspirationally to fuse GEMM epilogues.
 git submodule update --init                 # fetch the fast.cu reference submodule
 pip install -e ".[dev]"                     # install (editable) + pytest
 pytest                                      # run the tests
-python benchmarks/bench_gemm_collection.py  # benchmark
+python -m benchmarks.bench_gemm_collection  # benchmark
 ```
 
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, % of peak, and

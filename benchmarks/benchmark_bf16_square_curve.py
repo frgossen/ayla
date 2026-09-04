@@ -15,7 +15,7 @@ from ayla.gemm import (
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
-from common import (
+from benchmarks.common import (
     gemm_bench_config,
     assert_against_torch,
     out_parameter_op,
