@@ -54,6 +54,63 @@ def test_preexisting_barrier_updates_dataflow_state():
     )
 
 
+def test_grid_barrier_infers_a_leader_bulk_store_handoff():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %sync: gmem<2xf32>) grid_dim=[8, 1, 1] block_dim=[128, 1, 1] {
+            %zero: index = index_constant() attrs={value: 0}
+            %smem: smem<64x64xf32> = alloc()
+            %registers: rmem<64x64xf32> = alloc()
+            move(%smem: smem<64x64xf32>, %registers: rmem<64x64xf32>)
+            %lock: lock<bulk> = alloc()
+            async(%lock: lock<bulk>) tma_move(%dst: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %smem: smem<64x64xf32>, %zero: index, %zero: index)
+            await(%lock: lock<bulk>)
+            %after: index = index_constant() attrs={value: 0}
+            barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    barriers = [
+        line.strip() for line in repr(module).splitlines()
+        if "barrier(" in line
+    ]
+    assert barriers == [
+        'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',
+        'barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}',
+    ]
+
+
+def test_grid_barrier_retains_block_arrival_for_an_unowned_global_write():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %other: gmem<1xf32>, %sync: gmem<2xf32>) grid_dim=[8, 1, 1] block_dim=[128, 1, 1] {
+            %zero: index = index_constant() attrs={value: 0}
+            %smem: smem<64x64xf32> = alloc()
+            %tile: rmem<64x64xf32> = alloc()
+            move(%smem: smem<64x64xf32>, %tile: rmem<64x64xf32>)
+            %lock: lock<bulk> = alloc()
+            async(%lock: lock<bulk>) tma_move(%dst: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %smem: smem<64x64xf32>, %zero: index, %zero: index)
+            await(%lock: lock<bulk>)
+            %value: rmem<1xf32> = alloc()
+            move(%other: gmem<1xf32>, %value: rmem<1xf32>)
+            barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    barriers = [
+        line.strip() for line in repr(module).splitlines()
+        if "barrier(" in line
+    ]
+    assert barriers[-2:] == [
+        'barrier() attrs={scope: "block"}',
+        'barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}',
+    ]
+
+
 def test_war_on_shared_buffer_gets_barrier():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

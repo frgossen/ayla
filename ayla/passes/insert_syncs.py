@@ -128,7 +128,9 @@ class ConcurrentMemoryEffect:
 class DataflowState:
     """The forward analysis state: outstanding concurrent memory effects keyed by
     root buffer, named-barrier ids in use until a full-block sync, and ids in use
-    until an await on a particular lock."""
+    until an await on a particular lock. ``bulk_store_handoff`` is the lock for
+    a leader-issued store that received the CTA's latest block-to-leader
+    rendezvous and has had no intervening effectful work."""
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
@@ -136,10 +138,22 @@ class DataflowState:
     named_barrier_ids_pending_await: dict[Value, set[int]] = (
         dataclasses.field(default_factory=dict)
     )
+    bulk_store_handoff: Value | None = None
 
     def clone(self) -> DataflowState:
         """A copy with fresh sets, safe for in-place per-op mutation."""
-        return self.join(DataflowState())  # union with empty -> fresh sets
+        return DataflowState(
+            {
+                buf: set(effects)
+                for buf, effects in self.concurrent_memory_effects.items()
+            },
+            set(self.named_barrier_ids),
+            {
+                lock: set(ids)
+                for lock, ids in self.named_barrier_ids_pending_await.items()
+            },
+            self.bulk_store_handoff,
+        )
 
     def join(self, other: DataflowState) -> DataflowState:
         """The dataflow join: per-buffer union of effects, union of barrier ids."""
@@ -153,6 +167,11 @@ class DataflowState:
             self.named_barrier_ids | other.named_barrier_ids,
             {lock: p.get(lock, set()) | q.get(lock, set())
              for lock in p.keys() | q.keys()},
+            (
+                self.bulk_store_handoff
+                if self.bulk_store_handoff is other.bulk_store_handoff
+                else None
+            ),
         )
 
 
@@ -164,6 +183,10 @@ def _after_barrier(
     if barrier in (BarrierScope.BLOCK, BarrierScope.GRID):
         live.named_barrier_ids.clear()
         live.named_barrier_ids_pending_await.clear()
+    if barrier in (
+        BarrierScope.BLOCK_TO_LEADER, BarrierScope.BLOCK, BarrierScope.GRID,
+    ):
+        live.bulk_store_handoff = None
     for buf, effects in live.concurrent_memory_effects.items():
         live.concurrent_memory_effects[buf] = {
             effect for effect in effects
@@ -252,11 +275,16 @@ def _analyze(
             scope = BarrierScope[op.scope.upper()]
         except KeyError as error:
             raise ValueError(f"unknown barrier scope {op.scope!r}") from error
-        # Only thread 0 executes the software grid protocol. Rendezvous the CTA
-        # first so it cannot publish arrival before every thread has completed
-        # its pre-barrier work.
+        # Only thread 0 executes the software grid protocol. A block-to-leader
+        # barrier immediately handed to a bulk store already gathered the CTA;
+        # otherwise rendezvous the block before publishing its grid arrival.
         if scope == BarrierScope.GRID:
-            targets[op] = BarrierTarget(BarrierScope.BLOCK)
+            arrival_scope = (
+                BarrierScope.THREAD
+                if live.bulk_store_handoff is not None
+                else BarrierScope.BLOCK
+            )
+            targets[op] = BarrierTarget(arrival_scope)
         return _after_barrier(live, scope)
     if is_side_effect_free(op):
         return live
@@ -279,6 +307,11 @@ def _analyze(
         # An mbar await also completes a block-leader handoff: all threads wait
         # for t0's async work, so no arriving warp can lap the named barrier.
         live.named_barrier_ids_pending_await.pop(op.lock, None)
+        if (
+            live.bulk_store_handoff is not None
+            and op.lock is not live.bulk_store_handoff
+        ):
+            live.bulk_store_handoff = None
         return live
     effects = memory_effects(op)
     if effects is None:
@@ -349,6 +382,13 @@ def _analyze(
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
     live = _after_barrier(live, barrier_scope)
+    live.bulk_store_handoff = (
+        op.lock
+        if isinstance(op, AsyncOp)
+        and op.lock.type.kind == "bulk"
+        and barrier_scope == BarrierScope.BLOCK_TO_LEADER
+        else None
+    )
     # An async op's effects that its await fully orders wait pending on the lock
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for
