@@ -366,8 +366,12 @@ class PromoteBuffers(LoweringPass):
         # labelled ones.
         buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
         if init is not None:
+            # SMEM initialization has no lowering. Keep the initialization on
+            # the matmul so a subsequent register promotion can materialize it.
             alloc = AllocOp.build_with_fresh_id(
-                target_type, init=init, attrs=buffer_attrs
+                target_type,
+                init=None if self.target_type == "smem" else init,
+                attrs=buffer_attrs,
             )
             new_ops.append(alloc)
         else:
@@ -480,7 +484,13 @@ class PromoteBuffers(LoweringPass):
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
             tmp_alloc = AllocOp.build_with_fresh_id(tmp_type)
-            cvt = ConvertOp.build(dst=tmp_alloc.result(), src=src)
+            cvt = ConvertOp.build(
+                dst=tmp_alloc.result(), src=src,
+                attrs=(
+                    {"label": f"{matmul_label}_{operand_name}_convert"}
+                    if matmul_label is not None else None
+                ),
+            )
             new_ops.extend([tmp_alloc, cvt])
             src = tmp_alloc.result()
         if self.tma and self.target_type == "wrmem":
@@ -570,7 +580,10 @@ class PromoteBuffers(LoweringPass):
         if "dst" in self.operand_names:
             ops, [new_dst] = self._build_operand_promotion(dst, "dst", label, init=init)
             pre_ops.extend(ops)
-            init = None
+            # A staged SMEM destination is intermediate IR; its matmul still
+            # owns initialization until the destination reaches registers.
+            if self.target_type != "smem":
+                init = None
 
         matmul = MatmulOp.build(
             lhs=new_lhs, rhs=new_rhs, dst=new_dst, init=init, attrs=op.extra_attrs

@@ -47,7 +47,7 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
             %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
             %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
             %2: smem<64x128xbf16> = alloc() attrs={id: 2}
             %3: smem<64x128xbf16> = alloc() attrs={id: 3}
             move(%2: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_smem", wgmma_col_start: 0}
@@ -97,8 +97,8 @@ def test_promote_gmem_matmul_operands_to_smem():
             move(%0: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) attrs={tma: True}
             %1: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             move(%1: smem<128x64xbf16 swizzle="128B">, %b: gmem<128x64xbf16>) attrs={tma: True}
-            %2: smem<128x128xf32 swizzle="128B"> = alloc() attrs={id: 2, init: 0.0}
-            matmul(%0: smem<128x64xbf16 swizzle="128B">, %1: smem<128x64xbf16 swizzle="128B">, %2: smem<128x128xf32 swizzle="128B">)
+            %2: smem<128x128xf32 swizzle="128B"> = alloc() attrs={id: 2}
+            matmul(%0: smem<128x64xbf16 swizzle="128B">, %1: smem<128x64xbf16 swizzle="128B">, %2: smem<128x128xf32 swizzle="128B">) attrs={init: 0.0}
             move(%c: rmem<128x128xf32>, %2: smem<128x128xf32 swizzle="128B">) attrs={tma: True}
           }
         }""")
@@ -261,7 +261,7 @@ def test_epilogue_runs_on_the_promoted_accumulator():
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
             elementwise(%0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
             %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
             move(%c: gmem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
         }""")  # noqa: E501

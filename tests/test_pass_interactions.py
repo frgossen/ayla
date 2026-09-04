@@ -35,15 +35,19 @@ MODULE_STR = textwrap.dedent("""\
     }""")
 
 
-def _tiled():
-    """The module after both tilings -- the input to promotion."""
+def _block_tiled():
     module = gpu_dialect.parse(MODULE_STR)
-    module = tile_matmul(
+    return tile_matmul(
         module,
         tile_dims=["M", "N"], tile_sizes=[128, 256],
         tile_levels=["block.x", "block.y"], tile_labels=[None, None],
         label_filter="mm", epilogue_label_filter="epilogue",
     )
+
+
+def _tiled():
+    """The module after both matmul tilings -- the input to promotion."""
+    module = _block_tiled()
     return tile_matmul(
         module,
         tile_dims=["M"], tile_sizes=[64],
@@ -119,6 +123,44 @@ def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():
     ]
 
 
+def test_output_tiling_remains_in_explicit_loops_after_promotion():
+    """Promotion establishes memory scope before output tiling adds loops."""
+    module = _block_tiled()
+    promote_buffers(
+        module, target_type="smem", operands=["dst"], tma=True,
+        label_filter="mm", epilogue_label_filter="epilogue",
+    )
+    tile_matmul(
+        module,
+        tile_dims=["M"], tile_sizes=[64],
+        tile_levels=["wg.x"], tile_labels=[None],
+        label_filter="mm", epilogue_label_filter="epilogue",
+    )
+    promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4,
+        label_filter="mm", epilogue_label_filter="epilogue",
+    )
+    tile_elementwise(
+        module,
+        tile_dims=[1], tile_sizes=[64],
+        tile_levels=["for"], tile_labels=["outn"],
+        label_filter=(
+            "epilogue|mm_dst_convert|mm_dst_wrmem|mm_dst_smem"
+        ),
+    )
+
+    loops = find_ops(module, lambda op: isinstance(op, ForOp))
+    assert len(loops) == 4
+    assert all((loop.lb, loop.ub, loop.step) == (0, 4, 1) for loop in loops)
+    assert all(loop.attrs["label"] == "outn" for loop in loops)
+    for loop in loops:
+        tiles = find_ops(loop, lambda op: isinstance(op, TileOp))
+        assert tiles
+        assert all(tile.indices[1] is loop.iv for tile in tiles)
+        assert all(tile.result().type.sizes[1] == 64 for tile in tiles)
+
+
 TILED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
@@ -150,7 +192,7 @@ PROMOTED_IR = textwrap.dedent("""\
         matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
         elementwise(%6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
         %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-        convert(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+        convert(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
         move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
       }
     }""")
