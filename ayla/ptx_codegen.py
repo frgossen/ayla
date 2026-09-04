@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import pytree
+from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdsOp,
     GmemTensorType,
@@ -37,7 +38,7 @@ from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
-from .base.pipeline import Pipeline
+from .passes.verify import VerificationStage, Verify
 
 
 class PtxLoweringPipeline(Pipeline):
@@ -45,6 +46,7 @@ class PtxLoweringPipeline(Pipeline):
 
     def __init__(self) -> None:
         super().__init__()
+        self.add_pass(Verify(VerificationStage.PTX_LOWERING))
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
