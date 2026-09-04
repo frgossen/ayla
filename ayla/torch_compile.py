@@ -53,8 +53,15 @@ from torch.utils._ordered_set import OrderedSet
 
 from . import gemm_collection  # noqa: F401 -- defines the ops below
 
-_MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
-_MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
+_MM_OUT = (
+    torch.ops.ayla
+    .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_out.default
+)
+_MM_SIGMOID_OUT = (
+    torch.ops.ayla
+    .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_sigmoid_out
+    .default
+)
 
 
 class AylaTemplateBuffer(ir.TemplateBuffer):

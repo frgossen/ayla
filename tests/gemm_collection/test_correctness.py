@@ -159,6 +159,16 @@ def test_lhs_l2_promotion_reaches_tma_descriptor():
             torch.sigmoid,
             id="auto_matmul_4096_wgmma256_wg_sigmoid",
         ),
+        pytest.param(
+            ayla
+            .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_sigmoid,
+            BF16,
+            torch.sigmoid,
+            id=(
+                "auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2"
+                "_sigmoid"
+            ),
+        ),
     ],
 )
 def test_gemm_correctness(op, dtype, epilogue, seed):

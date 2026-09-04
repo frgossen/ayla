@@ -4,7 +4,19 @@ import torch
 import torch._inductor.config as inductor_config
 from torch._inductor.utils import run_and_get_code
 
+from ayla import torch_compile
 from tests.testing_utils import requires_cuda
+
+
+def _op_name(overload) -> str:
+    """The bare op name, as it appears in generated code."""
+    return overload.name().split("::")[-1]
+
+
+# Which kernel serves which case is the lowering's to say, so read it off the
+# lowering rather than pinning a name a swap would then have to chase.
+_MM = _op_name(torch_compile._MM_OUT)
+_MM_SIGMOID = _op_name(torch_compile._MM_SIGMOID_OUT)
 
 
 @requires_cuda
@@ -12,12 +24,12 @@ from tests.testing_utils import requires_cuda
 @pytest.mark.parametrize("fn,op", [
     pytest.param(
         lambda x, w: torch.sigmoid(x @ w.t()),
-        "auto_matmul_4096_wgmma256_wg_sigmoid_out",
+        _MM_SIGMOID,
         id="sigmoid_epilogue",
     ),
     pytest.param(
         lambda x, w: x @ w.t(),
-        "auto_matmul_4096_wgmma256_wg_out",
+        _MM,
         id="no_epilogue",
     ),
 ])
@@ -69,8 +81,8 @@ def test_a_second_reader_of_the_matmul_keeps_both_kernels():
 
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
-    assert "auto_matmul_4096_wgmma256_wg_out" in code, "the matmul is still ayla's"
-    assert "_sigmoid_out" not in code, "but the epilogue cannot fold into it"
+    assert _MM in code, "the matmul is still ayla's"
+    assert _MM_SIGMOID not in code, "but the epilogue cannot fold into it"
     assert code.count("async_compile.triton") == 1
 
 

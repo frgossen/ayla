@@ -35,6 +35,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     ptx_optimization_level: int | None = None,
+    epilogue: str | None = None,
 ) -> ModuleOp:
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
@@ -81,13 +82,27 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
+    if epilogue is not None:
+        name += f"_{epilogue}"
+    # Written against the whole output, saying nothing about where it runs.
+    # `epi` is what the tiling and promotion passes below follow to cut it to
+    # the matmul's tile and point it at the accumulator; without that it stays
+    # put and reads the output back after the store.
+    epilogue_op = (
+        ""
+        if epilogue is None
+        # Indented to match the block below, which dedent measures as a whole.
+        else f'\n            elementwise(%c: gmem<{m}x{n}xbf16>,'
+             f' %c: gmem<{m}x{n}xbf16>) attrs={{fn: "{epilogue}", label: "epi"}}'
+    )
+    epi = None if epilogue is None else "epi"
     m_blocks = (m + output_m_tile - 1) // output_m_tile
     grid_x = (m_blocks + output_tiles_per_cta - 1) // output_tiles_per_cta
     grid_y = (n + output_n_tile - 1) // output_n_tile
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) grid_dim=[{grid_x}, {grid_y}, 1] attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
-            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
+            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}{epilogue_op}
           }}
         }}"""))
     if output_tiles_per_cta == 1:
@@ -95,7 +110,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             module, tile_dims=["M", "N"],
             tile_sizes=[output_m_tile, output_n_tile],
             tile_levels=["block.x", "block.y"], tile_labels=[None, None],
-            label_filter="mm",
+            label_filter="mm", epilogue_label_filter=epi,
             allow_partial=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
@@ -107,6 +122,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
             tile_levels=["for", "block.x", "block.y"],
             tile_labels=["outm", None, None], label_filter="mm",
+            epilogue_label_filter=epi,
             allow_partial=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
@@ -119,6 +135,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     module = tile_matmul(
         module, tile_dims=[wg_dim], tile_sizes=[wg_size],
         tile_levels=["wg.x"], tile_labels=[None], label_filter="mm",
+        epilogue_label_filter=epi,
     )
     module = promote_buffers(
         module, target_type="wrmem", operands=["dst"], swizzle=None,
@@ -134,11 +151,12 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         writeback_slices=output_slices,
         writeback_buffers=output_store_buffers,
         move_attrs=operand_move_attrs,
-        target_dtype="f32", label_filter="mm",
+        target_dtype="f32", label_filter="mm", epilogue_label_filter=epi,
     )
     module = tile_matmul(
         module, tile_dims=["K"], tile_sizes=[operand_k_tile],
         tile_levels=["for"], tile_labels=["k"], label_filter="mm",
+        epilogue_label_filter=epi,
     )
     module = promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
@@ -160,6 +178,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     module = tile_matmul(
         module, tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["kk"], label_filter="mm",
+        epilogue_label_filter=epi,
     )
     module = multi_buffer(
         module, depth=operand_stages, label_filter="mm_lhs_smem",
