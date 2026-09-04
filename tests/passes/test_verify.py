@@ -3,11 +3,11 @@ import textwrap
 import pytest
 
 from ayla.gpu_dialect import ModuleOp, gpu_dialect
-from ayla.passes.verify import VerificationStage, Verify
+from ayla.passes.verify import VerificationStage, verify
 from ayla.ptx_codegen import make_ptx_kernel
 
 
-def _dynamic_matmul() -> ModuleOp:
+def _dynamic_matmul_module() -> ModuleOp:
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @dynamic(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) block_dim=[128, None, None] {
@@ -19,9 +19,9 @@ def _dynamic_matmul() -> ModuleOp:
 
 
 def test_default_verification_allows_dynamic_shapes():
-    module = _dynamic_matmul()
+    module = _dynamic_matmul_module()
 
-    assert Verify().run(module) is module
+    assert verify(module) is module
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():
@@ -33,14 +33,14 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
         }"""))
 
     with pytest.raises(ValueError, match="inconsistent matmul shapes"):
-        Verify().run(module)
+        verify(module)
 
 
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
-        Verify(VerificationStage.PTX_LOWERING).run(_dynamic_matmul())
+        verify(_dynamic_matmul_module(), VerificationStage.PTX_LOWERING)
 
 
 def test_ptx_codegen_verifies_static_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
-        make_ptx_kernel(_dynamic_matmul())
+        make_ptx_kernel(_dynamic_matmul_module())

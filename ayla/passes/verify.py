@@ -15,11 +15,11 @@ class VerificationStage(Enum):
     PTX_LOWERING = auto()
 
 
-def _verify_static_type(typ: Type) -> None:
+def _verify_static_shape(typ: Type) -> None:
     if isinstance(typ, MemTensorType) and typ.is_dynamic:
         raise ValueError(f"unresolved dynamic shape {typ}")
     if isinstance(typ, TmaDescType):
-        _verify_static_type(typ.gmem_type)
+        _verify_static_shape(typ.gmem_type)
 
 
 def _verify_matmul(op: MatmulOp) -> None:
@@ -60,7 +60,15 @@ class Verify(Pass):
             if self.stage is VerificationStage.PTX_LOWERING:
                 for block in op.blocks:
                     for argument in block.arguments:
-                        _verify_static_type(argument.type)
+                        _verify_static_shape(argument.type)
                 for value in (*op.operands, *op.results):
-                    _verify_static_type(value.type)
+                    _verify_static_shape(value.type)
         return module
+
+
+def verify(
+    module: ModuleOp,
+    stage: VerificationStage = VerificationStage.DEFAULT,
+) -> ModuleOp:
+    """Convenience entry point."""
+    return Verify(stage).run(module)
