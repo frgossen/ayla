@@ -1,17 +1,18 @@
 """Configurable GEMM module builders."""
 import textwrap
 
+from .base.pipeline import Pipeline
 from .gpu_dialect import ModuleOp, gpu_dialect
 from .passes.canonicalize import Canonicalize
-from .passes.fuse_async import fuse_async
-from .passes.licm import licm
-from .passes.lower_to_async import lower_to_async
-from .passes.multi_buffer import multi_buffer
-from .passes.pipeline_loop import pipeline_loop
-from .passes.promote_buffers import promote_buffers
-from .passes.schedule_async import schedule_async
-from .passes.tile_matmul import tile_matmul
-from .passes.unroll_loop import unroll_loop
+from .passes.fuse_async import FuseAsync
+from .passes.licm import LICM
+from .passes.lower_to_async import LowerToAsync
+from .passes.multi_buffer import MultiBuffer
+from .passes.pipeline_loop import PipelineLoop
+from .passes.promote_buffers import PromoteBuffers
+from .passes.schedule_async import ScheduleAsync
+from .passes.tile_matmul import TileMatmul
+from .passes.unroll_loop import UnrollLoop
 
 
 def auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -90,9 +91,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
+    pipeline = Pipeline()
     if output_tiles_per_cta == 1:
-        module = tile_matmul(
-            module, tile_dims=["M", "N"],
+        pipeline.add_pass(TileMatmul(
+            tile_dims=["M", "N"],
             tile_sizes=[output_m_tile, output_n_tile],
             tile_levels=["block.x", "block.y"], tile_labels=[None, None],
             label_filter="mm",
@@ -100,10 +102,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
             ),
-        )
+        ))
     else:
-        module = tile_matmul(
-            module, tile_dims=["M", "M", "N"],
+        pipeline.add_pass(TileMatmul(
+            tile_dims=["M", "M", "N"],
             tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
             tile_levels=["for", "block.x", "block.y"],
             tile_labels=["outm", None, None], label_filter="mm",
@@ -111,17 +113,17 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
             ),
-        )
+        ))
     wg_dim, wg_size = (
         ("M", 64) if output_n_tile == 256
         else ("N", warpgroup_n_tile)
     )
-    module = tile_matmul(
-        module, tile_dims=[wg_dim], tile_sizes=[wg_size],
+    pipeline.add_pass(TileMatmul(
+        tile_dims=[wg_dim], tile_sizes=[wg_size],
         tile_levels=["wg.x"], tile_labels=[None], label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="wrmem", operands=["dst"], swizzle=None,
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="wrmem", operands=["dst"], swizzle=None,
         layout="wgmma_layout_0", warps=4, tma=True,
         physical_layout=(
             {
@@ -135,13 +137,13 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         writeback_buffers=output_store_buffers,
         move_attrs=operand_move_attrs,
         target_dtype="f32", label_filter="mm",
-    )
-    module = tile_matmul(
-        module, tile_dims=["K"], tile_sizes=[operand_k_tile],
+    ))
+    pipeline.add_pass(TileMatmul(
+        tile_dims=["K"], tile_sizes=[operand_k_tile],
         tile_levels=["for"], tile_labels=["k"], label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="smem", operands=["lhs", "rhs"],
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None, tma=True,
         physical_layout=(
             {
@@ -156,43 +158,46 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         ),
         move_attrs=operand_move_attrs,
         label_filter="mm",
-    )
-    module = tile_matmul(
-        module, tile_dims=["K"], tile_sizes=[16],
+    ))
+    pipeline.add_pass(TileMatmul(
+        tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["kk"], label_filter="mm",
-    )
-    module = multi_buffer(
-        module, depth=operand_stages, label_filter="mm_lhs_smem",
-    )
-    module = multi_buffer(
-        module, depth=operand_stages, label_filter="mm_rhs_smem",
-    )
-    module = licm(module)
-    module = unroll_loop(module, unroll_factor=operand_stages, label_filter="k")
-    module = Canonicalize().run(module)
-    module = lower_to_async(module)
-    module = fuse_async(module)
-    module = licm(module)
-    module = Canonicalize().run(module)
+    ))
+    pipeline.add_pass(MultiBuffer(
+        depth=operand_stages, label_filter="mm_lhs_smem",
+    ))
+    pipeline.add_pass(MultiBuffer(
+        depth=operand_stages, label_filter="mm_rhs_smem",
+    ))
+    pipeline.add_pass(LICM())
+    pipeline.add_pass(UnrollLoop(
+        unroll_factor=operand_stages, label_filter="k",
+    ))
+    pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(LowerToAsync())
+    pipeline.add_pass(FuseAsync())
+    pipeline.add_pass(LICM())
+    pipeline.add_pass(Canonicalize())
 
-    module = pipeline_loop(
-        module, label_filter_loop="k",
+    pipeline.add_pass(PipelineLoop(
+        label_filter_loop="k",
         label_filter_op=r"mm_(lhs|rhs)_smem_iter\d+_async",
         pipelining_offset=1,
-    )
-    module = unroll_loop(
-        module, unroll_factor=operand_k_tile // 16,
+    ))
+    pipeline.add_pass(UnrollLoop(
+        unroll_factor=operand_k_tile // 16,
         label_filter=r"kk(?:_tail\d+)?(?:_iter\d+)?",
-    )
-    module = fuse_async(module)
+    ))
+    pipeline.add_pass(FuseAsync())
     for _ in range(2):
-        module = licm(module)
-        module = Canonicalize().run(module)
+        pipeline.add_pass(LICM())
+        pipeline.add_pass(Canonicalize())
 
     if output_tiles_per_cta != 1:
-        module = unroll_loop(
-            module, unroll_factor=output_tiles_per_cta,
+        pipeline.add_pass(UnrollLoop(
+            unroll_factor=output_tiles_per_cta,
             label_filter="outm",
-        )
-    module = schedule_async(module)
-    return Canonicalize().run(module)
+        ))
+    pipeline.add_pass(ScheduleAsync())
+    pipeline.add_pass(Canonicalize())
+    return pipeline.run(module)
