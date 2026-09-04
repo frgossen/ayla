@@ -51,8 +51,10 @@ class SpecializeShapes(Pass):
     """Bind concrete shapes to a high-level kernel's gmem arguments.
 
     This intentionally specializes only entry-block arguments. Dynamic shapes
-    introduced elsewhere require shape propagation through the IR; reject
-    those for now instead of silently passing partially specialized IR onward.
+    introduced elsewhere are rejected instead of silently passing partially
+    specialized IR onward.
+
+    TODO: Propagate dynamic shapes introduced elsewhere through the IR.
     """
 
     def __init__(self, argument_shapes: list[tuple[int, ...]]) -> None:
@@ -102,5 +104,5 @@ def specialize_shapes(
     module: ModuleOp,
     argument_shapes: list[tuple[int, ...]],
 ) -> ModuleOp:
-    """Run :class:`SpecializeShapes` on ``module`` in place."""
+    """Run :class:`SpecializeShapes` on ``module``."""
     return SpecializeShapes(argument_shapes).run(module)

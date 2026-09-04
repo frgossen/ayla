@@ -29,9 +29,12 @@ def test_specialization_can_mutate_an_explicit_clone():
     )
 
     assert specialized is module
-    signature = specialized.body.ops[0].signature
-    assert [list(typ.sizes) for typ in signature] == [[7, 11], [13, 11], [7, 13]]
-    assert "?" not in repr(specialized)
+    assert repr(specialized) == textwrap.dedent("""\
+        module {
+          kernel @dynamic(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>) {
+            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>)
+          }
+        }""")  # noqa: E501
     assert "?" in repr(template)
 
 
