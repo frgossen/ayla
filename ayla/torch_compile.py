@@ -45,8 +45,6 @@ from torch._inductor.lowering import user_lowerings
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
-    FusedSchedulerNode,
-    SchedulerNode,
 )
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet

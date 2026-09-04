@@ -1083,10 +1083,10 @@ class LowerToPtxTemplate(LoweringPass):
                     {st_inst} [{st_addr}], ${{{suffix}:co_tmp}};
                 """)
 
-        template += textwrap.dedent(f"""\
-            add.u32 ${{b32:co_idx}}, ${{b32:co_idx}}, ${{b32:co_ntid}};
-            bra ${{label:co_idx_loop}};
-            ${{label:co_end}}:
+        template += textwrap.dedent("""\
+            add.u32 ${b32:co_idx}, ${b32:co_idx}, ${b32:co_ntid};
+            bra ${label:co_idx_loop};
+            ${label:co_end}:
         """)
 
         new_op = PTXTemplateOp.build(
@@ -1328,17 +1328,17 @@ class LowerToPtxTemplate(LoweringPass):
                 shr.u32 ${{b32:st_wg}}, ${{b32:st_full_tid}}, 7;
                 setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
             """)
-        template = writer_setup + textwrap.dedent(f"""\
-            mov.u32 ${{b32:st_lane}}, %laneid;
-            mov.u32 ${{b32:st_tid}}, %tid.x;
-            and.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, 127;
-            shr.u32 ${{b32:st_warp}}, ${{b32:st_tid}}, 5;
-            and.b32 ${{b32:st_row}}, ${{b32:st_lane}}, 7;
-            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, 16, ${{b32:st_row}};
-            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 3;
-            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
-            mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, 64, ${{b32:st_col}};
-            shl.b32 ${{b32:st_off}}, ${{b32:st_off}}, 1;
+        template = writer_setup + textwrap.dedent("""\
+            mov.u32 ${b32:st_lane}, %laneid;
+            mov.u32 ${b32:st_tid}, %tid.x;
+            and.b32 ${b32:st_tid}, ${b32:st_tid}, 127;
+            shr.u32 ${b32:st_warp}, ${b32:st_tid}, 5;
+            and.b32 ${b32:st_row}, ${b32:st_lane}, 7;
+            mad.lo.u32 ${b32:st_row}, ${b32:st_warp}, 16, ${b32:st_row};
+            shr.u32 ${b32:st_col}, ${b32:st_lane}, 3;
+            shl.b32 ${b32:st_col}, ${b32:st_col}, 3;
+            mad.lo.u32 ${b32:st_off}, ${b32:st_row}, 64, ${b32:st_col};
+            shl.b32 ${b32:st_off}, ${b32:st_off}, 1;
         """)
         groups: list[tuple[list[int], int]] = []
         for i in range(0, len(register_starts), 2):

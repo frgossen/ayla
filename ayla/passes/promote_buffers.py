@@ -20,7 +20,6 @@ Example — promote lhs/rhs to smem::
 from __future__ import annotations
 
 from ..gpu_dialect import (
-    AddrMemTensorType,
     AllocOp,
     BF16Type,
     BlockIdsOp,

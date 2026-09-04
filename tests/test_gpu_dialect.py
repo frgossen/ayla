@@ -225,9 +225,9 @@ def test_dynamic_gmem_shape_roundtrips_and_defers_static_properties():
 
 
 def test_naive_matmul_4096_module():
-    module_str = textwrap.dedent(f"""\
-        module {{
-          kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {{
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
             %cx: index, %cy: index, %cz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
@@ -236,19 +236,19 @@ def test_naive_matmul_4096_module():
             %a_thread: gmem<2x4096xf32> = tile(%a_block: gmem<64x4096xf32>, %tx: index, 0)
             %b_thread: gmem<4096x2xf32 strides=[4096, 1]> = tile(%b_block: gmem<4096x64xf32 strides=[4096, 1]>, 0, %ty: index)
             %c_thread: gmem<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={{id: 0, init: 0.0}}
-            for (%k: index = 0 to 4096) {{
+            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
+            for (%k: index = 0 to 4096) {
               %a_sloop: gmem<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem<2x4096xf32>, 0, %k: index)
               %b_sloop: gmem<1x2xf32 strides=[4096, 1]> = tile(%b_thread: gmem<4096x2xf32 strides=[4096, 1]>, %k: index, 0)
-              %a_sloop_rmem: rmem<2x1xf32> = alloc() attrs={{id: 1}}
+              %a_sloop_rmem: rmem<2x1xf32> = alloc() attrs={id: 1}
               move(%a_sloop_rmem: rmem<2x1xf32>, %a_sloop: gmem<2x1xf32 strides=[4096, 1]>)
-              %b_sloop_rmem: rmem<1x2xf32> = alloc() attrs={{id: 2}}
+              %b_sloop_rmem: rmem<1x2xf32> = alloc() attrs={id: 2}
               move(%b_sloop_rmem: rmem<1x2xf32>, %b_sloop: gmem<1x2xf32 strides=[4096, 1]>)
               matmul(%a_sloop_rmem: rmem<2x1xf32>, %b_sloop_rmem: rmem<1x2xf32>, %c_thread_rmem: rmem<2x2xf32>)
-            }}
+            }
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
-          }}
-        }}""")  # noqa: E501
+          }
+        }""")  # noqa: E501
     module = gpu_dialect.parse(module_str)
 
     assert_print_and_roundtrip(module, module_str)
