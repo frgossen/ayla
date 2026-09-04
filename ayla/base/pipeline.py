@@ -30,19 +30,36 @@ class Pipeline(Pass):
     """A sequence of passes invoked one after the other.
 
     Subclasses register passes via `add_pass` (typically in `__init__`).
+    With `dump_ir_on_change=True`, the complete module is printed after each
+    direct child pass that changes its printed representation. Passes registered
+    via `add_instrumentation_pass` run after each direct child pass, but do not
+    themselves trigger instrumentation.
 
     A pipeline is itself a pass, so one nests inside another: a group of passes
     that always run together can be named once and added wherever a single pass
     goes. `run` is overridden outright, so the inherited walk never runs.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, dump_ir_on_change: bool = False) -> None:
         self.passes: list[Pass] = []
+        self.instrumentation_passes: list[Pass] = []
+        self.dump_ir_on_change = dump_ir_on_change
 
     def add_pass(self, p: Pass) -> None:
         self.passes.append(p)
 
+    def add_instrumentation_pass(self, p: Pass) -> None:
+        self.instrumentation_passes.append(p)
+
     def run(self, module: ModuleOp) -> ModuleOp:
         for p in self.passes:
+            before = repr(module) if self.dump_ir_on_change else None
             module = p.run(module)
+            after = repr(module) if self.dump_ir_on_change else None
+            if after != before:
+                print(f"// ----- IR after {type(p).__name__} -----")
+                print(after)
+                print()
+            for instrumentation_pass in self.instrumentation_passes:
+                module = instrumentation_pass.run(module)
         return module
