@@ -51,22 +51,55 @@ from ..base.ir import Op, Value, find_ops
 from ..base.lowering_pass import LoweringPass, lowers
 
 
-def _lower_elementwise_sigmoid_ptx(dst: str, src: str) -> str:
-    """1 / (1 + exp(-x)) for one element, into ``dst``.
+def _lower_elementwise_sigmoid_ptx(
+    dst_regs: list[str], src_regs: list[str], *, bf16_output: bool,
+) -> str:
+    """Lower sigmoid according to the dtype consumed by its conversion."""
+    if bf16_output:
+        # Keep independent registers in the same instruction phase. The
+        # scaled reciprocal form permits FTZ without affecting normal BF16
+        # outputs and exposes enough independent work to cover SFU latency.
+        phases = (
+            "mul.f32 {dst}, {src}, 0fBFB8AA3B;",
+            "ex2.approx.ftz.f32 {dst}, {dst};",
+            "fma.rn.f32 {dst}, {dst}, 0f3E800000, 0f3E800000;",
+            "rcp.approx.ftz.f32 {dst}, {dst};",
+            "mul.f32 {dst}, {dst}, 0f3E800000;",
+        )
+        return "".join(
+            phase.format(dst=dst, src=src) + "\n"
+            for phase in phases
+            for dst, src in zip(dst_regs, src_regs, strict=True)
+        )
 
-    The hardware exponential is base 2, so exp(-x) is ex2 of -x * log2(e)
-    (0fBFB8AA3B).
-
-    TODO: cheaper arrangements to evaluate -- exp2 -> fma -> rcp -> mul, and
-    tanh.approx.f32, which gives sigmoid in two instructions via
-    0.5 * (1 + tanh(x/2)). Both trade accuracy, so they want to be separate
-    fns a caller can ask for rather than a silent swap.
-    """
-    return (
+    # The hardware exponential is base 2, so exp(-x) is ex2 of
+    # -x * log2(e) (0fBFB8AA3B). Keep this as the default FP32 contract.
+    return "".join(
         f"mul.f32 {dst}, {src}, 0fBFB8AA3B;\n"
         f"ex2.approx.f32 {dst}, {dst};\n"
         f"add.f32 {dst}, {dst}, 0f3F800000;\n"
         f"rcp.approx.f32 {dst}, {dst};\n"
+        for dst, src in zip(dst_regs, src_regs, strict=True)
+    )
+
+
+def _elementwise_has_bf16_output(op: ElementwiseOp) -> bool:
+    """Whether this in-place result is subsequently converted to BF16.
+
+    Buffer promotion computes the elementwise operation in an F32 accumulator,
+    then writes it back through an explicit conversion. Static tiling preserves
+    that dataflow: each elementwise view is the source of its matching convert.
+    """
+    block = op.parent_block
+    assert block is not None
+    op_index = block.ops.index(op)
+    return any(
+        isinstance(user, ConvertOp)
+        and user.src is op.dst
+        and isinstance(user.dst.type.dtype, BF16Type)
+        and user.parent_block is block
+        and block.ops.index(user) > op_index
+        for user in op.dst.users()
     )
 
 
@@ -392,22 +425,8 @@ class LowerToPtxTemplate(LoweringPass):
         """Lower an element-wise op on wrmem tensors, one function per element.
 
         dst doubles as the scratch register, so the same tensor as both
-        operands computes in place.
-
-        TODO: schedule this better. Per-element sequences are emitted back to
-        back, so each element's `mul` waits on the previous element's `rcp`;
-        grouping by instruction would expose the independence. Unrolling
-        several at a time would also let a packed consumer take the group --
-        a following cvt.rn.bf16x2.f32 wants pairs, so N*2 is the natural step,
-        and lower_convert already emits that way while this path does not.
-
-        What is unresolved is who decides. If kernels are written on top of
-        deliberately plain ops, plain is the right default here and the knob
-        belongs in the pass options, where whoever writes the kernel can ask
-        for it. If the compiler is meant to find the schedule itself, it
-        belongs in this function. The granularity argues for the first: N*2 is
-        only the right unroll because of what consumes the result, which this
-        function cannot see.
+        operands computes in place. BF16 writeback uses the phased FTZ sequence;
+        other output paths retain the ordinary per-element sequence.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
@@ -429,23 +448,22 @@ class LowerToPtxTemplate(LoweringPass):
                 f"{dst_type.dtype}"
             )
         if op.fn == "sigmoid":
-            emit = _lower_elementwise_sigmoid_ptx
+            dst_regs = [
+                f"${{f32:operand.dst.r{reg}}}"
+                for reg in _view_f32_register_indices(op.dst)
+            ]
+            src_regs = [
+                f"${{f32:operand.src.r{reg}}}"
+                for reg in _view_f32_register_indices(op.src)
+            ]
+            template = _lower_elementwise_sigmoid_ptx(
+                dst_regs, src_regs,
+                bf16_output=_elementwise_has_bf16_output(op),
+            )
         else:
             raise NotImplementedError(
                 f"lower_elementwise: unsupported fn {op.fn!r}"
             )
-
-        template = "".join(
-            emit(
-                f"${{f32:operand.dst.r{dst}}}",
-                f"${{f32:operand.src.r{src}}}",
-            )
-            for dst, src in zip(
-                _view_f32_register_indices(op.dst),
-                _view_f32_register_indices(op.src),
-                strict=True,
-            )
-        )
 
         new_op = PTXTemplateOp.build(
             operands=[dst_value, src_value],

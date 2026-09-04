@@ -177,6 +177,31 @@ def test_lower_elementwise_sigmoid_mma():
     assert template == expected
 
 
+def test_lower_bf16_sigmoid_uses_ftz_phase_schedule():
+    w = 'wrmem<16x8xf32 layout="mma">'
+    b = 'wrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
+            %a: {w} = alloc() attrs={{id: 0}}
+            %b: {b} = alloc() attrs={{id: 1}}
+            elementwise(%a: {w}, %a: {w}) attrs={{fn: "sigmoid"}}
+            convert(%b: {b}, %a: {w})
+          }}
+        }}"""))
+
+    [template] = [
+        op.attrs["template"]
+        for op in find_ops(
+            lower_to_ptx_template(module),
+            lambda op: isinstance(op, PTXTemplateOp),
+        )
+        if "ex2." in op.attrs["template"]
+    ]
+    assert "ex2.approx.ftz.f32" in template
+    assert "rcp.approx.ftz.f32" in template
+
+
 def test_lower_convert_uses_root_registers_for_wrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
