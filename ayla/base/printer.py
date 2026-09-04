@@ -98,9 +98,11 @@ class Printer:
         )
         self.write(f'"{s}"')
 
-    def write_shape(self, sizes: list[int] | tuple[int, ...], dtype=None) -> None:
+    def write_shape(
+        self, sizes: list[int | None] | tuple[int | None, ...], dtype=None,
+    ) -> None:
         """Write `NxMx...` or `NxMx...xDTYPE` if dtype is given."""
-        self.write("x".join(str(s) for s in sizes))
+        self.write("x".join("?" if s is None else str(s) for s in sizes))
         if dtype is not None:
             self.write("x")
             dtype.print(self)

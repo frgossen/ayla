@@ -824,7 +824,7 @@ class MemTensorType(Type):
     @classmethod
     def build(
         cls,
-        sizes: list[int],
+        sizes: list[int | None],
         dtype: Type,
         attrs: dict[str, object] | None = None,
     ):
@@ -835,11 +835,13 @@ class MemTensorType(Type):
         })
 
     @property
-    def sizes(self) -> tuple[int, ...]:
+    def sizes(self) -> tuple[int | None, ...]:
         return self.attrs["sizes"]  # type: ignore[return-value]
 
     @sizes.setter
-    def sizes(self, value: list[int] | tuple[int, ...]) -> None:
+    def sizes(
+        self, value: list[int | None] | tuple[int | None, ...],
+    ) -> None:
         self.attrs["sizes"] = list(value)
 
     @property
@@ -847,8 +849,14 @@ class MemTensorType(Type):
         return len(self.sizes)
 
     @property
-    def num_elements(self) -> int:
+    def num_elements(self) -> int | None:
+        if self.is_dynamic:
+            return None
         return math.prod(self.sizes)
+
+    @property
+    def is_dynamic(self) -> bool:
+        return any(size is None for size in self.sizes)
 
     @property
     def dtype(self) -> Type:
@@ -886,13 +894,15 @@ class AddrMemTensorType(MemTensorType):
     """
 
     @staticmethod
-    def canonical_strides(sizes: list[int]) -> list[int]:
+    def canonical_strides(
+        sizes: list[int | None],
+    ) -> list[int | None]:
         """Row-major dense strides (in elements)."""
-        strides: list[int] = []
-        running = 1
+        strides: list[int | None] = []
+        running: int | None = 1
         for s in reversed(sizes):
             strides.insert(0, running)
-            running *= s
+            running = None if running is None or s is None else running * s
         return strides
 
     @property
@@ -902,9 +912,9 @@ class AddrMemTensorType(MemTensorType):
     @classmethod
     def build(  # type: ignore[override]
         cls,
-        sizes: list[int],
+        sizes: list[int | None],
         dtype: Type,
-        strides: list[int] | None = None,
+        strides: list[int | None] | None = None,
         attrs: dict[str, object] | None = None,
     ):
         if strides is None:
@@ -917,7 +927,7 @@ class AddrMemTensorType(MemTensorType):
         })
 
     @property
-    def strides(self) -> tuple[int, ...]:
+    def strides(self) -> tuple[int | None, ...]:
         """Per-dim stride in elements."""
         return tuple(self.attrs["strides"])  # type: ignore[arg-type]
 
@@ -927,7 +937,7 @@ class AddrMemTensorType(MemTensorType):
             p.write_list_attr(list(self.strides))
 
     @staticmethod
-    def read_strides(sizes: list[int], p) -> list[int]:
+    def read_strides(sizes: list[int | None], p) -> list[int | None]:
         strides = AddrMemTensorType.canonical_strides(sizes)
         if p.can_read_literal("strides"):
             p.read_literal("strides")
