@@ -988,6 +988,7 @@ class LowerToPtxTemplate(LoweringPass):
                 mov.u32 ${{b32:grid_tid}}, %tid.x;
                 setp.ne.u32 ${{pred:grid_not_leader}}, ${{b32:grid_tid}}, 0;
                 @${{pred:grid_not_leader}} bra ${{label:grid_after_leader}};
+                cp.async.bulk.wait_group 0;
                 ld.acquire.gpu.global.u32 ${{b32:grid_sense}}, [${{b64:operand.sync.ptr}}+4];
                 atom.acq_rel.gpu.global.inc.u32 ${{b32:grid_ticket}}, [${{b64:operand.sync.ptr}}], {grid_size - 1};
                 setp.eq.u32 ${{pred:grid_last}}, ${{b32:grid_ticket}}, {grid_size - 1};
