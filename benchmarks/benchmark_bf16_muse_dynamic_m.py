@@ -16,6 +16,7 @@ from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from common import (
     GemmBenchConfig,
+    gemm_bench_config,
     assert_against_torch,
     out_parameter_op,
     plot_tflops_curve,
@@ -84,9 +85,9 @@ def _ayla_config(matmul: MatmulConfig) -> tuple[GemmBenchConfig, str]:
     )
     op = out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
     return (
-        GemmBenchConfig(
-            f"Ayla {matmul.label}", matmul.m, matmul.n, matmul.k, op,
-            torch.bfloat16,
+        gemm_bench_config(
+            name=f"Ayla {matmul.label}", m=matmul.m, n=matmul.n,
+            k=matmul.k, compute=op, dtype=torch.bfloat16,
         ),
         config_name,
     )
@@ -129,6 +130,9 @@ def _plot(rows: list[dict[str, object]], output: Path) -> None:
 
 
 def main() -> int:
+    # Every config in this file wants tf32 matmuls; it used to be a
+    # per-config field that nothing ever set to False.
+    torch.backends.cuda.matmul.allow_tf32 = True
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workloads", nargs="+", choices=PROJECTION_DIMS,
@@ -154,9 +158,9 @@ def main() -> int:
             )
             configs = [
                 ayla_config,
-                GemmBenchConfig(
-                    "cuBLAS", matmul.m, matmul.n, matmul.k, torch_mm_nt,
-                    torch.bfloat16,
+                gemm_bench_config(
+                    name="cuBLAS", m=matmul.m, n=matmul.n, k=matmul.k,
+                    compute=torch_mm_nt, dtype=torch.bfloat16,
                 ),
             ]
             ayla_result, torch_result = run(configs)

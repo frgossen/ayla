@@ -29,9 +29,9 @@ def build_gemm_sigmoid_benchmark(
         return torch.sigmoid(a @ bt.t())
 
     return BenchConfig(
-        f"gemm_sigmoid {m}x{k}x{n}x{dtype}".replace("torch.", ""),
-        make_inputs,
-        compute,
+        name=f"gemm_sigmoid {m}x{k}x{n}x{dtype}".replace("torch.", ""),
+        make_inputs=make_inputs,
+        compute=compute,
     )
 
 
@@ -63,9 +63,12 @@ def variants(config: BenchConfig) -> list[BenchConfig]:
 
     eager = config.compute
     return [
-        BenchConfig(f"{config.name} eager", config.make_inputs, eager),
-        BenchConfig(f"{config.name} compiled", config.make_inputs, compiled),
-        BenchConfig(f"{config.name} ayla_compiled", config.make_inputs, ayla),
+        BenchConfig(name=f"{config.name} eager",
+                    make_inputs=config.make_inputs, compute=eager),
+        BenchConfig(name=f"{config.name} compiled",
+                    make_inputs=config.make_inputs, compute=compiled),
+        BenchConfig(name=f"{config.name} ayla_compiled",
+                    make_inputs=config.make_inputs, compute=ayla),
     ]
 
 

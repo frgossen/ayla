@@ -1,12 +1,9 @@
-"""Shared timing harness for the GEMM benchmarks.
+"""Shared timing harness for the benchmarks.
 
-The benchmark entry points build lists of :class:`GemmBenchConfig` and hand
-them to :func:`run`, so they report identical columns measured identically.
-
-Configs describe the mathematical GEMM, ``(m, k) @ (k, n)``. The operands are
-built in the layout ayla's kernels take: the right one transposed, as ``(n, k)``,
-computing ``a @ bt.T``. The torch baseline is :func:`torch_mm_nt` for the same
-reason -- timing an NN GEMM against ayla's NT one would not be a comparison.
+Configs describe the mathematical GEMM, ``(m, k) @ (k, n)``, but the operands
+are built in the layout ayla's kernels take -- the right one transposed, as
+``(n, k)``, computing ``a @ bt.T``. Timing an NN GEMM against ayla's NT one
+would not be a comparison.
 """
 
 from __future__ import annotations
@@ -39,13 +36,19 @@ _PEAK_DENSE_TC_TFLOPS = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class BenchConfig:
-    """A computation to measure: what to feed it, and what to run."""
+    """A computation to measure: what to feed it, and what to run.
+
+    `verify` sees the output and inputs once before timing, and should raise
+    if the computation is not doing what it claims. `make_inputs` is optional
+    only so a subclass can derive it -- required when constructing directly.
+    """
 
     name: str
-    make_inputs: Callable[[], list[torch.Tensor]]
     compute: Callable[..., torch.Tensor]
+    make_inputs: Callable[[], list[torch.Tensor]] | None = None
+    verify: Callable[..., None] | None = None
 
 
 @dataclass(frozen=True)
@@ -62,19 +65,40 @@ class BenchResult:
     max_ms: float
 
 
-@dataclass
-class GemmBenchConfig:
-    label: str  # e.g. "torch.mm" or "ayla.naive_matmul_4096"
+@dataclass(frozen=True, kw_only=True)
+class GemmBenchConfig(BenchConfig):
+    """A GEMM, as a benchmark: ``compute(a, bt)`` computing ``a @ bt.T``."""
+
     m: int
     n: int
     k: int
-    op: Callable  # the GEMM to time, called as op(a, bt) with bt of shape (n, k)
     dtype: torch.dtype
-    allow_tf32: bool = True
 
     @property
     def flops(self) -> int:
         return 2 * self.m * self.n * self.k
+
+
+def gemm_bench_config(
+    *, name: str, m: int, n: int, k: int, compute: Callable,
+    dtype: torch.dtype,
+) -> GemmBenchConfig:
+    """A :class:`GemmBenchConfig` with its operands and check derived."""
+    def make_inputs() -> list[torch.Tensor]:
+        return [
+            torch.randn(m, k, dtype=dtype, device="cuda"),
+            torch.randn(n, k, dtype=dtype, device="cuda"),
+        ]
+
+    def verify(output: torch.Tensor, _inputs) -> None:
+        assert output.dtype == dtype, (
+            f"{name}: produced {output.dtype}, config says {dtype}"
+        )
+
+    return GemmBenchConfig(
+        name=name, compute=compute, make_inputs=make_inputs, verify=verify,
+        m=m, n=n, k=k, dtype=dtype,
+    )
 
 
 @dataclass(frozen=True)
@@ -86,13 +110,8 @@ class GemmBenchResult(BenchResult):
     torch_mm_pct: float | None = None
 
 
-# The reporting below renders either, and nothing else about them.
-AnyResult = BenchResult | GemmBenchResult
-
-
-# CUDA-event timing config. Both implementations are captured and replayed on
-# the same PyTorch CUDA stream, so neither Python nor dispatcher launch overhead
-# is attributed to one implementation but not the other.
+# Everything is captured and replayed on one stream, so launch overhead is not
+# attributed to one implementation but not another.
 _WARMUP_S = 0.5        # clock-ramp warmup budget...
 _WARMUP_ITERS = 100    # ...capped at this many launches (survive slow kernels)
 _GRAPH_WARMUP = 3      # launches on the capture stream before recording
@@ -133,7 +152,7 @@ def assert_against_torch(
     torch.manual_seed(seed)
     a = torch.randn((cfg.m, cfg.k), dtype=cfg.dtype, device="cuda")
     bt = torch.randn((cfg.n, cfg.k), dtype=cfg.dtype, device="cuda")
-    actual = cfg.op(a, bt)
+    actual = cfg.compute(a, bt)
     expected = torch_mm_nt(a, bt)
     torch.cuda.synchronize()
     difference = actual.float() - expected.float()
@@ -143,38 +162,9 @@ def assert_against_torch(
     )
     if max_abs > max_abs_error or relative_rms > max_relative_rms_error:
         raise RuntimeError(
-            f"{cfg.label}: max abs {max_abs}, relative RMS {relative_rms}"
+            f"{cfg.name}: max abs {max_abs}, relative RMS {relative_rms}"
         )
     return max_abs, relative_rms
-
-
-def _capture_graph(
-    run: Callable, stream: torch.cuda.Stream,
-) -> torch.cuda.CUDAGraph:
-    """Record `run` into a graph that can be replayed.
-
-    The launches before recording are not about clock ramp -- that is the
-    caller's business, and :func:`_prepare` budgets for it. They are for
-    anything a call does only once, allocating a workspace or initialising a
-    handle: that has to happen before recording starts, or it lands inside the
-    graph and is replayed forever after.
-
-    `_prepare` already warms enough to cover that. Doing it here as well costs
-    three launches and makes the function correct to call on its own, which is
-    what a caller wants if it ramps the clocks by replaying the graph rather
-    than by calling through Python.
-    """
-    with torch.cuda.stream(stream):
-        for _ in range(_GRAPH_WARMUP):
-            run()
-    stream.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream), torch.cuda.graph(graph):
-        for _ in range(_GRAPH_LAUNCHES):
-            run()
-    stream.synchronize()
-    return graph
 
 
 def _time_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> float:
@@ -188,62 +178,6 @@ def _time_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> float
     return start.elapsed_time(end) / _GRAPH_LAUNCHES
 
 
-def _prepare(
-    cfg: GemmBenchConfig,
-    a: torch.Tensor,
-    bt: torch.Tensor,
-    stream: torch.cuda.Stream,
-) -> tuple[torch.cuda.CUDAGraph, float]:
-    torch.backends.cuda.matmul.allow_tf32 = cfg.allow_tf32
-    op = cfg.op
-
-    def invoke():
-        return op(a, bt)
-
-    result = invoke()
-    assert result.dtype == cfg.dtype
-
-    # Use one explicit stream for the warmup, graph capture, Ayla launch, torch
-    # launch, and timing events. PtxLauncher selects PyTorch's current stream,
-    # while torch.mm naturally enqueues onto that same current stream.
-    probe_start = torch.cuda.Event(enable_timing=True)
-    probe_end = torch.cuda.Event(enable_timing=True)
-    with torch.cuda.stream(stream):
-        probe_start.record(stream)
-        invoke()
-        probe_end.record(stream)
-    probe_end.synchronize()
-    one_ms = max(probe_start.elapsed_time(probe_end), 1e-3)
-
-    warmup_iters = max(1, min(_WARMUP_ITERS, round(_WARMUP_S * 1e3 / one_ms)))
-    with torch.cuda.stream(stream):
-        for _ in range(warmup_iters):
-            invoke()
-    stream.synchronize()
-
-    graph = _capture_graph(invoke, stream)
-    return graph, max(_time_graph(graph, stream), 1e-3)
-
-
-def _result(cfg: GemmBenchConfig, times_ms: list[float]) -> GemmBenchResult:
-    n = len(times_ms)
-    min_ms = min(times_ms)
-    median_ms = statistics.median(times_ms)
-    # Median throughput is more stable than selecting the luckiest round.
-    tflops = cfg.flops / (median_ms / 1e3) / 1e12
-    return GemmBenchResult(
-        name=f"{cfg.label} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})",
-        rounds=n,
-        iters=_GRAPH_LAUNCHES,
-        median_ms=median_ms,
-        mean_ms=statistics.mean(times_ms),
-        stdev_ms=statistics.stdev(times_ms) if n > 1 else 0.0,
-        min_ms=min_ms,
-        max_ms=max(times_ms),
-        tflops=tflops,
-    )
-
-
 def _with_percentages(
     configs: list[GemmBenchConfig], results: list[GemmBenchResult]
 ) -> list[GemmBenchResult]:
@@ -252,7 +186,7 @@ def _with_percentages(
         (
             result.tflops
             for cfg, result in zip(configs, results)
-            if cfg.op is torch_mm_nt
+            if cfg.compute is torch_mm_nt
         ),
         None,
     )
@@ -274,9 +208,7 @@ def _format_value(value, name: str) -> str:
         return "-"
     if isinstance(value, float):
         if name.endswith("_ms"):
-            # Four decimals, not three: these benchmarks run at fractions of
-            # a millisecond, and three rounds every row's stdev to the same
-            # number, which is exactly the column you need to read a spread.
+            # Four decimals: three collapses every row's stdev to one number.
             return f"{value:.4f}ms"
         if name.endswith("_pct"):
             return f"{value:.1f}%"
@@ -296,73 +228,42 @@ def _align(f) -> str:
     return "<" if _is_str_field(f) else ">"
 
 
-def _format_field(r: AnyResult, f, label_width: int) -> str:
+def _format_field(r: BenchResult, f, label_width: int) -> str:
     value = _format_value(getattr(r, f.name), f.name)
     return f"{value:{_align(f)}{_width(f, label_width)}s}"
 
 
 def run(configs: list[GemmBenchConfig]) -> list[GemmBenchResult]:
-    """Time configs in rotating order on one stream and shared shape inputs."""
+    """Time GEMM configs, and say what the timing means as throughput.
+
+    :func:`run_bench` does the timing; this adds only the GEMM arithmetic.
+    """
     if not configs:
         return []
-    stream = torch.cuda.current_stream()
-    inputs: dict[
-        tuple[int, int, int, torch.dtype],
-        tuple[torch.Tensor, torch.Tensor],
-    ] = {}
-    prepared: list[tuple[GemmBenchConfig, torch.cuda.CUDAGraph, float]] = []
-    for i, cfg in enumerate(configs, 1):
-        key = cfg.m, cfg.n, cfg.k, cfg.dtype
-        if key not in inputs:
-            inputs[key] = (
-                torch.randn(cfg.m, cfg.k, dtype=cfg.dtype, device="cuda"),
-                torch.randn(cfg.n, cfg.k, dtype=cfg.dtype, device="cuda"),
-            )
-        graph, graph_ms = _prepare(cfg, *inputs[key], stream)
-        prepared.append((cfg, graph, graph_ms))
-        print(
-            f"[prepare {i}/{len(configs)}] {cfg.label}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    slowest_graph_ms = max(ms for _, _, ms in prepared) * _GRAPH_LAUNCHES
-    rounds = max(
-        3,
-        min(_MAX_ROUNDS, round(_MIN_RUN_TIME_S * 1e3 / slowest_graph_ms)),
-    )
-    samples = [[] for _ in prepared]
-    for round_index in range(rounds):
-        offset = round_index % len(prepared)
-        order = range(offset, offset + len(prepared))
-        for raw_index in order:
-            index = raw_index % len(prepared)
-            samples[index].append(_time_graph(prepared[index][1], stream))
-
+    timed = run_bench(configs)
+    carried = [field.name for field in dataclasses.fields(BenchResult)]
     results = [
-        _result(cfg, times_ms)
-        for (cfg, _, _), times_ms in zip(prepared, samples, strict=True)
+        GemmBenchResult(
+            **{name: getattr(row, name) for name in carried}
+            | {"name": f"{cfg.name} ({cfg.m}x{cfg.k} @ {cfg.k}x{cfg.n})"},
+            tflops=cfg.flops / (row.median_ms / 1e3) / 1e12,
+        )
+        for cfg, row in zip(configs, timed, strict=True)
     ]
     return _with_percentages(configs, results)
 
 
 def print_results(
-    results: list[AnyResult],
+    results: list[BenchResult],
     label_width: int | None = None,
     with_header: bool = True,
 ) -> None:
     """Print rows as a table, whatever dataclass they are.
 
-    Nothing is assumed about the row type beyond its being a dataclass. Its
-    fields are the columns, in declaration order; a `str` field is
-    left-aligned and sized to the widest value in it, everything else is
-    right-aligned in a fixed column; and the suffix on a field name picks the
-    units, `_ms` or `_pct`. So :class:`GemmBenchResult` and
-    :class:`BenchResult` both render without this knowing either of them.
-
-    `label_width` is measured from the rows unless given. Pass it, with
-    `with_header=False`, to append to a table already printed -- a caller
-    reporting a sweep row by row as it goes, rather than all at the end.
+    Fields are the columns in declaration order; `str` fields are left-aligned
+    and sized to their widest value, the rest right-aligned, and a `_ms` or
+    `_pct` suffix picks the units. Pass `label_width` with `with_header=False`
+    to append to a table already printed.
     """
     if not results:
         return
@@ -384,45 +285,59 @@ def print_results(
         ))
 
 
-# ---------------------------------------------------------------------------
-# A general harness, for anything that is not a GEMM
-# ---------------------------------------------------------------------------
-
 def _capture(config: BenchConfig, stream) -> torch.cuda.CUDAGraph:
-    """Capture one config's compute into a graph that can be replayed."""
+    """Capture one config's compute into a graph that can be replayed.
+
+    The launches before recording flush anything a call does only once -- a
+    workspace, a handle -- which would otherwise land inside the graph.
+    """
     inputs = config.make_inputs()
-    return _capture_graph(lambda: config.compute(*inputs), stream)
+
+    def invoke():
+        return config.compute(*inputs)
+
+    if config.verify is not None:
+        config.verify(invoke(), inputs)
+
+    with torch.cuda.stream(stream):
+        for _ in range(_GRAPH_WARMUP):
+            invoke()
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph):
+        for _ in range(_GRAPH_LAUNCHES):
+            invoke()
+    stream.synchronize()
+    return graph
 
 
 def run_bench(configs: list[BenchConfig]) -> list[BenchResult]:
     """Time every row once per round, on one stream.
 
-    Everything after capture is a graph replay, warmup included. Interleaving
-    is the point: warmed and timed row by row instead, the first would run on
-    a cold card and the last would find the clocks already up, and whatever
-    drifts over the run would land on one row rather than all of them.
-
-    The rounds are not rotated, which is the one place this departs from
-    :func:`run` above. That shifts the starting config each round to keep any
-    one of them out of a fixed position; measured on three same-sized configs
-    it moved the result by less than the round-to-round spread, so it is left
-    out here. Worth revisiting for configs of very different sizes, where a
-    big one's cache footprint would reliably land on its neighbour.
+    Interleaving is the point: warmed and timed row by row instead, the first
+    would run on a cold card and the last would find the clocks already up.
+    Rounds rotate their starting row for the same reason.
     """
     stream = torch.cuda.current_stream()
-    graphs = [_capture(config, stream) for config in configs]
+    graphs = []
+    for i, config in enumerate(configs, 1):
+        graphs.append(_capture(config, stream))
+        # Capturing a long suite takes minutes; say where it is up to.
+        print(f"[capture {i}/{len(configs)}] {config.name}",
+              file=sys.stderr, flush=True)
 
-    def replay_all() -> list[float]:
-        """Replay and time every row once, in row order."""
-        return [_time_graph(graph, stream) for graph in graphs]
+    def replay_all(offset: int = 0) -> list[float]:
+        """Replay and time every row once, starting at `offset`."""
+        times = [0.0] * len(graphs)
+        for i in range(len(graphs)):
+            index = (offset + i) % len(graphs)
+            times[index] = _time_graph(graphs[index], stream)
+        return times
 
-    # Warm to a time budget rather than a fixed count, the way :func:`_prepare`
-    # does, so a slow config is not warmed a hundred times over. One round
-    # replays every config, so the budget is spent against their sum -- unlike
-    # `rounds` below, which sizes off the slowest, because there the goal is
-    # per-config measured time rather than elapsed ramp. The cap is
-    # `_WARMUP_ITERS` launches per config, which is what binds for anything
-    # fast.
+    # A budget, not a fixed count, so a slow config is not warmed a hundred
+    # times over. One round replays every config, so it is spent against their
+    # sum -- unlike `rounds` below, which sizes off the slowest.
     per_round_ms = max(sum(replay_all()), 1e-3) * _GRAPH_LAUNCHES
     for _ in range(max(1, min(_WARMUP_ITERS // _GRAPH_LAUNCHES,
                               round(_WARMUP_S * 1e3 / per_round_ms)))):
@@ -433,11 +348,11 @@ def run_bench(configs: list[BenchConfig]) -> list[BenchResult]:
     rounds = max(3, min(_MAX_ROUNDS,
                         round(_MIN_RUN_TIME_S * 1e3 / slowest)))
 
-    by_round = [replay_all() for _ in range(rounds)]
-    # A round per entry, transposed to a row per entry. Both zips are strict:
-    # every round has to have timed every row, and every row has to have a
-    # config. Neither can fail today, and a lenient zip would answer a broken
-    # one by quietly dropping rows off the end of the table.
+    # Rotate the starting row each round, so no row sits permanently first
+    # (cold) or permanently behind the same neighbour.
+    by_round = [replay_all(r) for r in range(rounds)]
+    # A round per entry, transposed to a row per entry. Strict: a lenient zip
+    # would answer a mismatch by dropping rows off the end of the table.
     by_row = zip(*by_round, strict=True)
 
     return [

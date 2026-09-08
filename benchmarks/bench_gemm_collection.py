@@ -8,10 +8,13 @@ import re
 import ayla.gemm_collection  # noqa: F401 -- registers torch.ops.ayla.*
 import torch
 
-from common import GemmBenchConfig, print_results, run, torch_mm_nt
+from common import gemm_bench_config, print_results, run, torch_mm_nt
 
 
 def main() -> None:
+    # Every config in this file wants tf32 matmuls; it used to be a
+    # per-config field that nothing ever set to False.
+    torch.backends.cuda.matmul.allow_tf32 = True
     parser = argparse.ArgumentParser(description="Benchmark GEMM kernels")
     parser.add_argument("-k", "--filter", type=str, default=None,
                         help="Regex to filter benchmarks by label")
@@ -23,78 +26,79 @@ def main() -> None:
         raise SystemExit("CUDA required")
 
     configs = [
-        GemmBenchConfig(
-            label="torch.mm.bf16",
+        gemm_bench_config(
+            name="torch.mm.bf16",
             m=4096,
             n=4096,
             k=4096,
-            op=torch_mm_nt,
+            compute=torch_mm_nt,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.pranjalssh",
+        gemm_bench_config(
+            name="ayla.pranjalssh",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.pranjalssh_4096,
+            compute=torch.ops.ayla.pranjalssh_4096,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.pranjalssh_pipelined (prev best)",
+        gemm_bench_config(
+            name="ayla.pranjalssh_pipelined (prev best)",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.pranjalssh_4096_pipelined,
+            compute=torch.ops.ayla.pranjalssh_4096_pipelined,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.auto_matmul (wgmma128)",
+        gemm_bench_config(
+            name="ayla.auto_matmul (wgmma128)",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.auto_matmul_4096,
+            compute=torch.ops.ayla.auto_matmul_4096,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.auto_matmul (wgmma256 wg)",
+        gemm_bench_config(
+            name="ayla.auto_matmul (wgmma256 wg)",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg,
+            compute=torch.ops.ayla.auto_matmul_4096_wgmma256_wg,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3)",
+        gemm_bench_config(
+            name="ayla.auto_matmul (wgmma256 wg, TMA store K=3)",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
+            compute=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.auto_matmul (wgmma256 wg, TMA store K=3, 2 tiles/CTA)",
+        gemm_bench_config(
+            name="ayla.auto_matmul (wgmma256 wg, TMA store K=3, 2 tiles/CTA)",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
+            compute=torch.ops.ayla
+            .auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles,
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label=(
+        gemm_bench_config(
+            name=(
                 "ayla.auto_matmul (wgmma256 wg, TMA store K=3, split output, "
                 "2 tiles/CTA)"
             ),
             m=4096,
             n=4096,
             k=4096,
-            op=(
+            compute=(
                 torch.ops.ayla
                 .auto_matmul_4096_wgmma256_wg_tma_store_k3_2tiles_split2_dbuf2
             ),
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label=(
+        gemm_bench_config(
+            name=(
                 "ayla.auto_matmul (wgmma256 wg, PTX JIT O1, packed shared "
                 "allocations, A promote 256B, split output, 4 tiles/CTA, "
                 "A+C evict-first)"
@@ -102,24 +106,24 @@ def main() -> None:
             m=4096,
             n=4096,
             k=4096,
-            op=(
+            compute=(
                 torch.ops.ayla
                 .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2
             ),
             dtype=torch.bfloat16,
         ),
-        GemmBenchConfig(
-            label="ayla.fastcu_5_1 (fast.cu static smem)",
+        gemm_bench_config(
+            name="ayla.fastcu_5_1 (fast.cu static smem)",
             m=4096,
             n=4096,
             k=4096,
-            op=torch.ops.ayla.fastcu_5_1,
+            compute=torch.ops.ayla.fastcu_5_1,
             dtype=torch.bfloat16,
         ),
     ]
     if args.filter:
         pattern = re.compile(args.filter)
-        configs = [c for c in configs if pattern.search(c.label)]
+        configs = [c for c in configs if pattern.search(c.name)]
     if args.reverse:
         configs = configs[::-1]
     print_results(run(configs))
