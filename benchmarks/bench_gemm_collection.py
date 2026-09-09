@@ -8,7 +8,7 @@ import re
 import ayla.gemm_collection  # noqa: F401 -- registers torch.ops.ayla.*
 import torch
 
-from common import gemm_bench_config, print_results, run, torch_mm_nt
+from benchmarks.common import gemm_bench_config, print_results, run, torch_mm_nt
 
 
 def main() -> None:

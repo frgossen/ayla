@@ -55,4 +55,4 @@ default = ["dev", "bench"]
 install = { cmd = "pip install torch --index-url https://download.pytorch.org/whl/cu128 && pip install -e ." }
 test = "pytest"
 lint = "ruff check"
-bench = "python benchmarks/bench_gemm_collection.py"
+bench = "python -m benchmarks.bench_gemm_collection"
