@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-
 from ..gpu_dialect import (
     BlockIdsOp,
     ForOp,
@@ -16,6 +14,7 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
+from ..base.pipeline import op_label_matches
 
 
 class TileMatmul(LoweringPass):
@@ -126,7 +125,7 @@ class TileMatmul(LoweringPass):
         block.ops = new_ops
 
     def _is_hero(self, op: Op) -> bool:
-        return isinstance(op, MatmulOp) and _label_matches(self.label_filter, op)
+        return isinstance(op, MatmulOp) and op_label_matches(op, self.label_filter)
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
         """The ops directly behind ``ops[hero]`` that its tiling should absorb.
@@ -143,7 +142,7 @@ class TileMatmul(LoweringPass):
             op = ops[i]
             if self.epilogue_label_filter is None or not is_elementwise(op):
                 break
-            if not _label_matches(self.epilogue_label_filter, op):
+            if not op_label_matches(op, self.epilogue_label_filter):
                 break
             # In place over the hero's destination is the only shape supported:
             # one operand pattern, one set of dims, no broadcast to reason about.
@@ -429,10 +428,3 @@ def tile_matmul(
         tile_dims, tile_sizes, tile_levels, tile_labels,
         label_filter, epilogue_label_filter, allow_partial,
     ).run(module)
-
-
-def _label_matches(label_filter: str | None, op: Op) -> bool:
-    if label_filter is None:
-        return True
-    label = op.attrs.get("label")
-    return isinstance(label, str) and bool(re.fullmatch(label_filter, label))

@@ -18,9 +18,13 @@ test.
 # flake8: noqa: E501
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import ElementwiseOp, ForOp, TileOp, gpu_dialect
+from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.promote_buffers import promote_buffers
+from ayla.passes.tile_elementwise import tile_elementwise
 from ayla.passes.tile_matmul import tile_matmul
+from ayla.passes.unroll_loop import unroll_loop
 
 MODULE_STR = textwrap.dedent("""\
     module {
@@ -76,6 +80,43 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
     )
 
     assert repr(module) == PROMOTED_IR
+
+
+def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+            elementwise(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
+          }
+        }"""))  # noqa: E501
+    tile_elementwise(
+        module,
+        tile_dims=[1], tile_sizes=[64],
+        tile_levels=["for"], tile_labels=["outn"],
+        label_filter="epilogue",
+    )
+
+    [loop] = find_ops(module, lambda op: isinstance(op, ForOp))
+    assert (loop.lb, loop.ub, loop.step) == (0, 4, 1)
+    [dynamic_tile] = find_ops(module, lambda op: isinstance(op, TileOp))
+    assert dynamic_tile.static_indices == [0, None]
+
+    unroll_loop(module, unroll_factor=4, label_filter="outn")
+    Canonicalize().run(module)
+    Canonicalize().run(module)
+
+    assert not find_ops(module, lambda op: isinstance(op, ForOp))
+    tiles = find_ops(module, lambda op: isinstance(op, TileOp))
+    assert [tile.static_indices for tile in tiles] == [
+        [0, 0], [0, 1], [0, 2], [0, 3],
+    ]
+    elementwise = find_ops(module, lambda op: isinstance(op, ElementwiseOp))
+    assert [op.attrs["label"] for op in elementwise] == [
+        "epilogue_iter0",
+        "epilogue_iter1",
+        "epilogue_iter2",
+        "epilogue_iter3",
+    ]
 
 
 TILED_IR = textwrap.dedent("""\
