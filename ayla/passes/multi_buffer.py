@@ -29,6 +29,7 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Op, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
+from ._utils import label_matches
 
 
 def _enclosing_loop(op: Op) -> ForOp | None:
@@ -61,7 +62,7 @@ class MultiBuffer(LoweringPass):
         loop = _enclosing_loop(op)
         if self.depth <= 1 or loop is None:
             return None
-        if self.label_filter is not None and op.attrs.get("label") != self.label_filter:
+        if not label_matches(op, self.label_filter):
             return None
         # A per-iteration initializer would have to be re-run per buffer.
         if op.init is not None:

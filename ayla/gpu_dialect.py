@@ -1396,13 +1396,25 @@ class ForOp(Op):
     def lb(self) -> int:
         return self.attrs["lb"]  # type: ignore[return-value]
 
+    @lb.setter
+    def lb(self, value: int) -> None:
+        self.attrs["lb"] = value
+
     @property
     def ub(self) -> int:
         return self.attrs["ub"]  # type: ignore[return-value]
 
+    @ub.setter
+    def ub(self, value: int) -> None:
+        self.attrs["ub"] = value
+
     @property
     def step(self) -> int:
         return self.attrs["step"]  # type: ignore[return-value]
+
+    @step.setter
+    def step(self, value: int) -> None:
+        self.attrs["step"] = value
 
     @property
     def trip_count(self) -> int:

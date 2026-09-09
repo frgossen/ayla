@@ -14,8 +14,6 @@ otherwise each copy gets its own.
 """
 from __future__ import annotations
 
-import re
-
 from ..gpu_dialect import (
     ForOp,
     IndexAddOp,
@@ -23,8 +21,10 @@ from ..gpu_dialect import (
     IndexType,
     ModuleOp,
 )
-from ..base.ir import Block, Op, Value, clone_op, iter_ops
+from ..base.ir import Block, Op, Value
 from ..base.lowering_pass import LoweringPass, lowers
+from ._loop_utils import clone_loop_iteration
+from ._utils import label_matches
 
 
 class UnrollLoop(LoweringPass):
@@ -41,7 +41,7 @@ class UnrollLoop(LoweringPass):
     ) -> tuple[list[Op], list[object]] | None:
         if self.unroll_factor <= 1:
             return None
-        if self.label_filter is not None and not re.fullmatch(self.label_filter, op.attrs.get("label", "")):
+        if not label_matches(op, self.label_filter):
             return None
 
         # Recursively transform nested ops first.
@@ -61,14 +61,16 @@ class UnrollLoop(LoweringPass):
             iteration_iv = IndexAddOp.build(lhs=new_iv, rhs=offset.result())
             main_body_ops.extend([offset, iteration_iv])
             main_body_ops.extend(
-                _clone_iteration(op, iteration_iv.result(), f"_iter{i}")
+                clone_loop_iteration(op, iteration_iv.result(), f"_iter{i}")
             )
 
         tail_ops: list[Op] = []
         for i in range(num_tail_iterations):
             tail_iv = IndexConstantOp.build(value=new_ub + i * step)
             tail_ops.append(tail_iv)
-            tail_ops.extend(_clone_iteration(op, tail_iv.result(), f"_tail{i}"))
+            tail_ops.extend(
+                clone_loop_iteration(op, tail_iv.result(), f"_tail{i}")
+            )
 
         # An empty main loop is left for folding to erase rather than special
         # cased here.
@@ -78,24 +80,6 @@ class UnrollLoop(LoweringPass):
         ]
         result.extend(tail_ops)
         return result, []
-
-
-def _clone_iteration(
-    op: ForOp, iteration_iv: Value, label_suffix: str,
-) -> list[Op]:
-    """Clone the loop body once, rebinding the induction variable.
-
-    Labels get the suffix so that later passes can name a single copy.
-    """
-    vmap: dict[Value, Value] = {op.iv: iteration_iv}
-    cloned = [clone_op(body_op, vmap) for body_op in op.body.ops]
-    for cloned_op in cloned:
-        for nested in iter_ops(cloned_op):
-            label = nested.attrs.get("label")
-            if isinstance(label, str):
-                nested.attrs["label"] = label + label_suffix
-    return cloned
-
 
 def unroll_loop(module: ModuleOp, unroll_factor: int, label_filter: str | None = None) -> ModuleOp:
     """Convenience entry point."""

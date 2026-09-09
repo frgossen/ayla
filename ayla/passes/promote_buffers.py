@@ -48,6 +48,7 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
+from ._utils import label_matches
 
 
 def _target_level(target_type: str) -> str:
@@ -522,10 +523,7 @@ class PromoteBuffers(LoweringPass):
         block.ops = new_ops
 
     def _promotes(self, op: Op) -> bool:
-        return isinstance(op, MatmulOp) and (
-            self.label_filter is None
-            or op.attrs.get("label") == self.label_filter
-        )
+        return isinstance(op, MatmulOp) and label_matches(op, self.label_filter)
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
         """The ops directly behind ``ops[hero]`` that promote with it.
@@ -546,7 +544,7 @@ class PromoteBuffers(LoweringPass):
         for op in ops[hero + 1:]:
             if not is_elementwise(op):
                 break
-            if op.attrs.get("label") != self.epilogue_label_filter:
+            if not label_matches(op, self.epilogue_label_filter):
                 break
             if len(op.operands) != 2 or not all(v is dst for v in op.operands):
                 break
