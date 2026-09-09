@@ -285,7 +285,9 @@ def print_results(
         ))
 
 
-def _capture(config: BenchConfig, stream) -> torch.cuda.CUDAGraph:
+def _capture(
+    config: BenchConfig, stream,
+) -> tuple[torch.cuda.CUDAGraph, list[torch.Tensor]]:
     """Capture one config's compute into a graph that can be replayed.
 
     The launches before recording flush anything a call does only once -- a
@@ -309,7 +311,10 @@ def _capture(config: BenchConfig, stream) -> torch.cuda.CUDAGraph:
         for _ in range(_GRAPH_LAUNCHES):
             invoke()
     stream.synchronize()
-    return graph
+    # A CUDA graph records input addresses, not the Python objects that own
+    # them.  Keep the tensors alive alongside the graph so the allocator
+    # cannot reuse their storage while the benchmark suite is being captured.
+    return graph, inputs
 
 
 def run_bench(configs: list[BenchConfig]) -> list[BenchResult]:
@@ -321,8 +326,11 @@ def run_bench(configs: list[BenchConfig]) -> list[BenchResult]:
     """
     stream = torch.cuda.current_stream()
     graphs = []
+    graph_inputs = []
     for i, config in enumerate(configs, 1):
-        graphs.append(_capture(config, stream))
+        graph, inputs = _capture(config, stream)
+        graphs.append(graph)
+        graph_inputs.append(inputs)
         # Capturing a long suite takes minutes; say where it is up to.
         print(f"[capture {i}/{len(configs)}] {config.name}",
               file=sys.stderr, flush=True)

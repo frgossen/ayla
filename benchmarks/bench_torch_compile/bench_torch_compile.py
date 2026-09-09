@@ -9,6 +9,7 @@ in `corpus/`, one module per graph.
 from __future__ import annotations
 
 import torch
+import torch._dynamo.config as dynamo_config
 import torch._inductor.config as inductor_config
 
 from ayla import torch_compile
@@ -52,12 +53,19 @@ def variants(config: BenchConfig) -> list[BenchConfig]:
 
 
 def main() -> None:
+    configs = build_configs()
     # Both span the run: the backend is outside the cache key, and dynamo
     # guards on grad mode.
-    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+    with (
+        dynamo_config.patch(
+            recompile_limit=max(dynamo_config.recompile_limit, len(configs)),
+        ),
+        inductor_config.patch(force_disable_caches=True),
+        torch.no_grad(),
+    ):
         expanded = [
             variant
-            for config in build_configs()
+            for config in configs
             for variant in variants(config)
         ]
         print_results(run_bench(expanded))
