@@ -130,9 +130,20 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_tile(
         self, op: TileOp,
     ) -> tuple[list[Op], list[object]] | None:
-        """Lower a tile op to ToPtrOp + index arithmetic + PtrAddOp."""
+        """Lower an address tile to a pointer, or erase a WRMEM view.
+
+        A WRMEM tile is a zero-cost view of its parent's distributed register
+        fragment. Consumers inspect the original TileOp chain to select the
+        corresponding root registers; mapping the result to the root value
+        prevents the view from allocating another register tensor.
+        """
         arg = self.value_map[op.arg]
         new_ops: list[Op] = []
+
+        if isinstance(op.arg.type, WrmemTensorType):
+            _wgmma_view_pairs(op.result())  # Validate the static view.
+            assert isinstance(arg, Value)
+            return [], [arg]
 
         # First tile: convert tensor to ptr.
         if isinstance(arg, Value) and isinstance(arg.type, AddrMemTensorType):
@@ -335,8 +346,8 @@ class LowerToPtxTemplate(LoweringPass):
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
-        dst_type = dst_value.type
-        src_type = src_value.type
+        dst_type = op.dst.type
+        src_type = op.src.type
 
         if not (isinstance(src_type, WrmemTensorType)
                 and isinstance(dst_type, WrmemTensorType)):
@@ -346,22 +357,23 @@ class LowerToPtxTemplate(LoweringPass):
         assert tuple(src_type.sizes) == tuple(dst_type.sizes)
         assert src_type.warps == dst_type.warps
 
-        src_n = src_type.num_elements_per_thread
         if not (isinstance(src_type.dtype, F32Type)
                 and isinstance(dst_type.dtype, (BF16Type, F16Type))):
             raise NotImplementedError(
                 f"lower_convert: unsupported {src_type.dtype} -> {dst_type.dtype}"
             )
 
-        template = ""
-        for i in range(0, src_n, 2):
-            dst_reg = i // 2
-            template += (
-                f"cvt.rn.{dst_type.dtype.name}x2.f32 "
-                f"${{b32:operand.dst.r{dst_reg}}}, "
-                f"${{f32:operand.src.r{i + 1}}}, "
-                f"${{f32:operand.src.r{i}}};\n"
+        template = "".join(
+            f"cvt.rn.{dst_type.dtype.name}x2.f32 "
+            f"${{b32:operand.dst.r{dst_pair}}}, "
+            f"${{f32:operand.src.r{2 * src_pair + 1}}}, "
+            f"${{f32:operand.src.r{2 * src_pair}}};\n"
+            for dst_pair, src_pair in zip(
+                _view_pair_indices(op.dst),
+                _view_pair_indices(op.src),
+                strict=True,
             )
+        )
 
         new_op = PTXTemplateOp.build(
             operands=[dst_value, src_value],
@@ -399,8 +411,8 @@ class LowerToPtxTemplate(LoweringPass):
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
-        dst_type = dst_value.type
-        src_type = src_value.type
+        dst_type = op.dst.type
+        src_type = op.src.type
 
         if not (isinstance(src_type, WrmemTensorType)
                 and isinstance(dst_type, WrmemTensorType)):
@@ -423,11 +435,17 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_elementwise: unsupported fn {op.fn!r}"
             )
 
-        template = ""
-        for i in range(src_type.num_elements_per_thread):
-            template += emit(
-                f"${{f32:operand.dst.r{i}}}", f"${{f32:operand.src.r{i}}}",
+        template = "".join(
+            emit(
+                f"${{f32:operand.dst.r{dst}}}",
+                f"${{f32:operand.src.r{src}}}",
             )
+            for dst, src in zip(
+                _view_f32_register_indices(op.dst),
+                _view_f32_register_indices(op.src),
+                strict=True,
+            )
+        )
 
         new_op = PTXTemplateOp.build(
             operands=[dst_value, src_value],
@@ -1247,18 +1265,30 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
         m_dim, n_dim = wrmem_type.sizes
-        col_start = int(op.attrs.get("wgmma_col_start", 0))
-        dst_m, dst_n = dst_type.sizes
-        assert dst_m == m_dim and 0 <= col_start < n_dim, (
-            f"wgmma store: invalid destination shape {list(dst_type.sizes)} "
-            f"and column start {col_start} for fragment {[m_dim, n_dim]}"
-        )
-        assert col_start + dst_n <= n_dim
+        root_n = root_buffer(op.src).type.sizes[1]
+        if isinstance(op.src.definition, TileOp):
+            assert list(dst_type.sizes) == [m_dim, n_dim], (
+                f"wgmma store: destination shape {list(dst_type.sizes)} does "
+                f"not match fragment {[m_dim, n_dim]}"
+            )
+            pairs = _wgmma_view_pairs(op.src)
+        else:
+            # Keep accepting the legacy producer until PromoteBuffers switches
+            # from an attribute-based slice to an explicit WRMEM view.
+            col_start = int(op.attrs.get("wgmma_col_start", 0))
+            dst_m, dst_n = dst_type.sizes
+            assert dst_m == m_dim and 0 <= col_start < n_dim
+            assert col_start + dst_n <= n_dim
+            pairs = [
+                (pair, row, col - col_start)
+                for pair, row, col in _wgmma_view_pairs(op.src)
+                if col_start <= col < col_start + dst_n
+            ]
         assert m_dim % 64 == 0, (
             f"wgmma store: m must be a multiple of 64; got {m_dim}"
         )
-        assert n_dim % 16 == 0 and 8 <= n_dim <= 256, (
-            f"wgmma store: n must be a multiple of 16 in [8, 256]; got {n_dim}"
+        assert root_n % 16 == 0 and 8 <= root_n <= 256, (
+            f"wgmma store: n must be a multiple of 16 in [8, 256]; got {root_n}"
         )
         dtype_bytes = dst_type.dtype.byte_size
         row_stride_bytes = dst_type.strides[0] * dtype_bytes
@@ -1281,15 +1311,11 @@ class LowerToPtxTemplate(LoweringPass):
             address = "${b32:base}"
             instruction = "st.shared.b32"
 
-        num_registers = wrmem_type.num_elements_per_thread // 2
-        for reg in range(num_registers):
-            di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
-            if not col_start <= dj < col_start + dst_n:
-                continue
-            offset = di * row_stride_bytes + (dj - col_start) * dtype_bytes
+        for pair, di, dj in pairs:
+            offset = di * row_stride_bytes + dj * dtype_bytes
             template += (
                 f"{instruction} [{address}+{offset}], "
-                f"${{b32:operand.src.r{reg}}};\n"
+                f"${{b32:operand.src.r{pair}}};\n"
             )
 
         new_op = PTXTemplateOp.build(
@@ -1310,8 +1336,12 @@ class LowerToPtxTemplate(LoweringPass):
         src_type = op.src.type
         assert isinstance(dst_type, SmemTensorType)
         assert isinstance(src_type, WrmemTensorType)
-        col_start = int(op.attrs.get("wgmma_col_start", 0))
-        n_dim = src_type.sizes[1]
+        col_start = (
+            _static_view_origin(op.src)[1]
+            if isinstance(op.src.definition, TileOp)
+            else int(op.attrs.get("wgmma_col_start", 0))
+        )
+        n_dim = root_buffer(op.src).type.sizes[1]
         root_type = root_buffer(op.dst).type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = root_type.sizes
@@ -1344,15 +1374,15 @@ class LowerToPtxTemplate(LoweringPass):
         for i in range(0, len(register_starts), 2):
             first0 = register_starts[i]
             first1 = register_starts[i + 1]
-            di, dj = _get_wgmma_layout_0_static_offsets(first0, n_dim)
-            next_di, next_dj = _get_wgmma_layout_0_static_offsets(
+            di, dj = _wgmma_pair_static_offset(first0, n_dim)
+            next_di, next_dj = _wgmma_pair_static_offset(
                 first1, n_dim,
             )
             assert next_di == di and next_dj == dj + 16
-            offset0 = _get_stmatrix_store_static_offset(
+            offset0 = _stmatrix_store_static_offset(
                 first0, n_dim, col_start, root_sizes[0],
             )
-            offset1 = _get_stmatrix_store_static_offset(
+            offset1 = _stmatrix_store_static_offset(
                 first0 + 1, n_dim, col_start, root_sizes[0],
             )
             groups.extend([
@@ -1718,23 +1748,101 @@ def _build_wgmma_layout_0_dynamic_offset(
     return ops, byte_offset.result()
 
 
-def _get_wgmma_layout_0_static_offsets(reg: int, n_dim: int = 128) -> tuple[int, int]:
-    """(row, col) offset for register `reg` in wgmma_layout_0 (4 warps).
+def _wgmma_pair_static_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
+    """Thread-independent root offset of a WGMMA pair's first element.
 
-    Each b32 register holds a pair of adjacent bf16 column elements.
-    n_dim determines the number of column groups (n_dim // 16).
+    The runtime warp/lane offset selects the thread's base coordinate. This
+    returns the additional logical ``(row, column)`` offset for ``pair_index``
+    in that thread's register fragment.
     """
     n_groups = n_dim // 16
-    m, w = divmod(reg // 4, n_groups)
-    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][reg % 4]
+    m, w = divmod(pair_index // 4, n_groups)
+    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][pair_index % 4]
     return (m * 64 + di, w * 16 + dj)
 
 
-def _get_stmatrix_store_static_offset(
-    reg: int, n_dim: int, col_start: int, dst_m: int,
+def _static_view_origin(value: Value) -> tuple[int, ...]:
+    """Logical element coordinates of a static view's origin in its root."""
+    offsets = [0] * value.type.rank
+    while isinstance(value.definition, TileOp):
+        tile = value.definition
+        for dim, index in enumerate(tile.static_indices):
+            if index is None:
+                raise NotImplementedError(
+                    "WRMEM views currently require static tile indices"
+                )
+            offsets[dim] += index * tile.result().type.sizes[dim]
+        value = tile.arg
+    return tuple(offsets)
+
+
+def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
+    """Map a WGMMA WRMEM value or view to pairs in its root.
+
+    Each tuple is ``(root_pair_index, view_row_offset, view_column_offset)``.
+    Pair ``p`` names F32 registers ``2*p`` and ``2*p + 1``, or the packed
+    BF16/F16 b32 register ``p``. The offsets are the thread-independent
+    logical coordinates of the pair's first element relative to the view;
+    store lowering adds the runtime warp/lane coordinate separately.
+    """
+    view_type, root_type = value.type, root_buffer(value).type
+    assert isinstance(view_type, WrmemTensorType)
+    assert isinstance(root_type, WrmemTensorType)
+    assert view_type.layout == root_type.layout == "wgmma_layout_0"
+    assert view_type.rank == root_type.rank == 2
+    assert view_type.warps == root_type.warps == 4
+    assert view_type.dtype == root_type.dtype
+    assert isinstance(view_type.dtype, (F32Type, BF16Type, F16Type)), (
+        f"WGMMA views support f32, bf16, and f16; got {view_type.dtype}"
+    )
+    assert root_type.num_elements_per_thread % 2 == 0
+    row_start, col_start = _static_view_origin(value)
+    view_m, view_n = view_type.sizes
+    pairs = [
+        (pair_index, row - row_start, col - col_start)
+        for pair_index in range(root_type.num_elements_per_thread // 2)
+        for row, col in [
+            _wgmma_pair_static_offset(pair_index, root_type.sizes[1])
+        ]
+        if row_start <= row < row_start + view_m
+        and col_start <= col < col_start + view_n
+    ]
+    assert len(pairs) == view_m * view_n // (root_type.warps * 64)
+    return pairs
+
+
+def _view_pair_indices(value: Value) -> list[int]:
+    """Return per-thread root pair indices selected by a WRMEM value or view."""
+    assert isinstance(value.type, WrmemTensorType)
+    if value.type.layout == "wgmma_layout_0":
+        return [pair for pair, _, _ in _wgmma_view_pairs(value)]
+    if isinstance(value.definition, TileOp):
+        raise NotImplementedError(
+            f"WRMEM views are unsupported for layout {value.type.layout!r}"
+        )
+    count = value.type.num_elements_per_thread
+    assert count % 2 == 0, (
+        f"WRMEM pair operations require an even number of elements per thread; "
+        f"got {count}"
+    )
+    return list(range(count // 2))
+
+
+def _view_f32_register_indices(value: Value) -> list[int]:
+    """Return root F32 register indices covered by a WRMEM value or view."""
+    assert isinstance(value.type.dtype, F32Type)
+    return [
+        2 * pair + element
+        for pair in _view_pair_indices(value)
+        for element in (0, 1)
+    ]
+
+
+def _stmatrix_store_static_offset(
+    pair_index: int, n_dim: int, col_start: int, dst_m: int,
 ) -> int:
-    """Byte offset for a register in the selected 64-column blocked layout."""
-    di, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
+    """Byte offset for a pair in the selected 64-column blocked layout."""
+    di, dj = _wgmma_pair_static_offset(pair_index, n_dim)
     relative_col = dj - col_start
     assert relative_col >= 0 and relative_col % 32 == 0
     block_offset = relative_col // 64 * dst_m * 64
@@ -1801,31 +1909,36 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         return None
 
     m_dim, n_dim = src_type.sizes
-    col_start = int(op.attrs.get("wgmma_col_start", 0))
-    dst_m, dst_n = dst_type.sizes
+    root_n = root_buffer(op.src).type.sizes[1]
+    is_view = isinstance(op.src.definition, TileOp)
+    if is_view:
+        row_start, col_start = _static_view_origin(op.src)
+        pairs = _wgmma_view_pairs(op.src)
+    else:
+        row_start = 0
+        col_start = int(op.attrs.get("wgmma_col_start", 0))
+        pairs = [
+            (pair, row, col - col_start)
+            for pair, row, col in _wgmma_view_pairs(op.src)
+            if col_start <= col < col_start + dst_type.sizes[1]
+        ]
     if (
-        dst_m != m_dim
+        dst_type.sizes[0] != m_dim
+        or (is_view and dst_type.sizes[1] != n_dim)
+        or row_start != 0
         or col_start < 0
         or col_start % 16
-        or col_start + dst_n > n_dim
-    ):
-        return None
-    if (
-        m_dim % 64
-        or n_dim % 16
-        or dst_n % 64
-        or not (8 <= n_dim <= 256)
+        or (not is_view and col_start + dst_type.sizes[1] > n_dim)
+        or m_dim % 64
+        or dst_type.sizes[1] % 64
+        or root_n % 16
+        or not (8 <= root_n <= 256)
     ):
         return None
 
-    num_registers = src_type.num_elements_per_thread // 2
-    if num_registers % 4:
+    if len(pairs) % 4:
         return None
-    register_starts = []
-    for reg in range(0, num_registers, 4):
-        _, dj = _get_wgmma_layout_0_static_offsets(reg, n_dim)
-        if col_start <= dj < col_start + dst_n:
-            register_starts.append(reg)
+    register_starts = [pair for pair, _, _ in pairs if pair % 4 == 0]
     return register_starts if len(register_starts) % 2 == 0 else None
 
 
