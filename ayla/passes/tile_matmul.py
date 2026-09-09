@@ -85,28 +85,15 @@ class TileMatmul(LoweringPass):
         self.tile_sizes = list(tile_sizes)
         self.iteration_bindings = list(iteration_bindings)
         self.for_loop_labels = list(for_loop_labels)
-        self.grid_dim_constraints: list[int | None]
-        self.block_dim_constraints: list[int | None]
-        self.num_warp_groups_constraints: list[int | None]
+        self.kernel: KernelOp
 
     @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
-        self.grid_dim_constraints = [None, None, None]
-        self.block_dim_constraints = [None, None, None]
-        self.num_warp_groups_constraints = [None]
+        self.kernel = op
         for block in op.blocks:
             self._rewrite_block(block)
-        op.grid_dim = _resolve_launch_dim_constraints(
-            op.grid_dim, self.grid_dim_constraints,
-        )
-        op.block_dim = _resolve_launch_dim_constraints(
-            op.block_dim, self.block_dim_constraints,
-        )
-        [op.num_warp_groups] = _resolve_launch_dim_constraints(
-            [op.num_warp_groups], self.num_warp_groups_constraints,
-        )
         return [op], []
 
     def _rewrite_block(self, block: Block) -> None:
@@ -320,35 +307,36 @@ class TileMatmul(LoweringPass):
         if iteration_binding == "for":
             pass
         elif iteration_binding == "block.x":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [ub, None, None],
+            self.kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.grid_dim), [ub, None, None],
             )
         elif iteration_binding == "block.y":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [None, ub, None],
+            self.kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.grid_dim), [None, ub, None],
             )
         elif iteration_binding == "block.z":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [None, None, ub],
+            self.kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.grid_dim), [None, None, ub],
             )
         elif iteration_binding == "thread.x":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [ub, None, None],
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [ub, None, None],
             )
         elif iteration_binding == "thread.y":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [None, ub, None],
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [None, ub, None],
             )
         elif iteration_binding == "thread.z":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [None, None, ub],
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [None, None, ub],
             )
         elif iteration_binding == "wg.x":
-            self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
-                self.num_warp_groups_constraints, [ub],
+            [num_warp_groups] = _resolve_launch_dim_constraints(
+                [self.kernel.num_warp_groups], [ub],
             )
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [ub * 128, 1, 1],
+            self.kernel.num_warp_groups = num_warp_groups
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [ub * 128, 1, 1],
             )
         elif iteration_binding in ("wg.y", "wg.z"):
             raise ValueError(
