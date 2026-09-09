@@ -1,3 +1,6 @@
 [submodule "cuda_experiments/fast.cu"]
 	path = cuda_experiments/fast.cu
 	url = https://github.com/pranjalssh/fast.cu.git
+[submodule "third_party/better-benchmark"]
+	path = third_party/better-benchmark
+	url = https://github.com/eellison/better-benchmark
