@@ -172,9 +172,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     module = Canonicalize().run(module)
     module = lower_to_async(module)
     module = fuse_async(module)
-    for _ in range(4):
-        module = licm(module)
-        module = Canonicalize().run(module)
+    module = licm(module)
+    module = Canonicalize().run(module)
 
     module = pipeline_loop(
         module, label_filter_loop="k",
@@ -186,7 +185,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         label_filter=r"kk(?:_tail\d+)?(?:_iter\d+)?",
     )
     module = fuse_async(module)
-    for _ in range(4):
+    for _ in range(2):
         module = licm(module)
         module = Canonicalize().run(module)
 
