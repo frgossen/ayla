@@ -4,25 +4,19 @@ The row that matters is `ayla_compiled` against `compiled`: the same graph
 lowered the same way everywhere except the matmul. What gets measured lives
 in `corpus/`, one module per graph.
 
-    python benchmarks/bench_torch_compile/bench_torch_compile.py
+    python -m benchmarks.bench_torch_compile.bench_torch_compile
 """
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 
 import torch
 import torch._inductor.config as inductor_config
 
-# `benchmarks/` holds `common`, and running a script only puts that script's
-# own directory on the path.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ayla import torch_compile
+from benchmarks.common import BenchConfig, print_results, run_bench
 
-from ayla import torch_compile  # noqa: E402
-from common import BenchConfig, print_results, run_bench  # noqa: E402
 # TODO: Imports every corpus module, each building its configs at import
 # time. Select and load on demand once that gets slow.
-from corpus import CONFIGS  # noqa: E402
+from .corpus import build_configs
 
 
 def _compile(fn, inputs, *, use_ayla: bool):
@@ -62,7 +56,9 @@ def main() -> None:
     # guards on grad mode.
     with inductor_config.patch(force_disable_caches=True), torch.no_grad():
         expanded = [
-            variant for config in CONFIGS for variant in variants(config)
+            variant
+            for config in build_configs()
+            for variant in variants(config)
         ]
         print_results(run_bench(expanded))
 

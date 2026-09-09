@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from common import BenchConfig
+from benchmarks.common import BenchConfig
 
 
 def build_gemm_sigmoid_config(
@@ -31,9 +31,10 @@ def build_gemm_sigmoid_config(
     )
 
 
-# What this file contributes to the corpus.
-CONFIGS = [
-    # 4096 cubed bf16, a shape the collection covers, so ayla has something to
-    # claim and the bottom row means something.
-    build_gemm_sigmoid_config(m=4096, k=4096, n=4096, dtype=torch.bfloat16),
-]
+def build_configs() -> list[BenchConfig]:
+    """What this module contributes to the corpus."""
+    return [
+        # 4096 cubed bf16, a shape the collection covers, so ayla has
+        # something to claim and the bottom row means something.
+        build_gemm_sigmoid_config(m=4096, k=4096, n=4096, dtype=torch.bfloat16),
+    ]
