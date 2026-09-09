@@ -20,8 +20,6 @@ Legality: see ``_check_legality``.
 """
 from __future__ import annotations
 
-import re
-
 from ..gpu_dialect import (
     ForOp,
     IndexAddOp,
@@ -34,6 +32,7 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
+from ._utils import label_matches
 
 
 class PipelineLoop(LoweringPass):
@@ -46,13 +45,9 @@ class PipelineLoop(LoweringPass):
         pipelining_offset: int,
     ) -> None:
         super().__init__()
-        self.label_filter_loop = re.compile(label_filter_loop)
-        self.label_filter_op = re.compile(label_filter_op)
+        self.label_filter_loop = label_filter_loop
+        self.label_filter_op = label_filter_op
         self.pipelining_offset = pipelining_offset
-
-    def _label_matches(self, op: Op) -> bool:
-        label = op.attrs.get("label")
-        return isinstance(label, str) and self.label_filter_op.fullmatch(label) is not None
 
     def _compute_labeled_and_shared(
         self, body_ops: list[Op],
@@ -73,7 +68,7 @@ class PipelineLoop(LoweringPass):
         shared: set[Op] = set()
         labeled: set[Op] = {
             body_op for body_op in body_ops
-            if self._label_matches(body_op)
+            if label_matches(body_op, self.label_filter_op)
         }
         worklist = list(labeled)
         while worklist:
@@ -243,8 +238,7 @@ class PipelineLoop(LoweringPass):
             self._check_legal_for_offset_gt_one(body_ops, labeled_set, shared_set)
 
     def _loop_matches(self, op: ForOp) -> bool:
-        label = op.attrs.get("label", "")
-        return self.label_filter_loop.fullmatch(label or "") is not None
+        return label_matches(op, self.label_filter_loop)
 
     @lowers(ForOp)
     def lower_for(
