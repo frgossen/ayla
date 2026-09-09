@@ -1,7 +1,8 @@
 """Tests for the `folding` pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops
+from ayla.gpu_dialect import TileOp, gpu_dialect
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
@@ -42,6 +43,22 @@ def test_fold_constants():
             %cx_offset: index = index_mul(%cx: index, %c64: index)
           }
         }""")
+
+
+def test_fold_constant_tile_indices_to_static_indices():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+            %c3: index = index_constant() attrs={value: 3}
+            %tile: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%a: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %c3: index)
+          }
+        }"""))  # noqa: E501
+
+    folding(module)
+
+    [tile] = find_ops(module, lambda op: isinstance(op, TileOp))
+    assert tile.static_indices == [0, 3]
+    assert tile.indices == [0, 3]
 
 
 def test_per_iteration_buffer_choice_folds_after_unrolling():

@@ -1,8 +1,21 @@
 """Base class for IR passes."""
 from __future__ import annotations
 
+import re
+
 from ..gpu_dialect import ModuleOp
 from .ir import Block, Op
+
+
+def op_label_matches(op: Op, label_filter: str | None) -> bool:
+    """Whether an op's string label fully matches a filter.
+
+    A ``None`` filter selects every op.
+    """
+    if label_filter is None:
+        return True
+    label = op.attrs.get("label")
+    return isinstance(label, str) and re.fullmatch(label_filter, label) is not None
 
 
 class Pass:
