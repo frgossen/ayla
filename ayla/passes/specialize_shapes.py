@@ -10,7 +10,6 @@ from ..gpu_dialect import (
     ModuleOp,
     TmaDescType,
 )
-from .verify_gpu_dialect import VerifyGpuDialect
 
 
 def _specialize_argument(
@@ -97,7 +96,7 @@ class SpecializeShapes(Pass):
                         f"shape {value.type} through the IR"
                     )
 
-        return VerifyGpuDialect().run(module)
+        return module
 
 
 def specialize_shapes(

@@ -46,7 +46,9 @@ class PtxLoweringPipeline(Pipeline):
 
     def __init__(self) -> None:
         super().__init__()
-        self.add_pass(VerifyGpuDialect(VerificationStage.PTX_LOWERING))
+        self.add_instrumentation_pass(
+            VerifyGpuDialect(VerificationStage.PTX_LOWERING)
+        )
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
