@@ -244,22 +244,23 @@ class PromoteBuffers(LoweringPass):
         label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
     ) -> None:
-        super().__init__()
-        self.target_type = target_type
-        self.target_dtype = target_dtype
-        self.operand_names = set(operands)
-        self.label_filter = label_filter
-        self.epilogue_label_filter = epilogue_label_filter
-        self.swizzle = swizzle
-        self.layout = layout
-        self.warps = warps
-        self.tma = tma
-        self.nc = nc
-        self.physical_layout = physical_layout
-        self.move_attrs = dict(move_attrs or {})
-        self.writeback_slices = writeback_slices
-        self.writeback_buffers = writeback_buffers
-        self.tma_load_slices = dict(tma_load_slices or {})
+        super().__init__(
+            target_type=target_type,
+            target_dtype=target_dtype,
+            operands=operands,
+            swizzle=swizzle,
+            layout=layout,
+            warps=warps,
+            tma=tma,
+            nc=nc,
+            physical_layout=physical_layout,
+            move_attrs=dict(move_attrs or {}),
+            writeback_slices=writeback_slices,
+            writeback_buffers=writeback_buffers,
+            tma_load_slices=dict(tma_load_slices or {}),
+            label_filter=label_filter,
+            epilogue_label_filter=epilogue_label_filter,
+        )
         assert writeback_slices >= 1, "writeback_slices must be positive"
         assert writeback_buffers in (1, writeback_slices), (
             "writeback_buffers must be 1 or equal writeback_slices"
@@ -267,6 +268,7 @@ class PromoteBuffers(LoweringPass):
         assert all(n >= 1 for n in self.tma_load_slices.values()), (
             "TMA load slice counts must be positive"
         )
+        self.operand_names = set(operands)
 
     def _build_smem_type(self, sizes, dtype):
         layout = dict(self.physical_layout or {})

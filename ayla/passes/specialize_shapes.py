@@ -57,7 +57,7 @@ class SpecializeShapes(Pass):
     """
 
     def __init__(self, argument_shapes: list[tuple[int, ...]]) -> None:
-        self.argument_shapes = argument_shapes
+        super().__init__(argument_shapes=argument_shapes)
 
     def run(self, module: ModuleOp) -> ModuleOp:
         top_ops = module.body.ops

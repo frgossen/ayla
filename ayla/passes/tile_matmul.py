@@ -61,10 +61,15 @@ class TileMatmul(LoweringPass):
         epilogue_label_filter: str | None = None,
         allow_partial_tiles: bool = False,
     ) -> None:
-        super().__init__()
-        self.op_label_filter = op_label_filter
-        self.epilogue_label_filter = epilogue_label_filter
-        self.allow_partial_tiles = allow_partial_tiles
+        super().__init__(
+            op_dims=list(op_dims),
+            tile_sizes=list(tile_sizes),
+            iteration_bindings=list(iteration_bindings),
+            for_loop_labels=list(for_loop_labels),
+            op_label_filter=op_label_filter,
+            epilogue_label_filter=epilogue_label_filter,
+            allow_partial_tiles=allow_partial_tiles,
+        )
         assert (
             len(op_dims)
             == len(tile_sizes)
@@ -81,10 +86,6 @@ class TileMatmul(LoweringPass):
             binding == "for" or label is None
             for binding, label in zip(iteration_bindings, for_loop_labels)
         ), "TileMatmul: only 'for' iteration bindings may have loop labels"
-        self.op_dims = list(op_dims)
-        self.tile_sizes = list(tile_sizes)
-        self.iteration_bindings = list(iteration_bindings)
-        self.for_loop_labels = list(for_loop_labels)
         self.kernel: KernelOp
 
     @lowers(KernelOp)

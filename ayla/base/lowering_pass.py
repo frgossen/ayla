@@ -69,7 +69,8 @@ class LoweringPass(Pass):
                     table[op_type] = member
         cls._rewriters = table
 
-    def __init__(self) -> None:
+    def __init__(self, **options: object) -> None:
+        super().__init__(**options)
         self.value_map: dict[Value, object] = {}
 
     def run(self, module: ModuleOp) -> ModuleOp:

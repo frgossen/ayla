@@ -51,9 +51,7 @@ class MultiBuffer(LoweringPass):
     """Clone loop-local allocations `depth` times and select per iteration."""
 
     def __init__(self, depth: int, label_filter: str | None = None) -> None:
-        super().__init__()
-        self.depth = depth
-        self.label_filter = label_filter
+        super().__init__(depth=depth, label_filter=label_filter)
 
     @lowers(AllocOp)
     def lower_alloc(

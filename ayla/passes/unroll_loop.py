@@ -31,9 +31,10 @@ class UnrollLoop(LoweringPass):
     """Unroll all ForOps by `unroll_factor`."""
 
     def __init__(self, unroll_factor: int, label_filter: str | None = None) -> None:
-        super().__init__()
-        self.unroll_factor = unroll_factor
-        self.label_filter = label_filter
+        super().__init__(
+            unroll_factor=unroll_factor,
+            label_filter=label_filter,
+        )
 
     @lowers(ForOp)
     def lower_for(

@@ -13,6 +13,19 @@ class Pass:
     Subclasses override whichever level they need.
     """
 
+    def __init__(self, **options: object) -> None:
+        self._option_names = tuple(options)
+        for name, value in options.items():
+            if hasattr(type(self), name):
+                raise ValueError(f"option shadows Pass attribute: {name}")
+            setattr(self, name, value)
+
+    def __repr__(self) -> str:
+        args = ", ".join(
+            f"{name}={getattr(self, name)!r}" for name in self._option_names
+        )
+        return f"{type(self).__name__}({args})"
+
     def run(self, module: ModuleOp) -> ModuleOp:
         self.run_op(module)
         return module
@@ -41,9 +54,9 @@ class Pipeline(Pass):
     """
 
     def __init__(self, *, dump_ir_on_change: bool = False) -> None:
+        super().__init__(dump_ir_on_change=dump_ir_on_change)
         self.passes: list[Pass] = []
         self.instrumentation_passes: list[Pass] = []
-        self.dump_ir_on_change = dump_ir_on_change
 
     def add_pass(self, p: Pass) -> None:
         self.passes.append(p)
@@ -59,7 +72,7 @@ class Pipeline(Pass):
             module = p.run(module)
             after = repr(module) if self.dump_ir_on_change else None
             if after != before:
-                print(f"// ----- IR after {type(p).__name__} -----")
+                print(f"// ----- IR after {p!r} -----")
                 print(after)
                 print()
             for instrumentation_pass in self.instrumentation_passes:
