@@ -85,15 +85,14 @@ class TileMatmul(LoweringPass):
         self.tile_sizes = list(tile_sizes)
         self.iteration_bindings = list(iteration_bindings)
         self.for_loop_labels = list(for_loop_labels)
-        self.kernel: KernelOp
+        self._kernel: KernelOp
 
     @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
-        self.kernel = op
-        for block in op.blocks:
-            self._rewrite_block(block)
+        self._kernel = op
+        self._rewrite_block(op.body)
         return [op], []
 
     def _rewrite_block(self, block: Block) -> None:
@@ -307,36 +306,36 @@ class TileMatmul(LoweringPass):
         if iteration_binding == "for":
             pass
         elif iteration_binding == "block.x":
-            self.kernel.grid_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.grid_dim), [ub, None, None],
+            self._kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.grid_dim), [ub, None, None],
             )
         elif iteration_binding == "block.y":
-            self.kernel.grid_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.grid_dim), [None, ub, None],
+            self._kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.grid_dim), [None, ub, None],
             )
         elif iteration_binding == "block.z":
-            self.kernel.grid_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.grid_dim), [None, None, ub],
+            self._kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.grid_dim), [None, None, ub],
             )
         elif iteration_binding == "thread.x":
-            self.kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.block_dim), [ub, None, None],
+            self._kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.block_dim), [ub, None, None],
             )
         elif iteration_binding == "thread.y":
-            self.kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.block_dim), [None, ub, None],
+            self._kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.block_dim), [None, ub, None],
             )
         elif iteration_binding == "thread.z":
-            self.kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.block_dim), [None, None, ub],
+            self._kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.block_dim), [None, None, ub],
             )
         elif iteration_binding == "wg.x":
             [num_warp_groups] = _resolve_launch_dim_constraints(
-                [self.kernel.num_warp_groups], [ub],
+                [self._kernel.num_warp_groups], [ub],
             )
-            self.kernel.num_warp_groups = num_warp_groups
-            self.kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self.kernel.block_dim), [ub * 128, 1, 1],
+            self._kernel.num_warp_groups = num_warp_groups
+            self._kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self._kernel.block_dim), [ub * 128, 1, 1],
             )
         elif iteration_binding in ("wg.y", "wg.z"):
             raise ValueError(
