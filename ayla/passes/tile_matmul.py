@@ -18,17 +18,20 @@ from ._utils import label_matches
 
 
 class TileMatmul(LoweringPass):
-    """Tile every ``matmul`` along ``tile_dims`` by matching ``tile_sizes``.
+    """Tile every ``matmul`` along ``op_dims`` by matching ``tile_sizes``.
 
-    Three parallel lists describe the tiling:
-      - ``tile_dims[i]``: one of ``"M" | "N" | "K"`` (matmul shapes
+    Four parallel lists describe the tiling:
+      - ``op_dims[i]``: one of ``"M" | "N" | "K"`` (matmul shapes
         are lhs=[M, K], rhs=[N, K], dst=[M, N]).
       - ``tile_sizes[i]``: tile size for that dim.
-      - ``tile_levels[i]``: where the iteration lives — ``"for"`` for a
+      - ``iteration_bindings[i]``: where the iteration lives — ``"for"`` for a
         sequential ``for`` loop, ``"block.{x,y,z}"`` for ``block_ids()``
         (writes the matching axis of the kernel's ``grid_dim``), or
         ``"thread.{x,y,z}"`` for ``thread_ids()`` (writes the matching
-        axis of the kernel's ``block_dim``).
+        axis of the kernel's ``block_dim``), or ``"wg.x"`` for
+        ``warp_group_id()``.
+      - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
+        ``None`` for an iteration mapped to a hardware dimension.
 
     Nesting order is outer→inner along the list.
 
@@ -43,61 +46,54 @@ class TileMatmul(LoweringPass):
     a loop and leaves the epilogue after it, running once per tile rather than
     once per K step.
 
-    ``allow_partial`` permits a non-divisible block-level tile by rounding the
-    grid dimension up. Addressing remains full-tile; callers must use memory
-    operations with defined out-of-bounds behavior, such as TMA.
+    ``allow_partial_tiles`` permits a non-divisible block-level tile by
+    rounding the grid dimension up. Addressing remains full-tile; callers must
+    use memory operations with defined out-of-bounds behavior, such as TMA.
     """
 
     def __init__(
         self,
-        tile_dims: list[str],
+        op_dims: list[str],
         tile_sizes: list[int],
-        tile_levels: list[str],
-        tile_labels: list[str | None],
-        label_filter: str | None = None,
+        iteration_bindings: list[str],
+        for_loop_labels: list[str | None],
+        op_label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
-        allow_partial: bool = False,
+        allow_partial_tiles: bool = False,
     ) -> None:
         super().__init__()
-        self.label_filter = label_filter
+        self.op_label_filter = op_label_filter
         self.epilogue_label_filter = epilogue_label_filter
-        self.allow_partial = allow_partial
-        if not (len(tile_dims) == len(tile_sizes) == len(tile_levels) == len(tile_labels)):
-            raise ValueError(
-                f"TileMatmul: tile_dims, tile_sizes, tile_levels, tile_labels "
-                f"must have the same length; got {len(tile_dims)}, "
-                f"{len(tile_sizes)}, {len(tile_levels)}, {len(tile_labels)}"
-            )
-        self.tile_dims = list(tile_dims)
+        self.allow_partial_tiles = allow_partial_tiles
+        assert (
+            len(op_dims)
+            == len(tile_sizes)
+            == len(iteration_bindings)
+            == len(for_loop_labels)
+        ), (
+            "TileMatmul: op_dims, tile_sizes, iteration_bindings, "
+            "for_loop_labels "
+            f"must have the same length; got {len(op_dims)}, "
+            f"{len(tile_sizes)}, {len(iteration_bindings)}, "
+            f"{len(for_loop_labels)}"
+        )
+        assert all(
+            binding == "for" or label is None
+            for binding, label in zip(iteration_bindings, for_loop_labels)
+        ), "TileMatmul: only 'for' iteration bindings may have loop labels"
+        self.op_dims = list(op_dims)
         self.tile_sizes = list(tile_sizes)
-        self.tile_levels = list(tile_levels)
-        self.tile_labels = list(tile_labels)
-        # Per-kernel state: two 3-lists of `int | None` (x/y/z).
-        # `grid_dim_constraints` holds the demands from `block.*` levels
-        # (writes to kernel.grid_dim). `block_dim_constraints` holds the
-        # demands from `thread.*` levels (writes to kernel.block_dim).
-        self.grid_dim_constraints: list[int | None]
-        self.block_dim_constraints: list[int | None]
-        self.num_warp_groups_constraints: list[int | None]
+        self.iteration_bindings = list(iteration_bindings)
+        self.for_loop_labels = list(for_loop_labels)
+        self.kernel: KernelOp
 
     @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
-        self.grid_dim_constraints = [None, None, None]
-        self.block_dim_constraints = [None, None, None]
-        self.num_warp_groups_constraints = [None]
+        self.kernel = op
         for block in op.blocks:
             self._rewrite_block(block)
-        op.grid_dim = _resolve_launch_dim_constraints(
-            op.grid_dim, self.grid_dim_constraints,
-        )
-        op.block_dim = _resolve_launch_dim_constraints(
-            op.block_dim, self.block_dim_constraints,
-        )
-        [op.num_warp_groups] = _resolve_launch_dim_constraints(
-            [op.num_warp_groups], self.num_warp_groups_constraints,
-        )
         return [op], []
 
     def _rewrite_block(self, block: Block) -> None:
@@ -125,7 +121,9 @@ class TileMatmul(LoweringPass):
         block.ops = new_ops
 
     def _is_hero(self, op: Op) -> bool:
-        return isinstance(op, MatmulOp) and label_matches(op, self.label_filter)
+        return isinstance(op, MatmulOp) and label_matches(
+            op, self.op_label_filter,
+        )
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
         """The ops directly behind ``ops[hero]`` that its tiling should absorb.
@@ -163,77 +161,84 @@ class TileMatmul(LoweringPass):
 
         # Compute iteration bounds and accumulate kernel constraints.
         ubs: list[int] = []
-        for tile_dim, tile_size, tile_level in zip(
-            self.tile_dims, self.tile_sizes, self.tile_levels,
+        for op_dim, tile_size, iteration_binding in zip(
+            self.op_dims, self.tile_sizes, self.iteration_bindings,
         ):
-            if tile_dim not in sizes_by_dim:
+            if op_dim not in sizes_by_dim:
                 raise ValueError(
-                    f"TileMatmul: tile_dim must be 'M', 'N', or 'K'; "
-                    f"got {tile_dim!r}"
+                    f"TileMatmul: op_dim must be 'M', 'N', or 'K'; "
+                    f"got {op_dim!r}"
                 )
-            tile_dim_size = sizes_by_dim[tile_dim]
-            is_partial = tile_dim_size % tile_size != 0
+            op_dim_size = sizes_by_dim[op_dim]
+            is_partial = op_dim_size % tile_size != 0
             if is_partial and not (
-                self.allow_partial
-                and (tile_level == "for" or tile_level.startswith("block."))
-            ):
+                self.allow_partial_tiles
+                and (
+                    iteration_binding == "for"
+                    or iteration_binding.startswith("block.")
+                )
+                ):
                 raise ValueError(
-                    f"TileMatmul: tile_dim {tile_dim} size "
-                    f"({tile_dim_size}) is not divisible by tile "
+                    f"TileMatmul: op_dim {op_dim} size "
+                    f"({op_dim_size}) is not divisible by tile "
                     f"size ({tile_size})"
                 )
-            ub = (tile_dim_size + tile_size - 1) // tile_size
+            ub = (op_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
-            self._accumulate_constraint(tile_level, ub)
-            sizes_by_dim[tile_dim] = tile_size
+            self._accumulate_constraint(iteration_binding, ub)
+            sizes_by_dim[op_dim] = tile_size
 
 
         new_ops: list[Op] = []
         block_ids_op: BlockIdsOp | None = None
         thread_ids_op: ThreadIdsOp | None = None
         wg_id_op: WarpGroupIdOp | None = None
-        if any(level.startswith("block.") for level in self.tile_levels):
+        if any(binding.startswith("block.") for binding in self.iteration_bindings):
             block_ids_op = BlockIdsOp.build()
             new_ops.append(block_ids_op)
-        if any(level.startswith("thread.") for level in self.tile_levels):
+        if any(binding.startswith("thread.") for binding in self.iteration_bindings):
             thread_ids_op = ThreadIdsOp.build()
             new_ops.append(thread_ids_op)
             self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
                 self.num_warp_groups_constraints, [-1],
             )
-        if any(level.startswith("wg.") for level in self.tile_levels):
+        if any(binding.startswith("wg.") for binding in self.iteration_bindings):
             wg_id_op = WarpGroupIdOp.build()
             new_ops.append(wg_id_op)
 
         ivs: list[Value] = []
-        for tile_level, tile_label in zip(self.tile_levels, self.tile_labels):
-            if tile_level == "for":
-                ivs.append(Value(name=tile_label, type=IndexType()))
-            elif tile_level == "block.x":
+        for iteration_binding, loop_label in zip(
+            self.iteration_bindings, self.for_loop_labels,
+        ):
+            if iteration_binding == "for":
+                ivs.append(Value(name=loop_label, type=IndexType()))
+            elif iteration_binding == "block.x":
                 ivs.append(block_ids_op.x)
-            elif tile_level == "block.y":
+            elif iteration_binding == "block.y":
                 ivs.append(block_ids_op.y)
-            elif tile_level == "block.z":
+            elif iteration_binding == "block.z":
                 ivs.append(block_ids_op.z)
-            elif tile_level == "thread.x":
+            elif iteration_binding == "thread.x":
                 ivs.append(thread_ids_op.x)
-            elif tile_level == "thread.y":
+            elif iteration_binding == "thread.y":
                 ivs.append(thread_ids_op.y)
-            elif tile_level == "thread.z":
+            elif iteration_binding == "thread.z":
                 ivs.append(thread_ids_op.z)
-            elif tile_level == "wg.x":
+            elif iteration_binding == "wg.x":
                 ivs.append(wg_id_op.x)
             else:
                 raise ValueError(
-                    f"TileMatmul: unexpected tile_level {tile_level!r}"
+                    "TileMatmul: unexpected iteration_binding "
+                    f"{iteration_binding!r}"
                 )
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
         outside_of = min(
             (
-                i for i, dim in enumerate(self.tile_dims)
-                if dim not in ("M", "N") and self.tile_levels[i] == "for"
+                i for i, dim in enumerate(self.op_dims)
+                if dim not in ("M", "N")
+                and self.iteration_bindings[i] == "for"
             ),
             default=None,
         )
@@ -241,21 +246,21 @@ class TileMatmul(LoweringPass):
         body_ops: list[Op] = []
         ops, lhs = _build_tile_op(
             lhs, ["M", "K"],
-            tile_dims=self.tile_dims,
+            op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
         ops, rhs = _build_tile_op(
             rhs, ["N", "K"],
-            tile_dims=self.tile_dims,
+            op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
         dst_ops, dst = _build_tile_op(
             dst, ["M", "N"],
-            tile_dims=self.tile_dims,
+            op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
@@ -279,9 +284,9 @@ class TileMatmul(LoweringPass):
             tiled_epilogue = []
 
         for i, iv, ub, level, label in zip(
-            reversed(range(len(self.tile_levels))),
-            reversed(ivs), reversed(ubs), reversed(self.tile_levels),
-            reversed(self.tile_labels),
+            reversed(range(len(self.iteration_bindings))),
+            reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
+            reversed(self.for_loop_labels),
         ):
             if level != "for":
                 continue
@@ -298,49 +303,51 @@ class TileMatmul(LoweringPass):
         new_ops.extend(body_ops)
         return new_ops
 
-    def _accumulate_constraint(self, tile_level: str, ub: int) -> None:
-        if tile_level == "for":
+    def _accumulate_constraint(self, iteration_binding: str, ub: int) -> None:
+        if iteration_binding == "for":
             pass
-        elif tile_level == "block.x":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [ub, None, None],
+        elif iteration_binding == "block.x":
+            self.kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.grid_dim), [ub, None, None],
             )
-        elif tile_level == "block.y":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [None, ub, None],
+        elif iteration_binding == "block.y":
+            self.kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.grid_dim), [None, ub, None],
             )
-        elif tile_level == "block.z":
-            self.grid_dim_constraints = _resolve_launch_dim_constraints(
-                self.grid_dim_constraints, [None, None, ub],
+        elif iteration_binding == "block.z":
+            self.kernel.grid_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.grid_dim), [None, None, ub],
             )
-        elif tile_level == "thread.x":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [ub, None, None],
+        elif iteration_binding == "thread.x":
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [ub, None, None],
             )
-        elif tile_level == "thread.y":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [None, ub, None],
+        elif iteration_binding == "thread.y":
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [None, ub, None],
             )
-        elif tile_level == "thread.z":
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [None, None, ub],
+        elif iteration_binding == "thread.z":
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [None, None, ub],
             )
-        elif tile_level == "wg.x":
-            self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
-                self.num_warp_groups_constraints, [ub],
+        elif iteration_binding == "wg.x":
+            [num_warp_groups] = _resolve_launch_dim_constraints(
+                [self.kernel.num_warp_groups], [ub],
             )
-            self.block_dim_constraints = _resolve_launch_dim_constraints(
-                self.block_dim_constraints, [ub * 128, 1, 1],
+            self.kernel.num_warp_groups = num_warp_groups
+            self.kernel.block_dim = _resolve_launch_dim_constraints(
+                list(self.kernel.block_dim), [ub * 128, 1, 1],
             )
-        elif tile_level in ("wg.y", "wg.z"):
+        elif iteration_binding in ("wg.y", "wg.z"):
             raise ValueError(
-                f"TileMatmul: tile_level {tile_level!r} is not "
+                f"TileMatmul: iteration_binding {iteration_binding!r} is not "
                 f"supported; warp groups are 1D — use "
-                f"'thread.{tile_level[-1]}' instead"
+                f"'thread.{iteration_binding[-1]}' instead"
             )
         else:
             raise ValueError(
-                f"TileMatmul: unexpected tile_level {tile_level!r}"
+                "TileMatmul: unexpected iteration_binding "
+                f"{iteration_binding!r}"
             )
 
 
@@ -372,12 +379,12 @@ def _build_tile_op(
     arg: Value,
     dim_names: list[str],
     *,
-    tile_dims: list[str],
+    op_dims: list[str],
     tile_idxs: list[Value],
     tile_sizes: list[int],
 ) -> tuple[list[Op], Value]:
     """Build TileOps that contract the dims of ``arg`` named in
-    ``tile_dims`` to the matching ``tile_sizes`` at the matching
+    ``op_dims`` to the matching ``tile_sizes`` at the matching
     ``tile_idxs``. Each tiling step produces a new value that
     subsequent steps operate on, so the same dim can be tiled
     multiple times (e.g. K=64 then K=16).
@@ -386,15 +393,15 @@ def _build_tile_op(
         f"_build_tile_op: dim_names ({dim_names}) must have one entry "
         f"per arg dim ({arg.type.sizes})"
     )
-    assert len(tile_dims) == len(tile_idxs) == len(tile_sizes), (
-        "_build_tile_op: tile_dims, tile_idxs, tile_sizes must have the "
+    assert len(op_dims) == len(tile_idxs) == len(tile_sizes), (
+        "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the "
         "same length"
     )
     name_to_idx = {n: i for i, n in enumerate(dim_names)}
     ops: list[Op] = []
     cur = arg
     maybe_partial_dims: set[str] = set()
-    for name, iv, ts in zip(tile_dims, tile_idxs, tile_sizes):
+    for name, iv, ts in zip(op_dims, tile_idxs, tile_sizes):
         d = name_to_idx.get(name)
         if d is None:
             continue
@@ -415,16 +422,16 @@ def _build_tile_op(
 
 def tile_matmul(
     module: ModuleOp,
-    tile_dims: list[str],
+    op_dims: list[str],
     tile_sizes: list[int],
-    tile_levels: list[str],
-    tile_labels: list[str | None],
-    label_filter: str | None = None,
+    iteration_bindings: list[str],
+    for_loop_labels: list[str | None],
+    op_label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
-    allow_partial: bool = False,
+    allow_partial_tiles: bool = False,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
-        tile_dims, tile_sizes, tile_levels, tile_labels,
-        label_filter, epilogue_label_filter, allow_partial,
+        op_dims, tile_sizes, iteration_bindings, for_loop_labels,
+        op_label_filter, epilogue_label_filter, allow_partial_tiles,
     ).run(module)

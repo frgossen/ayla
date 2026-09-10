@@ -46,9 +46,10 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
         }"""))
     module = tile_matmul(
         module,
-        tile_dims=["M", "M"], tile_sizes=[2048, 128],
-        tile_levels=["for", "block.x"], tile_labels=["outm", None],
-        label_filter="mm",
+        op_dims=["M", "M"], tile_sizes=[2048, 128],
+        iteration_bindings=["for", "block.x"],
+        for_loop_labels=["outm", None],
+        op_label_filter="mm",
     )
     text = repr(module)
     assert "grid_dim=[16, 1, 1]" in text
@@ -67,8 +68,8 @@ def test_warp_group_tiling_sets_block_dim():
 
     module = tile_matmul(
         module,
-        tile_dims=["M"], tile_sizes=[64],
-        tile_levels=["wg.x"], tile_labels=[None],
+        op_dims=["M"], tile_sizes=[64],
+        iteration_bindings=["wg.x"], for_loop_labels=[None],
     )
 
     [kernel] = module.body.ops
@@ -84,9 +85,9 @@ def test_partial_block_tile_rounds_up_the_grid():
           }
         }"""))
     tile_matmul(
-        module, tile_dims=["M"], tile_sizes=[128],
-        tile_levels=["block.x"], tile_labels=[None],
-        label_filter="mm", allow_partial=True,
+        module, op_dims=["M"], tile_sizes=[128],
+        iteration_bindings=["block.x"], for_loop_labels=[None],
+        op_label_filter="mm", allow_partial_tiles=True,
     )
     assert "grid_dim=[2, None, None]" in repr(module)
     tiles = find_ops(module, lambda op: isinstance(op, TileOp))
@@ -112,7 +113,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
     module = tile_matmul(
         gpu_dialect.parse(module_str),
         ["M", "K"], [32, 16], ["block.x", "for"], [None, "k"],
-        label_filter="mm", epilogue_label_filter="epilogue",
+        op_label_filter="mm", epilogue_label_filter="epilogue",
     )
 
     assert repr(module) == textwrap.dedent("""\

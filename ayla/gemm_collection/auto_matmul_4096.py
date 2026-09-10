@@ -39,9 +39,10 @@ def auto_matmul_4096_module():
     module = gpu_dialect.parse(module_str)
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
-        tile_dims=["M", "N"], tile_sizes=[128, 128],
-        tile_levels=["block.x", "block.y"], tile_labels=[None, None],
-        label_filter="mm",
+        op_dims=["M", "N"], tile_sizes=[128, 128],
+        iteration_bindings=["block.x", "block.y"],
+        for_loop_labels=[None, None],
+        op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
         target_type="wrmem", operands=["dst"],
@@ -49,9 +50,9 @@ def auto_matmul_4096_module():
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
     ))
     pipeline.add_pass(TileMatmul(
-        tile_dims=["K"], tile_sizes=[64],
-        tile_levels=["for"], tile_labels=["k"],
-        label_filter="mm",
+        op_dims=["K"], tile_sizes=[64],
+        iteration_bindings=["for"], for_loop_labels=["k"],
+        op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
         target_type="smem", operands=["lhs", "rhs"],
@@ -59,9 +60,9 @@ def auto_matmul_4096_module():
         tma=True, label_filter="mm",
     ))
     pipeline.add_pass(TileMatmul(
-        tile_dims=["K"], tile_sizes=[16],
-        tile_levels=["for"], tile_labels=["l"],
-        label_filter="mm",
+        op_dims=["K"], tile_sizes=[16],
+        iteration_bindings=["for"], for_loop_labels=["l"],
+        op_label_filter="mm",
     ))
     pipeline.add_pass(MultiBuffer(depth=2, label_filter="mm_lhs_smem"))
     pipeline.add_pass(MultiBuffer(depth=2, label_filter="mm_rhs_smem"))

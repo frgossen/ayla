@@ -36,15 +36,16 @@ def _tiled():
     module = gpu_dialect.parse(MODULE_STR)
     module = tile_matmul(
         module,
-        tile_dims=["M", "N"], tile_sizes=[128, 256],
-        tile_levels=["block.x", "block.y"], tile_labels=[None, None],
-        label_filter="mm", epilogue_label_filter="epilogue",
+        op_dims=["M", "N"], tile_sizes=[128, 256],
+        iteration_bindings=["block.x", "block.y"],
+        for_loop_labels=[None, None],
+        op_label_filter="mm", epilogue_label_filter="epilogue",
     )
     return tile_matmul(
         module,
-        tile_dims=["M"], tile_sizes=[64],
-        tile_levels=["wg.x"], tile_labels=[None],
-        label_filter="mm", epilogue_label_filter="epilogue",
+        op_dims=["M"], tile_sizes=[64],
+        iteration_bindings=["wg.x"], for_loop_labels=[None],
+        op_label_filter="mm", epilogue_label_filter="epilogue",
     )
 
 

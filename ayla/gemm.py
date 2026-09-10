@@ -94,22 +94,23 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     pipeline = Pipeline()
     if output_tiles_per_cta == 1:
         pipeline.add_pass(TileMatmul(
-            tile_dims=["M", "N"],
+            op_dims=["M", "N"],
             tile_sizes=[output_m_tile, output_n_tile],
-            tile_levels=["block.x", "block.y"], tile_labels=[None, None],
-            label_filter="mm",
-            allow_partial=(
+            iteration_bindings=["block.x", "block.y"],
+            for_loop_labels=[None, None],
+            op_label_filter="mm",
+            allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
             ),
         ))
     else:
         pipeline.add_pass(TileMatmul(
-            tile_dims=["M", "M", "N"],
+            op_dims=["M", "M", "N"],
             tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
-            tile_levels=["for", "block.x", "block.y"],
-            tile_labels=["outm", None, None], label_filter="mm",
-            allow_partial=(
+            iteration_bindings=["for", "block.x", "block.y"],
+            for_loop_labels=["outm", None, None], op_label_filter="mm",
+            allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
             ),
@@ -119,8 +120,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         else ("N", warpgroup_n_tile)
     )
     pipeline.add_pass(TileMatmul(
-        tile_dims=[wg_dim], tile_sizes=[wg_size],
-        tile_levels=["wg.x"], tile_labels=[None], label_filter="mm",
+        op_dims=[wg_dim], tile_sizes=[wg_size],
+        iteration_bindings=["wg.x"], for_loop_labels=[None],
+        op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
         target_type="wrmem", operands=["dst"], swizzle=None,
@@ -139,8 +141,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         target_dtype="f32", label_filter="mm",
     ))
     pipeline.add_pass(TileMatmul(
-        tile_dims=["K"], tile_sizes=[operand_k_tile],
-        tile_levels=["for"], tile_labels=["k"], label_filter="mm",
+        op_dims=["K"], tile_sizes=[operand_k_tile],
+        iteration_bindings=["for"], for_loop_labels=["k"],
+        op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
         target_type="smem", operands=["lhs", "rhs"],
@@ -160,8 +163,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         label_filter="mm",
     ))
     pipeline.add_pass(TileMatmul(
-        tile_dims=["K"], tile_sizes=[16],
-        tile_levels=["for"], tile_labels=["kk"], label_filter="mm",
+        op_dims=["K"], tile_sizes=[16],
+        iteration_bindings=["for"], for_loop_labels=["kk"],
+        op_label_filter="mm",
     ))
     pipeline.add_pass(MultiBuffer(
         depth=operand_stages, label_filter="mm_lhs_smem",
