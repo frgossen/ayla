@@ -7,11 +7,12 @@ from __future__ import annotations
 
 from benchmarks.common import BenchConfig
 
-from . import gemm_sigmoid
+from . import gemm_sigmoid, muse_glimmer_block
 
 
 def build_configs() -> list[BenchConfig]:
     """Every config in the corpus."""
     return [
         *gemm_sigmoid.build_configs(),
+        *muse_glimmer_block.build_configs(),
     ]
