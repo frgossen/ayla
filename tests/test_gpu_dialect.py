@@ -18,9 +18,11 @@ from ayla.gpu_dialect import (
     F32Type,
     ForOp,
     IfOp,
+    IndexLtOp,
     IndexType,
     LockType,
     MoveOp,
+    PredicateType,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
@@ -116,15 +118,31 @@ def test_for_loop():
 
 
 def test_if_op():
-    index = Value(name="i", type=IndexType())
-    op = IfOp.build(index, 7, "lt", Block())
+    condition = Value(name="condition", type=PredicateType())
+    op = IfOp.build(condition, Block())
     assert_print_and_roundtrip(op, textwrap.dedent("""\
-        if(%i: index) attrs={comparison: "lt", rhs: 7} {
+        if(%condition: pred) {
         ^bb0:
         }"""))
 
-    with pytest.raises(ValueError, match="unsupported comparison"):
-        IfOp.build(index, 7, "invalid")
+    with pytest.raises(AssertionError, match="expected PredicateType"):
+        IfOp.build(Value(name="i", type=IndexType()), Block())
+
+
+def test_index_lt_op():
+    lhs = Value(name="lhs", type=IndexType())
+    rhs = Value(name="rhs", type=IndexType())
+    op = IndexLtOp.build(lhs, rhs)
+    assert_print_and_roundtrip(
+        op,
+        "%0: pred = index_lt(%lhs: index, %rhs: index)",
+    )
+
+    not_index = Value(name="f", type=F32Type())
+    with pytest.raises(AssertionError, match="expected IndexType lhs"):
+        IndexLtOp.build(not_index, rhs)
+    with pytest.raises(AssertionError, match="expected IndexType rhs"):
+        IndexLtOp.build(lhs, not_index)
 
 
 def test_async_op():

@@ -16,6 +16,7 @@ from ayla.gpu_dialect import (
     F32Type,
     IfOp,
     IndexConstantOp,
+    IndexLtOp,
     ThreadIdsOp,
     gpu_dialect,
 )
@@ -91,19 +92,19 @@ def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
 
 
 def test_codegen_if_branches_over_its_body():
-    index = IndexConstantOp.build(3)
+    lhs = IndexConstantOp.build(3)
+    rhs = IndexConstantOp.build(4)
+    condition = IndexLtOp.build(lhs.result(), rhs.result())
     guarded_value = IndexConstantOp.build(1)
-    conditional = IfOp.build(
-        index.result(), 4, "lt", Block(ops=[guarded_value]),
-    )
+    conditional = IfOp.build(condition.result(), Block(ops=[guarded_value]))
     module = ModuleOp.build(Block(ops=[KernelOp.build(
-        "conditional", Block(ops=[index, conditional]),
+        "conditional", Block(ops=[lhs, rhs, condition, conditional]),
         grid_dim=(1, 1, 1), block_dim=(32, 1, 1),
     )]))
 
     ptx = make_ptx_kernel(module).ptx
-    assert "setp.ge.u32" in ptx
-    assert "@%p0 bra" in ptx
+    assert "setp.lt.u32 %p0" in ptx
+    assert "@!%p0 bra" in ptx
 
 
 def test_codegen_naive_matmul_4096():

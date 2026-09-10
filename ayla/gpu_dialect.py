@@ -678,36 +678,23 @@ class BarrierOp(Op):
 
 @gpu_dialect.register_op("if")
 class IfOp(Op):
-    """Execute a region when an index comparison is true."""
-
-    COMPARISONS: ClassVar[tuple[str, ...]] = (
-        "eq", "ne", "lt", "le", "gt", "ge",
-    )
+    """Execute a region when its predicate is true."""
 
     @classmethod
     def build(
-        cls, lhs: Value, rhs: int, comparison: str,
-        body: Block | None = None,
+        cls, condition: Value, body: Block,
     ) -> "IfOp":
-        if comparison not in cls.COMPARISONS:
-            raise ValueError(f"unsupported comparison {comparison!r}")
+        assert isinstance(condition.type, PredicateType), (
+            f"IfOp: expected PredicateType; got {condition.type}"
+        )
         return cls(
-            operands=[lhs], results=[],
-            attrs={"rhs": rhs, "comparison": comparison},
-            blocks=[body or Block()],
+            operands=[condition], results=[],
+            blocks=[body],
         )
 
     @property
-    def lhs(self) -> Value:
+    def condition(self) -> Value:
         return self.operands[0]
-
-    @property
-    def rhs(self) -> int:
-        return self.attrs["rhs"]  # type: ignore[return-value]
-
-    @property
-    def comparison(self) -> str:
-        return self.attrs["comparison"]  # type: ignore[return-value]
 
     @property
     def body(self) -> Block:
@@ -1495,6 +1482,11 @@ class IndexType(Type):
     pass
 
 
+@gpu_dialect.register_type("pred")
+class PredicateType(Type):
+    pass
+
+
 @gpu_dialect.register_type("f16")
 class F16Type(Type):
     byte_size = 2
@@ -1605,6 +1597,32 @@ class IndexConstantOp(Op):
 
     def expr_str(self, prec=0, val_str=None) -> str:
         return str(self.value)
+
+
+@gpu_dialect.register_op("index_lt")
+class IndexLtOp(Op):
+    """Compare two index values using unsigned less-than."""
+
+    @classmethod
+    def build(cls, lhs: Value, rhs: Value) -> "IndexLtOp":
+        assert isinstance(lhs.type, IndexType), (
+            f"IndexLtOp: expected IndexType lhs; got {lhs.type}"
+        )
+        assert isinstance(rhs.type, IndexType), (
+            f"IndexLtOp: expected IndexType rhs; got {rhs.type}"
+        )
+        return cls(
+            operands=[lhs, rhs],
+            results=[Value(name=None, type=PredicateType())],
+        )
+
+    @property
+    def lhs(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def rhs(self) -> Value:
+        return self.operands[1]
 
 
 def _resolve_val_str(v, prec, val_str):
@@ -1937,6 +1955,7 @@ def is_side_effect_free(op: Op) -> bool:
         IndexAddOp,
         IndexConstantOp,
         IndexDivOp,
+        IndexLtOp,
         IndexModOp,
         IndexMulOp,
         LaneIdOp,

@@ -13,6 +13,7 @@ from .gpu_dialect import (
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
+    IndexLtOp,
     IndexModOp,
     IndexMulOp,
     IndexType,
@@ -24,6 +25,7 @@ from .gpu_dialect import (
     PTXTemplateOp,
     PtrAddOp,
     PtrType,
+    PredicateType,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -141,6 +143,11 @@ def map_type_to_registers(type):
     if isinstance(type, IndexType):
         return TypeRegisterMapping(
             member_register_types=PtxType.B32,
+            member_names="val",
+        )
+    if isinstance(type, PredicateType):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.PRED,
             member_names="val",
         )
     if isinstance(type, TmaDescType):
@@ -315,6 +322,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_index_mul(p, op)
     elif isinstance(op, IndexDivOp):
         _emit_index_div(p, op)
+    elif isinstance(op, IndexLtOp):
+        _emit_index_lt(p, op)
     elif isinstance(op, IndexModOp):
         _emit_index_mod(p, op)
     elif isinstance(op, WarpGroupIdOp):
@@ -352,15 +361,9 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
 
 
 def _emit_if(p: PtxPrinter, op: IfOp) -> None:
-    complement = {
-        "eq": "ne", "ne": "eq", "lt": "ge",
-        "le": "gt", "gt": "le", "ge": "lt",
-    }[op.comparison]
-    lhs = p.unique_ptx_names_for_value(op.lhs)
+    condition = p.unique_ptx_names_for_value(op.condition)
     done = p.unique_ptx_names(op, PtxType.LABEL)
-    pred = p.unique_ptx_names((op, "pred"), PtxType.PRED)
-    p.write_line(f"setp.{complement}.u32 {pred}, {lhs}, {op.rhs};")
-    p.write_line(f"@{pred} bra {done};")
+    p.write_line(f"@!{condition} bra {done};")
     _emit_block(p, op.body)
     p.write_line(f"{done}:")
 
@@ -542,6 +545,13 @@ def _emit_index_add(p: PtxPrinter, op: IndexAddOp) -> None:
     else:
         rhs = p.unique_ptx_names_for_value(op.rhs)
         _write_with_comment(p, f"add.s32 {dst}, {lhs}, {rhs};", op)
+
+
+def _emit_index_lt(p: PtxPrinter, op: IndexLtOp) -> None:
+    dst = p.unique_ptx_names_for_value(op.result())
+    lhs = p.unique_ptx_names_for_value(op.lhs)
+    rhs = p.unique_ptx_names_for_value(op.rhs)
+    _write_with_comment(p, f"setp.lt.u32 {dst}, {lhs}, {rhs};", op)
 
 
 def _emit_index_mul(p: PtxPrinter, op: IndexMulOp) -> None:
