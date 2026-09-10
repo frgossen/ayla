@@ -1,6 +1,8 @@
 """Tests for utilities shared by transformation passes."""
+import re
+
 from ayla.base.ir import Op
-from ayla.passes._utils import label_matches
+from ayla.passes.utils import label_matches
 
 
 def test_label_matches_full_regex_filters():
@@ -9,6 +11,7 @@ def test_label_matches_full_regex_filters():
     assert label_matches(op, None)
     assert label_matches(op, "stage_1")
     assert label_matches(op, r"stage_\d")
+    assert label_matches(op, re.compile(r"stage_\d"))
     assert not label_matches(op, r"stage")
 
 

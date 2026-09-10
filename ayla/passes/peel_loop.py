@@ -22,7 +22,7 @@ from ..base.ir import Op
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import ForOp, IndexConstantOp, ModuleOp
 from ._loop_utils import clone_loop_iteration
-from ._utils import label_matches
+from .utils import label_matches
 
 
 class PeelLoop(LoweringPass):

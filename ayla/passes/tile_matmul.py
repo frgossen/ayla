@@ -14,7 +14,7 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
-from ._utils import label_matches
+from .utils import label_matches
 
 
 class TileMatmul(LoweringPass):

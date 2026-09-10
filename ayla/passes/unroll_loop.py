@@ -24,7 +24,7 @@ from ..gpu_dialect import (
 from ..base.ir import Block, Op, Value
 from ..base.lowering_pass import LoweringPass, lowers
 from ._loop_utils import clone_loop_iteration
-from ._utils import label_matches
+from .utils import label_matches
 
 
 class UnrollLoop(LoweringPass):

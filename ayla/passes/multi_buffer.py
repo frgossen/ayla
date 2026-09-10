@@ -29,7 +29,7 @@ from ..gpu_dialect import (
 )
 from ..base.ir import Op, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
-from ._utils import label_matches
+from .utils import label_matches
 
 
 def _enclosing_loop(op: Op) -> ForOp | None:
