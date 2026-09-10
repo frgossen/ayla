@@ -152,7 +152,7 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
     )
 
     loops = find_ops(module, lambda op: isinstance(op, ForOp))
-    assert len(loops) == 4
+    assert len(loops) == 3
     assert all((loop.lb, loop.ub, loop.step) == (0, 4, 1) for loop in loops)
     assert all(loop.attrs["label"] == "outn" for loop in loops)
     for loop in loops:
@@ -191,9 +191,8 @@ PROMOTED_IR = textwrap.dedent("""\
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
         %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
         matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm"}
-        elementwise(%6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
         %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-        elementwise(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert", label: "mm_dst_convert"}
+        elementwise(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
         move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
       }
     }""")

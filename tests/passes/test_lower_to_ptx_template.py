@@ -177,6 +177,49 @@ def test_lower_elementwise_sigmoid_mma():
     assert template == expected
 
 
+def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
+    w = 'wrmem<16x8xf32 layout="mma">'
+    b = 'wrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
+            %a: {w} = alloc() attrs={{id: 0}}
+            %b: {b} = alloc() attrs={{id: 1}}
+            elementwise(%b: {b}, %a: {w}) attrs={{fn: "sigmoid"}}
+          }}
+        }}"""))
+
+    [template] = [
+        op.attrs["template"]
+        for op in find_ops(
+            lower_to_ptx_template(module),
+            lambda op: isinstance(op, PTXTemplateOp),
+        )
+        if "ex2." in op.attrs["template"]
+    ]
+    assert "ex2.approx.ftz.f32" in template
+    assert "rcp.approx.ftz.f32" in template
+
+
+def test_lower_sigmoid_can_convert_its_result_to_f16():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %src: wrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
+            %dst: wrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
+            elementwise(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">) attrs={fn: "sigmoid"}
+          }
+        }"""))  # noqa: E501
+
+    template = find_ops(
+        lower_to_ptx_template(module),
+        lambda op: isinstance(op, PTXTemplateOp),
+    )[-1].attrs["template"]
+    assert "ex2.approx.f32" in template
+    assert "ex2.approx.ftz.f32" not in template
+    assert template.count("cvt.rn.f16x2.f32") == 2
+
+
 def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

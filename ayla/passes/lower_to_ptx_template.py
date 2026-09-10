@@ -46,27 +46,143 @@ from ..gpu_dialect import (
     physical_layout,
     root_buffer,
 )
-from ..base.ir import Op, Value, find_ops
+from ..base.ir import Op, Type, Value, find_ops
 from ..base.lowering_pass import LoweringPass, lowers
 
 
-def _lower_elementwise_sigmoid_ptx(dst: str, src: str) -> str:
-    """1 / (1 + exp(-x)) for one element, into ``dst``.
-
-    The hardware exponential is base 2, so exp(-x) is ex2 of -x * log2(e)
-    (0fBFB8AA3B).
-
-    TODO: cheaper arrangements to evaluate -- exp2 -> fma -> rcp -> mul, and
-    tanh.approx.f32, which gives sigmoid in two instructions via
-    0.5 * (1 + tanh(x/2)). Both trade accuracy, so they want to be separate
-    fns a caller can ask for rather than a silent swap.
-    """
-    return (
+def _lower_elementwise_sigmoid_ptx(
+    dst_regs: list[str], src_regs: list[str],
+) -> str:
+    """Lower an F32 sigmoid into the provided registers."""
+    return "".join(
         f"mul.f32 {dst}, {src}, 0fBFB8AA3B;\n"
         f"ex2.approx.f32 {dst}, {dst};\n"
         f"add.f32 {dst}, {dst}, 0f3F800000;\n"
         f"rcp.approx.f32 {dst}, {dst};\n"
+        for dst, src in zip(dst_regs, src_regs, strict=True)
     )
+
+
+def _lower_elementwise_sigmoid_bf16_ptx(
+    dst_regs: list[str], src_regs: list[str],
+) -> str:
+    """Lower sigmoid with FTZ, which is lossless for a BF16 result."""
+    # Group independent registers by instruction to expose SFU latency.
+    phases = (
+        "mul.f32 {dst}, {src}, 0fBFB8AA3B;",
+        "ex2.approx.ftz.f32 {dst}, {dst};",
+        "fma.rn.f32 {dst}, {dst}, 0f3E800000, 0f3E800000;",
+        "rcp.approx.ftz.f32 {dst}, {dst};",
+        "mul.f32 {dst}, {dst}, 0f3E800000;",
+    )
+    return "".join(
+        phase.format(dst=dst, src=src) + "\n"
+        for phase in phases
+        for dst, src in zip(dst_regs, src_regs, strict=True)
+    )
+
+
+def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
+    """Return the PTX-template registers occupied by one WRMEM operand."""
+    dtype = value.type.dtype
+    if isinstance(dtype, F32Type):
+        return [
+            f"${{f32:operand.{operand_name}.r{reg}}}"
+            for reg in _view_f32_register_indices(value)
+        ]
+    if isinstance(dtype, (BF16Type, F16Type)):
+        return [
+            f"${{b32:operand.{operand_name}.r{reg}}}"
+            for reg in _view_pair_indices(value)
+        ]
+    raise NotImplementedError(
+        f"lower_elementwise: unsupported register dtype {dtype}"
+    )
+
+
+def _lower_f32_to_packed16_ptx(
+    dst_regs: list[str],
+    src_regs: list[str],
+    src_dtype: Type,
+    dst_dtype: Type,
+) -> str:
+    """Lower F32 to packed BF16/F16; both use PTX's x2 form."""
+    assert isinstance(src_dtype, F32Type)
+    assert isinstance(dst_dtype, (BF16Type, F16Type))
+    assert len(src_regs) == 2 * len(dst_regs)
+    return "".join(
+        f"cvt.rn.{dst_dtype.name}x2.f32 {dst}, {src_hi}, {src_lo};\n"
+        for dst, src_lo, src_hi in zip(
+            dst_regs, src_regs[::2], src_regs[1::2], strict=True,
+        )
+    )
+
+
+def _lower_dtype_conversion_ptx(
+    dst_regs: list[str],
+    src_regs: list[str],
+    src_dtype: Type,
+    dst_dtype: Type,
+) -> str:
+    """Lower a conversion independently of the element-wise function."""
+    if not (
+        isinstance(src_dtype, F32Type)
+        and isinstance(dst_dtype, (BF16Type, F16Type))
+    ):
+        raise NotImplementedError(
+            f"lower_elementwise: unsupported conversion "
+            f"{src_dtype} -> {dst_dtype}"
+        )
+    return _lower_f32_to_packed16_ptx(
+        dst_regs, src_regs, src_dtype, dst_dtype,
+    )
+
+
+def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
+    return _lower_dtype_conversion_ptx(
+        _elementwise_operand_regs(op.dst, "dst"),
+        _elementwise_operand_regs(op.src, "src"),
+        op.src.type.dtype,
+        op.dst.type.dtype,
+    )
+
+
+def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
+    src_dtype = op.src.type.dtype
+    dst_dtype = op.dst.type.dtype
+    if not isinstance(src_dtype, F32Type):
+        raise NotImplementedError(
+            f"lower_elementwise: sigmoid does not support {src_dtype} input"
+        )
+
+    src_regs = _elementwise_operand_regs(op.src, "src")
+    if src_dtype == dst_dtype:
+        result_regs = _elementwise_operand_regs(op.dst, "dst")
+    else:
+        result_regs = [
+            f"${{f32:sigmoid_tmp{reg}}}" for reg in range(len(src_regs))
+        ]
+
+    if isinstance(dst_dtype, BF16Type):
+        template = _lower_elementwise_sigmoid_bf16_ptx(
+            result_regs, src_regs,
+        )
+    else:
+        template = _lower_elementwise_sigmoid_ptx(result_regs, src_regs)
+    if src_dtype != dst_dtype:
+        template += _lower_dtype_conversion_ptx(
+            _elementwise_operand_regs(op.dst, "dst"),
+            result_regs,
+            src_dtype,
+            dst_dtype,
+        )
+    return template
+
+
+_ELEMENTWISE_LOWERERS = {
+    "convert": _lower_convert_elementwise_ptx,
+    "sigmoid": _lower_sigmoid_elementwise_ptx,
+}
 
 
 class LowerToPtxTemplate(LoweringPass):
@@ -338,7 +454,12 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_elementwise(
         self, op: ElementwiseOp,
     ) -> tuple[list[Op], list[object]]:
-        """Lower an element-wise op on wrmem tensors."""
+        """Lower an element-wise op on wrmem tensors, one function per element.
+
+        Source and destination dtypes are independent. Function lowering runs
+        in the source dtype and a supported conversion writes the result to the
+        destination dtype.
+        """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
         dst_type = op.dst.type
@@ -352,51 +473,12 @@ class LowerToPtxTemplate(LoweringPass):
             )
         assert tuple(src_type.sizes) == tuple(dst_type.sizes)
         assert src_type.warps == dst_type.warps
-
-        if op.fn == "convert":
-            if not (
-                isinstance(src_type.dtype, F32Type)
-                and isinstance(dst_type.dtype, (BF16Type, F16Type))
-            ):
-                raise NotImplementedError(
-                    f"lower_elementwise: unsupported conversion "
-                    f"{src_type.dtype} -> {dst_type.dtype}"
-                )
-            template = "".join(
-                f"cvt.rn.{dst_type.dtype.name}x2.f32 "
-                f"${{b32:operand.dst.r{dst_pair}}}, "
-                f"${{f32:operand.src.r{2 * src_pair + 1}}}, "
-                f"${{f32:operand.src.r{2 * src_pair}}};\n"
-                for dst_pair, src_pair in zip(
-                    _view_pair_indices(op.dst),
-                    _view_pair_indices(op.src),
-                    strict=True,
-                )
-            )
-        elif op.fn == "sigmoid":
-            if not (
-                isinstance(src_type.dtype, F32Type)
-                and isinstance(dst_type.dtype, F32Type)
-            ):
-                raise NotImplementedError(
-                    f"lower_elementwise: unsupported "
-                    f"{src_type.dtype} -> {dst_type.dtype}"
-                )
-            template = "".join(
-                _lower_elementwise_sigmoid_ptx(
-                    f"${{f32:operand.dst.r{dst}}}",
-                    f"${{f32:operand.src.r{src}}}",
-                )
-                for dst, src in zip(
-                    _view_f32_register_indices(op.dst),
-                    _view_f32_register_indices(op.src),
-                    strict=True,
-                )
-            )
-        else:
+        lower = _ELEMENTWISE_LOWERERS.get(op.fn)
+        if lower is None:
             raise NotImplementedError(
                 f"lower_elementwise: unsupported fn {op.fn!r}"
             )
+        template = lower(op)
 
         new_op = PTXTemplateOp.build(
             operands=[dst_value, src_value],

@@ -178,7 +178,8 @@ def test_sigmoid_output_tiles_lower_to_ptx():
     def at(pattern):
         return [i for i, line in enumerate(lines) if pattern in line]
 
-    sigmoids = at("ex2.approx")
+    sigmoids = at("ex2.approx.ftz.f32")
+    assert not at("ex2.approx.f32")
     converts = at("cvt.rn.bf16x2.f32")
     stores = at("cp.async.bulk.tensor.3d.global.shared")
     # Four output-M iterations each contain four fully unrolled 64-column

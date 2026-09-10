@@ -405,9 +405,10 @@ class ElementwiseOp(Op):
     ``fn`` names the function -- an attribute, not an op each, since exp,
     tanh, relu and the rest differ only in the instructions they lower to.
 
-    ``convert`` performs an element-wise dtype conversion. Other functions
-    require matching source and destination dtypes. Passing the same value as
-    both operands computes in place.
+    Source and destination types may differ. ``convert`` performs only the
+    element-wise dtype conversion; other functions may convert their result
+    to the destination dtype implicitly. Passing the same value as both
+    operands computes in place.
 
     TODO: generalize to several sources and destinations. One of each admits
     only unary functions -- add, mul and select need more than one input, and
