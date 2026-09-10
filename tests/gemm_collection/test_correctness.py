@@ -137,11 +137,29 @@ def test_sigmoid_output_tiles_lower_to_ptx():
     assert not at("ex2.approx.f32")
     converts = at("cvt.rn.bf16x2.f32")
     stores = at("cp.async.bulk.tensor.3d.global.shared")
+    commits = at("wgmma.commit_group")
+    waits = at("wgmma.wait_group")
     # Four output-M iterations each contain four fully unrolled 64-column
     # slices, with 32 f32 values (16 packed outputs) per thread and slice.
     assert len(sigmoids) == 4 * 4 * 32
     assert len(converts) == 4 * 4 * 16
     assert len(stores) == 16
+
+    # At each output-M boundary, one complete 64-column output slice is
+    # emitted after the next iteration's WGMMA commit and before its wait.
+    # This proves actual asynchronous overlap, not merely output tiling.
+    overlap_windows = []
+    for commit, wait in zip(commits, waits, strict=True):
+        window = lines[commit + 1:wait]
+        counts = tuple(sum(pattern in line for line in window) for pattern in (
+            "ex2.approx.ftz.f32",
+            "cvt.rn.bf16x2.f32",
+            "stmatrix.",
+            "cp.async.bulk.tensor.3d.global.shared",
+        ))
+        if any(counts):
+            overlap_windows.append(counts)
+    assert overlap_windows == [(32, 16, 4, 1)] * 3
 
 
 def test_sigmoid_output_tiles_are_static_before_ptx_lowering():

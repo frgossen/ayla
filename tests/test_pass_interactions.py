@@ -19,7 +19,17 @@ test.
 import textwrap
 
 from ayla.base.ir import find_ops
-from ayla.gpu_dialect import ElementwiseOp, ForOp, TileOp, gpu_dialect
+from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_sigmoid import (
+    auto_matmul_4096_wgmma256_wg_sigmoid_module,
+)
+from ayla.gpu_dialect import (
+    AsyncOp,
+    AwaitOp,
+    ElementwiseOp,
+    ForOp,
+    TileOp,
+    gpu_dialect,
+)
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.tile_elementwise import tile_elementwise
@@ -159,6 +169,38 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         assert tiles
         assert all(tile.indices[1] is loop.iv for tile in tiles)
         assert all(tile.result().type.sizes[1] == 64 for tile in tiles)
+
+
+def test_unrolled_output_tail_overlaps_the_next_wgmma():
+    """The composed sigmoid schedule keeps a 192-column head and 64 tail."""
+    module = auto_matmul_4096_wgmma256_wg_sigmoid_module()
+    ops = module.body.ops[0].body.ops
+
+    def labeled(label):
+        return next(op for op in ops if op.attrs.get("label") == label)
+
+    issue = labeled("mm_iter2_async_iter0_iter1")
+    assert isinstance(issue, AsyncOp)
+    wait = next(
+        op for op in ops[ops.index(issue) + 1:]
+        if isinstance(op, AwaitOp) and op.lock is issue.lock
+    )
+    assert all(
+        ops.index(labeled(f"epi_iter{n}_iter0")) < ops.index(issue)
+        for n in range(3)
+    )
+    scheduled = [
+        issue,
+        labeled("epi_iter3_iter0"),
+        labeled("mm_dst_convert_iter3_iter0"),
+        labeled("mm_dst_wrmem_iter3_iter0"),
+        labeled("mm_dst_smem_async_iter3_iter0"),
+        wait,
+        labeled("epi_iter0_iter1"),
+    ]
+    assert [ops.index(op) for op in scheduled] == sorted(
+        ops.index(op) for op in scheduled
+    )
 
 
 TILED_IR = textwrap.dedent("""\

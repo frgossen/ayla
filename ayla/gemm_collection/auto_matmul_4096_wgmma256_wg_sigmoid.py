@@ -11,6 +11,7 @@ from ..passes.multi_buffer import MultiBuffer
 from ..passes.pipeline_loop import PipelineLoop
 from ..passes.promote_buffers import PromoteBuffers
 from ..passes.schedule_async import ScheduleAsync
+from ..passes.schedule_output_epilogue import ScheduleOutputEpilogue
 from ..passes.tile_elementwise import TileElementwise
 from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
@@ -38,9 +39,9 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     written, reading the output back after the store -- correct, and a round
     trip.
 
-    Explicit unrolling materializes all four 64-column output iterations. A
-    follow-up can pipeline those operations once the desired overlap is
-    expressed through the general loop scheduler.
+    Explicit unrolling materializes four 64-column output iterations. The
+    final slice is scheduled into the next output-M iteration's WGMMA wait
+    window, leaving a 192-column head before the next iteration begins.
     """
     module_str = textwrap.dedent("""\
         module {
@@ -129,6 +130,7 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(UnrollLoop(unroll_factor=4, label_filter="outm"))
+    pipeline.add_pass(ScheduleOutputEpilogue(label_filter=r"epi.*"))
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     return pipeline.run(module)
