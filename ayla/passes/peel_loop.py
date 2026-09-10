@@ -34,14 +34,15 @@ class PeelLoop(LoweringPass):
         front_iterations: int = 0,
         back_iterations: int = 0,
     ) -> None:
-        super().__init__()
+        super().__init__(
+            label_filter=label_filter,
+            front_iterations=front_iterations,
+            back_iterations=back_iterations,
+        )
         if front_iterations < 0:
             raise ValueError("PeelLoop: front_iterations must be non-negative")
         if back_iterations < 0:
             raise ValueError("PeelLoop: back_iterations must be non-negative")
-        self.label_filter = label_filter
-        self.front_iterations = front_iterations
-        self.back_iterations = back_iterations
 
     @lowers(ForOp)
     def lower_for(

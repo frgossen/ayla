@@ -44,10 +44,11 @@ class PipelineLoop(LoweringPass):
         label_filter_op: str,
         pipelining_offset: int,
     ) -> None:
-        super().__init__()
-        self.label_filter_loop = label_filter_loop
-        self.label_filter_op = label_filter_op
-        self.pipelining_offset = pipelining_offset
+        super().__init__(
+            label_filter_loop=label_filter_loop,
+            label_filter_op=label_filter_op,
+            pipelining_offset=pipelining_offset,
+        )
 
     def _compute_labeled_and_shared(
         self, body_ops: list[Op],
