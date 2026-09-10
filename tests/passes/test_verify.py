@@ -3,7 +3,10 @@ import textwrap
 import pytest
 
 from ayla.gpu_dialect import ModuleOp, gpu_dialect
-from ayla.passes.verify import VerificationStage, verify
+from ayla.passes.verify_gpu_dialect import (
+    VerificationStage,
+    verify_gpu_dialect,
+)
 from ayla.ptx_codegen import make_ptx_kernel
 
 
@@ -21,7 +24,7 @@ def _dynamic_matmul_module() -> ModuleOp:
 def test_default_verification_allows_dynamic_shapes():
     module = _dynamic_matmul_module()
 
-    assert verify(module) is module
+    assert verify_gpu_dialect(module) is module
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():
@@ -33,12 +36,14 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
         }"""))
 
     with pytest.raises(ValueError, match="inconsistent matmul shapes"):
-        verify(module)
+        verify_gpu_dialect(module)
 
 
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
-        verify(_dynamic_matmul_module(), VerificationStage.PTX_LOWERING)
+        verify_gpu_dialect(
+            _dynamic_matmul_module(), VerificationStage.PTX_LOWERING,
+        )
 
 
 def test_ptx_codegen_verifies_static_shapes():
