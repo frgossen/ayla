@@ -4,15 +4,16 @@ import textwrap
 
 import torch
 
+from ayla.base.pipeline import Pipeline
 from ayla.gpu_dialect import gpu_dialect
-from ayla.passes.licm import licm
-from ayla.passes.pipeline_loop import pipeline_loop
-from ayla.passes.promote_buffers import promote_buffers
+from ayla.passes.licm import LICM
+from ayla.passes.pipeline_loop import PipelineLoop
+from ayla.passes.promote_buffers import PromoteBuffers
+from ayla.passes.tile_matmul import TileMatmul
+from ayla.passes.unroll_loop import UnrollLoop
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
-from ayla.passes.tile_matmul import tile_matmul
-from ayla.passes.unroll_loop import unroll_loop
 
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(
@@ -247,37 +248,40 @@ def test_experimental_auto_matmul_4096():
           }
         }""")
     module = gpu_dialect.parse(module_str)
-    module = tile_matmul(
-        module,
+    pipeline = Pipeline()
+    pipeline.add_pass(TileMatmul(
         tile_dims=["M", "N"], tile_sizes=[128, 128],
         tile_levels=["block.x", "block.y"], tile_labels=[None, None],
         label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="wrmem", operands=["dst"],
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="wrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
+    ))
+    pipeline.add_pass(TileMatmul(
         tile_dims=["K"], tile_sizes=[64],
         tile_levels=["for"], tile_labels=["k"],
         label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="smem", operands=["lhs", "rhs"],
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None,
         tma=True, label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
+    ))
+    pipeline.add_pass(TileMatmul(
         tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["l"],
         label_filter="mm",
-    )
-    module = unroll_loop(module, unroll_factor=2, label_filter="k")
-    module = licm(module)
-    module = pipeline_loop(module, label_filter_loop="k", label_filter_op="mm_(lhs|rhs)_smem_iter0", pipelining_offset=1)
+    ))
+    pipeline.add_pass(UnrollLoop(unroll_factor=2, label_filter="k"))
+    pipeline.add_pass(LICM())
+    pipeline.add_pass(PipelineLoop(
+        label_filter_loop="k",
+        label_filter_op="mm_(lhs|rhs)_smem_iter0",
+        pipelining_offset=1,
+    ))
+    module = pipeline.run(module)
 
     print(repr(module))
 
@@ -305,34 +309,33 @@ def test_dbg_module():
           }
         }""")
     module = gpu_dialect.parse(module_str)
-    module = tile_matmul(
-        module,
+    pipeline = Pipeline()
+    pipeline.add_pass(TileMatmul(
         tile_dims=["M", "N"], tile_sizes=[128, 256],
         tile_levels=["block.x", "block.y"], tile_labels=[None, None],
         label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="wrmem", operands=["dst"],
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="wrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
+    ))
+    pipeline.add_pass(TileMatmul(
         tile_dims=["K"], tile_sizes=[64],
         tile_levels=["for"], tile_labels=["k"],
         label_filter="mm",
-    )
-    module = promote_buffers(
-        module, target_type="smem", operands=["lhs", "rhs"],
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None,
         tma=True, label_filter="mm",
-    )
-    module = tile_matmul(
-        module,
+    ))
+    pipeline.add_pass(TileMatmul(
         tile_dims=["K"], tile_sizes=[16],
         tile_levels=["for"], tile_labels=["k"],
         label_filter="mm",
-    )
+    ))
+    module = pipeline.run(module)
 
     print(module)
 
