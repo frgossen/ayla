@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import ClassVar
+
 from ..gpu_dialect import (
     BlockIdsOp,
     ForOp,
@@ -15,6 +18,46 @@ from ..gpu_dialect import (
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
+
+
+@dataclass
+class CollectiveAttr:
+    """Collective level per axis, recording only the strongest level."""
+
+    _LEVELS: ClassVar[tuple[str, ...]] = ("", "thread", "wg", "block", "grid")
+
+    value: dict[str, str]
+
+    def tile(self, level: str, dim: str) -> None:
+        current = self.value.get(dim, "grid")
+        assert self._LEVELS.index(level) <= self._LEVELS.index(
+            current,
+        )
+        self.value[dim] = level
+
+    def is_block_collective(self, *dims: str | int) -> bool:
+        return self._is_collective("block", dims)
+
+    def is_thread_collective(self, *dims: str | int) -> bool:
+        return self._is_collective("thread", dims)
+
+    def is_wg_collective(self, *dims: str | int) -> bool:
+        return self._is_collective("wg", dims, valid_dims="x")
+
+    def _is_collective(
+        self,
+        level: str,
+        dims: tuple[str | int, ...],
+        valid_dims: str = "xyz",
+    ) -> bool:
+        if not dims:
+            dims = tuple(valid_dims)
+        normalized = ["xyz"[dim] if isinstance(dim, int) else dim for dim in dims]
+        return all(
+            self._LEVELS.index(self.value.get(dim, ""))
+            >= self._LEVELS.index(level)
+            for dim in normalized
+        )
 
 
 class TileMatmul(LoweringPass):
@@ -271,6 +314,11 @@ class TileMatmul(LoweringPass):
         hoist_dst = outside_of is not None
         if not hoist_dst:
             body_ops.extend(dst_ops)
+        collective = CollectiveAttr(hero.attrs.setdefault("collective", {}))
+        for iteration_binding in self.iteration_bindings:
+            if iteration_binding != "for":
+                level, dim = iteration_binding.split(".")
+                collective.tile(level, dim)
         body_ops.append(
             MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=hero.attrs),
         )
