@@ -143,17 +143,17 @@ def test_lower_move_gmem_to_smem():
     assert template.count("ld.global.b16") == 64, "64 rows unrolled"
 
 
-def test_lower_elementwise_sigmoid():
-    """One f32 element per thread: -x*log2(e), ex2, +1, reciprocal.
+def test_lower_elementwise_sigmoid_mma():
+    """Lower every register of a valid mma.sync m16n8 accumulator.
 
     The hardware exponential is base 2, so exp(-x) is ex2 of -x*log2(e)
     (0fBFB8AA3B). dst doubles as the scratch register -- src is read by the
     first instruction and not after, which is what lets dst be src.
     """
-    w = 'wrmem<128x1xf32 warps=4 layout="wgmma_layout_0">'
+    w = 'wrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
             %b: {w} = alloc() attrs={{id: 1}}
             elementwise(%b: {w}, %a: {w}) attrs={{fn: "sigmoid"}}
@@ -165,10 +165,64 @@ def test_lower_elementwise_sigmoid():
         lowered, lambda o: isinstance(o, PTXTemplateOp)
     )[-1].attrs["template"]
 
-    assert template == textwrap.dedent("""\
-        mul.f32 ${f32:operand.dst.r0}, ${f32:operand.src.r0}, 0fBFB8AA3B;
-        ex2.approx.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0};
-        add.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0}, 0f3F800000;
-        rcp.approx.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0};
-        """)
+    expected = "".join(
+        textwrap.dedent(f"""\
+            mul.f32 ${{f32:operand.dst.r{reg}}}, ${{f32:operand.src.r{reg}}}, 0fBFB8AA3B;
+            ex2.approx.f32 ${{f32:operand.dst.r{reg}}}, ${{f32:operand.dst.r{reg}}};
+            add.f32 ${{f32:operand.dst.r{reg}}}, ${{f32:operand.dst.r{reg}}}, 0f3F800000;
+            rcp.approx.f32 ${{f32:operand.dst.r{reg}}}, ${{f32:operand.dst.r{reg}}};
+            """)
+        for reg in range(4)
+    )
+    assert template == expected
 
+
+def test_lower_convert_uses_root_registers_for_wrmem_view():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
+            %dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
+            convert(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp),
+    )[-1].attrs["template"]
+    assert template.count("cvt.rn.bf16x2.f32") == 16
+    assert "operand.dst.r48" in template
+    assert "operand.src.r97" in template
+    assert "operand.dst.r47" not in template
+
+
+def test_lower_elementwise_uses_root_registers_for_wrmem_view():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
+            elementwise(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid"}
+          }
+        }"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp),
+    )[-1].attrs["template"]
+    assert template.count("mul.f32") == 32
+    assert template.count("ex2.approx.f32") == 32
+    assert template.count("add.f32") == 32
+    assert template.count("rcp.approx.f32") == 32
+    assert "operand.dst.r96" in template
+    assert "operand.dst.r95" not in template
+    assert_contains_in_order(template, """
+        mul.f32 ${f32:operand.dst.r96}, ${f32:operand.src.r96}, 0fBFB8AA3B;
+        ex2.approx.f32 ${f32:operand.dst.r96}, ${f32:operand.dst.r96};
+        add.f32 ${f32:operand.dst.r96}, ${f32:operand.dst.r96}, 0f3F800000;
+        rcp.approx.f32 ${f32:operand.dst.r96}, ${f32:operand.dst.r96};
+        mul.f32 ${f32:operand.dst.r97}, ${f32:operand.src.r97}, 0fBFB8AA3B;
+    """)
