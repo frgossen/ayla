@@ -13,6 +13,7 @@ from ..passes.promote_buffers import PromoteBuffers
 from ..passes.schedule_async import ScheduleAsync
 from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
+from ..passes.verify_gpu_dialect import VerifyGpuDialect
 from ..torch_custom_call import OperandKind
 from .registry import register
 
@@ -49,6 +50,7 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
         }""")
     module = gpu_dialect.parse(module_str)
     pipeline = Pipeline()
+    pipeline.add_instrumentation_pass(VerifyGpuDialect())
     pipeline.add_pass(TileMatmul(
         op_dims=["M", "N"], tile_sizes=[128, 256],
         iteration_bindings=["block.x", "block.y"],

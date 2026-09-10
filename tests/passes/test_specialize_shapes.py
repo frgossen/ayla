@@ -5,6 +5,7 @@ import pytest
 from ayla.base.ir import Op, Value, clone_op
 from ayla.gpu_dialect import BF16Type, GmemTensorType, ModuleOp, gpu_dialect
 from ayla.passes.specialize_shapes import SpecializeShapes, specialize_shapes
+from ayla.ptx_codegen import PtxLoweringPipeline
 
 
 def _template() -> ModuleOp:
@@ -49,13 +50,15 @@ def test_specialize_shapes_is_a_mutating_pass():
     assert "?" not in repr(module)
 
 
-def test_specialization_rejects_matmul_dimension_conflicts():
+def test_lowering_rejects_matmul_dimension_conflicts_after_specialization():
     module = _template()
+    specialize_shapes(
+        module,
+        [(7, 11), (13, 11), (8, 13)],
+    )
+
     with pytest.raises(ValueError, match="inconsistent matmul shapes"):
-        specialize_shapes(
-            module,
-            [(7, 11), (13, 11), (8, 13)],
-        )
+        PtxLoweringPipeline().run(module)
 
 
 def test_specialization_rejects_unpropagated_dynamic_results():

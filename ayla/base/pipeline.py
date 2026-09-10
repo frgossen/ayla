@@ -49,6 +49,8 @@ class Pipeline(Pass):
         self.passes.append(p)
 
     def add_instrumentation_pass(self, p: Pass) -> None:
+        # TODO: Allow instrumentation passes, including verifiers, to be
+        # enabled or disabled with an environment variable.
         self.instrumentation_passes.append(p)
 
     def run(self, module: ModuleOp) -> ModuleOp:
