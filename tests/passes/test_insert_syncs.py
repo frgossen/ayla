@@ -267,7 +267,7 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             }
             %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 17}
             await(%33: lock<wgmma>)
-            convert(%78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            elementwise(%78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
             move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
         }"""))  # noqa: E501

@@ -5,7 +5,6 @@ from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..base.pipeline import op_label_matches
 from ..gpu_dialect import (
-    ConvertOp,
     ElementwiseOp,
     ForOp,
     IndexType,
@@ -60,9 +59,9 @@ class TileElementwise(LoweringPass):
         self.tile_labels = list(tile_labels)
         self.label_filter = label_filter
 
-    @lowers(ConvertOp, ElementwiseOp, MoveOp)
+    @lowers(ElementwiseOp, MoveOp)
     def lower_elementwise(
-        self, op: ConvertOp | ElementwiseOp | MoveOp,
+        self, op: ElementwiseOp | MoveOp,
     ) -> tuple[list[Op], list[object]] | None:
         if isinstance(op, MoveOp) and self.label_filter is None:
             return None

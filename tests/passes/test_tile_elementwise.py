@@ -3,7 +3,7 @@ import textwrap
 import pytest
 
 from ayla.base.ir import find_ops
-from ayla.gpu_dialect import ConvertOp, ForOp, MoveOp, TileOp, gpu_dialect
+from ayla.gpu_dialect import ElementwiseOp, ForOp, MoveOp, TileOp, gpu_dialect
 from ayla.passes.tile_elementwise import tile_elementwise
 
 
@@ -66,7 +66,7 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @epilogue(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            convert(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "convert"}
+            elementwise(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert", label: "convert"}
           }
         }"""))  # noqa: E501
 
@@ -79,7 +79,10 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
 
     assert len(find_ops(module, lambda op: isinstance(op, ForOp))) == 1
     assert len(find_ops(module, lambda op: isinstance(op, TileOp))) == 2
-    [convert] = find_ops(module, lambda op: isinstance(op, ConvertOp))
+    [convert] = find_ops(
+        module,
+        lambda op: isinstance(op, ElementwiseOp) and op.fn == "convert",
+    )
     assert tuple(convert.dst.type.sizes) == (64, 64)
     assert tuple(convert.src.type.sizes) == (64, 64)
 

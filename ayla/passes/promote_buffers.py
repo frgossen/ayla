@@ -23,7 +23,7 @@ from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BlockIdsOp,
-    ConvertOp,
+    ElementwiseOp,
     F16Type,
     F32Type,
     F64Type,
@@ -390,7 +390,9 @@ class PromoteBuffers(LoweringPass):
             ))
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
-                cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
+                cvt = ElementwiseOp.build(
+                    dst=cvt_alloc.result(), src=alloc.result(), fn="convert",
+                )
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
 
@@ -474,7 +476,11 @@ class PromoteBuffers(LoweringPass):
         return new_ops
 
     def _build_operand_writeback(
-        self, dst: Value, src: Value, operand_name: str, matmul_label: str | None = None
+        self,
+        dst: Value,
+        src: Value,
+        operand_name: str,
+        matmul_label: str | None = None,
     ) -> tuple[list[Op], list[Value]]:
         target_level = _target_level(self.target_type)
         dst_level = _collective_level(dst)
@@ -487,8 +493,8 @@ class PromoteBuffers(LoweringPass):
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
             tmp_alloc = AllocOp.build_with_fresh_id(tmp_type)
-            cvt = ConvertOp.build(
-                dst=tmp_alloc.result(), src=src,
+            cvt = ElementwiseOp.build(
+                dst=tmp_alloc.result(), src=src, fn="convert",
                 attrs=(
                     {"label": f"{matmul_label}_{operand_name}_convert"}
                     if matmul_label is not None else None
@@ -546,8 +552,8 @@ class PromoteBuffers(LoweringPass):
         stepped over, or moving what follows past it would reorder the two.
 
         Element-wise alone would be too weak a test, which is why the filter
-        has to name them: promotion leaves a `convert` behind every
-        accumulator, and a `convert` is element-wise.
+        has to name them: promotion may leave an ``elementwise`` conversion
+        behind an accumulator.
         """
         if self.epilogue_label_filter is None:
             return []
