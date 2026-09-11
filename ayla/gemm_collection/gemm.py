@@ -248,7 +248,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
-            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
+            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{collective: {{x: "grid", y: "grid", z: "grid"}}, init: 0.0, label: "mm"}}
           }}
         }}"""))
     assert isinstance(module, ModuleOp)

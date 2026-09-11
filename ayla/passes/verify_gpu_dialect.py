@@ -32,6 +32,19 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
+        collective = op.attrs.get("collective")
+        if (
+            not isinstance(collective, dict)
+            or set(collective) != set("xyz")
+            or not all(
+                level in ("thread", "wg", "block", "grid")
+                for level in collective.values()
+            )
+        ):
+            raise ValueError(
+                "matmul collective attribute must list x, y, and z"
+            )
+
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):
             raise ValueError("matmul operands must be memory tensors")

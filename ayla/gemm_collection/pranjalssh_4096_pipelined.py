@@ -40,7 +40,7 @@ def pranjalssh_4096_pipelined_module():
               for (%ki0: index = 0 to 4) {
                 %a_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a0: smem<128x64xbf16 swizzle="128B">, 0, %ki0: index)
                 %b_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b0: smem<128x64xbf16 swizzle="128B">, 0, %ki0: index)
-                matmul(%a_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+                matmul(%a_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
               }
               %a_tile_next: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem<128x4096xbf16 strides=[4096, 1]>, 0, %k2: index)
               %bt_tile_next: gmem<128x64xbf16 strides=[4096, 1]> = tile(%bt_block: gmem<128x4096xbf16 strides=[4096, 1]>, 0, %k2: index)
@@ -53,7 +53,7 @@ def pranjalssh_4096_pipelined_module():
               for (%ki1: index = 0 to 4) {
                 %a_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a1: smem<128x64xbf16 swizzle="128B">, 0, %ki1: index)
                 %b_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b1: smem<128x64xbf16 swizzle="128B">, 0, %ki1: index)
-                matmul(%a_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+                matmul(%a_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
               }
               await(%lock_a0_next: lock<mbar>)
               await(%lock_b0_next: lock<mbar>)
@@ -68,14 +68,14 @@ def pranjalssh_4096_pipelined_module():
             for (%ki0e: index = 0 to 4) {
               %a_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a0: smem<128x64xbf16 swizzle="128B">, 0, %ki0e: index)
               %b_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b0: smem<128x64xbf16 swizzle="128B">, 0, %ki0e: index)
-              matmul(%a_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+              matmul(%a_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
             }
             await(%lock_a1_e: lock<mbar>)
             await(%lock_b1_e: lock<mbar>)
             for (%ki1e: index = 0 to 4) {
               %a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a1: smem<128x64xbf16 swizzle="128B">, 0, %ki1e: index)
               %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b1: smem<128x64xbf16 swizzle="128B">, 0, %ki1e: index)
-              matmul(%a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+              matmul(%a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
             }
             %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 13}
             elementwise(%acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}

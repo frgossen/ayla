@@ -24,7 +24,9 @@ from ._utils import label_matches
 class CollectiveAttr:
     """Collective level per axis, recording only the strongest level."""
 
-    _LEVELS: ClassVar[tuple[str, ...]] = ("", "thread", "wg", "block", "grid")
+    _LEVELS: ClassVar[tuple[str, ...]] = (
+        "thread", "wg", "block", "grid",
+    )
 
     value: dict[str, str]
 
@@ -54,7 +56,7 @@ class CollectiveAttr:
             dims = tuple(valid_dims)
         normalized = ["xyz"[dim] if isinstance(dim, int) else dim for dim in dims]
         return all(
-            self._LEVELS.index(self.value.get(dim, ""))
+            self._LEVELS.index(self.value[dim])
             >= self._LEVELS.index(level)
             for dim in normalized
         )

@@ -620,7 +620,7 @@ def clone_op(
     new_op = type(op)(
         operands=new_operands,
         results=new_results,
-        attrs={**op.attrs, **(override_attrs or {})},
+        attrs={**copy.deepcopy(op.attrs), **(override_attrs or {})},
         blocks=new_blocks,
     )
 

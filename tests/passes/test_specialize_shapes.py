@@ -12,7 +12,7 @@ def _template() -> ModuleOp:
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @dynamic(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) {
-            matmul(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>)
+            matmul(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
           }
         }"""))
     assert isinstance(module, ModuleOp)
@@ -33,7 +33,7 @@ def test_specialization_can_mutate_an_explicit_clone():
     assert repr(specialized) == textwrap.dedent("""\
         module {
           kernel @dynamic(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>) {
-            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>)
+            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
           }
         }""")  # noqa: E501
     assert "?" in repr(template)

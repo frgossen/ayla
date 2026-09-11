@@ -28,7 +28,7 @@ def loop_8x8_matmul_4096_module():
               move(%a_rmem: rmem<8x1xf32>, %a_k: gmem<8x1xf32 strides=[4096, 1]>) attrs={nc: true}
               %b_rmem: rmem<8x1xf32> = alloc() attrs={id: 2}
               move(%b_rmem: rmem<8x1xf32>, %b_k: gmem<8x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              matmul(%a_rmem: rmem<8x1xf32>, %b_rmem: rmem<8x1xf32>, %c_rmem: rmem<8x8xf32>)
+              matmul(%a_rmem: rmem<8x1xf32>, %b_rmem: rmem<8x1xf32>, %c_rmem: rmem<8x8xf32>) attrs={collective: {x: "thread", y: "thread", z: "thread"}}
             }
             move(%c_thread: gmem<8x8xf32 strides=[4096, 1]>, %c_rmem: rmem<8x8xf32>)
           }
