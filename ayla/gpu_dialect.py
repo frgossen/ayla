@@ -398,27 +398,6 @@ class TileOp(Op):
         )
 
 
-@gpu_dialect.register_op("convert")
-class ConvertOp(Op):
-    """Element-wise dtype conversion: convert(dst, src).
-
-    Reads from src, converts each element, writes to dst.
-    Both must have the same shape and memory space but different dtypes.
-    """
-
-    @classmethod
-    def build(cls, dst: Value, src: Value) -> "ConvertOp":
-        return cls(operands=[dst, src], results=[])
-
-    @property
-    def dst(self) -> Value:
-        return self.operands[0]
-
-    @property
-    def src(self) -> Value:
-        return self.operands[1]
-
-
 @gpu_dialect.register_op("elementwise")
 class ElementwiseOp(Op):
     """One scalar function over each element: elementwise(dst, src).
@@ -426,14 +405,17 @@ class ElementwiseOp(Op):
     ``fn`` names the function -- an attribute, not an op each, since exp,
     tanh, relu and the rest differ only in the instructions they lower to.
 
-    Passing the same value as both operands computes in place.
+    Source and destination types may differ. ``convert`` performs only the
+    element-wise dtype conversion; other functions may convert their result
+    to the destination dtype implicitly. Passing the same value as both
+    operands computes in place.
 
     TODO: generalize to several sources and destinations. One of each admits
     only unary functions -- add, mul and select need more than one input, and
     a lowering may want to produce more than one value at a time.
     """
 
-    FUNCTIONS: ClassVar[tuple[str, ...]] = ("sigmoid",)
+    FUNCTIONS: ClassVar[tuple[str, ...]] = ("convert", "sigmoid")
 
     @classmethod
     def build(
@@ -1862,7 +1844,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
                 ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
                 ("R", dst, CollectiveScope.THREAD),
                 ("W", dst, CollectiveScope.THREAD)]
-    if isinstance(op, (ConvertOp, ElementwiseOp)):
+    if isinstance(op, ElementwiseOp):
         return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
                 ("R", root_buffer(op.src), CollectiveScope.THREAD)]
     if isinstance(op, AwaitOp):
@@ -1936,10 +1918,7 @@ def is_elementwise(op: Op) -> bool:
     so the op carries no cross-element dependency: it can be split along any
     axis, fused with another of its kind, or applied to a tile in place.
     """
-    return isinstance(op, (
-        ConvertOp,
-        ElementwiseOp,
-    ))
+    return isinstance(op, ElementwiseOp)
 
 
 def effective_operands(op: Op) -> list[Value]:

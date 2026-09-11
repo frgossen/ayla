@@ -25,7 +25,7 @@ from ..gpu_dialect import (
     SelectOp,
     TileOp,
 )
-from ..base.ir import Block, Op, Value, clone_op
+from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 
 
@@ -295,6 +295,29 @@ class Folding(LoweringPass):
         arg = self.value_map[op.arg]
         if list(op.result().type.sizes) == list(arg.type.sizes):
             return [], [arg]
+        indices: list[int | Value] = []
+        changed = False
+        for index in op.indices:
+            if isinstance(index, int):
+                indices.append(index)
+                continue
+            mapped = self.value_map.get(index, index)
+            constant = self._const_val(index)
+            if constant is None:
+                indices.append(mapped)
+            else:
+                indices.append(constant)
+                changed = True
+        if changed:
+            attrs = {
+                key: value for key, value in op.attrs.items()
+                if key not in ("static_indices", "maybe_partial")
+            }
+            tile = TileOp.build(
+                arg, indices, clone_type(op.result().type), attrs=attrs,
+                maybe_partial=op.maybe_partial,
+            )
+            return [tile], [tile.result()]
         return None
 
 

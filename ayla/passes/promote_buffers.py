@@ -23,7 +23,7 @@ from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BlockIdsOp,
-    ConvertOp,
+    ElementwiseOp,
     F16Type,
     F32Type,
     F64Type,
@@ -369,8 +369,12 @@ class PromoteBuffers(LoweringPass):
         # labelled ones.
         buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
         if init is not None:
+            # SMEM initialization has no lowering. Keep the initialization on
+            # the matmul so a subsequent register promotion can materialize it.
             alloc = AllocOp.build_with_fresh_id(
-                target_type, init=init, attrs=buffer_attrs
+                target_type,
+                init=None if self.target_type == "smem" else init,
+                attrs=buffer_attrs,
             )
             new_ops.append(alloc)
         else:
@@ -386,7 +390,9 @@ class PromoteBuffers(LoweringPass):
             ))
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
-                cvt = ConvertOp.build(dst=cvt_alloc.result(), src=alloc.result())
+                cvt = ElementwiseOp.build(
+                    dst=cvt_alloc.result(), src=alloc.result(), fn="convert",
+                )
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
 
@@ -470,7 +476,12 @@ class PromoteBuffers(LoweringPass):
         return new_ops
 
     def _build_operand_writeback(
-        self, dst: Value, src: Value, operand_name: str, matmul_label: str | None = None
+        self,
+        dst: Value,
+        src: Value,
+        operand_name: str,
+        matmul_label: str | None = None,
+        epilogue: list[ElementwiseOp] | None = None,
     ) -> tuple[list[Op], list[Value]]:
         target_level = _target_level(self.target_type)
         dst_level = _collective_level(dst)
@@ -480,12 +491,33 @@ class PromoteBuffers(LoweringPass):
                 f"when promoting to {self.target_type}"
             )
         new_ops: list[Op] = []
+        epilogue = list(epilogue or [])
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
             tmp_alloc = AllocOp.build_with_fresh_id(tmp_type)
-            cvt = ConvertOp.build(dst=tmp_alloc.result(), src=src)
-            new_ops.extend([tmp_alloc, cvt])
+            new_ops.extend(epilogue[:-1])
+            new_ops.append(tmp_alloc)
+            if epilogue:
+                final = epilogue[-1]
+                # TODO: Generalize this rewrite for multi-source element-wise
+                # epilogues such as SwiGLU. Retarget the final operation's
+                # destination while preserving and remapping all its sources.
+                assert final.dst is src and final.src is src
+                new_ops.append(ElementwiseOp.build(
+                    dst=tmp_alloc.result(), src=src, fn=final.fn,
+                    attrs=final.attrs,
+                ))
+            else:
+                new_ops.append(ElementwiseOp.build(
+                    dst=tmp_alloc.result(), src=src, fn="convert",
+                    attrs=(
+                        {"label": f"{matmul_label}_{operand_name}_convert"}
+                        if matmul_label is not None else None
+                    ),
+                ))
             src = tmp_alloc.result()
+        else:
+            new_ops.extend(epilogue)
         if self.tma and self.target_type == "wrmem":
             new_ops.extend(self._build_tma_writeback(dst, src, matmul_label))
             return new_ops, []
@@ -536,8 +568,8 @@ class PromoteBuffers(LoweringPass):
         stepped over, or moving what follows past it would reorder the two.
 
         Element-wise alone would be too weak a test, which is why the filter
-        has to name them: promotion leaves a `convert` behind every
-        accumulator, and a `convert` is element-wise.
+        has to name them: promotion may leave an ``elementwise`` conversion
+        behind an accumulator.
         """
         if self.epilogue_label_filter is None:
             return []
@@ -570,7 +602,10 @@ class PromoteBuffers(LoweringPass):
         if "dst" in self.operand_names:
             ops, [new_dst] = self._build_operand_promotion(dst, "dst", label, init=init)
             pre_ops.extend(ops)
-            init = None
+            # A staged SMEM destination is intermediate IR; its matmul still
+            # owns initialization until the destination reaches registers.
+            if self.target_type != "smem":
+                init = None
 
         matmul = MatmulOp.build(
             lhs=new_lhs, rhs=new_rhs, dst=new_dst, init=init, attrs=op.extra_attrs
@@ -579,13 +614,14 @@ class PromoteBuffers(LoweringPass):
         # The epilogue runs on the promoted buffer, before it is written back:
         # that is the whole point of promoting the destination, and it is only
         # reachable here because the ops behind the matmul came along.
-        post_ops = [
+        post_ops: list[ElementwiseOp] = [
             type(e)(operands=[new_dst, new_dst], results=[], attrs=e.attrs)
             for e in epilogue
         ]
         if "dst" in self.operand_names:
-            ops, _ = self._build_operand_writeback(dst, new_dst, "dst", label)
-            post_ops.extend(ops)
+            post_ops, _ = self._build_operand_writeback(
+                dst, new_dst, "dst", label, post_ops,
+            )
 
         return pre_ops + [matmul] + post_ops
 

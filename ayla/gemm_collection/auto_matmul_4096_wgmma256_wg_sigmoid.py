@@ -11,6 +11,7 @@ from ..passes.multi_buffer import MultiBuffer
 from ..passes.pipeline_loop import PipelineLoop
 from ..passes.promote_buffers import PromoteBuffers
 from ..passes.schedule_async import ScheduleAsync
+from ..passes.tile_elementwise import TileElementwise
 from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
 from ..passes.verify_gpu_dialect import VerifyGpuDialect
@@ -28,22 +29,23 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
 
     The sigmoid is written against the whole 4096x4096 output and never says
     where it should run. Tiling cuts it to the same tile as the matmul and
-    leaves it after the K loop; promotion then points it at the wgmma
-    accumulator, so it happens in registers on the way out rather than as a
-    second pass over gmem.
+    leaves it after the K loop. The output is promoted first to block-wide
+    SMEM and then, after warp-group tiling, to the WGMMA accumulator.
+    Element-wise tiling adds a four-iteration, 64-column output loop only after
+    those memory spaces are known.
 
-    Both passes take it along only because `epilogue_label_filter` names it.
-    Without that it stays where it was written, reading the output back after
-    the store -- correct, and a round trip.
+    Matmul tiling and promotion take it along only because
+    `epilogue_label_filter` names it. Without that it stays where it was
+    written, reading the output back after the store -- correct, and a round
+    trip.
 
-    TODO: tile the epilogue and schedule its segments separately, pipelining
-    them if it pays. It runs as one block over the whole accumulator today,
-    which nothing can overlap -- the output writeback is already sliced, so a
-    per-segment epilogue could store one segment while the next computes.
+    Explicit unrolling materializes all four 64-column output iterations. A
+    follow-up can pipeline those operations once the desired overlap is
+    expressed through the general loop scheduler.
     """
     module_str = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096_wgmma256_wg_sigmoid(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] {
+          kernel @auto_matmul_4096_wgmma256_wg_sigmoid(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) {
             matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={init: 0.0, label: "mm"}
             elementwise(%c: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={fn: "sigmoid", label: "epi"}
           }
@@ -52,10 +54,19 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     pipeline = Pipeline()
     pipeline.add_instrumentation_pass(VerifyGpuDialect())
     pipeline.add_pass(TileMatmul(
-        op_dims=["M", "N"], tile_sizes=[128, 256],
-        iteration_bindings=["block.x", "block.y"],
-        for_loop_labels=[None, None],
+        op_dims=["M", "M", "N"], tile_sizes=[1024, 128, 256],
+        iteration_bindings=["for", "block.x", "block.y"],
+        for_loop_labels=["outm", None, None],
         op_label_filter="mm", epilogue_label_filter="epi",
+    ))
+    pipeline.add_pass(PromoteBuffers(
+        target_type="smem", operands=["dst"], tma=True,
+        label_filter="mm", epilogue_label_filter="epi",
+        physical_layout={
+            "swizzle": "128B",
+            "block_width": 64,
+            "order": "block_major",
+        },
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["M"], tile_sizes=[64],
@@ -67,6 +78,11 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
         epilogue_label_filter="epi",
+    ))
+    pipeline.add_pass(TileElementwise(
+        tile_dims=[1], tile_sizes=[64],
+        tile_levels=["for"], tile_labels=["outn"],
+        label_filter="epi|mm_dst_convert|mm_dst_wrmem|mm_dst_smem",
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[64],
@@ -83,10 +99,10 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
         iteration_bindings=["for"], for_loop_labels=["kk"],
         op_label_filter="mm", epilogue_label_filter="epi",
     ))
-    pipeline.add_pass(MultiBuffer(depth=4, label_filter="mm_lhs_smem"))
-    pipeline.add_pass(MultiBuffer(depth=4, label_filter="mm_rhs_smem"))
+    pipeline.add_pass(MultiBuffer(depth=3, label_filter="mm_lhs_smem"))
+    pipeline.add_pass(MultiBuffer(depth=3, label_filter="mm_rhs_smem"))
     pipeline.add_pass(LICM())
-    pipeline.add_pass(UnrollLoop(unroll_factor=4, label_filter="k"))
+    pipeline.add_pass(UnrollLoop(unroll_factor=3, label_filter="k"))
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(LowerToAsync())
     # Fuse each stage's lhs+rhs TMA loads onto one mbarrier BEFORE pipelining,
@@ -111,6 +127,10 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
         pipeline.add_pass(LICM())
         pipeline.add_pass(Canonicalize())
 
+    pipeline.add_pass(UnrollLoop(unroll_factor=4, label_filter="outn"))
+    pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(UnrollLoop(unroll_factor=4, label_filter="outm"))
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     return pipeline.run(module)
