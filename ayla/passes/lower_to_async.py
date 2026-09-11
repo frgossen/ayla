@@ -105,7 +105,14 @@ class LowerToAsync(LoweringPass):
                 and isinstance(dst.type, WrmemTensorType)
                 and dst.type.warps == 4):
             return None
-        matmul = MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=op.attrs)
+        matmul = MatmulOp.build(
+            lhs=lhs,
+            rhs=rhs,
+            dst=dst,
+            collective=op.collective,
+            attrs=op.extra_attrs,
+            init=op.init,
+        )
         return self._wrap(matmul, "wgmma", op.attrs)
 
 

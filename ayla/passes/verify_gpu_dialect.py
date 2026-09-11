@@ -5,7 +5,12 @@ from enum import Enum, auto
 
 from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
-from ..gpu_dialect import MatmulOp, MemTensorType, ModuleOp, TmaDescType
+from ..gpu_dialect import (
+    MatmulOp,
+    MemTensorType,
+    ModuleOp,
+    TmaDescType,
+)
 
 
 class VerificationStage(Enum):
@@ -36,14 +41,11 @@ class VerifyGpuDialect(VerificationPass):
         if (
             not isinstance(collective, dict)
             or set(collective) != set("xyz")
-            or not all(
-                level in ("thread", "wg", "block", "grid")
-                for level in collective.values()
-            )
         ):
             raise ValueError(
                 "matmul collective attribute must list x, y, and z"
             )
+        _ = op.collective
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):

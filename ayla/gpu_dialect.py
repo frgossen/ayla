@@ -226,6 +226,23 @@ class KernelOp(Op):
         )
 
 
+class CollectiveLevel(enum.IntEnum):
+    THREAD = 0
+    WARP = 1
+    WG = 2
+    BLOCK = 3
+    GRID = 4
+
+    def join(self, other: CollectiveLevel) -> CollectiveLevel:
+        return max(self, other)
+
+
+class CollectiveAxis(enum.IntEnum):
+    X = 0
+    Y = 1
+    Z = 2
+
+
 @gpu_dialect.register_op("matmul")
 class MatmulOp(Op):
     @classmethod
@@ -234,10 +251,17 @@ class MatmulOp(Op):
         lhs: Value,
         rhs: Value,
         dst: Value,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
+        if "collective" in a:
+            raise ValueError("pass collective as an explicit argument")
+        a["collective"] = {
+            axis.name.lower(): level.name.lower()
+            for axis, level in collective.items()
+        }
         if init is not None:
             a["init"] = init
         return cls(
@@ -261,10 +285,52 @@ class MatmulOp(Op):
         return self.attrs.get("init")  # type: ignore[return-value]
 
     @property
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        collective = self.attrs["collective"]
+        return {
+            CollectiveAxis[axis.upper()]: CollectiveLevel[level.upper()]
+            for axis, level in collective.items()  # type: ignore[union-attr]
+        }
+
+    def collective_level(self, axis: CollectiveAxis) -> CollectiveLevel:
+        return self.collective[axis]
+
+    def narrow_collective_level(
+        self, axis: CollectiveAxis, level: CollectiveLevel,
+    ) -> None:
+        current = self.collective_level(axis)
+        assert level.join(current) == current
+        collective = self.attrs["collective"]
+        collective[axis.name.lower()] = level.name.lower()  # type: ignore[index]
+
+    def is_block_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(CollectiveLevel.BLOCK, axes)
+
+    def is_thread_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(CollectiveLevel.THREAD, axes)
+
+    def is_wg_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(
+            CollectiveLevel.WG, axes, valid_axes=(CollectiveAxis.X,),
+        )
+
+    def _is_collective(
+        self,
+        level: CollectiveLevel,
+        axes: tuple[CollectiveAxis, ...],
+        valid_axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
+    ) -> bool:
+        if not axes:
+            axes = valid_axes
+        assert all(axis in valid_axes for axis in axes)
+        return all(self.collective_level(axis) >= level for axis in axes)
+
+    @property
     def extra_attrs(self) -> dict[str, object]:
-        return {k: v for k, v in self.attrs.items() if k != "init"}
-
-
+        return {
+            k: v for k, v in self.attrs.items()
+            if k not in ("collective", "init")
+        }
 
 @gpu_dialect.register_op("tile")
 class TileOp(Op):

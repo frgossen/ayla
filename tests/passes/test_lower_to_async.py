@@ -56,7 +56,7 @@ def test_sync_matmul_stays_as_matmul():
             %lhs: rmem<2x2xf32> = alloc() attrs={id: 0}
             %rhs: rmem<2x2xf32> = alloc() attrs={id: 1}
             %dst: rmem<2x2xf32> = alloc() attrs={id: 2}
-            matmul(%lhs: rmem<2x2xf32>, %rhs: rmem<2x2xf32>, %dst: rmem<2x2xf32>)
+            matmul(%lhs: rmem<2x2xf32>, %rhs: rmem<2x2xf32>, %dst: rmem<2x2xf32>) attrs={collective: {x: "thread", y: "thread", z: "thread"}}
           }
         }""")
 
@@ -72,7 +72,7 @@ def test_wgmma_matmul_to_async_await():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
           }
         }""")
 
@@ -84,7 +84,7 @@ def test_wgmma_matmul_to_async_await():
         module {
           kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %0: lock<wgmma> = alloc() attrs={id: 0}
-            async(%0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            async(%0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
             await(%0: lock<wgmma>)
           }
         }""")

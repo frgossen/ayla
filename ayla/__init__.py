@@ -1,5 +1,7 @@
 from .gpu_dialect import (
     AsyncOp,
+    CollectiveAxis,
+    CollectiveLevel,
     GmemTensorType,
     KernelOp,
     MatmulOp,
@@ -18,6 +20,8 @@ from .jit_compiler import ShapeSpecializingJITCompiler
 
 __all__ = [
     "AsyncOp",
+    "CollectiveAxis",
+    "CollectiveLevel",
     "Block",
     "GmemTensorType",
     "KernelOp",
