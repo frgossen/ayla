@@ -8,7 +8,6 @@ from ayla.gpu_dialect import (
     BarrierOp,
     ForOp,
     IfOp,
-    MatmulOp,
     TileOp,
     gpu_dialect,
 )
