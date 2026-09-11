@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from ayla.gpu_dialect import ModuleOp, gpu_dialect
-from ayla.jit_compiler import JITCompiler
+from ayla.jit_compiler import ShapeSpecializingJITCompiler
 
 
 def _template(name="dispatch_test") -> ModuleOp:
@@ -49,7 +49,7 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
         compiled.append(module)
         return _Launcher()
 
-    compiler = JITCompiler(
+    compiler = ShapeSpecializingJITCompiler(
         template,
         compile_fn,
     )
@@ -67,7 +67,7 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
 
 
 def test_jit_compiler_rejects_capture_time_cache_miss(monkeypatch):
-    compiler = JITCompiler(
+    compiler = ShapeSpecializingJITCompiler(
         _template("dispatch_capture_miss"),
         lambda module: _Launcher(),
     )
@@ -86,6 +86,8 @@ def test_jit_compiler_rejects_noncontiguous_tensors():
         def is_contiguous(self):
             return False
 
-    compiler = JITCompiler(_template(), lambda module: _Launcher())
+    compiler = ShapeSpecializingJITCompiler(
+        _template(), lambda module: _Launcher(),
+    )
     with pytest.raises(ValueError, match="contiguous"):
         compiler(Tensor(), Tensor(), Tensor())

@@ -14,7 +14,7 @@ from .base.ir import (
     Value,
 )
 from .ptx_codegen import PtxPrinter, PtxKernel, make_ptx_kernel
-from .jit_compiler import JITCompiler
+from .jit_compiler import ShapeSpecializingJITCompiler
 
 __all__ = [
     "AsyncOp",
@@ -31,5 +31,5 @@ __all__ = [
     "PtxPrinter",
     "PtxKernel",
     "make_ptx_kernel",
-    "JITCompiler",
+    "ShapeSpecializingJITCompiler",
 ]

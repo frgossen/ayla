@@ -12,41 +12,46 @@ from .ptx_runtime import PtxLauncher
 from .torch_custom_call import to_torch_dtype
 
 
-class JITCompiler:
+class ShapeSpecializingJITCompiler:
     """Cache one static PTX launcher per concrete tensor signature."""
 
     def __init__(
         self,
-        template: ModuleOp,
+        module: ModuleOp,
         compile_fn: Callable[[ModuleOp], PtxLauncher],
     ) -> None:
-        top_ops = template.body.ops
+        top_ops = module.body.ops
         if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
             raise ValueError(
-                "JITCompiler requires exactly one kernel"
+                "ShapeSpecializingJITCompiler requires exactly one kernel"
             )
         kernel = top_ops[0]
         if len(kernel.body.ops) != 1 or not isinstance(
             kernel.body.ops[0], MatmulOp,
         ):
             raise ValueError(
-                "JITCompiler requires exactly one matmul"
+                "ShapeSpecializingJITCompiler requires exactly one matmul"
             )
         if not all(
             isinstance(typ, GmemTensorType) for typ in kernel.signature
         ):
             raise ValueError(
-                "JITCompiler currently supports only gmem arguments"
+                "ShapeSpecializingJITCompiler currently supports only gmem arguments"
             )
         if not all(typ.is_canonical_strides for typ in kernel.signature):
             raise ValueError(
-                "JITCompiler requires canonical gmem layouts"
+                "ShapeSpecializingJITCompiler requires canonical gmem layouts"
             )
 
-        self._template = template
-        self._kernel = kernel
+        self._module = module
         self._compile_fn = compile_fn
         self._cache: dict[tuple[object, ...], PtxLauncher] = {}
+
+    @property
+    def _kernel(self) -> KernelOp:
+        [kernel] = self._module.body.ops
+        assert isinstance(kernel, KernelOp)
+        return kernel
 
     @property
     def name(self) -> str:
@@ -97,7 +102,7 @@ class JITCompiler:
                 f"{self.name}: specialization cache miss during CUDA graph "
                 "capture; invoke the kernel once before capture"
             )
-        module = clone_op(self._template, {})
+        module = clone_op(self._module, {})
         assert isinstance(module, ModuleOp)
         specialize_shapes(module, shapes)
         launcher = self._compile_fn(module)

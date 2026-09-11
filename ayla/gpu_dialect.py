@@ -140,11 +140,11 @@ class KernelOp(Op):
         return self.attrs.get("ptx_optimization_level")  # type: ignore[return-value]
 
     @property
-    def num_threads(self) -> int:
-        """Number of threads, treating unused block axes as one."""
-        return math.prod(
-            dim if dim is not None else 1 for dim in self.block_dim
-        )
+    def num_threads(self) -> int | None:
+        """Number of threads, or ``None`` if a block axis is unresolved."""
+        if any(dim is None for dim in self.block_dim):
+            return None
+        return math.prod(self.block_dim)  # type: ignore[arg-type]
 
     @property
     def extra_attrs(self) -> dict[str, object]:

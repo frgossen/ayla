@@ -69,7 +69,7 @@ def test_codegen_cwise_add():
         }""")
 
 
-def test_lowering_materializes_implicit_block_dimensions():
+def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, None, None] num_warp_groups=1 {
@@ -78,7 +78,7 @@ def test_lowering_materializes_implicit_block_dimensions():
     [input_kernel] = module.body.ops
 
     kernel = make_ptx_kernel(module)
-    assert input_kernel.block_dim == (128, 1, 1)
+    assert input_kernel.block_dim == (128, None, None)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
 

@@ -81,9 +81,6 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
-        op.block_dim = tuple(
-            dim if dim is not None else 1 for dim in op.block_dim
-        )
         # TODO: Materialize cache policies in an earlier pass, potentially
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({

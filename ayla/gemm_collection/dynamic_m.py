@@ -5,7 +5,7 @@ import textwrap
 
 from .. import ptx_runtime, torch_custom_call
 from ..gpu_dialect import ModuleOp, gpu_dialect
-from ..jit_compiler import JITCompiler
+from ..jit_compiler import ShapeSpecializingJITCompiler
 from ..ptx_codegen import make_ptx_kernel
 from ..torch_custom_call import DEFAULT_NAMESPACE, OperandKind
 from .gemm import schedule_matmul
@@ -57,19 +57,19 @@ def _dynamic_m_schedule_heuristic(
 
 
 def dynamic_m_matmul_template(
-    problem_n: int,
-    problem_k: int,
+    n: int,
+    k: int,
     *,
     name: str | None = None,
 ) -> ModuleOp:
     """Build the high-level BF16 GEMM template with dynamic M."""
-    if min(problem_n, problem_k) <= 0:
+    if n <= 0 or k <= 0:
         raise ValueError("problem dimensions must be positive")
-    name = name or f"dynamic_m_matmul_n{problem_n}_k{problem_k}"
+    name = name or f"dynamic_m_matmul_n{n}_k{k}"
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem<?x{problem_k}xbf16>, %b: gmem<{problem_n}x{problem_k}xbf16>, %c: gmem<?x{problem_n}xbf16>) {{
-            matmul(%a: gmem<?x{problem_k}xbf16>, %b: gmem<{problem_n}x{problem_k}xbf16>, %c: gmem<?x{problem_n}xbf16>) attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) {{
+            matmul(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
     assert isinstance(module, ModuleOp)
@@ -77,29 +77,29 @@ def dynamic_m_matmul_template(
 
 
 def make_dynamic_m_matmul(
-    problem_n: int,
-    problem_k: int,
+    n: int,
+    k: int,
     *,
     name: str | None = None,
     namespace: str = DEFAULT_NAMESPACE,
 ):
     """Create an exact-shape cached ``op(lhs, rhs) -> out`` GEMM."""
-    template = dynamic_m_matmul_template(problem_n, problem_k, name=name)
+    module = dynamic_m_matmul_template(n, k, name=name)
 
     def compile_specialization(module: ModuleOp):
         m = int(module.body.ops[0].signature[0].sizes[0])
         scheduled = schedule_matmul(
             module,
-            **_dynamic_m_schedule_heuristic(m, problem_n, problem_k),
+            **_dynamic_m_schedule_heuristic(m, n, k),
         )
         kernel = make_ptx_kernel(scheduled)
         return ptx_runtime.make_ptx_launcher(kernel)
 
-    compiler = JITCompiler(template, compile_specialization)
+    compiler = ShapeSpecializingJITCompiler(module, compile_specialization)
     operands = [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     return torch_custom_call.make_torch_custom_call(
         compiler,
         operands,
         namespace=namespace,
-        infer_result_shapes=lambda lhs, _rhs: [(lhs.shape[0], problem_n)],
+        infer_result_shapes=lambda lhs, _rhs: [(lhs.shape[0], n)],
     )

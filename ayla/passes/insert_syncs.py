@@ -344,7 +344,7 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
 def _insert_barriers(
     block: Block,
     targets: BarrierTargetsType,
-    num_threads: int,
+    num_threads: int | None,
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
@@ -357,6 +357,9 @@ def _insert_barriers(
                 )
             attrs = {} if target.named_id is None else {"id": target.named_id}
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
+                assert num_threads is not None, (
+                    "block-leader barriers require resolved block dimensions"
+                )
                 if num_threads % 32 != 0:
                     raise ValueError(
                         "block-leader barriers require a whole number of "
