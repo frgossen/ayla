@@ -15,15 +15,21 @@ from ayla import (
 from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    BF16Type,
     F32Type,
     ForOp,
+    IfOp,
+    IndexLtOp,
     IndexType,
     LockType,
     MoveOp,
+    PredicateType,
+    ReinterpretOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
     gpu_dialect,
+    root_buffer,
 )
 
 
@@ -31,6 +37,29 @@ def assert_print_and_roundtrip(op, expected):
     text = repr(op)
     assert text == expected
     assert repr(gpu_dialect.parse(text)) == text
+
+
+def test_reinterpret_op():
+    storage_type = SmemTensorType.build((64, 64), BF16Type())
+    view_type = SmemTensorType.build((32, 64), BF16Type())
+    storage = Value(name="storage", type=storage_type)
+    reinterpret = ReinterpretOp.build(storage, view_type, byte_offset=8192)
+
+    assert reinterpret.storage is storage
+    assert reinterpret.byte_offset == 8192
+    assert root_buffer(reinterpret.result()) is storage
+    assert_print_and_roundtrip(
+        reinterpret,
+        "%0: smem<32x64xbf16> = reinterpret(%storage: smem<64x64xbf16>) "
+        "attrs={byte_offset: 8192}",
+    )
+
+    with pytest.raises(ValueError, match="byte_offset"):
+        ReinterpretOp.build(storage, view_type, byte_offset=-1)
+    with pytest.raises(ValueError, match="storage"):
+        ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
+    with pytest.raises(ValueError, match="result"):
+        ReinterpretOp.build(storage, F32Type())
 
 
 def test_matmul_program():
@@ -112,6 +141,34 @@ def test_for_loop():
           generic(%0: index)
         }""")
     assert_print_and_roundtrip(op, expected)
+
+
+def test_if_op():
+    condition = Value(name="condition", type=PredicateType())
+    op = IfOp.build(condition, Block())
+    assert_print_and_roundtrip(op, textwrap.dedent("""\
+        if(%condition: pred) {
+        ^bb0:
+        }"""))
+
+    with pytest.raises(AssertionError, match="expected PredicateType"):
+        IfOp.build(Value(name="i", type=IndexType()), Block())
+
+
+def test_index_lt_op():
+    lhs = Value(name="lhs", type=IndexType())
+    rhs = Value(name="rhs", type=IndexType())
+    op = IndexLtOp.build(lhs, rhs)
+    assert_print_and_roundtrip(
+        op,
+        "%0: pred = index_lt(%lhs: index, %rhs: index)",
+    )
+
+    not_index = Value(name="f", type=F32Type())
+    with pytest.raises(AssertionError, match="expected IndexType lhs"):
+        IndexLtOp.build(not_index, rhs)
+    with pytest.raises(AssertionError, match="expected IndexType rhs"):
+        IndexLtOp.build(lhs, not_index)
 
 
 def test_async_op():

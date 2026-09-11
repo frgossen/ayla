@@ -11,6 +11,8 @@ import math
 import struct
 import textwrap
 
+from ..base.ir import Op, Type, Value, find_ops
+from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
@@ -18,6 +20,7 @@ from ..gpu_dialect import (
     AwaitOp,
     BarrierOp,
     BF16Type,
+    ElementwiseOp,
     F16Type,
     F32Type,
     GmemTensorType,
@@ -31,10 +34,10 @@ from ..gpu_dialect import (
     MatmulOp,
     ModuleOp,
     MoveOp,
-    PTXTemplateOp,
     PtrAddOp,
     PtrType,
-    ElementwiseOp,
+    PTXTemplateOp,
+    ReinterpretOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -46,8 +49,6 @@ from ..gpu_dialect import (
     physical_layout,
     root_buffer,
 )
-from ..base.ir import Op, Type, Value, find_ops
-from ..base.lowering_pass import LoweringPass, lowers
 
 
 def _lower_elementwise_sigmoid_ptx(
@@ -342,6 +343,29 @@ class LowerToPtxTemplate(LoweringPass):
             f"lower_alloc: unsupported result type {type(result_type).__name__}"
         )
 
+    @lowers(ReinterpretOp)
+    def lower_reinterpret(
+        self, op: ReinterpretOp,
+    ) -> tuple[list[Op], list[object]]:
+        storage = self.value_map[op.storage]
+        assert isinstance(storage, Value)
+        if op.byte_offset == 0:
+            return [], [storage]
+
+        new_ops: list[Op] = []
+        if isinstance(storage.type, AddrMemTensorType):
+            to_ptr = ToPtrOp.build(storage)
+            new_ops.append(to_ptr)
+            ptr = to_ptr.result()
+        else:
+            assert isinstance(storage.type, PtrType)
+            ptr = storage
+        byte_offset = IndexConstantOp.build(op.byte_offset)
+        new_ops.append(byte_offset)
+        ptr_add = PtrAddOp.build(ptr, byte_offset.result())
+        new_ops.append(ptr_add)
+        return new_ops, [ptr_add.result()]
+
     def _lower_alloc_lock(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
@@ -430,7 +454,12 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_bytes = smem_type.num_elements * smem_type.dtype.byte_size
+        n_bytes = op.attrs.get(
+            "allocation_bytes",
+            smem_type.num_elements * smem_type.dtype.byte_size,
+        )
+        if not isinstance(n_bytes, int) or n_bytes <= 0:
+            raise ValueError("allocation_bytes must be a positive integer")
         # TMA swizzling and the corresponding software address swizzle operate
         # within 1 KiB regions and require the shared-memory base to match.
         alignment = (
@@ -439,6 +468,7 @@ class LowerToPtxTemplate(LoweringPass):
             and physical_layout(smem_type) is not None
             else 128
         )
+        alignment = op.attrs.get("allocation_alignment", alignment)
         template = textwrap.dedent(f"""\
             .shared .align {alignment} .b8 ${{smem:sym}}[{n_bytes}];
             mov.u32 ${{b32:result.dst.ptr}}, ${{smem:sym}};

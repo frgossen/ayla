@@ -6,38 +6,42 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import pytree
+from .base.ir import Op, Printer, Value
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdsOp,
+    ForOp,
     GmemTensorType,
+    IfOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
+    IndexLtOp,
     IndexModOp,
     IndexMulOp,
     IndexType,
     KernelOp,
-    ForOp,
+    LaneIdOp,
     LockType,
     ModuleOp,
-    PTXTemplateOp,
+    PredicateType,
     PtrAddOp,
     PtrType,
+    PTXTemplateOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
     TmaDescType,
     ToPtrOp,
-    LaneIdOp,
     WarpGroupIdOp,
     WrmemTensorType,
 )
-from .base.ir import Op, Printer, Value
 from .passes.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
-from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
+from .passes.lower_to_tma_move import LowerToTmaMove
+from .passes.pack_smem_allocs import ReuseSmemAllocs
 from .passes.verify_gpu_dialect import VerificationStage, VerifyGpuDialect
 
 
@@ -53,6 +57,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
+        self.add_pass(ReuseSmemAllocs())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(Canonicalize())
 
@@ -140,6 +145,11 @@ def map_type_to_registers(type):
     if isinstance(type, IndexType):
         return TypeRegisterMapping(
             member_register_types=PtxType.B32,
+            member_names="val",
+        )
+    if isinstance(type, PredicateType):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.PRED,
             member_names="val",
         )
     if isinstance(type, TmaDescType):
@@ -298,6 +308,8 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
 def _emit_op(p: PtxPrinter, op: Op) -> None:
     if isinstance(op, ForOp):
         _emit_for(p, op)
+    elif isinstance(op, IfOp):
+        _emit_if(p, op)
     elif isinstance(op, PTXTemplateOp):
         _emit_ptx_template(p, op)
     elif isinstance(op, ThreadIdsOp):
@@ -312,6 +324,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_index_mul(p, op)
     elif isinstance(op, IndexDivOp):
         _emit_index_div(p, op)
+    elif isinstance(op, IndexLtOp):
+        _emit_index_lt(p, op)
     elif isinstance(op, IndexModOp):
         _emit_index_mod(p, op)
     elif isinstance(op, WarpGroupIdOp):
@@ -346,6 +360,14 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     p.write_line(f"setp.lt.s32 {pred}, {iv_reg}, {op.ub};")
     p.write_line(f"@{pred} bra {label};")
     p.write_newline_once()
+
+
+def _emit_if(p: PtxPrinter, op: IfOp) -> None:
+    condition = p.unique_ptx_names_for_value(op.condition)
+    done = p.unique_ptx_names(op, PtxType.LABEL)
+    p.write_line(f"@!{condition} bra {done};")
+    _emit_block(p, op.body)
+    p.write_line(f"{done}:")
 
 
 def _emit_module(
@@ -525,6 +547,13 @@ def _emit_index_add(p: PtxPrinter, op: IndexAddOp) -> None:
     else:
         rhs = p.unique_ptx_names_for_value(op.rhs)
         _write_with_comment(p, f"add.s32 {dst}, {lhs}, {rhs};", op)
+
+
+def _emit_index_lt(p: PtxPrinter, op: IndexLtOp) -> None:
+    dst = p.unique_ptx_names_for_value(op.result())
+    lhs = p.unique_ptx_names_for_value(op.lhs)
+    rhs = p.unique_ptx_names_for_value(op.rhs)
+    _write_with_comment(p, f"setp.lt.u32 {dst}, {lhs}, {rhs};", op)
 
 
 def _emit_index_mul(p: PtxPrinter, op: IndexMulOp) -> None:

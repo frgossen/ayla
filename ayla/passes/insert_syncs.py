@@ -10,6 +10,7 @@ from ..gpu_dialect import (
     BarrierOp,
     CollectiveScope,
     ForOp,
+    IfOp,
     KernelOp,
     ModuleOp,
     PTXTemplateOp,
@@ -155,6 +156,23 @@ class DataflowState:
         )
 
 
+def _after_barrier(
+    live: DataflowState, barrier: BarrierScope,
+) -> DataflowState:
+    """Discharge the settled effects ordered by ``barrier``."""
+    live = live.clone()
+    if barrier in (BarrierScope.BLOCK, BarrierScope.GRID):
+        live.named_barrier_ids.clear()
+        live.named_barrier_ids_pending_await.clear()
+    for buf, effects in live.concurrent_memory_effects.items():
+        live.concurrent_memory_effects[buf] = {
+            effect for effect in effects
+            if effect.pending_await is not None
+            or not _barrier_covers(barrier, effect.scope)
+        }
+    return live
+
+
 @dataclasses.dataclass(frozen=True)
 class BarrierTarget:
     """The barrier before an op: its ``scope`` and, for a block-leader barrier,
@@ -221,6 +239,20 @@ def _analyze(
             if joined == header:
                 return live_out
             header = joined
+    if isinstance(op, IfOp):
+        # The region may not execute, so its effects join the fallthrough
+        # state instead of replacing it.
+        return live.join(_analyze_block(op.body.ops, live, targets))
+    if isinstance(op, BarrierOp):
+        # Schedulers may author structural barriers before this pass, such as
+        # block barriers between persistent-grid waves or grid barriers between
+        # kernel phases. Account for their ordering so we do not insert a
+        # redundant barrier after them.
+        try:
+            scope = BarrierScope[op.scope.upper()]
+        except KeyError as error:
+            raise ValueError(f"unknown barrier scope {op.scope!r}") from error
+        return _after_barrier(live, scope)
     if is_side_effect_free(op):
         return live
     if isinstance(op, PTXTemplateOp):
@@ -308,18 +340,10 @@ def _analyze(
             ).add(named_id)
         else:
             live.named_barrier_ids.add(named_id)
-    elif barrier_scope == BarrierScope.BLOCK:
-        live.named_barrier_ids = set()
-        live.named_barrier_ids_pending_await = {}
     targets[op] = BarrierTarget(barrier_scope, named_id)
-    # A barrier orders settled accesses it covers; pending (in-block) effects
-    # survive — only their await completes them.
-    for buf, effs in live.concurrent_memory_effects.items():
-        live.concurrent_memory_effects[buf] = {
-            e for e in effs
-            if e.pending_await is not None
-            or not _barrier_covers(barrier_scope, e.scope)
-        }
+    # A barrier orders settled accesses it covers; pending async effects survive
+    # until their await completes them.
+    live = _after_barrier(live, barrier_scope)
     # An async op's effects that its await fully orders wait pending on the lock
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for

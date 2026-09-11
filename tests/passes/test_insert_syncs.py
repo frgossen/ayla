@@ -23,6 +23,32 @@ def test_block_leader_barrier_requires_whole_warps():
         _insert_barriers(block, targets, num_threads=33)
 
 
+def test_preexisting_barrier_updates_dataflow_state():
+    source = """\
+        module {
+          kernel @test(%g: gmem<1xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %r: rmem<1xf32> = alloc()
+            move(%g: gmem<1xf32>, %r: rmem<1xf32>)
+            barrier() attrs={scope: \"__SCOPE__\"}
+            move(%r: rmem<1xf32>, %g: gmem<1xf32>)
+          }
+        }"""
+
+    # A block barrier cannot discharge a grid-scoped global-memory effect.
+    with pytest.raises(NotImplementedError, match="barrier GRID"):
+        insert_syncs(gpu_dialect.parse(textwrap.dedent(
+            source.replace("__SCOPE__", "block"),
+        )))
+
+    # Scheduling passes may author structural barriers before InsertSyncs. The
+    # grid barrier discharges the effect, so the pass must not insert another.
+    module = gpu_dialect.parse(textwrap.dedent(
+        source.replace("__SCOPE__", "grid"),
+    ))
+    insert_syncs(module)
+    assert repr(module).count("barrier()") == 1
+
+
 def test_war_on_shared_buffer_gets_barrier():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -47,8 +73,9 @@ def test_war_on_shared_buffer_gets_barrier():
 
     insert_syncs(module)
 
-    # One named (block_leader) barrier, before the TMA loads: the WAR on %sa/%sb
-    # vs. the prior iteration's matmul reads. It's block_leader, not block,
+    # One named (block_leader) barrier, before the TMA loads: the WAR on
+    # %sa/%sb vs. the prior iteration's matmul reads. It's block_leader,
+    # not block,
     # because the TMA write is issued by a single leader thread (all-arrive /
     # t0-wait suffices). The matmul's own RAW on the freshly loaded %sa/%sb needs
     # no barrier — the load's mbar await already covers it.
