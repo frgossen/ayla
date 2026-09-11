@@ -258,10 +258,7 @@ class MatmulOp(Op):
         a: dict[str, object] = dict(attrs or {})
         if "collective" in a:
             raise ValueError("pass collective as an explicit argument")
-        a["collective"] = {
-            axis.name.lower(): level.name.lower()
-            for axis, level in collective.items()
-        }
+        a["collective"] = dict(collective)
         if init is not None:
             a["init"] = init
         return cls(
@@ -286,11 +283,7 @@ class MatmulOp(Op):
 
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
-        collective = self.attrs["collective"]
-        return {
-            CollectiveAxis[axis.upper()]: CollectiveLevel[level.upper()]
-            for axis, level in collective.items()  # type: ignore[union-attr]
-        }
+        return self.attrs["collective"]  # type: ignore[return-value]
 
     def collective_level(self, axis: CollectiveAxis) -> CollectiveLevel:
         return self.collective[axis]
@@ -300,8 +293,7 @@ class MatmulOp(Op):
     ) -> None:
         current = self.collective_level(axis)
         assert level.join(current) == current
-        collective = self.attrs["collective"]
-        collective[axis.name.lower()] = level.name.lower()  # type: ignore[index]
+        self.collective[axis] = level
 
     def is_block_collective(self, *axes: CollectiveAxis) -> bool:
         return self._is_collective(CollectiveLevel.BLOCK, axes)

@@ -6,6 +6,7 @@ from enum import Enum, auto
 from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
+    CollectiveAxis,
     MatmulOp,
     MemTensorType,
     ModuleOp,
@@ -40,12 +41,11 @@ class VerifyGpuDialect(VerificationPass):
         collective = op.attrs.get("collective")
         if (
             not isinstance(collective, dict)
-            or set(collective) != set("xyz")
+            or set(collective) != set(CollectiveAxis)
         ):
             raise ValueError(
                 "matmul collective attribute must list x, y, and z"
             )
-        _ = op.collective
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):
