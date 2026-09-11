@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from ayla.gemm import (
+from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
 from ayla.ptx_codegen import make_ptx_kernel

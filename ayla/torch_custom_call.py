@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
+from typing import Protocol
 
 import torch
 
 from .gpu_dialect import BF16Type, F16Type, F32Type, F64Type
-from .ptx_runtime import PtxLauncher
 
 _TORCH_DTYPES = [
     (F16Type(), torch.float16),
@@ -34,6 +34,13 @@ class OperandKind(Enum):
     R = "r"
     RW = "rw"
     RESULT = "result"
+
+
+class _Launcher(Protocol):
+    name: str
+    signature: list
+
+    def __call__(self, *tensors: torch.Tensor) -> None: ...
 
 
 def _get_library(namespace: str) -> torch.library.Library:
@@ -64,7 +71,7 @@ def _make_schema(op_name: str, signature_mapping: list[OperandKind]) -> str:
 
 
 def make_torch_custom_call(
-    launcher: PtxLauncher,
+    launcher: _Launcher,
     signature_mapping: list[OperandKind],
     *,
     namespace: str = DEFAULT_NAMESPACE,

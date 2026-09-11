@@ -95,6 +95,15 @@ def test_kernel_num_threads():
     assert kernel.num_threads == 256
 
 
+def test_kernel_num_threads_is_unresolved_with_an_unset_axis():
+    kernel = KernelOp.build(
+        "k", Block(),
+        block_dim=(256, None, None), num_warp_groups=2,
+    )
+
+    assert kernel.num_threads is None
+
+
 def test_for_loop():
     op = ForOp.build(0, 64, 4)
     op.body.append(Op(operands=[op.iv], results=[]))

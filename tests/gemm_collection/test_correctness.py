@@ -5,8 +5,12 @@ import pytest
 import torch
 from torch.ops import ayla
 
-from ayla.gemm import (
+from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+)
+from ayla.gemm_collection.dynamic_m import (
+    _dynamic_m_schedule_heuristic,
+    make_dynamic_m_matmul,
 )
 from ayla.gpu_dialect import TmaDescType
 from ayla.ptx_codegen import make_ptx_kernel
@@ -112,6 +116,47 @@ def test_lhs_l2_promotion_reaches_tma_descriptor():
     }
     assert input_descs[0].l2_promotion == "256B"
     assert input_descs[1].l2_promotion is None
+
+
+def test_dynamic_m_schedule_uses_broad_muse_regimes():
+    heuristic = _dynamic_m_schedule_heuristic
+    assert heuristic(128, 19968, 6656)["output_n_tile"] == 64
+    assert heuristic(512, 19968, 6656)["output_n_tile"] == 208
+    assert heuristic(1024, 19968, 19968)["output_n_tile"] == 208
+    assert heuristic(4096, 19968, 19968)["output_n_tile"] == 256
+
+
+def test_dynamic_m_gemm_returns_an_inferred_meta_output():
+    op = make_dynamic_m_matmul(
+        256, 64,
+        name="test_dynamic_m_gemm_returns_an_inferred_meta_output",
+        namespace="ayla_dynamic_schema_test",
+    )
+    lhs = torch.empty((32, 64), dtype=BF16, device="meta")
+    rhs = torch.empty((256, 64), dtype=BF16, device="meta")
+
+    out = op(lhs, rhs)
+
+    assert str(op._schema).endswith("(Tensor arg0, Tensor arg1) -> Tensor")
+    assert out.shape == (32, 256)
+    assert out.dtype == BF16
+    assert out.device.type == "meta"
+
+
+@requires_cuda
+def test_dynamic_m_gemm_specializes_distinct_shapes():
+    op = make_dynamic_m_matmul(
+        256, 64,
+        name="test_dynamic_m_gemm_specializes_distinct_shapes",
+        namespace="ayla_dynamic_test",
+    )
+    for m in (3, 128, 256):
+        torch.manual_seed(m)
+        lhs = torch.randn((m, 64), dtype=BF16, device="cuda")
+        rhs = torch.randn((256, 64), dtype=BF16, device="cuda")
+        out = op(lhs, rhs)
+        torch.cuda.synchronize()
+        assert torch.equal(out, torch.mm(lhs, rhs.T))
 
 
 @requires_cuda

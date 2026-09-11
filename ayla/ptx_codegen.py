@@ -259,15 +259,15 @@ class PtxKernel:
     ptx_optimization_level: int | None = None
 
 
-def _resolve_block_dim(kernel: KernelOp) -> None:
-    """Materialize the kernel's PTX launch dimensions."""
+def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
+    """Resolve implicit block axes for PTX emission and launch."""
     if all(dim is None for dim in kernel.block_dim):
         raise ValueError(
             f"make_ptx_kernel: block_dim is entirely unset: {kernel.block_dim}"
         )
-    kernel.block_dim = tuple(
+    return tuple(
         dim if dim is not None else 1 for dim in kernel.block_dim
-    )
+    )  # type: ignore[return-value]
 
 
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
@@ -276,31 +276,27 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    _resolve_block_dim(kernel)
 
     module = PtxLoweringPipeline().run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
     grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
+    block_dim = _resolve_block_dim(kernel)
     p = PtxPrinter()
-    _emit_op(p, module)
+    _emit_module(p, module, block_dim)
     return PtxKernel(
         ptx=p.render(),
         name=kernel.name,
         signature=kernel.signature,
         grid_dim=grid_dim,
-        block_dim=kernel.block_dim,
+        block_dim=block_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
     )
 
 
 def _emit_op(p: PtxPrinter, op: Op) -> None:
-    if isinstance(op, ModuleOp):
-        _emit_module(p, op)
-    elif isinstance(op, KernelOp):
-        _emit_kernel(p, op)
-    elif isinstance(op, ForOp):
+    if isinstance(op, ForOp):
         _emit_for(p, op)
     elif isinstance(op, PTXTemplateOp):
         _emit_ptx_template(p, op)
@@ -352,15 +348,25 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     p.write_newline_once()
 
 
-def _emit_module(p: PtxPrinter, op: ModuleOp) -> None:
+def _emit_module(
+    p: PtxPrinter,
+    op: ModuleOp,
+    block_dim: tuple[int, int, int],
+) -> None:
     p.write_line(f".version {op.version}")
     p.write_line(f".target {op.target}")
     p.write_line(f".address_size {op.address_size}")
     p.write_newline_once()
-    _emit_block(p, op.body)
+    [kernel] = op.body.ops
+    assert isinstance(kernel, KernelOp)
+    _emit_kernel(p, kernel, block_dim)
 
 
-def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
+def _emit_kernel(
+    p: PtxPrinter,
+    op: KernelOp,
+    block_dim: tuple[int, int, int],
+) -> None:
 
     p.write_line(f".visible .entry {op.name}(")
     with p.indented():
@@ -379,7 +385,6 @@ def _emit_kernel(p: PtxPrinter, op: KernelOp) -> None:
             sep = "," if i < len(param_lines) - 1 else ""
             p.write_line(f"{line}{sep}")
     p.write_line(")")
-    block_dim = op.block_dim
     p.write_line(f".reqntid {block_dim[0]}, {block_dim[1]}, {block_dim[2]}")
     p.write_line("{")
     with p.indented():
