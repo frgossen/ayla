@@ -104,7 +104,7 @@ def test_codegen_naive_matmul_4096():
               move(%a_k_rmem: rmem<2x1xf32>, %a_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
               %b_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 2}
               move(%b_k_rmem: rmem<2x1xf32>, %b_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>) attrs={collective: {x: "thread", y: "thread", z: "thread"}}
+              matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>) collective=xyz.thread
             }
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
           }

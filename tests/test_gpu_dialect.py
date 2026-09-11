@@ -61,7 +61,7 @@ def test_matmul_program():
     expected = textwrap.dedent("""\
         generic() {
         ^bb0(%a: gmem<64x128xf32>, %b: gmem<128x32xf32>, %c: gmem<64x32xf32>):
-          matmul(%a: gmem<64x128xf32>, %b: gmem<128x32xf32>, %c: gmem<64x32xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, library: "cublas"}
+          matmul(%a: gmem<64x128xf32>, %b: gmem<128x32xf32>, %c: gmem<64x32xf32>) collective=xyz.grid attrs={library: "cublas"}
         }""")  # noqa: E501
     assert_print_and_roundtrip(program, expected)
     assert matmul.collective == {
@@ -174,8 +174,8 @@ def test_async_op():
     op = AsyncOp.build(lock, body=body)
     expected = textwrap.dedent("""\
         async(%lock: lock<wgmma>) {
-          matmul(%lhs0: gmem<64x64xf32>, %rhs0: gmem<64x64xf32>, %dst: gmem<64x64xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
-          matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
+          matmul(%lhs0: gmem<64x64xf32>, %rhs0: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
+          matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
         }""")  # noqa: E501
     assert_print_and_roundtrip(op, expected)
 
@@ -298,7 +298,7 @@ def test_naive_matmul_4096_module():
               move(%a_sloop_rmem: rmem<2x1xf32>, %a_sloop: gmem<2x1xf32 strides=[4096, 1]>)
               %b_sloop_rmem: rmem<1x2xf32> = alloc() attrs={id: 2}
               move(%b_sloop_rmem: rmem<1x2xf32>, %b_sloop: gmem<1x2xf32 strides=[4096, 1]>)
-              matmul(%a_sloop_rmem: rmem<2x1xf32>, %b_sloop_rmem: rmem<1x2xf32>, %c_thread_rmem: rmem<2x2xf32>)
+              matmul(%a_sloop_rmem: rmem<2x1xf32>, %b_sloop_rmem: rmem<1x2xf32>, %c_thread_rmem: rmem<2x2xf32>) collective=xyz.thread
             }
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
           }

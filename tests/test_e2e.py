@@ -156,7 +156,7 @@ def test_naive_matmul_4096_from_ir():
               move(%a_k_rmem: rmem<2x1xf32>, %a_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
               %b_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 2}
               move(%b_k_rmem: rmem<2x1xf32>, %b_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc: true}
-              matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>) attrs={collective: {x: "thread", y: "thread", z: "thread"}}
+              matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>) collective=xyz.thread
             }
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
           }
@@ -244,7 +244,7 @@ def test_experimental_auto_matmul_4096():
     module_str = textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) block_dim=[128, 1, 1] {
-            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, init: 0.0, label: "mm"}
+            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
           }
         }""")
     module = gpu_dialect.parse(module_str)
@@ -306,7 +306,7 @@ def test_dbg_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, init: 0.0, label: "mm"}
+            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
           }
         }""")
     module = gpu_dialect.parse(module_str)

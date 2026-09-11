@@ -9,7 +9,7 @@ def _template(name="dispatch_test") -> ModuleOp:
     module = gpu_dialect.parse(f"""
         module {{
           kernel @{name}(%a: gmem<?x8xbf16>, %b: gmem<16x8xbf16>, %c: gmem<?x16xbf16>) {{
-            matmul(%a: gmem<?x8xbf16>, %b: gmem<16x8xbf16>, %c: gmem<?x16xbf16>)
+            matmul(%a: gmem<?x8xbf16>, %b: gmem<16x8xbf16>, %c: gmem<?x16xbf16>) collective=xyz.grid
           }}
         }}
     """)

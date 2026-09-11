@@ -332,6 +332,71 @@ class MatmulOp(Op):
             if k not in ("collective", "init")
         }
 
+    def print(self, p: Printer) -> None:
+        p.write("matmul(")
+        for i, operand in enumerate(self.operands):
+            if i:
+                p.write(", ")
+            operand.print(p)
+        p.write(") collective=")
+        levels: dict[CollectiveLevel, str] = {}
+        for axis in CollectiveAxis:
+            dim = axis.name.lower()
+            level = self.collective[axis]
+            levels[level] = levels.get(level, "") + dim
+        bracketed = len(levels) > 1
+        if bracketed:
+            p.write("[")
+        for i, (level, dims) in enumerate(levels.items()):
+            if i:
+                p.write(", ")
+            p.write(f"{dims}.{level.name.lower()}")
+        if bracketed:
+            p.write("]")
+        p.write_extra_attrs(self.attrs, skip_keys=("collective",))
+
+    @classmethod
+    def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        assert not results
+        p.read_literal("(")
+        operands = [Value.parse(p)]
+        for _ in range(2):
+            p.read_literal(",")
+            operands.append(Value.parse(p))
+        p.read_literal(")")
+        p.read_literal("collective")
+        p.read_literal("=")
+        bracketed = p.can_read_literal("[")
+        if bracketed:
+            p.read_literal("[")
+        collective: dict[CollectiveAxis, CollectiveLevel] = {}
+        while True:
+            dims = p.read_identifier()
+            p.read_literal(".")
+            level = p.read_identifier()
+            for dim in dims:
+                collective[CollectiveAxis[dim.upper()]] = (
+                    CollectiveLevel[level.upper()]
+                )
+            if not bracketed or not p.can_read_literal(","):
+                break
+            p.read_literal(",")
+        if bracketed:
+            p.read_literal("]")
+        attrs = p.read_extra_attrs()
+        init = attrs.pop("init", None)
+        return cls.build(
+            *operands,
+            collective=collective,
+            attrs=attrs,
+            init=init,  # type: ignore[arg-type]
+        )
+
+
 @gpu_dialect.register_op("tile")
 class TileOp(Op):
     """Select a sub-region (view) of a buffer.

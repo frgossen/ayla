@@ -14,7 +14,7 @@ def test_inline_single_trip_for():
               %c1: index = index_constant() attrs={value: 1}
               %j: index = index_add(%i: index, %c1: index)
               %t: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%a: smem<128x64xbf16 swizzle="128B">, 0, %j: index)
-              matmul(%t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+              matmul(%t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
           }
         }""")  # noqa: E501
@@ -29,7 +29,7 @@ def test_inline_single_trip_for():
             %c1: index = index_constant() attrs={value: 1}
             %j: index = index_add(%c0: index, %c1: index)
             %t: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%a: smem<128x64xbf16 swizzle="128B">, 0, %j: index)
-            matmul(%t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            matmul(%t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %t: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
           }
         }""")  # noqa: E501
     assert repr(module) == expected_after_first
@@ -39,7 +39,7 @@ def test_inline_single_trip_for():
         module {
           kernel @test(%a: smem<128x64xbf16 swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %0: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%a: smem<128x64xbf16 swizzle="128B">, 0, 1)
-            matmul(%0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            matmul(%0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
           }
         }""")  # noqa: E501
     assert repr(module) == expected_after_second

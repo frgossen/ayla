@@ -24,7 +24,7 @@ def pranjalssh_4096_module():
               for (%ki: index = 0 to 4) {
                 %a_inner: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a: smem<128x64xbf16 swizzle="128B">, 0, %ki: index)
                 %b_inner: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b: smem<128x64xbf16 swizzle="128B">, 0, %ki: index)
-                matmul(%a_inner: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={collective: {x: "block", y: "block", z: "thread"}}
+                matmul(%a_inner: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               }
             }
             %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 3}

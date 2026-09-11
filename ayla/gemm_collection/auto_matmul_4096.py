@@ -34,7 +34,7 @@ def auto_matmul_4096_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) block_dim=[128, 1, 1] {
-            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, init: 0.0, label: "mm"}
+            matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
           }
         }""")
     module = gpu_dialect.parse(module_str)

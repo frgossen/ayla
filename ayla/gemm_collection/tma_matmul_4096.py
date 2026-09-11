@@ -37,7 +37,7 @@ def tma_matmul_4096_module():
                 move(%a_ki_rmem: rmem<2x1xf32>, %a_ki: smem<2x1xf32 strides=[64, 1]>)
                 %b_ki_rmem: rmem<2x1xf32> = alloc() attrs={id: 4}
                 move(%b_ki_rmem: rmem<2x1xf32>, %b_ki: smem<2x1xf32 strides=[64, 1]>)
-                matmul(%a_ki_rmem: rmem<2x1xf32>, %b_ki_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>) attrs={collective: {x: "thread", y: "thread", z: "thread"}}
+                matmul(%a_ki_rmem: rmem<2x1xf32>, %b_ki_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<2x2xf32>) collective=xyz.thread
               }
             }
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)

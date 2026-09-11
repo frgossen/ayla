@@ -12,7 +12,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
     module_str = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
           }
         }""")
 
@@ -29,7 +29,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
                 %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %m: index, 0)
                 %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
                 %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
+                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=xyz.grid
               }
             }
           }
@@ -41,7 +41,7 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
-            matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, label: "mm"}
+            matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) collective=xyz.grid attrs={label: "mm"}
           }
         }"""))
     module = tile_matmul(
@@ -62,7 +62,7 @@ def test_warp_group_tiling_sets_block_dim():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
-            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}}
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
           }
         }"""))
 
@@ -81,7 +81,7 @@ def test_partial_block_tile_rounds_up_the_grid():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) {
-            matmul(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, label: "mm"}
+            matmul(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) collective=xyz.grid attrs={label: "mm"}
           }
         }"""))
     tile_matmul(
@@ -105,7 +105,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
     module_str = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) block_dim=[128, 1, 1] {
-            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) attrs={collective: {x: "grid", y: "grid", z: "grid"}, label: "mm"}
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid attrs={label: "mm"}
             elementwise(%c: gmem<128x128xf32>, %c: gmem<128x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
           }
         }""")  # noqa: E501
@@ -125,7 +125,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
               %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
               %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
               %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) attrs={collective: {x: "block", y: "grid", z: "grid"}, label: "mm"}
+              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=[x.block, yz.grid] attrs={label: "mm"}
             }
             elementwise(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
           }

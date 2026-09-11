@@ -26,7 +26,7 @@ def loop_4x4_matmul_4096_module():
               move(%a_rmem: rmem<4x4xf32>, %a_k: gmem<4x4xf32 strides=[4096, 1]>) attrs={nc: true}
               %b_rmem: rmem<4x4xf32> = alloc() attrs={id: 2}
               move(%b_rmem: rmem<4x4xf32>, %b_k: gmem<4x4xf32 strides=[4096, 1]>) attrs={nc: true}
-              matmul(%a_rmem: rmem<4x4xf32>, %b_rmem: rmem<4x4xf32>, %c_rmem: rmem<4x4xf32>) attrs={collective: {x: "thread", y: "thread", z: "thread"}}
+              matmul(%a_rmem: rmem<4x4xf32>, %b_rmem: rmem<4x4xf32>, %c_rmem: rmem<4x4xf32>) collective=xyz.thread
             }
             move(%c_thread: gmem<4x4xf32 strides=[4096, 1]>, %c_rmem: rmem<4x4xf32>)
           }
