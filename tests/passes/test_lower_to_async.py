@@ -56,7 +56,7 @@ def test_sync_matmul_stays_as_matmul():
             %lhs: rmem<2x2xf32> = alloc() attrs={id: 0}
             %rhs: rmem<2x2xf32> = alloc() attrs={id: 1}
             %dst: rmem<2x2xf32> = alloc() attrs={id: 2}
-            matmul(%lhs: rmem<2x2xf32>, %rhs: rmem<2x2xf32>, %dst: rmem<2x2xf32>) collective=xyz.thread
+            matmul(%lhs: rmem<2x2xf32>, %rhs: rmem<2x2xf32>, %dst: rmem<2x2xf32>)
           }
         }""")
 

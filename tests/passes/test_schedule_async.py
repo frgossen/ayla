@@ -14,7 +14,7 @@ def test_bulk_await_sinks_until_shared_source_is_overwritten():
             %r: rmem<4x4xf32> = alloc() attrs={id: 1}
             %acc: rmem<1x1xf32> = alloc() attrs={id: 2, init: 0.0}
             move(%g: gmem<4x4xf32>, %s: smem<4x4xf32>) attrs={label: "store", tma: true}
-            matmul(%a: rmem<1x1xf32>, %b: rmem<1x1xf32>, %acc: rmem<1x1xf32>) collective=xyz.thread attrs={label: "next_compute"}
+            matmul(%a: rmem<1x1xf32>, %b: rmem<1x1xf32>, %acc: rmem<1x1xf32>) attrs={label: "next_compute"}
             move(%s: smem<4x4xf32>, %r: rmem<4x4xf32>) attrs={label: "reuse"}
           }
         }"""))

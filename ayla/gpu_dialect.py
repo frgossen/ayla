@@ -330,21 +330,23 @@ class MatmulOp(Op):
             if i:
                 p.write(", ")
             operand.print(p)
-        p.write(") collective=")
+        p.write(")")
         levels: dict[CollectiveLevel, str] = {}
         for axis in CollectiveAxis:
             dim = axis.name.lower()
             level = self.collective[axis]
             levels[level] = levels.get(level, "") + dim
-        bracketed = len(levels) > 1
-        if bracketed:
-            p.write("[")
-        for i, (level, dims) in enumerate(levels.items()):
-            if i:
-                p.write(", ")
-            p.write(f"{dims}.{level.name.lower()}")
-        if bracketed:
-            p.write("]")
+        if levels != {CollectiveLevel.THREAD: "xyz"}:
+            p.write(" collective=")
+            bracketed = len(levels) > 1
+            if bracketed:
+                p.write("[")
+            for i, (level, dims) in enumerate(levels.items()):
+                if i:
+                    p.write(", ")
+                p.write(f"{dims}.{level.name.lower()}")
+            if bracketed:
+                p.write("]")
         p.write_extra_attrs(self.attrs, skip_keys=("collective",))
 
     @classmethod
@@ -360,25 +362,29 @@ class MatmulOp(Op):
             p.read_literal(",")
             operands.append(Value.parse(p))
         p.read_literal(")")
-        p.read_literal("collective")
-        p.read_literal("=")
-        bracketed = p.can_read_literal("[")
-        if bracketed:
-            p.read_literal("[")
-        collective: dict[CollectiveAxis, CollectiveLevel] = {}
-        while True:
-            dims = p.read_identifier()
-            p.read_literal(".")
-            level = p.read_identifier()
-            for dim in dims:
-                collective[CollectiveAxis[dim.upper()]] = (
-                    CollectiveLevel[level.upper()]
-                )
-            if not bracketed or not p.can_read_literal(","):
-                break
-            p.read_literal(",")
-        if bracketed:
-            p.read_literal("]")
+        collective = {
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        }
+        if p.can_read_literal("collective"):
+            p.read_literal("collective")
+            p.read_literal("=")
+            bracketed = p.can_read_literal("[")
+            if bracketed:
+                p.read_literal("[")
+            collective = {}
+            while True:
+                dims = p.read_identifier()
+                p.read_literal(".")
+                level = p.read_identifier()
+                for dim in dims:
+                    collective[CollectiveAxis[dim.upper()]] = (
+                        CollectiveLevel[level.upper()]
+                    )
+                if not bracketed or not p.can_read_literal(","):
+                    break
+                p.read_literal(",")
+            if bracketed:
+                p.read_literal("]")
         attrs = p.read_extra_attrs()
         init = attrs.pop("init", None)
         return cls.build(
