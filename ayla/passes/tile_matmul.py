@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from ..gpu_dialect import (
     BlockIdsOp,
+    CollectiveAxis,
+    CollectiveLevel,
     ForOp,
     IndexType,
     KernelOp,
@@ -271,8 +273,22 @@ class TileMatmul(LoweringPass):
         hoist_dst = outside_of is not None
         if not hoist_dst:
             body_ops.extend(dst_ops)
+        for iteration_binding in self.iteration_bindings:
+            if iteration_binding != "for":
+                level, dim = iteration_binding.split(".")
+                hero.narrow_collective_level(
+                    CollectiveAxis[dim.upper()],
+                    CollectiveLevel[level.upper()],
+                )
         body_ops.append(
-            MatmulOp.build(lhs=lhs, rhs=rhs, dst=dst, attrs=hero.attrs),
+            MatmulOp.build(
+                lhs=lhs,
+                rhs=rhs,
+                dst=dst,
+                collective=hero.collective,
+                attrs=hero.extra_attrs,
+                init=hero.init,
+            ),
         )
 
         tiled_epilogue = [

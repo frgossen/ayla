@@ -4,6 +4,8 @@ import pytest
 
 from ayla import (
     Block,
+    CollectiveAxis,
+    CollectiveLevel,
     GmemTensorType,
     KernelOp,
     MatmulOp,
@@ -71,16 +73,41 @@ def test_matmul_program():
     a = Value(name="a", type=a_type)
     b = Value(name="b", type=b_type)
     c = Value(name="c", type=c_type)
-    matmul = MatmulOp.build(a, b, c, attrs={"library": "cublas"})
+    matmul = MatmulOp.build(
+        a,
+        b,
+        c,
+        collective={
+            CollectiveAxis.X: CollectiveLevel.GRID,
+            CollectiveAxis.Y: CollectiveLevel.GRID,
+            CollectiveAxis.Z: CollectiveLevel.GRID,
+        },
+        attrs={"library": "cublas"},
+    )
     block = Block(arguments=[a, b, c], ops=[matmul])
     program = Op(operands=[], results=[], blocks=[block])
 
     expected = textwrap.dedent("""\
         generic() {
         ^bb0(%a: gmem<64x128xf32>, %b: gmem<128x32xf32>, %c: gmem<64x32xf32>):
-          matmul(%a: gmem<64x128xf32>, %b: gmem<128x32xf32>, %c: gmem<64x32xf32>) attrs={library: "cublas"}
+          matmul(%a: gmem<64x128xf32>, %b: gmem<128x32xf32>, %c: gmem<64x32xf32>) collective=xyz.grid attrs={library: "cublas"}
         }""")  # noqa: E501
     assert_print_and_roundtrip(program, expected)
+    assert matmul.collective == {
+        CollectiveAxis.X: CollectiveLevel.GRID,
+        CollectiveAxis.Y: CollectiveLevel.GRID,
+        CollectiveAxis.Z: CollectiveLevel.GRID,
+    }
+    assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
+    assert matmul.is_block_collective()
+    matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
+    assert matmul.is_wg_collective()
+    assert not matmul.is_block_collective(CollectiveAxis.X)
+    assert matmul.is_block_collective(CollectiveAxis.Y, CollectiveAxis.Z)
+    with pytest.raises(AssertionError):
+        matmul.narrow_collective_level(
+            CollectiveAxis.X, CollectiveLevel.BLOCK,
+        )
 
 
 def test_kernel_op():
@@ -180,14 +207,32 @@ def test_async_op():
     dst = Value(name="dst", type=t)
     lock = Value(name="lock", type=LockType.build(kind="wgmma"))
     body = Block(ops=[
-        MatmulOp.build(lhs0, rhs0, dst),
-        MatmulOp.build(lhs1, rhs1, dst),
+        MatmulOp.build(
+            lhs0,
+            rhs0,
+            dst,
+            collective={
+                CollectiveAxis.X: CollectiveLevel.GRID,
+                CollectiveAxis.Y: CollectiveLevel.GRID,
+                CollectiveAxis.Z: CollectiveLevel.GRID,
+            },
+        ),
+        MatmulOp.build(
+            lhs1,
+            rhs1,
+            dst,
+            collective={
+                CollectiveAxis.X: CollectiveLevel.GRID,
+                CollectiveAxis.Y: CollectiveLevel.GRID,
+                CollectiveAxis.Z: CollectiveLevel.GRID,
+            },
+        ),
     ])
     op = AsyncOp.build(lock, body=body)
     expected = textwrap.dedent("""\
         async(%lock: lock<wgmma>) {
-          matmul(%lhs0: gmem<64x64xf32>, %rhs0: gmem<64x64xf32>, %dst: gmem<64x64xf32>)
-          matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>)
+          matmul(%lhs0: gmem<64x64xf32>, %rhs0: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
+          matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
         }""")  # noqa: E501
     assert_print_and_roundtrip(op, expected)
 

@@ -14,7 +14,7 @@ def _dynamic_matmul_module() -> ModuleOp:
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @dynamic(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) block_dim=[128, None, None] {
-            matmul(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>)
+            matmul(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) collective=xyz.grid
           }
         }"""))
     assert isinstance(module, ModuleOp)
@@ -31,7 +31,7 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @invalid(%a: gmem<7x11xbf16>, %b: gmem<13x12xbf16>, %c: gmem<7x13xbf16>) {
-            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x12xbf16>, %c: gmem<7x13xbf16>)
+            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x12xbf16>, %c: gmem<7x13xbf16>) collective=xyz.grid
           }
         }"""))
 

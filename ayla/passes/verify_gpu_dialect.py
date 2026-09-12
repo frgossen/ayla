@@ -5,7 +5,13 @@ from enum import Enum, auto
 
 from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
-from ..gpu_dialect import MatmulOp, MemTensorType, ModuleOp, TmaDescType
+from ..gpu_dialect import (
+    CollectiveAxis,
+    MatmulOp,
+    MemTensorType,
+    ModuleOp,
+    TmaDescType,
+)
 
 
 class VerificationStage(Enum):
@@ -32,6 +38,15 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
+        collective = op.attrs.get("collective")
+        if (
+            not isinstance(collective, dict)
+            or set(collective) != set(CollectiveAxis)
+        ):
+            raise ValueError(
+                "matmul collective attribute must list x, y, and z"
+            )
+
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):
             raise ValueError("matmul operands must be memory tensors")

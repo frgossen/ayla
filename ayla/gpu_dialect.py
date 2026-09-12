@@ -226,6 +226,23 @@ class KernelOp(Op):
         )
 
 
+class CollectiveLevel(enum.IntEnum):
+    THREAD = 0
+    WARP = 1
+    WG = 2
+    BLOCK = 3
+    GRID = 4
+
+    def join(self, other: CollectiveLevel) -> CollectiveLevel:
+        return max(self, other)
+
+
+class CollectiveAxis(enum.IntEnum):
+    X = 0
+    Y = 1
+    Z = 2
+
+
 @gpu_dialect.register_op("matmul")
 class MatmulOp(Op):
     @classmethod
@@ -234,10 +251,14 @@ class MatmulOp(Op):
         lhs: Value,
         rhs: Value,
         dst: Value,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
+        if "collective" in a:
+            raise ValueError("pass collective as an explicit argument")
+        a["collective"] = dict(collective)
         if init is not None:
             a["init"] = init
         return cls(
@@ -261,9 +282,117 @@ class MatmulOp(Op):
         return self.attrs.get("init")  # type: ignore[return-value]
 
     @property
-    def extra_attrs(self) -> dict[str, object]:
-        return {k: v for k, v in self.attrs.items() if k != "init"}
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        return self.attrs["collective"]  # type: ignore[return-value]
 
+    def collective_level(self, axis: CollectiveAxis) -> CollectiveLevel:
+        return self.collective[axis]
+
+    def narrow_collective_level(
+        self, axis: CollectiveAxis, level: CollectiveLevel,
+    ) -> None:
+        current = self.collective_level(axis)
+        assert level.join(current) == current
+        self.collective[axis] = level
+
+    def is_block_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(CollectiveLevel.BLOCK, axes)
+
+    def is_thread_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(CollectiveLevel.THREAD, axes)
+
+    def is_wg_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(
+            CollectiveLevel.WG, axes, valid_axes=(CollectiveAxis.X,),
+        )
+
+    def _is_collective(
+        self,
+        level: CollectiveLevel,
+        axes: tuple[CollectiveAxis, ...],
+        valid_axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
+    ) -> bool:
+        if not axes:
+            axes = valid_axes
+        assert all(axis in valid_axes for axis in axes)
+        return all(self.collective_level(axis) >= level for axis in axes)
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            k: v for k, v in self.attrs.items()
+            if k not in ("collective", "init")
+        }
+
+    def print(self, p: Printer) -> None:
+        p.write("matmul(")
+        for i, operand in enumerate(self.operands):
+            if i:
+                p.write(", ")
+            operand.print(p)
+        p.write(")")
+        levels: dict[CollectiveLevel, str] = {}
+        for axis in CollectiveAxis:
+            dim = axis.name.lower()
+            level = self.collective[axis]
+            levels[level] = levels.get(level, "") + dim
+        if levels != {CollectiveLevel.THREAD: "xyz"}:
+            p.write(" collective=")
+            bracketed = len(levels) > 1
+            if bracketed:
+                p.write("[")
+            for i, (level, dims) in enumerate(levels.items()):
+                if i:
+                    p.write(", ")
+                p.write(f"{dims}.{level.name.lower()}")
+            if bracketed:
+                p.write("]")
+        p.write_extra_attrs(self.attrs, skip_keys=("collective",))
+
+    @classmethod
+    def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        assert not results
+        p.read_literal("(")
+        operands = [Value.parse(p)]
+        for _ in range(2):
+            p.read_literal(",")
+            operands.append(Value.parse(p))
+        p.read_literal(")")
+        collective = {
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        }
+        if p.can_read_literal("collective"):
+            p.read_literal("collective")
+            p.read_literal("=")
+            bracketed = p.can_read_literal("[")
+            if bracketed:
+                p.read_literal("[")
+            collective = {}
+            while True:
+                dims = p.read_identifier()
+                p.read_literal(".")
+                level = p.read_identifier()
+                for dim in dims:
+                    collective[CollectiveAxis[dim.upper()]] = (
+                        CollectiveLevel[level.upper()]
+                    )
+                if not bracketed or not p.can_read_literal(","):
+                    break
+                p.read_literal(",")
+            if bracketed:
+                p.read_literal("]")
+        attrs = p.read_extra_attrs()
+        init = attrs.pop("init", None)
+        return cls.build(
+            *operands,
+            collective=collective,
+            attrs=attrs,
+            init=init,  # type: ignore[arg-type]
+        )
 
 
 @gpu_dialect.register_op("tile")

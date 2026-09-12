@@ -7,14 +7,14 @@ Example — promote lhs/rhs to smem::
 
     # Before:
     matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>,
-           %c: rmem<128x128xf32>)
+           %c: rmem<128x128xf32>) collective=xyz.grid
 
     # After:
     %a_smem: smem<128x64xbf16 swizzle="128B"> = alloc()
     move(%a_smem, %a) attrs={tma: true}
     %b_smem: smem<128x64xbf16 swizzle="128B"> = alloc()
     move(%b_smem, %b) attrs={tma: true}
-    matmul(%a_smem, %b_smem, %c)
+    matmul(%a_smem, %b_smem, %c) collective=xyz.grid
 """
 
 from __future__ import annotations
@@ -623,7 +623,12 @@ class PromoteBuffers(LoweringPass):
                 init = None
 
         matmul = MatmulOp.build(
-            lhs=new_lhs, rhs=new_rhs, dst=new_dst, init=init, attrs=op.extra_attrs
+            lhs=new_lhs,
+            rhs=new_rhs,
+            dst=new_dst,
+            collective=op.collective,
+            init=init,
+            attrs=op.extra_attrs,
         )
 
         # The epilogue runs on the promoted buffer, before it is written back:
