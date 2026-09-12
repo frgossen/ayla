@@ -17,7 +17,11 @@ from ..gpu_dialect import (
 )
 
 
-_ELEMENTWISE_FUNCTIONS = {"convert", "sigmoid"}
+_ELEMENTWISE_ARITIES = {
+    "convert": 1,
+    "mul": 2,
+    "sigmoid": 1,
+}
 
 
 class VerificationStage(Enum):
@@ -77,8 +81,14 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ElementwiseOp)
     def _verify_elementwise(self, op: ElementwiseOp) -> None:
-        if op.fn not in _ELEMENTWISE_FUNCTIONS:
+        expected = _ELEMENTWISE_ARITIES.get(op.fn)
+        if expected is None:
             raise ValueError(f"unknown elementwise function {op.fn!r}")
+        if op.num_srcs != expected:
+            raise ValueError(
+                f"elementwise {op.fn} expects {expected} sources, "
+                f"got {op.num_srcs}"
+            )
 
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:
