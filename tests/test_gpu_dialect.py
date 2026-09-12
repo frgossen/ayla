@@ -160,7 +160,7 @@ def test_elementwise_syntax():
     dst = Value(name="dst", type=tensor_type)
     src = Value(name="src", type=tensor_type)
     op = ElementwiseOp.build(
-        dst, src, fn="sigmoid", attrs={"label": "activation"},
+        dst, [src], fn="sigmoid", attrs={"label": "activation"},
     )
 
     assert_print_and_roundtrip(

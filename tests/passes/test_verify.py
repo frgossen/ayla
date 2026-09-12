@@ -48,17 +48,6 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
         verify_gpu_dialect(module)
 
 
-def test_default_verification_rejects_unknown_elementwise_function():
-    typ = GmemTensorType.build([8], F32Type())
-    value = Value(name="value", type=typ)
-    module = ModuleOp.build(Block(ops=[
-        ElementwiseOp.build(value, value, fn="unknown"),
-    ]))
-
-    with pytest.raises(ValueError, match="unknown elementwise function"):
-        verify_gpu_dialect(module)
-
-
 def test_default_verification_checks_reshape():
     source = Value(
         name="source",
@@ -98,6 +87,29 @@ def test_default_verification_checks_reshape():
     ]))
     with pytest.raises(ValueError, match="canonical strides"):
         verify_gpu_dialect(strided)
+
+
+def test_elementwise_function_and_arity_are_verified():
+    typ = GmemTensorType.build([8], F32Type())
+    dst = Value(name="dst", type=typ)
+    srcs = [Value(name=f"src{i}", type=typ) for i in range(2)]
+
+    valid = ModuleOp.build(Block(ops=[
+        ElementwiseOp.build(dst, srcs=srcs, fn="mul"),
+    ]))
+    assert verify_gpu_dialect(valid) is valid
+
+    invalid_arity = ModuleOp.build(Block(ops=[
+        ElementwiseOp.build(dst, srcs=srcs[:1], fn="mul"),
+    ]))
+    with pytest.raises(ValueError, match="mul expects 2 sources, got 1"):
+        verify_gpu_dialect(invalid_arity)
+
+    unknown = ModuleOp.build(Block(ops=[
+        ElementwiseOp.build(dst, srcs=srcs[:1], fn="unknown"),
+    ]))
+    with pytest.raises(ValueError, match="unknown elementwise function"):
+        verify_gpu_dialect(unknown)
 
 
 def test_ptx_lowering_verification_rejects_dynamic_shapes():

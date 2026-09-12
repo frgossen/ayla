@@ -84,7 +84,7 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
         if op.fn == "convert"
     ]
     assert tuple(convert.dst.type.sizes) == (64, 64)
-    assert tuple(convert.src.type.sizes) == (64, 64)
+    assert tuple(convert.src(0).type.sizes) == (64, 64)
 
 
 def test_rejects_negative_dimension():

@@ -143,21 +143,21 @@ def _lower_dtype_conversion_ptx(
 def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     return _lower_dtype_conversion_ptx(
         _elementwise_operand_regs(op.dst, "dst"),
-        _elementwise_operand_regs(op.src, "src"),
-        op.src.type.dtype,
+        _elementwise_operand_regs(op.src(0), "src"),
+        op.src(0).type.dtype,
         op.dst.type.dtype,
     )
 
 
 def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
-    src_dtype = op.src.type.dtype
+    src_dtype = op.src(0).type.dtype
     dst_dtype = op.dst.type.dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
         )
 
-    src_regs = _elementwise_operand_regs(op.src, "src")
+    src_regs = _elementwise_operand_regs(op.src(0), "src")
     if src_dtype == dst_dtype:
         result_regs = _elementwise_operand_regs(op.dst, "dst")
     else:
@@ -499,10 +499,15 @@ class LowerToPtxTemplate(LoweringPass):
         in the source dtype and a supported conversion writes the result to the
         destination dtype.
         """
+        if op.num_srcs != 1:
+            raise NotImplementedError(
+                "lower_elementwise: only unary functions are supported"
+            )
+        src = op.src(0)
         dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        src_value = self.value_map[src]
         dst_type = op.dst.type
-        src_type = op.src.type
+        src_type = src.type
 
         if not (isinstance(src_type, WrmemTensorType)
                 and isinstance(dst_type, WrmemTensorType)):
