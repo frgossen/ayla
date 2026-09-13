@@ -62,16 +62,29 @@ def _lower_mul_registers(
     )
 
 
-def _lower_elementwise_sigmoid_ptx(
-    dst_regs: list[str], src_regs: list[str],
+def _lower_sigmoid_registers(
+    op: ElementwiseOp, dst_regs: list[str], src_regs: list[str],
 ) -> str:
-    """Lower an F32 sigmoid into the provided registers."""
+    precision = op.attrs.get("precision")
+    if precision == "approximate":
+        instructions = (
+            "mul.f32 {dst}, {src}, 0f3F000000;",
+            "tanh.approx.f32 {dst}, {dst};",
+            "fma.rn.f32 {dst}, {dst}, 0f3F000000, 0f3F000000;",
+        )
+    elif precision is None:
+        instructions = (
+            "mul.f32 {dst}, {src}, 0fBFB8AA3B;",
+            "ex2.approx.f32 {dst}, {dst};",
+            "add.f32 {dst}, {dst}, 0f3F800000;",
+            "rcp.approx.f32 {dst}, {dst};",
+        )
+    else:
+        raise ValueError(f"unsupported elementwise precision {precision!r}")
     return "".join(
-        f"mul.f32 {dst}, {src}, 0fBFB8AA3B;\n"
-        f"ex2.approx.f32 {dst}, {dst};\n"
-        f"add.f32 {dst}, {dst}, 0f3F800000;\n"
-        f"rcp.approx.f32 {dst}, {dst};\n"
+        instruction.format(dst=dst, src=src) + "\n"
         for dst, src in zip(dst_regs, src_regs, strict=True)
+        for instruction in instructions
     )
 
 
@@ -175,12 +188,12 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
             f"${{f32:sigmoid_tmp{reg}}}" for reg in range(len(src_regs))
         ]
 
-    if isinstance(dst_dtype, BF16Type):
+    if isinstance(dst_dtype, BF16Type) and op.attrs.get("precision") is None:
         template = _lower_elementwise_sigmoid_bf16_ptx(
             result_regs, src_regs,
         )
     else:
-        template = _lower_elementwise_sigmoid_ptx(result_regs, src_regs)
+        template = _lower_sigmoid_registers(op, result_regs, src_regs)
     if src_dtype != dst_dtype:
         template += _lower_dtype_conversion_ptx(
             _elementwise_operand_regs(op.dst, "dst"),
