@@ -366,3 +366,60 @@ def test_lower_elementwise_mul():
         f"${{f32:operand.src.r{reg}}}, ${{f32:operand.rhs.r{reg}}};\n"
         for reg in range(4)
     )
+
+
+def test_lower_elementwise_silu():
+    w = 'wrmem<16x8xf32 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %a: {w} = alloc() attrs={{id: 0}}
+            elementwise(%a: {w}, %a: {w}) attrs={{fn: "silu"}}
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp)
+    )[-1].attrs["template"]
+
+    expected = "".join(
+        textwrap.dedent(f"""\
+            mul.f32 ${{f32:silu_tmp{reg}}}, ${{f32:operand.src.r{reg}}}, 0fBFB8AA3B;
+            ex2.approx.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}};
+            add.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}}, 0f3F800000;
+            rcp.approx.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}};
+            """)
+        for reg in range(4)
+    )
+    expected += "".join(
+        f"mul.f32 ${{f32:operand.dst.r{reg}}}, "
+        f"${{f32:operand.src.r{reg}}}, ${{f32:silu_tmp{reg}}};\n"
+        for reg in range(4)
+    )
+    assert template == expected
+
+
+def test_lower_elementwise_silu_with_bf16_output():
+    w = 'wrmem<16x8xf32 layout="mma">'
+    b = 'wrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %src: {w} = alloc() attrs={{id: 0}}
+            %dst: {b} = alloc() attrs={{id: 1}}
+            elementwise(%dst: {b}, %src: {w}) attrs={{fn: "silu"}}
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp)
+    )[-1].attrs["template"]
+
+    assert template.count("ex2.approx.f32") == 4
+    assert template.count("mul.f32 ${f32:silu_result") == 4
+    assert template.endswith(textwrap.dedent("""\
+        cvt.rn.bf16x2.f32 ${b32:operand.dst.r0}, ${f32:silu_result1}, ${f32:silu_result0};
+        cvt.rn.bf16x2.f32 ${b32:operand.dst.r1}, ${f32:silu_result3}, ${f32:silu_result2};
+        """))

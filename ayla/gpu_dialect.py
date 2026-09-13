@@ -419,6 +419,7 @@ class ElementwiseOp(Op):
     FUNCTION_ARITIES: ClassVar[dict[str, tuple[int, int]]] = {
         "convert": (1, 1),
         "sigmoid": (1, 1),
+        "silu": (1, 1),
         "mul": (2, 1),
     }
 
