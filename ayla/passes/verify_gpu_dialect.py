@@ -23,6 +23,7 @@ from ..gpu_dialect import (
 
 _ELEMENTWISE_ARITIES = {
     "convert": 1,
+    "silu": 1,
     "mul": 2,
     "sigmoid": 1,
 }

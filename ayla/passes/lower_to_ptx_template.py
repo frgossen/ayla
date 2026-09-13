@@ -202,10 +202,43 @@ def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
     )
 
 
+def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
+    src = op.src(0)
+    src_dtype = src.type.dtype
+    dst_dtype = op.dst.type.dtype
+    if not isinstance(src_dtype, F32Type):
+        raise NotImplementedError(
+            f"lower_elementwise: silu does not support {src_dtype} input"
+        )
+
+    src_regs = _elementwise_operand_regs(src, "src")
+    if src_dtype == dst_dtype:
+        result_regs = _elementwise_operand_regs(op.dst, "dst")
+    else:
+        result_regs = [
+            f"${{f32:silu_result{reg}}}" for reg in range(len(src_regs))
+        ]
+    tmp_regs = [f"${{f32:silu_tmp{reg}}}" for reg in range(len(src_regs))]
+    template = _lower_elementwise_sigmoid_ptx(tmp_regs, src_regs)
+    template += _lower_mul_registers(result_regs, src_regs, tmp_regs)
+    # TODO: Have PromoteBuffers emit an explicit convert after the F32
+    # epilogue; only promotion knows the register accumulator exists. Preserve
+    # sigmoid's BF16-specific lowering when making this general.
+    if src_dtype != dst_dtype:
+        template += _lower_dtype_conversion_ptx(
+            _elementwise_operand_regs(op.dst, "dst"),
+            result_regs,
+            src_dtype,
+            dst_dtype,
+        )
+    return template
+
+
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
     "mul": _lower_mul_elementwise_ptx,
     "sigmoid": _lower_sigmoid_elementwise_ptx,
+    "silu": _lower_silu_elementwise_ptx,
 }
 
 
