@@ -29,6 +29,7 @@ _ELEMENTWISE_ARITIES = {
     "convert": 1,
     "mul": 2,
     "sigmoid": 1,
+    "silu": 1,
 }
 
 
