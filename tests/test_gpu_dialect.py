@@ -19,6 +19,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BF16Type,
     BarrierOp,
+    ElementwiseOp,
     F32Type,
     ForOp,
     IfOp,
@@ -133,6 +134,26 @@ def test_matmul_program():
     with pytest.raises(AssertionError):
         matmul.narrow_collective_level(
             CollectiveAxis.X, CollectiveLevel.BLOCK,
+        )
+
+
+def test_elementwise_syntax():
+    tensor_type = GmemTensorType.build((8,), F32Type())
+    dst = Value(name="dst", type=tensor_type)
+    src = Value(name="src", type=tensor_type)
+    op = ElementwiseOp.build(
+        dst, src, fn="sigmoid", attrs={"label": "activation"},
+    )
+
+    assert_print_and_roundtrip(
+        op,
+        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+        'attrs={label: "activation"}',
+    )
+    with pytest.raises(ValueError, match="must not also appear in attrs"):
+        gpu_dialect.parse(
+            'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+            'attrs={fn: "convert"}'
         )
 
 

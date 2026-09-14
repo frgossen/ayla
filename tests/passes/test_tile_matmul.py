@@ -106,7 +106,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) block_dim=[128, 1, 1] {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid attrs={label: "mm"}
-            elementwise(%c: gmem<128x128xf32>, %c: gmem<128x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%c: gmem<128x128xf32>, %c: gmem<128x128xf32>) attrs={label: "epilogue"}
           }
         }""")  # noqa: E501
 
@@ -127,6 +127,6 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
               %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
               matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=[x.block, yz.grid] attrs={label: "mm"}
             }
-            elementwise(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={label: "epilogue"}
           }
         }""")  # noqa: E501

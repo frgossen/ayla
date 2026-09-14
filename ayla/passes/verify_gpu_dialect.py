@@ -7,11 +7,15 @@ from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     CollectiveAxis,
+    ElementwiseOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
     TmaDescType,
 )
+
+
+_ELEMENTWISE_FUNCTIONS = {"convert", "sigmoid"}
 
 
 class VerificationStage(Enum):
@@ -68,6 +72,11 @@ class VerifyGpuDialect(VerificationPass):
                 f"inconsistent matmul shapes: {lhs.sizes}, {rhs.sizes}, "
                 f"{dst.sizes}"
             )
+
+    @verifies(ElementwiseOp)
+    def _verify_elementwise(self, op: ElementwiseOp) -> None:
+        if op.fn not in _ELEMENTWISE_FUNCTIONS:
+            raise ValueError(f"unknown elementwise function {op.fn!r}")
 
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:
