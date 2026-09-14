@@ -69,6 +69,7 @@ class Pipeline(Pass):
 
     def __init__(self, *, dump_ir_on_change: bool = False) -> None:
         super().__init__(dump_ir_on_change=dump_ir_on_change)
+        self.dump_ir_on_change = dump_ir_on_change
         self.passes: list[Pass] = []
         self.instrumentation_passes: list[Pass] = []
 

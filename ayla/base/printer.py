@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import overload
 
 from .. import pytree
 
@@ -17,6 +18,24 @@ class Printer:
         self._assigned_names: dict[tuple[str, object], str | tuple] = {}
         self._used_names: dict[str, set[str]] = defaultdict(set)
         self._suffix_counters: dict[tuple[str, str], int] = defaultdict(int)
+
+    @overload
+    def unique_names(
+        self,
+        obj: object,
+        basenames: str,
+        namespace: str = "default",
+        always_suffix: bool = False,
+    ) -> str: ...
+
+    @overload
+    def unique_names(
+        self,
+        obj: object,
+        basenames: tuple,
+        namespace: str = "default",
+        always_suffix: bool = False,
+    ) -> tuple: ...
 
     def unique_names(
         self,

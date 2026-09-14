@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 bench = ["matplotlib"]
-dev = ["pytest", "ruff"]
+dev = ["pyright", "pytest", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["ayla*"]
@@ -30,6 +30,12 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 ignore = ["E501"]
+
+[tool.pyright]
+# Expand this boundary as the transformation layer gains precise annotations.
+include = ["ayla/base"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
 
 # ---------------------------------------------------------------------------
 # pixi environment management (formerly pixi.toml). Name/version/description,
@@ -55,4 +61,5 @@ default = ["dev", "bench"]
 install = { cmd = "pip install torch --index-url https://download.pytorch.org/whl/cu128 && pip install -e ." }
 test = "pytest"
 lint = "ruff check"
+typecheck = "pyright"
 bench = "python -m benchmarks.bench_gemm_collection"

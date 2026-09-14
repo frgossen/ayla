@@ -51,6 +51,7 @@ class VerificationPass(Pass):
 
     def __init__(self, stage: object | None = None) -> None:
         super().__init__(stage=stage)
+        self.stage = stage
 
     def run_op(self, op: Op) -> None:
         for (op_type, stage), fn in self._verifiers.items():
