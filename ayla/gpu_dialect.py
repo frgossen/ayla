@@ -709,7 +709,7 @@ class ReinterpretOp(Op):
     """Reinterpret a typed region at a byte offset into existing storage.
 
     The operation does not allocate, convert, or move data. Its result aliases
-    ``storage`` and may describe part of it with a different tensor shape,
+    ``arg`` and may describe part of it with a different tensor shape,
     dtype, or physical layout. Only shared-memory storage and result types are
     supported today.
     """
@@ -717,24 +717,24 @@ class ReinterpretOp(Op):
     @classmethod
     def build(
         cls,
-        storage: Value,
+        arg: Value,
         type: Type,
         byte_offset: int = 0,
     ) -> "ReinterpretOp":
-        if not isinstance(storage.type, SmemTensorType):
-            raise ValueError("reinterpret: storage must be shared memory")
+        if not isinstance(arg.type, SmemTensorType):
+            raise ValueError("reinterpret: arg must be shared memory")
         if not isinstance(type, SmemTensorType):
             raise ValueError("reinterpret: result must be shared memory")
         if not isinstance(byte_offset, int) or byte_offset < 0:
             raise ValueError("reinterpret: byte_offset must be non-negative")
         return cls(
-            operands=[storage],
+            operands=[arg],
             results=[Value(name=None, type=type)],
             attrs={"byte_offset": byte_offset},
         )
 
     @property
-    def storage(self) -> Value:
+    def arg(self) -> Value:
         return self.operands[0]
 
     @property
@@ -2040,7 +2040,7 @@ def root_buffers(value: Value) -> set[Value]:
     """Return every physical buffer that may underlie ``value``."""
     definition = value.definition
     if isinstance(definition, ReinterpretOp):
-        return root_buffers(definition.storage)
+        return root_buffers(definition.arg)
     if isinstance(definition, (ReshapeOp, TileOp)):
         return root_buffers(definition.arg)
     if isinstance(definition, SelectOp):
