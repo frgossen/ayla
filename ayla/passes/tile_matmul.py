@@ -5,6 +5,9 @@ from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
     ForOp,
+    IfOp,
+    IndexConstantOp,
+    IndexLtOp,
     IndexType,
     KernelOp,
     MatmulOp,
@@ -31,7 +34,10 @@ class TileMatmul(LoweringPass):
         (writes the matching axis of the kernel's ``grid_dim``), or
         ``"thread.{x,y,z}"`` for ``thread_ids()`` (writes the matching
         axis of the kernel's ``block_dim``), or ``"wg.x"`` for
-        ``warp_group_id()``.
+        ``warp_group_id()``. If an output dimension is bound to ``block.x``
+        and that grid axis is already larger than its tile count, excess
+        blocks are guarded. A smaller grid remains a launch conflict; express
+        multiple waves with an explicit outer ``for`` tiling level.
       - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
         ``None`` for an iteration mapped to a hardware dimension.
 
@@ -49,8 +55,9 @@ class TileMatmul(LoweringPass):
     once per K step.
 
     ``allow_partial_tiles`` permits a non-divisible block-level tile by
-    rounding the grid dimension up. Addressing remains full-tile; callers must
-    use memory operations with defined out-of-bounds behavior, such as TMA.
+    rounding the logical tile count up. Addressing remains full-tile; callers
+    must use memory operations with defined out-of-bounds behavior, such as
+    TMA.
     """
 
     def __init__(
@@ -163,9 +170,10 @@ class TileMatmul(LoweringPass):
 
         # Compute iteration bounds and accumulate kernel constraints.
         ubs: list[int] = []
-        for op_dim, tile_size, iteration_binding in zip(
+        block_x_guard: int | None = None
+        for i, (op_dim, tile_size, iteration_binding) in enumerate(zip(
             self.op_dims, self.tile_sizes, self.iteration_bindings,
-        ):
+        )):
             if op_dim not in sizes_by_dim:
                 raise ValueError(
                     f"TileMatmul: op_dim must be 'M', 'N', or 'K'; "
@@ -187,7 +195,15 @@ class TileMatmul(LoweringPass):
                 )
             ub = (op_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
-            self._accumulate_constraint(iteration_binding, ub)
+            if (
+                iteration_binding == "block.x"
+                and op_dim in ("M", "N")
+                and self._kernel.grid_dim[0] is not None
+                and self._kernel.grid_dim[0] > ub
+            ):
+                block_x_guard = i
+            else:
+                self._accumulate_constraint(iteration_binding, ub)
             sizes_by_dim[op_dim] = tile_size
 
 
@@ -215,6 +231,7 @@ class TileMatmul(LoweringPass):
             if iteration_binding == "for":
                 ivs.append(Value(name=loop_label, type=IndexType()))
             elif iteration_binding == "block.x":
+                assert block_ids_op is not None
                 ivs.append(block_ids_op.x)
             elif iteration_binding == "block.y":
                 ivs.append(block_ids_op.y)
@@ -304,6 +321,14 @@ class TileMatmul(LoweringPass):
             reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
             reversed(self.for_loop_labels),
         ):
+            if i == block_x_guard:
+                limit = IndexConstantOp.build(ub)
+                condition = IndexLtOp.build(iv, limit.result())
+                body_ops = [
+                    limit,
+                    condition,
+                    IfOp.build(condition.result(), Block(ops=body_ops)),
+                ]
             if level != "for":
                 continue
             body = Block(arguments=[iv], ops=body_ops)
