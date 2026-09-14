@@ -19,7 +19,7 @@ class Printer:
         self._used_names: dict[str, set[str]] = defaultdict(set)
         self._suffix_counters: dict[tuple[str, str], int] = defaultdict(int)
 
-    def unique_names[T: pytree.PyTree[str]](
+    def unique_names[T: (str, tuple)](
         self,
         obj: object,
         basenames: T,
