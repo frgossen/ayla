@@ -204,7 +204,7 @@ def test_lower_elementwise_sigmoid_mma():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
             %b: {w} = alloc() attrs={{id: 1}}
-            elementwise(%b: {w}, %a: {w}) attrs={{fn: "sigmoid"}}
+            elementwise sigmoid(%b: {w}, %a: {w})
           }}
         }}"""))
 
@@ -233,7 +233,7 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
             %b: {b} = alloc() attrs={{id: 1}}
-            elementwise(%b: {b}, %a: {w}) attrs={{fn: "sigmoid"}}
+            elementwise sigmoid(%b: {b}, %a: {w})
           }}
         }}"""))
 
@@ -255,7 +255,7 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %src: wrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
             %dst: wrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
-            elementwise(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">) attrs={fn: "sigmoid"}
+            elementwise sigmoid(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">)
           }
         }"""))  # noqa: E501
 
@@ -276,7 +276,7 @@ def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
             %dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
             %dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
+            elementwise convert(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -296,7 +296,7 @@ def test_lower_elementwise_uses_root_registers_for_wrmem_view():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
             %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid"}
+            elementwise sigmoid(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
