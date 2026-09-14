@@ -78,6 +78,7 @@ class KernelOp(Op):
         body: Block,
         grid_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         block_dim: tuple[int | None, int | None, int | None] = (None, None, None),
+        cluster_dim: tuple[int, int, int] | None = None,
         num_warp_groups: int | None = None,
         ptx_optimization_level: int | None = None,
         attrs: dict[str, object] | None = None,
@@ -94,6 +95,12 @@ class KernelOp(Op):
             raise ValueError("ptx_optimization_level must be in [0, 4]")
         if ptx_optimization_level is not None:
             attrs["ptx_optimization_level"] = ptx_optimization_level
+        if cluster_dim is not None:
+            if any(dim <= 0 for dim in cluster_dim):
+                raise ValueError("cluster_dim components must be positive")
+            for grid, cluster in zip(grid_dim, cluster_dim, strict=True):
+                if grid is not None and grid % cluster:
+                    raise ValueError("cluster_dim must divide grid_dim")
         return cls(
             operands=[],
             results=[],
@@ -101,6 +108,9 @@ class KernelOp(Op):
                 "name": name,
                 "grid_dim": list(grid_dim),
                 "block_dim": list(block_dim),
+                "cluster_dim": (
+                    None if cluster_dim is None else list(cluster_dim)
+                ),
                 "num_warp_groups": num_warp_groups,
                 **attrs,
             },
@@ -128,6 +138,11 @@ class KernelOp(Op):
         self.attrs["block_dim"] = list(value)
 
     @property
+    def cluster_dim(self) -> tuple[int, int, int] | None:
+        value = self.attrs["cluster_dim"]
+        return None if value is None else tuple(value)  # type: ignore[return-value]
+
+    @property
     def num_warp_groups(self) -> int | None:
         return self.attrs["num_warp_groups"]  # type: ignore[return-value]
 
@@ -148,7 +163,7 @@ class KernelOp(Op):
 
     @property
     def extra_attrs(self) -> dict[str, object]:
-        return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "num_warp_groups")}
+        return {k: v for k, v in self.attrs.items() if k not in ("name", "grid_dim", "block_dim", "cluster_dim", "num_warp_groups")}
 
     @property
     def signature(self) -> list[Type]:
@@ -172,10 +187,16 @@ class KernelOp(Op):
         if any(d is not None for d in self.block_dim):
             p.write(" block_dim=")
             p.write_list_attr(list(self.block_dim))
+        if self.cluster_dim is not None:
+            p.write(" cluster_dim=")
+            p.write_list_attr(list(self.cluster_dim))
         if self.num_warp_groups is not None:
             p.write(f" num_warp_groups={self.num_warp_groups}")
         p.write_extra_attrs(
-            self.attrs, skip_keys={"name", "grid_dim", "block_dim", "num_warp_groups"},
+            self.attrs, skip_keys={
+                "name", "grid_dim", "block_dim", "cluster_dim",
+                "num_warp_groups",
+            },
         )
         p.write(" ")
         self.body.print(p, skip_label=True)
@@ -198,6 +219,7 @@ class KernelOp(Op):
         p.read_literal(")")
         grid_dim = (None, None, None)
         block_dim = (None, None, None)
+        cluster_dim = None
         if p.can_read_literal("grid_dim"):
             p.read_literal("grid_dim")
             p.read_literal("=")
@@ -206,6 +228,10 @@ class KernelOp(Op):
             p.read_literal("block_dim")
             p.read_literal("=")
             block_dim = tuple(p.read_list_attr())
+        if p.can_read_literal("cluster_dim"):
+            p.read_literal("cluster_dim")
+            p.read_literal("=")
+            cluster_dim = tuple(p.read_list_attr())
         num_warp_groups = None
         if p.can_read_literal("num_warp_groups"):
             p.read_literal("num_warp_groups")
@@ -220,6 +246,7 @@ class KernelOp(Op):
             body,
             grid_dim=grid_dim,
             block_dim=block_dim,
+            cluster_dim=cluster_dim,
             num_warp_groups=num_warp_groups,
             ptx_optimization_level=ptx_optimization_level,
             attrs=attrs,

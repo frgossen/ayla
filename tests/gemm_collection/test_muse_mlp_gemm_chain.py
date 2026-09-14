@@ -133,9 +133,40 @@ def test_muse_glimmer_swiglu_keeps_dual_projection_in_registers(m):
     assert "bar.sync 0;" not in before_grid_arrival
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [muse_mlp_gemm_chain_module, muse_glimmer_swiglu_module],
+)
+def test_muse_split_k_down_projection_uses_cluster_dsmem(builder):
+    module = builder(
+        m=32, split_k=2, down_n_tile=64, down_operand_stages=4,
+    )
+    [kernel_op] = module.body.ops
+    assert kernel_op.cluster_dim == (2, 1, 1)
+
+    down = [
+        op for op in find_ops(module, lambda op: isinstance(op, MatmulOp))
+        if op.attrs["label"].split("_")[0] == "down"
+    ]
+    assert down
+    assert all(op.lhs.type.sizes[1] == 16 for op in down)
+    assert len([
+        op for op in find_ops(module, lambda op: isinstance(op, BarrierOp))
+        if op.scope == "grid"
+    ]) == 1
+
+    ptx = make_ptx_kernel(module).ptx
+    assert "add.f32" in ptx
+    assert "ld.shared::cluster.f32" in ptx
+    assert "cvt.rn.bf16.f32" in ptx
+    assert ".reqnctapercluster 2, 1, 1" in ptx
+    assert ptx.count("mapa.shared::cluster") == 2
+
+
 @requires_cuda
 @pytest.mark.parametrize("m", [32, 64])
-def test_muse_mlp_chain_matches_torch(m):
+@pytest.mark.parametrize("split_k", [None, 2])
+def test_muse_mlp_chain_matches_torch(m, split_k):
     torch.manual_seed(20260902 + m)
     a = torch.randn((m, 6656), device="cuda", dtype=torch.bfloat16)
     w_up = (
@@ -150,7 +181,7 @@ def test_muse_mlp_chain_matches_torch(m):
     actual = torch.empty((m, 6656), device="cuda", dtype=torch.bfloat16)
     sync = torch.zeros(2, device="cuda", dtype=torch.float32)
     launcher = make_ptx_launcher(make_ptx_kernel(
-        muse_mlp_gemm_chain_module(m=m),
+        muse_mlp_gemm_chain_module(m=m, split_k=split_k),
     ))
 
     launcher(a, w_up, w_down, intermediate, actual, sync)
@@ -168,7 +199,8 @@ def test_muse_mlp_chain_matches_torch(m):
 
 @requires_cuda
 @pytest.mark.parametrize("m", [32, 64])
-def test_muse_glimmer_swiglu_matches_torch(m):
+@pytest.mark.parametrize("split_k", [None, 2])
+def test_muse_glimmer_swiglu_matches_torch(m, split_k):
     torch.manual_seed(20260902 + m)
     a = torch.randn((m, 6656), device="cuda", dtype=torch.bfloat16)
     w_gate = (
@@ -184,7 +216,7 @@ def test_muse_glimmer_swiglu_matches_torch(m):
     actual = torch.empty((m, 6656), device="cuda", dtype=torch.bfloat16)
     sync = torch.zeros(2, device="cuda", dtype=torch.float32)
     launcher = make_ptx_launcher(make_ptx_kernel(
-        muse_glimmer_swiglu_module(m=m),
+        muse_glimmer_swiglu_module(m=m, split_k=split_k),
     ))
 
     launcher(a, w_gate, w_up, w_down, hidden, actual, sync)

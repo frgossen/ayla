@@ -105,6 +105,37 @@ static int max_resident_grid_blocks(
     return blocks_per_sm * multiprocessors;
 }
 
+static int max_resident_cluster_blocks(
+    uintptr_t function_handle,
+    std::tuple<int, int, int> grid_dim,
+    std::tuple<int, int, int> block_dim,
+    std::tuple<int, int, int> cluster_dim,
+    int64_t dynamic_shared_mem_bytes
+) {
+    auto fn = reinterpret_cast<CUfunction>(function_handle);
+    auto [gx, gy, gz] = grid_dim;
+    auto [bx, by, bz] = block_dim;
+    auto [cx, cy, cz] = cluster_dim;
+    CUlaunchAttribute attribute = {};
+    attribute.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    attribute.value.clusterDim.x = cx;
+    attribute.value.clusterDim.y = cy;
+    attribute.value.clusterDim.z = cz;
+    CUlaunchConfig config = {};
+    config.gridDimX = gx;
+    config.gridDimY = gy;
+    config.gridDimZ = gz;
+    config.blockDimX = bx;
+    config.blockDimY = by;
+    config.blockDimZ = bz;
+    config.sharedMemBytes = static_cast<unsigned int>(dynamic_shared_mem_bytes);
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    int clusters = 0;
+    CU_CHECK(cuOccupancyMaxActiveClusters(&clusters, fn, &config));
+    return clusters * cx * cy * cz;
+}
+
 static CUtensorMapL2promotion parse_l2_promotion(
     const std::string& l2_promotion
 ) {
@@ -304,6 +335,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
     m.def("max_resident_grid_blocks", &max_resident_grid_blocks);
+    m.def("max_resident_cluster_blocks", &max_resident_cluster_blocks);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -371,9 +403,19 @@ class PtxLauncher:
                     * self._kernel.block_dim[1]
                     * self._kernel.block_dim[2]
                 )
-                capacity = self._ext.max_resident_grid_blocks(
-                    self._function, block_size,
-                    self._kernel.shared_mem_bytes,
+                capacity = (
+                    self._ext.max_resident_grid_blocks(
+                        self._function, block_size,
+                        self._kernel.shared_mem_bytes,
+                    )
+                    if self._kernel.cluster_dim is None
+                    else self._ext.max_resident_cluster_blocks(
+                        self._function,
+                        self._kernel.grid_dim,
+                        self._kernel.block_dim,
+                        self._kernel.cluster_dim,
+                        self._kernel.shared_mem_bytes,
+                    )
                 )
                 grid_size = (
                     self._kernel.grid_dim[0]

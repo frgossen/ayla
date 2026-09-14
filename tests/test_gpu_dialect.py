@@ -136,6 +136,26 @@ def test_kernel_num_threads_is_unresolved_with_an_unset_axis():
     assert kernel.num_threads is None
 
 
+def test_kernel_cluster_dimensions_round_trip_and_divide_the_grid():
+    kernel = KernelOp.build(
+        "k", Block(), grid_dim=(12, 1, 1), cluster_dim=(3, 1, 1),
+    )
+    module = ModuleOp.build(Block(ops=[kernel]))
+
+    assert kernel.cluster_dim == (3, 1, 1)
+    assert_print_and_roundtrip(module, textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[12, 1, 1] cluster_dim=[3, 1, 1] {
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="cluster_dim must divide grid_dim"):
+        KernelOp.build(
+            "invalid", Block(), grid_dim=(10, 1, 1),
+            cluster_dim=(3, 1, 1),
+        )
+
+
 def test_for_loop():
     op = ForOp.build(0, 64, 4)
     op.body.append(Op(operands=[op.iv], results=[]))

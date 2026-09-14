@@ -30,6 +30,10 @@ from common import BenchConfig, error_metrics, run_bench, write_csv
 M_VALUES = (32, 64)
 HIDDEN = 6_656
 INTERMEDIATE = 19_968
+DEFAULT_CONFIGS = {
+    32: (2, 48, 4),
+    64: (None, None, None),
+}
 
 
 def _standalone_gemm(
@@ -72,7 +76,12 @@ def _standalone_gemm(
     return make_ptx_launcher(make_ptx_kernel(module))
 
 
-def _run_case(m: int) -> dict[str, object]:
+def _run_case(
+    m: int,
+    split_k: int | None,
+    down_n_tile: int | None,
+    down_operand_stages: int | None,
+) -> dict[str, object]:
     torch.manual_seed(20260902 + m)
     a = torch.randn((m, HIDDEN), device="cuda", dtype=torch.bfloat16)
     w_up = (
@@ -92,8 +101,17 @@ def _run_case(m: int) -> dict[str, object]:
     sync = torch.zeros(2, device="cuda", dtype=torch.float32)
 
     fused = make_ptx_launcher(make_ptx_kernel(
-        muse_mlp_gemm_chain_module(m=m),
+        muse_mlp_gemm_chain_module(
+            m=m,
+            split_k=split_k,
+            down_n_tile=down_n_tile,
+            down_operand_stages=down_operand_stages,
+        ),
     ))
+    baseline_fused = (
+        make_ptx_launcher(make_ptx_kernel(muse_mlp_gemm_chain_module(m=m)))
+        if split_k is not None else None
+    )
     up = _standalone_gemm(
         m, INTERMEDIATE, HIDDEN,
         epilogue="silu", dst_cache_hint="evict_last",
@@ -113,6 +131,10 @@ def _run_case(m: int) -> dict[str, object]:
         up(a, w_up, intermediate)
         down(intermediate, w_down, output)
 
+    def run_baseline_fused() -> None:
+        assert baseline_fused is not None
+        baseline_fused(a, w_up, w_down, intermediate, output, sync)
+
     def run_torch() -> None:
         nonlocal torch_output
         torch_output = compiled_torch(a, w_up, w_down)
@@ -126,30 +148,48 @@ def _run_case(m: int) -> dict[str, object]:
             f"M={m}: max abs {max_abs}, relative RMS {relative_rms}"
         )
 
-    timings = run_bench([
+    configs = [
         BenchConfig(
             name="Ayla unfused", make_inputs=lambda: [], compute=run_unfused,
         ),
         BenchConfig(
             name="Ayla fused", make_inputs=lambda: [], compute=run_fused,
         ),
+    ]
+    if baseline_fused is not None:
+        configs.append(BenchConfig(
+            name="Ayla fused baseline", make_inputs=lambda: [],
+            compute=run_baseline_fused,
+        ))
+    configs.append(
         BenchConfig(
             name="Torch compiled", make_inputs=lambda: [], compute=run_torch,
-        ),
-    ])
+        )
+    )
+    timings = run_bench(configs)
     by_label = {timing.name: timing for timing in timings}
     unfused_ms = by_label["Ayla unfused"].median_ms
     fused_ms = by_label["Ayla fused"].median_ms
     torch_ms = by_label["Torch compiled"].median_ms
+    baseline_fused_ms = (
+        by_label["Ayla fused baseline"].median_ms
+        if baseline_fused is not None else fused_ms
+    )
     print(
         f"M={m:2d}  unfused={unfused_ms:.6f} ms  fused={fused_ms:.6f} ms  "
         f"fusion={unfused_ms / fused_ms:.4f}x  torch={torch_ms:.6f} ms  "
-        f"vs_torch={torch_ms / fused_ms:.4f}x"
+        f"vs_torch={torch_ms / fused_ms:.4f}x  "
+        f"vs_baseline={baseline_fused_ms / fused_ms:.4f}x"
     )
     return {
         "m": m,
+        "split_k": split_k,
+        "down_n_tile": down_n_tile,
+        "down_operand_stages": down_operand_stages,
         "unfused_ayla_ms": unfused_ms,
         "fused_ayla_ms": fused_ms,
+        "baseline_fused_ayla_ms": baseline_fused_ms,
+        "split_k_speedup": baseline_fused_ms / fused_ms,
         "fusion_speedup": unfused_ms / fused_ms,
         "torch_ms": torch_ms,
         "fused_vs_torch": torch_ms / fused_ms,
@@ -165,6 +205,9 @@ def _run_case(m: int) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ms", nargs="+", type=int, default=list(M_VALUES))
+    parser.add_argument("--split-k", type=int)
+    parser.add_argument("--down-n-tile", type=int)
+    parser.add_argument("--down-operand-stages", type=int)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if any(m not in M_VALUES for m in args.ms):
@@ -172,7 +215,20 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
-    rows = [_run_case(m) for m in args.ms]
+    use_selected = (
+        args.split_k is None
+        and args.down_n_tile is None
+        and args.down_operand_stages is None
+    )
+    rows = []
+    for m in args.ms:
+        config = (
+            DEFAULT_CONFIGS[m]
+            if use_selected else (
+                args.split_k, args.down_n_tile, args.down_operand_stages,
+            )
+        )
+        rows.append(_run_case(m, *config))
     if args.output is not None:
         write_csv(rows, args.output)
         print(f"Raw results: {args.output.resolve()}")

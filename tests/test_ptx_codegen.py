@@ -91,6 +91,17 @@ def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
 
 
+def test_codegen_carries_required_cluster_dimensions_to_runtime():
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "clustered", Block(), grid_dim=(6, 1, 1),
+        block_dim=(32, 1, 1), cluster_dim=(3, 1, 1),
+    )]))
+
+    kernel = make_ptx_kernel(module)
+    assert kernel.cluster_dim == (3, 1, 1)
+    assert ".reqnctapercluster 3, 1, 1" in kernel.ptx
+
+
 def test_codegen_if_branches_over_its_body():
     lhs = IndexConstantOp.build(3)
     rhs = IndexConstantOp.build(4)

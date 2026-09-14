@@ -1418,9 +1418,8 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(wrmem_type, WrmemTensorType)
         assert wrmem_type.layout == "wgmma_layout_0"
         assert wrmem_type.rank == 2 and dst_type.rank == 2
-        assert isinstance(wrmem_type.dtype, (BF16Type, F16Type)), (
-            f"wgmma store: expected bf16/f16; "
-            f"got {wrmem_type.dtype}. Use convert first for f32 accumulators."
+        assert isinstance(wrmem_type.dtype, (BF16Type, F16Type, F32Type)), (
+            f"wgmma store: expected bf16/f16/f32; got {wrmem_type.dtype}"
         )
         assert dst_type.dtype == wrmem_type.dtype, (
             f"wgmma store: dtype mismatch; "
@@ -1465,21 +1464,35 @@ class LowerToPtxTemplate(LoweringPass):
                 add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
             """)
             address = "${b64:base}"
-            instruction = "st.global.b32"
+            instruction = (
+                "st.global.f32"
+                if isinstance(wrmem_type.dtype, F32Type) else "st.global.b32"
+            )
         else:
             template = (
                 "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
                 "${b32:operand.offset.val};\n"
             )
             address = "${b32:base}"
-            instruction = "st.shared.b32"
+            instruction = (
+                "st.shared.f32"
+                if isinstance(wrmem_type.dtype, F32Type) else "st.shared.b32"
+            )
 
         for pair, di, dj in pairs:
             offset = di * row_stride_bytes + dj * dtype_bytes
-            template += (
-                f"{instruction} [{address}+{offset}], "
-                f"${{b32:operand.src.r{pair}}};\n"
-            )
+            if isinstance(wrmem_type.dtype, F32Type):
+                template += (
+                    f"{instruction} [{address}+{offset}], "
+                    f"${{f32:operand.src.r{2 * pair}}};\n"
+                    f"{instruction} [{address}+{offset + dtype_bytes}], "
+                    f"${{f32:operand.src.r{2 * pair + 1}}};\n"
+                )
+            else:
+                template += (
+                    f"{instruction} [{address}+{offset}], "
+                    f"${{b32:operand.src.r{pair}}};\n"
+                )
 
         new_op = PTXTemplateOp.build(
             operands=[dst_value, src_value, byte_offset],
