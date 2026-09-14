@@ -88,6 +88,28 @@ def test_reshape_from_ir():
     torch.testing.assert_close(dst, src.reshape(1, 4))
 
 
+@requires_cuda
+def test_elementwise_mul_from_ir():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mul(%dst: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %lhs: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 2.0}
+            %rhs: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1, init: 3.0}
+            %product: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2}
+            elementwise mul(%product: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0">, %lhs: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0">, %rhs: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0">)
+            %converted: wrmem<64x16xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 3}
+            elementwise convert(%converted: wrmem<64x16xbf16 warps=4 layout="wgmma_layout_0">, %product: wrmem<64x16xf32 warps=4 layout="wgmma_layout_0">)
+            move(%dst: gmem<64x16xbf16>, %converted: wrmem<64x16xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    dst = torch.empty(64, 16, dtype=torch.bfloat16, device="cuda")
+    make_ptx_launcher(make_ptx_kernel(module))(dst)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst, torch.full_like(dst, 6))
+
+
 # 16x16 f32 matmul, row-major. One block of 16x16 threads, one grid
 # block. Each thread computes one C[i][j] via a k-loop.
 MATMUL_16_TEMPLATE = textwrap.dedent(

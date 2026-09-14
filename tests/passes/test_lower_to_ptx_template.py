@@ -239,6 +239,41 @@ def test_lower_elementwise_sigmoid_mma():
     assert template == expected
 
 
+@pytest.mark.parametrize(
+    ("dtype", "register", "instruction", "num_registers"),
+    [
+        ("f32", "f32", "mul.rn.f32", 4),
+        ("bf16", "b32", "mul.rn.bf16x2", 2),
+        ("f16", "b32", "mul.rn.f16x2", 2),
+    ],
+)
+def test_lower_elementwise_mul_mma(
+    dtype, register, instruction, num_registers,
+):
+    w = f'wrmem<16x8x{dtype} layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
+            %lhs: {w} = alloc() attrs={{id: 0}}
+            %rhs: {w} = alloc() attrs={{id: 1}}
+            %dst: {w} = alloc() attrs={{id: 2}}
+            elementwise mul(%dst: {w}, %lhs: {w}, %rhs: {w})
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda o: isinstance(o, PTXTemplateOp)
+    )[-1].attrs["template"]
+
+    assert template == "".join(
+        f"{instruction} ${{{register}:operand.dst.r{reg}}}, "
+        f"${{{register}:operand.lhs.r{reg}}}, "
+        f"${{{register}:operand.rhs.r{reg}}};\n"
+        for reg in range(num_registers)
+    )
+
+
 def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
     w = 'wrmem<16x8xf32 layout="mma">'
     b = 'wrmem<16x8xbf16 layout="mma">'

@@ -143,21 +143,21 @@ def _lower_dtype_conversion_ptx(
 def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     return _lower_dtype_conversion_ptx(
         _elementwise_operand_regs(op.dst, "dst"),
-        _elementwise_operand_regs(op.src, "src"),
-        op.src.type.dtype,
+        _elementwise_operand_regs(op.src(0), "src"),
+        op.src(0).type.dtype,
         op.dst.type.dtype,
     )
 
 
 def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
-    src_dtype = op.src.type.dtype
+    src_dtype = op.src(0).type.dtype
     dst_dtype = op.dst.type.dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
         )
 
-    src_regs = _elementwise_operand_regs(op.src, "src")
+    src_regs = _elementwise_operand_regs(op.src(0), "src")
     if src_dtype == dst_dtype:
         result_regs = _elementwise_operand_regs(op.dst, "dst")
     else:
@@ -181,8 +181,39 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
     return template
 
 
+def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
+    lhs = op.src(0)
+    rhs = op.src(1)
+    dtype = op.dst.type.dtype
+    if not (lhs.type.dtype == rhs.type.dtype == dtype):
+        raise NotImplementedError(
+            "lower_elementwise: mul requires matching operand dtypes"
+        )
+    if isinstance(dtype, F32Type):
+        instruction = "mul.rn.f32"
+    elif isinstance(dtype, BF16Type):
+        instruction = "mul.rn.bf16x2"
+    elif isinstance(dtype, F16Type):
+        instruction = "mul.rn.f16x2"
+    else:
+        raise NotImplementedError(
+            f"lower_elementwise: mul does not support {dtype}"
+        )
+
+    return "".join(
+        f"{instruction} {dst_reg}, {lhs_reg}, {rhs_reg};\n"
+        for dst_reg, lhs_reg, rhs_reg in zip(
+            _elementwise_operand_regs(op.dst, "dst"),
+            _elementwise_operand_regs(lhs, "lhs"),
+            _elementwise_operand_regs(rhs, "rhs"),
+            strict=True,
+        )
+    )
+
+
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
+    "mul": _lower_mul_elementwise_ptx,
     "sigmoid": _lower_sigmoid_elementwise_ptx,
 }
 
@@ -495,35 +526,41 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower an element-wise op on wrmem tensors, one function per element.
 
-        Source and destination dtypes are independent. Function lowering runs
-        in the source dtype and a supported conversion writes the result to the
-        destination dtype.
+        Each function lowering defines the dtype combinations it supports.
         """
         dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        src_values = [
+            self.value_map[op.src(i)] for i in range(op.num_srcs)
+        ]
         dst_type = op.dst.type
-        src_type = op.src.type
+        src_types = [op.src(i).type for i in range(op.num_srcs)]
 
-        if not (isinstance(src_type, WrmemTensorType)
-                and isinstance(dst_type, WrmemTensorType)):
+        if not (
+            isinstance(dst_type, WrmemTensorType)
+            and all(isinstance(typ, WrmemTensorType) for typ in src_types)
+        ):
             raise NotImplementedError(
-                f"lower_elementwise: only wrmem supported; got "
-                f"{src_type} -> {dst_type}"
+                "lower_elementwise: only wrmem supported; got "
+                f"{src_types} -> {dst_type}"
             )
-        assert tuple(src_type.sizes) == tuple(dst_type.sizes)
-        assert src_type.warps == dst_type.warps
+        assert all(
+            tuple(typ.sizes) == tuple(dst_type.sizes) for typ in src_types
+        )
+        assert all(typ.warps == dst_type.warps for typ in src_types)
         lower = _ELEMENTWISE_LOWERERS.get(op.fn)
         if lower is None:
             raise NotImplementedError(
                 f"lower_elementwise: unsupported fn {op.fn!r}"
             )
         template = lower(op)
+        assert op.num_srcs in (1, 2)
+        src_names = ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
 
         new_op = PTXTemplateOp.build(
-            operands=[dst_value, src_value],
+            operands=[dst_value, *src_values],
             result_types=[],
             template=template,
-            operand_names=["dst", "src"],
+            operand_names=["dst", *src_names],
             result_names=[],
             description=str(op),
         )

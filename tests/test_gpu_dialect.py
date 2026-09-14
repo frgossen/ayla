@@ -134,7 +134,7 @@ def test_elementwise_syntax():
     dst = Value(name="dst", type=tensor_type)
     src = Value(name="src", type=tensor_type)
     op = ElementwiseOp.build(
-        dst, src, fn="sigmoid", attrs={"label": "activation"},
+        dst, [src], fn="sigmoid", attrs={"label": "activation"},
     )
 
     assert_print_and_roundtrip(
@@ -147,6 +147,22 @@ def test_elementwise_syntax():
             'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
             'attrs={fn: "convert"}'
         )
+
+
+def test_elementwise_mul_syntax():
+    tensor_type = GmemTensorType.build((8,), F32Type())
+    dst = Value(name="dst", type=tensor_type)
+    lhs = Value(name="lhs", type=tensor_type)
+    rhs = Value(name="rhs", type=tensor_type)
+    op = ElementwiseOp.build(dst, [lhs, rhs], fn="mul")
+
+    assert op.src(0) is lhs
+    assert op.src(1) is rhs
+    assert_print_and_roundtrip(
+        op,
+        "elementwise mul(%dst: gmem<8xf32>, %lhs: gmem<8xf32>, "
+        "%rhs: gmem<8xf32>)",
+    )
 
 
 def test_kernel_op():

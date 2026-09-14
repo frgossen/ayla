@@ -52,10 +52,21 @@ def test_default_verification_rejects_unknown_elementwise_function():
     typ = GmemTensorType.build([8], F32Type())
     value = Value(name="value", type=typ)
     module = ModuleOp.build(Block(ops=[
-        ElementwiseOp.build(value, value, fn="unknown"),
+        ElementwiseOp.build(value, [value], fn="unknown"),
     ]))
 
     with pytest.raises(ValueError, match="unknown elementwise function"):
+        verify_gpu_dialect(module)
+
+
+def test_default_verification_rejects_wrong_elementwise_arity():
+    typ = GmemTensorType.build([8], F32Type())
+    value = Value(name="value", type=typ)
+    module = ModuleOp.build(Block(ops=[
+        ElementwiseOp.build(value, [value], fn="mul"),
+    ]))
+
+    with pytest.raises(ValueError, match="mul expects 2 sources, got 1"):
         verify_gpu_dialect(module)
 
 

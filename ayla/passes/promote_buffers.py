@@ -402,7 +402,7 @@ class PromoteBuffers(LoweringPass):
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
                 cvt = ElementwiseOp.build(
-                    dst=cvt_alloc.result(), src=alloc.result(), fn="convert",
+                    dst=cvt_alloc.result(), srcs=[alloc.result()], fn="convert",
                 )
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
@@ -517,14 +517,18 @@ class PromoteBuffers(LoweringPass):
                 # TODO: Generalize this rewrite for multi-source element-wise
                 # epilogues such as SwiGLU. Retarget the final operation's
                 # destination while preserving and remapping all its sources.
-                assert final.dst is src and final.src is src
+                assert (
+                    final.dst is src
+                    and final.num_srcs == 1
+                    and final.src(0) is src
+                )
                 new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), src=src, fn=final.fn,
+                    dst=tmp_alloc.result(), srcs=[src], fn=final.fn,
                     attrs=final.attrs,
                 ))
             else:
                 new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), src=src, fn="convert",
+                    dst=tmp_alloc.result(), srcs=[src], fn="convert",
                     attrs=(
                         {"label": f"{matmul_label}_{operand_name}_convert"}
                         if matmul_label is not None else None
