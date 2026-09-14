@@ -10,6 +10,7 @@ from ayla.gpu_dialect import (
     PtrAddOp,
     PTXTemplateOp,
     ReinterpretOp,
+    ReshapeOp,
     ToPtrOp,
     gpu_dialect,
 )
@@ -91,6 +92,19 @@ def test_lower_zero_offset_reinterpret_is_elided():
     assert not find_ops(module, lambda op: isinstance(
         op, (ReinterpretOp, ToPtrOp, PtrAddOp),
     ))
+
+
+def test_lower_reshape_is_elided():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%arg: gmem<2x3x4xf32>) {
+            %view: gmem<6x4xf32> = reshape(%arg: gmem<2x3x4xf32>)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+
+    assert not find_ops(module, lambda op: isinstance(op, ReshapeOp))
 
 
 def test_lower_barrier_unsupported_scope_raises():

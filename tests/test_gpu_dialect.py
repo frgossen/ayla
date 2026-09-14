@@ -29,6 +29,7 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    ReshapeOp,
     SelectOp,
     SmemTensorType,
     TmaDescType,
@@ -89,6 +90,23 @@ def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
     assert memory_effects(barrier) is None
     assert has_ordering_effect(barrier)
     assert has_ordering_effect(nested)
+
+
+def test_reshape_op():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([2, 3, 4], F32Type()),
+    )
+    reshape = ReshapeOp.build(
+        source, GmemTensorType.build([6, 4], F32Type()),
+    )
+
+    assert reshape.arg is source
+    assert root_buffer(reshape.result()) is source
+    assert_print_and_roundtrip(
+        reshape,
+        "%0: gmem<6x4xf32> = reshape(%source: gmem<2x3x4xf32>)",
+    )
 
 
 def test_matmul_program():

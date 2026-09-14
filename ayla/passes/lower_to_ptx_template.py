@@ -38,6 +38,7 @@ from ..gpu_dialect import (
     PtrType,
     PTXTemplateOp,
     ReinterpretOp,
+    ReshapeOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -275,6 +276,8 @@ class LowerToPtxTemplate(LoweringPass):
         assert root is not None
         root_type = root.type
         assert isinstance(root_type, AddrMemTensorType)
+        arg_type = op.arg.type
+        assert isinstance(arg_type, AddrMemTensorType)
         dtype_bytes = root_type.dtype.byte_size
         result_sizes = list(op.result().type.sizes)
         layout = (
@@ -300,7 +303,7 @@ class LowerToPtxTemplate(LoweringPass):
             elem_off = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(elem_off)
 
-            stride = root_type.strides[dim]
+            stride = arg_type.strides[dim]
             if (
                 layout is not None
                 and layout[1] == "block_major"
@@ -365,6 +368,12 @@ class LowerToPtxTemplate(LoweringPass):
         ptr_add = PtrAddOp.build(ptr, byte_offset.result())
         new_ops.append(ptr_add)
         return new_ops, [ptr_add.result()]
+
+    @lowers(ReshapeOp)
+    def lower_reshape(
+        self, op: ReshapeOp,
+    ) -> tuple[list[Op], list[object]]:
+        return [], [self.value_map[op.arg]]
 
     def _lower_alloc_lock(
         self, op: AllocOp,
