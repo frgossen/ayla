@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import contextmanager
-from typing import overload
+from typing import cast
 
 from .. import pytree
 
@@ -19,40 +19,22 @@ class Printer:
         self._used_names: dict[str, set[str]] = defaultdict(set)
         self._suffix_counters: dict[tuple[str, str], int] = defaultdict(int)
 
-    @overload
-    def unique_names(
+    def unique_names[T: (str, tuple)](
         self,
         obj: object,
-        basenames: str,
+        basenames: T,
         namespace: str = "default",
         always_suffix: bool = False,
-    ) -> str: ...
-
-    @overload
-    def unique_names(
-        self,
-        obj: object,
-        basenames: tuple,
-        namespace: str = "default",
-        always_suffix: bool = False,
-    ) -> tuple: ...
-
-    def unique_names(
-        self,
-        obj: object,
-        basenames: str | tuple,
-        namespace: str = "default",
-        always_suffix: bool = False,
-    ) -> str | tuple:
+    ) -> T:
         key = (namespace, obj)
         if key in self._assigned_names:
-            return self._assigned_names[key]
+            return cast(T, self._assigned_names[key])
         result = pytree.map(
             lambda b: self._mint_name(b, namespace, always_suffix),
             basenames,
         )
         self._assigned_names[key] = result
-        return result
+        return cast(T, result)
 
     def _mint_name(
         self, base: str, namespace: str, always_suffix: bool,
