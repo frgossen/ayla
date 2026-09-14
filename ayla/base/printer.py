@@ -19,7 +19,7 @@ class Printer:
         self._used_names: dict[str, set[str]] = defaultdict(set)
         self._suffix_counters: dict[tuple[str, str], int] = defaultdict(int)
 
-    def unique_names[T: (str, tuple)](
+    def unique_names[T: pytree.PyTree[str]](
         self,
         obj: object,
         basenames: T,
@@ -29,10 +29,11 @@ class Printer:
         key = (namespace, obj)
         if key in self._assigned_names:
             return cast(T, self._assigned_names[key])
-        result = pytree.map(
-            lambda b: self._mint_name(b, namespace, always_suffix),
-            basenames,
-        )
+
+        def mint_name(base: str) -> str:
+            return self._mint_name(base, namespace, always_suffix)
+
+        result = pytree.map(mint_name, basenames)
         self._assigned_names[key] = result
         return cast(T, result)
 
