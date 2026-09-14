@@ -1,6 +1,5 @@
 """Tiny tuple-shaped pytree helpers."""
 from collections.abc import Callable, Iterator
-from typing import Any
 
 
 def map[T, U](fn: Callable[[T], U], t: T | tuple) -> U | tuple:
@@ -10,7 +9,7 @@ def map[T, U](fn: Callable[[T], U], t: T | tuple) -> U | tuple:
     return fn(t)
 
 
-def flatten(t: Any) -> Iterator[Any]:
+def flatten[T](t: T | tuple) -> Iterator[T]:
     """Yield the leaves of a tuple-shaped pytree in order."""
     if isinstance(t, tuple):
         for x in t:
