@@ -1,8 +1,10 @@
 """Tests for the tile_matmul pass."""
 import textwrap
 
+import pytest
+
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import TileOp, gpu_dialect
+from ayla.gpu_dialect import ForOp, IfOp, TileOp, gpu_dialect
 from ayla.passes.tile_matmul import tile_matmul
 
 
@@ -130,3 +132,82 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
             elementwise sigmoid(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={label: "epilogue"}
           }
         }""")  # noqa: E501
+
+
+def test_block_x_tiling_guards_more_blocks_than_tiles():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) collective=xyz.grid attrs={label: "mm"}
+            elementwise sigmoid(%c: gmem<64x192xf32>, %c: gmem<64x192xf32>) attrs={label: "epi"}
+          }
+        }"""))
+
+    tile_matmul(
+        module,
+        op_dims=["N"], tile_sizes=[64],
+        iteration_bindings=["block.x"], for_loop_labels=[None],
+        op_label_filter="mm", epilogue_label_filter="epi",
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c3: index = index_constant() attrs={value: 3}
+            %0: pred = index_lt(%bx: index, %c3: index)
+            if(%0: pred) {
+            ^bb0:
+              %1: gmem<64x64xbf16> = tile(%b: gmem<192x64xbf16>, %bx: index, 0)
+              %2: gmem<64x64xf32 strides=[192, 1]> = tile(%c: gmem<64x192xf32>, 0, %bx: index)
+              matmul(%a: gmem<64x64xbf16>, %1: gmem<64x64xbf16>, %2: gmem<64x64xf32 strides=[192, 1]>) collective=[x.block, yz.grid] attrs={label: "mm"}
+              elementwise sigmoid(%2: gmem<64x64xf32 strides=[192, 1]>, %2: gmem<64x64xf32 strides=[192, 1]>) attrs={label: "epi"}
+            }
+          }
+        }""")  # noqa: E501
+
+
+def test_block_x_tiling_rejects_a_smaller_fixed_grid():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="launch dim conflict"):
+        tile_matmul(
+            module,
+            op_dims=["N"], tile_sizes=[64],
+            iteration_bindings=["block.x"], for_loop_labels=[None],
+            op_label_filter="mm",
+        )
+
+
+def test_block_x_tiling_sets_an_unconstrained_grid():
+    source = textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) {
+            matmul(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) collective=xyz.grid
+          }
+        }""")
+    module = gpu_dialect.parse(source)
+    tile_matmul(
+        module,
+        op_dims=["N"], tile_sizes=[64],
+        iteration_bindings=["block.x"], for_loop_labels=[None],
+    )
+    [kernel] = module.body.ops
+    assert kernel.grid_dim == (3, None, None)
+    assert not find_ops_of_type(module, ForOp)
+    assert not find_ops_of_type(module, IfOp)
+
+    unmatched = gpu_dialect.parse(source)
+    before = repr(unmatched)
+    tile_matmul(
+        unmatched,
+        op_dims=["N"], tile_sizes=[64],
+        iteration_bindings=["block.x"], for_loop_labels=[None],
+        op_label_filter="missing",
+    )
+    assert repr(unmatched) == before
