@@ -527,6 +527,22 @@ class TileOp(Op):
         )
 
 
+@gpu_dialect.register_op("reshape")
+class ReshapeOp(Op):
+    """Reinterpret a dense tensor with a different shape without moving data."""
+
+    @classmethod
+    def build(cls, arg: Value, type: Type) -> "ReshapeOp":
+        return cls(
+            operands=[arg],
+            results=[Value(name=None, type=type)],
+        )
+
+    @property
+    def arg(self) -> Value:
+        return self.operands[0]
+
+
 @gpu_dialect.register_op("elementwise")
 class ElementwiseOp(Op):
     """One scalar function over each element: elementwise(dst, src).
@@ -1971,7 +1987,7 @@ def root_buffer(value: Value) -> Value:
     For an allocation, kernel argument, or other non-view value, this returns
     the value itself.
     """
-    while isinstance(value.definition, (ReinterpretOp, TileOp)):
+    while isinstance(value.definition, (ReinterpretOp, ReshapeOp, TileOp)):
         if isinstance(value.definition, ReinterpretOp):
             value = value.definition.storage
         else:
@@ -2163,6 +2179,7 @@ def is_side_effect_free(op: Op) -> bool:
         PtrAddOp,
         SelectOp,
         ReinterpretOp,
+        ReshapeOp,
         ThreadIdsOp,
         TileOp,
         ToPtrOp,

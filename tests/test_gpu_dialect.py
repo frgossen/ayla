@@ -28,6 +28,7 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    ReshapeOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
@@ -63,6 +64,23 @@ def test_reinterpret_op():
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
         ReinterpretOp.build(storage, F32Type())
+
+
+def test_reshape_op():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([2, 3, 4], F32Type()),
+    )
+    reshape = ReshapeOp.build(
+        source, GmemTensorType.build([6, 4], F32Type()),
+    )
+
+    assert reshape.arg is source
+    assert root_buffer(reshape.result()) is source
+    assert_print_and_roundtrip(
+        reshape,
+        "%0: gmem<6x4xf32> = reshape(%source: gmem<2x3x4xf32>)",
+    )
 
 
 def test_matmul_program():

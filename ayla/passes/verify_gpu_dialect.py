@@ -6,11 +6,13 @@ from enum import Enum, auto
 from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
+    AddrMemTensorType,
     CollectiveAxis,
     ElementwiseOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
+    ReshapeOp,
     TmaDescType,
 )
 
@@ -77,6 +79,32 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_elementwise(self, op: ElementwiseOp) -> None:
         if op.fn not in _ELEMENTWISE_FUNCTIONS:
             raise ValueError(f"unknown elementwise function {op.fn!r}")
+
+    @verifies(ReshapeOp)
+    def _verify_reshape(self, op: ReshapeOp) -> None:
+        arg = op.arg.type
+        result = op.result().type
+        if not isinstance(arg, MemTensorType) or not isinstance(
+            result, MemTensorType,
+        ):
+            raise ValueError("reshape operands must be memory tensors")
+        if type(arg) is not type(result):
+            raise ValueError("reshape must preserve the memory space")
+        if arg.dtype != result.dtype:
+            raise ValueError("reshape must preserve the element type")
+        # TODO: Accept non-canonical strides when the reshape preserves the
+        # underlying linear element order.
+        if isinstance(arg, AddrMemTensorType) and (
+            not arg.is_canonical_strides
+            or not result.is_canonical_strides
+        ):
+            raise ValueError("reshape operands must have canonical strides")
+        if (
+            arg.num_elements is not None
+            and result.num_elements is not None
+            and arg.num_elements != result.num_elements
+        ):
+            raise ValueError("reshape must preserve the number of elements")
 
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:
