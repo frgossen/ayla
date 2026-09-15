@@ -18,10 +18,17 @@ from ..passes.canonicalize import Canonicalize
 from ..passes.schedule_async import schedule_async
 from ..passes.tile_matmul import tile_matmul
 from .gemm import schedule_tiled_matmul
+from .swiglu_projection import build_persistent_swiglu_projection
 
 
 _HIDDEN = 6_656
 _INTERMEDIATE = 19_968
+_OUTPUT_M_TILE = 64
+_OUTPUT_N_TILE = 192
+_K_TILE = 64
+# Both the 19,968-wide projection and 6,656-wide down projection use 104 tiles.
+_RESIDENT_BLOCKS = 104
+_SWIGLU_OPERAND_STAGES = 3
 
 
 def _schedule_projection(
@@ -137,6 +144,100 @@ def muse_mlp_gemm_chain_module(*, m: int) -> ModuleOp:
         module, label="down", epilogue_label=None,
         m_tile=m_tile, n_tile=n_tile,
         operand_stages=operand_stages, k_tile=k_tile,
+        dst_cache_hint="evict_first",
+    )
+    module = schedule_async(module)
+    module = Canonicalize().run(module)
+    return module
+
+
+def muse_glimmer_swiglu_module(*, m: int) -> ModuleOp:
+    """Build the dual-projection Muse Glimmer SwiGLU chain.
+
+    The two projection accumulators remain in registers until SiLU and their
+    elementwise product have completed, so only the final hidden activation is
+    materialized before the down projection.
+    """
+    down_n_tile = 64
+    if m == 32:
+        down_operand_stages = 5
+    elif m == 64:
+        down_operand_stages = 6
+    else:
+        raise ValueError(f"unsupported M={m}; expected 32 or 64")
+
+    bf16 = BF16Type()
+    a = Value("a", GmemTensorType.build([m, _HIDDEN], bf16))
+    w_gate = Value(
+        "w_gate", GmemTensorType.build([_INTERMEDIATE, _HIDDEN], bf16),
+    )
+    w_up = Value(
+        "w_up", GmemTensorType.build([_INTERMEDIATE, _HIDDEN], bf16),
+    )
+    w_down = Value(
+        "w_down", GmemTensorType.build([_HIDDEN, _INTERMEDIATE], bf16),
+    )
+    hidden = Value("hidden", GmemTensorType.build([m, _INTERMEDIATE], bf16))
+    output = Value("output", GmemTensorType.build([m, _HIDDEN], bf16))
+    sync = Value("sync", GmemTensorType.build([2], F32Type()))
+    grid_collective = {
+        axis: CollectiveLevel.GRID for axis in CollectiveAxis
+    }
+
+    projection = build_persistent_swiglu_projection(
+        resident_blocks=_RESIDENT_BLOCKS,
+        lhs=a,
+        gate_rhs=w_gate,
+        up_rhs=w_up,
+        dst=hidden,
+        m_tile=_OUTPUT_M_TILE,
+        n_tile=_OUTPUT_N_TILE,
+    )
+    grid_barrier = BarrierOp.build("grid", sync=sync)
+    down = MatmulOp.build(
+        hidden, w_down, output, collective=grid_collective,
+        init=0.0, attrs={"label": "down"},
+    )
+    kernel = KernelOp.build(
+        f"muse_glimmer_swiglu_m{m}",
+        Block(
+            arguments=[a, w_gate, w_up, w_down, hidden, output, sync],
+            ops=[*projection, grid_barrier, down],
+        ),
+        grid_dim=(_RESIDENT_BLOCKS, 1, 1),
+        ptx_optimization_level=4,
+    )
+    module = ModuleOp.build(Block(ops=[kernel]))
+    projection_move_attrs = {
+        "lhs": {
+            "l2_cache_hint": "evict_last",
+            "l2_promotion": "128B",
+        },
+        "rhs": {
+            "l2_cache_hint": "evict_first",
+            "l2_promotion": "256B",
+        },
+        "dst": {"l2_cache_hint": "evict_last"},
+    }
+    for label in ("gate", "up"):
+        # The projection builder already performed the block-grid and
+        # warp-group tiling and allocated register-resident accumulators.
+        module = schedule_tiled_matmul(
+            module,
+            label=label,
+            output_m_tile=_OUTPUT_M_TILE,
+            output_n_tile=_OUTPUT_N_TILE,
+            operand_stages=_SWIGLU_OPERAND_STAGES,
+            operand_k_tile=_K_TILE,
+            output_tma_inner_size=None,
+            unsafe_reuse_smem=True,
+            operand_move_attrs=projection_move_attrs,
+            loop_label_prefix=label,
+        )
+    module = _schedule_projection(
+        module, label="down", epilogue_label=None,
+        m_tile=_OUTPUT_M_TILE, n_tile=down_n_tile,
+        operand_stages=down_operand_stages, k_tile=_K_TILE,
         dst_cache_hint="evict_first",
     )
     module = schedule_async(module)
