@@ -18,7 +18,7 @@ test.
 # flake8: noqa: E501
 import textwrap
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import ElementwiseOp, ForOp, TileOp, gpu_dialect
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.promote_buffers import promote_buffers
@@ -101,21 +101,21 @@ def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():
         label_filter="epilogue",
     )
 
-    [loop] = find_ops(module, lambda op: isinstance(op, ForOp))
+    [loop] = find_ops_of_type(module, ForOp)
     assert (loop.lb, loop.ub, loop.step) == (0, 4, 1)
-    [dynamic_tile] = find_ops(module, lambda op: isinstance(op, TileOp))
+    [dynamic_tile] = find_ops_of_type(module, TileOp)
     assert dynamic_tile.static_indices == [0, None]
 
     unroll_loop(module, unroll_factor=4, label_filter="outn")
     Canonicalize().run(module)
     Canonicalize().run(module)
 
-    assert not find_ops(module, lambda op: isinstance(op, ForOp))
-    tiles = find_ops(module, lambda op: isinstance(op, TileOp))
+    assert not find_ops_of_type(module, ForOp)
+    tiles = find_ops_of_type(module, TileOp)
     assert [tile.static_indices for tile in tiles] == [
         [0, 0], [0, 1], [0, 2], [0, 3],
     ]
-    elementwise = find_ops(module, lambda op: isinstance(op, ElementwiseOp))
+    elementwise = find_ops_of_type(module, ElementwiseOp)
     assert [op.attrs["label"] for op in elementwise] == [
         "epilogue_iter0",
         "epilogue_iter1",
@@ -151,12 +151,12 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         ),
     )
 
-    loops = find_ops(module, lambda op: isinstance(op, ForOp))
+    loops = find_ops_of_type(module, ForOp)
     assert len(loops) == 3
     assert all((loop.lb, loop.ub, loop.step) == (0, 4, 1) for loop in loops)
     assert all(loop.attrs["label"] == "outn" for loop in loops)
     for loop in loops:
-        tiles = find_ops(loop, lambda op: isinstance(op, TileOp))
+        tiles = find_ops_of_type(loop, TileOp)
         assert tiles
         assert all(tile.indices[1] is loop.iv for tile in tiles)
         assert all(tile.result().type.sizes[1] == 64 for tile in tiles)

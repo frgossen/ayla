@@ -11,7 +11,7 @@ import math
 import struct
 import textwrap
 
-from ..base.ir import Op, Type, Value, find_ops
+from ..base.ir import Op, Type, Value, find_ops_of_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AddrMemTensorType,
@@ -201,9 +201,7 @@ class LowerToPtxTemplate(LoweringPass):
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({
             hint
-            for tma in find_ops(op, lambda candidate: isinstance(
-                candidate, TmaMoveOp,
-            ))
+            for tma in find_ops_of_type(op, TmaMoveOp)
             if (hint := tma.l2_cache_hint) is not None
         })
         self.cache_policy_values = {}

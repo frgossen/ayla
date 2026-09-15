@@ -1,7 +1,7 @@
 """Configurable GEMM module builders used by collection entries."""
 import textwrap
 
-from ..base.ir import find_ops
+from ..base.ir import find_ops_of_type
 from ..base.pipeline import Pipeline
 from ..gpu_dialect import KernelOp, MatmulOp, ModuleOp, gpu_dialect
 from ..passes.canonicalize import Canonicalize
@@ -43,7 +43,7 @@ def schedule_matmul(
     [kernel] = module.body.ops
     if not isinstance(kernel, KernelOp):
         raise ValueError("schedule_matmul requires exactly one kernel")
-    matmuls = find_ops(module, lambda op: isinstance(op, MatmulOp))
+    matmuls = find_ops_of_type(module, MatmulOp)
     if len(matmuls) != 1:
         raise ValueError("schedule_matmul requires exactly one matmul")
     matmul = matmuls[0]

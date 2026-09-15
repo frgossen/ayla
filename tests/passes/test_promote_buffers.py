@@ -1,7 +1,7 @@
 """Tests for the promote_buffers pass."""
 import textwrap
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import AllocOp, gpu_dialect
 from ayla.passes.promote_buffers import promote_buffers
 
@@ -74,7 +74,7 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
     )
     assert {
         op.attrs.get("reuse_group")
-        for op in find_ops(module, lambda op: isinstance(op, AllocOp))
+        for op in find_ops_of_type(module, AllocOp)
     } == {"mm_compute"}
 
     module = gpu_dialect.parse(textwrap.dedent("""\
@@ -91,7 +91,7 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
     )
     assert {
         op.attrs.get("reuse_group")
-        for op in find_ops(module, lambda op: isinstance(op, AllocOp))
+        for op in find_ops_of_type(module, AllocOp)
         if op.attrs.get("reuse_group") is not None
     } == {"mm_writeback"}
 
