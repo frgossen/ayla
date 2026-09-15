@@ -1934,27 +1934,35 @@ class LaneIdOp(Op):
         return cls(operands=[], results=[Value(name=None, type=IndexType())])
 
 
-def root_buffer(value: Value) -> Value:
-    """Walk back through storage views and tiles to the underlying SSA root.
+def root_buffers(value: Value) -> set[Value]:
+    """Return every physical buffer that may underlie ``value``."""
+    definition = value.definition
+    if isinstance(definition, ReinterpretOp):
+        return root_buffers(definition.storage)
+    if isinstance(definition, TileOp):
+        return root_buffers(definition.arg)
+    if isinstance(definition, SelectOp):
+        return {
+            root
+            for case in definition.cases
+            for root in root_buffers(case)
+        }
+    if isinstance(definition, ToPtrOp):
+        return root_buffers(definition.arg)
+    if isinstance(definition, PtrAddOp):
+        return root_buffers(definition.ptr)
+    if isinstance(value.type, (MemTensorType, TmaDescType)):
+        return {value}
+    return set()
 
-    For an allocation, kernel argument, or other non-view value, this returns
-    the value itself.
-    """
-    while isinstance(value.definition, (ReinterpretOp, TileOp)):
-        if isinstance(value.definition, ReinterpretOp):
-            value = value.definition.storage
-        else:
-            value = value.definition.arg
-    if isinstance(value.definition, SelectOp):
-        # Returning the select would claim it is a buffer of its own, distinct
-        # from the cases it actually aliases -- the unsafe direction, since a
-        # caller would read that as "no dependency". A select is meant to be
-        # folded away before anything reasons about buffers.
-        raise ValueError(
-            f"root_buffer: {value.definition.op_id} has no single root buffer; "
-            "it aliases every one of its cases. Fold it first."
-        )
-    return value
+
+def root_buffer(value: Value) -> Value | None:
+    """Return the unique physical buffer underlying ``value``, if any."""
+    roots = root_buffers(value)
+    assert len(roots) <= 1, (
+        f"root_buffer: {value} has multiple root buffers: {roots}"
+    )
+    return next(iter(roots), None)
 
 
 class CollectiveScope(enum.IntEnum):
@@ -2028,12 +2036,18 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
     )
 
 
+def _memory_effect(
+    kind: str, value: Value, scope: CollectiveScope,
+) -> list[tuple[str, Value, CollectiveScope]]:
+    return [(kind, root, scope) for root in root_buffers(value)]
+
+
 def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     """Best-effort memory effect summary for ``op``.
 
     Returns a list of ``(kind, root, scope)`` tuples where ``kind`` is ``"R"`` or
-    ``"W"``, ``root`` is the underlying alloc/arg (after stripping views via
-    ``root_buffer``), and ``scope`` is the :class:`CollectiveScope` at which
+    ``"W"``, ``root`` is an underlying alloc/arg (after stripping views via
+    ``root_buffers``), and ``scope`` is the :class:`CollectiveScope` at which
     the access is independent of concurrent threads.
 
     Returns ``None`` for ops we don't know how to model; callers must treat that
@@ -2054,25 +2068,33 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
             else _type_collective_scope(op.dst.type)
         )
-        return [("W", root_buffer(op.dst), dst_scope),
-                ("R", root_buffer(op.src), src_scope)]
+        return (
+            _memory_effect("W", op.dst, dst_scope)
+            + _memory_effect("R", op.src, src_scope)
+        )
     if isinstance(op, TmaMoveOp):
-        # Leader-issued (t0): the smem side is BLOCK_LEADER (dst on a load, src on
-        # a store).
-        smem_is_dst = isinstance(op.dst.type, SmemTensorType)
-        smem = op.dst if smem_is_dst else op.src
-        kind = "W" if smem_is_dst else "R"
-        return [(kind, root_buffer(smem), CollectiveScope.BLOCK_LEADER)]
+        # The block leader issues both sides of the TMA transfer.
+        return (
+            _memory_effect("W", op.dst, CollectiveScope.BLOCK_LEADER)
+            + _memory_effect("R", op.src, CollectiveScope.BLOCK_LEADER)
+        )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
-        dst = root_buffer(op.dst)
-        return [("R", root_buffer(op.lhs), _type_collective_scope(op.lhs.type)),
-                ("R", root_buffer(op.rhs), _type_collective_scope(op.rhs.type)),
-                ("R", dst, CollectiveScope.THREAD),
-                ("W", dst, CollectiveScope.THREAD)]
+        return (
+            _memory_effect(
+                "R", op.lhs, _type_collective_scope(op.lhs.type),
+            )
+            + _memory_effect(
+                "R", op.rhs, _type_collective_scope(op.rhs.type),
+            )
+            + _memory_effect("R", op.dst, CollectiveScope.THREAD)
+            + _memory_effect("W", op.dst, CollectiveScope.THREAD)
+        )
     if isinstance(op, ElementwiseOp):
-        return [("W", root_buffer(op.dst), CollectiveScope.THREAD),
-                ("R", root_buffer(op.src), CollectiveScope.THREAD)]
+        return (
+            _memory_effect("W", op.dst, CollectiveScope.THREAD)
+            + _memory_effect("R", op.src, CollectiveScope.THREAD)
+        )
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
@@ -2097,8 +2119,8 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             if isinstance(buf.type, WrmemTensorType)
             else _type_collective_scope(buf.type)
         )
-        return [("W", root_buffer(buf), scope)]
-    if isinstance(op, (ForOp, IfOp, AsyncOp)):
+        return _memory_effect("W", buf, scope)
+    if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
             for body_op in block.ops:
@@ -2108,6 +2130,17 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
                 effects.extend(body_effects)
         return effects
     return None
+
+
+def has_ordering_effect(op: Op) -> bool:
+    """Whether ``op`` or a nested operation constrains operation ordering."""
+    if isinstance(op, BarrierOp):
+        return True
+    return any(
+        has_ordering_effect(nested)
+        for block in op.blocks
+        for nested in block.ops
+    )
 
 
 def is_side_effect_free(op: Op) -> bool:

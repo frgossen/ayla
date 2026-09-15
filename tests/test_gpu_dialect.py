@@ -18,6 +18,8 @@ from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
     BF16Type,
+    BarrierOp,
+    CollectiveScope,
     F32Type,
     ForOp,
     IfOp,
@@ -27,11 +29,15 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    SelectOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
     gpu_dialect,
+    has_ordering_effect,
+    memory_effects,
     root_buffer,
+    root_buffers,
 )
 
 
@@ -62,6 +68,27 @@ def test_reinterpret_op():
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
         ReinterpretOp.build(storage, F32Type())
+
+
+def test_buffer_roots_support_no_root_and_multiple_roots():
+    lhs = Value(name="lhs", type=SmemTensorType.build((1,), F32Type()))
+    rhs = Value(name="rhs", type=SmemTensorType.build((1,), F32Type()))
+    index = Value(name="index", type=IndexType())
+    select = SelectOp.build(index, [lhs, rhs])
+
+    assert root_buffers(select.result()) == {lhs, rhs}
+    with pytest.raises(AssertionError, match="multiple root buffers"):
+        root_buffer(select.result())
+    assert root_buffer(index) is None
+
+
+def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
+    barrier = BarrierOp.build()
+    nested = IfOp(operands=[], results=[], blocks=[Block(ops=[barrier])])
+
+    assert memory_effects(barrier) is None
+    assert has_ordering_effect(barrier)
+    assert has_ordering_effect(nested)
 
 
 def test_matmul_program():
@@ -262,6 +289,41 @@ def test_tma_move_build_accepts_l2_cache_hint():
     )
 
     assert op.l2_cache_hint == "evict_last"
+
+
+@pytest.mark.parametrize(
+    ("smem_is_dst", "expected"),
+    [
+        (
+            True,
+            {
+                ("W", "smem", CollectiveScope.BLOCK_LEADER),
+                ("R", "desc", CollectiveScope.BLOCK_LEADER),
+            },
+        ),
+        (
+            False,
+            {
+                ("W", "desc", CollectiveScope.BLOCK_LEADER),
+                ("R", "smem", CollectiveScope.BLOCK_LEADER),
+            },
+        ),
+    ],
+)
+def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
+    gmem_type = GmemTensorType.build((64, 64), F32Type())
+    desc = Value(
+        name="desc",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
+    index = Value(name="index", type=IndexType())
+    dst, src = (smem, desc) if smem_is_dst else (desc, smem)
+
+    effects = memory_effects(TmaMoveOp.build(dst, src, [index]))
+
+    assert effects is not None
+    assert {(kind, root.name, scope) for kind, root, scope in effects} == expected
 
 
 def test_tma_descriptor_validates_l2_promotion():
