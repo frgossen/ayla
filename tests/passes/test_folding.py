@@ -1,7 +1,7 @@
 """Tests for the `folding` pass."""
 import textwrap
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import TileOp, gpu_dialect
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
@@ -56,7 +56,7 @@ def test_fold_constant_tile_indices_to_static_indices():
 
     folding(module)
 
-    [tile] = find_ops(module, lambda op: isinstance(op, TileOp))
+    [tile] = find_ops_of_type(module, TileOp)
     assert tile.static_indices == [0, 3]
     assert tile.indices == [0, 3]
 

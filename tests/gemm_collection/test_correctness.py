@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.ops import ayla
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
@@ -192,19 +192,19 @@ def test_sigmoid_output_tiles_lower_to_ptx():
 def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
     module = auto_matmul_4096_wgmma256_wg_sigmoid_module()
 
-    loops = find_ops(module, lambda op: isinstance(op, ForOp))
+    loops = find_ops_of_type(module, ForOp)
     assert all(loop.attrs.get("label") != "outn" for loop in loops)
     wrmem_tiles = [
-        op for op in find_ops(module, lambda op: isinstance(op, TileOp))
+        op for op in find_ops_of_type(module, TileOp)
         if isinstance(op.result().type, WrmemTensorType)
     ]
     assert wrmem_tiles
     assert all(None not in tile.static_indices for tile in wrmem_tiles)
 
-    epilogues = find_ops(
-        module,
-        lambda op: isinstance(op, ElementwiseOp) and op.fn == "sigmoid",
-    )
+    epilogues = [
+        op for op in find_ops_of_type(module, ElementwiseOp)
+        if op.fn == "sigmoid"
+    ]
     assert [op.attrs.get("label") for op in epilogues[:4]] == [
         "epi_iter0_iter0",
         "epi_iter1_iter0",

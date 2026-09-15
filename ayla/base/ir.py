@@ -592,6 +592,10 @@ def find_ops(root: Op, predicate: Callable[[Op], bool]) -> list[Op]:
     return list(iter_ops(root, predicate))
 
 
+def find_ops_of_type[OpT: Op](root: Op, op_type: type[OpT]) -> list[OpT]:
+    return [op for op in iter_ops(root) if isinstance(op, op_type)]
+
+
 def find_op(root: Op, predicate: Callable[[Op], bool]) -> Op | None:
     return next(iter_ops(root, predicate), None)
 

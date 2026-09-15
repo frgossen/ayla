@@ -2,7 +2,7 @@ import textwrap
 
 import pytest
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import ElementwiseOp, ForOp, MoveOp, TileOp, gpu_dialect
 from ayla.passes.tile_elementwise import tile_elementwise
 
@@ -77,12 +77,12 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
         label_filter="convert",
     )
 
-    assert len(find_ops(module, lambda op: isinstance(op, ForOp))) == 1
-    assert len(find_ops(module, lambda op: isinstance(op, TileOp))) == 2
-    [convert] = find_ops(
-        module,
-        lambda op: isinstance(op, ElementwiseOp) and op.fn == "convert",
-    )
+    assert len(find_ops_of_type(module, ForOp)) == 1
+    assert len(find_ops_of_type(module, TileOp)) == 2
+    [convert] = [
+        op for op in find_ops_of_type(module, ElementwiseOp)
+        if op.fn == "convert"
+    ]
     assert tuple(convert.dst.type.sizes) == (64, 64)
     assert tuple(convert.src.type.sizes) == (64, 64)
 
@@ -151,8 +151,8 @@ def test_tiles_an_explicitly_selected_move():
         label_filter="writeback",
     )
 
-    assert len(find_ops(module, lambda op: isinstance(op, ForOp))) == 1
-    [move] = find_ops(module, lambda op: isinstance(op, MoveOp))
+    assert len(find_ops_of_type(module, ForOp)) == 1
+    [move] = find_ops_of_type(module, MoveOp)
     assert tuple(move.dst.type.sizes) == (64, 64)
     assert tuple(move.src.type.sizes) == (64, 64)
 
@@ -171,5 +171,5 @@ def test_does_not_tile_moves_without_an_explicit_label_filter():
         tile_levels=["for"], tile_labels=["outn"],
     )
 
-    assert not find_ops(module, lambda op: isinstance(op, TileOp))
-    assert len(find_ops(module, lambda op: isinstance(op, MoveOp))) == 1
+    assert not find_ops_of_type(module, TileOp)
+    assert len(find_ops_of_type(module, MoveOp)) == 1

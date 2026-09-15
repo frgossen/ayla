@@ -2,7 +2,15 @@
 
 import textwrap
 
-from ayla.base.ir import Block, Dialect, Op, Type, Value, clone_op, clone_type
+from ayla.base.ir import (
+    Block,
+    Dialect,
+    Op,
+    Type,
+    Value,
+    clone_op,
+    clone_type,
+)
 
 
 def assert_print_and_roundtrip(op: Op, expected: str) -> None:
