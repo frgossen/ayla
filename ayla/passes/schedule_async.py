@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from ..gpu_dialect import (
     AsyncOp,
-    TmaMoveOp,
     AwaitOp,
+    TmaMoveOp,
     effective_operands,
+    has_ordering_effect,
     is_side_effect_free,
     memory_effects,
     ModuleOp,
@@ -46,6 +47,9 @@ def _is_await(op: Op) -> bool:
 
 
 def _can_swap(upper: Op, lower: Op) -> bool:
+
+    if has_ordering_effect(upper) or has_ordering_effect(lower):
+        return False
 
     # SSA dependency: lower consumes a result of upper.
     upper_results = set(upper.results)
