@@ -8,8 +8,15 @@ import textwrap
 
 import torch
 
-from ayla.gpu_dialect import F32Type, GmemTensorType
-from ayla.ptx_codegen import PtxKernel
+from ayla.base.ir import Block, Value
+from ayla.gpu_dialect import (
+    F32Type,
+    GmemTensorType,
+    KernelOp,
+    ModuleOp,
+    PTXTemplateOp,
+)
+from ayla.ptx_codegen import PtxKernel, make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
 
@@ -80,3 +87,38 @@ def test_cwise_add():
 
     torch.cuda.synchronize()
     assert torch.allclose(c, a + b)
+
+
+@requires_cuda
+def test_required_cluster_dimensions_reach_the_launch():
+    output_type = GmemTensorType.build((2,), F32Type())
+    output = Value("output", output_type)
+    write_rank = PTXTemplateOp.build(
+        operands=[output],
+        result_types=[],
+        template=textwrap.dedent("""\
+            mov.u32 ${b32:cta}, %ctaid.x;
+            mul.wide.u32 ${b64:offset}, ${b32:cta}, 4;
+            add.u64 ${b64:dst}, ${b64:operand.output.ptr}, ${b64:offset};
+            mov.u32 ${b32:rank}, %cluster_ctarank;
+            cvt.rn.f32.u32 ${f32:value}, ${b32:rank};
+            st.global.f32 [${b64:dst}], ${f32:value};
+        """),
+        operand_names=["output"],
+        result_names=[],
+        description="write cluster rank",
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "cluster_rank",
+        Block(arguments=[output], ops=[write_rank]),
+        grid_dim=(2, 1, 1),
+        block_dim=(1, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )]))
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    actual = torch.empty(2, device="cuda")
+
+    launcher(actual)
+    torch.cuda.synchronize()
+
+    assert actual.cpu().tolist() == [0.0, 1.0]

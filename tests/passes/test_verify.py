@@ -112,6 +112,29 @@ def test_elementwise_function_and_arity_are_verified():
         verify_gpu_dialect(unknown)
 
 
+@pytest.mark.parametrize("cluster_dim", [(2, 0, 1), (2, 1)])
+def test_default_verification_rejects_invalid_cluster_dimensions(cluster_dim):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid() grid_dim=[4, 1, 1] cluster_dim={list(cluster_dim)} {{
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match="three positive dimensions"):
+        verify_gpu_dialect(module)
+
+
+def test_default_verification_rejects_cluster_that_does_not_divide_grid():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() grid_dim=[10, 1, 1] cluster_dim=[3, 1, 1] {
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="cluster_dim must divide grid_dim"):
+        verify_gpu_dialect(module)
+
+
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
         verify_gpu_dialect(
