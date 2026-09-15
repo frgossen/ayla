@@ -71,6 +71,9 @@ def _materialize_cluster_mbars(
     """Allocate one cluster mbarrier per cluster-to-leader barrier site."""
     barrier_syncs: dict[Op, Value] = {}
     allocs: list[AllocOp] = []
+    # TODO: Track cluster-mbarrier lifetimes and reuse an allocation after a
+    # cluster/grid rendezvous proves that every CTA completed its prior use.
+    # Until then, allocate one mbarrier per static barrier site.
     for op, target in targets.items():
         if target.scope != BarrierScope.CLUSTER_TO_LEADER:
             continue

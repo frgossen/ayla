@@ -233,6 +233,39 @@ def test_cluster_mbar_materialization_depends_on_barrier_scope():
     assert kernel.body.ops[0].result() is sync
 
 
+def test_tma_multicast_reuse_waits_for_every_recipient_cta():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%lock: lock<mbar>)
+            %rmem: rmem<16x16xf32> = alloc()
+            move(%rmem: rmem<16x16xf32>, %smem: smem<16x16xf32>)
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    insert_syncs(module)
+
+    text = repr(module)
+    # The parent multicast lowering synchronizes mbarrier initialization. This
+    # pass only needs the one-way reuse handoff to the next multicast issuer.
+    assert 'barrier() attrs={scope: "cluster"}' not in text
+    barriers = [
+        op for op in find_ops_of_type(module, BarrierOp)
+        if op.scope == "cluster_to_leader"
+    ]
+    assert len(barriers) == 1
+    sync = barriers[0].sync
+    assert sync is not None
+    assert isinstance(sync.type, LockType)
+    assert sync.type.kind == "cluster_mbar"
+
+
 def test_preexisting_barrier_updates_dataflow_state():
     source = """\
         module {
