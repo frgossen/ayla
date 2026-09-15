@@ -4,14 +4,21 @@ import textwrap
 import pytest
 
 from ayla import Block, Op
-from ayla.gpu_dialect import gpu_dialect
+from ayla.analysis.sync import BarrierTarget, SyncAnalysis
+from ayla.gpu_dialect import ForOp, IfOp, KernelOp, ModuleOp, gpu_dialect
 from ayla.passes.insert_syncs import (
     BarrierScope,
-    BarrierTarget,
     _insert_barriers,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
+
+
+def test_every_gpu_leaf_op_has_explicit_sync_transfer():
+    structured_ops = {ModuleOp, KernelOp, ForOp, IfOp}
+    dialect_ops = set(gpu_dialect._ops.values()) - {Op}
+
+    assert set(SyncAnalysis._transfers) | structured_ops == dialect_ops
 
 
 def test_block_leader_barrier_requires_whole_warps():
