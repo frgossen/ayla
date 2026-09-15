@@ -18,6 +18,7 @@ from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
     BF16Type,
+    BarrierOp,
     F32Type,
     ForOp,
     IfOp,
@@ -32,6 +33,8 @@ from ayla.gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     gpu_dialect,
+    has_ordering_effect,
+    memory_effects,
     root_buffer,
     root_buffers,
 )
@@ -76,6 +79,15 @@ def test_buffer_roots_support_no_root_and_multiple_roots():
     with pytest.raises(AssertionError, match="multiple root buffers"):
         root_buffer(select.result())
     assert root_buffer(index) is None
+
+
+def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
+    barrier = BarrierOp.build()
+    nested = IfOp(operands=[], results=[], blocks=[Block(ops=[barrier])])
+
+    assert memory_effects(barrier) is None
+    assert has_ordering_effect(barrier)
+    assert has_ordering_effect(nested)
 
 
 def test_matmul_program():

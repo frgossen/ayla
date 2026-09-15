@@ -27,6 +27,7 @@ from ..gpu_dialect import (
     IndexType,
     ModuleOp,
     effective_operands,
+    has_ordering_effect,
     is_side_effect_free,
     memory_effects,
 )
@@ -142,6 +143,8 @@ class PipelineLoop(LoweringPass):
         if they touch the same root buffer and at least one is a
         write. Unknown effects (``None``) are treated as worst-case.
         """
+        if has_ordering_effect(earlier) or has_ordering_effect(later):
+            return False
         if is_side_effect_free(earlier) or is_side_effect_free(later):
             return True
         eff_earlier = memory_effects(earlier)

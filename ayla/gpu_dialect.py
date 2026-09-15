@@ -2133,6 +2133,17 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
     return None
 
 
+def has_ordering_effect(op: Op) -> bool:
+    """Whether ``op`` or a nested operation constrains operation ordering."""
+    if isinstance(op, BarrierOp):
+        return True
+    return any(
+        has_ordering_effect(nested)
+        for block in op.blocks
+        for nested in block.ops
+    )
+
+
 def is_side_effect_free(op: Op) -> bool:
     """Safe to move, and interchangeable with an identical op.
 
