@@ -10,6 +10,8 @@ import torch
 
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
+    BarrierOp,
+    ClusterBlockIdsOp,
     F32Type,
     GmemTensorType,
     KernelOp,
@@ -90,27 +92,31 @@ def test_cwise_add():
 
 
 @requires_cuda
-def test_required_cluster_dimensions_reach_the_launch():
+def test_cluster_block_ids_and_barrier_reach_the_launch():
     output_type = GmemTensorType.build((2,), F32Type())
     output = Value("output", output_type)
-    write_rank = PTXTemplateOp.build(
-        operands=[output],
+    ids = ClusterBlockIdsOp.build()
+    write_x = PTXTemplateOp.build(
+        operands=[output, ids.x],
         result_types=[],
         template=textwrap.dedent("""\
             mov.u32 ${b32:cta}, %ctaid.x;
             mul.wide.u32 ${b64:offset}, ${b32:cta}, 4;
             add.u64 ${b64:dst}, ${b64:operand.output.ptr}, ${b64:offset};
-            mov.u32 ${b32:rank}, %cluster_ctarank;
-            cvt.rn.f32.u32 ${f32:value}, ${b32:rank};
+            cvt.rn.f32.u32 ${f32:value}, ${b32:operand.x.val};
             st.global.f32 [${b64:dst}], ${f32:value};
         """),
-        operand_names=["output"],
+        operand_names=["output", "x"],
         result_names=[],
-        description="write cluster rank",
+        description="write cluster block x",
     )
     module = ModuleOp.build(Block(ops=[KernelOp.build(
-        "cluster_rank",
-        Block(arguments=[output], ops=[write_rank]),
+        "cluster_block_ids",
+        Block(arguments=[output], ops=[
+            ids,
+            BarrierOp.build("cluster"),
+            write_x,
+        ]),
         grid_dim=(2, 1, 1),
         block_dim=(1, 1, 1),
         cluster_dim=(2, 1, 1),

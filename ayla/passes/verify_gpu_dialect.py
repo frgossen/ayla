@@ -7,6 +7,8 @@ from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
+    BarrierOp,
+    ClusterBlockIdsOp,
     CollectiveAxis,
     ElementwiseOp,
     KernelOp,
@@ -37,6 +39,16 @@ def _verify_static_shape(typ: Type) -> None:
         raise ValueError(f"unresolved dynamic shape {typ}")
     if isinstance(typ, TmaDescType):
         _verify_static_shape(typ.gmem_type)
+
+
+def _ancestor_kernel(op: Op) -> KernelOp | None:
+    block = op.parent_block
+    while block is not None:
+        parent = block.parent_op
+        if isinstance(parent, KernelOp):
+            return parent
+        block = None if parent is None else parent.parent_block
+    return None
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -73,6 +85,28 @@ class VerifyGpuDialect(VerificationPass):
             for grid, cluster in zip(grid_dim, cluster_dim, strict=True)
         ):
             raise ValueError("cluster_dim must divide grid_dim")
+
+    @verifies(ClusterBlockIdsOp)
+    def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:
+        kernel = _ancestor_kernel(op)
+        if kernel is None or not any(
+            dim is not None for dim in kernel.cluster_dim
+        ):
+            raise ValueError(
+                "cluster_block_ids requires an enclosing clustered kernel"
+            )
+
+    @verifies(BarrierOp)
+    def _verify_barrier(self, op: BarrierOp) -> None:
+        if op.scope != "cluster":
+            return
+        kernel = _ancestor_kernel(op)
+        if kernel is None or not any(
+            dim is not None for dim in kernel.cluster_dim
+        ):
+            raise ValueError(
+                "cluster barrier requires an enclosing clustered kernel"
+            )
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:

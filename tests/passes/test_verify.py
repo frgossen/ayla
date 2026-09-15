@@ -135,6 +135,28 @@ def test_default_verification_rejects_cluster_that_does_not_divide_grid():
         verify_gpu_dialect(module)
 
 
+@pytest.mark.parametrize(
+    "op",
+    [
+        (
+            "%cbx: index, %cby: index, %cbz: index "
+            "= cluster_block_ids()"
+        ),
+        'barrier() attrs={scope: "cluster"}',
+    ],
+)
+def test_cluster_operations_require_a_clustered_kernel(op):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid() grid_dim=[1, 1, 1] {{
+            {op}
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match="enclosing clustered kernel"):
+        verify_gpu_dialect(module)
+
+
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
         verify_gpu_dialect(

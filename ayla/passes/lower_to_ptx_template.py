@@ -963,6 +963,11 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
+        elif scope == "cluster":
+            template = textwrap.dedent("""\
+                barrier.cluster.arrive.release;
+                barrier.cluster.wait.acquire;
+                """)
         elif scope == "block_leader":
             # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
             # insert_syncs (unique among concurrently-live block-leader barriers).

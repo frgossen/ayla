@@ -38,6 +38,10 @@ def _lower_barrier(scope: str) -> str:
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
+    ("cluster", textwrap.dedent("""\
+        barrier.cluster.arrive.release;
+        barrier.cluster.wait.acquire;
+    """)),
 ])
 def test_lower_barrier(scope, expected):
     assert _lower_barrier(scope) == expected

@@ -900,7 +900,8 @@ class BarrierOp(Op):
     across its participating threads.
 
     The ``scope`` attribute records the participant set the sync spans, one of:
-    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``, ``grid``.
+    ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
+    ``cluster``, ``grid``.
     """
 
     @classmethod
@@ -1797,6 +1798,34 @@ class BlockIdsOp(Op):
         return self.results[2]
 
 
+@gpu_dialect.register_op("cluster_block_ids")
+class ClusterBlockIdsOp(Op):
+    """Produce the 3D CTA index within the enclosing cluster."""
+
+    @classmethod
+    def build(cls) -> "ClusterBlockIdsOp":
+        idx = IndexType()
+        return cls(
+            operands=[],
+            results=[
+                Value(name=name, type=idx)
+                for name in ["cbx", "cby", "cbz"]
+            ],
+        )
+
+    @property
+    def x(self) -> Value:
+        return self.results[0]
+
+    @property
+    def y(self) -> Value:
+        return self.results[1]
+
+    @property
+    def z(self) -> Value:
+        return self.results[2]
+
+
 @gpu_dialect.register_op("warp_group_id")
 class WarpGroupIdOp(Op):
     """Produce the 3D warp group index within the block."""
@@ -2044,6 +2073,8 @@ class CollectiveScope(enum.IntEnum):
 
              GRID
               |
+           CLUSTER
+              |
             BLOCK
             /   \
     WARPGROUP   BLOCK_LEADER
@@ -2057,7 +2088,8 @@ class CollectiveScope(enum.IntEnum):
     WARPGROUP = 2
     BLOCK_LEADER = 3
     BLOCK = 4
-    GRID = 5
+    CLUSTER = 5
+    GRID = 6
 
     def join(self, other: CollectiveScope) -> CollectiveScope:
         """The join (least upper bound) on the CollectiveScope lattice."""
@@ -2065,16 +2097,28 @@ class CollectiveScope(enum.IntEnum):
             return self
         if self == CollectiveScope.THREAD:
             return other
-        if self == CollectiveScope.BLOCK:
+        if self == CollectiveScope.CLUSTER:
             return other if other == CollectiveScope.GRID else self
+        if self == CollectiveScope.BLOCK:
+            return other if other in {
+                CollectiveScope.CLUSTER, CollectiveScope.GRID,
+            } else self
         if self == CollectiveScope.BLOCK_LEADER:
             if other in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
                 return self
-            if other in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
+            if other in {
+                CollectiveScope.BLOCK,
+                CollectiveScope.CLUSTER,
+                CollectiveScope.GRID,
+            }:
                 return other
             return CollectiveScope.BLOCK  # other is WARP or WARPGROUP
         if self == CollectiveScope.WARPGROUP:
-            if other in {CollectiveScope.BLOCK, CollectiveScope.GRID}:
+            if other in {
+                CollectiveScope.BLOCK,
+                CollectiveScope.CLUSTER,
+                CollectiveScope.GRID,
+            }:
                 return other
             if other == CollectiveScope.BLOCK_LEADER:
                 return CollectiveScope.BLOCK
@@ -2230,6 +2274,7 @@ def is_side_effect_free(op: Op) -> bool:
         return op.init is None
     return isinstance(op, (
         BlockIdsOp,
+        ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,
         IndexDivOp,

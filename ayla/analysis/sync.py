@@ -10,6 +10,7 @@ from ..gpu_dialect import (
     AwaitOp,
     BarrierOp,
     BlockIdsOp,
+    ClusterBlockIdsOp,
     CollectiveScope,
     ElementwiseOp,
     IndexAddOp,
@@ -47,6 +48,8 @@ class BarrierScope(enum.IntEnum):
 
              GRID
               |
+           CLUSTER
+              |
             BLOCK
             /   \
     WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
@@ -61,7 +64,8 @@ class BarrierScope(enum.IntEnum):
     BLOCK_TO_LEADER = 3
     LEADER_TO_BLOCK = 4
     BLOCK = 5
-    GRID = 6
+    CLUSTER = 6
+    GRID = 7
 
     def join(self, other: BarrierScope) -> BarrierScope:
         """The join (least upper bound) on the BarrierScope lattice."""
@@ -73,6 +77,8 @@ class BarrierScope(enum.IntEnum):
             return self
         if self == BarrierScope.GRID or other == BarrierScope.GRID:
             return BarrierScope.GRID
+        if self == BarrierScope.CLUSTER or other == BarrierScope.CLUSTER:
+            return BarrierScope.CLUSTER
         if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
             return BarrierScope.BLOCK
         if {self, other} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
@@ -102,6 +108,8 @@ def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierS
         return BarrierScope.WARPGROUP
     if joined == CollectiveScope.BLOCK:
         return BarrierScope.BLOCK
+    if joined == CollectiveScope.CLUSTER:
+        return BarrierScope.CLUSTER
     if joined == CollectiveScope.GRID:
         return BarrierScope.GRID
     raise NotImplementedError(f"_barrier_scope: unhandled join {joined!r}")
@@ -124,6 +132,8 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
         # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
     if barrier == BarrierScope.BLOCK:
+        return scope not in (CollectiveScope.CLUSTER, CollectiveScope.GRID)
+    if barrier == BarrierScope.CLUSTER:
         return scope != CollectiveScope.GRID
     if barrier == BarrierScope.GRID:
         return True
@@ -181,7 +191,9 @@ def _after_barrier(
 ) -> SyncState:
     """Discharge the settled effects ordered by ``barrier``."""
     live = live.clone()
-    if barrier in (BarrierScope.BLOCK, BarrierScope.GRID):
+    if barrier in (
+        BarrierScope.BLOCK, BarrierScope.CLUSTER, BarrierScope.GRID,
+    ):
         live.named_barrier_ids.clear()
         live.named_barrier_ids_pending_await.clear()
     for buf, effects in live.concurrent_memory_effects.items():
@@ -330,6 +342,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(
         BlockIdsOp,
+        ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,
         IndexDivOp,
