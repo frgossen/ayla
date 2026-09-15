@@ -2073,12 +2073,11 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             + _memory_effect("R", op.src, src_scope)
         )
     if isinstance(op, TmaMoveOp):
-        # Leader-issued (t0): the smem side is BLOCK_LEADER (dst on a load, src on
-        # a store).
-        smem_is_dst = isinstance(op.dst.type, SmemTensorType)
-        smem = op.dst if smem_is_dst else op.src
-        kind = "W" if smem_is_dst else "R"
-        return _memory_effect(kind, smem, CollectiveScope.BLOCK_LEADER)
+        # The block leader issues both sides of the TMA transfer.
+        return (
+            _memory_effect("W", op.dst, CollectiveScope.BLOCK_LEADER)
+            + _memory_effect("R", op.src, CollectiveScope.BLOCK_LEADER)
+        )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         return (
@@ -2121,7 +2120,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             else _type_collective_scope(buf.type)
         )
         return _memory_effect("W", buf, scope)
-    if isinstance(op, (ForOp, IfOp, AsyncOp)):
+    if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
         effects: list[tuple[str, Value, CollectiveScope]] = []
         for block in op.blocks:
             for body_op in block.ops:
