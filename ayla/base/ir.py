@@ -501,9 +501,11 @@ class Dialect:
         self._ops: dict[str, type[Op]] = {"generic": Op}
         self._types: dict[str, type[Type]] = {"generic": Type}
 
-    def register_op(self, op_id: str):
+    def register_op[T: Op](
+        self, op_id: str,
+    ) -> Callable[[type[T]], type[T]]:
         """Class decorator: register an Op subclass under `op_id`."""
-        def deco(cls: type[Op]) -> type[Op]:
+        def deco(cls: type[T]) -> type[T]:
             if op_id in self._ops:
                 raise ValueError(
                     f"{self.name}: op_id {op_id!r} already registered to "
@@ -514,9 +516,11 @@ class Dialect:
             return cls
         return deco
 
-    def register_type(self, type_id: str):
+    def register_type[T: Type](
+        self, type_id: str,
+    ) -> Callable[[type[T]], type[T]]:
         """Class decorator: register a Type subclass under `type_id`."""
-        def deco(cls: type[Type]) -> type[Type]:
+        def deco(cls: type[T]) -> type[T]:
             if type_id in self._types:
                 raise ValueError(
                     f"{self.name}: type_id {type_id!r} already registered "

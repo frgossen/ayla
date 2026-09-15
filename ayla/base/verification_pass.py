@@ -25,6 +25,8 @@ def verifies(*op_types: type[Op], stage: object | None = None):
 class VerificationPass(Pass):
     """Walk the IR and dispatch registered verification methods."""
 
+    stage: object | None
+
     _verifiers: ClassVar[
         dict[
             tuple[type[Op], object | None],
