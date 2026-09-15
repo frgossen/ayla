@@ -4,15 +4,14 @@ import textwrap
 import pytest
 
 from ayla import Block, Op
+from ayla.analysis.sync import BarrierTarget
 from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.insert_syncs import (
     BarrierScope,
-    BarrierTarget,
     _insert_barriers,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
-
 
 def test_block_leader_barrier_requires_whole_warps():
     op = Op(operands=[], results=[])
