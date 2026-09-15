@@ -27,11 +27,13 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    SelectOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
     gpu_dialect,
     root_buffer,
+    root_buffers,
 )
 
 
@@ -62,6 +64,18 @@ def test_reinterpret_op():
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
         ReinterpretOp.build(storage, F32Type())
+
+
+def test_buffer_roots_support_no_root_and_multiple_roots():
+    lhs = Value(name="lhs", type=SmemTensorType.build((1,), F32Type()))
+    rhs = Value(name="rhs", type=SmemTensorType.build((1,), F32Type()))
+    index = Value(name="index", type=IndexType())
+    select = SelectOp.build(index, [lhs, rhs])
+
+    assert root_buffers(select.result()) == {lhs, rhs}
+    with pytest.raises(AssertionError, match="multiple root buffers"):
+        root_buffer(select.result())
+    assert root_buffer(index) is None
 
 
 def test_matmul_program():

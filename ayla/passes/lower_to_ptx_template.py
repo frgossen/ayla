@@ -271,7 +271,9 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_tile: unexpected arg type {type(arg)}"
             )
 
-        root_type = root_buffer(op.arg).type
+        root = root_buffer(op.arg)
+        assert root is not None
+        root_type = root.type
         assert isinstance(root_type, AddrMemTensorType)
         dtype_bytes = root_type.dtype.byte_size
         result_sizes = list(op.result().type.sizes)
@@ -1326,7 +1328,9 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
         m_dim, n_dim = wrmem_type.sizes
-        root_n = root_buffer(op.src).type.sizes[1]
+        root = root_buffer(op.src)
+        assert root is not None
+        root_n = root.type.sizes[1]
         if isinstance(op.src.definition, TileOp):
             assert list(dst_type.sizes) == [m_dim, n_dim], (
                 f"wgmma store: destination shape {list(dst_type.sizes)} does "
@@ -1402,8 +1406,11 @@ class LowerToPtxTemplate(LoweringPass):
             if isinstance(op.src.definition, TileOp)
             else int(op.attrs.get("wgmma_col_start", 0))
         )
-        n_dim = root_buffer(op.src).type.sizes[1]
-        root_type = root_buffer(op.dst).type
+        src_root = root_buffer(op.src)
+        dst_root = root_buffer(op.dst)
+        assert src_root is not None and dst_root is not None
+        n_dim = src_root.type.sizes[1]
+        root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = root_type.sizes
         # TODO: Model writer ownership as a warpgroup-uniform IR condition so
@@ -1846,7 +1853,9 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     logical coordinates of the pair's first element relative to the view;
     store lowering adds the runtime warp/lane coordinate separately.
     """
-    view_type, root_type = value.type, root_buffer(value).type
+    root = root_buffer(value)
+    assert root is not None
+    view_type, root_type = value.type, root.type
     assert isinstance(view_type, WrmemTensorType)
     assert isinstance(root_type, WrmemTensorType)
     assert view_type.layout == root_type.layout == "wgmma_layout_0"
@@ -1960,7 +1969,9 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     ):
         return None
 
-    root_type = root_buffer(op.dst).type
+    dst_root = root_buffer(op.dst)
+    assert dst_root is not None
+    root_type = dst_root.type
     if (
         not isinstance(root_type, SmemTensorType)
         or root_type.rank != 2
@@ -1970,7 +1981,9 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         return None
 
     m_dim, n_dim = src_type.sizes
-    root_n = root_buffer(op.src).type.sizes[1]
+    src_root = root_buffer(op.src)
+    assert src_root is not None
+    root_n = src_root.type.sizes[1]
     is_view = isinstance(op.src.definition, TileOp)
     if is_view:
         row_start, col_start = _static_view_origin(op.src)
