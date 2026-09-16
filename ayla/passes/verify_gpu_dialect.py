@@ -7,16 +7,20 @@ from ..base.ir import Op, Type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
+    AsyncOp,
     BarrierOp,
     ClusterBlockIdsOp,
     CollectiveAxis,
+    CollectiveLevel,
     ElementwiseOp,
     KernelOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
+    MoveOp,
     ReshapeOp,
     TmaDescType,
+    TmaMoveOp,
 )
 
 
@@ -49,6 +53,21 @@ def _ancestor_kernel(op: Op) -> KernelOp | None:
             return parent
         block = None if parent is None else parent.parent_block
     return None
+
+
+def _verify_collective(op: Op) -> None:
+    collective = op.attrs.get("collective")
+    if (
+        not isinstance(collective, dict)
+        or set(collective) != set(CollectiveAxis)
+        or not all(
+            isinstance(level, CollectiveLevel)
+            for level in collective.values()
+        )
+    ):
+        raise ValueError(
+            f"{op.op_id} collective attribute must list x, y, and z"
+        )
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -108,16 +127,21 @@ class VerifyGpuDialect(VerificationPass):
                 "cluster barrier requires an enclosing clustered kernel"
             )
 
+    @verifies(AsyncOp)
+    def _verify_async(self, op: AsyncOp) -> None:
+        _verify_collective(op)
+
+    @verifies(MoveOp)
+    def _verify_move(self, op: MoveOp) -> None:
+        _verify_collective(op)
+
+    @verifies(TmaMoveOp)
+    def _verify_tma_move(self, op: TmaMoveOp) -> None:
+        _verify_collective(op)
+
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
-        collective = op.attrs.get("collective")
-        if (
-            not isinstance(collective, dict)
-            or set(collective) != set(CollectiveAxis)
-        ):
-            raise ValueError(
-                "matmul collective attribute must list x, y, and z"
-            )
+        _verify_collective(op)
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):

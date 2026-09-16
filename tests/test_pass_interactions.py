@@ -193,6 +193,6 @@ PROMOTED_IR = textwrap.dedent("""\
         matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
         %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
         elementwise sigmoid(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
-        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm_dst_wrmem"}
       }
     }""")

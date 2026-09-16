@@ -35,6 +35,8 @@ from __future__ import annotations
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
+    CollectiveAxis,
+    CollectiveLevel,
     MatmulOp,
     ModuleOp,
     MoveOp,
@@ -73,12 +75,14 @@ class FuseAsync(Pass):
         group_lock = None
         group_kind: str | None = None
         group_attrs: dict | None = None
+        group_collective: dict[CollectiveAxis, CollectiveLevel] | None = None
         # Member locks still awaiting their (to-be-dropped) await. Each fused
         # async adds its lock; its await removes it. Must be empty at finalize.
         in_flight_locks: set = set()
 
         def finalize() -> None:
             nonlocal group_inner, group_lock, group_kind, group_attrs
+            nonlocal group_collective
             nonlocal in_flight_locks
             if group_inner:
                 # Every member's await must have been dropped (its lock removed)
@@ -91,8 +95,10 @@ class FuseAsync(Pass):
                     f"no adjacent await; members' awaits must be adjacent (fuse "
                     f"TMA loads before pipelining)"
                 )
+                assert group_collective is not None
                 new_ops.append(AsyncOp.build(
                     group_lock,
+                    collective=group_collective,
                     body=Block(ops=group_inner),
                     attrs=group_attrs,
                 ))
@@ -101,6 +107,7 @@ class FuseAsync(Pass):
             group_lock = None
             group_kind = None
             group_attrs = None
+            group_collective = None
             in_flight_locks = set()
 
         for op in block.ops:
@@ -111,7 +118,16 @@ class FuseAsync(Pass):
                 if group_lock is None:
                     group_lock = op.lock
                     group_kind = kind
-                    group_attrs = dict(op.attrs) if op.attrs else None
+                    group_attrs = dict(op.attrs) or None
+                    group_collective = dict(op.collective)
+                else:
+                    assert group_collective is not None
+                    group_collective = {
+                        axis: group_collective[axis].join(
+                            op.collective[axis],
+                        )
+                        for axis in CollectiveAxis
+                    }
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:

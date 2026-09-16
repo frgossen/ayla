@@ -50,10 +50,10 @@ def test_fuse_tma_loads():
             %a0: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %c0: index)
             %b0: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %c0: index)
             %l0: lock<mbar> = alloc() attrs={id: 2}
-            async(%l0: lock<mbar>) move(%s0: smem<128x64xbf16 swizzle="128B">, %a0: gmem<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_lhs_smem", nc: True, tma: True}
+            async(%l0: lock<mbar>) collective=xyz.block move(%s0: smem<128x64xbf16 swizzle="128B">, %a0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.block attrs={label: "mm_lhs_smem", nc: True, tma: True}
             await(%l0: lock<mbar>)
             %l1: lock<mbar> = alloc() attrs={id: 3}
-            async(%l1: lock<mbar>) move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_rhs_smem", nc: True, tma: True}
+            async(%l1: lock<mbar>) collective=xyz.cluster move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.cluster attrs={label: "mm_rhs_smem", nc: True, tma: True}
             await(%l1: lock<mbar>)
           }
         }""")
@@ -72,9 +72,9 @@ def test_fuse_tma_loads():
             %b0: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %c0: index)
             %l0: lock<mbar> = alloc() attrs={id: 2}
             %l1: lock<mbar> = alloc() attrs={id: 3}
-            async(%l0: lock<mbar>) {
-              move(%s0: smem<128x64xbf16 swizzle="128B">, %a0: gmem<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_lhs_smem", nc: True, tma: True}
-              move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) attrs={label: "mm_rhs_smem", nc: True, tma: True}
+            async(%l0: lock<mbar>) collective=xyz.cluster {
+              move(%s0: smem<128x64xbf16 swizzle="128B">, %a0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.block attrs={label: "mm_lhs_smem", nc: True, tma: True}
+              move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.cluster attrs={label: "mm_rhs_smem", nc: True, tma: True}
             }
             await(%l0: lock<mbar>)
           }

@@ -45,10 +45,13 @@ class LowerToAsync(LoweringPass):
         ``{label}_await`` on the await (mirroring each other), so label-matching
         passes see it on the top-level ops rather than buried in the block.
         """
+        assert isinstance(inner, (MatmulOp, MoveOp, TmaMoveOp))
         lock = AllocOp.build_with_fresh_id(LockType.build(kind=kind))
         label = attrs.get("label")
         async_op = AsyncOp.build(
-            lock.result(), body=Block(ops=[inner]),
+            lock.result(),
+            collective=inner.collective,
+            body=Block(ops=[inner]),
             attrs={"label": f"{label}_async"} if label is not None else None,
         )
         await_op = AwaitOp.build(
@@ -74,7 +77,12 @@ class LowerToAsync(LoweringPass):
             return None
         dst = self.value_map[op.dst]
         src = self.value_map[op.src]
-        move = MoveOp.build(dst=dst, src=src, attrs=op.attrs)
+        move = MoveOp.build(
+            dst=dst,
+            src=src,
+            collective=op.collective,
+            attrs=op.attrs,
+        )
         return self._wrap(move, _tma_lock_kind(dst), op.attrs)
 
     @lowers(TmaMoveOp)
@@ -84,7 +92,13 @@ class LowerToAsync(LoweringPass):
         dst = self.value_map[op.dst]
         src = self.value_map[op.src]
         indices = [self.value_map[v] for v in op.indices]
-        tma = TmaMoveOp.build(dst=dst, src=src, indices=indices, attrs=op.attrs)
+        tma = TmaMoveOp.build(
+            dst=dst,
+            src=src,
+            indices=indices,
+            collective=op.collective,
+            attrs=op.attrs,
+        )
         return self._wrap(tma, _tma_lock_kind(dst), op.attrs)
 
     @lowers(MatmulOp)
@@ -113,7 +127,7 @@ class LowerToAsync(LoweringPass):
             attrs=op.extra_attrs,
             init=op.init,
         )
-        return self._wrap(matmul, "wgmma", op.attrs)
+        return self._wrap(matmul, "wgmma", op.extra_attrs)
 
 
 def lower_to_async(module: ModuleOp) -> ModuleOp:
