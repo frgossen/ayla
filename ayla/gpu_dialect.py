@@ -545,41 +545,42 @@ class ReshapeOp(Op):
 
 @gpu_dialect.register_op("elementwise")
 class ElementwiseOp(Op):
-    """One scalar function over each element: elementwise(dst, src).
+    """One scalar function over corresponding elements of its sources.
 
     ``fn`` names the function and is part of the op's textual syntax. Exp,
     tanh, relu and the rest still share one operation because they differ only
     in the instructions they lower to.
 
-    Source and destination types may differ. ``convert`` performs only the
-    element-wise dtype conversion; other functions may convert their result
-    to the destination dtype implicitly. Passing the same value as both
-    operands computes in place.
+    The first operand is the destination and the rest are sources. Passing the
+    same value as the destination and first source computes in place.
 
-    TODO: generalize to several sources and destinations. One of each admits
-    only unary functions -- add, mul and select need more than one input, and
-    a lowering may want to produce more than one value at a time.
+    TODO: generalize to several destinations.
     """
 
     @classmethod
     def build(
         cls,
         dst: Value,
-        src: Value,
+        srcs: list[Value],
         fn: str,
         attrs: dict[str, object] | None = None,
     ) -> "ElementwiseOp":
         return cls(
-            operands=[dst, src], results=[], attrs={"fn": fn, **(attrs or {})},
+            operands=[dst, *srcs],
+            results=[],
+            attrs={"fn": fn, **(attrs or {})},
         )
 
     @property
     def dst(self) -> Value:
         return self.operands[0]
 
+    def src(self, index: int) -> Value:
+        return self.operands[index + 1]
+
     @property
-    def src(self) -> Value:
-        return self.operands[1]
+    def num_srcs(self) -> int:
+        return len(self.operands) - 1
 
     @property
     def fn(self) -> str:
@@ -2138,10 +2139,12 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
             + _memory_effect("W", op.dst, CollectiveScope.THREAD)
         )
     if isinstance(op, ElementwiseOp):
-        return (
-            _memory_effect("W", op.dst, CollectiveScope.THREAD)
-            + _memory_effect("R", op.src, CollectiveScope.THREAD)
-        )
+        effects = _memory_effect("W", op.dst, CollectiveScope.THREAD)
+        for i in range(op.num_srcs):
+            effects += _memory_effect(
+                "R", op.src(i), CollectiveScope.THREAD,
+            )
+        return effects
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
@@ -2216,6 +2219,7 @@ def is_side_effect_free(op: Op) -> bool:
         ThreadIdsOp,
         TileOp,
         ToPtrOp,
+        ReshapeOp,
         WarpGroupIdOp,
     ))
 
