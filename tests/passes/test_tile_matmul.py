@@ -4,8 +4,18 @@ import textwrap
 import pytest
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import ForOp, IfOp, TileOp, gpu_dialect
-from ayla.passes.tile_matmul import tile_matmul
+from ayla.gpu_dialect import (
+    CollectiveAxis,
+    CollectiveLevel,
+    ForOp,
+    IfOp,
+    IndexConstantOp,
+    IndexLtOp,
+    MatmulOp,
+    TileOp,
+    gpu_dialect,
+)
+from ayla.passes.tile_matmul import TileMatmul, tile_matmul
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -19,7 +29,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
         }""")
 
     module = gpu_dialect.parse(module_str)
-    module = tile_matmul(module, ["M", "K"], [32, 16], ["for", "for"], ["m", "k"])
+    module = tile_matmul(module, ["M", "K"], [32, 16], [None, None], ["m", "k"])
     text = repr(module)
 
     expected = textwrap.dedent("""\
@@ -49,7 +59,10 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
     module = tile_matmul(
         module,
         op_dims=["M", "M"], tile_sizes=[2048, 128],
-        iteration_bindings=["for", "block.x"],
+        iteration_bindings=[
+            None,
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+        ],
         for_loop_labels=["outm", None],
         op_label_filter="mm",
     )
@@ -71,7 +84,8 @@ def test_warp_group_tiling_sets_block_dim():
     module = tile_matmul(
         module,
         op_dims=["M"], tile_sizes=[64],
-        iteration_bindings=["wg.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)],
+        for_loop_labels=[None],
     )
 
     [kernel] = module.body.ops
@@ -88,7 +102,8 @@ def test_partial_block_tile_rounds_up_the_grid():
         }"""))
     tile_matmul(
         module, op_dims=["M"], tile_sizes=[128],
-        iteration_bindings=["block.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+        for_loop_labels=[None],
         op_label_filter="mm", allow_partial_tiles=True,
     )
     assert "grid_dim=[2, None, None]" in repr(module)
@@ -114,7 +129,8 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
 
     module = tile_matmul(
         gpu_dialect.parse(module_str),
-        ["M", "K"], [32, 16], ["block.x", "for"], [None, "k"],
+        ["M", "K"], [32, 16],
+        [(CollectiveLevel.BLOCK, CollectiveAxis.X), None], [None, "k"],
         op_label_filter="mm", epilogue_label_filter="epilogue",
     )
 
@@ -146,7 +162,8 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
     tile_matmul(
         module,
         op_dims=["N"], tile_sizes=[64],
-        iteration_bindings=["block.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+        for_loop_labels=[None],
         op_label_filter="mm", epilogue_label_filter="epi",
     )
 
@@ -157,7 +174,6 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
             %c3: index = index_constant() attrs={value: 3}
             %0: pred = index_lt(%bx: index, %c3: index)
             if(%0: pred) {
-            ^bb0:
               %1: gmem<64x64xbf16> = tile(%b: gmem<192x64xbf16>, %bx: index, 0)
               %2: gmem<64x64xf32 strides=[192, 1]> = tile(%c: gmem<64x192xf32>, 0, %bx: index)
               matmul(%a: gmem<64x64xbf16>, %1: gmem<64x64xbf16>, %2: gmem<64x64xf32 strides=[192, 1]>) collective=[x.block, yz.grid] attrs={label: "mm"}
@@ -165,6 +181,108 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
             }
           }
         }""")  # noqa: E501
+
+
+@pytest.mark.parametrize(
+    ("op_dim", "iteration_binding", "launch_dims", "index_name"),
+    [
+        (
+            "M", (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            "grid_dim=[4, 1, 1]", "bx",
+        ),
+        (
+            "N", (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+            "grid_dim=[1, 4, 1]", "by",
+        ),
+        (
+            "K", (CollectiveLevel.BLOCK, CollectiveAxis.Z),
+            "grid_dim=[1, 1, 4]", "bz",
+        ),
+        (
+            "M", (CollectiveLevel.THREAD, CollectiveAxis.X),
+            "block_dim=[4, 1, 1]", "tx",
+        ),
+        (
+            "N", (CollectiveLevel.THREAD, CollectiveAxis.Y),
+            "block_dim=[1, 4, 1]", "ty",
+        ),
+        (
+            "K", (CollectiveLevel.THREAD, CollectiveAxis.Z),
+            "block_dim=[1, 1, 4]", "tz",
+        ),
+        (
+            "M", (CollectiveLevel.WG, CollectiveAxis.X),
+            "block_dim=[512, 1, 1] num_warp_groups=4", "wgx",
+        ),
+    ],
+)
+def test_parallel_tiling_guards_every_supported_binding(
+    op_dim, iteration_binding, launch_dims, index_name,
+):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) {launch_dims} {{
+            matmul(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
+          }}
+        }}"""))  # noqa: E501
+
+    tile_matmul(
+        module,
+        op_dims=[op_dim], tile_sizes=[64],
+        iteration_bindings=[iteration_binding], for_loop_labels=[None],
+    )
+
+    [guard] = find_ops_of_type(module, IfOp)
+    [condition] = find_ops_of_type(module, IndexLtOp)
+    assert condition.lhs.name == index_name
+    assert isinstance(condition.rhs.definition, IndexConstantOp)
+    assert condition.rhs.definition.value == 3
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.parent_block is guard.body
+
+
+def test_parallel_tiling_guards_multiple_dimensions():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) grid_dim=[4, 5, 1] {
+            matmul(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
+          }
+        }"""))  # noqa: E501
+
+    tile_matmul(
+        module,
+        op_dims=["M", "N"], tile_sizes=[64, 64],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
+        for_loop_labels=[None, None],
+    )
+
+    guards = find_ops_of_type(module, IfOp)
+    assert len(guards) == 2
+    conditions = find_ops_of_type(module, IndexLtOp)
+    assert [condition.lhs.name for condition in conditions] == ["bx", "by"]
+    assert all(
+        isinstance(condition.rhs.definition, IndexConstantOp)
+        and condition.rhs.definition.value == 3
+        for condition in conditions
+    )
+
+
+def test_parallel_tiling_rejects_two_dims_on_one_hardware_axis():
+    binding = (CollectiveLevel.BLOCK, CollectiveAxis.X)
+
+    with pytest.raises(
+        ValueError,
+        match="one hardware dimension cannot tile multiple matmul dimensions",
+    ):
+        TileMatmul(
+            op_dims=["M", "N"],
+            tile_sizes=[64, 64],
+            iteration_bindings=[binding, binding],
+            for_loop_labels=[None, None],
+        )
 
 
 def test_block_x_tiling_rejects_a_smaller_fixed_grid():
@@ -179,7 +297,8 @@ def test_block_x_tiling_rejects_a_smaller_fixed_grid():
         tile_matmul(
             module,
             op_dims=["N"], tile_sizes=[64],
-            iteration_bindings=["block.x"], for_loop_labels=[None],
+            iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+            for_loop_labels=[None],
             op_label_filter="mm",
         )
 
@@ -195,7 +314,8 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
     tile_matmul(
         module,
         op_dims=["N"], tile_sizes=[64],
-        iteration_bindings=["block.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+        for_loop_labels=[None],
     )
     [kernel] = module.body.ops
     assert kernel.grid_dim == (3, None, None)
@@ -207,7 +327,8 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
     tile_matmul(
         unmatched,
         op_dims=["N"], tile_sizes=[64],
-        iteration_bindings=["block.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+        for_loop_labels=[None],
         op_label_filter="missing",
     )
     assert repr(unmatched) == before

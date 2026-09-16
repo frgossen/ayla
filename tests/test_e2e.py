@@ -5,7 +5,7 @@ import textwrap
 import torch
 
 from ayla.base.pipeline import Pipeline
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
 from ayla.passes.licm import LICM
 from ayla.passes.pipeline_loop import PipelineLoop
 from ayla.passes.promote_buffers import PromoteBuffers
@@ -261,11 +261,11 @@ def test_tma_lowered():
 
 
 @requires_cuda
-def test_experimental_auto_matmul_4096():
-    """Experimental: build a wgmma matmul from high-level tiling passes."""
+def test_experimental_auto_matmul_4096_with_excess_block():
+    """Build a WGMMA matmul whose fixed grid has one inactive block."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) block_dim=[128, 1, 1] {
+          kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[33, 32, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
           }
         }""")
@@ -273,7 +273,10 @@ def test_experimental_auto_matmul_4096():
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
         op_dims=["M", "N"], tile_sizes=[128, 128],
-        iteration_bindings=["block.x", "block.y"],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
         for_loop_labels=[None, None],
         op_label_filter="mm",
     ))
@@ -284,7 +287,7 @@ def test_experimental_auto_matmul_4096():
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[64],
-        iteration_bindings=["for"], for_loop_labels=["k"],
+        iteration_bindings=[None], for_loop_labels=["k"],
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
@@ -294,7 +297,7 @@ def test_experimental_auto_matmul_4096():
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[16],
-        iteration_bindings=["for"], for_loop_labels=["l"],
+        iteration_bindings=[None], for_loop_labels=["l"],
         op_label_filter="mm",
     ))
     pipeline.add_pass(UnrollLoop(unroll_factor=2, label_filter="k"))
@@ -335,7 +338,10 @@ def test_dbg_module():
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
         op_dims=["M", "N"], tile_sizes=[128, 256],
-        iteration_bindings=["block.x", "block.y"],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
         for_loop_labels=[None, None],
         op_label_filter="mm",
     ))
@@ -346,7 +352,7 @@ def test_dbg_module():
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[64],
-        iteration_bindings=["for"], for_loop_labels=["k"],
+        iteration_bindings=[None], for_loop_labels=["k"],
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
@@ -356,7 +362,7 @@ def test_dbg_module():
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[16],
-        iteration_bindings=["for"], for_loop_labels=["k"],
+        iteration_bindings=[None], for_loop_labels=["k"],
         op_label_filter="mm",
     ))
     module = pipeline.run(module)

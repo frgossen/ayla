@@ -1032,6 +1032,26 @@ class IfOp(Op):
     def body(self) -> Block:
         return self.blocks[0]
 
+    def print(self, p: Printer) -> None:
+        p.write("if(")
+        self.condition.print(p)
+        p.write(") ")
+        self.body.print(p, skip_label=True)
+
+    @classmethod
+    def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        assert not results
+        p.read_literal("(")
+        condition = Value.parse(p)
+        p.read_literal(")")
+        brace = p.read_literal("{")
+        body = Block.parse(brace, p, arguments=[])
+        return cls.build(condition, body)
+
 
 @gpu_dialect.register_op("async")
 class AsyncOp(Op):
