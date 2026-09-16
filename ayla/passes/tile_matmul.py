@@ -17,9 +17,20 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     is_elementwise,
 )
-from ..base.ir import Block, Op, Value, clone_type
+from ..base.ir import Block, Op, Value, clone_type, find_ops
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
+
+
+_PARALLEL_BINDINGS = {
+    "block.x": ("block", CollectiveAxis.X),
+    "block.y": ("block", CollectiveAxis.Y),
+    "block.z": ("block", CollectiveAxis.Z),
+    "thread.x": ("thread", CollectiveAxis.X),
+    "thread.y": ("thread", CollectiveAxis.Y),
+    "thread.z": ("thread", CollectiveAxis.Z),
+    "wg.x": ("wg", CollectiveAxis.X),
+}
 
 
 class TileMatmul(LoweringPass):
@@ -34,10 +45,10 @@ class TileMatmul(LoweringPass):
         (writes the matching axis of the kernel's ``grid_dim``), or
         ``"thread.{x,y,z}"`` for ``thread_ids()`` (writes the matching
         axis of the kernel's ``block_dim``), or ``"wg.x"`` for
-        ``warp_group_id()``. If an output dimension is bound to ``block.x``
-        and that grid axis is already larger than its tile count, excess
-        blocks are guarded. A smaller grid remains a launch conflict; express
-        multiple waves with an explicit outer ``for`` tiling level.
+        ``warp_group_id()``. An existing parallel launch extent may be larger
+        than the logical tile count; excess workers are guarded. A smaller
+        extent remains a launch conflict; express multiple waves with an
+        explicit outer ``for`` tiling level.
       - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
         ``None`` for an iteration mapped to a hardware dimension.
 
@@ -102,10 +113,17 @@ class TileMatmul(LoweringPass):
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
         self._kernel = op
-        self._rewrite_block(op.body)
+        heroes = find_ops(op, self._is_hero)
+        bounds = {hero: self._iteration_bounds(hero) for hero in heroes}
+        self._resolve_launch_extents(bounds)
+        self._rewrite_block(op.body, bounds)
         return [op], []
 
-    def _rewrite_block(self, block: Block) -> None:
+    def _rewrite_block(
+        self,
+        block: Block,
+        bounds: dict[MatmulOp, list[int]],
+    ) -> None:
         """Replace each hero and the epilogue behind it with a tiled region.
 
         Nested blocks first, so a matmul already inside a loop from an earlier
@@ -113,7 +131,7 @@ class TileMatmul(LoweringPass):
         """
         for op in block.ops:
             for nested in op.blocks:
-                self._rewrite_block(nested)
+                self._rewrite_block(nested, bounds)
 
         ops = list(block.ops)
         new_ops: list[Op] = []
@@ -125,7 +143,7 @@ class TileMatmul(LoweringPass):
                 i += 1
                 continue
             epilogue = self._epilogue(ops, i)
-            new_ops.extend(self._tile(op, epilogue))
+            new_ops.extend(self._tile(op, epilogue, bounds[op]))
             i += 1 + len(epilogue)
         block.ops = new_ops
 
@@ -159,21 +177,17 @@ class TileMatmul(LoweringPass):
             i += 1
         return found
 
-    def _tile(self, hero: MatmulOp, epilogue: list[Op]) -> list[Op]:
-        lhs, rhs, dst = hero.operands
-
+    def _iteration_bounds(self, hero: MatmulOp) -> list[int]:
+        lhs, rhs, _ = hero.operands
         sizes_by_dim = {
             "M": lhs.type.sizes[0],
             "N": rhs.type.sizes[0],
             "K": lhs.type.sizes[1],
         }
-
-        # Compute iteration bounds and accumulate kernel constraints.
         ubs: list[int] = []
-        block_x_guard: int | None = None
-        for i, (op_dim, tile_size, iteration_binding) in enumerate(zip(
+        for op_dim, tile_size, iteration_binding in zip(
             self.op_dims, self.tile_sizes, self.iteration_bindings,
-        )):
+        ):
             if op_dim not in sizes_by_dim:
                 raise ValueError(
                     f"TileMatmul: op_dim must be 'M', 'N', or 'K'; "
@@ -195,34 +209,56 @@ class TileMatmul(LoweringPass):
                 )
             ub = (op_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
-            if (
-                iteration_binding == "block.x"
-                and op_dim in ("M", "N")
-                and self._kernel.grid_dim[0] is not None
-                and self._kernel.grid_dim[0] > ub
-            ):
-                block_x_guard = i
-            else:
-                self._accumulate_constraint(iteration_binding, ub)
             sizes_by_dim[op_dim] = tile_size
+        return ubs
 
+    def _resolve_launch_extents(
+        self, bounds: dict[MatmulOp, list[int]],
+    ) -> None:
+        required: dict[str, int] = {}
+        for ubs in bounds.values():
+            for binding, ub in zip(self.iteration_bindings, ubs):
+                if binding != "for":
+                    required[binding] = max(required.get(binding, 0), ub)
+
+        for binding, extent in required.items():
+            current = self._launch_extent(binding)
+            if current is not None and current > extent:
+                continue
+            self._accumulate_constraint(binding, extent)
+
+    def _launch_extent(self, binding: str) -> int | None:
+        level, axis = _PARALLEL_BINDINGS[binding]
+        if level == "block":
+            return self._kernel.grid_dim[axis]
+        if level == "thread":
+            return self._kernel.block_dim[axis]
+        return self._kernel.num_warp_groups
+
+    def _tile(
+        self,
+        hero: MatmulOp,
+        epilogue: list[Op],
+        ubs: list[int],
+    ) -> list[Op]:
+        lhs, rhs, dst = hero.operands
 
         new_ops: list[Op] = []
-        block_ids_op: BlockIdsOp | None = None
-        thread_ids_op: ThreadIdsOp | None = None
-        wg_id_op: WarpGroupIdOp | None = None
-        if any(binding.startswith("block.") for binding in self.iteration_bindings):
-            block_ids_op = BlockIdsOp.build()
-            new_ops.append(block_ids_op)
-        if any(binding.startswith("thread.") for binding in self.iteration_bindings):
-            thread_ids_op = ThreadIdsOp.build()
-            new_ops.append(thread_ids_op)
-            self.num_warp_groups_constraints = _resolve_launch_dim_constraints(
-                self.num_warp_groups_constraints, [-1],
-            )
-        if any(binding.startswith("wg.") for binding in self.iteration_bindings):
-            wg_id_op = WarpGroupIdOp.build()
-            new_ops.append(wg_id_op)
+        parallel_ids: dict[
+            str, BlockIdsOp | ThreadIdsOp | WarpGroupIdOp
+        ] = {}
+        for level, op_type in (
+            ("block", BlockIdsOp),
+            ("thread", ThreadIdsOp),
+            ("wg", WarpGroupIdOp),
+        ):
+            if any(
+                binding.startswith(f"{level}.")
+                for binding in self.iteration_bindings
+            ):
+                ids = op_type.build()
+                parallel_ids[level] = ids
+                new_ops.append(ids)
 
         ivs: list[Value] = []
         for iteration_binding, loop_label in zip(
@@ -230,26 +266,9 @@ class TileMatmul(LoweringPass):
         ):
             if iteration_binding == "for":
                 ivs.append(Value(name=loop_label, type=IndexType()))
-            elif iteration_binding == "block.x":
-                assert block_ids_op is not None
-                ivs.append(block_ids_op.x)
-            elif iteration_binding == "block.y":
-                ivs.append(block_ids_op.y)
-            elif iteration_binding == "block.z":
-                ivs.append(block_ids_op.z)
-            elif iteration_binding == "thread.x":
-                ivs.append(thread_ids_op.x)
-            elif iteration_binding == "thread.y":
-                ivs.append(thread_ids_op.y)
-            elif iteration_binding == "thread.z":
-                ivs.append(thread_ids_op.z)
-            elif iteration_binding == "wg.x":
-                ivs.append(wg_id_op.x)
             else:
-                raise ValueError(
-                    "TileMatmul: unexpected iteration_binding "
-                    f"{iteration_binding!r}"
-                )
+                level, axis = _PARALLEL_BINDINGS[iteration_binding]
+                ivs.append(parallel_ids[level].results[axis])
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
@@ -292,9 +311,9 @@ class TileMatmul(LoweringPass):
             body_ops.extend(dst_ops)
         for iteration_binding in self.iteration_bindings:
             if iteration_binding != "for":
-                level, dim = iteration_binding.split(".")
+                level, axis = _PARALLEL_BINDINGS[iteration_binding]
                 hero.narrow_collective_level(
-                    CollectiveAxis[dim.upper()],
+                    axis,
                     CollectiveLevel[level.upper()],
                 )
         body_ops.append(
@@ -316,20 +335,21 @@ class TileMatmul(LoweringPass):
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
 
-        for i, iv, ub, level, label in zip(
+        for i, iv, ub, binding, label in zip(
             reversed(range(len(self.iteration_bindings))),
             reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
             reversed(self.for_loop_labels),
         ):
-            if i == block_x_guard:
-                limit = IndexConstantOp.build(ub)
-                condition = IndexLtOp.build(iv, limit.result())
-                body_ops = [
-                    limit,
-                    condition,
-                    IfOp.build(condition.result(), Block(ops=body_ops)),
-                ]
-            if level != "for":
+            if binding != "for":
+                launch_extent = self._launch_extent(binding)
+                if launch_extent is not None and launch_extent > ub:
+                    limit = IndexConstantOp.build(ub)
+                    condition = IndexLtOp.build(iv, limit.result())
+                    body_ops = [
+                        limit,
+                        condition,
+                        IfOp.build(condition.result(), Block(ops=body_ops)),
+                    ]
                 continue
             body = Block(arguments=[iv], ops=body_ops)
             attrs = {"label": label} if label is not None else None
