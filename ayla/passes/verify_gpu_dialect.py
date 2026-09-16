@@ -50,13 +50,18 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(KernelOp)
     def _verify_kernel(self, op: KernelOp) -> None:
         cluster_dim = op.cluster_dim
-        if cluster_dim is None:
-            return
         if len(cluster_dim) != 3 or any(
-            not isinstance(dim, int) or dim <= 0 for dim in cluster_dim
+            dim is not None and (not isinstance(dim, int) or dim <= 0)
+            for dim in cluster_dim
         ):
             raise ValueError(
                 "cluster_dim must contain three positive dimensions"
+            )
+        if all(dim is None for dim in cluster_dim):
+            return
+        if self.stage == VerificationStage.PTX_LOWERING:
+            cluster_dim = tuple(
+                dim if dim is not None else 1 for dim in cluster_dim
             )
         grid_dim = (
             tuple(dim if dim is not None else 1 for dim in op.grid_dim)
@@ -64,7 +69,7 @@ class VerifyGpuDialect(VerificationPass):
             else op.grid_dim
         )
         if any(
-            grid is not None and grid % cluster
+            grid is not None and cluster is not None and grid % cluster
             for grid, cluster in zip(grid_dim, cluster_dim, strict=True)
         ):
             raise ValueError("cluster_dim must divide grid_dim")

@@ -78,7 +78,7 @@ class KernelOp(Op):
         body: Block,
         grid_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         block_dim: tuple[int | None, int | None, int | None] = (None, None, None),
-        cluster_dim: tuple[int, int, int] | None = None,
+        cluster_dim: tuple[int | None, int | None, int | None] = (None, None, None),
         num_warp_groups: int | None = None,
         ptx_optimization_level: int | None = None,
         attrs: dict[str, object] | None = None,
@@ -104,9 +104,7 @@ class KernelOp(Op):
                 "name": name,
                 "grid_dim": list(grid_dim),
                 "block_dim": list(block_dim),
-                "cluster_dim": (
-                    None if cluster_dim is None else list(cluster_dim)
-                ),
+                "cluster_dim": list(cluster_dim),
                 "num_warp_groups": num_warp_groups,
                 **attrs,
             },
@@ -134,9 +132,8 @@ class KernelOp(Op):
         self.attrs["block_dim"] = list(value)
 
     @property
-    def cluster_dim(self) -> tuple[int, int, int] | None:
-        value = self.attrs.get("cluster_dim")
-        return None if value is None else tuple(value)  # type: ignore[return-value]
+    def cluster_dim(self) -> tuple[int | None, int | None, int | None]:
+        return tuple(self.attrs["cluster_dim"])  # type: ignore[return-value]
 
     @property
     def num_warp_groups(self) -> int | None:
@@ -189,7 +186,7 @@ class KernelOp(Op):
         if any(d is not None for d in self.block_dim):
             p.write(" block_dim=")
             p.write_list_attr(list(self.block_dim))
-        if self.cluster_dim is not None:
+        if any(d is not None for d in self.cluster_dim):
             p.write(" cluster_dim=")
             p.write_list_attr(list(self.cluster_dim))
         if self.num_warp_groups is not None:
@@ -222,7 +219,7 @@ class KernelOp(Op):
         p.read_literal(")")
         grid_dim = (None, None, None)
         block_dim = (None, None, None)
-        cluster_dim = None
+        cluster_dim = (None, None, None)
         if p.can_read_literal("grid_dim"):
             p.read_literal("grid_dim")
             p.read_literal("=")

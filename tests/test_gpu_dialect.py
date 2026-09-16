@@ -238,6 +238,19 @@ def test_kernel_cluster_dimensions_round_trip():
           }
         }"""))
 
+
+def test_kernel_cluster_dimensions_default_to_unresolved():
+    kernel = KernelOp.build("k", Block())
+    module = ModuleOp.build(Block(ops=[kernel]))
+
+    assert kernel.cluster_dim == (None, None, None)
+    assert_print_and_roundtrip(module, textwrap.dedent("""\
+        module {
+          kernel @k() {
+          }
+        }"""))
+
+
 def test_for_loop():
     op = ForOp.build(0, 64, 4)
     op.body.append(Op(operands=[op.iv], results=[]))
