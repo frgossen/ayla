@@ -51,6 +51,7 @@ include = [
     "ayla/passes/canonicalize.py",
     "ayla/passes/dce.py",
     "ayla/passes/schedule_async.py",
+    "ayla/passes/specialize_shapes.py",
     "ayla/pytree.py",
 ]
 pythonVersion = "3.12"
