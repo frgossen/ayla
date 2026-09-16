@@ -84,8 +84,6 @@ class KernelOp(Op):
         attrs: dict[str, object] | None = None,
     ) -> "KernelOp":
         attrs = dict(attrs or {})
-        if "cluster_dim" in attrs:
-            raise ValueError("pass cluster_dim as an explicit argument")
         if "ptx_optimization_level" in attrs:
             raise ValueError(
                 "pass ptx_optimization_level as an explicit argument"
