@@ -25,6 +25,39 @@ def test_reuses_output_buffer_for_matmul_temporary():
         }""")
 
 
+def test_reuses_output_buffer_between_matmuls():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
+            %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
+            %first_acc: smem<16x16xf32> = alloc() attrs={id: 1, init: 0.0}
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) collective=xyz.grid
+            move(%tmp: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) attrs={tma: True}
+            %second_lhs: smem<16x16xf32> = alloc() attrs={id: 2, init: 0.0}
+            move(%second_lhs: smem<16x16xf32>, %tmp: gmem<16x16xf32>) attrs={tma: True}
+            %second_acc: smem<16x16xf32> = alloc() attrs={id: 3, init: 0.0}
+            matmul(%second_lhs: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
+            move(%output: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) attrs={tma: True}
+          }
+        }"""))
+
+    reuse_buffers(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
+            %first_acc: smem<16x16xf32> = alloc() attrs={id: 1, init: 0.0}
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) collective=xyz.grid
+            move(%output: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) attrs={tma: True}
+            %second_lhs: smem<16x16xf32> = alloc() attrs={id: 2, init: 0.0}
+            move(%second_lhs: smem<16x16xf32>, %output: gmem<16x16xf32>) attrs={tma: True}
+            %second_acc: smem<16x16xf32> = alloc() attrs={id: 3, init: 0.0}
+            matmul(%second_lhs: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
+            move(%output: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) attrs={tma: True}
+          }
+        }""")
+
+
 def test_reuses_one_buffer_for_elementwise_chain():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
