@@ -4,7 +4,8 @@ from __future__ import annotations
 import enum
 import itertools
 import math
-from typing import ClassVar, Iterator
+from collections.abc import Sequence
+from typing import ClassVar, Iterator, cast
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
@@ -37,15 +38,21 @@ class ModuleOp(Op):
 
     @property
     def version(self) -> str:
-        return self.attrs["version"]
+        value = self.attrs["version"]
+        assert isinstance(value, str)
+        return value
 
     @property
     def target(self) -> str:
-        return self.attrs["target"]
+        value = self.attrs["target"]
+        assert isinstance(value, str)
+        return value
 
     @property
     def address_size(self) -> int:
-        return self.attrs["address_size"]
+        value = self.attrs["address_size"]
+        assert isinstance(value, int)
+        return value
 
     def print(self, p: Printer) -> None:
         p.write("module")
@@ -215,6 +222,9 @@ class KernelOp(Op):
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=args)
         ptx_optimization_level = attrs.pop("ptx_optimization_level", None)
+        assert ptx_optimization_level is None or isinstance(
+            ptx_optimization_level, int,
+        )
         return cls.build(
             name,
             body,
@@ -776,7 +786,9 @@ class LockType(Type):
 
     @property
     def kind(self) -> str | None:
-        return self.attrs.get("kind")
+        kind = self.attrs.get("kind")
+        assert kind is None or isinstance(kind, str)
+        return kind
 
     def print(self, p: Printer) -> None:
         p.write("lock<")
@@ -1000,7 +1012,7 @@ class MemTensorType(Type):
     @classmethod
     def build(
         cls,
-        sizes: list[int | None],
+        sizes: Sequence[int | None],
         dtype: Type,
         attrs: dict[str, object] | None = None,
     ):
@@ -1026,9 +1038,10 @@ class MemTensorType(Type):
 
     @property
     def num_elements(self) -> int | None:
-        if self.is_dynamic:
+        sizes = self.sizes
+        if None in sizes:
             return None
-        return math.prod(self.sizes)
+        return math.prod(cast(tuple[int, ...], sizes))
 
     @property
     def is_dynamic(self) -> bool:
@@ -1052,7 +1065,7 @@ class MemTensorType(Type):
                 f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
             )
         p.read_literal("<")
-        sizes, dtype = p.read_shape(with_dtype=True)
+        sizes, dtype = p.read_shape_with_dtype()
         attrs = p.read_extra_attrs()
         p.read_literal(">")
         return cls(attrs={
@@ -1071,7 +1084,7 @@ class AddrMemTensorType(MemTensorType):
 
     @staticmethod
     def canonical_strides(
-        sizes: list[int | None],
+        sizes: Sequence[int | None],
     ) -> list[int | None]:
         """Row-major dense strides (in elements)."""
         strides: list[int | None] = []
@@ -1088,9 +1101,9 @@ class AddrMemTensorType(MemTensorType):
     @classmethod
     def build(  # type: ignore[override]
         cls,
-        sizes: list[int | None],
+        sizes: Sequence[int | None],
         dtype: Type,
-        strides: list[int | None] | None = None,
+        strides: Sequence[int | None] | None = None,
         attrs: dict[str, object] | None = None,
     ):
         if strides is None:
@@ -1113,8 +1126,10 @@ class AddrMemTensorType(MemTensorType):
             p.write_list_attr(list(self.strides))
 
     @staticmethod
-    def read_strides(sizes: list[int | None], p) -> list[int | None]:
-        strides = AddrMemTensorType.canonical_strides(sizes)
+    def read_strides(
+        sizes: Sequence[int | None], p,
+    ) -> list[int | None]:
+        strides = list(AddrMemTensorType.canonical_strides(sizes))
         if p.can_read_literal("strides"):
             p.read_literal("strides")
             p.read_literal("=")
@@ -1138,7 +1153,7 @@ class AddrMemTensorType(MemTensorType):
                 f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
             )
         p.read_literal("<")
-        sizes, dtype = p.read_shape(with_dtype=True)
+        sizes, dtype = p.read_shape_with_dtype()
         strides = cls.read_strides(sizes, p)
         attrs = p.read_extra_attrs()
         p.read_literal(">")
@@ -1169,14 +1184,16 @@ class SmemTensorType(AddrMemTensorType):
     @classmethod
     def build(  # type: ignore[override]
         cls,
-        sizes: list[int],
+        sizes: Sequence[int],
         dtype: Type,
-        strides: list[int] | None = None,
+        strides: Sequence[int] | None = None,
         swizzle: str | None = None,
         attrs: dict[str, object] | None = None,
     ):
         if strides is None:
-            strides = cls.canonical_strides(sizes)
+            canonical_strides = cls.canonical_strides(sizes)
+            assert None not in canonical_strides
+            strides = cast(list[int], canonical_strides)
         return cls(attrs={
             "sizes": list(sizes),
             "dtype": dtype,
@@ -1187,7 +1204,9 @@ class SmemTensorType(AddrMemTensorType):
 
     @property
     def swizzle(self) -> str | None:
-        return self.attrs["swizzle"]
+        swizzle = self.attrs["swizzle"]
+        assert swizzle is None or isinstance(swizzle, str)
+        return swizzle
 
     def print(self, p: Printer) -> None:
         p.write(self.name)
@@ -1208,7 +1227,7 @@ class SmemTensorType(AddrMemTensorType):
                 f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
             )
         p.read_literal("<")
-        sizes, dtype = p.read_shape(with_dtype=True)
+        sizes, dtype = p.read_shape_with_dtype()
         strides = cls.read_strides(sizes, p)
         swizzle: str | None = None
         if p.can_read_literal("swizzle"):
@@ -1217,7 +1236,15 @@ class SmemTensorType(AddrMemTensorType):
             swizzle = p.read_str_attr()
         attrs = p.read_extra_attrs()
         p.read_literal(">")
-        return cls.build(sizes, dtype, strides, swizzle, attrs=attrs)
+        assert None not in sizes
+        assert None not in strides
+        return cls.build(
+            cast(list[int], sizes),
+            dtype,
+            cast(list[int], strides),
+            swizzle,
+            attrs=attrs,
+        )
 
 
 @gpu_dialect.register_type("ptr")
@@ -1237,7 +1264,9 @@ class PtrType(Type):
 
     @property
     def space(self) -> str:
-        return self.attrs["space"]
+        space = self.attrs["space"]
+        assert isinstance(space, str)
+        return space
 
     def print(self, p: Printer) -> None:
         p.write(f"ptr<{self.space}")
@@ -1347,11 +1376,15 @@ class TmaDescType(Type):
 
     @property
     def arg_idx(self) -> int:
-        return self.attrs["arg_idx"]
+        arg_idx = self.attrs["arg_idx"]
+        assert isinstance(arg_idx, int)
+        return arg_idx
 
     @property
     def gmem_type(self) -> "GmemTensorType":
-        return self.attrs["gmem_type"]
+        gmem_type = self.attrs["gmem_type"]
+        assert isinstance(gmem_type, GmemTensorType)
+        return gmem_type
 
     @property
     def dtype(self) -> Type:
@@ -1359,7 +1392,10 @@ class TmaDescType(Type):
 
     @property
     def tile_sizes(self) -> tuple[int, ...]:
-        return tuple(self.attrs["tile_shape"])
+        tile_shape = self.attrs["tile_shape"]
+        assert isinstance(tile_shape, list)
+        assert all(isinstance(size, int) for size in tile_shape)
+        return tuple(tile_shape)
 
     @property
     def tile_num_elements(self) -> int:
@@ -1371,7 +1407,9 @@ class TmaDescType(Type):
 
     @property
     def swizzle(self) -> str | None:
-        return self.attrs["swizzle"]
+        swizzle = self.attrs["swizzle"]
+        assert swizzle is None or isinstance(swizzle, str)
+        return swizzle
 
     def print(self, p: Printer) -> None:
         p.write(f"{self.name}<")
@@ -1401,7 +1439,7 @@ class TmaDescType(Type):
         gmem_type = GmemTensorType.parse(gmem_prefix, p)
         p.read_literal("tile")
         p.read_literal("=")
-        tile_shape = p.read_shape(with_dtype=False)
+        tile_shape = p.read_shape()
         swizzle: str | None = None
         if p.can_read_literal("swizzle"):
             p.read_literal("swizzle")
@@ -1410,10 +1448,12 @@ class TmaDescType(Type):
         attrs = p.read_extra_attrs()
         p.read_literal(">")
         l2_promotion = attrs.pop("l2_promotion", None)
+        assert None not in tile_shape
+        assert l2_promotion is None or isinstance(l2_promotion, str)
         return cls.build(
             arg_idx,
             gmem_type,
-            tile_shape,
+            cast(list[int], tile_shape),
             swizzle=swizzle,
             l2_promotion=l2_promotion,
             attrs=attrs,
@@ -1494,7 +1534,9 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
 
     @property
     def num_elements_per_thread(self) -> int:
-        return self.num_elements // (self.warps * 32)
+        num_elements = self.num_elements
+        assert num_elements is not None
+        return num_elements // (self.warps * 32)
 
     def print(self, p: Printer) -> None:
         p.write(self.name)
@@ -1515,7 +1557,7 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
                 f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
             )
         p.read_literal("<")
-        sizes, dtype = p.read_shape(with_dtype=True)
+        sizes, dtype = p.read_shape_with_dtype()
         warps = 1
         if p.can_read_literal("warps"):
             p.read_literal("warps")
@@ -1637,6 +1679,9 @@ class ForOp(Op):
         if p.can_read_literal("step"):
             p.read_literal("step")
             step = p.read_literal_attr()
+        assert isinstance(lb, int)
+        assert isinstance(ub, int)
+        assert isinstance(step, int)
         p.read_literal(")")
         attrs = p.read_extra_attrs()
         brace = p.read_literal("{")
@@ -1760,7 +1805,9 @@ class IndexConstantOp(Op):
 
     @property
     def value(self) -> int:
-        return self.attrs["value"]
+        value = self.attrs["value"]
+        assert isinstance(value, int)
+        return value
 
     def expr_str(self, prec=0, val_str=None) -> str:
         return str(self.value)

@@ -283,7 +283,7 @@ def test_build_is_not_a_user_until_placed():
     t = Type()
     a = Value(name="a", type=t)
     block = Block(arguments=[a])
-    op = Op.build(operands=[a])
+    op = Op(operands=[a], results=[])
     assert a.users() == []
 
     block.ops.append(op)
