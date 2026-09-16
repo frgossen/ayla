@@ -25,6 +25,33 @@ def test_reuses_output_buffer_for_matmul_temporary():
         }""")
 
 
+def test_reuses_one_buffer_for_elementwise_chain():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @elementwise_chain(%src: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
+            %a: gmem<16x16xf32> = alloc() attrs={id: 0}
+            %b: gmem<16x16xf32> = alloc() attrs={id: 1}
+            %c: gmem<16x16xf32> = alloc() attrs={id: 2}
+            elementwise(%a: gmem<16x16xf32>, %src: gmem<16x16xf32>) attrs={fn: "relu"}
+            elementwise(%b: gmem<16x16xf32>, %a: gmem<16x16xf32>) attrs={fn: "exp"}
+            elementwise(%c: gmem<16x16xf32>, %b: gmem<16x16xf32>) attrs={fn: "tanh"}
+            elementwise(%output: gmem<16x16xf32>, %c: gmem<16x16xf32>) attrs={fn: "sigmoid"}
+          }
+        }"""))
+
+    reuse_buffers(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @elementwise_chain(%src: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
+            elementwise(%output: gmem<16x16xf32>, %src: gmem<16x16xf32>) attrs={fn: "relu"}
+            elementwise(%output: gmem<16x16xf32>, %output: gmem<16x16xf32>) attrs={fn: "exp"}
+            elementwise(%output: gmem<16x16xf32>, %output: gmem<16x16xf32>) attrs={fn: "tanh"}
+            elementwise(%output: gmem<16x16xf32>, %output: gmem<16x16xf32>) attrs={fn: "sigmoid"}
+          }
+        }""")
+
+
 def test_does_not_reuse_buffer_that_remains_live_after_handoff():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
