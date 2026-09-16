@@ -19,6 +19,8 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BF16Type,
     BarrierOp,
+    ClusterBlockIdsOp,
+    CollectiveScope,
     ElementwiseOp,
     F32Type,
     ForOp,
@@ -249,6 +251,28 @@ def test_kernel_cluster_dimensions_default_to_unresolved():
           kernel @k() {
           }
         }"""))
+
+
+def test_cluster_block_ids_round_trip():
+    ids = ClusterBlockIdsOp.build()
+
+    assert ids.results == [ids.x, ids.y, ids.z]
+    assert_print_and_roundtrip(
+        ids,
+        "%cbx: index, %cby: index, %cbz: index "
+        "= cluster_block_ids()",
+    )
+
+
+def test_cluster_collective_scope_is_between_block_and_grid():
+    assert (
+        CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER)
+        == CollectiveScope.CLUSTER
+    )
+    assert (
+        CollectiveScope.CLUSTER.join(CollectiveScope.GRID)
+        == CollectiveScope.GRID
+    )
 
 
 def test_for_loop():

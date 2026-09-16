@@ -10,6 +10,7 @@ from .base.ir import Op, Printer, Value
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdsOp,
+    ClusterBlockIdsOp,
     ForOp,
     GmemTensorType,
     IfOp,
@@ -323,6 +324,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_thread_ids(p, op)
     elif isinstance(op, BlockIdsOp):
         _emit_block_ids(p, op)
+    elif isinstance(op, ClusterBlockIdsOp):
+        _emit_cluster_block_ids(p, op)
     elif isinstance(op, IndexConstantOp):
         _emit_index_constant(p, op)
     elif isinstance(op, IndexAddOp):
@@ -514,6 +517,19 @@ def _emit_block_ids(p: PtxPrinter, op: BlockIdsOp) -> None:
     p.write_line(f"mov.u32 {rx}, %ctaid.x;")
     p.write_line(f"mov.u32 {ry}, %ctaid.y;")
     p.write_line(f"mov.u32 {rz}, %ctaid.z;")
+    p.write_newline_once()
+
+
+# TODO: Consider making the thread, block, and cluster block ID ops take an
+# axis attribute and return one value instead of always materializing x, y, z.
+def _emit_cluster_block_ids(p: PtxPrinter, op: ClusterBlockIdsOp) -> None:
+    rx = p.unique_ptx_names_for_value(op.x)
+    ry = p.unique_ptx_names_for_value(op.y)
+    rz = p.unique_ptx_names_for_value(op.z)
+    p.write_newline_once()
+    p.write_line(f"mov.u32 {rx}, %cluster_ctaid.x;")
+    p.write_line(f"mov.u32 {ry}, %cluster_ctaid.y;")
+    p.write_line(f"mov.u32 {rz}, %cluster_ctaid.z;")
     p.write_newline_once()
 
 
