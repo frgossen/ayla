@@ -11,6 +11,7 @@ and aspirationally to fuse GEMM epilogues.
 ```bash
 git submodule update --init                 # fetch the fast.cu reference submodule
 pip install -e ".[dev]"                     # install (editable) + pytest
+git config core.hooksPath .githooks         # run checks before each push
 pytest                                      # run the tests
 python -m benchmarks.bench_gemm_collection  # benchmark
 ```
