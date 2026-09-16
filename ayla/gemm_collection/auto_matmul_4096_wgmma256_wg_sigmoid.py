@@ -50,7 +50,7 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
             elementwise(%c: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={fn: "sigmoid", label: "epi"}
           }
         }""")
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     pipeline = Pipeline()
     pipeline.add_instrumentation_pass(VerifyGpuDialect())
     pipeline.add_pass(TileMatmul(
