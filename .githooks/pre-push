@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+pytest -q -rs
+ruff check
+pyright
