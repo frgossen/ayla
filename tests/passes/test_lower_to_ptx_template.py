@@ -4,7 +4,7 @@ import textwrap
 
 import pytest
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
     IndexConstantOp,
     PtrAddOp,
@@ -30,7 +30,7 @@ def _lower_barrier(scope: str) -> str:
     lowered = lower_to_ptx_template(module)
     return "".join(
         t.attrs["template"]
-        for t in find_ops(lowered, lambda o: isinstance(o, PTXTemplateOp))
+        for t in find_ops_of_type(lowered, PTXTemplateOp)
     )
 
 
@@ -64,17 +64,17 @@ def test_lower_smem_arena_and_reinterpret():
     lower_to_ptx_template(module)
     templates = [
         op.attrs["template"]
-        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+        for op in find_ops_of_type(module, PTXTemplateOp)
     ]
     assert sum(".shared" in template for template in templates) == 1
     assert ".shared .align 1024" in templates[0]
     assert "[12288]" in templates[0]
     assert len(templates) == 1
-    [reinterpret] = find_ops(module, lambda op: isinstance(op, PtrAddOp))
+    [reinterpret] = find_ops_of_type(module, PtrAddOp)
     assert isinstance(reinterpret.ptr.definition, ToPtrOp)
     assert isinstance(reinterpret.byte_offset.definition, IndexConstantOp)
     assert reinterpret.byte_offset.definition.value == 8192
-    assert not find_ops(module, lambda op: isinstance(op, ReinterpretOp))
+    assert not find_ops_of_type(module, ReinterpretOp)
 
 
 def test_lower_zero_offset_reinterpret_is_elided():
@@ -111,7 +111,7 @@ def test_lower_tma_load_with_l2_cache_hint():
     lower_to_ptx_template(module)
     ptx = "".join(
         op.attrs["template"]
-        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+        for op in find_ops_of_type(module, PTXTemplateOp)
     )
     assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
     assert "mbarrier::complete_tx::bytes.L2::cache_hint" in ptx
@@ -130,7 +130,7 @@ def test_lower_tma_store_with_l2_cache_hint():
     lower_to_ptx_template(module)
     ptx = "".join(
         op.attrs["template"]
-        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+        for op in find_ops_of_type(module, PTXTemplateOp)
     )
     assert ptx.count("createpolicy.fractional.L2::evict_first") == 1
     assert "global.shared::cta.bulk_group.L2::cache_hint" in ptx
@@ -153,7 +153,7 @@ def test_lower_move_gmem_to_smem():
     module = gpu_dialect.parse(module_str)
     module = lower_to_async(module)
     lowered = lower_to_ptx_template(module)
-    templates = find_ops(lowered, lambda op: isinstance(op, PTXTemplateOp))
+    templates = find_ops_of_type(lowered, PTXTemplateOp)
     template = templates[-1].attrs["template"]
 
     assert_contains_in_order(
@@ -209,9 +209,7 @@ def test_lower_elementwise_sigmoid_mma():
         }}"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops(
-        lowered, lambda o: isinstance(o, PTXTemplateOp)
-    )[-1].attrs["template"]
+    template = find_ops_of_type(lowered, PTXTemplateOp)[-1].attrs["template"]
 
     expected = "".join(
         textwrap.dedent(f"""\
@@ -239,9 +237,8 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
 
     [template] = [
         op.attrs["template"]
-        for op in find_ops(
-            lower_to_ptx_template(module),
-            lambda op: isinstance(op, PTXTemplateOp),
+        for op in find_ops_of_type(
+            lower_to_ptx_template(module), PTXTemplateOp,
         )
         if "ex2." in op.attrs["template"]
     ]
@@ -259,9 +256,8 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
           }
         }"""))  # noqa: E501
 
-    template = find_ops(
-        lower_to_ptx_template(module),
-        lambda op: isinstance(op, PTXTemplateOp),
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
     )[-1].attrs["template"]
     assert "ex2.approx.f32" in template
     assert "ex2.approx.ftz.f32" not in template
@@ -281,8 +277,8 @@ def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
         }"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops(
-        lowered, lambda op: isinstance(op, PTXTemplateOp),
+    template = find_ops_of_type(
+        lowered, PTXTemplateOp,
     )[-1].attrs["template"]
     assert template.count("cvt.rn.bf16x2.f32") == 16
     assert "operand.dst.r48" in template
@@ -301,8 +297,8 @@ def test_lower_elementwise_uses_root_registers_for_wrmem_view():
         }"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops(
-        lowered, lambda op: isinstance(op, PTXTemplateOp),
+    template = find_ops_of_type(
+        lowered, PTXTemplateOp,
     )[-1].attrs["template"]
     assert template.count("mul.f32") == 32
     assert template.count("ex2.approx.f32") == 32

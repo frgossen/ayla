@@ -18,6 +18,7 @@ from ayla.gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
     BF16Type,
+    BarrierOp,
     F32Type,
     ForOp,
     IfOp,
@@ -27,11 +28,15 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    SelectOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
     gpu_dialect,
+    has_ordering_effect,
+    memory_effects,
     root_buffer,
+    root_buffers,
 )
 
 
@@ -62,6 +67,27 @@ def test_reinterpret_op():
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
         ReinterpretOp.build(storage, F32Type())
+
+
+def test_buffer_roots_support_no_root_and_multiple_roots():
+    lhs = Value(name="lhs", type=SmemTensorType.build((1,), F32Type()))
+    rhs = Value(name="rhs", type=SmemTensorType.build((1,), F32Type()))
+    index = Value(name="index", type=IndexType())
+    select = SelectOp.build(index, [lhs, rhs])
+
+    assert root_buffers(select.result()) == {lhs, rhs}
+    with pytest.raises(AssertionError, match="multiple root buffers"):
+        root_buffer(select.result())
+    assert root_buffer(index) is None
+
+
+def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
+    barrier = BarrierOp.build()
+    nested = IfOp(operands=[], results=[], blocks=[Block(ops=[barrier])])
+
+    assert memory_effects(barrier) is None
+    assert has_ordering_effect(barrier)
+    assert has_ordering_effect(nested)
 
 
 def test_matmul_program():

@@ -1,7 +1,7 @@
 """Tests for lowering compatible moves with STMatrix stores."""
 import textwrap
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     PTXTemplateOp,
     gpu_dialect,
@@ -20,7 +20,7 @@ def test_lowers_128b_block_major_move_with_stmatrix():
         }"""))
 
     module = lower_to_ptx_template(module)
-    templates = find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    templates = find_ops_of_type(module, PTXTemplateOp)
     template = next(
         op.template for op in templates if "stmatrix.sync" in op.template
     )
@@ -42,7 +42,7 @@ def test_lowers_128b_block_major_column_slice():
         }"""))
 
     module = lower_to_ptx_template(module)
-    templates = find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    templates = find_ops_of_type(module, PTXTemplateOp)
     template = next(
         op.template for op in templates if "stmatrix.sync" in op.template
     )
@@ -65,7 +65,7 @@ def test_lowers_legacy_attribute_column_slice():
         }"""))
 
     module = lower_to_ptx_template(module)
-    templates = find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    templates = find_ops_of_type(module, PTXTemplateOp)
     template = next(
         op.template for op in templates if "stmatrix.sync" in op.template
     )
@@ -83,7 +83,7 @@ def test_unswizzled_move_uses_scalar_store_fallback():
         }"""))
 
     module = lower_to_ptx_template(module)
-    templates = find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    templates = find_ops_of_type(module, PTXTemplateOp)
     template = "".join(op.template for op in templates)
     assert "stmatrix.sync" not in template
     assert "st.shared.b32" in template
@@ -102,7 +102,7 @@ def test_scalar_store_uses_root_registers_for_nested_wrmem_view():
         }"""))
 
     module = lower_to_ptx_template(module)
-    templates = find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    templates = find_ops_of_type(module, PTXTemplateOp)
     template = "".join(op.template for op in templates)
     assert template.count("st.shared.b32") == 16
     assert "${b32:operand.src.r112}" in template

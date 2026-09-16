@@ -2,7 +2,7 @@
 
 import textwrap
 
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     AllocOp,
     BF16Type,
@@ -61,7 +61,7 @@ def test_reuses_storage_between_named_allocation_groups():
 
     reuse_smem_allocs(module)
     [kernel] = module.body.ops
-    allocations = find_ops(kernel, lambda op: isinstance(op, AllocOp))
+    allocations = find_ops_of_type(kernel, AllocOp)
     [persistent] = [
         op for op in allocations if op.attrs.get("label") == "shared"
     ]
@@ -71,11 +71,11 @@ def test_reuses_storage_between_named_allocation_groups():
     ]
     assert owner.attrs["allocation_bytes"] == 8192
     assert allocations == [persistent, owner]
-    [second] = find_ops(kernel, lambda op: isinstance(op, ReinterpretOp))
+    [second] = find_ops_of_type(kernel, ReinterpretOp)
     assert second.storage is owner.result()
     assert second.byte_offset == 0
     assert second.result().type == SmemTensorType.build((32, 64), BF16Type())
-    [move] = find_ops(kernel, lambda op: isinstance(op, MoveOp))
+    [move] = find_ops_of_type(kernel, MoveOp)
     assert move.dst is second.result()
     assert move.src is second.result()
     assert {op.attrs.get("reuse_group") for op in allocations} == {

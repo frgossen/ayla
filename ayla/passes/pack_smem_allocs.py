@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..base.ir import Block, find_ops
+from ..base.ir import Block, find_ops_of_type
 from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
@@ -55,7 +55,7 @@ class PackSmemAllocs(Pass):
         first_wide_index = alignments.index(widest)
         first_wide = allocs[first_wide_index]
 
-        # TODO: A general kernel-wide packing pass should use find_ops to
+        # TODO: A general kernel-wide packing pass should use find_ops_of_type to
         # collect nested SMEM allocations, safely hoist them to a common block,
         # and optimize their complete layout. This heuristic only reorders
         # allocations that are already direct children of the same block.
@@ -102,11 +102,10 @@ class ReuseSmemAllocs(Pass):
         [kernel] = module.body.ops
         if not isinstance(kernel, KernelOp):
             raise ValueError("SMEM reuse requires a single-kernel module")
-        allocations = find_ops(
-            kernel,
-            lambda op: isinstance(op, AllocOp)
-            and isinstance(op.result().type, SmemTensorType),
-        )
+        allocations = [
+            op for op in find_ops_of_type(kernel, AllocOp)
+            if isinstance(op.result().type, SmemTensorType)
+        ]
         groups: dict[str, list[AllocOp]] = {}
         base: AllocOp | None = None
         arena_alignment = 1

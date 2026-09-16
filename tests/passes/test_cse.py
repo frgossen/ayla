@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect, IndexConstantOp
-from ayla.base.ir import find_ops
+from ayla.base.ir import find_ops_of_type
 from ayla.passes.cse import cse
 
 
@@ -22,11 +22,11 @@ def test_cse_deduplicates_index_constants():
         }""")
 
     module = gpu_dialect.parse(module_str)
-    before_constants = find_ops(module, lambda op: isinstance(op, IndexConstantOp))
+    before_constants = find_ops_of_type(module, IndexConstantOp)
     assert sum(1 for op in before_constants if op.value == 64) == 2
 
     module = cse(module)
-    after_constants = find_ops(module, lambda op: isinstance(op, IndexConstantOp))
+    after_constants = find_ops_of_type(module, IndexConstantOp)
     assert sum(1 for op in after_constants if op.value == 64) == 1
 
     # c64b is CSE'd to c64a, offset_b is CSE'd to offset_a.
