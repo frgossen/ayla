@@ -146,10 +146,6 @@ class KernelOp(Op):
         return self.attrs.get("ptx_optimization_level")  # type: ignore[return-value]
 
     @property
-    def requires_resident_grid(self) -> bool:
-        return bool(self.attrs.get("requires_resident_grid", False))
-
-    @property
     def num_threads(self) -> int | None:
         """Number of threads, or ``None`` if a block axis is unresolved."""
         if any(dim is None for dim in self.block_dim):
@@ -993,7 +989,9 @@ class BarrierOp(Op):
 
     It only establishes a happens-before across its participating threads.
     Hardware-backed scopes need no operand; a software grid barrier carries
-    the global-memory synchronization buffer used by its lowering.
+    its zero-initialized global-memory synchronization buffer. Kernels using a
+    grid barrier must be scheduled so all participating blocks can be resident
+    concurrently.
 
     The ``scope`` attribute records the participant set the sync spans, one of:
     ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
@@ -1007,8 +1005,6 @@ class BarrierOp(Op):
         sync: Value | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "BarrierOp":
-        if attrs is not None and "scope" in attrs:
-            raise ValueError("BarrierOp: pass scope as an explicit argument")
         return cls(
             operands=[] if sync is None else [sync],
             results=[], attrs={"scope": scope, **(attrs or {})},

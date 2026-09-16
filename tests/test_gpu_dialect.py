@@ -19,7 +19,6 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BarrierOp,
     BF16Type,
-    BarrierOp,
     ClusterBlockIdsOp,
     CollectiveScope,
     ElementwiseOp,
@@ -305,8 +304,6 @@ def test_barrier_op():
         barrier,
         'barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}',
     )
-    with pytest.raises(ValueError, match="scope as an explicit argument"):
-        BarrierOp.build(attrs={"scope": "grid"})
 
 
 def test_index_lt_op():

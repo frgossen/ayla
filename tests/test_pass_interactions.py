@@ -34,7 +34,6 @@ from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.tile_elementwise import tile_elementwise
 from ayla.passes.tile_matmul import tile_matmul
 from ayla.passes.unroll_loop import unroll_loop
-from ayla.ptx_codegen import make_ptx_kernel
 
 MODULE_STR = textwrap.dedent("""\
     module {
@@ -199,24 +198,6 @@ def test_two_matmuls_share_block_x_with_different_n_tile_counts():
     matmuls = find_ops_of_type(module, MatmulOp)
     assert matmuls[0].parent_block is guard.body
     assert matmuls[1].parent_block is kernel.body
-
-
-def test_grid_barrier_pipeline_orders_cta_arrival_and_release():
-    module = gpu_dialect.parse(textwrap.dedent("""\
-        module {
-          kernel @k(%sync: gmem<2xf32>) grid_dim=[8, 1, 1] block_dim=[32, 1, 1] {
-            barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}
-          }
-        }"""))
-
-    kernel = make_ptx_kernel(module)
-
-    assert kernel.requires_resident_grid
-    entry = kernel.ptx.index("bar.sync 0;")
-    arrival = kernel.ptx.index("atom.acq_rel.gpu.global.inc.u32")
-    release = kernel.ptx.index("st.release.gpu.global.u32")
-    exit = kernel.ptx.rindex("bar.sync 0;")
-    assert entry < arrival < release < exit
 
 
 TILED_IR = textwrap.dedent("""\

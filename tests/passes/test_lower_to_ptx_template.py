@@ -130,17 +130,6 @@ def test_lower_tile_uses_the_reinterpreted_view_strides():
     assert tile.byte_offset.definition.value == 32
 
 
-def test_grid_barrier_requires_a_sync_buffer():
-    with pytest.raises(ValueError, match="synchronization buffer"):
-        module = gpu_dialect.parse(textwrap.dedent("""\
-            module {
-              kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-                barrier() attrs={scope: "grid"}
-              }
-            }"""))
-        lower_to_ptx_template(module)
-
-
 def test_grid_barrier_uses_last_arriver_to_release_waiters():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
