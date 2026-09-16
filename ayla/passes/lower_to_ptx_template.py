@@ -198,6 +198,7 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_kernel(
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
+        self.grid_dim = op.grid_dim
         # TODO: Materialize cache policies in an earlier pass, potentially
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted({
@@ -976,26 +977,9 @@ class LowerToPtxTemplate(LoweringPass):
                 @!${{pred:bl_w0}} bar.arrive {bar_id}, {num_threads};
                 """)
         elif scope == "grid":
-            if op.sync is None:
-                raise ValueError("grid barrier requires a synchronization buffer")
-            enclosing_op: Op | None = op
-            while not isinstance(enclosing_op, KernelOp):
-                parent_block = enclosing_op.parent_block
-                enclosing_op = (
-                    None if parent_block is None else parent_block.parent_op
-                )
-                if enclosing_op is None:
-                    break
-            if (
-                not isinstance(enclosing_op, KernelOp)
-                or all(dim is None for dim in enclosing_op.grid_dim)
-            ):
-                raise ValueError(
-                    "grid barrier requires a resolved enclosing kernel grid"
-                )
+            assert op.sync is not None
             grid_size = math.prod(
-                dim if dim is not None else 1
-                for dim in enclosing_op.grid_dim
+                dim if dim is not None else 1 for dim in self.grid_dim
             )
             sync = self.value_map[op.sync]
             assert isinstance(sync, Value)

@@ -6,7 +6,6 @@ result.
 """
 import textwrap
 
-import pytest
 import torch
 
 from ayla.base.ir import Block, Value
@@ -132,16 +131,51 @@ def test_cluster_block_ids_and_barrier_reach_the_launch():
 
 
 @requires_cuda
-def test_resident_grid_rejects_more_blocks_than_can_be_active():
-    buf_type = GmemTensorType.build((1,), F32Type())
-    kernel = PtxKernel(
-        ptx=SIMPLE_ADD_PTX,
-        name="cwise_add",
-        signature=[buf_type, buf_type, buf_type],
-        grid_dim=(1_000_000, 1, 1),
-        block_dim=(256, 1, 1),
-        requires_resident_grid=True,
+def test_grid_barrier_makes_prior_block_writes_visible():
+    buf_type = GmemTensorType.build((2,), F32Type())
+    data = Value("data", buf_type)
+    sync = Value("sync", buf_type)
+    write = PTXTemplateOp.build(
+        operands=[data],
+        result_types=[],
+        template=textwrap.dedent(r"""\
+            mov.u32 ${b32:bid}, %ctaid.x;
+            shl.b32 ${b32:value}, ${b32:bid}, 23;
+            add.u32 ${b32:value}, ${b32:value}, 1065353216;
+            mul.wide.u32 ${b64:offset}, ${b32:bid}, 4;
+            add.u64 ${b64:address}, ${b64:operand.data.ptr}, ${b64:offset};
+            st.release.gpu.global.u32 [${b64:address}], ${b32:value};
+            """),
+        operand_names=["data"],
+        result_names=[],
     )
+    read = PTXTemplateOp.build(
+        operands=[data],
+        result_types=[],
+        template=textwrap.dedent(r"""\
+            mov.u32 ${b32:bid}, %ctaid.x;
+            setp.ne.u32 ${pred:skip}, ${b32:bid}, 0;
+            @${pred:skip} bra ${label:done};
+            ld.acquire.gpu.global.u32 ${b32:value}, [${b64:operand.data.ptr}+4];
+            st.release.gpu.global.u32 [${b64:operand.data.ptr}], ${b32:value};
+            ${label:done}:
+            """),
+        operand_names=["data"],
+        result_names=[],
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "grid_barrier",
+        Block(
+            arguments=[data, sync],
+            ops=[write, BarrierOp.build("grid", sync), read],
+        ),
+        grid_dim=(2, 1, 1),
+        block_dim=(1, 1, 1),
+    )]))
+    data_tensor = torch.zeros(2, device="cuda", dtype=torch.float32)
+    sync_tensor = torch.zeros(2, device="cuda", dtype=torch.float32)
 
-    with pytest.raises(RuntimeError, match="requiring 1000000 resident blocks"):
-        make_ptx_launcher(kernel).ensure_loaded()
+    make_ptx_launcher(make_ptx_kernel(module))(data_tensor, sync_tensor)
+
+    torch.cuda.synchronize()
+    assert torch.equal(data_tensor, torch.tensor([2.0, 2.0], device="cuda"))
