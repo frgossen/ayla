@@ -19,6 +19,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BF16Type,
     BarrierOp,
+    ElementwiseOp,
     F32Type,
     ForOp,
     IfOp,
@@ -28,6 +29,7 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    ReshapeOp,
     SelectOp,
     SmemTensorType,
     TmaDescType,
@@ -90,6 +92,23 @@ def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
     assert has_ordering_effect(nested)
 
 
+def test_reshape_op():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([2, 3, 4], F32Type()),
+    )
+    reshape = ReshapeOp.build(
+        source, GmemTensorType.build([6, 4], F32Type()),
+    )
+
+    assert reshape.arg is source
+    assert root_buffer(reshape.result()) is source
+    assert_print_and_roundtrip(
+        reshape,
+        "%0: gmem<6x4xf32> = reshape(%source: gmem<2x3x4xf32>)",
+    )
+
+
 def test_matmul_program():
     m, k, n = 64, 128, 32
     a_type = GmemTensorType.build((m, k), F32Type())
@@ -133,6 +152,26 @@ def test_matmul_program():
     with pytest.raises(AssertionError):
         matmul.narrow_collective_level(
             CollectiveAxis.X, CollectiveLevel.BLOCK,
+        )
+
+
+def test_elementwise_syntax():
+    tensor_type = GmemTensorType.build((8,), F32Type())
+    dst = Value(name="dst", type=tensor_type)
+    src = Value(name="src", type=tensor_type)
+    op = ElementwiseOp.build(
+        dst, src, fn="sigmoid", attrs={"label": "activation"},
+    )
+
+    assert_print_and_roundtrip(
+        op,
+        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+        'attrs={label: "activation"}',
+    )
+    with pytest.raises(ValueError, match="must not also appear in attrs"):
+        gpu_dialect.parse(
+            'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+            'attrs={fn: "convert"}'
         )
 
 

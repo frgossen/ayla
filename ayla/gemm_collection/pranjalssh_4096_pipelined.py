@@ -78,7 +78,7 @@ def pranjalssh_4096_pipelined_module():
               matmul(%a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
             %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 13}
-            elementwise(%acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
+            elementwise convert(%acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
             %c_block: gmem<128x128xbf16 strides=[4096, 1]> = tile(%c: gmem<4096x4096xbf16>, %by: index, %bx: index)
             move(%c_block: gmem<128x128xbf16 strides=[4096, 1]>, %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">)
           }

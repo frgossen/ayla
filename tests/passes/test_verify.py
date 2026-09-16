@@ -2,7 +2,16 @@ import textwrap
 
 import pytest
 
-from ayla.gpu_dialect import ModuleOp, gpu_dialect
+from ayla.base.ir import Block, Value
+from ayla.gpu_dialect import (
+    ElementwiseOp,
+    F32Type,
+    GmemTensorType,
+    ModuleOp,
+    ReshapeOp,
+    RmemTensorType,
+    gpu_dialect,
+)
 from ayla.passes.verify_gpu_dialect import (
     VerificationStage,
     verify_gpu_dialect,
@@ -37,6 +46,58 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
 
     with pytest.raises(ValueError, match="inconsistent matmul shapes"):
         verify_gpu_dialect(module)
+
+
+def test_default_verification_rejects_unknown_elementwise_function():
+    typ = GmemTensorType.build([8], F32Type())
+    value = Value(name="value", type=typ)
+    module = ModuleOp.build(Block(ops=[
+        ElementwiseOp.build(value, value, fn="unknown"),
+    ]))
+
+    with pytest.raises(ValueError, match="unknown elementwise function"):
+        verify_gpu_dialect(module)
+
+
+def test_default_verification_checks_reshape():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([2, 3, 4], F32Type()),
+    )
+    valid = ModuleOp.build(Block(ops=[
+        ReshapeOp.build(
+            source, GmemTensorType.build([6, 4], F32Type()),
+        ),
+    ]))
+    assert verify_gpu_dialect(valid) is valid
+
+    register_source = Value(
+        name="register_source",
+        type=RmemTensorType.build([2, 3, 4], F32Type()),
+    )
+    register_reshape = ModuleOp.build(Block(ops=[
+        ReshapeOp.build(
+            register_source, RmemTensorType.build([6, 4], F32Type()),
+        ),
+    ]))
+    assert verify_gpu_dialect(register_reshape) is register_reshape
+
+    wrong_size = ModuleOp.build(Block(ops=[
+        ReshapeOp.build(
+            source, GmemTensorType.build([5, 4], F32Type()),
+        ),
+    ]))
+    with pytest.raises(ValueError, match="preserve the number of elements"):
+        verify_gpu_dialect(wrong_size)
+
+    strided = ModuleOp.build(Block(ops=[
+        ReshapeOp.build(
+            source,
+            GmemTensorType.build([6, 4], F32Type(), strides=[5, 1]),
+        ),
+    ]))
+    with pytest.raises(ValueError, match="canonical strides"):
+        verify_gpu_dialect(strided)
 
 
 def test_ptx_lowering_verification_rejects_dynamic_shapes():

@@ -48,7 +48,7 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
             %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
             %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert", label: "mm_dst_convert"}
+            elementwise convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
             %2: smem<64x128xbf16> = alloc() attrs={id: 2}
             %3: smem<64x128xbf16> = alloc() attrs={id: 3}
             move(%2: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_smem", wgmma_col_start: 0}
@@ -216,7 +216,7 @@ def test_promote_smem_with_warp_group_dependent_lhs():
               matmul(%6: gmem<64x64xbf16 strides=[4096, 1]>, %7: gmem<256x64xbf16 strides=[4096, 1]>, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
             }
             %8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise(%8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
+            elementwise convert(%8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
             move(%4: gmem<64x256xbf16 strides=[4096, 1]>, %8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
         }""")
@@ -261,7 +261,7 @@ def test_promote_smem_with_warp_group_dependent_lhs():
               matmul(%10: smem<64x64xbf16 swizzle="128B">, %11: smem<256x64xbf16 swizzle="128B">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
             }
             %12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise(%12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
+            elementwise convert(%12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
             move(%4: gmem<64x256xbf16 strides=[4096, 1]>, %12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
         }""")
@@ -280,7 +280,7 @@ def test_epilogue_runs_on_the_promoted_accumulator():
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) collective=[xy.block, z.thread] attrs={init: 0.0, label: "mm"}
-            elementwise(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
 
@@ -296,7 +296,7 @@ def test_epilogue_runs_on_the_promoted_accumulator():
             %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
             %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
             move(%c: gmem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
         }""")  # noqa: E501

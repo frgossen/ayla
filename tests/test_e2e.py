@@ -66,6 +66,28 @@ def test_cwise_add_from_ir():
     assert torch.allclose(c, a + b)
 
 
+@requires_cuda
+def test_reshape_from_ir():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @reshape_copy(%src: gmem<2x2xf32>, %dst: gmem<1x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            %view: gmem<1x4xf32> = reshape(%src: gmem<2x2xf32>)
+            %values: rmem<1x4xf32> = alloc() attrs={id: 0}
+            move(%values: rmem<1x4xf32>, %view: gmem<1x4xf32>) attrs={nc: true}
+            move(%dst: gmem<1x4xf32>, %values: rmem<1x4xf32>)
+          }
+        }"""))  # noqa: E501
+
+    kernel = make_ptx_kernel(module)
+    src = torch.randn(2, 2, dtype=torch.float32, device="cuda")
+    dst = torch.empty(1, 4, dtype=torch.float32, device="cuda")
+
+    make_ptx_launcher(kernel)(src, dst)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst, src.reshape(1, 4))
+
+
 # 16x16 f32 matmul, row-major. One block of 16x16 threads, one grid
 # block. Each thread computes one C[i][j] via a k-loop.
 MATMUL_16_TEMPLATE = textwrap.dedent(

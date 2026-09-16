@@ -527,12 +527,29 @@ class TileOp(Op):
         )
 
 
+@gpu_dialect.register_op("reshape")
+class ReshapeOp(Op):
+    """Reinterpret a dense tensor with a different shape without moving data."""
+
+    @classmethod
+    def build(cls, arg: Value, type: Type) -> "ReshapeOp":
+        return cls(
+            operands=[arg],
+            results=[Value(name=None, type=type)],
+        )
+
+    @property
+    def arg(self) -> Value:
+        return self.operands[0]
+
+
 @gpu_dialect.register_op("elementwise")
 class ElementwiseOp(Op):
     """One scalar function over each element: elementwise(dst, src).
 
-    ``fn`` names the function -- an attribute, not an op each, since exp,
-    tanh, relu and the rest differ only in the instructions they lower to.
+    ``fn`` names the function and is part of the op's textual syntax. Exp,
+    tanh, relu and the rest still share one operation because they differ only
+    in the instructions they lower to.
 
     Source and destination types may differ. ``convert`` performs only the
     element-wise dtype conversion; other functions may convert their result
@@ -544,8 +561,6 @@ class ElementwiseOp(Op):
     a lowering may want to produce more than one value at a time.
     """
 
-    FUNCTIONS: ClassVar[tuple[str, ...]] = ("convert", "sigmoid")
-
     @classmethod
     def build(
         cls,
@@ -554,11 +569,6 @@ class ElementwiseOp(Op):
         fn: str,
         attrs: dict[str, object] | None = None,
     ) -> "ElementwiseOp":
-        if fn not in cls.FUNCTIONS:
-            raise ValueError(
-                f"elementwise: unknown fn {fn!r}; expected one of "
-                f"{', '.join(cls.FUNCTIONS)}"
-            )
         return cls(
             operands=[dst, src], results=[], attrs={"fn": fn, **(attrs or {})},
         )
@@ -574,6 +584,43 @@ class ElementwiseOp(Op):
     @property
     def fn(self) -> str:
         return self.attrs["fn"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write(f"{self.op_id} {self.fn}(")
+        for index, operand in enumerate(self.operands):
+            if index:
+                p.write(", ")
+            operand.print(p)
+        p.write(")")
+        p.write_extra_attrs(self.attrs, skip_keys=("fn",))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ElementwiseOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        fn = p.read_identifier()
+        p.read_literal("(")
+        operands: list[Value] = []
+        if not p.can_read_literal(")"):
+            operands.append(Value.parse(p))
+            while p.can_read_literal(","):
+                p.read_literal(",")
+                operands.append(Value.parse(p))
+        p.read_literal(")")
+        attrs = p.read_extra_attrs()
+        if "fn" in attrs:
+            raise ValueError(
+                "elementwise function must not also appear in attrs"
+            )
+        return cls(
+            operands=operands,
+            results=results,
+            attrs={"fn": fn, **attrs},
+        )
 
 
 @gpu_dialect.register_op("alloc")
@@ -1939,7 +1986,7 @@ def root_buffers(value: Value) -> set[Value]:
     definition = value.definition
     if isinstance(definition, ReinterpretOp):
         return root_buffers(definition.storage)
-    if isinstance(definition, TileOp):
+    if isinstance(definition, (ReshapeOp, TileOp)):
         return root_buffers(definition.arg)
     if isinstance(definition, SelectOp):
         return {
@@ -1954,7 +2001,6 @@ def root_buffers(value: Value) -> set[Value]:
     if isinstance(value.type, (MemTensorType, TmaDescType)):
         return {value}
     return set()
-
 
 def root_buffer(value: Value) -> Value | None:
     """Return the unique physical buffer underlying ``value``, if any."""
@@ -2166,6 +2212,7 @@ def is_side_effect_free(op: Op) -> bool:
         PtrAddOp,
         SelectOp,
         ReinterpretOp,
+        ReshapeOp,
         ThreadIdsOp,
         TileOp,
         ToPtrOp,
