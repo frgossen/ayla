@@ -48,7 +48,11 @@ class VerifyGpuDialect(VerificationPass):
             )
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
-        if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):
+        if (
+            not isinstance(lhs, MemTensorType)
+            or not isinstance(rhs, MemTensorType)
+            or not isinstance(dst, MemTensorType)
+        ):
             raise ValueError("matmul operands must be memory tensors")
         if any(typ.rank != 2 for typ in (lhs, rhs, dst)):
             raise ValueError(
