@@ -4,7 +4,15 @@ import textwrap
 import pytest
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import ForOp, IfOp, TileOp, gpu_dialect
+from ayla.gpu_dialect import (
+    ForOp,
+    IfOp,
+    IndexConstantOp,
+    IndexLtOp,
+    MatmulOp,
+    TileOp,
+    gpu_dialect,
+)
 from ayla.passes.tile_matmul import tile_matmul
 
 
@@ -165,6 +173,72 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
             }
           }
         }""")  # noqa: E501
+
+
+@pytest.mark.parametrize(
+    ("op_dim", "iteration_binding", "launch_dims", "index_name"),
+    [
+        ("M", "block.x", "grid_dim=[4, 1, 1]", "bx"),
+        ("N", "block.y", "grid_dim=[1, 4, 1]", "by"),
+        ("K", "block.z", "grid_dim=[1, 1, 4]", "bz"),
+        ("M", "thread.x", "block_dim=[4, 1, 1]", "tx"),
+        ("N", "thread.y", "block_dim=[1, 4, 1]", "ty"),
+        ("K", "thread.z", "block_dim=[1, 1, 4]", "tz"),
+        (
+            "M", "wg.x",
+            "block_dim=[512, 1, 1] num_warp_groups=4", "wgx",
+        ),
+    ],
+)
+def test_parallel_tiling_guards_every_supported_binding(
+    op_dim, iteration_binding, launch_dims, index_name,
+):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) {launch_dims} {{
+            matmul(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
+          }}
+        }}"""))  # noqa: E501
+
+    tile_matmul(
+        module,
+        op_dims=[op_dim], tile_sizes=[64],
+        iteration_bindings=[iteration_binding], for_loop_labels=[None],
+    )
+
+    [guard] = find_ops_of_type(module, IfOp)
+    [condition] = find_ops_of_type(module, IndexLtOp)
+    assert condition.lhs.name == index_name
+    assert isinstance(condition.rhs.definition, IndexConstantOp)
+    assert condition.rhs.definition.value == 3
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.parent_block is guard.body
+
+
+def test_parallel_tiling_guards_multiple_dimensions():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) grid_dim=[4, 5, 1] {
+            matmul(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
+          }
+        }"""))  # noqa: E501
+
+    tile_matmul(
+        module,
+        op_dims=["M", "N"], tile_sizes=[64, 64],
+        iteration_bindings=["block.x", "block.y"],
+        for_loop_labels=[None, None],
+    )
+
+    guards = find_ops_of_type(module, IfOp)
+    assert len(guards) == 2
+    conditions = find_ops_of_type(module, IndexLtOp)
+    assert [condition.lhs.name for condition in conditions] == ["bx", "by"]
+    assert all(
+        isinstance(condition.rhs.definition, IndexConstantOp)
+        and condition.rhs.definition.value == 3
+        for condition in conditions
+    )
 
 
 def test_block_x_tiling_rejects_a_smaller_fixed_grid():
