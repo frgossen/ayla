@@ -86,9 +86,12 @@ class ReuseBuffers(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         lifetime = BufferLifetimeAnalysis()
         lifetime.analyze(kernel)
+        # TODO: Investigate modeling lock effects to support safe lock reuse.
         candidate_allocations = [
             op for op in kernel.body.ops
-            if isinstance(op, AllocOp) and op.init is None
+            if isinstance(op, AllocOp)
+            and op.init is None
+            and isinstance(op.result().type, MemTensorType)
         ]
         op_local_conflicts = _op_local_conflicts(kernel)
         reuse_sets = [
