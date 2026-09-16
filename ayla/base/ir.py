@@ -143,14 +143,6 @@ class Type:
     def attr(self, name: str) -> object:
         return self.attrs[name]
 
-    @classmethod
-    def build(cls, attrs: dict[str, object] | None = None):
-        """Default builder: just constructs `cls(attrs=...)`. Subclasses
-        with extra params (e.g. `MemTensorType` which takes sizes/dtype)
-        should override.
-        """
-        return cls(attrs=dict(attrs or {}))
-
     def print(self, p: Printer) -> None:
         p.write(self.name)
         if self.attrs:
@@ -289,28 +281,6 @@ class Op:
 
     def attr(self, name: str) -> object:
         return self.attrs[name]
-
-    @classmethod
-    def build(
-        cls,
-        operands: list["Value"] | None = None,
-        result_types: list["Type"] | None = None,
-        attrs: dict[str, object] | None = None,
-        blocks: list["Block"] | None = None,
-    ) -> "Op":
-        """Default builder. Constructs results from `result_types`.
-        Subclasses with richer ergonomic signatures (lhs/rhs/dst/...)
-        should override.
-        """
-        results = [
-            Value(name=None, type=t) for t in (result_types or [])
-        ]
-        return cls(
-            operands=list(operands or []),
-            results=results,
-            attrs=dict(attrs or {}),
-            blocks=list(blocks or []),
-        )
 
     def __iter__(self):
         return iter(self.results)
