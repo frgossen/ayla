@@ -7,7 +7,7 @@ from ..analysis.sync import (
     BarrierTargetsType,
     SyncAnalysis,
 )
-from ..base.ir import Block, Op, find_op, find_ops_of_type
+from ..base.ir import Block, Op, find_op
 from ..base.pipeline import Pass
 from ..gpu_dialect import BarrierOp, KernelOp, ModuleOp
 
@@ -61,11 +61,6 @@ class InsertSyncs(Pass):
         analysis.analyze(module)
         kernel = find_op(module, lambda op: isinstance(op, KernelOp))
         assert isinstance(kernel, KernelOp)
-        if any(
-            op.scope == "grid"
-            for op in find_ops_of_type(kernel, BarrierOp)
-        ):
-            kernel.attrs["requires_resident_grid"] = True
         # Transform: insert the barriers with the kernel-wide participant count.
         _insert_barriers(module.body, analysis.targets, kernel.num_threads)
         return module
