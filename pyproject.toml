@@ -42,6 +42,7 @@ include = [
     "ayla/gemm_collection/auto_matmul_4096_wgmma256_wg_sigmoid.py",
     "ayla/gemm_collection/auto_matmul_4096_wgmma256_wg_tma_store.py",
     "ayla/gemm_collection/fastcu_5_1.py",
+    "ayla/gemm_collection/gemm.py",
     "ayla/gemm_collection/loop_4x4_matmul_4096.py",
     "ayla/gemm_collection/loop_8x8_matmul_4096.py",
     "ayla/gemm_collection/naive_matmul_4096_loop.py",

@@ -1,5 +1,6 @@
 """Configurable GEMM module builders used by collection entries."""
 import textwrap
+from typing import cast
 
 from ..base.ir import find_ops_of_type
 from ..base.pipeline import Pipeline
@@ -8,6 +9,7 @@ from ..gpu_dialect import (
     CollectiveLevel,
     KernelOp,
     MatmulOp,
+    MemTensorType,
     ModuleOp,
     gpu_dialect,
 )
@@ -166,13 +168,16 @@ def schedule_matmul(
     if len(matmuls) != 1:
         raise ValueError("schedule_matmul requires exactly one matmul")
     matmul = matmuls[0]
+    assert isinstance(matmul, MatmulOp)
+    assert isinstance(matmul.lhs.type, MemTensorType)
+    assert isinstance(matmul.rhs.type, MemTensorType)
     m, k = matmul.lhs.type.sizes
     n, rhs_k = matmul.rhs.type.sizes
     if None in (m, n, k, rhs_k):
         raise ValueError("schedule_matmul requires static dimensions")
     if rhs_k != k:
         raise ValueError("matmul reduction dimensions must match")
-    m, n, k = int(m), int(n), int(k)
+    m, n, k = cast(tuple[int, int, int], (m, n, k))
 
     if output_tiles_per_cta not in (1, 2, 4):
         raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
