@@ -2,6 +2,8 @@
 # flake8: noqa: E501
 import textwrap
 
+import pytest
+
 from ayla import (
     Block,
     GmemTensorType,
@@ -89,6 +91,32 @@ def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
     assert input_kernel.block_dim == (128, None, None)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".reqntid 128, 1, 1") == 1
+
+
+def test_codegen_resolves_implicit_cluster_dimensions_without_mutating_ir():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[4, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, None, None] {
+          }
+        }"""))
+    [input_kernel] = module.body.ops
+
+    kernel = make_ptx_kernel(module)
+
+    assert input_kernel.cluster_dim == (2, None, None)
+    assert kernel.cluster_dim == (2, 1, 1)
+    assert ".reqnctapercluster 2, 1, 1" in kernel.ptx
+
+
+def test_codegen_rejects_cluster_dimension_after_grid_resolution():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[None, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="cluster_dim must divide grid_dim"):
+        make_ptx_kernel(module)
 
 
 def test_codegen_if_branches_over_its_body():
