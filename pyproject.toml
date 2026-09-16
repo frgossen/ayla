@@ -50,6 +50,7 @@ include = [
     "ayla/passes/_utils.py",
     "ayla/passes/canonicalize.py",
     "ayla/passes/dce.py",
+    "ayla/passes/fuse_async.py",
     "ayla/passes/schedule_async.py",
     "ayla/pytree.py",
 ]
