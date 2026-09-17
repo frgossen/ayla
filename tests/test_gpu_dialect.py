@@ -343,9 +343,15 @@ def test_async_op():
             },
         ),
     ])
-    op = AsyncOp.build(lock, body=body)
+    op = AsyncOp.build(
+        lock,
+        collective={
+            axis: CollectiveLevel.GRID for axis in CollectiveAxis
+        },
+        body=body,
+    )
     expected = textwrap.dedent("""\
-        async(%lock: lock<wgmma>) {
+        async(%lock: lock<wgmma>) collective=xyz.grid {
           matmul(%lhs0: gmem<64x64xf32>, %rhs0: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
           matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
         }""")  # noqa: E501
@@ -357,9 +363,14 @@ def test_async_op_single_move():
     dst = Value(name="dst", type=t)
     src = Value(name="src", type=t)
     lock = Value(name="lock", type=LockType.build(kind="bulk"))
-    body = Block(ops=[MoveOp.build(dst, src)])
-    op = AsyncOp.build(lock, body=body)
-    expected = "async(%lock: lock<bulk>) move(%dst: gmem<64x64xf32>, %src: gmem<64x64xf32>)"  # noqa: E501
+    collective = {
+        axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
+    }
+    body = Block(ops=[MoveOp.build(
+        dst, src, collective=collective,
+    )])
+    op = AsyncOp.build(lock, collective=collective, body=body)
+    expected = "async(%lock: lock<bulk>) collective=xyz.cluster move(%dst: gmem<64x64xf32>, %src: gmem<64x64xf32>) collective=xyz.cluster"  # noqa: E501
     assert_print_and_roundtrip(op, expected)
 
 
@@ -373,10 +384,23 @@ def test_tma_move_build_accepts_l2_cache_hint():
     indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
 
     op = TmaMoveOp.build(
-        smem, desc, indices, l2_cache_hint="evict_last",
+        smem,
+        desc,
+        indices=indices,
+        collective={
+            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+        },
+        l2_cache_hint="evict_last",
     )
 
     assert op.l2_cache_hint == "evict_last"
+    assert_print_and_roundtrip(
+        op,
+        "tma_move(%smem: smem<64x64xf32>, %desc: "
+        "tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %i0: index, "
+        "%i1: index) collective=xyz.block "
+        'attrs={l2_cache_hint: "evict_last"}',
+    )
 
 
 def test_tma_descriptor_validates_l2_promotion():

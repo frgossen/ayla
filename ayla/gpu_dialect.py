@@ -256,7 +256,8 @@ class CollectiveLevel(enum.IntEnum):
     WARP = 1
     WG = 2
     BLOCK = 3
-    GRID = 4
+    CLUSTER = 4
+    GRID = 5
 
     def join(self, other: CollectiveLevel) -> CollectiveLevel:
         return max(self, other)
@@ -266,6 +267,56 @@ class CollectiveAxis(enum.IntEnum):
     X = 0
     Y = 1
     Z = 2
+
+
+def _print_collective(
+    p: Printer,
+    collective: dict[CollectiveAxis, CollectiveLevel],
+) -> None:
+    levels: dict[CollectiveLevel, str] = {}
+    for axis in CollectiveAxis:
+        dim = axis.name.lower()
+        level = collective[axis]
+        levels[level] = levels.get(level, "") + dim
+    if levels == {CollectiveLevel.THREAD: "xyz"}:
+        return
+    p.write(" collective=")
+    bracketed = len(levels) > 1
+    if bracketed:
+        p.write("[")
+    for i, (level, dims) in enumerate(levels.items()):
+        if i:
+            p.write(", ")
+        p.write(f"{dims}.{level.name.lower()}")
+    if bracketed:
+        p.write("]")
+
+
+def _parse_collective(p) -> dict[CollectiveAxis, CollectiveLevel]:
+    if not p.can_read_literal("collective"):
+        return {
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        }
+    p.read_literal("collective")
+    p.read_literal("=")
+    bracketed = p.can_read_literal("[")
+    if bracketed:
+        p.read_literal("[")
+    collective = {}
+    while True:
+        dims = p.read_identifier()
+        p.read_literal(".")
+        level = p.read_identifier()
+        for dim in dims:
+            collective[CollectiveAxis[dim.upper()]] = (
+                CollectiveLevel[level.upper()]
+            )
+        if not bracketed or not p.can_read_literal(","):
+            break
+        p.read_literal(",")
+    if bracketed:
+        p.read_literal("]")
+    return collective
 
 
 @gpu_dialect.register_op("matmul")
@@ -356,22 +407,7 @@ class MatmulOp(Op):
                 p.write(", ")
             operand.print(p)
         p.write(")")
-        levels: dict[CollectiveLevel, str] = {}
-        for axis in CollectiveAxis:
-            dim = axis.name.lower()
-            level = self.collective[axis]
-            levels[level] = levels.get(level, "") + dim
-        if levels != {CollectiveLevel.THREAD: "xyz"}:
-            p.write(" collective=")
-            bracketed = len(levels) > 1
-            if bracketed:
-                p.write("[")
-            for i, (level, dims) in enumerate(levels.items()):
-                if i:
-                    p.write(", ")
-                p.write(f"{dims}.{level.name.lower()}")
-            if bracketed:
-                p.write("]")
+        _print_collective(p, self.collective)
         p.write_extra_attrs(self.attrs, skip_keys=("collective",))
 
     @classmethod
@@ -387,29 +423,7 @@ class MatmulOp(Op):
             p.read_literal(",")
             operands.append(Value.parse(p))
         p.read_literal(")")
-        collective = {
-            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
-        }
-        if p.can_read_literal("collective"):
-            p.read_literal("collective")
-            p.read_literal("=")
-            bracketed = p.can_read_literal("[")
-            if bracketed:
-                p.read_literal("[")
-            collective = {}
-            while True:
-                dims = p.read_identifier()
-                p.read_literal(".")
-                level = p.read_identifier()
-                for dim in dims:
-                    collective[CollectiveAxis[dim.upper()]] = (
-                        CollectiveLevel[level.upper()]
-                    )
-                if not bracketed or not p.can_read_literal(","):
-                    break
-                p.read_literal(",")
-            if bracketed:
-                p.read_literal("]")
+        collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
         init = attrs.pop("init", None)
         return cls.build(
@@ -744,7 +758,7 @@ class ReinterpretOp(Op):
 
 @gpu_dialect.register_op("move")
 class MoveOp(Op):
-    """Move data into a destination, with optional indices."""
+    """Move data into a destination, with optional indices and collectivity."""
 
     @classmethod
     def build(
@@ -752,11 +766,15 @@ class MoveOp(Op):
         dst: Value,
         src: Value,
         indices: list[Value] | None = None,
+        *,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
     ) -> "MoveOp":
         operands = [dst, src] + (indices or [])
+        attrs = dict(attrs or {})
+        attrs["collective"] = dict(collective)
         return cls(
-            operands=operands, results=[], attrs=attrs or {},
+            operands=operands, results=[], attrs=attrs,
         )
 
     @property
@@ -771,10 +789,44 @@ class MoveOp(Op):
     def indices(self) -> list[Value]: # TODO: Does MoveOp need indices?
         return self.operands[2:]
 
+    @property
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        return self.attrs["collective"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write("move(")
+        for i, operand in enumerate(self.operands):
+            if i:
+                p.write(", ")
+            operand.print(p)
+        p.write(")")
+        _print_collective(p, self.collective)
+        p.write_extra_attrs(self.attrs, skip_keys=("collective",))
+
+    @classmethod
+    def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        assert not results
+        p.read_literal("(")
+        operands = [Value.parse(p)]
+        while p.can_read_literal(","):
+            p.read_literal(",")
+            operands.append(Value.parse(p))
+        p.read_literal(")")
+        collective = _parse_collective(p)
+        attrs = p.read_extra_attrs()
+        return cls.build(
+            operands[0], operands[1], operands[2:],
+            collective=collective, attrs=attrs,
+        )
+
 
 @gpu_dialect.register_op("tma_move")
 class TmaMoveOp(Op):
-    """TMA bulk transfer between smem and gmem (block-collective), sync form.
+    """Synchronous TMA bulk transfer with explicit collectivity.
 
     One operand is a TMA descriptor (gmem side), the other is smem. Indices are
     per-dim element coordinates for the TMA engine. Direction (load/store) is
@@ -788,12 +840,15 @@ class TmaMoveOp(Op):
         cls,
         dst: Value,
         src: Value,
+        *,
         indices: list[Value],
+        collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         l2_cache_hint: str | None = None,
     ) -> "TmaMoveOp":
         operands = [dst, src] + indices
         attrs = dict(attrs or {})
+        attrs["collective"] = dict(collective)
         if l2_cache_hint is not None:
             attrs["l2_cache_hint"] = l2_cache_hint
         return cls(operands=operands, results=[], attrs=attrs)
@@ -826,6 +881,42 @@ class TmaMoveOp(Op):
         if hint not in (None, "evict_first", "evict_last"):
             raise ValueError(f"unsupported TMA L2 cache hint {hint!r}")
         return hint  # type: ignore[return-value]
+
+    @property
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        return self.attrs["collective"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write("tma_move(")
+        for i, operand in enumerate(self.operands):
+            if i:
+                p.write(", ")
+            operand.print(p)
+        p.write(")")
+        _print_collective(p, self.collective)
+        p.write_extra_attrs(self.attrs, skip_keys=("collective",))
+
+    @classmethod
+    def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        assert not results
+        p.read_literal("(")
+        operands = [Value.parse(p)]
+        while p.can_read_literal(","):
+            p.read_literal(",")
+            operands.append(Value.parse(p))
+        p.read_literal(")")
+        collective = _parse_collective(p)
+        attrs = p.read_extra_attrs()
+        l2_cache_hint = attrs.pop("l2_cache_hint", None)
+        return cls.build(
+            operands[0], operands[1], indices=operands[2:],
+            collective=collective, attrs=attrs,
+            l2_cache_hint=l2_cache_hint,  # type: ignore[arg-type]
+        )
 
 
 @gpu_dialect.register_type("lock")
@@ -949,13 +1040,15 @@ class AsyncOp(Op):
     Wraps a body block of ops that run asynchronously under one ``lock``. The
     lock is the only operand — what an async op carries beyond the plain op(s)
     it wraps — while the work ops inside keep their own (matmul/move) operands.
-    Completion is signalled elsewhere by ``await(%lock)``.
+    Completion is signalled elsewhere by ``await(%lock)``. Its collective
+    records the scope of the work it groups.
     """
 
     @classmethod
     def build(
         cls,
         lock: Value,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         body: Block | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "AsyncOp":
@@ -969,7 +1062,9 @@ class AsyncOp(Op):
                 f"async: body block takes no arguments, got "
                 f"{len(body.arguments)}"
             )
-        return cls(operands=[lock], results=[], attrs=attrs or {}, blocks=[body])
+        attrs = dict(attrs or {})
+        attrs["collective"] = dict(collective)
+        return cls(operands=[lock], results=[], attrs=attrs, blocks=[body])
 
     @property
     def lock(self) -> Value:
@@ -983,11 +1078,16 @@ class AsyncOp(Op):
     def body(self) -> Block:
         return self.blocks[0]
 
+    @property
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        return self.attrs["collective"]  # type: ignore[return-value]
+
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id}(")
         self.lock.print(p)
         p.write(")")
-        p.write_extra_attrs(self.attrs)
+        _print_collective(p, self.collective)
+        p.write_extra_attrs(self.attrs, skip_keys=("collective",))
         p.write(" ")
         if len(self.body.ops) == 1:
             # Sugar: a single-op body prints inline, without braces.
@@ -1004,6 +1104,7 @@ class AsyncOp(Op):
         p.read_literal("(")
         lock = Value.parse(p)
         p.read_literal(")")
+        collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
         if p.can_read_literal("{"):
             brace = p.read_literal("{")
@@ -1011,7 +1112,9 @@ class AsyncOp(Op):
         else:
             # Sugar: a single op stands in for a one-op body block.
             body = Block(ops=[Op.parse(p)])
-        return cls.build(lock, body=body, attrs=attrs)
+        return cls.build(
+            lock, collective=collective, body=body, attrs=attrs,
+        )
 
 
 @gpu_dialect.register_op("ptx_template")

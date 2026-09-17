@@ -114,12 +114,20 @@ class LowerToTmaMove(LoweringPass):
         l2_cache_hint = attrs.pop("l2_cache_hint", None)
         if is_load:
             tma_op = TmaMoveOp.build(
-                dst=smem, src=desc_value, indices=indices, attrs=attrs,
+                dst=smem,
+                src=desc_value,
+                indices=indices,
+                collective=move.collective,
+                attrs=attrs,
                 l2_cache_hint=l2_cache_hint,
             )
         else:
             tma_op = TmaMoveOp.build(
-                dst=desc_value, src=smem, indices=indices, attrs=attrs,
+                dst=desc_value,
+                src=smem,
+                indices=indices,
+                collective=move.collective,
+                attrs=attrs,
                 l2_cache_hint=l2_cache_hint,
             )
         return index_ops, tma_op
