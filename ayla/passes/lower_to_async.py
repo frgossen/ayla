@@ -91,11 +91,14 @@ class LowerToAsync(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         dst = self.value_map[op.dst]
         src = self.value_map[op.src]
-        indices = [self.value_map[v] for v in op.indices]
+        descriptor = self.value_map[op.descriptor]
+        assert isinstance(dst, Value)
+        assert isinstance(src, Value)
+        assert isinstance(descriptor, Value)
         tma = TmaMoveOp.build(
             dst=dst,
             src=src,
-            indices=indices,
+            descriptor=descriptor,
             collective=op.collective,
             attrs=op.attrs,
         )

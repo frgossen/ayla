@@ -238,9 +238,10 @@ def test_tma_lowered():
           kernel @tma_load(%a: gmem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %gx: index, %gy: index, %gz: index = block_ids()
             %tx: index, %ty: index, %tz: index = thread_ids()
+            %a_tile: gmem<64x64xf32 strides=[64, 1]> = tile(%a: gmem<64x64xf32>, %gx: index, %gy: index)
             %a_smem: smem<64x64xf32> = alloc() attrs={id: 0}
             %lock: lock<mbar> = alloc() attrs={id: 1}
-            async(%lock: lock<mbar>) tma_move(%a_smem: smem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %gx: index, %gy: index)
+            async(%lock: lock<mbar>) tma_move(%a_smem: smem<64x64xf32>, %a_tile: gmem<64x64xf32 strides=[64, 1]>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
             await(%lock: lock<mbar>)
           }
         }""")  # noqa: E501

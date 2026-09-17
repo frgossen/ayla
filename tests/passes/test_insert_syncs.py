@@ -1,21 +1,36 @@
 """Tests for the cross-thread sync-barrier insertion pass."""
+
 import textwrap
 
 import pytest
 
 from ayla import Block, Op
 from ayla.analysis.sync import (
+    AffineExpr,
+    AffineTileAccess,
     BarrierScope,
     BarrierTarget,
+    IVRange,
+    ParallelIV,
+    SyncAnalysis,
+    UnknownTileAccess,
     _barrier_covers,
     _barrier_scope,
 )
-from ayla.gpu_dialect import CollectiveScope, gpu_dialect
+from ayla.gpu_dialect import (
+    CollectiveAxis,
+    CollectiveLevel,
+    CollectiveScope,
+    KernelOp,
+    MoveOp,
+    gpu_dialect,
+)
 from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
+
 
 def test_block_leader_barrier_requires_whole_warps():
     op = Op(operands=[], results=[])
@@ -35,6 +50,118 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
     assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
 
 
+def test_sync_state_carries_affine_tile_access_and_iv_ranges():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @store(%buffer: gmem<512xf32>) grid_dim=[4, 2, 1] block_dim=[128, 1, 1] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c2: index = index_constant() attrs={value: 2}
+            %row: index = index_mul(%bx: index, %c2: index)
+            %tile_index: index = index_add(%row: index, %by: index)
+            %tile: gmem<64xf32> = tile(%buffer: gmem<512xf32>, %tile_index: index)
+            %src: smem<64xf32> = alloc() attrs={id: 0}
+            move(%tile: gmem<64xf32>, %src: smem<64xf32>) collective=xyz.block
+          }
+        }""")
+    )
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    move = kernel.body.ops[-1]
+    assert isinstance(move, MoveOp)
+
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    root = kernel.body.arguments[0]
+    [write] = [
+        effect
+        for effect in analysis.live_out(move).concurrent_memory_effects[root]
+        if effect.kind == "W"
+    ]
+
+    block_x = ParallelIV(CollectiveLevel.BLOCK, CollectiveAxis.X)
+    block_y = ParallelIV(CollectiveLevel.BLOCK, CollectiveAxis.Y)
+    block_z = ParallelIV(CollectiveLevel.BLOCK, CollectiveAxis.Z)
+    assert write.tile_access == AffineTileAccess(
+        indices=(AffineExpr(((block_x, 128), (block_y, 64))),),
+        sizes=(64,),
+        iv_ranges=(
+            IVRange(block_x, 0, 4),
+            IVRange(block_y, 0, 2),
+            IVRange(block_z, 0, 1),
+        ),
+    )
+
+
+def test_sync_state_retains_each_access_in_an_async_group():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @load(%buffer: gmem<128xf32>, %desc: tma_desc<arg_idx=0 gmem<128xf32> tile=64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %first: gmem<64xf32> = tile(%buffer: gmem<128xf32>, 0)
+            %second: gmem<64xf32> = tile(%buffer: gmem<128xf32>, 1)
+            %dst0: smem<64xf32> = alloc() attrs={id: 0}
+            %dst1: smem<64xf32> = alloc() attrs={id: 1}
+            %lock: lock<mbar> = alloc() attrs={id: 2}
+            async(%lock: lock<mbar>) collective=xyz.block {
+              tma_move(%dst0: smem<64xf32>, %first: gmem<64xf32>, %desc: tma_desc<arg_idx=0 gmem<128xf32> tile=64>) collective=xyz.block
+              tma_move(%dst1: smem<64xf32>, %second: gmem<64xf32>, %desc: tma_desc<arg_idx=0 gmem<128xf32> tile=64>) collective=xyz.block
+            }
+          }
+        }""")
+    )  # noqa: E501
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    async_op = kernel.body.ops[-1]
+
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    root = kernel.body.arguments[0]
+    accesses = {
+        effect.tile_access
+        for effect in analysis.live_out(async_op).concurrent_memory_effects[root]
+        if effect.kind == "R"
+    }
+    block_ranges = tuple(
+        IVRange(ParallelIV(CollectiveLevel.BLOCK, axis), 0, 1)
+        for axis in CollectiveAxis
+    )
+
+    assert accesses == {
+        AffineTileAccess((AffineExpr(constant=0),), (64,), block_ranges),
+        AffineTileAccess((AffineExpr(constant=64),), (64,), block_ranges),
+    }
+
+
+def test_tile_access_rejects_id_finer_than_collective_level():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @store(%buffer: gmem<512xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
+            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tile: gmem<64xf32> = tile(%buffer: gmem<512xf32>, %tx: index)
+            %src: smem<64xf32> = alloc() attrs={id: 0}
+            move(%tile: gmem<64xf32>, %src: smem<64xf32>) collective=xyz.block
+          }
+        }""")
+    )
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    move = kernel.body.ops[-1]
+    assert isinstance(move, MoveOp)
+
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    root = kernel.body.arguments[0]
+    [write] = [
+        effect
+        for effect in analysis.live_out(move).concurrent_memory_effects[root]
+        if effect.kind == "W"
+    ]
+
+    assert write.tile_access == UnknownTileAccess()
+
+
 def test_preexisting_barrier_updates_dataflow_state():
     source = """\
         module {
@@ -47,22 +174,180 @@ def test_preexisting_barrier_updates_dataflow_state():
         }"""
 
     # A block barrier cannot discharge a grid-scoped global-memory effect.
-    with pytest.raises(NotImplementedError, match="barrier GRID"):
-        insert_syncs(gpu_dialect.parse(textwrap.dedent(
+    module = gpu_dialect.parse(
+        textwrap.dedent(
             source.replace("__SCOPE__", "block"),
-        )))
+        )
+    )
+    insert_syncs(module)
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%g: gmem<1xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %r: rmem<1xf32> = alloc()
+            move(%g: gmem<1xf32>, %r: rmem<1xf32>)
+            barrier() attrs={scope: "block"}
+            barrier() attrs={scope: "grid"}
+            move(%r: rmem<1xf32>, %g: gmem<1xf32>)
+          }
+        }""")
 
     # Scheduling passes may author structural barriers before InsertSyncs. The
     # grid barrier discharges the effect, so the pass must not insert another.
-    module = gpu_dialect.parse(textwrap.dedent(
-        source.replace("__SCOPE__", "grid"),
-    ))
+    module = gpu_dialect.parse(
+        textwrap.dedent(
+            source.replace("__SCOPE__", "grid"),
+        )
+    )
     insert_syncs(module)
     assert repr(module).count("barrier()") == 1
 
 
+def test_tma_store_then_load_at_same_indices_requires_grid_barrier():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @store_then_load(%buffer: gmem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %src: smem<64x64xf32> = alloc()
+            %dst: smem<64x64xf32> = alloc()
+            %store_lock: lock<bulk> = alloc()
+            async(%store_lock: lock<bulk>) tma_move(%buffer: gmem<64x64xf32>, %src: smem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
+            await(%store_lock: lock<bulk>)
+            %load_lock: lock<mbar> = alloc()
+            async(%load_lock: lock<mbar>) tma_move(%dst: smem<64x64xf32>, %buffer: gmem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
+            await(%load_lock: lock<mbar>)
+          }
+        }""")
+    module = gpu_dialect.parse(module_str)
+
+    insert_syncs(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @store_then_load(%buffer: gmem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %src: smem<64x64xf32> = alloc()
+            %dst: smem<64x64xf32> = alloc()
+            %store_lock: lock<bulk> = alloc()
+            async(%store_lock: lock<bulk>) tma_move(%buffer: gmem<64x64xf32>, %src: smem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
+            await(%store_lock: lock<bulk>)
+            %load_lock: lock<mbar> = alloc()
+            barrier() attrs={scope: "grid"}
+            async(%load_lock: lock<mbar>) tma_move(%dst: smem<64x64xf32>, %buffer: gmem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
+            await(%load_lock: lock<mbar>)
+          }
+        }""")
+
+
+def test_disjoint_tma_accesses_do_not_require_grid_barrier():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @store_then_load(%buffer: gmem<256x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<256x64xf32> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %block: gmem<128x64xf32> = tile(%buffer: gmem<256x64xf32>, %bx: index, 0)
+            %first: gmem<64x64xf32> = tile(%block: gmem<128x64xf32>, 0, 0)
+            %next: gmem<64x64xf32> = tile(%block: gmem<128x64xf32>, 1, 0)
+            %src: smem<64x64xf32> = alloc()
+            %dst: smem<64x64xf32> = alloc()
+            %store_lock: lock<bulk> = alloc()
+            async(%store_lock: lock<bulk>) tma_move(%first: gmem<64x64xf32>, %src: smem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<256x64xf32> tile=64x64>)
+            await(%store_lock: lock<bulk>)
+            %load_lock: lock<mbar> = alloc()
+            async(%load_lock: lock<mbar>) tma_move(%dst: smem<64x64xf32>, %next: gmem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<256x64xf32> tile=64x64>)
+            await(%load_lock: lock<mbar>)
+          }
+        }""")  # noqa: E501
+    module = gpu_dialect.parse(module_str)
+
+    insert_syncs(module)
+
+    assert repr(module) == module_str
+
+
+def test_affine_disjoint_tiled_matmul_writeback_shape():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @writeback(%buffer: gmem<256x256xf32>) grid_dim=[2, 2, 1] block_dim=[256, 1, 1] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %block: gmem<128x128xf32 strides=[256, 1]> = tile(%buffer: gmem<256x256xf32>, %bx: index, %by: index)
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %wg: gmem<64x128xf32 strides=[256, 1]> = tile(%block: gmem<128x128xf32 strides=[256, 1]>, %wgx: index, 0)
+            %first: gmem<64x64xf32 strides=[256, 1]> = tile(%wg: gmem<64x128xf32 strides=[256, 1]>, 0, 0)
+            %second: gmem<64x64xf32 strides=[256, 1]> = tile(%wg: gmem<64x128xf32 strides=[256, 1]>, 0, 1)
+            %src: smem<64x64xf32> = alloc()
+            move(%first: gmem<64x64xf32 strides=[256, 1]>, %src: smem<64x64xf32>) collective=[x.wg, y.block, z.grid]
+            move(%second: gmem<64x64xf32 strides=[256, 1]>, %src: smem<64x64xf32>) collective=[x.wg, y.block, z.grid]
+          }
+        }""")  # noqa: E501
+    module = gpu_dialect.parse(module_str)
+
+    insert_syncs(module)
+
+    assert repr(module) == module_str
+
+
+def test_affine_proof_considers_independent_operation_occurrences():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @stores(%buffer: gmem<192x64xf32>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %one: index = index_constant() attrs={value: 1}
+            %next_bx: index = index_add(%bx: index, %one: index)
+            %first: gmem<64x64xf32> = tile(%buffer: gmem<192x64xf32>, %bx: index, 0)
+            %second: gmem<64x64xf32> = tile(%buffer: gmem<192x64xf32>, %next_bx: index, 0)
+            %src: smem<64x64xf32> = alloc()
+            move(%first: gmem<64x64xf32>, %src: smem<64x64xf32>) collective=xyz.block
+            move(%second: gmem<64x64xf32>, %src: smem<64x64xf32>) collective=xyz.block
+          }
+        }""")
+    )  # noqa: E501
+
+    insert_syncs(module)
+
+    assert 'barrier() attrs={scope: "grid"}' in repr(module)
+
+
+def test_affine_proof_rejects_overlapping_physical_layout():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @stores(%buffer: gmem<2x2xf32 strides=[1, 1]>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %first: gmem<1x2xf32 strides=[1, 1]> = tile(%buffer: gmem<2x2xf32 strides=[1, 1]>, 0, 0)
+            %second: gmem<1x2xf32 strides=[1, 1]> = tile(%buffer: gmem<2x2xf32 strides=[1, 1]>, 1, 0)
+            %src: smem<1x2xf32> = alloc()
+            move(%first: gmem<1x2xf32 strides=[1, 1]>, %src: smem<1x2xf32>) collective=xyz.block
+            move(%second: gmem<1x2xf32 strides=[1, 1]>, %src: smem<1x2xf32>) collective=xyz.block
+          }
+        }""")
+    )  # noqa: E501
+
+    insert_syncs(module)
+
+    assert 'barrier() attrs={scope: "grid"}' in repr(module)
+
+
+def test_loop_iv_tiling_is_conservatively_synchronized():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @stores(%buffer: gmem<256x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<256x64xf32> tile=64x64>) {
+            %src: smem<64x64xf32> = alloc()
+            %lock: lock<bulk> = alloc()
+            for (%i: index = 0 to 4) {
+              %tile: gmem<64x64xf32> = tile(%buffer: gmem<256x64xf32>, %i: index, 0)
+              async(%lock: lock<bulk>) tma_move(%tile: gmem<64x64xf32>, %src: smem<64x64xf32>, %buffer_desc: tma_desc<arg_idx=0 gmem<256x64xf32> tile=64x64>)
+              await(%lock: lock<bulk>)
+            }
+          }
+        }""")
+    )  # noqa: E501
+
+    insert_syncs(module)
+
+    assert 'barrier() attrs={scope: "grid"}' in repr(module)
+
+
 def test_war_on_shared_buffer_gets_barrier():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<128x4096xbf16>, %b: gmem<128x4096xbf16>, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %sa: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
@@ -81,7 +366,8 @@ def test_war_on_shared_buffer_gets_barrier():
               await(%lw: lock<wgmma>)
             }
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     insert_syncs(module)
 
@@ -114,9 +400,9 @@ def test_war_on_shared_buffer_gets_barrier():
         }""")  # noqa: E501
 
 
-
 def test_wgmma256_wg_pipeline_inserts_barriers():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096_wgmma256_wg(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
             %c0: index = index_constant() attrs={value: 0}
@@ -309,7 +595,8 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             elementwise convert(%78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
             move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     insert_syncs(module)
 
     # One named (block_leader) barrier per stage reload (WAR: the next TMA load
@@ -333,7 +620,8 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
 
 
 def test_named_barrier_id_is_reused_after_mbar_await():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<64x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<64x64xbf16>, %d: gmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %sa: smem<64x64xbf16> = alloc()
@@ -363,11 +651,13 @@ def test_named_barrier_id_is_reused_after_mbar_await():
               move(%sd: smem<64x64xbf16>, %d: gmem<64x64xbf16>) attrs={tma: True}
             }
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
     barriers = [
-        line.strip() for line in repr(module).splitlines()
+        line.strip()
+        for line in repr(module).splitlines()
         if 'scope: "block_leader"' in line
     ]
     assert barriers == [
@@ -377,27 +667,29 @@ def test_named_barrier_id_is_reused_after_mbar_await():
 
 
 def test_bulk_await_does_not_release_named_barrier_id():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
-          kernel @test(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %c0: index = index_constant() attrs={value: 0}
+          kernel @test(%g0: gmem<64x64xf32>, %g1: gmem<64x64xf32>, %d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %s0: smem<64x64xf32> = alloc()
             %r0: rmem<64x64xf32> = alloc()
             move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)
             %l0: lock<bulk> = alloc()
-            async(%l0: lock<bulk>) tma_move(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %s0: smem<64x64xf32>, %c0: index, %c0: index)
+            async(%l0: lock<bulk>) tma_move(%g0: gmem<64x64xf32>, %s0: smem<64x64xf32>, %d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
             await(%l0: lock<bulk>)
             %s1: smem<64x64xf32> = alloc()
             %r1: rmem<64x64xf32> = alloc()
             move(%s1: smem<64x64xf32>, %r1: rmem<64x64xf32>)
             %l1: lock<bulk> = alloc()
-            async(%l1: lock<bulk>) tma_move(%d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>, %s1: smem<64x64xf32>, %c0: index, %c0: index)
+            async(%l1: lock<bulk>) tma_move(%g1: gmem<64x64xf32>, %s1: smem<64x64xf32>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>)
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
     barriers = [
-        line.strip() for line in repr(module).splitlines()
+        line.strip()
+        for line in repr(module).splitlines()
         if 'scope: "block_leader"' in line
     ]
     assert barriers == [
@@ -407,15 +699,15 @@ def test_bulk_await_does_not_release_named_barrier_id():
 
 
 def test_full_block_sync_releases_all_named_barrier_ids():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
-          kernel @test(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %c0: index = index_constant() attrs={value: 0}
+          kernel @test(%g0: gmem<64x64xf32>, %g1: gmem<64x64xf32>, %d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %s0: smem<64x64xf32> = alloc()
             %r0: rmem<64x64xf32> = alloc()
             move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)
             %l0: lock<bulk> = alloc()
-            async(%l0: lock<bulk>) tma_move(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %s0: smem<64x64xf32>, %c0: index, %c0: index)
+            async(%l0: lock<bulk>) tma_move(%g0: gmem<64x64xf32>, %s0: smem<64x64xf32>, %d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
             await(%l0: lock<bulk>)
             %sync_s: smem<64x64xf32> = alloc()
             %sync_r: rmem<64x64xf32> = alloc()
@@ -425,14 +717,14 @@ def test_full_block_sync_releases_all_named_barrier_ids():
             %r1: rmem<64x64xf32> = alloc()
             move(%s1: smem<64x64xf32>, %r1: rmem<64x64xf32>)
             %l1: lock<bulk> = alloc()
-            async(%l1: lock<bulk>) tma_move(%d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>, %s1: smem<64x64xf32>, %c0: index, %c0: index)
+            async(%l1: lock<bulk>) tma_move(%g1: gmem<64x64xf32>, %s1: smem<64x64xf32>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>)
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
     barriers = [
-        line.strip() for line in repr(module).splitlines()
-        if "barrier()" in line
+        line.strip() for line in repr(module).splitlines() if "barrier()" in line
     ]
     assert barriers == [
         'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',

@@ -68,6 +68,28 @@ def _verify_collective_attr(op: Op) -> None:
         raise ValueError(
             f"{op.op_id} collective attribute must list x, y, and z"
         )
+    if any(
+        axis != CollectiveAxis.X
+        and collective[axis] in (CollectiveLevel.WARP, CollectiveLevel.WG)
+        for axis in CollectiveAxis
+    ):
+        raise ValueError(
+            f"{op.op_id} warp and warp-group collectivity is only supported "
+            "on the x axis"
+        )
+    x_level = collective[CollectiveAxis.X]
+    group_size = {
+        CollectiveLevel.WARP: 32,
+        CollectiveLevel.WG: 128,
+    }.get(x_level)
+    if group_size is not None:
+        kernel = find_ancestor_of_type(op, KernelOp)
+        block_x = None if kernel is None else kernel.block_dim[CollectiveAxis.X]
+        if block_x is not None and block_x % group_size:
+            raise ValueError(
+                f"{op.op_id} {x_level.name.lower()} collectivity requires "
+                f"block_dim.x to be divisible by {group_size}; got {block_x}"
+            )
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -80,6 +102,25 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(KernelOp)
     def _verify_kernel(self, op: KernelOp) -> None:
+        num_warp_groups = op.num_warp_groups
+        if num_warp_groups is not None and (
+            not isinstance(num_warp_groups, int) or num_warp_groups <= 0
+        ):
+            raise ValueError(
+                "num_warp_groups must be a positive integer"
+            )
+        block_x = op.block_dim[CollectiveAxis.X]
+        if (
+            num_warp_groups is not None
+            and block_x is not None
+            and block_x != 128 * num_warp_groups
+        ):
+            raise ValueError(
+                "block_dim.x must contain exactly 128 threads per warp group; "
+                f"got block_dim.x={block_x} and "
+                f"num_warp_groups={num_warp_groups}"
+            )
+
         cluster_dim = op.cluster_dim
         if len(cluster_dim) != 3 or any(
             dim is not None and (not isinstance(dim, int) or dim <= 0)
@@ -144,6 +185,32 @@ class VerifyGpuDialect(VerificationPass):
                     f"operand strides {arg_type.strides}"
                 )
 
+    @verifies(TmaMoveOp)
+    def _verify_tma_move(self, op: TmaMoveOp) -> None:
+        if len(op.operands) != 3:
+            raise ValueError(
+                "tma_move expects dst, src, and descriptor; "
+                f"got {len(op.operands)} operands"
+            )
+        dst_is_gmem = isinstance(op.dst.type, GmemTensorType)
+        src_is_gmem = isinstance(op.src.type, GmemTensorType)
+        dst_is_smem = isinstance(op.dst.type, SmemTensorType)
+        src_is_smem = isinstance(op.src.type, SmemTensorType)
+        if not (
+            (dst_is_gmem and src_is_smem)
+            or (dst_is_smem and src_is_gmem)
+        ):
+            raise ValueError(
+                "tma_move expects one gmem and one smem operand; "
+                f"got dst={op.dst.type}, src={op.src.type}"
+            )
+        if not isinstance(op.descriptor.type, TmaDescType):
+            raise ValueError(
+                "tma_move expects a TMA descriptor as its third operand; "
+                f"got {op.descriptor.type}"
+            )
+        _verify_collective_attr(op)
+
     @verifies(ClusterBlockIdsOp)
     def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:
         kernel = find_ancestor_of_type(op, KernelOp)
@@ -196,35 +263,6 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
-        _verify_collective_attr(op)
-
-    @verifies(TmaMoveOp)
-    def _verify_tma_move(self, op: TmaMoveOp) -> None:
-        if len(op.operands) < 2:
-            raise ValueError(
-                "tma_move expects dst, src, and one index per dimension; "
-                f"got {len(op.operands)} operands"
-            )
-        dst_is_tma = isinstance(op.dst.type, TmaDescType)
-        src_is_tma = isinstance(op.src.type, TmaDescType)
-        dst_is_smem = isinstance(op.dst.type, SmemTensorType)
-        src_is_smem = isinstance(op.src.type, SmemTensorType)
-        if not (
-            (dst_is_tma and src_is_smem)
-            or (dst_is_smem and src_is_tma)
-        ):
-            raise ValueError(
-                "tma_move expects one TMA descriptor and one smem operand; "
-                f"got dst={op.dst.type}, src={op.src.type}"
-            )
-        descriptor_type = op.dst.type if dst_is_tma else op.src.type
-        assert isinstance(descriptor_type, TmaDescType)
-        if len(op.indices) != descriptor_type.gmem_type.rank:
-            raise ValueError(
-                "tma_move expects one index per TMA dimension; "
-                f"got {len(op.indices)} indices for rank "
-                f"{descriptor_type.gmem_type.rank}"
-            )
         _verify_collective_attr(op)
 
     @verifies(MatmulOp)

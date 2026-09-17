@@ -152,13 +152,13 @@ def test_allocation_starts_a_reuse_set():
 def test_does_not_reuse_async_locks():
     module_str = textwrap.dedent("""\
         module {
-          kernel @two_tma_loads(%a: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %b: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) {
+          kernel @two_tma_loads(%a: gmem<64x64xf32>, %b: gmem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %b_desc: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) {
             %a_smem: smem<64x64xf32> = alloc() attrs={id: 0}
             %b_smem: smem<64x64xf32> = alloc() attrs={id: 1}
             %a_lock: lock<mbar> = alloc() attrs={id: 2}
             %b_lock: lock<mbar> = alloc() attrs={id: 3}
-            async(%a_lock: lock<mbar>) tma_move(%a_smem: smem<64x64xf32>, %a: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
-            async(%b_lock: lock<mbar>) tma_move(%b_smem: smem<64x64xf32>, %b: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>)
+            async(%a_lock: lock<mbar>) tma_move(%a_smem: smem<64x64xf32>, %a: gmem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>)
+            async(%b_lock: lock<mbar>) tma_move(%b_smem: smem<64x64xf32>, %b: gmem<64x64xf32>, %b_desc: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>)
             await(%a_lock: lock<mbar>)
             await(%b_lock: lock<mbar>)
           }

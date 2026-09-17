@@ -152,6 +152,7 @@ class KernelOp(Op):
 
     @property
     def num_warp_groups(self) -> int | None:
+        # TODO: Remove this attribute; it is block_dim.x // 128.
         return self.attrs["num_warp_groups"]  # type: ignore[return-value]
 
     @num_warp_groups.setter
@@ -821,11 +822,13 @@ class MoveOp(Op):
 class TmaMoveOp(Op):
     """Synchronous TMA bulk transfer with explicit collectivity.
 
-    One operand is a TMA descriptor (gmem side), the other is smem. Indices are
-    per-dim element coordinates for the TMA engine. Direction (load/store) is
-    determined by which side is smem vs tma_desc. Completion tracking is the
-    surrounding ``async { ... }`` wrapper's job (it owns the lock), so this op
-    carries no lock itself — mirroring ``move`` and ``matmul``.
+    The first two operands are the original gmem and smem views, in transfer
+    order, and the third is the TMA descriptor for the gmem root. Keeping the
+    tiled gmem value makes its complete view chain available to analyses.
+    Coordinates are materialized from that chain only during PTX lowering.
+    Completion tracking is the surrounding ``async { ... }`` wrapper's job
+    (it owns the lock), so this op carries no lock itself — mirroring ``move``
+    and ``matmul``.
     """
 
     @classmethod
@@ -833,13 +836,13 @@ class TmaMoveOp(Op):
         cls,
         dst: Value,
         src: Value,
+        descriptor: Value,
         *,
-        indices: list[Value],
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         l2_cache_hint: str | None = None,
     ) -> "TmaMoveOp":
-        operands = [dst, src] + indices
+        operands = [dst, src, descriptor]
         attrs = dict(attrs or {})
         attrs["collective"] = dict(collective)
         if l2_cache_hint is not None:
@@ -855,8 +858,16 @@ class TmaMoveOp(Op):
         return self.operands[1]
 
     @property
-    def indices(self) -> list[Value]:
-        return self.operands[2:]
+    def descriptor(self) -> Value:
+        return self.operands[2]
+
+    @property
+    def gmem(self) -> Value:
+        return self.dst if isinstance(self.dst.type, GmemTensorType) else self.src
+
+    @property
+    def smem(self) -> Value:
+        return self.dst if isinstance(self.dst.type, SmemTensorType) else self.src
 
     @property
     def l2_cache_hint(self) -> str | None:
@@ -896,7 +907,7 @@ class TmaMoveOp(Op):
         attrs = p.read_extra_attrs()
         l2_cache_hint = attrs.pop("l2_cache_hint", None)
         return cls.build(
-            operands[0], operands[1], indices=operands[2:],
+            operands[0], operands[1], operands[2],
             collective=collective, attrs=attrs,
             l2_cache_hint=l2_cache_hint,  # type: ignore[arg-type]
         )
@@ -2357,10 +2368,21 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             + _memory_effect("R", op.src, src_scope)
         )
     if isinstance(op, TmaMoveOp):
-        # The block leader issues both sides of the TMA transfer.
+        # The block leader issues the transfer, while the retained gmem view is
+        # shared across the grid. The descriptor is metadata, not memory.
+        dst_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if isinstance(op.dst.type, SmemTensorType)
+            else CollectiveScope.GRID
+        )
+        src_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if isinstance(op.src.type, SmemTensorType)
+            else CollectiveScope.GRID
+        )
         return (
-            _memory_effect("W", op.dst, CollectiveScope.BLOCK_LEADER)
-            + _memory_effect("R", op.src, CollectiveScope.BLOCK_LEADER)
+            _memory_effect("W", op.dst, dst_scope)
+            + _memory_effect("R", op.src, src_scope)
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.

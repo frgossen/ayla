@@ -156,7 +156,9 @@ def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
         if tile_type.sizes[i] != arg_type.sizes[i]:
             new_tile_type.sizes[i] = tile_type.sizes[i]
     new_tile = TileOp.build(
-        new_arg, list(tile.indices), new_tile_type,
+        new_arg,
+        list(tile.indices),
+        new_tile_type,
         maybe_partial=tile.maybe_partial,
     )
     return [new_tile], [new_tile.result()]
@@ -188,7 +190,9 @@ def _sliced_moves(
         raise ValueError("move extent must divide evenly into slices")
     ops: list[Op] = []
     for index in range(count):
-        src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
+        src_tile, dst_tile = [
+            _slice_tile(value, dim, index, size) for value in (src, dst)
+        ]
         move = MoveOp.build(
             dst_tile.result(), src_tile.result(),
             collective=collective, attrs=attrs,
