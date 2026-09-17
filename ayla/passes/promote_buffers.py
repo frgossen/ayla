@@ -225,6 +225,8 @@ class PromoteBuffers(LoweringPass):
         Mark shared allocations by their asserted compute/writeback lifetime
         so a later arena-packing pass may overlay their storage. This is unsafe:
         no analysis verifies that differently named groups are non-overlapping.
+        TODO: Replace this policy flag with independent allocations followed by
+        lifetime analysis and a pass that selects safe storage reuse.
     tma_load_slices : dict[str, int] or None
         Leading-dimension TMA load slices by operand.
     """

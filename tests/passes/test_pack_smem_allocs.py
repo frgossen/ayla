@@ -52,8 +52,9 @@ def test_reuses_storage_between_named_allocation_groups():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %persistent: smem<16x16xbf16> = alloc() attrs={label: "shared"}
-            %a: smem<64x64xbf16> = alloc() attrs={reuse_group: "first"}
+            %independent: smem<16x16xbf16> = alloc() attrs={label: "shared"}
+            %a0: smem<32x64xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={reuse_group: "first"}
+            %a1: smem<32x64xbf16> = alloc() attrs={reuse_group: "first"}
             %b: smem<32x64xbf16> = alloc() attrs={reuse_group: "second"}
             move(%b: smem<32x64xbf16>, %b: smem<32x64xbf16>)
           }
@@ -62,22 +63,35 @@ def test_reuses_storage_between_named_allocation_groups():
     reuse_smem_allocs(module)
     [kernel] = module.body.ops
     allocations = find_ops_of_type(kernel, AllocOp)
-    [persistent] = [
+    [independent] = [
         op for op in allocations if op.attrs.get("label") == "shared"
     ]
-    [owner] = [
+    [arena] = [
         op for op in allocations
-        if op.attrs.get("reuse_group") == "first"
+        if op is not independent
     ]
-    assert owner.attrs["allocation_bytes"] == 8192
-    assert allocations == [persistent, owner]
-    [second] = find_ops_of_type(kernel, ReinterpretOp)
-    assert second.storage is owner.result()
+    assert arena.result().type == SmemTensorType.build(
+        (4096,),
+        BF16Type(),
+        attrs={
+            "swizzle": "128B",
+            "physical_layout": {
+                "block_width": 64,
+                "order": "block_major",
+            },
+        },
+    )
+    assert allocations == [arena, independent]
+    reinterprets = find_ops_of_type(kernel, ReinterpretOp)
+    assert len(reinterprets) == 3
+    assert all(op.arg is arena.result() for op in reinterprets)
+    assert [op.byte_offset for op in reinterprets] == [0, 4096, 0]
+    second = next(
+        op for op in reinterprets
+        if op.result().users()
+    )
     assert second.byte_offset == 0
-    assert second.result().type == SmemTensorType.build((32, 64), BF16Type())
     [move] = find_ops_of_type(kernel, MoveOp)
     assert move.dst is second.result()
     assert move.src is second.result()
-    assert {op.attrs.get("reuse_group") for op in allocations} == {
-        None, "first",
-    }
+    assert all("reuse_group" not in op.attrs for op in allocations)

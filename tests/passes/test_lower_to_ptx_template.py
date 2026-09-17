@@ -14,6 +14,7 @@ from ayla.gpu_dialect import (
     ToPtrOp,
     gpu_dialect,
 )
+from ayla.passes.folding import Folding
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
@@ -61,8 +62,8 @@ def test_lower_smem_arena_and_reinterpret():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %arena: smem<64x64xbf16> = alloc() attrs={allocation_alignment: 1024, allocation_bytes: 12288, id: 0}
-            %reinterpret: smem<32x64xbf16> = reinterpret(%arena: smem<64x64xbf16>) attrs={byte_offset: 8192}
+            %arena: smem<6144xbf16> = alloc() attrs={allocation_alignment: 1024, id: 0}
+            %reinterpret: smem<32x64xbf16> = reinterpret(%arena: smem<6144xbf16>) attrs={byte_offset: 8192}
           }
         }"""))
 
@@ -109,6 +110,24 @@ def test_lower_reshape_is_elided():
     lower_to_ptx_template(module)
 
     assert not find_ops(module, lambda op: isinstance(op, ReshapeOp))
+
+
+def test_lower_tile_uses_the_reinterpreted_view_strides():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %arena: smem<4096xbf16> = alloc() attrs={id: 0}
+            %view: smem<64x64xbf16> = reinterpret(%arena: smem<4096xbf16>) attrs={byte_offset: 0}
+            %tile: smem<64x16xbf16 strides=[64, 1]> = tile(%view: smem<64x64xbf16>, 0, 1)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    Folding().run(module)
+
+    [tile] = find_ops(module, lambda op: isinstance(op, PtrAddOp))
+    assert isinstance(tile.byte_offset.definition, IndexConstantOp)
+    assert tile.byte_offset.definition.value == 32
 
 
 def test_lower_barrier_unsupported_scope_raises():

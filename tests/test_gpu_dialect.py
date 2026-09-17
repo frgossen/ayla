@@ -51,26 +51,26 @@ def assert_print_and_roundtrip(op, expected):
 
 
 def test_reinterpret_op():
-    storage_type = SmemTensorType.build((64, 64), BF16Type())
+    arg_type = SmemTensorType.build((64, 64), BF16Type())
     view_type = SmemTensorType.build((32, 64), BF16Type())
-    storage = Value(name="storage", type=storage_type)
-    reinterpret = ReinterpretOp.build(storage, view_type, byte_offset=8192)
+    arg = Value(name="arg", type=arg_type)
+    reinterpret = ReinterpretOp.build(arg, view_type, byte_offset=8192)
 
-    assert reinterpret.storage is storage
+    assert reinterpret.arg is arg
     assert reinterpret.byte_offset == 8192
-    assert root_buffer(reinterpret.result()) is storage
+    assert root_buffer(reinterpret.result()) is arg
     assert_print_and_roundtrip(
         reinterpret,
-        "%0: smem<32x64xbf16> = reinterpret(%storage: smem<64x64xbf16>) "
+        "%0: smem<32x64xbf16> = reinterpret(%arg: smem<64x64xbf16>) "
         "attrs={byte_offset: 8192}",
     )
 
     with pytest.raises(ValueError, match="byte_offset"):
-        ReinterpretOp.build(storage, view_type, byte_offset=-1)
-    with pytest.raises(ValueError, match="storage"):
+        ReinterpretOp.build(arg, view_type, byte_offset=-1)
+    with pytest.raises(ValueError, match="arg"):
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
-        ReinterpretOp.build(storage, F32Type())
+        ReinterpretOp.build(arg, F32Type())
 
 
 def test_buffer_roots_support_no_root_and_multiple_roots():
