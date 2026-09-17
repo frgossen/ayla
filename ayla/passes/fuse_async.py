@@ -84,7 +84,7 @@ class FuseAsync(Pass):
             nonlocal group_inner, group_lock, group_kind, group_attrs
             nonlocal group_collective
             nonlocal in_flight_locks
-            if group_inner:
+            if group_collective is not None:
                 # Every member's await must have been dropped (its lock removed)
                 # so the group's single await covers it. A leftover lock means a
                 # member's await wasn't adjacent (e.g. TMA loads fused *after*
@@ -95,7 +95,6 @@ class FuseAsync(Pass):
                     f"no adjacent await; members' awaits must be adjacent (fuse "
                     f"TMA loads before pipelining)"
                 )
-                assert group_collective is not None
                 new_ops.append(AsyncOp.build(
                     group_lock,
                     collective=group_collective,
@@ -115,13 +114,12 @@ class FuseAsync(Pass):
             if kind is not None:
                 if group_kind is not None and kind != group_kind:
                     finalize()  # different kind ends the run
-                if group_lock is None:
+                if group_collective is None:
                     group_lock = op.lock
                     group_kind = kind
-                    group_attrs = dict(op.attrs) or None
-                    group_collective = dict(op.collective)
+                    group_attrs = dict(op.attrs) if op.attrs else None
+                    group_collective = op.collective
                 else:
-                    assert group_collective is not None
                     group_collective = {
                         axis: group_collective[axis].join(
                             op.collective[axis],
