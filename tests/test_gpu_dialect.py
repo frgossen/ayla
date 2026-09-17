@@ -403,6 +403,48 @@ def test_tma_move_build_accepts_l2_cache_hint():
     )
 
 
+@pytest.mark.parametrize(
+    ("smem_is_dst", "expected"),
+    [
+        (
+            True,
+            {
+                ("W", "smem", CollectiveScope.BLOCK_LEADER),
+                ("R", "desc", CollectiveScope.BLOCK_LEADER),
+            },
+        ),
+        (
+            False,
+            {
+                ("W", "desc", CollectiveScope.BLOCK_LEADER),
+                ("R", "smem", CollectiveScope.BLOCK_LEADER),
+            },
+        ),
+    ],
+)
+def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
+    gmem_type = GmemTensorType.build((64, 64), F32Type())
+    desc = Value(
+        name="desc",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
+    index = Value(name="index", type=IndexType())
+    dst, src = (smem, desc) if smem_is_dst else (desc, smem)
+
+    effects = memory_effects(TmaMoveOp.build(
+        dst,
+        src,
+        indices=[index],
+        collective={
+            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+        },
+    ))
+
+    assert effects is not None
+    assert {(kind, root.name, scope) for kind, root, scope in effects} == expected
+
+
 def test_tma_descriptor_validates_l2_promotion():
     gmem_type = GmemTensorType.build((64, 64), F32Type())
     desc = TmaDescType.build(
