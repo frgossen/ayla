@@ -25,6 +25,8 @@ from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BlockIdsOp,
+    CollectiveAxis,
+    CollectiveLevel,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -170,17 +172,27 @@ def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
 
 
 def _sliced_moves(
-    dst: Value, src: Value, count: int, dim: int, attrs: dict[str, object],
+    dst: Value,
+    src: Value,
+    count: int,
+    dim: int,
+    collective: dict[CollectiveAxis, CollectiveLevel],
+    attrs: dict[str, object],
 ) -> list[Op]:
     if count == 1:
-        return [MoveOp.build(dst, src, attrs=attrs)]
+        return [MoveOp.build(
+            dst, src, collective=collective, attrs=attrs,
+        )]
     size, remainder = divmod(src.type.sizes[dim], count)
     if remainder:
         raise ValueError("move extent must divide evenly into slices")
     ops: list[Op] = []
     for index in range(count):
         src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
-        move = MoveOp.build(dst_tile.result(), src_tile.result(), attrs=attrs)
+        move = MoveOp.build(
+            dst_tile.result(), src_tile.result(),
+            collective=collective, attrs=attrs,
+        )
         ops.extend([src_tile, dst_tile, move])
     return ops
 
@@ -225,6 +237,8 @@ class PromoteBuffers(LoweringPass):
         Mark shared allocations by their asserted compute/writeback lifetime
         so a later arena-packing pass may overlay their storage. This is unsafe:
         no analysis verifies that differently named groups are non-overlapping.
+        TODO: Replace this policy flag with independent allocations followed by
+        lifetime analysis and a pass that selects safe storage reuse.
     tma_load_slices : dict[str, int] or None
         Leading-dimension TMA load slices by operand.
     """
@@ -333,6 +347,7 @@ class PromoteBuffers(LoweringPass):
         self,
         src: Value,
         operand_name: str,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
         init: object = None,
     ) -> tuple[list[Op], list[Value]]:
@@ -397,12 +412,13 @@ class PromoteBuffers(LoweringPass):
             new_ops.append(alloc)
             new_ops.extend(_sliced_moves(
                 alloc.result(), chain_root,
-                self.tma_load_slices.get(operand_name, 1), 0, attrs,
+                self.tma_load_slices.get(operand_name, 1), 0,
+                collective, attrs,
             ))
             if target_type.dtype != chain_root.type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
                 cvt = ElementwiseOp.build(
-                    dst=cvt_alloc.result(), src=alloc.result(), fn="convert",
+                    dst=cvt_alloc.result(), srcs=[alloc.result()], fn="convert",
                 )
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
@@ -417,7 +433,11 @@ class PromoteBuffers(LoweringPass):
         return new_ops, [result]
 
     def _build_tma_writeback(
-        self, dst: Value, src: Value, matmul_label: str | None,
+        self,
+        dst: Value,
+        src: Value,
+        collective: dict[CollectiveAxis, CollectiveLevel],
+        matmul_label: str | None,
     ) -> list[Op]:
         """Stage a narrow distributed value for one block-wide TMA store.
 
@@ -476,7 +496,12 @@ class PromoteBuffers(LoweringPass):
                 # TODO: Express this source slice with a tile op instead of the
                 # wgmma_col_start attribute.
                 gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
-            gather = MoveOp.build(dst=gather_dst, src=src, attrs=gather_attrs)
+            gather = MoveOp.build(
+                dst=gather_dst,
+                src=src,
+                collective=collective,
+                attrs=gather_attrs,
+            )
             store_tiles = (
                 [_slice_tile(block_dst, -1, slice_idx, slice_cols)]
                 if self.writeback_slices > 1 else []
@@ -485,7 +510,10 @@ class PromoteBuffers(LoweringPass):
             store_attrs = {"label": f"{matmul_label}_dst_tma", "tma": True}
             store_attrs.update(self.move_attrs.get("dst", {}))
             store = MoveOp.build(
-                dst=store_dst_value, src=smem.result(), attrs=store_attrs,
+                dst=store_dst_value,
+                src=smem.result(),
+                collective=collective,
+                attrs=store_attrs,
             )
             new_ops.extend([gather, *store_tiles, store])
         return new_ops
@@ -495,6 +523,7 @@ class PromoteBuffers(LoweringPass):
         dst: Value,
         src: Value,
         operand_name: str,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
         epilogue: list[ElementwiseOp] | None = None,
     ) -> tuple[list[Op], list[Value]]:
@@ -517,14 +546,14 @@ class PromoteBuffers(LoweringPass):
                 # TODO: Generalize this rewrite for multi-source element-wise
                 # epilogues such as SwiGLU. Retarget the final operation's
                 # destination while preserving and remapping all its sources.
-                assert final.dst is src and final.src is src
+                assert final.dst is src and final.src(0) is src
                 new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), src=src, fn=final.fn,
+                    dst=tmp_alloc.result(), srcs=[src], fn=final.fn,
                     attrs=final.attrs,
                 ))
             else:
                 new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), src=src, fn="convert",
+                    dst=tmp_alloc.result(), srcs=[src], fn="convert",
                     attrs=(
                         {"label": f"{matmul_label}_{operand_name}_convert"}
                         if matmul_label is not None else None
@@ -534,10 +563,14 @@ class PromoteBuffers(LoweringPass):
         else:
             new_ops.extend(epilogue)
         if self.tma and self.target_type == "wrmem":
-            new_ops.extend(self._build_tma_writeback(dst, src, matmul_label))
+            new_ops.extend(self._build_tma_writeback(
+                dst, src, collective, matmul_label,
+            ))
             return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
-        move = MoveOp.build(dst=dst, src=src, attrs=attrs)
+        move = MoveOp.build(
+            dst=dst, src=src, collective=collective, attrs=attrs,
+        )
         new_ops.append(move)
         return new_ops, []
 
@@ -608,14 +641,20 @@ class PromoteBuffers(LoweringPass):
         new_lhs, new_rhs, new_dst = lhs, rhs, dst
 
         if "lhs" in self.operand_names:
-            ops, [new_lhs] = self._build_operand_promotion(lhs, "lhs", label)
+            ops, [new_lhs] = self._build_operand_promotion(
+                lhs, "lhs", op.collective, label,
+            )
             pre_ops.extend(ops)
         if "rhs" in self.operand_names:
-            ops, [new_rhs] = self._build_operand_promotion(rhs, "rhs", label)
+            ops, [new_rhs] = self._build_operand_promotion(
+                rhs, "rhs", op.collective, label,
+            )
             pre_ops.extend(ops)
         init = op.init
         if "dst" in self.operand_names:
-            ops, [new_dst] = self._build_operand_promotion(dst, "dst", label, init=init)
+            ops, [new_dst] = self._build_operand_promotion(
+                dst, "dst", op.collective, label, init=init,
+            )
             pre_ops.extend(ops)
             # A staged SMEM destination is intermediate IR; its matmul still
             # owns initialization until the destination reaches registers.
@@ -640,7 +679,7 @@ class PromoteBuffers(LoweringPass):
         ]
         if "dst" in self.operand_names:
             post_ops, _ = self._build_operand_writeback(
-                dst, new_dst, "dst", label, post_ops,
+                dst, new_dst, "dst", op.collective, label, post_ops,
             )
 
         return pre_ops + [matmul] + post_ops

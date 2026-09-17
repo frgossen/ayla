@@ -19,7 +19,9 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BF16Type,
     BarrierOp,
+    ClusterBlockIdsOp,
     CollectiveScope,
+    ElementwiseOp,
     F32Type,
     ForOp,
     IfOp,
@@ -29,6 +31,7 @@ from ayla.gpu_dialect import (
     MoveOp,
     PredicateType,
     ReinterpretOp,
+    ReshapeOp,
     SelectOp,
     SmemTensorType,
     TmaDescType,
@@ -48,26 +51,26 @@ def assert_print_and_roundtrip(op, expected):
 
 
 def test_reinterpret_op():
-    storage_type = SmemTensorType.build((64, 64), BF16Type())
+    arg_type = SmemTensorType.build((64, 64), BF16Type())
     view_type = SmemTensorType.build((32, 64), BF16Type())
-    storage = Value(name="storage", type=storage_type)
-    reinterpret = ReinterpretOp.build(storage, view_type, byte_offset=8192)
+    arg = Value(name="arg", type=arg_type)
+    reinterpret = ReinterpretOp.build(arg, view_type, byte_offset=8192)
 
-    assert reinterpret.storage is storage
+    assert reinterpret.arg is arg
     assert reinterpret.byte_offset == 8192
-    assert root_buffer(reinterpret.result()) is storage
+    assert root_buffer(reinterpret.result()) is arg
     assert_print_and_roundtrip(
         reinterpret,
-        "%0: smem<32x64xbf16> = reinterpret(%storage: smem<64x64xbf16>) "
+        "%0: smem<32x64xbf16> = reinterpret(%arg: smem<64x64xbf16>) "
         "attrs={byte_offset: 8192}",
     )
 
     with pytest.raises(ValueError, match="byte_offset"):
-        ReinterpretOp.build(storage, view_type, byte_offset=-1)
-    with pytest.raises(ValueError, match="storage"):
+        ReinterpretOp.build(arg, view_type, byte_offset=-1)
+    with pytest.raises(ValueError, match="arg"):
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
-        ReinterpretOp.build(storage, F32Type())
+        ReinterpretOp.build(arg, F32Type())
 
 
 def test_buffer_roots_support_no_root_and_multiple_roots():
@@ -89,6 +92,23 @@ def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
     assert memory_effects(barrier) is None
     assert has_ordering_effect(barrier)
     assert has_ordering_effect(nested)
+
+
+def test_reshape_op():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([2, 3, 4], F32Type()),
+    )
+    reshape = ReshapeOp.build(
+        source, GmemTensorType.build([6, 4], F32Type()),
+    )
+
+    assert reshape.arg is source
+    assert root_buffer(reshape.result()) is source
+    assert_print_and_roundtrip(
+        reshape,
+        "%0: gmem<6x4xf32> = reshape(%source: gmem<2x3x4xf32>)",
+    )
 
 
 def test_matmul_program():
@@ -134,6 +154,26 @@ def test_matmul_program():
     with pytest.raises(AssertionError):
         matmul.narrow_collective_level(
             CollectiveAxis.X, CollectiveLevel.BLOCK,
+        )
+
+
+def test_elementwise_syntax():
+    tensor_type = GmemTensorType.build((8,), F32Type())
+    dst = Value(name="dst", type=tensor_type)
+    src = Value(name="src", type=tensor_type)
+    op = ElementwiseOp.build(
+        dst, [src], fn="sigmoid", attrs={"label": "activation"},
+    )
+
+    assert_print_and_roundtrip(
+        op,
+        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+        'attrs={label: "activation"}',
+    )
+    with pytest.raises(ValueError, match="must not also appear in attrs"):
+        gpu_dialect.parse(
+            'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+            'attrs={fn: "convert"}'
         )
 
 
@@ -185,6 +225,54 @@ def test_kernel_num_threads_is_unresolved_with_an_unset_axis():
     )
 
     assert kernel.num_threads is None
+
+
+def test_kernel_cluster_dimensions_round_trip():
+    kernel = KernelOp.build(
+        "k", Block(), grid_dim=(12, 1, 1), cluster_dim=(3, 1, 1),
+    )
+    module = ModuleOp.build(Block(ops=[kernel]))
+
+    assert kernel.cluster_dim == (3, 1, 1)
+    assert_print_and_roundtrip(module, textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[12, 1, 1] cluster_dim=[3, 1, 1] {
+          }
+        }"""))
+
+
+def test_kernel_cluster_dimensions_default_to_unresolved():
+    kernel = KernelOp.build("k", Block())
+    module = ModuleOp.build(Block(ops=[kernel]))
+
+    assert kernel.cluster_dim == (None, None, None)
+    assert_print_and_roundtrip(module, textwrap.dedent("""\
+        module {
+          kernel @k() {
+          }
+        }"""))
+
+
+def test_cluster_block_ids_round_trip():
+    ids = ClusterBlockIdsOp.build()
+
+    assert ids.results == [ids.x, ids.y, ids.z]
+    assert_print_and_roundtrip(
+        ids,
+        "%cbx: index, %cby: index, %cbz: index "
+        "= cluster_block_ids()",
+    )
+
+
+def test_cluster_collective_scope_is_between_block_and_grid():
+    assert (
+        CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER)
+        == CollectiveScope.CLUSTER
+    )
+    assert (
+        CollectiveScope.CLUSTER.join(CollectiveScope.GRID)
+        == CollectiveScope.GRID
+    )
 
 
 def test_for_loop():
@@ -255,9 +343,15 @@ def test_async_op():
             },
         ),
     ])
-    op = AsyncOp.build(lock, body=body)
+    op = AsyncOp.build(
+        lock,
+        collective={
+            axis: CollectiveLevel.GRID for axis in CollectiveAxis
+        },
+        body=body,
+    )
     expected = textwrap.dedent("""\
-        async(%lock: lock<wgmma>) {
+        async(%lock: lock<wgmma>) collective=xyz.grid {
           matmul(%lhs0: gmem<64x64xf32>, %rhs0: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
           matmul(%lhs1: gmem<64x64xf32>, %rhs1: gmem<64x64xf32>, %dst: gmem<64x64xf32>) collective=xyz.grid
         }""")  # noqa: E501
@@ -269,9 +363,14 @@ def test_async_op_single_move():
     dst = Value(name="dst", type=t)
     src = Value(name="src", type=t)
     lock = Value(name="lock", type=LockType.build(kind="bulk"))
-    body = Block(ops=[MoveOp.build(dst, src)])
-    op = AsyncOp.build(lock, body=body)
-    expected = "async(%lock: lock<bulk>) move(%dst: gmem<64x64xf32>, %src: gmem<64x64xf32>)"  # noqa: E501
+    collective = {
+        axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
+    }
+    body = Block(ops=[MoveOp.build(
+        dst, src, collective=collective,
+    )])
+    op = AsyncOp.build(lock, collective=collective, body=body)
+    expected = "async(%lock: lock<bulk>) collective=xyz.cluster move(%dst: gmem<64x64xf32>, %src: gmem<64x64xf32>) collective=xyz.cluster"  # noqa: E501
     assert_print_and_roundtrip(op, expected)
 
 
@@ -285,10 +384,23 @@ def test_tma_move_build_accepts_l2_cache_hint():
     indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
 
     op = TmaMoveOp.build(
-        smem, desc, indices, l2_cache_hint="evict_last",
+        smem,
+        desc,
+        indices=indices,
+        collective={
+            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+        },
+        l2_cache_hint="evict_last",
     )
 
     assert op.l2_cache_hint == "evict_last"
+    assert_print_and_roundtrip(
+        op,
+        "tma_move(%smem: smem<64x64xf32>, %desc: "
+        "tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %i0: index, "
+        "%i1: index) collective=xyz.block "
+        'attrs={l2_cache_hint: "evict_last"}',
+    )
 
 
 @pytest.mark.parametrize(
@@ -320,7 +432,14 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
     index = Value(name="index", type=IndexType())
     dst, src = (smem, desc) if smem_is_dst else (desc, smem)
 
-    effects = memory_effects(TmaMoveOp.build(dst, src, [index]))
+    effects = memory_effects(TmaMoveOp.build(
+        dst,
+        src,
+        indices=[index],
+        collective={
+            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+        },
+    ))
 
     assert effects is not None
     assert {(kind, root.name, scope) for kind, root, scope in effects} == expected

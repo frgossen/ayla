@@ -107,7 +107,7 @@ class ReuseSmemAllocs(Pass):
             if isinstance(op.result().type, SmemTensorType)
         ]
         groups: dict[str, list[AllocOp]] = {}
-        base: AllocOp | None = None
+        arena_template: AllocOp | None = None
         arena_alignment = 1
         for alloc in allocations:
             group = alloc.attrs.get("reuse_group")
@@ -115,17 +115,15 @@ class ReuseSmemAllocs(Pass):
                 continue
             if not isinstance(group, str):
                 raise ValueError("reuse_group must be a string")
-            if (
-                "allocation_bytes" in alloc.attrs
-                or "allocation_alignment" in alloc.attrs
-            ):
+            if "allocation_alignment" in alloc.attrs:
                 raise ValueError(
                     "cannot reuse an allocation that already has a layout"
                 )
             groups.setdefault(group, []).append(alloc)
-            if base is None:
-                base = alloc
-            arena_alignment = max(arena_alignment, _alignment(alloc))
+            alignment = _alignment(alloc)
+            if alignment > arena_alignment or arena_template is None:
+                arena_template = alloc
+                arena_alignment = alignment
 
         if not groups:
             return module
@@ -140,24 +138,27 @@ class ReuseSmemAllocs(Pass):
             placements.extend(zip(group, offsets, strict=True))
             arena_bytes = max(arena_bytes, group_bytes)
 
-        assert base is not None
-        if base.parent_block is None:
-            raise ValueError("reuse-group allocation is detached from the kernel")
+        assert arena_template is not None
+        template_type = arena_template.result().type
+        assert isinstance(template_type, SmemTensorType)
+        dtype_bytes = template_type.dtype.byte_size
+        assert arena_bytes % dtype_bytes == 0
+        type_attrs = {
+            key: value for key, value in template_type.attrs.items()
+            if key not in ("sizes", "dtype", "strides")
+        }
+        arena_type = SmemTensorType.build(
+            [arena_bytes // dtype_bytes], template_type.dtype, attrs=type_attrs,
+        )
+        arena = AllocOp.build_with_fresh_id(arena_type)
+        kernel.body.ops.insert(0, arena)
 
-        # The owner is a physical allocation; every other selected allocation
-        # becomes a typed view at its planned offset.
-        base.attrs["allocation_bytes"] = arena_bytes
-        base.attrs["allocation_alignment"] = arena_alignment
-        if base.parent_block is not kernel.body:
-            base.parent_block.ops.remove(base)
-            kernel.body.ops.insert(0, base)
+        # Every selected allocation becomes a typed view of the arena.
         for alloc, offset in placements:
-            if alloc is base:
-                continue
             assert alloc.parent_block is not None
             block = alloc.parent_block
             reinterpret = ReinterpretOp.build(
-                base.result(), alloc.result().type, byte_offset=offset,
+                arena.result(), alloc.result().type, byte_offset=offset,
             )
             for user in alloc.result().users():
                 for i, operand in enumerate(user.operands):

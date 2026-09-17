@@ -8,6 +8,8 @@ from ayla.gpu_dialect import (
     AsyncOp,
     AwaitOp,
     BarrierOp,
+    CollectiveAxis,
+    CollectiveLevel,
     ElementwiseOp,
     F32Type,
     ForOp,
@@ -34,12 +36,21 @@ def smem_type() -> SmemTensorType:
     return SmemTensorType.build([16], F32Type())
 
 
+THREAD_COLLECTIVE = {
+    axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+}
+
+
 def test_buffer_is_live_from_first_to_last_access():
     alloc = AllocOp.build(smem_type(), id=0)
     before = BarrierOp.build()
-    first_access = MoveOp.build(alloc.result(), alloc.result())
+    first_access = MoveOp.build(
+        alloc.result(), alloc.result(), collective=THREAD_COLLECTIVE,
+    )
     between = BarrierOp.build()
-    last_access = MoveOp.build(alloc.result(), alloc.result())
+    last_access = MoveOp.build(
+        alloc.result(), alloc.result(), collective=THREAD_COLLECTIVE,
+    )
     after = BarrierOp.build()
     module = ModuleOp.build(Block(ops=[
         alloc, before, first_access, between, last_access, after,
@@ -61,7 +72,9 @@ def test_buffer_is_live_from_first_to_last_access():
 def test_initialized_allocation_is_the_first_access():
     alloc = AllocOp.build(smem_type(), id=0, init=0)
     between = BarrierOp.build()
-    access = MoveOp.build(alloc.result(), alloc.result())
+    access = MoveOp.build(
+        alloc.result(), alloc.result(), collective=THREAD_COLLECTIVE,
+    )
     module = ModuleOp.build(Block(ops=[alloc, between, access]))
 
     analysis = BufferLifetimeAnalysis()
@@ -82,9 +95,13 @@ def test_kernel_arguments_extend_to_their_abi_boundaries():
     )
     temporary = AllocOp.build(smem_type(), id=0)
     before_read = IndexConstantOp.build(0)
-    read = MoveOp.build(temporary.result(), input_buffer)
+    read = MoveOp.build(
+        temporary.result(), input_buffer, collective=THREAD_COLLECTIVE,
+    )
     between = IndexConstantOp.build(0)
-    write = MoveOp.build(output_buffer, temporary.result())
+    write = MoveOp.build(
+        output_buffer, temporary.result(), collective=THREAD_COLLECTIVE,
+    )
     after_write = IndexConstantOp.build(0)
     kernel = KernelOp.build(
         "test",
@@ -115,8 +132,12 @@ def test_in_place_handoff_lifetimes_do_not_intersect():
         name="output", type=GmemTensorType.build([16], F32Type()),
     )
     temporary = AllocOp.build(output_buffer.type, id=0)
-    produce = MoveOp.build(temporary.result(), input_buffer)
-    handoff = ElementwiseOp.build(output_buffer, temporary.result(), "sigmoid")
+    produce = MoveOp.build(
+        temporary.result(), input_buffer, collective=THREAD_COLLECTIVE,
+    )
+    handoff = ElementwiseOp.build(
+        output_buffer, [temporary.result()], fn="sigmoid",
+    )
     kernel = KernelOp.build(
         "test",
         Block(
@@ -137,9 +158,13 @@ def test_in_place_handoff_lifetimes_do_not_intersect():
 def test_views_resolve_to_their_physical_buffer():
     alloc = AllocOp.build(smem_type(), id=0)
     view = ReinterpretOp.build(alloc.result(), smem_type())
-    first_access = MoveOp.build(view.result(), view.result())
+    first_access = MoveOp.build(
+        view.result(), view.result(), collective=THREAD_COLLECTIVE,
+    )
     between = BarrierOp.build()
-    last_access = MoveOp.build(view.result(), view.result())
+    last_access = MoveOp.build(
+        view.result(), view.result(), collective=THREAD_COLLECTIVE,
+    )
     module = ModuleOp.build(Block(ops=[
         alloc, view, first_access, between, last_access,
     ]))
@@ -158,9 +183,13 @@ def test_select_keeps_every_possible_buffer_live():
     rhs = AllocOp.build(smem_type(), id=1)
     index = Value(name="index", type=F32Type())
     select = SelectOp.build(index, [lhs.result(), rhs.result()])
-    first_access = MoveOp.build(select.result(), select.result())
+    first_access = MoveOp.build(
+        select.result(), select.result(), collective=THREAD_COLLECTIVE,
+    )
     between = BarrierOp.build()
-    last_access = MoveOp.build(select.result(), select.result())
+    last_access = MoveOp.build(
+        select.result(), select.result(), collective=THREAD_COLLECTIVE,
+    )
     module = ModuleOp.build(Block(ops=[
         lhs, rhs, select, first_access, between, last_access,
     ]))
@@ -178,8 +207,12 @@ def test_select_keeps_every_possible_buffer_live():
 def test_buffer_stays_live_until_its_async_await():
     lock = AllocOp.build(LockType.build(kind="mbar"), id=0)
     alloc = AllocOp.build(smem_type(), id=1)
-    access = MoveOp.build(alloc.result(), alloc.result())
-    async_op = AsyncOp.build(lock.result(), Block(ops=[access]))
+    access = MoveOp.build(
+        alloc.result(), alloc.result(), collective=THREAD_COLLECTIVE,
+    )
+    async_op = AsyncOp.build(
+        lock.result(), collective=THREAD_COLLECTIVE, body=Block(ops=[access]),
+    )
     between = BarrierOp.build()
     await_op = AwaitOp.build(lock.result())
     module = ModuleOp.build(Block(ops=[lock, alloc, async_op, between, await_op]))

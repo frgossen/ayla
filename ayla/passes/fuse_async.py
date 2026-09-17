@@ -35,6 +35,8 @@ from __future__ import annotations
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
+    CollectiveAxis,
+    CollectiveLevel,
     MatmulOp,
     ModuleOp,
     MoveOp,
@@ -73,14 +75,15 @@ class FuseAsync(Pass):
         group_lock = None
         group_kind: str | None = None
         group_attrs: dict | None = None
+        group_collective: dict[CollectiveAxis, CollectiveLevel] | None = None
         # Member locks still awaiting their (to-be-dropped) await. Each fused
         # async adds its lock; its await removes it. Must be empty at finalize.
         in_flight_locks: set = set()
 
         def finalize() -> None:
-            nonlocal group_inner, group_lock, group_kind, group_attrs
+            nonlocal group_inner, group_lock, group_kind, group_attrs, group_collective
             nonlocal in_flight_locks
-            if group_inner:
+            if group_collective is not None:
                 # Every member's await must have been dropped (its lock removed)
                 # so the group's single await covers it. A leftover lock means a
                 # member's await wasn't adjacent (e.g. TMA loads fused *after*
@@ -93,6 +96,7 @@ class FuseAsync(Pass):
                 )
                 new_ops.append(AsyncOp.build(
                     group_lock,
+                    collective=group_collective,
                     body=Block(ops=group_inner),
                     attrs=group_attrs,
                 ))
@@ -101,17 +105,23 @@ class FuseAsync(Pass):
             group_lock = None
             group_kind = None
             group_attrs = None
+            group_collective = None
             in_flight_locks = set()
 
         for op in block.ops:
             kind = _fusion_kind(op)
             if kind is not None:
-                if group_kind is not None and kind != group_kind:
-                    finalize()  # different kind ends the run
-                if group_lock is None:
+                if group_kind is not None and (
+                    kind != group_kind
+                    or op.lock.type.kind != group_lock.type.kind
+                    or op.collective != group_collective
+                ):
+                    finalize()  # incompatible async ends the run
+                if group_collective is None:
                     group_lock = op.lock
                     group_kind = kind
                     group_attrs = dict(op.attrs) if op.attrs else None
+                    group_collective = op.collective
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:

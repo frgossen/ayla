@@ -24,6 +24,7 @@ def ayla_installed():
     # whole kernel collection.
     from ayla import torch_compile
 
+    AllocOp._id_counter = itertools.count()
     torch_compile.install()
     try:
         yield

@@ -10,9 +10,11 @@ from ayla.gpu_dialect import (
     PtrAddOp,
     PTXTemplateOp,
     ReinterpretOp,
+    ReshapeOp,
     ToPtrOp,
     gpu_dialect,
 )
+from ayla.passes.folding import Folding
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
@@ -37,6 +39,10 @@ def _lower_barrier(scope: str) -> str:
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
+    ("cluster", textwrap.dedent("""\
+        barrier.cluster.arrive.release;
+        barrier.cluster.wait.acquire;
+    """)),
 ])
 def test_lower_barrier(scope, expected):
     assert _lower_barrier(scope) == expected
@@ -56,8 +62,8 @@ def test_lower_smem_arena_and_reinterpret():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %arena: smem<64x64xbf16> = alloc() attrs={allocation_alignment: 1024, allocation_bytes: 12288, id: 0}
-            %reinterpret: smem<32x64xbf16> = reinterpret(%arena: smem<64x64xbf16>) attrs={byte_offset: 8192}
+            %arena: smem<6144xbf16> = alloc() attrs={allocation_alignment: 1024, id: 0}
+            %reinterpret: smem<32x64xbf16> = reinterpret(%arena: smem<6144xbf16>) attrs={byte_offset: 8192}
           }
         }"""))
 
@@ -91,6 +97,37 @@ def test_lower_zero_offset_reinterpret_is_elided():
     assert not find_ops(module, lambda op: isinstance(
         op, (ReinterpretOp, ToPtrOp, PtrAddOp),
     ))
+
+
+def test_lower_reshape_is_elided():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%arg: gmem<2x3x4xf32>) {
+            %view: gmem<6x4xf32> = reshape(%arg: gmem<2x3x4xf32>)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+
+    assert not find_ops(module, lambda op: isinstance(op, ReshapeOp))
+
+
+def test_lower_tile_uses_the_reinterpreted_view_strides():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %arena: smem<4096xbf16> = alloc() attrs={id: 0}
+            %view: smem<64x64xbf16> = reinterpret(%arena: smem<4096xbf16>) attrs={byte_offset: 0}
+            %tile: smem<64x16xbf16 strides=[64, 1]> = tile(%view: smem<64x64xbf16>, 0, 1)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    Folding().run(module)
+
+    [tile] = find_ops(module, lambda op: isinstance(op, PtrAddOp))
+    assert isinstance(tile.byte_offset.definition, IndexConstantOp)
+    assert tile.byte_offset.definition.value == 32
 
 
 def test_lower_barrier_unsupported_scope_raises():
@@ -145,7 +182,7 @@ def test_lower_move_gmem_to_smem():
             %bx: index, %by: index, %bz: index = block_ids()
             %a_tile: gmem<64x16xbf16 strides=[4096, 1]> = tile(%a: gmem<4096x4096xbf16>, %by: index, %bx: index)
             %smem_a: smem<64x16xbf16> = alloc() attrs={id: 0}
-            move(%smem_a: smem<64x16xbf16>, %a_tile: gmem<64x16xbf16 strides=[4096, 1]>) attrs={collective: "block"}
+            move(%smem_a: smem<64x16xbf16>, %a_tile: gmem<64x16xbf16 strides=[4096, 1]>) collective=xyz.block
           }
         }"""
     )  # noqa: E501
@@ -204,7 +241,7 @@ def test_lower_elementwise_sigmoid_mma():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
             %b: {w} = alloc() attrs={{id: 1}}
-            elementwise(%b: {w}, %a: {w}) attrs={{fn: "sigmoid"}}
+            elementwise sigmoid(%b: {w}, %a: {w})
           }}
         }}"""))
 
@@ -231,7 +268,7 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
             %b: {b} = alloc() attrs={{id: 1}}
-            elementwise(%b: {b}, %a: {w}) attrs={{fn: "sigmoid"}}
+            elementwise sigmoid(%b: {b}, %a: {w})
           }}
         }}"""))
 
@@ -252,7 +289,7 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %src: wrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
             %dst: wrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
-            elementwise(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">) attrs={fn: "sigmoid"}
+            elementwise sigmoid(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">)
           }
         }"""))  # noqa: E501
 
@@ -272,7 +309,7 @@ def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
             %dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
             %dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
+            elementwise convert(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -292,7 +329,7 @@ def test_lower_elementwise_uses_root_registers_for_wrmem_view():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
             %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid"}
+            elementwise sigmoid(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 

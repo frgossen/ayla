@@ -2,8 +2,8 @@
 
 A :class:`PtxLauncher` bundles:
     - the PTX source (driver-JIT'd via ``cuModuleLoadDataEx``),
-    - a :class:`~ayla.ptx.PtxKernel` (entry point, grid_dim/block_dim, shmem,
-      and — in the future — tensor-core / TMA / cluster setup),
+    - a :class:`~ayla.ptx.PtxKernel` (entry point, grid/block/cluster dims,
+      shared memory, and tensor-map setup),
     - the host-side wrapper that converts ``torch.Tensor`` args into kernel
       params and calls ``cuLaunchKernel`` on the current torch CUDA stream.
 

@@ -10,6 +10,7 @@ from .base.ir import Op, Printer, Value
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdsOp,
+    ClusterBlockIdsOp,
     ForOp,
     GmemTensorType,
     IfOp,
@@ -265,6 +266,7 @@ class PtxKernel:
     signature: list
     grid_dim: tuple[int, int, int]
     block_dim: tuple[int, int, int]
+    cluster_dim: tuple[int, int, int] | None = None
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
 
@@ -293,14 +295,20 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
     grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
     block_dim = _resolve_block_dim(kernel)
+    cluster_dim = (
+        tuple(d if d is not None else 1 for d in kernel.cluster_dim)
+        if any(d is not None for d in kernel.cluster_dim)
+        else None
+    )
     p = PtxPrinter()
-    _emit_module(p, module, block_dim)
+    _emit_module(p, module, block_dim, cluster_dim)
     return PtxKernel(
         ptx=p.render(),
         name=kernel.name,
         signature=kernel.signature,
         grid_dim=grid_dim,
         block_dim=block_dim,
+        cluster_dim=cluster_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
     )
 
@@ -316,6 +324,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_thread_ids(p, op)
     elif isinstance(op, BlockIdsOp):
         _emit_block_ids(p, op)
+    elif isinstance(op, ClusterBlockIdsOp):
+        _emit_cluster_block_ids(p, op)
     elif isinstance(op, IndexConstantOp):
         _emit_index_constant(p, op)
     elif isinstance(op, IndexAddOp):
@@ -374,6 +384,7 @@ def _emit_module(
     p: PtxPrinter,
     op: ModuleOp,
     block_dim: tuple[int, int, int],
+    cluster_dim: tuple[int, int, int] | None,
 ) -> None:
     p.write_line(f".version {op.version}")
     p.write_line(f".target {op.target}")
@@ -381,13 +392,14 @@ def _emit_module(
     p.write_newline_once()
     [kernel] = op.body.ops
     assert isinstance(kernel, KernelOp)
-    _emit_kernel(p, kernel, block_dim)
+    _emit_kernel(p, kernel, block_dim, cluster_dim)
 
 
 def _emit_kernel(
     p: PtxPrinter,
     op: KernelOp,
     block_dim: tuple[int, int, int],
+    cluster_dim: tuple[int, int, int] | None,
 ) -> None:
 
     p.write_line(f".visible .entry {op.name}(")
@@ -408,6 +420,11 @@ def _emit_kernel(
             p.write_line(f"{line}{sep}")
     p.write_line(")")
     p.write_line(f".reqntid {block_dim[0]}, {block_dim[1]}, {block_dim[2]}")
+    if cluster_dim is not None:
+        p.write_line(
+            ".reqnctapercluster "
+            f"{cluster_dim[0]}, {cluster_dim[1]}, {cluster_dim[2]}"
+        )
     p.write_line("{")
     with p.indented():
         decl_mark = p.mark()
@@ -500,6 +517,19 @@ def _emit_block_ids(p: PtxPrinter, op: BlockIdsOp) -> None:
     p.write_line(f"mov.u32 {rx}, %ctaid.x;")
     p.write_line(f"mov.u32 {ry}, %ctaid.y;")
     p.write_line(f"mov.u32 {rz}, %ctaid.z;")
+    p.write_newline_once()
+
+
+# TODO: Consider making the thread, block, and cluster block ID ops take an
+# axis attribute and return one value instead of always materializing x, y, z.
+def _emit_cluster_block_ids(p: PtxPrinter, op: ClusterBlockIdsOp) -> None:
+    rx = p.unique_ptx_names_for_value(op.x)
+    ry = p.unique_ptx_names_for_value(op.y)
+    rz = p.unique_ptx_names_for_value(op.z)
+    p.write_newline_once()
+    p.write_line(f"mov.u32 {rx}, %cluster_ctaid.x;")
+    p.write_line(f"mov.u32 {ry}, %cluster_ctaid.y;")
+    p.write_line(f"mov.u32 {rz}, %cluster_ctaid.z;")
     p.write_newline_once()
 
 

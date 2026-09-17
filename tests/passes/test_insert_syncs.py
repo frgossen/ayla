@@ -4,10 +4,14 @@ import textwrap
 import pytest
 
 from ayla import Block, Op
-from ayla.analysis.sync import BarrierTarget
-from ayla.gpu_dialect import gpu_dialect
-from ayla.passes.insert_syncs import (
+from ayla.analysis.sync import (
     BarrierScope,
+    BarrierTarget,
+    _barrier_covers,
+    _barrier_scope,
+)
+from ayla.gpu_dialect import CollectiveScope, gpu_dialect
+from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
 )
@@ -20,6 +24,15 @@ def test_block_leader_barrier_requires_whole_warps():
 
     with pytest.raises(ValueError, match="whole number of warps"):
         _insert_barriers(block, targets, num_threads=33)
+
+
+def test_cluster_barrier_scope_is_between_block_and_grid():
+    assert (
+        _barrier_scope(CollectiveScope.BLOCK, CollectiveScope.CLUSTER)
+        == BarrierScope.CLUSTER
+    )
+    assert _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.CLUSTER)
+    assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
 
 
 def test_preexisting_barrier_updates_dataflow_state():
@@ -293,7 +306,7 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             }
             %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 17}
             await(%33: lock<wgmma>)
-            elementwise(%78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert"}
+            elementwise convert(%78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
             move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
           }
         }"""))  # noqa: E501

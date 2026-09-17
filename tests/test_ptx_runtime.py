@@ -8,8 +8,17 @@ import textwrap
 
 import torch
 
-from ayla.gpu_dialect import F32Type, GmemTensorType
-from ayla.ptx_codegen import PtxKernel
+from ayla.base.ir import Block, Value
+from ayla.gpu_dialect import (
+    BarrierOp,
+    ClusterBlockIdsOp,
+    F32Type,
+    GmemTensorType,
+    KernelOp,
+    ModuleOp,
+    PTXTemplateOp,
+)
+from ayla.ptx_codegen import PtxKernel, make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
 
@@ -80,3 +89,42 @@ def test_cwise_add():
 
     torch.cuda.synchronize()
     assert torch.allclose(c, a + b)
+
+
+@requires_cuda
+def test_cluster_block_ids_and_barrier_reach_the_launch():
+    output_type = GmemTensorType.build((2,), F32Type())
+    output = Value("output", output_type)
+    ids = ClusterBlockIdsOp.build()
+    write_x = PTXTemplateOp.build(
+        operands=[output, ids.x],
+        result_types=[],
+        template=textwrap.dedent("""\
+            mov.u32 ${b32:cta}, %ctaid.x;
+            mul.wide.u32 ${b64:offset}, ${b32:cta}, 4;
+            add.u64 ${b64:dst}, ${b64:operand.output.ptr}, ${b64:offset};
+            cvt.rn.f32.u32 ${f32:value}, ${b32:operand.x.val};
+            st.global.f32 [${b64:dst}], ${f32:value};
+        """),
+        operand_names=["output", "x"],
+        result_names=[],
+        description="write cluster block x",
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "cluster_block_ids",
+        Block(arguments=[output], ops=[
+            ids,
+            BarrierOp.build("cluster"),
+            write_x,
+        ]),
+        grid_dim=(2, 1, 1),
+        block_dim=(1, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )]))
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    actual = torch.empty(2, device="cuda")
+
+    launcher(actual)
+    torch.cuda.synchronize()
+
+    assert actual.cpu().tolist() == [0.0, 1.0]

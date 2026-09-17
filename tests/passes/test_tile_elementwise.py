@@ -11,7 +11,7 @@ def test_tiles_elementwise_into_a_sequential_iteration_space():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            elementwise(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
 
@@ -27,7 +27,7 @@ def test_tiles_elementwise_into_a_sequential_iteration_space():
           kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             for (%outn: index = 0 to 4) attrs={label: "outn"} {
               %0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %outn: index)
-              elementwise(%0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "sigmoid", label: "epilogue"}
+              elementwise sigmoid(%0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
             }
           }
         }""")  # noqa: E501
@@ -37,7 +37,7 @@ def test_tiles_multiple_dimensions_in_one_invocation():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: gmem<128x256xf32>) {
-            elementwise(%value: gmem<128x256xf32>, %value: gmem<128x256xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%value: gmem<128x256xf32>, %value: gmem<128x256xf32>) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
 
@@ -55,7 +55,7 @@ def test_tiles_multiple_dimensions_in_one_invocation():
               for (%column: index = 0 to 4) attrs={label: "column"} {
                 %0: gmem<64x256xf32> = tile(%value: gmem<128x256xf32>, %row: index, 0)
                 %1: gmem<64x64xf32 strides=[256, 1]> = tile(%0: gmem<64x256xf32>, 0, %column: index)
-                elementwise(%1: gmem<64x64xf32 strides=[256, 1]>, %1: gmem<64x64xf32 strides=[256, 1]>) attrs={fn: "sigmoid", label: "epilogue"}
+                elementwise sigmoid(%1: gmem<64x64xf32 strides=[256, 1]>, %1: gmem<64x64xf32 strides=[256, 1]>) attrs={label: "epilogue"}
               }
             }
           }
@@ -66,7 +66,7 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @epilogue(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            elementwise(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={fn: "convert", label: "convert"}
+            elementwise convert(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "convert"}
           }
         }"""))  # noqa: E501
 
@@ -84,14 +84,14 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
         if op.fn == "convert"
     ]
     assert tuple(convert.dst.type.sizes) == (64, 64)
-    assert tuple(convert.src.type.sizes) == (64, 64)
+    assert tuple(convert.src(0).type.sizes) == (64, 64)
 
 
 def test_rejects_negative_dimension():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: gmem<64x256xf32>) {
-            elementwise(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
 
@@ -108,7 +108,7 @@ def test_rejects_nonuniform_partition():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: gmem<64x256xf32>) {
-            elementwise(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+            elementwise sigmoid(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
 
@@ -127,7 +127,7 @@ def test_rejects_parallel_iteration_binding():
             gpu_dialect.parse(textwrap.dedent("""\
                 module {
                   kernel @epilogue(%value: gmem<64x256xf32>) {
-                    elementwise(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={fn: "sigmoid", label: "epilogue"}
+                    elementwise sigmoid(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={label: "epilogue"}
                   }
                 }""")),  # noqa: E501
             tile_dims=[1], tile_sizes=[64],
