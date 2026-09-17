@@ -840,6 +840,7 @@ class TmaMoveOp(Op):
         cls,
         dst: Value,
         src: Value,
+        *,
         indices: list[Value],
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
@@ -912,7 +913,7 @@ class TmaMoveOp(Op):
         attrs = p.read_extra_attrs()
         l2_cache_hint = attrs.pop("l2_cache_hint", None)
         return cls.build(
-            operands[0], operands[1], operands[2:],
+            operands[0], operands[1], indices=operands[2:],
             collective=collective, attrs=attrs,
             l2_cache_hint=l2_cache_hint,  # type: ignore[arg-type]
         )

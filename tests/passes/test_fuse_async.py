@@ -1,6 +1,8 @@
 """Tests for the fuse_async pass."""
 import textwrap
 
+import pytest
+
 from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.fuse_async import fuse_async
 
@@ -53,7 +55,7 @@ def test_fuse_tma_loads():
             async(%l0: lock<mbar>) collective=xyz.block move(%s0: smem<128x64xbf16 swizzle="128B">, %a0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.block attrs={label: "mm_lhs_smem", nc: True, tma: True}
             await(%l0: lock<mbar>)
             %l1: lock<mbar> = alloc() attrs={id: 3}
-            async(%l1: lock<mbar>) collective=xyz.cluster move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.cluster attrs={label: "mm_rhs_smem", nc: True, tma: True}
+            async(%l1: lock<mbar>) collective=xyz.block move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.block attrs={label: "mm_rhs_smem", nc: True, tma: True}
             await(%l1: lock<mbar>)
           }
         }""")
@@ -72,14 +74,43 @@ def test_fuse_tma_loads():
             %b0: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %c0: index)
             %l0: lock<mbar> = alloc() attrs={id: 2}
             %l1: lock<mbar> = alloc() attrs={id: 3}
-            async(%l0: lock<mbar>) collective=xyz.cluster {
+            async(%l0: lock<mbar>) collective=xyz.block {
               move(%s0: smem<128x64xbf16 swizzle="128B">, %a0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.block attrs={label: "mm_lhs_smem", nc: True, tma: True}
-              move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.cluster attrs={label: "mm_rhs_smem", nc: True, tma: True}
+              move(%s1: smem<128x64xbf16 swizzle="128B">, %b0: gmem<128x64xbf16 strides=[4096, 1]>) collective=xyz.block attrs={label: "mm_rhs_smem", nc: True, tma: True}
             }
             await(%l0: lock<mbar>)
           }
         }""")
     assert text == expected
+
+
+@pytest.mark.parametrize(
+    ("second_lock_kind", "second_collective"),
+    [
+        ("mbar", "xyz.cluster"),
+        ("bulk", "xyz.block"),
+    ],
+)
+def test_does_not_fuse_incompatible_tma_loads(
+    second_lock_kind, second_collective,
+):
+    module_str = textwrap.dedent(f"""\
+        module {{
+          kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {{
+            %sa: smem<16x16xf32> = alloc()
+            %sb: smem<16x16xf32> = alloc()
+            %l0: lock<mbar> = alloc()
+            %l1: lock<{second_lock_kind}> = alloc()
+            async(%l0: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={{tma: True}}
+            await(%l0: lock<mbar>)
+            async(%l1: lock<{second_lock_kind}>) collective={second_collective} move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective={second_collective} attrs={{tma: True}}
+            await(%l1: lock<{second_lock_kind}>)
+          }}
+        }}""")
+
+    module = fuse_async(gpu_dialect.parse(module_str))
+
+    assert repr(module) == module_str
 
 
 def test_fuse_different_accumulators():

@@ -81,8 +81,7 @@ class FuseAsync(Pass):
         in_flight_locks: set = set()
 
         def finalize() -> None:
-            nonlocal group_inner, group_lock, group_kind, group_attrs
-            nonlocal group_collective
+            nonlocal group_inner, group_lock, group_kind, group_attrs, group_collective
             nonlocal in_flight_locks
             if group_collective is not None:
                 # Every member's await must have been dropped (its lock removed)
@@ -112,20 +111,17 @@ class FuseAsync(Pass):
         for op in block.ops:
             kind = _fusion_kind(op)
             if kind is not None:
-                if group_kind is not None and kind != group_kind:
-                    finalize()  # different kind ends the run
+                if group_kind is not None and (
+                    kind != group_kind
+                    or op.lock.type.kind != group_lock.type.kind
+                    or op.collective != group_collective
+                ):
+                    finalize()  # incompatible async ends the run
                 if group_collective is None:
                     group_lock = op.lock
                     group_kind = kind
                     group_attrs = dict(op.attrs) if op.attrs else None
                     group_collective = op.collective
-                else:
-                    group_collective = {
-                        axis: group_collective[axis].join(
-                            op.collective[axis],
-                        )
-                        for axis in CollectiveAxis
-                    }
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:

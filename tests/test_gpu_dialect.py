@@ -386,7 +386,7 @@ def test_tma_move_build_accepts_l2_cache_hint():
     op = TmaMoveOp.build(
         smem,
         desc,
-        indices,
+        indices=indices,
         collective={
             axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
         },

@@ -55,7 +55,7 @@ def _ancestor_kernel(op: Op) -> KernelOp | None:
     return None
 
 
-def _verify_collective(op: Op) -> None:
+def _verify_collective_attr(op: Op) -> None:
     collective = op.attrs.get("collective")
     if (
         not isinstance(collective, dict)
@@ -129,19 +129,19 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
-        _verify_collective(op)
+        _verify_collective_attr(op)
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
-        _verify_collective(op)
+        _verify_collective_attr(op)
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
-        _verify_collective(op)
+        _verify_collective_attr(op)
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
-        _verify_collective(op)
+        _verify_collective_attr(op)
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):
