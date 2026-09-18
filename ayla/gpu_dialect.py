@@ -4,7 +4,8 @@ from __future__ import annotations
 import enum
 import itertools
 import math
-from typing import ClassVar, Iterator
+from dataclasses import dataclass
+from typing import ClassVar, Iterator, Literal
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
@@ -2261,19 +2262,31 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
     )
 
 
+@dataclass(frozen=True)
+class MemoryEffect:
+    """A memory access before its view is resolved to physical roots."""
+
+    kind: Literal["R", "W"]
+    value: Value
+    scope: CollectiveScope
+
+    @property
+    def roots(self) -> set[Value]:
+        return root_buffers(self.value)
+
+
 def _memory_effect(
-    kind: str, value: Value, scope: CollectiveScope,
-) -> list[tuple[str, Value, CollectiveScope]]:
-    return [(kind, root, scope) for root in root_buffers(value)]
+    kind: Literal["R", "W"], value: Value, scope: CollectiveScope,
+) -> list[MemoryEffect]:
+    return [MemoryEffect(kind, value, scope)]
 
 
-def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
+def memory_effects(op: Op) -> list[MemoryEffect] | None:
     """Best-effort memory effect summary for ``op``.
 
-    Returns a list of ``(kind, root, scope)`` tuples where ``kind`` is ``"R"`` or
-    ``"W"``, ``root`` is an underlying alloc/arg (after stripping views via
-    ``root_buffers``), and ``scope`` is the :class:`CollectiveScope` at which
-    the access is independent of concurrent threads.
+    Each effect retains the accessed view so consumers can recover its precise
+    region. ``effect.roots`` provides its underlying allocations/arguments for
+    conservative alias checks.
 
     Returns ``None`` for ops we don't know how to model; callers must treat that
     as a worst-case conflict.
@@ -2348,7 +2361,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         )
         return _memory_effect("W", buf, scope)
     if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
-        effects: list[tuple[str, Value, CollectiveScope]] = []
+        effects: list[MemoryEffect] = []
         for block in op.blocks:
             for body_op in block.ops:
                 body_effects = memory_effects(body_op)

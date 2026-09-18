@@ -63,10 +63,22 @@ def _can_swap(upper: Op, lower: Op) -> bool:
         return False
 
     # RAW, WAR, or WAW conflict on the same buffer.
-    upper_r = {root for kind, root, _scope in upper_effs if kind == "R"}
-    upper_w = {root for kind, root, _scope in upper_effs if kind == "W"}
-    lower_r = {root for kind, root, _scope in lower_effs if kind == "R"}
-    lower_w = {root for kind, root, _scope in lower_effs if kind == "W"}
+    upper_r = {
+        root for effect in upper_effs if effect.kind == "R"
+        for root in effect.roots
+    }
+    upper_w = {
+        root for effect in upper_effs if effect.kind == "W"
+        for root in effect.roots
+    }
+    lower_r = {
+        root for effect in lower_effs if effect.kind == "R"
+        for root in effect.roots
+    }
+    lower_w = {
+        root for effect in lower_effs if effect.kind == "W"
+        for root in effect.roots
+    }
     if lower_w & upper_r or lower_r & upper_w or lower_w & upper_w:
         return False
 

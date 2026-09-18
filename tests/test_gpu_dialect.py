@@ -94,6 +94,30 @@ def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
     assert has_ordering_effect(nested)
 
 
+def test_memory_effect_retains_accessed_view_and_exposes_roots():
+    source = Value(
+        name="source",
+        type=SmemTensorType.build([4], F32Type()),
+    )
+    view = ReinterpretOp.build(
+        source,
+        SmemTensorType.build([2], F32Type()),
+    ).result()
+    dst = Value(name="dst", type=SmemTensorType.build([2], F32Type()))
+    effects = memory_effects(MoveOp.build(
+        dst,
+        view,
+        collective={
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        },
+    ))
+
+    assert effects is not None
+    read = next(effect for effect in effects if effect.kind == "R")
+    assert read.value is view
+    assert read.roots == {source}
+
+
 def test_reshape_op():
     source = Value(
         name="source",
@@ -451,7 +475,11 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
     ))
 
     assert effects is not None
-    assert {(kind, root.name, scope) for kind, root, scope in effects} == expected
+    assert {
+        (effect.kind, root.name, effect.scope)
+        for effect in effects
+        for root in effect.roots
+    } == expected
 
 
 def test_tma_descriptor_validates_l2_promotion():

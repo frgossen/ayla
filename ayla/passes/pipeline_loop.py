@@ -151,10 +151,10 @@ class PipelineLoop(LoweringPass):
         eff_later = memory_effects(later)
         if eff_earlier is None or eff_later is None:
             return False
-        for kind_a, root_a, _scope_a in eff_earlier:
-            for kind_b, root_b, _scope_b in eff_later:
-                if root_a is root_b and (
-                    kind_a == "W" or kind_b == "W"
+        for effect_a in eff_earlier:
+            for effect_b in eff_later:
+                if effect_a.roots & effect_b.roots and (
+                    effect_a.kind == "W" or effect_b.kind == "W"
                 ):
                     return False
         return True
