@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from enum import Enum, auto
 
-from ..base.ir import Op, Type
+from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
@@ -45,16 +45,6 @@ def _verify_static_shape(typ: Type) -> None:
         raise ValueError(f"unresolved dynamic shape {typ}")
     if isinstance(typ, TmaDescType):
         _verify_static_shape(typ.gmem_type)
-
-
-def _ancestor_kernel(op: Op) -> KernelOp | None:
-    block = op.parent_block
-    while block is not None:
-        parent = block.parent_op
-        if isinstance(parent, KernelOp):
-            return parent
-        block = None if parent is None else parent.parent_block
-    return None
 
 
 def _verify_collective_attr(op: Op) -> None:
@@ -109,7 +99,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ClusterBlockIdsOp)
     def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:
-        kernel = _ancestor_kernel(op)
+        kernel = find_ancestor_of_type(op, KernelOp)
         if kernel is None or not any(
             dim is not None for dim in kernel.cluster_dim
         ):
@@ -135,7 +125,7 @@ class VerifyGpuDialect(VerificationPass):
                     "BarrierOp: grid sync must contain at least 8 bytes"
                 )
         elif op.scope == "cluster":
-            kernel = _ancestor_kernel(op)
+            kernel = find_ancestor_of_type(op, KernelOp)
             if kernel is None or not any(
                 dim is not None for dim in kernel.cluster_dim
             ):

@@ -578,6 +578,59 @@ def root_ancestor(node: "Op | Block | Value") -> "Op | Block | Value":
         node = parent
 
 
+def iter_ancestors(op: Op) -> Iterator[Op]:
+    """Iterate over enclosing operations, nearest first."""
+    block = op.parent_block
+    while block is not None:
+        parent = block.parent_op
+        if parent is None:
+            return
+        yield parent
+        block = parent.parent_block
+
+
+def find_ancestors(
+    op: Op, predicate: Callable[[Op], bool],
+) -> list[Op]:
+    """Return enclosing operations matching ``predicate``, nearest first."""
+    return [ancestor for ancestor in iter_ancestors(op) if predicate(ancestor)]
+
+
+def find_ancestor(
+    op: Op, predicate: Callable[[Op], bool],
+) -> Op | None:
+    """Return the nearest enclosing operation matching ``predicate``."""
+    return next(
+        (ancestor for ancestor in iter_ancestors(op) if predicate(ancestor)),
+        None,
+    )
+
+
+def find_ancestors_of_type[OpT: Op](
+    op: Op, op_type: type[OpT],
+) -> list[OpT]:
+    """Return enclosing operations of ``op_type``, nearest first."""
+    return [
+        ancestor
+        for ancestor in iter_ancestors(op)
+        if isinstance(ancestor, op_type)
+    ]
+
+
+def find_ancestor_of_type[OpT: Op](
+    op: Op, op_type: type[OpT],
+) -> OpT | None:
+    """Return the nearest enclosing operation of ``op_type``."""
+    return next(
+        (
+            ancestor
+            for ancestor in iter_ancestors(op)
+            if isinstance(ancestor, op_type)
+        ),
+        None,
+    )
+
+
 def iter_ops(
     root: Op, predicate: Callable[[Op], bool] = lambda op: True,
 ) -> Iterator[Op]:
