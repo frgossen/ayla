@@ -11,6 +11,7 @@ from ayla.gpu_dialect import (
     F32Type,
     ForOp,
     GmemTensorType,
+    IndexType,
     LockType,
     ModuleOp,
     MoveOp,
@@ -18,6 +19,8 @@ from ayla.gpu_dialect import (
     RmemTensorType,
     SmemTensorType,
     TileOp,
+    TmaDescType,
+    TmaMoveOp,
     gpu_dialect,
 )
 from ayla.passes.verify_gpu_dialect import (
@@ -50,6 +53,45 @@ def test_default_verification_rejects_nonpositive_loop_step(step):
 
     with pytest.raises(ValueError, match="positive integer"):
         verify_gpu_dialect(module)
+
+
+def test_default_verification_checks_tma_move_structure():
+    gmem_type = GmemTensorType.build([64, 64], F32Type())
+    descriptor = Value(
+        name="descriptor",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(
+        name="smem", type=SmemTensorType.build([64, 64], F32Type()),
+    )
+    gmem = Value(name="gmem", type=gmem_type)
+    indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
+    collective = {
+        axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+    }
+
+    valid = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, descriptor, indices=indices, collective=collective,
+    )]))
+    assert verify_gpu_dialect(valid) is valid
+
+    wrong_index_count = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, descriptor, indices=indices[:1], collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one index per TMA dimension"):
+        verify_gpu_dialect(wrong_index_count)
+
+    wrong_memory_space = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        gmem, descriptor, indices=indices, collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one TMA descriptor and one smem"):
+        verify_gpu_dialect(wrong_memory_space)
+
+    missing_descriptor = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, gmem, indices=indices, collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one TMA descriptor and one smem"):
+        verify_gpu_dialect(missing_descriptor)
 
 
 def test_default_verification_checks_tile_result_type():

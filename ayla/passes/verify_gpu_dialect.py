@@ -21,6 +21,7 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     ReshapeOp,
+    SmemTensorType,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -194,6 +195,31 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
+        if len(op.operands) < 2:
+            raise ValueError(
+                "tma_move expects dst, src, and one index per dimension; "
+                f"got {len(op.operands)} operands"
+            )
+        dst_is_tma = isinstance(op.dst.type, TmaDescType)
+        src_is_tma = isinstance(op.src.type, TmaDescType)
+        dst_is_smem = isinstance(op.dst.type, SmemTensorType)
+        src_is_smem = isinstance(op.src.type, SmemTensorType)
+        if not (
+            (dst_is_tma and src_is_smem)
+            or (dst_is_smem and src_is_tma)
+        ):
+            raise ValueError(
+                "tma_move expects one TMA descriptor and one smem operand; "
+                f"got dst={op.dst.type}, src={op.src.type}"
+            )
+        descriptor_type = op.dst.type if dst_is_tma else op.src.type
+        assert isinstance(descriptor_type, TmaDescType)
+        if len(op.indices) != descriptor_type.gmem_type.rank:
+            raise ValueError(
+                "tma_move expects one index per TMA dimension; "
+                f"got {len(op.indices)} indices for rank "
+                f"{descriptor_type.gmem_type.rank}"
+            )
         _verify_collective_attr(op)
 
     @verifies(MatmulOp)

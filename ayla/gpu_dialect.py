@@ -827,16 +827,6 @@ class TmaMoveOp(Op):
             attrs["l2_cache_hint"] = l2_cache_hint
         return cls(operands=operands, results=[], attrs=attrs)
 
-    def __post_init__(self) -> None:  # type: ignore[override]
-        super().__post_init__()
-        dst_is_tma = isinstance(self.dst.type, TmaDescType)
-        src_is_tma = isinstance(self.src.type, TmaDescType)
-        assert dst_is_tma != src_is_tma, (
-            f"TmaMoveOp: exactly one operand must be a TMA descriptor; "
-            f"got dst={type(self.dst.type).__name__}, "
-            f"src={type(self.src.type).__name__}"
-        )
-
     @property
     def dst(self) -> Value:
         return self.operands[0]
