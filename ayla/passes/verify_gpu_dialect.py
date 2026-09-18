@@ -21,8 +21,10 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     ReshapeOp,
+    TileOp,
     TmaDescType,
     TmaMoveOp,
+    WrmemTensorType,
 )
 
 
@@ -103,6 +105,39 @@ class VerifyGpuDialect(VerificationPass):
         if type(op.step) is not int or op.step <= 0:
             raise ValueError(
                 f"for step must be a positive integer, got {op.step!r}"
+            )
+
+    @verifies(TileOp)
+    def _verify_tile(self, op: TileOp) -> None:
+        if len(op.results) != 1:
+            raise ValueError(
+                f"tile must produce exactly one result, got {len(op.results)}"
+            )
+        arg_type = op.arg.type
+        result_type = op.result().type
+        if type(arg_type) is not type(result_type):
+            raise ValueError("tile must preserve its operand's memory space")
+        if not isinstance(arg_type, (AddrMemTensorType, WrmemTensorType)):
+            raise ValueError(
+                "tile operand and result must be address-backed memory "
+                "tensors or wrmem"
+            )
+        if not (
+            arg_type.rank == result_type.rank == len(op.indices)
+        ):
+            raise ValueError(
+                "tile operand rank, result rank, and number of indices must "
+                f"match; got {arg_type.rank}, {result_type.rank}, and "
+                f"{len(op.indices)}"
+            )
+        if (
+            isinstance(arg_type, AddrMemTensorType)
+            and isinstance(result_type, AddrMemTensorType)
+            and arg_type.strides != result_type.strides
+        ):
+            raise ValueError(
+                f"tile result strides {result_type.strides} must match "
+                f"operand strides {arg_type.strides}"
             )
 
     @verifies(ClusterBlockIdsOp)

@@ -441,13 +441,6 @@ class TileOp(Op):
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
     defined out-of-bounds behavior.
-
-    Invariant: distinct tile results of the same buffer are
-    non-conflicting — they are either disjoint (safe for concurrent
-    writes) or overlapping read-only. This is the responsibility of
-    whoever constructs the tiles. It allows memory effect analysis to
-    use the tile Value directly as the buffer identity without
-    resolving to the root alloc.
     """
 
     @classmethod
@@ -498,26 +491,6 @@ class TileOp(Op):
     @property
     def maybe_partial(self) -> bool:
         return bool(self.attrs.get("maybe_partial", False))
-
-    def __post_init__(self) -> None:  # type: ignore[override]
-        super().__post_init__()
-        assert len(self.results) == 1, "TileOp must produce exactly one result"
-        # A tile is a view into its source — strides are inherited.
-        arg_type = self.arg.type
-        res_type = self.result(0).type
-        if isinstance(arg_type, WrmemTensorType):
-            assert isinstance(res_type, WrmemTensorType), (
-                "TileOp: wrmem arg requires wrmem result"
-            )
-        else:
-            assert (
-                isinstance(arg_type, AddrMemTensorType)
-                and isinstance(res_type, AddrMemTensorType)
-            ), "TileOp: arg and result must be AddrMemTensorType or WrmemTensorType"
-            assert list(arg_type.strides) == list(res_type.strides), (
-                f"TileOp: result strides {list(res_type.strides)} must "
-                f"match arg strides {list(arg_type.strides)}"
-            )
 
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):

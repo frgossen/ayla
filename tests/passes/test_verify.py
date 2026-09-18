@@ -11,6 +11,8 @@ from ayla.gpu_dialect import (
     ModuleOp,
     ReshapeOp,
     RmemTensorType,
+    SmemTensorType,
+    TileOp,
     gpu_dialect,
 )
 from ayla.passes.verify_gpu_dialect import (
@@ -43,6 +45,54 @@ def test_default_verification_rejects_nonpositive_loop_step(step):
 
     with pytest.raises(ValueError, match="positive integer"):
         verify_gpu_dialect(module)
+
+
+def test_default_verification_checks_tile_result_type():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([4, 4], F32Type()),
+    )
+    wrong_memory_space = TileOp.build(
+        source,
+        [0, 0],
+        SmemTensorType.build([4, 4], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[wrong_memory_space]))
+
+    with pytest.raises(ValueError, match="preserve.*memory space"):
+        verify_gpu_dialect(module)
+
+    tile = TileOp.build(
+        source,
+        [0, 0],
+        GmemTensorType.build([2, 2], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[tile]))
+
+    with pytest.raises(ValueError, match="result strides.*must match"):
+        verify_gpu_dialect(module)
+
+
+@pytest.mark.parametrize(
+    "indices,result_sizes",
+    [
+        ([0], [4, 4]),
+        ([0], [4]),
+    ],
+)
+def test_default_verification_checks_tile_rank(indices, result_sizes):
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([4, 4], F32Type()),
+    )
+    tile = TileOp.build(
+        source,
+        indices,
+        GmemTensorType.build(result_sizes, F32Type()),
+    )
+
+    with pytest.raises(ValueError, match="rank.*number of indices must match"):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[tile])))
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():
