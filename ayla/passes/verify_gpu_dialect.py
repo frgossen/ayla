@@ -179,6 +179,14 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
         _verify_collective_attr(op)
+        for inner in op.body.ops:
+            collective = inner.attrs.get("collective")
+            if collective is not None and collective != op.collective:
+                raise ValueError(
+                    "async collective must match the collective of every "
+                    f"contained operation; got {op.collective} and "
+                    f"{collective}"
+                )
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:

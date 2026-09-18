@@ -4,11 +4,16 @@ import pytest
 
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
+    AsyncOp,
+    CollectiveAxis,
+    CollectiveLevel,
     ElementwiseOp,
     F32Type,
     ForOp,
     GmemTensorType,
+    LockType,
     ModuleOp,
+    MoveOp,
     ReshapeOp,
     RmemTensorType,
     SmemTensorType,
@@ -93,6 +98,30 @@ def test_default_verification_checks_tile_rank(indices, result_sizes):
 
     with pytest.raises(ValueError, match="rank.*number of indices must match"):
         verify_gpu_dialect(ModuleOp.build(Block(ops=[tile])))
+
+
+def test_async_and_body_collectives_must_match():
+    typ = GmemTensorType.build([1], F32Type())
+    block_collective = {
+        axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+    }
+    thread_collective = {
+        axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+    }
+    move = MoveOp.build(
+        Value(name="dst", type=typ),
+        Value(name="src", type=typ),
+        collective=block_collective,
+    )
+    async_op = AsyncOp.build(
+        Value(name="lock", type=LockType.build("bulk")),
+        collective=thread_collective,
+        body=Block(ops=[move]),
+    )
+    module = ModuleOp.build(Block(ops=[async_op]))
+
+    with pytest.raises(ValueError, match="async collective must match"):
+        verify_gpu_dialect(module)
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():
