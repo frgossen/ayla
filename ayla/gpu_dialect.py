@@ -361,6 +361,13 @@ class MatmulOp(Op):
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
 
+    @property
+    def tiling_scheme(self) -> dict[str, object] | None:
+        """Provenance shared by copies of one logically tiled matmul."""
+        scheme = self.attrs.get("tiling_scheme")
+        assert scheme is None or isinstance(scheme, dict)
+        return scheme
+
     def collective_level(self, axis: CollectiveAxis) -> CollectiveLevel:
         return self.collective[axis]
 

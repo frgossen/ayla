@@ -16,6 +16,7 @@ from ayla.gpu_dialect import (
     gpu_dialect,
 )
 from ayla.passes.tile_matmul import TileMatmul, tile_matmul
+from ayla.passes.unroll_loop import unroll_loop
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -41,7 +42,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
                 %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %m: index, 0)
                 %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
                 %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=xyz.grid
+                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=xyz.grid attrs={tiling_scheme: {disjoint_operands: ["lhs"], id: 0}}
               }
             }
           }
@@ -143,7 +144,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
               %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
               %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
               %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=[x.block, yz.grid] attrs={label: "mm"}
+              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=[x.block, yz.grid] attrs={label: "mm", tiling_scheme: {disjoint_operands: ["lhs"], id: 0}}
             }
             elementwise sigmoid(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={label: "epilogue"}
           }
@@ -176,7 +177,7 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
             if(%0: pred) {
               %1: gmem<64x64xbf16> = tile(%b: gmem<192x64xbf16>, %bx: index, 0)
               %2: gmem<64x64xf32 strides=[192, 1]> = tile(%c: gmem<64x192xf32>, 0, %bx: index)
-              matmul(%a: gmem<64x64xbf16>, %1: gmem<64x64xbf16>, %2: gmem<64x64xf32 strides=[192, 1]>) collective=[x.block, yz.grid] attrs={label: "mm"}
+              matmul(%a: gmem<64x64xbf16>, %1: gmem<64x64xbf16>, %2: gmem<64x64xf32 strides=[192, 1]>) collective=[x.block, yz.grid] attrs={label: "mm", tiling_scheme: {disjoint_operands: ["rhs", "dst"], id: 0}}
               elementwise sigmoid(%2: gmem<64x64xf32 strides=[192, 1]>, %2: gmem<64x64xf32 strides=[192, 1]>) attrs={label: "epi"}
             }
           }
@@ -332,3 +333,122 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
         op_label_filter="missing",
     )
     assert repr(unmatched) == before
+
+
+def test_tiling_scheme_is_refined_across_tiling_passes():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
+          }
+        }"""))
+
+    tile_matmul(
+        module,
+        op_dims=["M"], tile_sizes=[32],
+        iteration_bindings=[None], for_loop_labels=["m"],
+    )
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.tiling_scheme == {
+        "id": 0,
+        "disjoint_operands": ["lhs", "dst"],
+    }
+
+    tile_matmul(
+        module,
+        op_dims=["K"], tile_sizes=[16],
+        iteration_bindings=[None], for_loop_labels=["k"],
+    )
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.tiling_scheme == {
+        "id": 0,
+        "disjoint_operands": ["lhs"],
+    }
+
+
+def test_unrolling_preserves_the_tiling_scheme():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
+          }
+        }"""))
+    tile_matmul(
+        module,
+        op_dims=["M"], tile_sizes=[32],
+        iteration_bindings=[None], for_loop_labels=["m"],
+    )
+
+    unroll_loop(module, unroll_factor=4, label_filter="m")
+
+    matmuls = find_ops_of_type(module, MatmulOp)
+    assert len(matmuls) == 4
+    assert all(matmul.tiling_scheme == {
+        "id": 0,
+        "disjoint_operands": ["lhs", "dst"],
+    } for matmul in matmuls)
+
+
+def test_tiling_schemes_get_distinct_ids():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
+          }
+        }"""))
+
+    tile_matmul(
+        module,
+        op_dims=["M"], tile_sizes=[32],
+        iteration_bindings=[None], for_loop_labels=["m"],
+    )
+
+    matmuls = find_ops_of_type(module, MatmulOp)
+    assert [matmul.tiling_scheme["id"] for matmul in matmuls] == [0, 1]
+
+
+def test_does_not_initialize_a_tiling_scheme_inside_a_loop():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
+            for (%i: index = 0 to 2) {
+              matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
+            }
+          }
+        }"""))
+
+    tile_matmul(
+        module,
+        op_dims=["M"], tile_sizes=[32],
+        iteration_bindings=[None], for_loop_labels=["m"],
+    )
+
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.tiling_scheme is None
+
+
+def test_initializes_a_tiling_scheme_inside_an_if():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
+            %zero: index = index_constant() attrs={value: 0}
+            %one: index = index_constant() attrs={value: 1}
+            %condition: pred = index_lt(%zero: index, %one: index)
+            if(%condition: pred) {
+              matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
+            }
+          }
+        }"""))
+
+    tile_matmul(
+        module,
+        op_dims=["N"], tile_sizes=[32],
+        iteration_bindings=[None], for_loop_labels=["n"],
+    )
+
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.tiling_scheme == {
+        "id": 0,
+        "disjoint_operands": ["rhs", "dst"],
+    }

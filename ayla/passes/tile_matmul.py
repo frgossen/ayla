@@ -28,6 +28,12 @@ _PARALLEL_ID_OPS = {
     CollectiveLevel.WG: WarpGroupIdOp,
 }
 
+_OPERAND_DIMS = {
+    "lhs": frozenset(("M", "K")),
+    "rhs": frozenset(("N", "K")),
+    "dst": frozenset(("M", "N")),
+}
+
 
 class TileMatmul(LoweringPass):
     """Tile every ``matmul`` along ``op_dims`` by matching ``tile_sizes``.
@@ -121,6 +127,23 @@ class TileMatmul(LoweringPass):
                     f"TileMatmul: unsupported iteration binding {binding!r}"
                 )
         self._kernel: KernelOp
+        self._next_tiling_scheme_id = 0
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        existing_ids: list[int] = []
+        for op in find_ops(module, lambda op: isinstance(op, MatmulOp)):
+            assert isinstance(op, MatmulOp)
+            scheme = op.tiling_scheme
+            if scheme is None:
+                continue
+            scheme_id = scheme.get("id")
+            if type(scheme_id) is not int or scheme_id < 0:
+                raise ValueError(
+                    "MatmulOp tiling_scheme id must be a non-negative integer"
+                )
+            existing_ids.append(scheme_id)
+        self._next_tiling_scheme_id = max(existing_ids, default=-1) + 1
+        return super().run(module)
 
     @lowers(KernelOp)
     def lower_kernel(
@@ -259,6 +282,7 @@ class TileMatmul(LoweringPass):
         ubs: list[int],
     ) -> list[Op]:
         lhs, rhs, dst = hero.operands
+        tiling_scheme = self._refine_tiling_scheme(hero, ubs)
 
         new_ops: list[Op] = []
         parallel_ids: dict[
@@ -333,13 +357,16 @@ class TileMatmul(LoweringPass):
                     axis,
                     level,
                 )
+        attrs = hero.extra_attrs
+        if tiling_scheme is not None:
+            attrs["tiling_scheme"] = tiling_scheme
         body_ops.append(
             MatmulOp.build(
                 lhs=lhs,
                 rhs=rhs,
                 dst=dst,
                 collective=hero.collective,
-                attrs=hero.extra_attrs,
+                attrs=attrs,
                 init=hero.init,
             ),
         )
@@ -380,6 +407,74 @@ class TileMatmul(LoweringPass):
         assert not tiled_epilogue, "TileMatmul: epilogue was never placed"
         new_ops.extend(body_ops)
         return new_ops
+
+    def _refine_tiling_scheme(
+        self,
+        hero: MatmulOp,
+        ubs: list[int],
+    ) -> dict[str, object] | None:
+        """Record operands disjoint across every occurrence of this scheme."""
+        scheme = hero.tiling_scheme
+        if scheme is None:
+            if not self._is_single_occurrence_grid_matmul(hero):
+                return None
+            scheme = {
+                "id": self._next_tiling_scheme_id,
+                "disjoint_operands": list(_OPERAND_DIMS),
+            }
+            self._next_tiling_scheme_id += 1
+        else:
+            scheme = dict(scheme)
+
+        scheme_id = scheme.get("id")
+        disjoint_operands = scheme.get("disjoint_operands")
+        if type(scheme_id) is not int or scheme_id < 0:
+            raise ValueError(
+                "MatmulOp tiling_scheme id must be a non-negative integer"
+            )
+        if (
+            not isinstance(disjoint_operands, list)
+            or any(
+                not isinstance(name, str) or name not in _OPERAND_DIMS
+                for name in disjoint_operands
+            )
+            or len(disjoint_operands) != len(set(disjoint_operands))
+        ):
+            raise ValueError(
+                "MatmulOp tiling_scheme disjoint_operands must contain unique "
+                "names from lhs, rhs, and dst"
+            )
+
+        repeated_dims = {
+            dim
+            for dim, ub in zip(self.op_dims, ubs, strict=True)
+            if ub > 1
+        }
+        scheme["disjoint_operands"] = [
+            name
+            for name in _OPERAND_DIMS
+            if name in disjoint_operands
+            and repeated_dims.issubset(_OPERAND_DIMS[name])
+        ]
+        return scheme
+
+    @staticmethod
+    def _is_single_occurrence_grid_matmul(op: MatmulOp) -> bool:
+        if not all(
+            op.collective_level(axis) == CollectiveLevel.GRID
+            for axis in CollectiveAxis
+        ):
+            return False
+
+        block = op.parent_block
+        while block is not None:
+            parent = block.parent_op
+            if isinstance(parent, ForOp):
+                return False
+            if isinstance(parent, KernelOp):
+                return True
+            block = None if parent is None else parent.parent_block
+        return False
 
     def _accumulate_constraint(
         self,
