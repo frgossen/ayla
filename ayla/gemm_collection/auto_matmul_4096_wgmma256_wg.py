@@ -2,7 +2,7 @@
 import textwrap
 
 from ..base.pipeline import Pipeline
-from ..gpu_dialect import gpu_dialect
+from ..gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
 from ..passes.canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
 from ..passes.licm import LICM
@@ -35,13 +35,17 @@ def auto_matmul_4096_wgmma256_wg_module():
     pipeline.add_instrumentation_pass(VerifyGpuDialect())
     pipeline.add_pass(TileMatmul(
         op_dims=["M", "N"], tile_sizes=[128, 256],
-        iteration_bindings=["block.x", "block.y"],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
         for_loop_labels=[None, None],
         op_label_filter="mm",
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["M"], tile_sizes=[64],
-        iteration_bindings=["wg.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)],
+        for_loop_labels=[None],
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
@@ -51,7 +55,7 @@ def auto_matmul_4096_wgmma256_wg_module():
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[64],
-        iteration_bindings=["for"], for_loop_labels=["k"],
+        iteration_bindings=[None], for_loop_labels=["k"],
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
@@ -61,7 +65,7 @@ def auto_matmul_4096_wgmma256_wg_module():
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[16],
-        iteration_bindings=["for"], for_loop_labels=["kk"],
+        iteration_bindings=[None], for_loop_labels=["kk"],
         op_label_filter="mm",
     ))
     pipeline.add_pass(MultiBuffer(depth=4, label_filter="mm_lhs_smem"))

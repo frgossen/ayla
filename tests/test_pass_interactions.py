@@ -19,7 +19,16 @@ test.
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import ElementwiseOp, ForOp, TileOp, gpu_dialect
+from ayla.gpu_dialect import (
+    CollectiveAxis,
+    CollectiveLevel,
+    ElementwiseOp,
+    ForOp,
+    IfOp,
+    MatmulOp,
+    TileOp,
+    gpu_dialect,
+)
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.tile_elementwise import tile_elementwise
@@ -40,7 +49,10 @@ def _block_tiled():
     return tile_matmul(
         module,
         op_dims=["M", "N"], tile_sizes=[128, 256],
-        iteration_bindings=["block.x", "block.y"],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
         for_loop_labels=[None, None],
         op_label_filter="mm", epilogue_label_filter="epilogue",
     )
@@ -52,7 +64,8 @@ def _tiled():
     return tile_matmul(
         module,
         op_dims=["M"], tile_sizes=[64],
-        iteration_bindings=["wg.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)],
+        for_loop_labels=[None],
         op_label_filter="mm", epilogue_label_filter="epilogue",
     )
 
@@ -134,7 +147,8 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
     tile_matmul(
         module,
         op_dims=["M"], tile_sizes=[64],
-        iteration_bindings=["wg.x"], for_loop_labels=[None],
+        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)],
+        for_loop_labels=[None],
         op_label_filter="mm", epilogue_label_filter="epilogue",
     )
     promote_buffers(
@@ -160,6 +174,30 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         assert tiles
         assert all(tile.indices[1] is loop.iv for tile in tiles)
         assert all(tile.result().type.sizes[1] == 64 for tile in tiles)
+
+
+def test_two_matmuls_share_block_x_with_different_n_tile_counts():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<192x64xbf16>, %intermediate: gmem<64x192xbf16>, %w_down: gmem<256x192xbf16>, %out: gmem<64x256xbf16>) {
+            matmul(%a: gmem<64x64xbf16>, %w_up: gmem<192x64xbf16>, %intermediate: gmem<64x192xbf16>) collective=xyz.grid attrs={label: "up"}
+            matmul(%intermediate: gmem<64x192xbf16>, %w_down: gmem<256x192xbf16>, %out: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "down"}
+          }
+        }"""))  # noqa: E501
+
+    tile_matmul(
+        module,
+        op_dims=["N"], tile_sizes=[64],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+        for_loop_labels=[None],
+    )
+
+    [kernel] = module.body.ops
+    assert kernel.grid_dim == (4, None, None)
+    [guard] = find_ops_of_type(module, IfOp)
+    matmuls = find_ops_of_type(module, MatmulOp)
+    assert matmuls[0].parent_block is guard.body
+    assert matmuls[1].parent_block is kernel.body
 
 
 TILED_IR = textwrap.dedent("""\

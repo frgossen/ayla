@@ -290,7 +290,6 @@ def test_if_op():
     op = IfOp.build(condition, Block())
     assert_print_and_roundtrip(op, textwrap.dedent("""\
         if(%condition: pred) {
-        ^bb0:
         }"""))
 
     with pytest.raises(AssertionError, match="expected PredicateType"):
