@@ -13,6 +13,7 @@ from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
+    ForOp,
     GmemTensorType,
     KernelOp,
     MatmulOp,
@@ -96,6 +97,13 @@ class VerifyGpuDialect(VerificationPass):
             for grid, cluster in zip(grid_dim, cluster_dim, strict=True)
         ):
             raise ValueError("cluster_dim must divide grid_dim")
+
+    @verifies(ForOp)
+    def _verify_for(self, op: ForOp) -> None:
+        if type(op.step) is not int or op.step <= 0:
+            raise ValueError(
+                f"for step must be a positive integer, got {op.step!r}"
+            )
 
     @verifies(ClusterBlockIdsOp)
     def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:

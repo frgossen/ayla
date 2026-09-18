@@ -1804,7 +1804,7 @@ class ForOp(Op):
 
     @property
     def trip_count(self) -> int:
-        return (self.ub - self.lb) // self.step
+        return max(0, (self.ub - self.lb + self.step - 1) // self.step)
 
     @property
     def extra_attrs(self) -> dict[str, object]:

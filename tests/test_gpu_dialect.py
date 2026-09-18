@@ -478,6 +478,11 @@ def test_for_loop_default_step():
     assert_print_and_roundtrip(op, expected)
 
 
+def test_for_loop_trip_count():
+    assert ForOp.build(0, 5, 2).trip_count == 3
+    assert ForOp.build(4, 2).trip_count == 0
+
+
 
 
 

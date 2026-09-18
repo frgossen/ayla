@@ -6,6 +6,7 @@ from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     ElementwiseOp,
     F32Type,
+    ForOp,
     GmemTensorType,
     ModuleOp,
     ReshapeOp,
@@ -34,6 +35,14 @@ def test_default_verification_allows_dynamic_shapes():
     module = _dynamic_matmul_module()
 
     assert verify_gpu_dialect(module) is module
+
+
+@pytest.mark.parametrize("step", [0, -1])
+def test_default_verification_rejects_nonpositive_loop_step(step):
+    module = ModuleOp.build(Block(ops=[ForOp.build(0, 4, step)]))
+
+    with pytest.raises(ValueError, match="positive integer"):
+        verify_gpu_dialect(module)
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():
