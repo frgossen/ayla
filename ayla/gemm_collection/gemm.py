@@ -19,6 +19,7 @@ from ..passes.multi_buffer import MultiBuffer
 from ..passes.pipeline_loop import PipelineLoop
 from ..passes.promote_buffers import PromoteBuffers
 from ..passes.schedule_async import ScheduleAsync
+from ..passes.stage_register_writeback import StageRegisterWriteback
 from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
 
@@ -141,6 +142,13 @@ def schedule_tiled_matmul(
     pipeline.add_pass(PromoteBuffers(
         target_type="wrmem", operands=["dst"], swizzle=None,
         layout="wgmma_layout_0", warps=4, tma=True,
+        move_attrs=operand_move_attrs,
+        target_dtype="f32", label_filter=label,
+        epilogue_label_filter=epilogue_label_filter,
+    ))
+    pipeline.add_pass(StageRegisterWriteback(
+        writeback_slices=output_slices,
+        writeback_buffers=output_store_buffers,
         physical_layout=(
             {
                 "swizzle": "128B",
@@ -149,12 +157,8 @@ def schedule_tiled_matmul(
             }
             if output_tma_inner_size is not None else None
         ),
-        writeback_slices=output_slices,
-        writeback_buffers=output_store_buffers,
-        move_attrs=operand_move_attrs,
-        target_dtype="f32", label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
         unsafe_reuse_smem=unsafe_reuse_smem,
+        label_filter=f"{label}_dst_wrmem",
     ))
     pipeline.add_pass(schedule_register_matmul(
         label=label,
