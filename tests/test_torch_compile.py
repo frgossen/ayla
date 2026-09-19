@@ -12,6 +12,57 @@ from tests.testing_utils import requires_cuda
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
+@pytest.mark.parametrize("m", [8, 128, 512])
+def test_muse_swiglu_projection_compiles_to_one_ayla_kernel(m):
+    def fn(x, packed_weight):
+        gate_up = torch.ops.aten.mm.default(
+            x, torch.ops.aten.permute.default(packed_weight, [1, 0]),
+        )
+        gate = torch.ops.aten.slice.Tensor(gate_up, 1, 0, 19968)
+        gate_f32 = torch.ops.prims.convert_element_type.default(
+            gate, torch.float32,
+        )
+        activation_f32 = torch.ops.aten.div.Tensor(
+            gate_f32,
+            torch.ops.aten.add.Tensor(
+                torch.ops.aten.exp.default(
+                    torch.ops.aten.neg.default(gate_f32),
+                ),
+                1,
+            ),
+        )
+        activation = torch.ops.prims.convert_element_type.default(
+            activation_f32, torch.bfloat16,
+        )
+        up = torch.ops.aten.slice.Tensor(
+            gate_up, 1, 19968, 9223372036854775807,
+        )
+        return torch.ops.aten.mul.Tensor(activation, up)
+
+    torch.manual_seed(m)
+    x = torch.randn(m, 6656, device="cuda", dtype=torch.bfloat16)
+    packed_weight = (
+        torch.randn(39936, 6656, device="cuda", dtype=torch.bfloat16) * .01
+    )
+    expected = fn(x, packed_weight)
+
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, dynamic=False), x, packed_weight,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=.125, rtol=.006)
+    calls = [
+        line for line in code.splitlines()
+        if "torch.ops.ayla" in line and ".default(" in line
+    ]
+    assert len(calls) == 1
+    assert "dynamic_m_muse_swiglu_projection.default" in calls[0]
+    assert code.count("async_compile.triton") == 0
+
+
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
 def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():
     def glimmer_attention_subgraph(
         attention_output,

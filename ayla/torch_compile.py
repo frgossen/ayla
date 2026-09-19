@@ -28,6 +28,11 @@ The Muse Glimmer prototype recognizes the gated attention-output
 ``view -> mm -> sigmoid -> mul -> mm`` producer region, translates it to
 high-level Ayla IR, and dumps that module. Lowering deliberately raises after
 the dump; code generation will follow separately.
+
+The Muse packed projection is a branched region rather than a linear matmul
+epilogue. A post-grad FX pass matches its exact mm/slices/FP32-SiLU/multiply
+dataflow and replaces the whole region with one functional Ayla custom op.
+Other graphs continue through the existing routing below.
 """
 from __future__ import annotations
 
@@ -35,6 +40,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
+import torch._inductor.config as inductor_config
 from torch._inductor import ir
 from torch._inductor.codegen.common import (
     BackendFeature,
@@ -73,6 +79,7 @@ from .gpu_dialect import (
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
 _MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
+_MUSE_SWIGLU_OP = None
 
 
 @dataclass(frozen=True)
@@ -123,8 +130,8 @@ def _match_node_val(
     return True
 
 
-def _only_used_by(node: Node, user: Node) -> bool:
-    return len(node.users) == 1 and user in node.users
+def _only_used_by(node: Node, *users: Node) -> bool:
+    return set(node.users) == set(users)
 
 
 def _match_node_target(
@@ -495,6 +502,16 @@ def _try_lower_glimmer_attention_subgraph(node: Node) -> None:
         f"{module}"
     )
 
+
+def _muse_swiglu_op():
+    global _MUSE_SWIGLU_OP
+    if _MUSE_SWIGLU_OP is None:
+        _MUSE_SWIGLU_OP = (
+            gemm_collection.make_dynamic_m_muse_swiglu_projection()
+        )
+    return _MUSE_SWIGLU_OP
+
+
 class AylaTemplateBuffer(ir.TemplateBuffer):
     """A matmul ayla will run."""
 
@@ -614,6 +631,161 @@ class AylaCombinedScheduling(CUDACombinedScheduling):
         )
 
 
+def _only_user(node: Node, target: object, args: int) -> Node | None:
+    if len(node.users) != 1:
+        return None
+    [user] = node.users
+    return user if _match_node_target(user, target, num_args=args) else None
+
+
+def _is_bf16_tensor(node: Node, shape: tuple[int, int]) -> bool:
+    value = node.meta.get("val")
+    return (
+        isinstance(value, torch.Tensor)
+        and value.device.type == "cuda"
+        and value.dtype == torch.bfloat16
+        and tuple(value.shape) == shape
+    )
+
+
+@dataclass(frozen=True)
+class _MuseSwiGLUMatch:
+    lhs: Node
+    packed_weight: Node
+    product: Node
+
+
+def _match_muse_swiglu(
+    matmul: Node, *, m: int,
+) -> _MuseSwiGLUMatch | None:
+    """Match Muse's exact sliced FP32 SiLU decomposition after one MM."""
+    slices = [
+        user for user in matmul.users
+        if _match_node_target(
+            user, torch.ops.aten.slice.Tensor, num_args=4,
+        )
+    ]
+    if len(slices) != 2 or set(matmul.users) != set(slices):
+        return None
+    gate = next((
+        node for node in slices
+        if node.args[1:] == (1, 0, 19_968)
+    ), None)
+    up = next((
+        node for node in slices
+        if node.args[1:] == (1, 19_968, 9_223_372_036_854_775_807)
+    ), None)
+    if gate is None or up is None:
+        return None
+    if not all(
+        _is_bf16_tensor(node, (m, 19_968)) for node in (gate, up)
+    ):
+        return None
+
+    gate_f32 = _only_user(
+        gate, torch.ops.prims.convert_element_type.default, 2,
+    )
+    if gate_f32 is None or gate_f32.args[1] is not torch.float32:
+        return None
+    gate_f32_users = list(gate_f32.users)
+    neg = next((
+        node for node in gate_f32_users
+        if _match_node_target(node, torch.ops.aten.neg.default, num_args=1)
+    ), None)
+    div = next((
+        node for node in gate_f32_users
+        if _match_node_target(node, torch.ops.aten.div.Tensor, num_args=2)
+    ), None)
+    if neg is None or div is None or set(gate_f32_users) != {neg, div}:
+        return None
+    exp = _only_user(neg, torch.ops.aten.exp.default, 1)
+    if exp is None:
+        return None
+    denominator = _only_user(exp, torch.ops.aten.add.Tensor, 2)
+    if (
+        denominator is None
+        or denominator.args != (exp, 1)
+        or div.args != (gate_f32, denominator)
+        or not _only_used_by(denominator, div)
+    ):
+        return None
+    gate_activation = _only_user(
+        div, torch.ops.prims.convert_element_type.default, 2,
+    )
+    if (
+        gate_activation is None
+        or gate_activation.args[1] is not torch.bfloat16
+    ):
+        return None
+    product = _only_user(gate_activation, torch.ops.aten.mul.Tensor, 2)
+    if (
+        product is None
+        or set(product.args) != {gate_activation, up}
+        or not _only_used_by(up, product)
+        or not _is_bf16_tensor(product, (m, 19_968))
+        or not product.meta["val"].is_contiguous()
+    ):
+        return None
+
+    if not _match_node_target(
+        matmul, torch.ops.aten.mm.default, num_args=2,
+    ):
+        return None
+    lhs, rhs = matmul.args
+    if not isinstance(lhs, Node) or not _match_node_target(
+        rhs, torch.ops.aten.permute.default, num_args=2,
+    ):
+        return None
+    assert isinstance(rhs, Node)
+    if rhs.args[1] != [1, 0] or not _only_used_by(rhs, matmul):
+        return None
+    packed_weight = rhs.args[0]
+    if not isinstance(packed_weight, Node):
+        return None
+    if not (
+        _is_bf16_tensor(lhs, (m, 6_656))
+        and _is_bf16_tensor(packed_weight, (39_936, 6_656))
+        and lhs.meta["val"].is_contiguous()
+        and packed_weight.meta["val"].is_contiguous()
+    ):
+        return None
+    return _MuseSwiGLUMatch(
+        lhs=lhs,
+        packed_weight=packed_weight,
+        product=product,
+    )
+
+
+def _replace_muse_swiglu(graph: torch.fx.Graph) -> None:
+    """Replace exact Muse SwiGLU Aten regions with the functional Ayla op."""
+    changed = False
+    for matmul in list(graph.nodes):
+        value = matmul.meta.get("val")
+        if not (
+            _match_node_target(
+                matmul, torch.ops.aten.mm.default, num_args=2,
+            )
+            and isinstance(value, torch.Tensor)
+            and len(value.shape) == 2
+            and int(value.shape[1]) == 39_936
+        ):
+            continue
+        match = _match_muse_swiglu(matmul, m=int(value.shape[0]))
+        if match is None:
+            continue
+        with graph.inserting_before(match.product):
+            replacement = graph.call_function(
+                _muse_swiglu_op(),
+                args=(match.lhs, match.packed_weight),
+            )
+        replacement.meta = dict(match.product.meta)
+        match.product.replace_all_uses_with(replacement)
+        changed = True
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+
+
 def _lower_mm(lhs, rhs, *, layout=None):
     """Claim this matmul as an ayla template, or decline and leave it be."""
     current = V.graph.current_node
@@ -642,12 +814,26 @@ def _lower_mm(lhs, rhs, *, layout=None):
 _LOWERING_TARGET = torch.ops.aten.mm.default
 _displaced_user_lowering = None
 _displaced_backend = None
+_displaced_post_grad_pass = None
+_post_grad_installed = False
 
 
 def install() -> None:
-    """Claim ``aten.mm``, and the cuda scheduling that decides what fuses into it."""
+    """Install Ayla's exact FX rewrite, mm lowering, and CUDA scheduling."""
     global _displaced_user_lowering, _displaced_backend
+    global _displaced_post_grad_pass, _post_grad_installed
     init_backend_registration()
+    if not _post_grad_installed:
+        _displaced_post_grad_pass = inductor_config.post_grad_custom_post_pass
+        existing = _displaced_post_grad_pass
+        if existing is None:
+            passes = [_replace_muse_swiglu]
+        elif isinstance(existing, (list, tuple)):
+            passes = [*existing, _replace_muse_swiglu]
+        else:
+            passes = [existing, _replace_muse_swiglu]
+        inductor_config.post_grad_custom_post_pass = passes
+        _post_grad_installed = True
     if _displaced_backend is None:
         _displaced_backend = device_codegens["cuda"]
         register_backend_for_device(
@@ -662,8 +848,18 @@ def install() -> None:
 
 
 def uninstall() -> None:
-    """Hand back ``aten.mm`` and the cuda scheduling."""
-    global _displaced_backend
+    """Restore the displaced FX pass, mm lowering, and CUDA scheduling."""
+    global _displaced_backend, _post_grad_installed
+    if _post_grad_installed:
+        current = inductor_config.post_grad_custom_post_pass
+        if (
+            isinstance(current, (list, tuple))
+            and _replace_muse_swiglu in current
+        ):
+            inductor_config.post_grad_custom_post_pass = (
+                _displaced_post_grad_pass
+            )
+        _post_grad_installed = False
     # Stand down if someone has claimed cuda since, rather than overwrite them.
     installed = device_codegens.get("cuda")
     if installed is not None and installed.scheduling is AylaCombinedScheduling:
