@@ -21,12 +21,11 @@ from __future__ import annotations
 
 from typing import cast
 
-from ..base.ir import Block, Op, Value, clone_type
+from ..base.ir import Block, Op, Value
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
-    BlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
@@ -34,99 +33,35 @@ from ..gpu_dialect import (
     F32Type,
     F64Type,
     GmemTensorType,
-    IndexAddOp,
-    IndexConstantOp,
-    IndexDivOp,
-    IndexModOp,
-    IndexMulOp,
     KernelOp,
-    LaneIdOp,
     MatmulOp,
     ModuleOp,
     MoveOp,
     RmemTensorType,
     SmemTensorType,
-    ThreadIdsOp,
     TileOp,
-    WarpGroupIdOp,
     WrmemTensorType,
     is_elementwise,
 )
-from ._utils import label_matches
+from ._utils import (
+    build_slice_tile,
+    label_matches,
+    rebuild_tile,
+    tile_introduces_narrow_level,
+    value_collective_level,
+)
 
 
-def _target_level(target_type: str) -> str:
+def _target_level(target_type: str) -> CollectiveLevel:
     if target_type == "smem":
-        return "block"
+        return CollectiveLevel.BLOCK
     if target_type == "wrmem":
-        return "wg"
+        return CollectiveLevel.WG
     if target_type == "rmem":
-        return "thread"
+        return CollectiveLevel.THREAD
     if target_type == "gmem":
-        return "block"
+        return CollectiveLevel.BLOCK
     raise ValueError(f"unsupported target type {target_type!r}")
-
-
-def _narrowest_level(a: str, b: str) -> str:
-    if a == "thread" or b == "thread":
-        return "thread"
-    if a == "wg" or b == "wg":
-        return "wg"
-    return "block"
-
-
-def _collective_level(value: Value) -> str:
-    """Determine the hardware parallelism level at which *value* varies.
-
-    Returns "block", "wg", or "thread".
-    """
-    defn = value.definition
-
-    # Block arguments are kernel args or for-loop IVs — both are uniform
-    # across all threads in a block.
-    if isinstance(defn, Block):
-        return "block"
-
-    if isinstance(defn, BlockIdsOp):
-        return "block"
-    if isinstance(defn, WarpGroupIdOp):
-        return "wg"
-    if isinstance(defn, (ThreadIdsOp, LaneIdOp)):
-        return "thread"
-    if isinstance(defn, IndexConstantOp):
-        return "block"
-
-    if isinstance(defn, AllocOp):
-        ty = value.type
-        if isinstance(ty, SmemTensorType):
-            return "block"
-        if isinstance(ty, WrmemTensorType):
-            return "wg"
-        if isinstance(ty, (RmemTensorType, GmemTensorType)):
-            return "thread"
-
-    if isinstance(defn, TileOp):
-        level = _collective_level(defn.arg)
-        for idx in defn.indices:
-            if isinstance(idx, Value):
-                level = _narrowest_level(level, _collective_level(idx))
-        return level
-
-    if isinstance(defn, (IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp)):
-        level = "block"
-        for operand in defn.operands:
-            level = _narrowest_level(level, _collective_level(operand))
-        return level
-
-    return "block"
-
-
-def _introduces_narrow(tile: TileOp, target_level: str) -> bool:
-    return any(
-        isinstance(idx, Value)
-        and _narrowest_level(_collective_level(idx), target_level) != target_level
-        for idx in tile.indices
-    )
 
 
 def _resolve_type(name: str):
@@ -149,30 +84,6 @@ def _resolve_type(name: str):
     raise ValueError(f"unsupported type {name!r}")
 
 
-def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
-    """Rebuild a tile op on a new argument, adjusting sizes for dims the tile changes."""
-    tile_type = tile.result().type
-    arg_type = tile.arg.type
-    new_tile_type = clone_type(new_arg.type)
-    for i in range(len(new_tile_type.sizes)):
-        if tile_type.sizes[i] != arg_type.sizes[i]:
-            new_tile_type.sizes[i] = tile_type.sizes[i]
-    new_tile = TileOp.build(
-        new_arg, list(tile.indices), new_tile_type,
-        maybe_partial=tile.maybe_partial,
-    )
-    return [new_tile], [new_tile.result()]
-
-
-def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
-    typ = clone_type(value.type)
-    dim %= typ.rank
-    typ.sizes[dim] = size
-    indices = [0] * typ.rank
-    indices[dim] = index
-    return TileOp.build(value, indices, typ)
-
-
 def _sliced_moves(
     dst: Value,
     src: Value,
@@ -190,7 +101,9 @@ def _sliced_moves(
         raise ValueError("move extent must divide evenly into slices")
     ops: list[Op] = []
     for index in range(count):
-        src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
+        src_tile, dst_tile = [
+            build_slice_tile(v, dim, index, size) for v in (src, dst)
+        ]
         move = MoveOp.build(
             dst_tile.result(), src_tile.result(),
             collective=collective, attrs=attrs,
@@ -208,10 +121,6 @@ class PromoteBuffers(LoweringPass):
     (applied before the alloc+move) and narrow-level tiles (replayed on
     the promoted smem buffer after the move).
 
-    TODO: The writeback path (dst promotion) does not yet handle
-    narrow-level-dependent output tiles — it always writes back
-    directly without considering the collective level.
-
     Parameters
     ----------
     target_type : str
@@ -225,19 +134,17 @@ class PromoteBuffers(LoweringPass):
     warps : int or None
         Wrmem warp count (``1``, ``4``).
     tma : bool
-        Use TMA for the move. A WRMEM destination is written back through a
-        block-wide SMEM staging buffer because TMA cannot read registers.
+        Mark moves for TMA lowering. Register writebacks remain semantic moves
+        for ``StageRegisterWriteback`` to materialize.
     nc : bool
         Non-coherent cache hint for scalar gmem→rmem loads.
     physical_layout : dict or None
         Physical layout attrs for promoted shared-memory buffers.
     move_attrs : dict[str, dict[str, object]] or None
         Extra move attributes by operand, such as a TMA ``l2_cache_hint``.
-    writeback_slices, writeback_buffers : int
-        Number of TMA output slices and SMEM staging arenas.
     unsafe_reuse_smem : bool
-        Mark shared allocations by their asserted compute/writeback lifetime
-        so a later arena-packing pass may overlay their storage. This is unsafe:
+        Mark shared operand allocations by their asserted compute lifetime so
+        a later arena-packing pass may overlay their storage. This is unsafe:
         no analysis verifies that differently named groups are non-overlapping.
         TODO: Replace this policy flag with independent allocations followed by
         lifetime analysis and a pass that selects safe storage reuse.
@@ -258,8 +165,6 @@ class PromoteBuffers(LoweringPass):
         nc: bool = False,
         physical_layout: dict[str, object] | None = None,
         move_attrs: dict[str, dict[str, object]] | None = None,
-        writeback_slices: int = 1,
-        writeback_buffers: int = 1,
         unsafe_reuse_smem: bool = False,
         tma_load_slices: dict[str, int] | None = None,
         label_filter: str | None = None,
@@ -276,16 +181,10 @@ class PromoteBuffers(LoweringPass):
             nc=nc,
             physical_layout=physical_layout,
             move_attrs=dict(move_attrs or {}),
-            writeback_slices=writeback_slices,
-            writeback_buffers=writeback_buffers,
             unsafe_reuse_smem=unsafe_reuse_smem,
             tma_load_slices=dict(tma_load_slices or {}),
             label_filter=label_filter,
             epilogue_label_filter=epilogue_label_filter,
-        )
-        assert writeback_slices >= 1, "writeback_slices must be positive"
-        assert writeback_buffers in (1, writeback_slices), (
-            "writeback_buffers must be 1 or equal writeback_slices"
         )
         assert all(n >= 1 for n in self.tma_load_slices.values()), (
             "TMA load slice counts must be positive"
@@ -372,7 +271,9 @@ class PromoteBuffers(LoweringPass):
         v = src
         while isinstance(v.definition, TileOp):
             tile_op = v.definition
-            if _narrowest_level(_collective_level(tile_op.result()), target_level) == target_level:
+            if min(
+                value_collective_level(tile_op.result()), target_level,
+            ) == target_level:
                 break
             chain.append(tile_op)
             v = tile_op.arg
@@ -386,9 +287,10 @@ class PromoteBuffers(LoweringPass):
         new_ops: list[Op] = []
 
         for tile in reversed(chain):
-            if not _introduces_narrow(tile, target_level):
-                ops, [chain_root] = _apply_tile(tile, chain_root)
-                new_ops.extend(ops)
+            if not tile_introduces_narrow_level(tile, target_level):
+                rebuilt = rebuild_tile(tile, chain_root)
+                new_ops.append(rebuilt)
+                chain_root = rebuilt.result()
 
         # Alloc + move at the target level.
         target_type = self._build_target_type(chain_root.type)
@@ -428,103 +330,12 @@ class PromoteBuffers(LoweringPass):
         # Replay narrow-level tiles on the promoted buffer (e.g. tile smem by wg_id).
         result = alloc.result()
         for tile in reversed(chain):
-            if _introduces_narrow(tile, target_level):
-                ops, [result] = _apply_tile(tile, result)
-                new_ops.extend(ops)
+            if tile_introduces_narrow_level(tile, target_level):
+                rebuilt = rebuild_tile(tile, result)
+                new_ops.append(rebuilt)
+                result = rebuilt.result()
 
         return new_ops, [result]
-
-    def _build_tma_writeback(
-        self,
-        dst: Value,
-        src: Value,
-        collective: dict[CollectiveAxis, CollectiveLevel],
-        matmul_label: str | None,
-        writeback_tiling_scheme: int | None,
-    ) -> list[Op]:
-        """Stage a narrow distributed value for one block-wide TMA store.
-
-        The block-wide SMEM tile is allocated whole (the bulk store transfers it
-        in one copy), then tiled back down to the writer's collective level so
-        the gather move matches ``src``'s shape -- mirroring how
-        ``_build_operand_promotion`` replays narrow tiles on a promoted buffer,
-        which keeps the warp-group row placement in the IR rather than the
-        lowering.
-        """
-        block_dst = dst
-        narrow_tiles: list[TileOp] = []
-        while isinstance(block_dst.definition, TileOp):
-            tile = block_dst.definition
-            if not _introduces_narrow(tile, "block"):
-                break
-            narrow_tiles.append(tile)
-            block_dst = tile.arg
-        assert isinstance(block_dst.type, GmemTensorType)
-        smem_sizes = list(block_dst.type.sizes)
-        if smem_sizes[-1] % self.writeback_slices:
-            raise ValueError("output columns must divide evenly into writeback_slices")
-        smem_sizes[-1] //= self.writeback_slices
-        smem_type = self._build_smem_type(
-            smem_sizes, block_dst.type.dtype,
-        )
-        attrs = (
-            {"reuse_group": f"{matmul_label}_writeback"}
-            if self.unsafe_reuse_smem and matmul_label is not None else None
-        )
-        smems = [
-            AllocOp.build_with_fresh_id(smem_type, attrs=attrs)
-            for _ in range(self.writeback_buffers)
-        ]
-        new_ops: list[Op] = list(smems)
-        slice_cols = smem_sizes[-1]
-        wg_column_tile = next((
-            tile for tile in narrow_tiles
-            if tile.result().type.sizes[-1] != tile.arg.type.sizes[-1]
-        ), None)
-        expected_slices = block_dst.type.sizes[-1] // src.type.sizes[-1]
-        if wg_column_tile is not None and self.writeback_slices != expected_slices:
-            raise ValueError("warpgroup-column writeback needs one slice per warpgroup")
-        for slice_idx in range(self.writeback_slices):
-            smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
-            gather_dst = smem.result()
-            for tile in reversed(narrow_tiles):
-                if tile is wg_column_tile:
-                    continue
-                ops, [gather_dst] = _apply_tile(tile, gather_dst)
-                new_ops.extend(ops)
-            gather_attrs = {"label": f"{matmul_label}_dst_smem"}
-            if wg_column_tile is not None:
-                gather_attrs["writer_wg"] = slice_idx
-            elif self.writeback_slices > 1:
-                # TODO: Express this source slice with a tile op instead of the
-                # wgmma_col_start attribute.
-                gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
-            gather = MoveOp.build(
-                dst=gather_dst,
-                src=src,
-                collective=collective,
-                attrs=gather_attrs,
-            )
-            store_tiles = (
-                [_slice_tile(block_dst, -1, slice_idx, slice_cols)]
-                if self.writeback_slices > 1 else []
-            )
-            store_dst_value = store_tiles[0].result() if store_tiles else block_dst
-            store_attrs: dict[str, object] = {
-                "label": f"{matmul_label}_dst_tma",
-                "tma": True,
-            }
-            store_attrs.update(self.move_attrs.get("dst", {}))
-            if writeback_tiling_scheme is not None:
-                store_attrs["dst_tiling_scheme"] = writeback_tiling_scheme
-            store = MoveOp.build(
-                dst=store_dst_value,
-                src=smem.result(),
-                collective=collective,
-                attrs=store_attrs,
-            )
-            new_ops.extend([gather, *store_tiles, store])
-        return new_ops
 
     def _build_operand_writeback(
         self,
@@ -537,12 +348,13 @@ class PromoteBuffers(LoweringPass):
         writeback_tiling_scheme: int | None = None,
     ) -> tuple[list[Op], list[Value]]:
         target_level = _target_level(self.target_type)
-        dst_level = _collective_level(dst)
-        if _narrowest_level(dst_level, target_level) != target_level:
+        dst_level = value_collective_level(dst)
+        if min(dst_level, target_level) != target_level:
             raise NotImplementedError(
-                f"writeback for {dst_level}-level dst not yet supported "
+                f"writeback for {dst_level.name.lower()}-level dst not yet "
+                f"supported "
                 f"when promoting to {self.target_type}"
-            )
+        )
         new_ops: list[Op] = []
         epilogue = list(epilogue or [])
         if src.type.dtype.name != dst.type.dtype.name:
@@ -571,15 +383,6 @@ class PromoteBuffers(LoweringPass):
             src = tmp_alloc.result()
         else:
             new_ops.extend(epilogue)
-        if self.tma and self.target_type == "wrmem":
-            new_ops.extend(self._build_tma_writeback(
-                dst,
-                src,
-                collective,
-                matmul_label,
-                writeback_tiling_scheme,
-            ))
-            return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         if writeback_tiling_scheme is not None:
             attrs["dst_tiling_scheme"] = writeback_tiling_scheme
@@ -720,8 +523,6 @@ def promote_buffers(
     nc: bool = False,
     physical_layout: dict[str, object] | None = None,
     move_attrs: dict[str, dict[str, object]] | None = None,
-    writeback_slices: int = 1,
-    writeback_buffers: int = 1,
     unsafe_reuse_smem: bool = False,
     tma_load_slices: dict[str, int] | None = None,
     label_filter: str | None = None,
@@ -739,8 +540,6 @@ def promote_buffers(
         nc=nc,
         physical_layout=physical_layout,
         move_attrs=move_attrs,
-        writeback_slices=writeback_slices,
-        writeback_buffers=writeback_buffers,
         unsafe_reuse_smem=unsafe_reuse_smem,
         tma_load_slices=tma_load_slices,
         label_filter=label_filter,
