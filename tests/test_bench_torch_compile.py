@@ -15,29 +15,48 @@ from benchmarks.bench_torch_compile.corpus import build_configs
 
 def test_captured_graph_marks_selected_nodes():
     def block(lhs, rhs):
-        return lhs @ rhs.t()
+        return torch.sigmoid(lhs @ rhs.t())
 
     graph = capture_aten_graph(
         block,
         [torch.randn(2, 3), torch.randn(4, 3)],
     )
 
-    rendered = format_captured_graph(graph, {"mm"})
+    rendered = format_captured_graph(graph, {"mm", "sigmoid"})
 
     assert "    %t :" in rendered
     assert ">>> %mm :" in rendered
+    assert ">>> %sigmoid :" in rendered
+
+
+def test_captured_graph_marks_the_complete_silu_dataflow():
+    def block(lhs, rhs):
+        result = lhs @ rhs.t()
+        return result * torch.sigmoid(result)
+
+    graph = capture_aten_graph(
+        block,
+        [torch.randn(2, 3), torch.randn(4, 3)],
+    )
+
+    rendered = format_captured_graph(graph, {"mm", "sigmoid", "mul"})
+
+    assert "    %t :" in rendered
+    assert ">>> %mm :" in rendered
+    assert ">>> %sigmoid :" in rendered
+    assert ">>> %mul :" in rendered
 
 
 def test_selected_ayla_kernels_are_read_from_generated_code():
     codes = [
-        "# ayla nodes: mm\n"
+        "# ayla nodes: mm,sigmoid,mul\n"
         "torch.ops.ayla.first.default(lhs, rhs)\n"
         "# ayla nodes: mm_1\n"
         "torch.ops.ayla.second.default(value)\n",
     ]
 
     assert selected_ayla_kernels(codes) == (
-        (("mm",), "first"),
+        (("mm", "sigmoid", "mul"), "first"),
         (("mm_1",), "second"),
     )
 
@@ -46,19 +65,19 @@ def test_profiled_launches_maps_wrapper_calls_to_source_nodes():
     codes = ["""
         # Topologically Sorted Source Nodes: [permute, mm], Original ATen: [aten.mm]
         extern_kernels.mm(lhs, rhs, out=buf0)
-        # Topologically Sorted Source Nodes: [add], Original ATen: [aten.add]
-        triton_poi_fused_add_0.run(buf0)
-        # Topologically Sorted Source Nodes: [add, mm_1], Original ATen: [aten.mm]
+        # Topologically Sorted Source Nodes: [sigmoid, mul], Original ATen: [aten.sigmoid, aten.mul]
+        triton_poi_fused_mul_sigmoid_0.run(buf0)
+        # Topologically Sorted Source Nodes: [sigmoid, mul, mm_1], Original ATen: [aten.mm]
         extern_kernels.mm(buf0, rhs, out=buf1)
-        # ayla nodes: mm_1
+        # ayla nodes: mm_2
         torch.ops.ayla.dynamic_m_matmul_out.default(lhs, rhs, buf2)
     """]
 
     assert profiled_launches(codes) == (
         ("aten::mm", frozenset({"permute", "mm"})),
-        ("triton_poi_fused_add_0", frozenset({"add"})),
+        ("triton_poi_fused_mul_sigmoid_0", frozenset({"sigmoid", "mul"})),
         ("aten::mm", frozenset({"mm_1"})),
-        ("ayla::dynamic_m_matmul_out", frozenset({"mm_1"})),
+        ("ayla::dynamic_m_matmul_out", frozenset({"mm_2"})),
     )
 
 

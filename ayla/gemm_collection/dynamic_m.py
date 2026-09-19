@@ -61,15 +61,43 @@ def dynamic_m_matmul_template(
     k: int,
     *,
     name: str | None = None,
+    epilogue: str | None = None,
 ) -> ModuleOp:
     """Build the high-level BF16 GEMM template with dynamic M."""
     if n <= 0 or k <= 0:
         raise ValueError("problem dimensions must be positive")
-    name = name or f"dynamic_m_matmul_n{n}_k{k}"
+    if epilogue not in (None, "sigmoid", "silu", "sigmoid_mul"):
+        raise ValueError(f"unsupported epilogue: {epilogue}")
+    name = name or (
+        f"dynamic_m_matmul_n{n}_k{k}"
+        f"{f'_{epilogue}' if epilogue is not None else ''}"
+    )
+    attention_arg = (
+        f", %attention: gmem<?x{n}xbf16>"
+        if epilogue == "sigmoid_mul" else ""
+    )
+    if epilogue == "sigmoid_mul":
+        epilogue_ops = (
+            f"\n            elementwise sigmoid"
+            f"(%c: gmem<?x{n}xbf16>, %c: gmem<?x{n}xbf16>)"
+            ' attrs={label: "epi"}'
+            f"\n            elementwise mul"
+            f"(%c: gmem<?x{n}xbf16>, %c: gmem<?x{n}xbf16>, "
+            f"%attention: gmem<?x{n}xbf16>)"
+            ' attrs={label: "epi"}'
+        )
+    elif epilogue is None:
+        epilogue_ops = ""
+    else:
+        epilogue_ops = (
+            f"\n            elementwise {epilogue}"
+            f"(%c: gmem<?x{n}xbf16>, %c: gmem<?x{n}xbf16>)"
+            ' attrs={label: "epi"}'
+        )
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) {{
-            matmul(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>{attention_arg}, %c: gmem<?x{n}xbf16>) {{
+            matmul(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}{epilogue_ops}
           }}
         }}"""))
     assert isinstance(module, ModuleOp)
@@ -100,14 +128,18 @@ def _make_dynamic_m_matmul_compiler(
     k: int,
     *,
     name: str | None = None,
+    epilogue: str | None = None,
 ) -> ShapeSpecializingJITCompiler:
     """Create the cached compiler shared by functional and out calls."""
-    module = dynamic_m_matmul_template(n, k, name=name)
+    module = dynamic_m_matmul_template(
+        n, k, name=name, epilogue=epilogue,
+    )
 
     def compile_specialization(module: ModuleOp):
         m = int(module.body.ops[0].signature[0].sizes[0])
         scheduled = schedule_matmul(
             module,
+            epilogue_label_filter=(None if epilogue is None else "epi"),
             **_dynamic_m_schedule_heuristic(m, n, k),
         )
         kernel = make_ptx_kernel(scheduled)
@@ -122,13 +154,23 @@ def make_dynamic_m_matmul_out(
     *,
     name: str | None = None,
     namespace: str = DEFAULT_NAMESPACE,
+    epilogue: str | None = None,
 ):
     """Create an exact-shape cached ``op(lhs, rhs, out)`` GEMM."""
-    op_name = name or f"dynamic_m_matmul_n{n}_k{k}_out"
-    compiler = _make_dynamic_m_matmul_compiler(n, k, name=op_name)
+    op_name = name or (
+        f"dynamic_m_matmul_n{n}_k{k}"
+        f"{f'_{epilogue}' if epilogue is not None else ''}_out"
+    )
+    compiler = _make_dynamic_m_matmul_compiler(
+        n, k, name=op_name, epilogue=epilogue,
+    )
+    operands = [OperandKind.R, OperandKind.R]
+    if epilogue == "sigmoid_mul":
+        operands.append(OperandKind.R)
+    operands.append(OperandKind.RW)
     return torch_custom_call.make_torch_custom_call(
         compiler,
-        [OperandKind.R, OperandKind.R, OperandKind.RW],
+        operands,
         namespace=namespace,
         name=op_name,
     )

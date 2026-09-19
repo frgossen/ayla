@@ -2318,7 +2318,11 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         dst_scope = (
             CollectiveScope.BLOCK_LEADER
             if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
-            else _type_collective_scope(op.dst.type)
+            else (
+                CollectiveScope.THREAD
+                if isinstance(op.dst.type, WrmemTensorType)
+                else _type_collective_scope(op.dst.type)
+            )
         )
         return (
             _memory_effect("W", op.dst, dst_scope)

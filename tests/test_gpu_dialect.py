@@ -36,6 +36,7 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    WrmemTensorType,
     gpu_dialect,
     has_ordering_effect,
     memory_effects,
@@ -452,6 +453,25 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
 
     assert effects is not None
     assert {(kind, root.name, scope) for kind, root, scope in effects} == expected
+
+
+def test_move_into_distributed_registers_has_thread_local_write_effect():
+    src = Value(
+        name="src", type=GmemTensorType.build((64, 256), BF16Type()),
+    )
+    dst = Value(
+        name="dst",
+        type=WrmemTensorType.build(
+            (64, 256), BF16Type(), warps=4, layout="wgmma_layout_0",
+        ),
+    )
+    effects = memory_effects(MoveOp.build(
+        dst, src,
+        collective={axis: CollectiveLevel.WG for axis in CollectiveAxis},
+    ))
+
+    assert effects is not None
+    assert ("W", dst, CollectiveScope.THREAD) in effects
 
 
 def test_tma_descriptor_validates_l2_promotion():

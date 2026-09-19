@@ -1,4 +1,4 @@
-"""Route compatible matmuls through Ayla under ``torch.compile``.
+"""Route matmuls through ayla under torch.compile, epilogue and all.
 
 Installs a lowering for compatible BF16 `aten.mm` operations and declines
 everything else, which falls through to Inductor's own lowering::
@@ -15,8 +15,8 @@ Three seams, following `nv_universal_gemm`, the closest thing in Inductor to a
 backend whose kernels are prebuilt rather than generated:
 
 - `AylaTemplateBuffer` is the node: a matmul ayla will run.
-- `AylaScheduling` preserves the existing fixed-shape sigmoid fusion and
-  `codegen_template` emits the selected call.
+- `AylaScheduling` answers `can_fuse_vertical` for supported elementwise
+  epilogues on an ayla template, and `codegen_template` emits the call.
 - `AylaCombinedScheduling` owns the cuda device and hands everything that is
   not an ayla template to the scheduling that would have had it.
 
@@ -53,20 +53,30 @@ from torch.utils._ordered_set import OrderedSet
 from . import gemm_collection  # noqa: F401 -- defines the ops below
 
 _MM_OUT = (
-    torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
+    torch.ops.ayla
+    .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_out.default
 )
 _MM_SIGMOID_OUT = (
-    torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
+    torch.ops.ayla
+    .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_sigmoid_out
+    .default
+)
+_MM_SILU_OUT = (
+    torch.ops.ayla
+    .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2_silu_out
+    .default
 )
 
-_DYNAMIC_M_OPS: dict[tuple[int, int], object] = {}
+_DYNAMIC_M_OPS: dict[tuple[int, int, str | None], object] = {}
 
 
-def _dynamic_m_op(n: int, k: int):
-    key = (n, k)
+def _dynamic_m_op(n: int, k: int, epilogue: str | None):
+    key = (n, k, epilogue)
     op = _DYNAMIC_M_OPS.get(key)
     if op is None:
-        op = gemm_collection.make_dynamic_m_matmul_out(n, k)
+        op = gemm_collection.make_dynamic_m_matmul_out(
+            n, k, epilogue=epilogue,
+        )
         _DYNAMIC_M_OPS[key] = op
     return op
 
@@ -101,13 +111,12 @@ class AylaScheduling(BaseScheduling):
             return False        # one epilogue: there is no kernel for two
         template = node1.get_template_node()
         assert isinstance(template, AylaTemplateBuffer)
-        if not _is_elementwise_sigmoid_node(node2):
-            return False
-        if "sigmoid" not in template.ayla_ops:
+        (output,) = node1.get_outputs()
+        epilogue = _elementwise_epilogue(node2, output.get_name())
+        if epilogue is None or epilogue[0] not in template.ayla_ops:
             return False
         # Repeated reads within one fused epilogue are fine; a different
         # consumer would still require the unfused matmul result.
-        (output,) = node1.get_outputs()
         return all(user.node is node2 for user in output.users if not user.is_weak)
 
     def can_fuse_horizontal(
@@ -127,16 +136,35 @@ class AylaScheduling(BaseScheduling):
         assert isinstance(template_buffer, AylaTemplateBuffer)
         source_node_names = [template_buffer.source_node_name]
         ayla_op = template_buffer.ayla_ops[None]
+        external_input_name = None
         if epilogue_nodes:
-            assert _is_elementwise_sigmoid_node(epilogue_nodes[0]), (
+            (output,) = template_node.get_outputs()
+            match = _elementwise_epilogue(
+                epilogue_nodes[0], output.get_name(),
+            )
+            epilogue = None if match is None else match[0]
+            assert epilogue is not None, (
                 "can_fuse_vertical let through what it cannot fuse"
             )
-            ayla_op = template_buffer.ayla_ops["sigmoid"]
+            external_input_name = match[1]
+            ayla_op = template_buffer.ayla_ops[epilogue]
             assert epilogue_nodes[0].node is not None
+            targets = {
+                "sigmoid": (torch.ops.aten.sigmoid.default,),
+                "silu": (
+                    torch.ops.aten.sigmoid.default,
+                    torch.ops.aten.mul.Tensor,
+                ),
+                "sigmoid_mul": (
+                    torch.ops.aten.sigmoid.default,
+                    torch.ops.aten.mul.Tensor,
+                ),
+            }[epilogue]
             source_node_names.extend(
                 origin.name
+                for target in targets
                 for origin in epilogue_nodes[0].node.get_origins()
-                if origin.target is torch.ops.aten.sigmoid.default
+                if origin.target is target
             )
 
         template_node.mark_run()
@@ -151,25 +179,87 @@ class AylaScheduling(BaseScheduling):
             dest = template_node.node.get_name()
 
         a, b = (inp.codegen_reference() for inp in template_node.node.inputs)
+        args = [a, f"{b}.t()"]
+        if external_input_name is not None:
+            external = V.graph.get_buffer(external_input_name)
+            external_ref = external.codegen_reference()
+            if list(external.get_size()) != list(template_buffer.get_size()):
+                external_ref = f"{external_ref}.view(-1, {template_buffer.get_size()[1]})"
+            args.append(external_ref)
+        args.append(dest)
         V.graph.wrapper_code.writeline(
             f"# ayla nodes: {','.join(source_node_names)}"
         )
         V.graph.wrapper_code.writeline(
-            f"torch.ops.{ayla_op}({a}, {b}.t(), {dest})"
+            f"torch.ops.{ayla_op}({', '.join(args)})"
         )
         self.free_buffers_in_scheduler()
         return None
 
 
-def _is_elementwise_sigmoid_node(node: BaseSchedulerNode) -> bool:
+def _elementwise_epilogue(
+    node: BaseSchedulerNode, template_output_name: str,
+) -> tuple[str, str | None] | None:
     inner = getattr(node, "node", None)
     if not isinstance(inner, ir.ComputedBuffer):
-        return False
+        return None
     if not isinstance(inner.data, ir.Pointwise):
-        return False
+        return None
     _, body, _ = inner.get_default_sizes_body()
-    ops = [n.target for n in body.root_block.graph.nodes if n.op == "call_method"]
-    return ops == ["load", "sigmoid", "store"]
+    calls = [n for n in body.root_block.graph.nodes if n.op == "call_method"]
+    loads = [n for n in calls if n.target == "load"]
+    sigmoids = [n for n in calls if n.target == "sigmoid"]
+    muls = [n for n in calls if n.target == "mul"]
+    stores = [n for n in calls if n.target == "store"]
+    if len(loads) == len(sigmoids) == len(stores) == 1 and not muls:
+        load, sigmoid, store = loads[0], sigmoids[0], stores[0]
+        if (
+            load.args[1] == template_output_name
+            and sigmoid.args[1] is load
+            and store.args[3] is sigmoid
+        ):
+            return "sigmoid", None
+        return None
+    if not (
+        len(loads) == 2 and len(sigmoids) == len(muls) == len(stores) == 1
+    ):
+        return None
+    sigmoid, mul, store = sigmoids[0], muls[0], stores[0]
+    if sigmoid.args[1] not in loads or store.args[3] is not mul:
+        return None
+    if str(sigmoid.args[1].args[1]) != template_output_name:
+        return None
+    other_load = next(load for load in loads if load is not sigmoid.args[1])
+    if set(mul.args[1:]) != {sigmoid, other_load}:
+        return None
+    load_names = [str(load.args[1]) for load in loads]
+    if load_names.count(template_output_name) == 2:
+        return "silu", None
+    if load_names.count(template_output_name) != 1:
+        return None
+    external_name = next(
+        name for name in load_names if name != template_output_name
+    )
+    reads = list(node.read_writes.reads)
+    output_reads = [dep for dep in reads if dep.name == template_output_name]
+    external_reads = [dep for dep in reads if dep.name == external_name]
+    if len(output_reads) != 1 or len(external_reads) != 1:
+        return None
+    output_read, external_read = output_reads[0], external_reads[0]
+    if (
+        output_read.index != external_read.index
+        or output_read.var_names != external_read.var_names
+        or output_read.size != external_read.size
+    ):
+        return None
+    external = V.graph.get_buffer(external_name)
+    if external.get_dtype() != torch.bfloat16:
+        return None
+    if not is_contiguous_strides_for_shape(
+        tuple(external.get_stride()), tuple(external.get_size()),
+    ):
+        return None
+    return "sigmoid_mul", external_name
 
 
 class AylaCombinedScheduling(CUDACombinedScheduling):
@@ -237,9 +327,14 @@ def _lower_mm(lhs, rhs, *, layout=None):
         ayla_ops = {
             None: _MM_OUT,
             "sigmoid": _MM_SIGMOID_OUT,
+            "silu": _MM_SILU_OUT,
+            "sigmoid_mul": _dynamic_m_op(4096, 4096, "sigmoid_mul"),
         }
     else:
-        ayla_ops = {None: _dynamic_m_op(n_int, k_int)}
+        ayla_ops = {
+            epilogue: _dynamic_m_op(n_int, k_int, epilogue)
+            for epilogue in (None, "sigmoid", "silu", "sigmoid_mul")
+        }
 
     return TensorBox.create(
         AylaTemplateBuffer(

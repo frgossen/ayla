@@ -19,7 +19,7 @@ Example — promote lhs/rhs to smem::
 
 from __future__ import annotations
 
-from ..base.ir import Block, Op, Value, clone_type
+from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
@@ -48,7 +48,6 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
     WrmemTensorType,
-    is_elementwise,
 )
 from ._utils import label_matches
 
@@ -331,12 +330,16 @@ class PromoteBuffers(LoweringPass):
         return attrs
 
     def _build_move_attrs(
-        self, matmul_label: str | None, operand_name: str, allow_nc: bool = True
+        self,
+        matmul_label: str | None,
+        operand_name: str,
+        allow_nc: bool = True,
+        allow_tma: bool = True,
     ) -> dict[str, object]:
         attrs: dict[str, object] = {}
         if matmul_label is not None:
             attrs["label"] = f"{matmul_label}_{operand_name}_{self.target_type}"
-        if self.tma:
+        if self.tma and allow_tma:
             attrs["tma"] = True
         if self.nc and allow_nc and not self.tma:
             attrs["nc"] = True
@@ -350,6 +353,7 @@ class PromoteBuffers(LoweringPass):
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
         init: object = None,
+        allow_tma: bool = True,
     ) -> tuple[list[Op], list[Value]]:
         """Promote an operand to the target memory, handling any collective level.
 
@@ -404,7 +408,9 @@ class PromoteBuffers(LoweringPass):
             )
             new_ops.append(alloc)
         else:
-            attrs = self._build_move_attrs(matmul_label, operand_name)
+            attrs = self._build_move_attrs(
+                matmul_label, operand_name, allow_tma=allow_tma,
+            )
             alloc = AllocOp.build_with_fresh_id(
                 self._build_target_type(chain_root.type, dtype=chain_root.type.dtype),
                 attrs=buffer_attrs,
@@ -543,12 +549,11 @@ class PromoteBuffers(LoweringPass):
             new_ops.append(tmp_alloc)
             if epilogue:
                 final = epilogue[-1]
-                # TODO: Generalize this rewrite for multi-source element-wise
-                # epilogues such as SwiGLU. Retarget the final operation's
-                # destination while preserving and remapping all its sources.
-                assert final.dst is src and final.src(0) is src
+                assert final.dst is src
                 new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), srcs=[src], fn=final.fn,
+                    dst=tmp_alloc.result(),
+                    srcs=[final.src(i) for i in range(final.num_srcs)],
+                    fn=final.fn,
                     attrs=final.attrs,
                 ))
             else:
@@ -607,11 +612,11 @@ class PromoteBuffers(LoweringPass):
     def _promotes(self, op: Op) -> bool:
         return isinstance(op, MatmulOp) and label_matches(op, self.label_filter)
 
-    def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
+    def _epilogue(self, ops: list[Op], hero: int) -> list[ElementwiseOp]:
         """The ops directly behind ``ops[hero]`` that promote with it.
 
         Contiguous only, and each has to earn its place: element-wise, selected
-        by ``epilogue_label_filter``, and in place over the destination.
+        by ``epilogue_label_filter``, writing and reading the destination.
         Anything else ends the run -- an op left where it is must not be
         stepped over, or moving what follows past it would reorder the two.
 
@@ -621,14 +626,26 @@ class PromoteBuffers(LoweringPass):
         """
         if self.epilogue_label_filter is None:
             return []
-        found: list[Op] = []
+        found: list[ElementwiseOp] = []
+        external_sources: set[Value] = set()
         dst = ops[hero].dst
         for op in ops[hero + 1:]:
-            if not is_elementwise(op):
+            if not isinstance(op, ElementwiseOp):
                 break
             if not label_matches(op, self.epilogue_label_filter):
                 break
-            if len(op.operands) != 2 or not all(v is dst for v in op.operands):
+            if op.dst is not dst or not any(
+                op.src(j) is dst for j in range(op.num_srcs)
+            ):
+                break
+            external_sources.update({
+                op.src(j) for j in range(op.num_srcs)
+                if op.src(j) is not dst
+            })
+            if len(external_sources) > 1 or any(
+                source.type.sizes != dst.type.sizes
+                for source in external_sources
+            ):
                 break
             found.append(op)
         return found
@@ -670,19 +687,39 @@ class PromoteBuffers(LoweringPass):
             attrs=op.extra_attrs,
         )
 
+        # External pointwise inputs are loaded only after the matmul so they do
+        # not occupy registers across the reduction loop.
+        epilogue_pre_ops: list[Op] = []
+        promoted_values = {dst: new_dst}
+        external_sources = list(dict.fromkeys(
+            e.src(j)
+            for e in epilogue
+            for j in range(e.num_srcs)
+            if e.src(j) is not dst
+        ))
+        for index, source in enumerate(external_sources):
+            ops, [promoted_source] = self._build_operand_promotion(
+                source,
+                f"epilogue_src{index}",
+                op.collective,
+                label,
+                allow_tma=False,
+            )
+            epilogue_pre_ops.extend(ops)
+            promoted_values[source] = promoted_source
+
         # The epilogue runs on the promoted buffer, before it is written back:
         # that is the whole point of promoting the destination, and it is only
         # reachable here because the ops behind the matmul came along.
-        post_ops: list[ElementwiseOp] = [
-            type(e)(operands=[new_dst, new_dst], results=[], attrs=e.attrs)
-            for e in epilogue
+        post_ops = [
+            clone_op(e, promoted_values) for e in epilogue
         ]
         if "dst" in self.operand_names:
             post_ops, _ = self._build_operand_writeback(
                 dst, new_dst, "dst", op.collective, label, post_ops,
             )
 
-        return pre_ops + [matmul] + post_ops
+        return pre_ops + [matmul] + epilogue_pre_ops + post_ops
 
 
 def promote_buffers(

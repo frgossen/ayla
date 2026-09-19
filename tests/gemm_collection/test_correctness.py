@@ -13,13 +13,12 @@ from ayla.gemm_collection.dynamic_m import (
     _dynamic_m_schedule_heuristic,
     make_dynamic_m_matmul,
 )
-from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_sigmoid import (
+from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_tma_store import (
     auto_matmul_4096_wgmma256_wg_sigmoid_module,
 )
 from ayla.gpu_dialect import (
     ElementwiseOp,
     ForOp,
-    TileOp,
     TmaDescType,
     WrmemTensorType,
 )
@@ -182,36 +181,30 @@ def test_sigmoid_output_tiles_lower_to_ptx():
     assert not at("ex2.approx.f32")
     converts = at("cvt.rn.bf16x2.f32")
     stores = at("cp.async.bulk.tensor.3d.global.shared")
-    # Four output-M iterations each contain four fully unrolled 64-column
-    # slices, with 32 f32 values (16 packed outputs) per thread and slice.
-    assert len(sigmoids) == 4 * 4 * 32
-    assert len(converts) == 4 * 4 * 16
-    assert len(stores) == 16
+    # Four output-M iterations each process one 64x256 accumulator, with 128
+    # f32 values (64 packed outputs) per thread and two TMA writeback slices.
+    assert len(sigmoids) == 4 * 128
+    assert len(converts) == 4 * 64
+    assert len(stores) == 4 * 2
 
 
-def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
+def test_sigmoid_epilogue_runs_on_each_register_accumulator():
     module = auto_matmul_4096_wgmma256_wg_sigmoid_module()
 
     loops = find_ops_of_type(module, ForOp)
     assert all(loop.attrs.get("label") != "outn" for loop in loops)
-    wrmem_tiles = [
-        op for op in find_ops_of_type(module, TileOp)
-        if isinstance(op.result().type, WrmemTensorType)
-    ]
-    assert wrmem_tiles
-    assert all(None not in tile.static_indices for tile in wrmem_tiles)
-
     epilogues = [
         op for op in find_ops_of_type(module, ElementwiseOp)
         if op.fn == "sigmoid"
     ]
-    assert [op.attrs.get("label") for op in epilogues[:4]] == [
-        "epi_iter0_iter0",
-        "epi_iter1_iter0",
-        "epi_iter2_iter0",
-        "epi_iter3_iter0",
+    assert [op.attrs.get("label") for op in epilogues] == [
+        "epi_iter0",
+        "epi_iter1",
+        "epi_iter2",
+        "epi_iter3",
     ]
-    assert len(epilogues) == 16
+    assert all(isinstance(op.dst.type, WrmemTensorType) for op in epilogues)
+    assert all(tuple(op.dst.type.sizes) == (64, 256) for op in epilogues)
 
 
 @requires_cuda

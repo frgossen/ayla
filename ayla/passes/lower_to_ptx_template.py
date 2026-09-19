@@ -131,6 +131,21 @@ def _lower_f32_to_packed16_ptx(
     )
 
 
+def _lower_packed_bf16_to_f32_ptx(
+    dst_regs: list[str], src_regs: list[str],
+) -> str:
+    assert len(dst_regs) == 2 * len(src_regs)
+    return "".join(
+        f"mov.b32 {{${{b16:convert_lo{pair}}}, "
+        f"${{b16:convert_hi{pair}}}}}, {src};\n"
+        f"cvt.f32.bf16 {lo}, ${{b16:convert_lo{pair}}};\n"
+        f"cvt.f32.bf16 {hi}, ${{b16:convert_hi{pair}}};\n"
+        for pair, (src, lo, hi) in enumerate(zip(
+            src_regs, dst_regs[::2], dst_regs[1::2], strict=True,
+        ))
+    )
+
+
 def _lower_dtype_conversion_ptx(
     dst_regs: list[str],
     src_regs: list[str],
@@ -138,16 +153,17 @@ def _lower_dtype_conversion_ptx(
     dst_dtype: Type,
 ) -> str:
     """Lower a conversion independently of the element-wise function."""
-    if not (
-        isinstance(src_dtype, F32Type)
-        and isinstance(dst_dtype, (BF16Type, F16Type))
+    if isinstance(src_dtype, F32Type) and isinstance(
+        dst_dtype, (BF16Type, F16Type),
     ):
-        raise NotImplementedError(
-            f"lower_elementwise: unsupported conversion "
-            f"{src_dtype} -> {dst_dtype}"
+        return _lower_f32_to_packed16_ptx(
+            dst_regs, src_regs, src_dtype, dst_dtype,
         )
-    return _lower_f32_to_packed16_ptx(
-        dst_regs, src_regs, src_dtype, dst_dtype,
+    if isinstance(src_dtype, BF16Type) and isinstance(dst_dtype, F32Type):
+        return _lower_packed_bf16_to_f32_ptx(dst_regs, src_regs)
+    raise NotImplementedError(
+        f"lower_elementwise: unsupported conversion "
+        f"{src_dtype} -> {dst_dtype}"
     )
 
 
@@ -193,13 +209,30 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
 
 
 def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
-    if not all(isinstance(value.type.dtype, F32Type) for value in op.operands):
-        raise NotImplementedError("lower_elementwise: mul supports only f32")
-    return _lower_mul_registers(
-        _elementwise_operand_regs(op.dst, "dst"),
+    if not all(
+        isinstance(op.src(i).type.dtype, F32Type)
+        for i in range(op.num_srcs)
+    ):
+        raise NotImplementedError("lower_elementwise: mul supports only f32 inputs")
+    dst_regs = _elementwise_operand_regs(op.dst, "dst")
+    result_regs = (
+        dst_regs
+        if isinstance(op.dst.type.dtype, F32Type)
+        else [
+            f"${{f32:mul_result{reg}}}"
+            for reg in range(len(_elementwise_operand_regs(op.src(0), "lhs")))
+        ]
+    )
+    template = _lower_mul_registers(
+        result_regs,
         _elementwise_operand_regs(op.src(0), "lhs"),
         _elementwise_operand_regs(op.src(1), "rhs"),
     )
+    if not isinstance(op.dst.type.dtype, F32Type):
+        template += _lower_dtype_conversion_ptx(
+            dst_regs, result_regs, op.src(0).type.dtype, op.dst.type.dtype,
+        )
+    return template
 
 
 def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
@@ -970,6 +1003,12 @@ class LowerToPtxTemplate(LoweringPass):
 
         if {type(dst_type), type(src_type)} == {RmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_rmem(op)
+        if (
+            isinstance(dst_type, WrmemTensorType)
+            and isinstance(src_type, GmemTensorType)
+            and dst_type.layout == "wgmma_layout_0"
+        ):
+            return self._lower_move_gmem_to_wrmem_wgmma(op)
         if {type(dst_type), type(src_type)} == {RmemTensorType, SmemTensorType}:
             return self._lower_move_smem_rmem(op)
         if {type(dst_type), type(src_type)} == {SmemTensorType, GmemTensorType}:
@@ -1191,6 +1230,71 @@ class LowerToPtxTemplate(LoweringPass):
         new_op = PTXTemplateOp.build(
             operands=operands, result_types=[], template=template,
             operand_names=operand_names, result_names=[],
+            description=str(op),
+        )
+        return [new_op], []
+
+    def _lower_move_gmem_to_wrmem_wgmma(
+        self, op: MoveOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Load a same-shaped global tile into WGMMA-distributed registers."""
+        dst_value = self.value_map[op.dst]
+        src_value = self.value_map[op.src]
+        dst_type = op.dst.type
+        src_type = op.src.type
+        assert isinstance(dst_type, WrmemTensorType)
+        assert isinstance(src_type, GmemTensorType)
+        assert dst_type.layout == "wgmma_layout_0"
+        assert dst_type.rank == src_type.rank == 2
+        assert dst_type.sizes == src_type.sizes
+        assert isinstance(dst_type.dtype, BF16Type)
+        assert dst_type.dtype == src_type.dtype
+
+        root = root_buffer(op.src)
+        assert root is not None and isinstance(root.type, GmemTensorType)
+        root_value = self.value_map[root]
+        root_type = root.type
+        row_stride_bytes = root_type.strides[0] * root_type.dtype.byte_size
+        row_bytes = root_type.sizes[1] * root_type.dtype.byte_size
+        pairs = _wgmma_view_pairs(op.dst)
+
+        template = textwrap.dedent(f"""\
+            mov.u32 ${{b32:load_tid}}, %tid.x;
+            rem.u32 ${{b32:load_tid_wg}}, ${{b32:load_tid}}, 128;
+            div.u32 ${{b32:load_warp}}, ${{b32:load_tid_wg}}, 32;
+            rem.u32 ${{b32:load_lane}}, ${{b32:load_tid_wg}}, 32;
+            mul.lo.u32 ${{b32:load_row}}, ${{b32:load_warp}}, 16;
+            div.u32 ${{b32:load_tmp}}, ${{b32:load_lane}}, 4;
+            add.u32 ${{b32:load_row}}, ${{b32:load_row}}, ${{b32:load_tmp}};
+            rem.u32 ${{b32:load_col}}, ${{b32:load_lane}}, 4;
+            mul.lo.u32 ${{b32:load_col}}, ${{b32:load_col}}, 2;
+            sub.u64 ${{b64:load_base_delta}}, ${{b64:operand.src.ptr}}, ${{b64:operand.root.ptr}};
+            div.u64 ${{b64:load_base_row}}, ${{b64:load_base_delta}}, {row_stride_bytes};
+            rem.u64 ${{b64:load_base_col}}, ${{b64:load_base_delta}}, {row_stride_bytes};
+        """)
+        for pair, row, col in pairs:
+            template += textwrap.dedent(f"""\
+                cvt.u64.u32 ${{b64:load_row64_{pair}}}, ${{b32:load_row}};
+                add.u64 ${{b64:load_row64_{pair}}}, ${{b64:load_row64_{pair}}}, ${{b64:load_base_row}};
+                add.u64 ${{b64:load_row64_{pair}}}, ${{b64:load_row64_{pair}}}, {row};
+                add.u64 ${{b64:load_col64_{pair}}}, ${{b64:load_base_col}}, {col * 2};
+                cvt.u64.u32 ${{b64:load_tmp64_{pair}}}, ${{b32:load_col}};
+                mul.lo.u64 ${{b64:load_tmp64_{pair}}}, ${{b64:load_tmp64_{pair}}}, 2;
+                add.u64 ${{b64:load_col64_{pair}}}, ${{b64:load_col64_{pair}}}, ${{b64:load_tmp64_{pair}}};
+                setp.lt.u64 ${{pred:load_row_ok_{pair}}}, ${{b64:load_row64_{pair}}}, {root_type.sizes[0]};
+                setp.le.u64 ${{pred:load_col_ok_{pair}}}, ${{b64:load_col64_{pair}}}, {row_bytes - 4};
+                and.pred ${{pred:load_ok_{pair}}}, ${{pred:load_row_ok_{pair}}}, ${{pred:load_col_ok_{pair}}};
+                mul.lo.u64 ${{b64:load_offset_{pair}}}, ${{b64:load_row64_{pair}}}, {row_stride_bytes};
+                add.u64 ${{b64:load_offset_{pair}}}, ${{b64:load_offset_{pair}}}, ${{b64:load_col64_{pair}}};
+                add.u64 ${{b64:load_addr_{pair}}}, ${{b64:operand.root.ptr}}, ${{b64:load_offset_{pair}}};
+                @${{pred:load_ok_{pair}}} ld.global.b32 ${{b32:operand.dst.r{pair}}}, [${{b64:load_addr_{pair}}}];
+                @!${{pred:load_ok_{pair}}} mov.b32 ${{b32:operand.dst.r{pair}}}, 0;
+            """)
+
+        new_op = PTXTemplateOp.build(
+            operands=[dst_value, src_value, root_value],
+            result_types=[], template=template,
+            operand_names=["dst", "src", "root"], result_names=[],
             description=str(op),
         )
         return [new_op], []

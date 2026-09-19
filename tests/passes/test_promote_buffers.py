@@ -300,3 +300,30 @@ def test_epilogue_runs_on_the_promoted_accumulator():
             move(%c: gmem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_wrmem"}
           }
         }""")  # noqa: E501
+
+
+def test_promotes_same_shape_external_epilogue_source():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %attention: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) collective=[xy.block, z.thread] attrs={init: 0.0, label: "mm"}
+            elementwise sigmoid(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) attrs={label: "epilogue"}
+            elementwise mul(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>, %attention: gmem<64x256xbf16>) attrs={label: "epilogue"}
+          }
+        }"""))  # noqa: E501
+
+    promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+        epilogue_label_filter="epilogue",
+    )
+
+    text = repr(module)
+    matmul = text.index("matmul(")
+    attention_load = text.index("move(%1: wrmem<64x256xbf16")
+    sigmoid = text.index("elementwise sigmoid(")
+    multiply = text.index("elementwise mul(")
+    assert matmul < attention_load < sigmoid < multiply
+    assert "elementwise convert(%2: wrmem<64x256xf32" in text
+    assert "elementwise mul(%3: wrmem<64x256xbf16" in text
+    assert "%2: wrmem<64x256xf32" in text

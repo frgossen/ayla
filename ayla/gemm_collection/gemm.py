@@ -153,6 +153,7 @@ def schedule_matmul(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    epilogue_label_filter: str | None = None,
 ) -> ModuleOp:
     """Apply the configurable WGMMA schedule to one concrete matmul.
 
@@ -207,6 +208,7 @@ def schedule_matmul(
             ],
             for_loop_labels=[None, None],
             op_label_filter="mm",
+            epilogue_label_filter=epilogue_label_filter,
             allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
@@ -222,6 +224,7 @@ def schedule_matmul(
                 (CollectiveLevel.BLOCK, CollectiveAxis.Y),
             ],
             for_loop_labels=["outm", None, None], op_label_filter="mm",
+            epilogue_label_filter=epilogue_label_filter,
             allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
@@ -238,6 +241,7 @@ def schedule_matmul(
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,
         operand_move_attrs=operand_move_attrs,
+        epilogue_label_filter=epilogue_label_filter,
     ))
     if output_tiles_per_cta != 1:
         pipeline.add_pass(UnrollLoop(
@@ -266,6 +270,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     ptx_optimization_level: int | None = None,
+    epilogue: str | None = None,
 ) -> ModuleOp:
     """Build and schedule a static BF16 GEMM module."""
     m = problem_size if m is None else m
@@ -300,11 +305,24 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
+    if epilogue is not None:
+        name += f"_{epilogue}"
+
+    epilogue_op = (
+        ""
+        if epilogue is None
+        else (
+            f"\n            elementwise {epilogue}"
+            f"(%c: gmem<{m}x{n}xbf16>, %c: gmem<{m}x{n}xbf16>)"
+            ' attrs={label: "epi"}'
+        )
+    )
+    epilogue_label = None if epilogue is None else "epi"
 
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
-            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}{epilogue_op}
           }}
         }}"""))
     assert isinstance(module, ModuleOp)
@@ -321,4 +339,5 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tma_inner_size=output_tma_inner_size,
         output_store=output_store,
         operand_move_attrs=operand_move_attrs,
+        epilogue_label_filter=epilogue_label,
     )

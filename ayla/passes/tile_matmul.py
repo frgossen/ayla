@@ -4,6 +4,7 @@ from ..gpu_dialect import (
     BlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
+    ElementwiseOp,
     ForOp,
     IfOp,
     IndexConstantOp,
@@ -15,9 +16,8 @@ from ..gpu_dialect import (
     ThreadIdsOp,
     TileOp,
     WarpGroupIdOp,
-    is_elementwise,
 )
-from ..base.ir import Block, Op, Value, clone_type, find_ops
+from ..base.ir import Block, Op, Value, clone_op, clone_type, find_ops
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
 
@@ -166,7 +166,7 @@ class TileMatmul(LoweringPass):
             op, self.op_label_filter,
         )
 
-    def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
+    def _epilogue(self, ops: list[Op], hero: int) -> list[ElementwiseOp]:
         """The ops directly behind ``ops[hero]`` that its tiling should absorb.
 
         Contiguous only, and each has to earn its place: element-wise, opted
@@ -174,18 +174,30 @@ class TileMatmul(LoweringPass):
         Anything else ends the run -- an op left where it is must not be
         stepped over, or absorbing what follows would reorder the two.
         """
-        found: list[Op] = []
+        found: list[ElementwiseOp] = []
+        external_sources: set[Value] = set()
         dst = ops[hero].dst
         i = hero + 1
         while i < len(ops):
             op = ops[i]
-            if self.epilogue_label_filter is None or not is_elementwise(op):
+            if self.epilogue_label_filter is None or not isinstance(
+                op, ElementwiseOp,
+            ):
                 break
             if not label_matches(op, self.epilogue_label_filter):
                 break
-            # In place over the hero's destination is the only shape supported:
-            # one operand pattern, one set of dims, no broadcast to reason about.
-            if len(op.operands) != 2 or not all(v is dst for v in op.operands):
+            if op.dst is not dst or not any(
+                op.src(j) is dst for j in range(op.num_srcs)
+            ):
+                break
+            external_sources.update({
+                op.src(j) for j in range(op.num_srcs)
+                if op.src(j) is not dst
+            })
+            if len(external_sources) > 1 or any(
+                source.type.sizes != dst.type.sizes
+                for source in external_sources
+            ):
                 break
             found.append(op)
             i += 1
@@ -255,7 +267,7 @@ class TileMatmul(LoweringPass):
     def _tile(
         self,
         hero: MatmulOp,
-        epilogue: list[Op],
+        epilogue: list[ElementwiseOp],
         ubs: list[int],
     ) -> list[Op]:
         lhs, rhs, dst = hero.operands
@@ -324,8 +336,25 @@ class TileMatmul(LoweringPass):
         # where it has to be for an epilogue there to name it. Only that far:
         # M may be a `for` level too, and the tile reads its iv.
         hoist_dst = outside_of is not None
+        epilogue_tiles = list(dst_ops)
+        tiled_values = {hero.dst: dst}
+        for op in epilogue:
+            for source in (
+                op.src(j) for j in range(op.num_srcs)
+                if op.src(j) is not hero.dst
+            ):
+                if source in tiled_values:
+                    continue
+                ops, tiled_source = _build_tile_op(
+                    source, ["M", "N"],
+                    op_dims=self.op_dims,
+                    tile_idxs=ivs,
+                    tile_sizes=self.tile_sizes,
+                )
+                epilogue_tiles.extend(ops)
+                tiled_values[source] = tiled_source
         if not hoist_dst:
-            body_ops.extend(dst_ops)
+            body_ops.extend(epilogue_tiles)
         for iteration_binding in self.iteration_bindings:
             if iteration_binding is not None:
                 level, axis = iteration_binding
@@ -344,10 +373,7 @@ class TileMatmul(LoweringPass):
             ),
         )
 
-        tiled_epilogue = [
-            type(op)(operands=[dst, dst], results=[], attrs=op.attrs)
-            for op in epilogue
-        ]
+        tiled_epilogue = [clone_op(op, tiled_values) for op in epilogue]
         if outside_of is None:
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
@@ -373,7 +399,7 @@ class TileMatmul(LoweringPass):
             body_ops = [ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)]
             if i == outside_of:
                 if hoist_dst:
-                    body_ops[:0] = dst_ops
+                    body_ops[:0] = epilogue_tiles
                 body_ops.extend(tiled_epilogue)
                 tiled_epilogue = []
 

@@ -241,6 +241,26 @@ def test_lower_move_gmem_to_smem():
     assert template.count("ld.global.b16") == 64, "64 rows unrolled"
 
 
+def test_lower_move_gmem_to_wgmma_registers():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%src: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            move(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: gmem<64x256xbf16>)
+          }
+        }"""))  # noqa: E501
+
+    lowered = lower_to_ptx_template(module)
+    templates = [
+        op.attrs["template"]
+        for op in find_ops_of_type(lowered, PTXTemplateOp)
+    ]
+    load = templates[-1]
+    assert load.count("ld.global.b32") == 64
+    assert "setp.lt.u64 ${pred:load_row_ok_0}" in load
+    assert "@!${pred:load_ok_0} mov.b32 ${b32:operand.dst.r0}, 0;" in load
+
+
 def test_lower_elementwise_sigmoid_mma():
     """Lower every register of a valid mma.sync m16n8 accumulator.
 
@@ -336,6 +356,23 @@ def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
     assert "operand.dst.r47" not in template
 
 
+def test_lower_elementwise_convert_bf16_to_f32():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %src: wrmem<16x8xbf16 layout="mma"> = alloc() attrs={id: 0}
+            %dst: wrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 1}
+            elementwise convert(%dst: wrmem<16x8xf32 layout="mma">, %src: wrmem<16x8xbf16 layout="mma">)
+          }
+        }"""))  # noqa: E501
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("mov.b32") == 2
+    assert template.count("cvt.f32.bf16") == 4
+
+
 def test_lower_elementwise_uses_root_registers_for_wrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -385,6 +422,27 @@ def test_lower_elementwise_mul():
         f"${{f32:operand.lhs.r{reg}}}, ${{f32:operand.rhs.r{reg}}};\n"
         for reg in range(4)
     )
+
+
+def test_lower_elementwise_mul_with_bf16_output():
+    w = 'wrmem<16x8xf32 layout="mma">'
+    b = 'wrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %lhs: {w} = alloc() attrs={{id: 0}}
+            %rhs: {w} = alloc() attrs={{id: 1}}
+            %dst: {b} = alloc() attrs={{id: 2}}
+            elementwise mul(%dst: {b}, %lhs: {w}, %rhs: {w})
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp)
+    )[-1].attrs["template"]
+    assert template.count("mul.f32 ${f32:mul_result") == 4
+    assert template.count("cvt.rn.bf16x2.f32") == 2
 
 
 def test_lower_elementwise_silu():

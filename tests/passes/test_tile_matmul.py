@@ -150,6 +150,30 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
         }""")  # noqa: E501
 
 
+def test_tiles_a_same_shape_external_epilogue_source():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %attention: gmem<128x128xf32>, %c: gmem<128x128xf32>) block_dim=[128, 1, 1] {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid attrs={label: "mm"}
+            elementwise sigmoid(%c: gmem<128x128xf32>, %c: gmem<128x128xf32>) attrs={label: "epilogue"}
+            elementwise mul(%c: gmem<128x128xf32>, %c: gmem<128x128xf32>, %attention: gmem<128x128xf32>) attrs={label: "epilogue"}
+          }
+        }"""))  # noqa: E501
+
+    tile_matmul(
+        module, ["M", "K"], [32, 16],
+        [(CollectiveLevel.BLOCK, CollectiveAxis.X), None], [None, "k"],
+        op_label_filter="mm", epilogue_label_filter="epilogue",
+    )
+
+    text = repr(module)
+    attention_tile = "%1: gmem<32x128xf32> = tile(%attention"
+    assert attention_tile in text
+    assert text.index(attention_tile) < text.index('for (%k: index')
+    assert "elementwise mul(%0: gmem<32x128xf32>, " in text
+    assert "%1: gmem<32x128xf32>)" in text
+
+
 def test_block_x_tiling_guards_more_blocks_than_tiles():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
