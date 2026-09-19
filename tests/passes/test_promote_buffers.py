@@ -4,6 +4,7 @@ import textwrap
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import AllocOp, gpu_dialect
 from ayla.passes.promote_buffers import promote_buffers
+from ayla.passes.stage_register_writeback import stage_register_writeback
 
 
 def test_wrmem_tma_writeback_stages_block_tile_in_smem():
@@ -19,6 +20,7 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
         module, target_type="wrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
     )
+    stage_register_writeback(module, label_filter="mm_dst_wrmem")
     text = repr(module)
     assert "smem<128x256xbf16> = alloc()" in text
     # SMEM is tiled by warp-group id, so the gather move matches the fragment
@@ -39,8 +41,11 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
         }"""))
     module = promote_buffers(
         module, target_type="wrmem", target_dtype="f32", operands=["dst"],
-        layout="wgmma_layout_0", warps=4, tma=True,
-        writeback_slices=2, writeback_buffers=2, label_filter="mm",
+        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+    )
+    stage_register_writeback(
+        module, writeback_slices=2, writeback_buffers=2,
+        label_filter="mm_dst_wrmem",
     )
     assert repr(module) == textwrap.dedent("""\
         module {
@@ -85,9 +90,11 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
         }"""))
     promote_buffers(
         module, target_type="wrmem", target_dtype="f32", operands=["dst"],
-        layout="wgmma_layout_0", warps=4, tma=True,
-        writeback_slices=2, writeback_buffers=2, unsafe_reuse_smem=True,
-        label_filter="mm",
+        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+    )
+    stage_register_writeback(
+        module, writeback_slices=2, writeback_buffers=2,
+        unsafe_reuse_smem=True, label_filter="mm_dst_wrmem",
     )
     assert {
         op.attrs.get("reuse_group")
@@ -109,6 +116,7 @@ def test_wrmem_tma_writeback_propagates_destination_move_attrs():
         move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
         label_filter="mm",
     )
+    stage_register_writeback(module, label_filter="mm_dst_wrmem")
     text = repr(module)
     assert text.count('l2_cache_hint: "evict_first"') == 1
     assert 'label: "mm_dst_tma"' in text

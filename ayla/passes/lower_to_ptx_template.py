@@ -1414,9 +1414,9 @@ class LowerToPtxTemplate(LoweringPass):
         The register layout and static element offsets are identical for both
         destinations; only the address width and PTX memory space differ. The
         destination is the writer warp group's own tile, so its shape matches
-        the fragment -- the block-wide SMEM staging tile is tiled by warp-group
-        id upstream (see promote_buffers._build_tma_writeback), so the row offset
-        is already folded into the destination pointer.
+        the fragment -- ``StageRegisterWriteback`` tiles the block-wide SMEM
+        staging buffer by warp-group id, so the row offset is already folded
+        into the destination pointer.
         """
         dst_value = self.value_map[op.dst]
         src_value = self.value_map[op.src]
