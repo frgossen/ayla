@@ -30,3 +30,8 @@ from .dynamic_m import (  # noqa: E402,F401
     dynamic_m_matmul_template,
     make_dynamic_m_matmul,
 )
+from .muse_swiglu_projection import (  # noqa: E402,F401
+    make_dynamic_m_muse_swiglu_projection,
+    muse_swiglu_projection_module,
+    muse_swiglu_projection_template,
+)
