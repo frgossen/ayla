@@ -49,6 +49,7 @@ class BenchConfig:
     compute: Callable[..., torch.Tensor]
     make_inputs: Callable[[], list[torch.Tensor]] | None = None
     verify: Callable[..., None] | None = None
+    compare_outputs: Callable[[object, object], None] | None = None
 
 
 @dataclass(frozen=True)
