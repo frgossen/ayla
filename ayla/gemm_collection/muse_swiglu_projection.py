@@ -97,8 +97,14 @@ def build_muse_swiglu_projection(
         [_M_TILE, _N_TILE], F32Type(), warps=4,
         layout="wgmma_layout_0",
     )
+    epilogue_type = WrmemTensorType.build(
+        [_M_TILE, _N_TILE], output.type.dtype, warps=4,
+        layout="wgmma_layout_0",
+    )
     gate = AllocOp.build_with_fresh_id(accumulator_type, init=0.0)
     up = AllocOp.build_with_fresh_id(accumulator_type, init=0.0)
+    gate_activation = AllocOp.build_with_fresh_id(epilogue_type)
+    product = AllocOp.build_with_fresh_id(epilogue_type)
     collective = {
         CollectiveAxis.X: CollectiveLevel.WG,
         CollectiveAxis.Y: CollectiveLevel.GRID,
@@ -112,16 +118,25 @@ def build_muse_swiglu_projection(
         lhs_tile.result(), up_tile.result(), up.result(),
         collective=collective, attrs={"label": "up"},
     )
-    gate_activation = ElementwiseOp.build(
-        gate.result(), [gate.result()], "silu",
+    round_gate = ElementwiseOp.build(
+        gate_activation.result(), [gate.result()], "convert",
+    )
+    widen_gate = ElementwiseOp.build(
+        gate.result(), [gate_activation.result()], "convert",
+    )
+    silu = ElementwiseOp.build(
+        gate_activation.result(), [gate.result()], "silu",
         attrs={"label": "gate_epi"},
     )
-    product = ElementwiseOp.build(
-        up.result(), [up.result(), gate.result()], "mul",
+    round_up = ElementwiseOp.build(
+        product.result(), [up.result()], "convert",
+    )
+    multiply = ElementwiseOp.build(
+        product.result(), [product.result(), gate_activation.result()], "mul",
         attrs={"label": "up_epi"},
     )
     writeback = MoveOp.build(
-        output_tile.result(), up.result(),
+        output_tile.result(), product.result(),
         collective=collective,
         attrs={
             "label": "up_dst_wrmem",
@@ -139,11 +154,16 @@ def build_muse_swiglu_projection(
         output_tile,
         gate,
         up,
+        gate_activation,
+        product,
         gate_matmul,
         BarrierOp.build("thread"),
         up_matmul,
-        gate_activation,
-        product,
+        round_gate,
+        widen_gate,
+        silu,
+        round_up,
+        multiply,
         writeback,
     ], writeback
 

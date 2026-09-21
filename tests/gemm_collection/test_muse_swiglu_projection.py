@@ -47,7 +47,7 @@ def test_projection_uses_explicit_paired_register_schedule(m: int):
         "gate", "up",
     }
     assert [op.fn for op in find_ops_of_type(module, ElementwiseOp)] == [
-        "silu", "mul", "convert",
+        "convert", "convert", "silu", "convert", "mul",
     ]
     assert all(
         op.scope == "thread" for op in find_ops_of_type(module, BarrierOp)
@@ -71,8 +71,8 @@ def test_projection_uses_explicit_paired_register_schedule(m: int):
     kernel = make_ptx_kernel(module)
     assert kernel.ptx.count(".shared .align 128 .b8") == 1
     assert "[98304]" in kernel.ptx
-    assert "ex2.approx.f32" in kernel.ptx
-    assert "mul.f32" in kernel.ptx
+    assert "ex2.approx.ftz.f32" in kernel.ptx
+    assert "mul.rn.bf16x2" in kernel.ptx
 
 
 def test_projection_rejects_nonpositive_m():

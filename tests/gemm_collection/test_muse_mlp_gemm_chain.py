@@ -28,7 +28,7 @@ def test_chain_reuses_the_standalone_projection(m: int):
         "gate", "up", "down",
     }
     assert [op.fn for op in find_ops_of_type(module, ElementwiseOp)] == [
-        "silu", "mul", "convert", "convert",
+        "convert", "convert", "silu", "convert", "mul", "convert",
     ]
     assert [
         op.scope for op in find_ops_of_type(module, BarrierOp)
@@ -38,8 +38,8 @@ def test_chain_reuses_the_standalone_projection(m: int):
     kernel = make_ptx_kernel(module)
     assert kernel.block_dim == (128, 1, 1)
     assert kernel.ptx.count(".shared .align 128 .b8") == 1
-    assert "ex2.approx.f32" in kernel.ptx
-    assert "mul.f32" in kernel.ptx
+    assert "ex2.approx.ftz.f32" in kernel.ptx
+    assert "mul.rn.bf16x2" in kernel.ptx
 
 
 def test_chain_rejects_unrouted_m():
