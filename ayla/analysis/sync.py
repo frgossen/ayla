@@ -92,8 +92,17 @@ class BarrierScope(enum.IntEnum):
 
 def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
     """The barrier scope needed to order a r/w hazard from ``prior`` to ``current``."""
-    if prior == current == CollectiveScope.BLOCK_LEADER:
+    if prior == current and prior in (
+        CollectiveScope.BLOCK_LEADER,
+        CollectiveScope.CLUSTER_LEADER,
+    ):
         return BarrierScope.THREAD
+    if CollectiveScope.CLUSTER_LEADER in (prior, current):
+        return (
+            BarrierScope.GRID
+            if CollectiveScope.GRID in (prior, current)
+            else BarrierScope.CLUSTER
+        )
     if current == CollectiveScope.BLOCK_LEADER:
         return BarrierScope.BLOCK_TO_LEADER
     if prior == CollectiveScope.BLOCK_LEADER:
@@ -132,7 +141,11 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
         # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
     if barrier == BarrierScope.BLOCK:
-        return scope not in (CollectiveScope.CLUSTER, CollectiveScope.GRID)
+        return scope not in (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER,
+            CollectiveScope.GRID,
+        )
     if barrier == BarrierScope.CLUSTER:
         return scope != CollectiveScope.GRID
     if barrier == BarrierScope.GRID:
@@ -224,23 +237,28 @@ BarrierTargetsType = dict["Op", "BarrierTarget"]
 _MAX_BARRIER_IDS = 16
 
 
-def _async_collective_scope(lock: Value) -> CollectiveScope:
-    """The collective scope an async op on ``lock`` synchronizes when awaited."""
-    kind = lock.type.kind
+def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
+    """Largest memory-effect scope completed by awaiting ``op``."""
+    kind = op.lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
     if kind == "mbar":
-        # A TMA-load mbar await is a leader completion: t0 issues the copy, all
-        # threads wait the mbarrier for it. So it closes BLOCK_LEADER (the leader
-        # write) but not a full-block all-thread effect.
-        return CollectiveScope.BLOCK_LEADER
+        # A TMA-load mbar await completes the issuing leader's write. Multicast
+        # uses one leader for the cluster; ordinary TMA uses one per block.
+        return (
+            CollectiveScope.CLUSTER_LEADER
+            if op.is_tma_multicast
+            else CollectiveScope.BLOCK_LEADER
+        )
     if kind == "bulk":
         # Bulk async-groups are per issuing thread, not warp-group-wide. TMA
         # stores are issued and committed by t0, so t0's wait completes the
         # leader-owned read of shared memory. This is the completed memory
         # effect's collective scope, not the execution width of wait_group.
         return CollectiveScope.BLOCK_LEADER
-    raise NotImplementedError(f"_async_collective_scope: unmodeled lock kind {kind!r}")
+    raise NotImplementedError(
+        f"_async_completion_scope: unmodeled lock kind {kind!r}"
+    )
 
 
 def _transfer_memory_effects(
@@ -333,7 +351,7 @@ def _transfer_memory_effects(
     # orders -- and every synchronous op's effect -- is live immediately, left for
     # a later barrier to order.
     async_scope = (
-        _async_collective_scope(async_lock) if async_lock is not None else None
+        _async_completion_scope(op) if isinstance(op, AsyncOp) else None
     )
     for memory_effect in effects:
         pending = (

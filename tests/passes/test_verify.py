@@ -287,6 +287,55 @@ def test_cluster_operations_require_a_clustered_kernel(op):
         verify_gpu_dialect(module)
 
 
+def test_tma_multicast_accepts_clustered_load():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @valid(%src: gmem<16x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %dst: smem<16x16xf32> = alloc() attrs={id: 0}
+            move(%dst: smem<16x16xf32>, %src: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
+          }
+        }"""))
+
+    assert verify_gpu_dialect(module) is module
+
+
+@pytest.mark.parametrize(
+    "kernel_attrs,move_attrs,error",
+    [
+        ('grid_dim=[1, 1, 1]', 'multicast: True, tma: True', "clustered kernel"),
+        ('grid_dim=[1, 1, 1] cluster_dim=[1, 1, 1]', 'multicast: True, tma: True', "at least two CTAs"),
+        ('grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1]', 'multicast: 1, tma: True', "must be a bool"),
+        ('grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1]', 'multicast: True', "requires a TMA move"),
+    ],
+)
+def test_tma_multicast_rejects_invalid_context(kernel_attrs, move_attrs, error):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid(%src: gmem<16x16xf32>) {kernel_attrs} {{
+            %dst: smem<16x16xf32> = alloc() attrs={{id: 0}}
+            move(%dst: smem<16x16xf32>, %src: gmem<16x16xf32>) collective=xyz.cluster attrs={{{move_attrs}}}
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match=error):
+        verify_gpu_dialect(module)
+
+
+def test_tma_multicast_async_collective_must_match_inner():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %dst: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) tma_move(%dst: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="async collective must match"):
+        verify_gpu_dialect(module)
+
+
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
         verify_gpu_dialect(

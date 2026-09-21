@@ -764,11 +764,16 @@ class MoveOp(Op):
         indices: list[Value] | None = None,
         *,
         collective: dict[CollectiveAxis, CollectiveLevel],
+        multicast: bool = False,
         attrs: dict[str, object] | None = None,
     ) -> "MoveOp":
         operands = [dst, src] + (indices or [])
         attrs = dict(attrs or {})
+        if "multicast" in attrs:
+            raise ValueError("pass multicast as an explicit argument")
         attrs["collective"] = dict(collective)
+        if multicast is not False:
+            attrs["multicast"] = multicast
         return cls(
             operands=operands, results=[], attrs=attrs,
         )
@@ -788,6 +793,17 @@ class MoveOp(Op):
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def multicast(self) -> bool:
+        return self.attrs.get("multicast", False)  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("collective", "multicast")
+        }
 
     def print(self, p: Printer) -> None:
         p.write("move(")
@@ -814,9 +830,12 @@ class MoveOp(Op):
         p.read_literal(")")
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
+        multicast = attrs.pop("multicast", False)
         return cls.build(
             operands[0], operands[1], operands[2:],
-            collective=collective, attrs=attrs,
+            collective=collective,
+            multicast=multicast,  # type: ignore[arg-type]
+            attrs=attrs,
         )
 
 
@@ -841,12 +860,17 @@ class TmaMoveOp(Op):
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         l2_cache_hint: str | None = None,
+        multicast: bool = False,
     ) -> "TmaMoveOp":
         operands = [dst, src] + indices
         attrs = dict(attrs or {})
+        if "multicast" in attrs:
+            raise ValueError("pass multicast as an explicit argument")
         attrs["collective"] = dict(collective)
         if l2_cache_hint is not None:
             attrs["l2_cache_hint"] = l2_cache_hint
+        if multicast is not False:
+            attrs["multicast"] = multicast
         return cls(operands=operands, results=[], attrs=attrs)
 
     @property
@@ -867,6 +891,10 @@ class TmaMoveOp(Op):
         if hint not in (None, "evict_first", "evict_last"):
             raise ValueError(f"unsupported TMA L2 cache hint {hint!r}")
         return hint  # type: ignore[return-value]
+
+    @property
+    def multicast(self) -> bool:
+        return self.attrs.get("multicast", False)  # type: ignore[return-value]
 
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
@@ -898,10 +926,12 @@ class TmaMoveOp(Op):
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
         l2_cache_hint = attrs.pop("l2_cache_hint", None)
+        multicast = attrs.pop("multicast", False)
         return cls.build(
             operands[0], operands[1], indices=operands[2:],
             collective=collective, attrs=attrs,
             l2_cache_hint=l2_cache_hint,  # type: ignore[arg-type]
+            multicast=multicast,  # type: ignore[arg-type]
         )
 
 
@@ -1102,6 +1132,13 @@ class AsyncOp(Op):
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def is_tma_multicast(self) -> bool:
+        return any(
+            isinstance(op, (MoveOp, TmaMoveOp)) and op.multicast is True
+            for op in self.body.ops
+        )
 
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id}(")
@@ -2228,37 +2265,54 @@ def root_buffer(value: Value) -> Value | None:
 class CollectiveScope(enum.IntEnum):
     r"""The granularity at which an effect is completely independent of concurrent
     operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
-    scope but performed exclusively by thread 0, e.g. a TMA::
+    scope but performed exclusively by thread 0, e.g. a TMA.
+    ``CLUSTER_LEADER`` is the corresponding single issuer for a cluster. A
+    cluster leader is also its CTA's block leader, while ``BLOCK`` (all threads
+    in one CTA) and ``CLUSTER_LEADER`` (one thread for the cluster) are
+    incomparable::
 
              GRID
               |
            CLUSTER
-              |
-            BLOCK
-            /   \
-    WARPGROUP   BLOCK_LEADER
-           |     |
-         WARP    |
-            \   /
-            THREAD
+           /       \
+        BLOCK   CLUSTER_LEADER
+        /   \       |
+ WARPGROUP   BLOCK_LEADER
+        |       |
+      WARP      |
+         \     /
+          THREAD
     """
     THREAD = 0
     WARP = 1
     WARPGROUP = 2
     BLOCK_LEADER = 3
     BLOCK = 4
-    CLUSTER = 5
-    GRID = 6
+    CLUSTER_LEADER = 5
+    CLUSTER = 6
+    GRID = 7
 
     def join(self, other: CollectiveScope) -> CollectiveScope:
         """The join (least upper bound) on the CollectiveScope lattice."""
         if self == CollectiveScope.GRID:
             return self
+        if other == CollectiveScope.GRID:
+            return other
         if self == CollectiveScope.THREAD:
             return other
         if self == CollectiveScope.CLUSTER:
             return other if other == CollectiveScope.GRID else self
+        if self == CollectiveScope.CLUSTER_LEADER:
+            if other in {
+                CollectiveScope.THREAD,
+                CollectiveScope.BLOCK_LEADER,
+                CollectiveScope.CLUSTER_LEADER,
+            }:
+                return self
+            return CollectiveScope.CLUSTER
         if self == CollectiveScope.BLOCK:
+            if other == CollectiveScope.CLUSTER_LEADER:
+                return CollectiveScope.CLUSTER
             return other if other in {
                 CollectiveScope.CLUSTER, CollectiveScope.GRID,
             } else self
@@ -2267,6 +2321,7 @@ class CollectiveScope(enum.IntEnum):
                 return self
             if other in {
                 CollectiveScope.BLOCK,
+                CollectiveScope.CLUSTER_LEADER,
                 CollectiveScope.CLUSTER,
                 CollectiveScope.GRID,
             }:
@@ -2281,12 +2336,16 @@ class CollectiveScope(enum.IntEnum):
                 return other
             if other == CollectiveScope.BLOCK_LEADER:
                 return CollectiveScope.BLOCK
+            if other == CollectiveScope.CLUSTER_LEADER:
+                return CollectiveScope.CLUSTER
             return self  # other is THREAD, WARP, or WARPGROUP
         if self == CollectiveScope.WARP:
             if other in {CollectiveScope.WARP, CollectiveScope.THREAD}:
                 return self
             if other == CollectiveScope.BLOCK_LEADER:
                 return CollectiveScope.BLOCK
+            if other == CollectiveScope.CLUSTER_LEADER:
+                return CollectiveScope.CLUSTER
             return other  # other is WARPGROUP, BLOCK, or GRID
         raise NotImplementedError(
             f"CollectiveScope.join: unhandled pair {self!r}, {other!r}"
@@ -2363,18 +2422,19 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
     if is_side_effect_free(op):
         return []
     if isinstance(op, MoveOp):
-        # A TMA move is issued by the leader thread (t0), so its smem write is
-        # BLOCK_LEADER; a cooperative move writes at the buffer's own scope.
+        # A TMA move is issued by t0 of its block, or by t0 of cluster rank 0
+        # for multicast. A cooperative move writes at the buffer's own scope.
         src_scope = (
             CollectiveScope.THREAD
             if isinstance(op.src.type, WrmemTensorType)
             else _type_collective_scope(op.src.type)
         )
-        dst_scope = (
-            CollectiveScope.BLOCK_LEADER
-            if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
-            else _type_collective_scope(op.dst.type)
-        )
+        if op.multicast is True:
+            dst_scope = CollectiveScope.CLUSTER_LEADER
+        elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):
+            dst_scope = CollectiveScope.BLOCK_LEADER
+        else:
+            dst_scope = _type_collective_scope(op.dst.type)
         return (
             _memory_effect(
                 "W", op.dst, dst_scope,
@@ -2386,10 +2446,13 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             )
         )
     if isinstance(op, TmaMoveOp):
-        # The block leader issues the transfer, while global memory is shared
-        # across the grid. The descriptor is metadata, not memory.
+        # A block leader issues ordinary TMA, while the cluster leader issues
+        # multicast. Global memory is shared across the grid. The descriptor is
+        # metadata, so resolve it to the underlying kernel argument.
         dst_scope = (
-            CollectiveScope.BLOCK_LEADER
+            CollectiveScope.CLUSTER_LEADER
+            if op.multicast is True
+            else CollectiveScope.BLOCK_LEADER
             if isinstance(op.dst.type, SmemTensorType)
             else CollectiveScope.GRID
         )

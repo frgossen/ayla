@@ -92,6 +92,51 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
     assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
 
 
+@pytest.mark.parametrize(
+    ("prior", "current", "expected"),
+    [
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.THREAD,
+        ),
+        (
+            CollectiveScope.THREAD,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.THREAD,
+            BarrierScope.CLUSTER,
+        ),
+        (
+            CollectiveScope.BLOCK_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.BLOCK_LEADER,
+            BarrierScope.CLUSTER,
+        ),
+    ],
+)
+def test_cluster_leader_hazards_choose_a_sufficient_barrier(
+    prior, current, expected,
+):
+    assert _barrier_scope(prior, current) == expected
+
+
+def test_block_barrier_does_not_cover_a_cluster_leader_effect():
+    assert not _barrier_covers(
+        BarrierScope.BLOCK, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert _barrier_covers(
+        BarrierScope.CLUSTER, CollectiveScope.CLUSTER_LEADER,
+    )
+
+
 def test_preexisting_barrier_updates_dataflow_state():
     source = """\
         module {

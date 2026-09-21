@@ -48,6 +48,22 @@ def test_tma_to_async_move_await():
     assert text == expected
 
 
+def test_tma_multicast_gets_cluster_collective_async():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<16x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            move(%smem: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
+          }
+        }"""))
+
+    lower_to_async(module)
+
+    text = repr(module)
+    assert "async(%0: lock<mbar>) collective=xyz.cluster" in text
+    assert "lock<mbar attrs=" not in text
+
+
 def test_sync_matmul_stays_as_matmul():
     """Non-wgmma matmul stays as MatmulOp."""
     module_str = textwrap.dedent("""\

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+import math
 
 from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
@@ -68,6 +69,28 @@ def _verify_collective_attr(op: Op) -> None:
         raise ValueError(
             f"{op.op_id} collective attribute must list x, y, and z"
         )
+
+
+def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
+    multicast = op.multicast
+    if type(multicast) is not bool:
+        raise ValueError("multicast must be a bool")
+    if not multicast:
+        return
+    if isinstance(op, MoveOp) and not op.attrs.get("tma"):
+        raise ValueError("multicast requires a TMA move")
+    if not isinstance(op.dst.type, SmemTensorType):
+        raise ValueError("TMA multicast is only supported for loads into smem")
+    if min(op.collective.values()) < CollectiveLevel.CLUSTER:
+        raise ValueError("TMA multicast must be cluster-collective")
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None or not any(dim is not None for dim in kernel.cluster_dim):
+        raise ValueError("TMA multicast requires an enclosing clustered kernel")
+    cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+    if cluster_size < 2:
+        raise ValueError("TMA multicast requires at least two CTAs per cluster")
+    if cluster_size > 16:
+        raise ValueError("TMA multicast supports at most 16 CTAs per cluster")
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -193,10 +216,18 @@ class VerifyGpuDialect(VerificationPass):
                     f"contained operation; got {op.collective} and "
                     f"{collective}"
                 )
+        if (
+            op.is_tma_multicast
+            and min(op.collective.values()) < CollectiveLevel.CLUSTER
+        ):
+            raise ValueError(
+                "TMA multicast async must be cluster-collective"
+            )
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
+        _verify_tma_multicast(op)
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
@@ -226,6 +257,7 @@ class VerifyGpuDialect(VerificationPass):
                 f"{descriptor_type.gmem_type.rank}"
             )
         _verify_collective_attr(op)
+        _verify_tma_multicast(op)
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:

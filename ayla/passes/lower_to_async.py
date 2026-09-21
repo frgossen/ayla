@@ -81,7 +81,8 @@ class LowerToAsync(LoweringPass):
             dst=dst,
             src=src,
             collective=op.collective,
-            attrs=op.attrs,
+            multicast=op.multicast,
+            attrs=op.extra_attrs,
         )
         return self._wrap(move, _tma_lock_kind(dst), op.attrs)
 
@@ -92,12 +93,15 @@ class LowerToAsync(LoweringPass):
         dst = self.value_map[op.dst]
         src = self.value_map[op.src]
         indices = [self.value_map[v] for v in op.indices]
+        attrs = dict(op.attrs)
+        attrs.pop("multicast", None)
         tma = TmaMoveOp.build(
             dst=dst,
             src=src,
             indices=indices,
             collective=op.collective,
-            attrs=op.attrs,
+            multicast=op.multicast,
+            attrs=attrs,
         )
         return self._wrap(tma, _tma_lock_kind(dst), op.attrs)
 
