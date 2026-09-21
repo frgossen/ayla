@@ -4,12 +4,23 @@ import pytest
 
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
+    AsyncOp,
+    CollectiveAxis,
+    CollectiveLevel,
     ElementwiseOp,
     F32Type,
+    ForOp,
     GmemTensorType,
+    IndexType,
+    LockType,
     ModuleOp,
+    MoveOp,
     ReshapeOp,
     RmemTensorType,
+    SmemTensorType,
+    TileOp,
+    TmaDescType,
+    TmaMoveOp,
     gpu_dialect,
 )
 from ayla.passes.verify_gpu_dialect import (
@@ -34,6 +45,125 @@ def test_default_verification_allows_dynamic_shapes():
     module = _dynamic_matmul_module()
 
     assert verify_gpu_dialect(module) is module
+
+
+@pytest.mark.parametrize("step", [0, -1])
+def test_default_verification_rejects_nonpositive_loop_step(step):
+    module = ModuleOp.build(Block(ops=[ForOp.build(0, 4, step)]))
+
+    with pytest.raises(ValueError, match="positive integer"):
+        verify_gpu_dialect(module)
+
+
+def test_default_verification_checks_tma_move_structure():
+    gmem_type = GmemTensorType.build([64, 64], F32Type())
+    descriptor = Value(
+        name="descriptor",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(
+        name="smem", type=SmemTensorType.build([64, 64], F32Type()),
+    )
+    gmem = Value(name="gmem", type=gmem_type)
+    indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
+    collective = {
+        axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+    }
+
+    valid = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, descriptor, indices=indices, collective=collective,
+    )]))
+    assert verify_gpu_dialect(valid) is valid
+
+    wrong_index_count = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, descriptor, indices=indices[:1], collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one index per TMA dimension"):
+        verify_gpu_dialect(wrong_index_count)
+
+    wrong_memory_space = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        gmem, descriptor, indices=indices, collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one TMA descriptor and one smem"):
+        verify_gpu_dialect(wrong_memory_space)
+
+    missing_descriptor = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, gmem, indices=indices, collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one TMA descriptor and one smem"):
+        verify_gpu_dialect(missing_descriptor)
+
+
+def test_default_verification_checks_tile_result_type():
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([4, 4], F32Type()),
+    )
+    wrong_memory_space = TileOp.build(
+        source,
+        [0, 0],
+        SmemTensorType.build([4, 4], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[wrong_memory_space]))
+
+    with pytest.raises(ValueError, match="preserve.*memory space"):
+        verify_gpu_dialect(module)
+
+    tile = TileOp.build(
+        source,
+        [0, 0],
+        GmemTensorType.build([2, 2], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[tile]))
+
+    with pytest.raises(ValueError, match="result strides.*must match"):
+        verify_gpu_dialect(module)
+
+
+@pytest.mark.parametrize(
+    "indices,result_sizes",
+    [
+        ([0], [4, 4]),
+        ([0], [4]),
+    ],
+)
+def test_default_verification_checks_tile_rank(indices, result_sizes):
+    source = Value(
+        name="source",
+        type=GmemTensorType.build([4, 4], F32Type()),
+    )
+    tile = TileOp.build(
+        source,
+        indices,
+        GmemTensorType.build(result_sizes, F32Type()),
+    )
+
+    with pytest.raises(ValueError, match="rank.*number of indices must match"):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[tile])))
+
+
+def test_async_and_body_collectives_must_match():
+    typ = GmemTensorType.build([1], F32Type())
+    block_collective = {
+        axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+    }
+    thread_collective = {
+        axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+    }
+    move = MoveOp.build(
+        Value(name="dst", type=typ),
+        Value(name="src", type=typ),
+        collective=block_collective,
+    )
+    async_op = AsyncOp.build(
+        Value(name="lock", type=LockType.build("bulk")),
+        collective=thread_collective,
+        body=Block(ops=[move]),
+    )
+    module = ModuleOp.build(Block(ops=[async_op]))
+
+    with pytest.raises(ValueError, match="async collective must match"):
+        verify_gpu_dialect(module)
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():

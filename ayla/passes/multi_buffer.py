@@ -27,24 +27,9 @@ from ..gpu_dialect import (
     ModuleOp,
     SelectOp,
 )
-from ..base.ir import Op, clone_op
+from ..base.ir import Op, clone_op, find_ancestor_of_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
-
-
-def _enclosing_loop(op: Op) -> ForOp | None:
-    """The innermost ``for`` whose body holds ``op``, if there is one.
-
-    The loop that indexes an allocation's buffers is the one it sits inside,
-    which the parent links reach directly from the allocation itself.
-    """
-    block = op.parent_block
-    while block is not None:
-        parent = block.parent_op
-        if isinstance(parent, ForOp):
-            return parent
-        block = None if parent is None else parent.parent_block
-    return None
 
 
 class MultiBuffer(LoweringPass):
@@ -57,7 +42,7 @@ class MultiBuffer(LoweringPass):
     def lower_alloc(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]] | None:
-        loop = _enclosing_loop(op)
+        loop = find_ancestor_of_type(op, ForOp)
         if self.depth <= 1 or loop is None:
             return None
         if not label_matches(op, self.label_filter):

@@ -10,6 +10,11 @@ from ayla.base.ir import (
     Value,
     clone_op,
     clone_type,
+    find_ancestor,
+    find_ancestor_of_type,
+    find_ancestors,
+    find_ancestors_of_type,
+    iter_ancestors,
 )
 
 
@@ -137,6 +142,26 @@ def test_nested_ops():
         }"""
     )
     assert_print_and_roundtrip(op, expected)
+
+
+def test_find_ancestors():
+    class ContainerOp(Op):
+        pass
+
+    leaf = Op(operands=[], results=[])
+    inner = ContainerOp(operands=[], results=[], blocks=[Block(ops=[leaf])])
+    outer = ContainerOp(operands=[], results=[], blocks=[Block(ops=[inner])])
+
+    def is_container(op: Op) -> bool:
+        return isinstance(op, ContainerOp)
+
+    assert list(iter_ancestors(leaf)) == [inner, outer]
+    assert find_ancestors(leaf, is_container) == [inner, outer]
+    assert find_ancestor(leaf, is_container) is inner
+    assert find_ancestors_of_type(leaf, ContainerOp) == [inner, outer]
+    assert find_ancestor_of_type(leaf, ContainerOp) is inner
+    assert find_ancestor_of_type(inner, ContainerOp) is outer
+    assert find_ancestor_of_type(outer, ContainerOp) is None
 
 
 # ---------------------------------------------------------------------------

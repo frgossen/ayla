@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from enum import Enum, auto
 
-from ..base.ir import Op, Type
+from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
@@ -13,6 +13,7 @@ from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
+    ForOp,
     GmemTensorType,
     KernelOp,
     MatmulOp,
@@ -20,8 +21,11 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     ReshapeOp,
+    SmemTensorType,
+    TileOp,
     TmaDescType,
     TmaMoveOp,
+    WrmemTensorType,
 )
 
 
@@ -45,16 +49,6 @@ def _verify_static_shape(typ: Type) -> None:
         raise ValueError(f"unresolved dynamic shape {typ}")
     if isinstance(typ, TmaDescType):
         _verify_static_shape(typ.gmem_type)
-
-
-def _ancestor_kernel(op: Op) -> KernelOp | None:
-    block = op.parent_block
-    while block is not None:
-        parent = block.parent_op
-        if isinstance(parent, KernelOp):
-            return parent
-        block = None if parent is None else parent.parent_block
-    return None
 
 
 def _verify_collective_attr(op: Op) -> None:
@@ -107,9 +101,49 @@ class VerifyGpuDialect(VerificationPass):
         ):
             raise ValueError("cluster_dim must divide grid_dim")
 
+    @verifies(ForOp)
+    def _verify_for(self, op: ForOp) -> None:
+        if type(op.step) is not int or op.step <= 0:
+            raise ValueError(
+                f"for step must be a positive integer, got {op.step!r}"
+            )
+
+    @verifies(TileOp)
+    def _verify_tile(self, op: TileOp) -> None:
+        if len(op.results) != 1:
+            raise ValueError(
+                f"tile must produce exactly one result, got {len(op.results)}"
+            )
+        arg_type = op.arg.type
+        result_type = op.result().type
+        if type(arg_type) is not type(result_type):
+            raise ValueError("tile must preserve its operand's memory space")
+        if not isinstance(arg_type, (AddrMemTensorType, WrmemTensorType)):
+            raise ValueError(
+                "tile operand and result must be address-backed memory "
+                "tensors or wrmem"
+            )
+        if not (
+            arg_type.rank == result_type.rank == len(op.indices)
+        ):
+            raise ValueError(
+                "tile operand rank, result rank, and number of indices must "
+                f"match; got {arg_type.rank}, {result_type.rank}, and "
+                f"{len(op.indices)}"
+            )
+        if (
+            isinstance(arg_type, AddrMemTensorType)
+            and isinstance(result_type, AddrMemTensorType)
+            and arg_type.strides != result_type.strides
+        ):
+            raise ValueError(
+                f"tile result strides {result_type.strides} must match "
+                f"operand strides {arg_type.strides}"
+            )
+
     @verifies(ClusterBlockIdsOp)
     def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:
-        kernel = _ancestor_kernel(op)
+        kernel = find_ancestor_of_type(op, KernelOp)
         if kernel is None or not any(
             dim is not None for dim in kernel.cluster_dim
         ):
@@ -135,7 +169,7 @@ class VerifyGpuDialect(VerificationPass):
                     "BarrierOp: grid sync must contain at least 8 bytes"
                 )
         elif op.scope == "cluster":
-            kernel = _ancestor_kernel(op)
+            kernel = find_ancestor_of_type(op, KernelOp)
             if kernel is None or not any(
                 dim is not None for dim in kernel.cluster_dim
             ):
@@ -146,6 +180,14 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
         _verify_collective_attr(op)
+        for inner in op.body.ops:
+            collective = inner.attrs.get("collective")
+            if collective is not None and collective != op.collective:
+                raise ValueError(
+                    "async collective must match the collective of every "
+                    f"contained operation; got {op.collective} and "
+                    f"{collective}"
+                )
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
@@ -153,6 +195,31 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
+        if len(op.operands) < 2:
+            raise ValueError(
+                "tma_move expects dst, src, and one index per dimension; "
+                f"got {len(op.operands)} operands"
+            )
+        dst_is_tma = isinstance(op.dst.type, TmaDescType)
+        src_is_tma = isinstance(op.src.type, TmaDescType)
+        dst_is_smem = isinstance(op.dst.type, SmemTensorType)
+        src_is_smem = isinstance(op.src.type, SmemTensorType)
+        if not (
+            (dst_is_tma and src_is_smem)
+            or (dst_is_smem and src_is_tma)
+        ):
+            raise ValueError(
+                "tma_move expects one TMA descriptor and one smem operand; "
+                f"got dst={op.dst.type}, src={op.src.type}"
+            )
+        descriptor_type = op.dst.type if dst_is_tma else op.src.type
+        assert isinstance(descriptor_type, TmaDescType)
+        if len(op.indices) != descriptor_type.gmem_type.rank:
+            raise ValueError(
+                "tma_move expects one index per TMA dimension; "
+                f"got {len(op.indices)} indices for rank "
+                f"{descriptor_type.gmem_type.rank}"
+            )
         _verify_collective_attr(op)
 
     @verifies(MatmulOp)

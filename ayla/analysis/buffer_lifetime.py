@@ -72,8 +72,10 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
         arguments = set(op.body.arguments)
         return BufferLivenessState(frozenset(
             buffer
-            for effect_kind, buffer, _ in effects
-            if effect_kind == kind and buffer in arguments
+            for effect in effects
+            if effect.kind == kind
+            for buffer in effect.roots
+            if buffer in arguments
         ))
 
     @transfers(
@@ -95,7 +97,9 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
                 f"unmodelled memory effects for {type(op).__name__}"
             )
         return BufferLivenessState(
-            state.buffers | {buffer for _, buffer, _ in effects}
+            state.buffers | {
+                buffer for effect in effects for buffer in effect.roots
+            }
         )
 
     @transfers(

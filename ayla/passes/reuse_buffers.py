@@ -44,7 +44,9 @@ def _op_local_conflicts(
             continue
         effects = memory_effects(op)
         assert effects is not None
-        buffers = {buffer for _, buffer, _ in effects}
+        buffers = {
+            buffer for effect in effects for buffer in effect.roots
+        }
         # Conservatively assume every pair accessed by an atomic op conflicts.
         for a, b in combinations(buffers, 2):
             op_local_conflicts.setdefault(a, set()).add(b)
@@ -68,7 +70,10 @@ def _can_reuse(
 def _writable_buffer_arguments(kernel: KernelOp) -> list[Value]:
     effects = memory_effects(kernel)
     assert effects is not None
-    written = {buffer for kind, buffer, _ in effects if kind == "W"}
+    written = {
+        buffer for effect in effects if effect.kind == "W"
+        for buffer in effect.roots
+    }
     return [
         argument
         for argument in kernel.body.arguments

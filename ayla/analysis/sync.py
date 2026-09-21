@@ -256,11 +256,14 @@ def _transfer_memory_effects(
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
-    for kind_y, buf, scope_y in effects:
-        for e in live.concurrent_memory_effects.get(buf, ()):
-            # A hazard needs a write (RAR is safe).
-            if e.kind == "W" or kind_y == "W":
-                barrier_scope = barrier_scope.join(_barrier_scope(e.scope, scope_y))
+    for current in effects:
+        for root in current.roots:
+            for prior in live.concurrent_memory_effects.get(root, ()):
+                # A hazard needs a write (RAR is safe).
+                if prior.kind == "W" or current.kind == "W":
+                    barrier_scope = barrier_scope.join(
+                        _barrier_scope(prior.scope, current.scope)
+                    )
     # A block-leader barrier is named. Its id remains in use until either a
     # full-block sync, or (for an mbar async) the await where everyone waits for
     # t0. Reuse any id whose prior lifetime has ended.
@@ -324,14 +327,20 @@ def _transfer_memory_effects(
     async_scope = (
         _async_collective_scope(async_lock) if async_lock is not None else None
     )
-    for (k, b, s) in effects:
+    for memory_effect in effects:
         pending = (
             async_lock
-            if async_scope is not None and s.leq(async_scope)
+            if (
+                async_scope is not None
+                and memory_effect.scope.leq(async_scope)
+            )
             else None
         )
-        effect = ConcurrentMemoryEffect(k, s, pending)
-        live.concurrent_memory_effects.setdefault(b, set()).add(effect)
+        effect = ConcurrentMemoryEffect(
+            memory_effect.kind, memory_effect.scope, pending,
+        )
+        for root in memory_effect.roots:
+            live.concurrent_memory_effects.setdefault(root, set()).add(effect)
     return live
 
 

@@ -4,7 +4,8 @@ from __future__ import annotations
 import enum
 import itertools
 import math
-from typing import ClassVar, Iterator
+from dataclasses import dataclass
+from typing import ClassVar, Iterator, Literal
 
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
@@ -441,13 +442,6 @@ class TileOp(Op):
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
     defined out-of-bounds behavior.
-
-    Invariant: distinct tile results of the same buffer are
-    non-conflicting — they are either disjoint (safe for concurrent
-    writes) or overlapping read-only. This is the responsibility of
-    whoever constructs the tiles. It allows memory effect analysis to
-    use the tile Value directly as the buffer identity without
-    resolving to the root alloc.
     """
 
     @classmethod
@@ -498,26 +492,6 @@ class TileOp(Op):
     @property
     def maybe_partial(self) -> bool:
         return bool(self.attrs.get("maybe_partial", False))
-
-    def __post_init__(self) -> None:  # type: ignore[override]
-        super().__post_init__()
-        assert len(self.results) == 1, "TileOp must produce exactly one result"
-        # A tile is a view into its source — strides are inherited.
-        arg_type = self.arg.type
-        res_type = self.result(0).type
-        if isinstance(arg_type, WrmemTensorType):
-            assert isinstance(res_type, WrmemTensorType), (
-                "TileOp: wrmem arg requires wrmem result"
-            )
-        else:
-            assert (
-                isinstance(arg_type, AddrMemTensorType)
-                and isinstance(res_type, AddrMemTensorType)
-            ), "TileOp: arg and result must be AddrMemTensorType or WrmemTensorType"
-            assert list(arg_type.strides) == list(res_type.strides), (
-                f"TileOp: result strides {list(res_type.strides)} must "
-                f"match arg strides {list(arg_type.strides)}"
-            )
 
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):
@@ -852,16 +826,6 @@ class TmaMoveOp(Op):
         if l2_cache_hint is not None:
             attrs["l2_cache_hint"] = l2_cache_hint
         return cls(operands=operands, results=[], attrs=attrs)
-
-    def __post_init__(self) -> None:  # type: ignore[override]
-        super().__post_init__()
-        dst_is_tma = isinstance(self.dst.type, TmaDescType)
-        src_is_tma = isinstance(self.src.type, TmaDescType)
-        assert dst_is_tma != src_is_tma, (
-            f"TmaMoveOp: exactly one operand must be a TMA descriptor; "
-            f"got dst={type(self.dst.type).__name__}, "
-            f"src={type(self.src.type).__name__}"
-        )
 
     @property
     def dst(self) -> Value:
@@ -1804,7 +1768,7 @@ class ForOp(Op):
 
     @property
     def trip_count(self) -> int:
-        return (self.ub - self.lb) // self.step
+        return max(0, (self.ub - self.lb + self.step - 1) // self.step)
 
     @property
     def extra_attrs(self) -> dict[str, object]:
@@ -2288,19 +2252,31 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
     )
 
 
+@dataclass(frozen=True)
+class MemoryEffect:
+    """A memory access before its view is resolved to physical roots."""
+
+    kind: Literal["R", "W"]
+    value: Value
+    scope: CollectiveScope
+
+    @property
+    def roots(self) -> set[Value]:
+        return root_buffers(self.value)
+
+
 def _memory_effect(
-    kind: str, value: Value, scope: CollectiveScope,
-) -> list[tuple[str, Value, CollectiveScope]]:
-    return [(kind, root, scope) for root in root_buffers(value)]
+    kind: Literal["R", "W"], value: Value, scope: CollectiveScope,
+) -> list[MemoryEffect]:
+    return [MemoryEffect(kind, value, scope)]
 
 
-def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
+def memory_effects(op: Op) -> list[MemoryEffect] | None:
     """Best-effort memory effect summary for ``op``.
 
-    Returns a list of ``(kind, root, scope)`` tuples where ``kind`` is ``"R"`` or
-    ``"W"``, ``root`` is an underlying alloc/arg (after stripping views via
-    ``root_buffers``), and ``scope`` is the :class:`CollectiveScope` at which
-    the access is independent of concurrent threads.
+    Each effect retains the accessed view so consumers can recover its precise
+    region. ``effect.roots`` provides its underlying allocations/arguments for
+    conservative alias checks.
 
     Returns ``None`` for ops we don't know how to model; callers must treat that
     as a worst-case conflict.
@@ -2375,7 +2351,7 @@ def memory_effects(op: Op) -> list[tuple[str, Value, CollectiveScope]] | None:
         )
         return _memory_effect("W", buf, scope)
     if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
-        effects: list[tuple[str, Value, CollectiveScope]] = []
+        effects: list[MemoryEffect] = []
         for block in op.blocks:
             for body_op in block.ops:
                 body_effects = memory_effects(body_op)
