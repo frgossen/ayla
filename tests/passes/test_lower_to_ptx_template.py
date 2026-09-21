@@ -387,6 +387,28 @@ def test_lower_elementwise_mul():
     )
 
 
+def test_lower_elementwise_bf16_mul():
+    w = 'wrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %lhs: {w} = alloc() attrs={{id: 0}}
+            %rhs: {w} = alloc() attrs={{id: 1}}
+            elementwise mul(%lhs: {w}, %lhs: {w}, %rhs: {w})
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda o: isinstance(o, PTXTemplateOp)
+    )[-1].attrs["template"]
+    assert template == "".join(
+        f"mul.rn.bf16x2 ${{b32:operand.dst.r{reg}}}, "
+        f"${{b32:operand.lhs.r{reg}}}, ${{b32:operand.rhs.r{reg}}};\n"
+        for reg in range(2)
+    )
+
+
 def test_lower_elementwise_silu():
     w = 'wrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
@@ -444,3 +466,30 @@ def test_lower_elementwise_silu_with_bf16_output():
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r0}, ${f32:silu_result1}, ${f32:silu_result0};
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r1}, ${f32:silu_result3}, ${f32:silu_result2};
         """))
+
+
+def test_lower_elementwise_convert_bf16_to_f32():
+    src = 'wrmem<16x8xbf16 layout="mma">'
+    dst = 'wrmem<16x8xf32 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %src: {src} = alloc() attrs={{id: 0}}
+            %dst: {dst} = alloc() attrs={{id: 1}}
+            elementwise convert(%dst: {dst}, %src: {src})
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp)
+    )[-1].attrs["template"]
+
+    assert template == textwrap.dedent("""\
+        mov.b32 {${b16:convert_src0_lo}, ${b16:convert_src0_hi}}, ${b32:operand.src.r0};
+        cvt.f32.bf16 ${f32:operand.dst.r0}, ${b16:convert_src0_lo};
+        cvt.f32.bf16 ${f32:operand.dst.r1}, ${b16:convert_src0_hi};
+        mov.b32 {${b16:convert_src1_lo}, ${b16:convert_src1_hi}}, ${b32:operand.src.r1};
+        cvt.f32.bf16 ${f32:operand.dst.r2}, ${b16:convert_src1_lo};
+        cvt.f32.bf16 ${f32:operand.dst.r3}, ${b16:convert_src1_hi};
+        """)
