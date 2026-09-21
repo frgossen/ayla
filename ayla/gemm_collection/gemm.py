@@ -225,8 +225,10 @@ def schedule_matmul(
         raise ValueError("output_m_tile must be 128 or 192")
     if output_m_tile == 192 and output_tiles_per_cta != 1:
         raise ValueError("M=192 currently requires one output tile per CTA")
-    if output_n_tile not in (64, 208, 256, 384):
-        raise ValueError("output_n_tile must be 64, 208, 256, or 384")
+    if output_n_tile not in (64, 192, 208, 256, 384):
+        raise ValueError(
+            "output_n_tile must be 64, 192, 208, 256, or 384"
+        )
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
     if warpgroup_n_tile is None:
