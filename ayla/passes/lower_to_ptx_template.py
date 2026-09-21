@@ -56,10 +56,21 @@ from ..gpu_dialect import (
 
 
 def _lower_mul_registers(
-    dst_regs: list[str], lhs_regs: list[str], rhs_regs: list[str],
+    dst_regs: list[str],
+    lhs_regs: list[str],
+    rhs_regs: list[str],
+    dtype: Type,
 ) -> str:
+    if isinstance(dtype, F32Type):
+        opcode = "mul.f32"
+    elif isinstance(dtype, BF16Type):
+        opcode = "mul.rn.bf16x2"
+    else:
+        raise NotImplementedError(
+            f"lower_elementwise: mul does not support {dtype}"
+        )
     return "".join(
-        f"mul.f32 {dst}, {lhs}, {rhs};\n"
+        f"{opcode} {dst}, {lhs}, {rhs};\n"
         for dst, lhs, rhs in zip(
             dst_regs, lhs_regs, rhs_regs, strict=True,
         )
@@ -134,6 +145,25 @@ def _lower_f32_to_packed16_ptx(
     )
 
 
+def _lower_packed_bf16_to_f32_ptx(
+    dst_regs: list[str], src_regs: list[str],
+) -> str:
+    """Unpack pairs of BF16 values and widen each one to F32."""
+    assert len(dst_regs) == 2 * len(src_regs)
+    template = ""
+    for pair, (src, dst_lo, dst_hi) in enumerate(zip(
+        src_regs, dst_regs[::2], dst_regs[1::2], strict=True,
+    )):
+        lo = f"${{b16:convert_src{pair}_lo}}"
+        hi = f"${{b16:convert_src{pair}_hi}}"
+        template += textwrap.dedent(f"""\
+            mov.b32 {{{lo}, {hi}}}, {src};
+            cvt.f32.bf16 {dst_lo}, {lo};
+            cvt.f32.bf16 {dst_hi}, {hi};
+        """)
+    return template
+
+
 def _lower_dtype_conversion_ptx(
     dst_regs: list[str],
     src_regs: list[str],
@@ -141,16 +171,17 @@ def _lower_dtype_conversion_ptx(
     dst_dtype: Type,
 ) -> str:
     """Lower a conversion independently of the element-wise function."""
-    if not (
-        isinstance(src_dtype, F32Type)
-        and isinstance(dst_dtype, (BF16Type, F16Type))
+    if isinstance(src_dtype, F32Type) and isinstance(
+        dst_dtype, (BF16Type, F16Type),
     ):
-        raise NotImplementedError(
-            f"lower_elementwise: unsupported conversion "
-            f"{src_dtype} -> {dst_dtype}"
+        return _lower_f32_to_packed16_ptx(
+            dst_regs, src_regs, src_dtype, dst_dtype,
         )
-    return _lower_f32_to_packed16_ptx(
-        dst_regs, src_regs, src_dtype, dst_dtype,
+    if isinstance(src_dtype, BF16Type) and isinstance(dst_dtype, F32Type):
+        return _lower_packed_bf16_to_f32_ptx(dst_regs, src_regs)
+    raise NotImplementedError(
+        f"lower_elementwise: unsupported conversion "
+        f"{src_dtype} -> {dst_dtype}"
     )
 
 
@@ -196,16 +227,18 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
 
 
 def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
-    if not all(
-        isinstance(cast(MemTensorType, value.type).dtype, F32Type)
+    dtype = cast(MemTensorType, op.dst.type).dtype
+    if any(
+        cast(MemTensorType, value.type).dtype != dtype
         for value in op.operands
     ):
-        raise NotImplementedError("lower_elementwise: mul supports only f32")
-    return _lower_mul_registers(
-        _elementwise_operand_regs(op.dst, "dst"),
-        _elementwise_operand_regs(op.src(0), "lhs"),
-        _elementwise_operand_regs(op.src(1), "rhs"),
-    )
+        raise NotImplementedError(
+            "lower_elementwise: mul requires matching operand dtypes"
+        )
+    dst_regs = _elementwise_operand_regs(op.dst, "dst")
+    lhs_regs = _elementwise_operand_regs(op.src(0), "lhs")
+    rhs_regs = _elementwise_operand_regs(op.src(1), "rhs")
+    return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs, dtype)
 
 
 def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
@@ -229,7 +262,9 @@ def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
         template = _lower_elementwise_sigmoid_bf16_ptx(tmp_regs, src_regs)
     else:
         template = _lower_elementwise_sigmoid_ptx(tmp_regs, src_regs)
-    template += _lower_mul_registers(result_regs, src_regs, tmp_regs)
+    template += _lower_mul_registers(
+        result_regs, src_regs, tmp_regs, F32Type(),
+    )
     # TODO: Have PromoteBuffers emit an explicit convert after the F32
     # epilogue; only promotion knows the register accumulator exists.
     if src_dtype != dst_dtype:
