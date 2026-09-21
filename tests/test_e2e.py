@@ -18,7 +18,7 @@ from tests.testing_utils import requires_cuda
 
 
 @requires_cuda
-@pytest.mark.parametrize("m", [32, 64])
+@pytest.mark.parametrize("m", [1, 4, 32, 64, 512, 2048])
 def test_muse_swiglu_benchmark_route_matches_torch(m: int):
     """Exercise the full benchmark route until torch.compile owns it."""
     from benchmarks.benchmark_bf16_muse_swiglu import (
