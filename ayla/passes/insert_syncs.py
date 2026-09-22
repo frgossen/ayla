@@ -12,6 +12,7 @@ from ..gpu_dialect import (
     ForOp,
     IfOp,
     KernelOp,
+    LockType,
     ModuleOp,
     PTXTemplateOp,
     is_side_effect_free,
@@ -192,6 +193,7 @@ _MAX_BARRIER_IDS = 16
 
 def _async_collective_scope(lock: Value) -> CollectiveScope:
     """The collective scope an async op on ``lock`` synchronizes when awaited."""
+    assert isinstance(lock.type, LockType)
     kind = lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
@@ -280,6 +282,11 @@ def _analyze(
         raise NotImplementedError(
             f"unmodelled effect-bearing op: {type(op).__name__}"
         )
+    lock = op.lock if isinstance(op, AsyncOp) else None
+    lock_type = None
+    if lock is not None:
+        assert isinstance(lock.type, LockType)
+        lock_type = lock.type
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
@@ -334,9 +341,9 @@ def _analyze(
             named_id = min(available_ids)
         # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
         # an mbar await is an all-thread rendezvous that ends this handoff.
-        if isinstance(op, AsyncOp) and op.lock.type.kind == "mbar":
+        if lock is not None and lock_type is not None and lock_type.kind == "mbar":
             live.named_barrier_ids_pending_await.setdefault(
-                op.lock, set(),
+                lock, set(),
             ).add(named_id)
         else:
             live.named_barrier_ids.add(named_id)
@@ -348,11 +355,9 @@ def _analyze(
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for
     # a later barrier to order.
-    async_scope = (
-        _async_collective_scope(op.lock) if isinstance(op, AsyncOp) else None
-    )
+    async_scope = _async_collective_scope(lock) if lock is not None else None
     for (k, b, s) in effects:
-        pending = op.lock if async_scope is not None and s.leq(async_scope) else None
+        pending = lock if async_scope is not None and s.leq(async_scope) else None
         effect = ConcurrentMemoryEffect(k, s, pending)
         live.concurrent_memory_effects.setdefault(b, set()).add(effect)
     return live
@@ -379,7 +384,9 @@ def _insert_barriers(
                 raise NotImplementedError(
                     f"no lowering for barrier {target.scope.name}"
                 )
-            attrs = {} if target.named_id is None else {"id": target.named_id}
+            attrs: dict[str, object] = (
+                {} if target.named_id is None else {"id": target.named_id}
+            )
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
                 assert num_threads is not None, (
                     "block-leader barriers require resolved block dimensions"

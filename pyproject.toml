@@ -51,7 +51,12 @@ include = [
     "ayla/passes/canonicalize.py",
     "ayla/passes/dce.py",
     "ayla/passes/licm.py",
+    "ayla/passes/insert_syncs.py",
+    "ayla/passes/fuse_async.py",
+    "ayla/passes/pack_smem_allocs.py",
+    "ayla/passes/pipeline_loop.py",
     "ayla/passes/schedule_async.py",
+    "ayla/passes/unroll_loop.py",
     "ayla/pytree.py",
 ]
 pythonVersion = "3.12"
