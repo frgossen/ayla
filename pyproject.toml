@@ -57,6 +57,7 @@ include = [
     "ayla/passes/pack_smem_allocs.py",
     "ayla/passes/pipeline_loop.py",
     "ayla/passes/schedule_async.py",
+    "ayla/passes/verify_gpu_dialect.py",
     "ayla/passes/unroll_loop.py",
     "ayla/pytree.py",
 ]
