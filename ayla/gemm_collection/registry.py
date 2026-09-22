@@ -29,11 +29,12 @@ from __future__ import annotations
 import inspect
 from typing import Callable
 
+from ..gpu_dialect import ModuleOp
 from ..ptx_codegen import make_ptx_kernel
 from ..ptx_runtime import make_ptx_launcher
 from ..torch_custom_call import OperandKind, make_torch_custom_call
 
-Builder = Callable[[], object]
+Builder = Callable[[], ModuleOp]
 
 
 def register(
