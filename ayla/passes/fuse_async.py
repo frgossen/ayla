@@ -41,7 +41,7 @@ from ..gpu_dialect import (
     SmemTensorType,
     is_side_effect_free,
 )
-from ..base.ir import Block, Op
+from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
@@ -70,17 +70,18 @@ class FuseAsync(Pass):
 
         new_ops: list[Op] = []
         group_inner: list[Op] = []
-        group_lock = None
+        group_lock: Value | None = None
         group_kind: str | None = None
-        group_attrs: dict | None = None
+        group_attrs: dict[str, object] | None = None
         # Member locks still awaiting their (to-be-dropped) await. Each fused
         # async adds its lock; its await removes it. Must be empty at finalize.
-        in_flight_locks: set = set()
+        in_flight_locks: set[Value] = set()
 
         def finalize() -> None:
             nonlocal group_inner, group_lock, group_kind, group_attrs
             nonlocal in_flight_locks
             if group_inner:
+                assert group_lock is not None
                 # Every member's await must have been dropped (its lock removed)
                 # so the group's single await covers it. A leftover lock means a
                 # member's await wasn't adjacent (e.g. TMA loads fused *after*
@@ -106,6 +107,7 @@ class FuseAsync(Pass):
         for op in block.ops:
             kind = _fusion_kind(op)
             if kind is not None:
+                assert isinstance(op, AsyncOp)
                 if group_kind is not None and kind != group_kind:
                     finalize()  # different kind ends the run
                 if group_lock is None:

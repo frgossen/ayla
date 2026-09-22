@@ -38,6 +38,10 @@ from ._utils import label_matches
 class PipelineLoop(LoweringPass):
     """Software-pipeline labeled ops in ForOp bodies."""
 
+    label_filter_loop: str
+    label_filter_op: str
+    pipelining_offset: int
+
     def __init__(
         self,
         label_filter_loop: str,
