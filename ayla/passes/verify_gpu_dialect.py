@@ -196,7 +196,9 @@ class VerifyGpuDialect(VerificationPass):
                 raise ValueError(
                     "BarrierOp: grid sync must contain at least 8 bytes"
                 )
-        elif op.scope == "cluster":
+        elif op.scope in (
+            "cluster_to_leader", "leader_to_cluster", "cluster",
+        ):
             kernel = find_ancestor_of_type(op, KernelOp)
             if kernel is None or not any(
                 dim is not None for dim in kernel.cluster_dim

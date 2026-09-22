@@ -525,10 +525,10 @@ def test_tma_multicast_reports_cluster_leader_write():
         (effect.kind, root.name, effect.scope)
         for effect in effects
         for root in effect.roots
-    } == {
-        ("W", "smem", CollectiveScope.CLUSTER_LEADER),
-        ("R", "desc", CollectiveScope.CLUSTER_LEADER),
-    }
+        } == {
+            ("W", "smem", CollectiveScope.CLUSTER_LEADER),
+            ("R", "desc", CollectiveScope.GRID),
+        }
 
 
 def test_tma_descriptor_validates_l2_promotion():

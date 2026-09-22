@@ -272,6 +272,8 @@ def test_default_verification_rejects_cluster_that_does_not_divide_grid():
             "%cbx: index, %cby: index, %cbz: index "
             "= cluster_block_ids()"
         ),
+        'barrier() attrs={scope: "cluster_to_leader"}',
+        'barrier() attrs={scope: "leader_to_cluster"}',
         'barrier() attrs={scope: "cluster"}',
     ],
 )

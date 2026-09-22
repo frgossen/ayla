@@ -12,7 +12,12 @@ from ayla.analysis.sync import (
     _barrier_scope,
 )
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import CollectiveScope, TmaMoveOp, gpu_dialect
+from ayla.gpu_dialect import (
+    BarrierOp,
+    CollectiveScope,
+    TmaMoveOp,
+    gpu_dialect,
+)
 from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
@@ -92,6 +97,18 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
     assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
 
 
+def test_barrier_scopes_form_a_lattice():
+    scopes = list(BarrierScope)
+    assert all(a.join(b) == b.join(a) for a in scopes for b in scopes)
+    assert all(a.join(a) == a for a in scopes)
+    assert all(
+        a.join(b).join(c) == a.join(b.join(c))
+        for a in scopes
+        for b in scopes
+        for c in scopes
+    )
+
+
 @pytest.mark.parametrize(
     ("prior", "current", "expected"),
     [
@@ -103,22 +120,32 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
         (
             CollectiveScope.THREAD,
             CollectiveScope.CLUSTER_LEADER,
-            BarrierScope.CLUSTER,
+            BarrierScope.CLUSTER_TO_LEADER,
         ),
         (
             CollectiveScope.CLUSTER_LEADER,
             CollectiveScope.THREAD,
-            BarrierScope.CLUSTER,
+            BarrierScope.LEADER_TO_CLUSTER,
         ),
         (
             CollectiveScope.BLOCK_LEADER,
             CollectiveScope.CLUSTER_LEADER,
-            BarrierScope.CLUSTER,
+            BarrierScope.CLUSTER_TO_LEADER,
         ),
         (
             CollectiveScope.CLUSTER_LEADER,
             CollectiveScope.BLOCK_LEADER,
-            BarrierScope.CLUSTER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+        (
+            CollectiveScope.CLUSTER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER,
+            BarrierScope.LEADER_TO_CLUSTER,
         ),
     ],
 )
@@ -135,6 +162,36 @@ def test_block_barrier_does_not_cover_a_cluster_leader_effect():
     assert _barrier_covers(
         BarrierScope.CLUSTER, CollectiveScope.CLUSTER_LEADER,
     )
+
+
+def test_cluster_leader_barrier_coverage_is_directional():
+    assert not _barrier_covers(
+        BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert not _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        (BarrierScope.CLUSTER_TO_LEADER, "cluster_to_leader"),
+        (BarrierScope.LEADER_TO_CLUSTER, "leader_to_cluster"),
+    ],
+)
+def test_insert_syncs_preserves_cluster_barrier_direction(scope, expected):
+    op = Op(operands=[], results=[])
+    block = Block(ops=[op])
+
+    _insert_barriers(block, {op: BarrierTarget(scope)}, num_threads=32)
+
+    barrier = block.ops[0]
+    assert isinstance(barrier, BarrierOp)
+    assert barrier.scope == expected
 
 
 def test_preexisting_barrier_updates_dataflow_state():

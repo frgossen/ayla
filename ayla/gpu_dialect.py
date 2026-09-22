@@ -1011,9 +1011,9 @@ class BarrierOp(Op):
     grid barrier must be scheduled so all participating blocks can be resident
     concurrently.
 
-    The ``scope`` attribute records the participant set the sync spans, one of:
+    The ``scope`` attribute records the participant set and direction, one of:
     ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
-    ``cluster``, ``grid``.
+    ``cluster_to_leader``, ``leader_to_cluster``, ``cluster``, ``grid``.
     """
 
     @classmethod
@@ -2266,9 +2266,10 @@ class CollectiveScope(enum.IntEnum):
     r"""The granularity at which an effect is completely independent of concurrent
     operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
     scope but performed exclusively by thread 0, e.g. a TMA.
-    ``CLUSTER_LEADER`` is the corresponding single issuer for a cluster. A
-    cluster leader is also its CTA's block leader, while ``BLOCK`` (all threads
-    in one CTA) and ``CLUSTER_LEADER`` (one thread for the cluster) are
+    ``CLUSTER_LEADER`` is the corresponding single issuer acting for a cluster,
+    so ``BLOCK_LEADER <= CLUSTER_LEADER``. They coincide operationally for a
+    single-CTA cluster but remain distinct lattice elements. ``BLOCK`` (all
+    threads in one CTA) and ``CLUSTER_LEADER`` (one issuer for the cluster) are
     incomparable::
 
              GRID

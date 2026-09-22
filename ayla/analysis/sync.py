@@ -43,20 +43,22 @@ class BarrierScope(enum.IntEnum):
 
     Mirrors CollectiveScope, but where that names the granularity at which an
     access *executes*, this names the *sync* between those granularities. The two
-    correspond one-to-one except for the asymmetric block leader syncs,
-    BLOCK_TO_LEADER and LEADER_TO_BLOCK::
+    correspond one-to-one except for the asymmetric block- and cluster-leader
+    syncs::
 
-             GRID
-              |
-           CLUSTER
-              |
-            BLOCK
-            /   \
-    WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
-           |     |
-         WARP    |
-            \   /
-            THREAD
+                       GRID
+                        |
+                     CLUSTER
+                    /   |   \
+                   /    |    CLUSTER_TO_LEADER / LEADER_TO_CLUSTER
+                  /     |     |
+               BLOCK    |     |
+               /   \    |     |
+       WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
+              |         |     |
+            WARP        |     |
+               \       /     /
+                    THREAD
     """
     THREAD = 0
     WARP = 1
@@ -64,8 +66,10 @@ class BarrierScope(enum.IntEnum):
     BLOCK_TO_LEADER = 3
     LEADER_TO_BLOCK = 4
     BLOCK = 5
-    CLUSTER = 6
-    GRID = 7
+    CLUSTER_TO_LEADER = 6
+    LEADER_TO_CLUSTER = 7
+    CLUSTER = 8
+    GRID = 9
 
     def join(self, other: BarrierScope) -> BarrierScope:
         """The join (least upper bound) on the BarrierScope lattice."""
@@ -78,6 +82,14 @@ class BarrierScope(enum.IntEnum):
         if self == BarrierScope.GRID or other == BarrierScope.GRID:
             return BarrierScope.GRID
         if self == BarrierScope.CLUSTER or other == BarrierScope.CLUSTER:
+            return BarrierScope.CLUSTER
+        if self in (
+            BarrierScope.CLUSTER_TO_LEADER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ) or other in (
+            BarrierScope.CLUSTER_TO_LEADER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ):
             return BarrierScope.CLUSTER
         if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
             return BarrierScope.BLOCK
@@ -97,11 +109,17 @@ def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierS
         CollectiveScope.CLUSTER_LEADER,
     ):
         return BarrierScope.THREAD
-    if CollectiveScope.CLUSTER_LEADER in (prior, current):
+    if current == CollectiveScope.CLUSTER_LEADER:
         return (
             BarrierScope.GRID
-            if CollectiveScope.GRID in (prior, current)
-            else BarrierScope.CLUSTER
+            if prior == CollectiveScope.GRID
+            else BarrierScope.CLUSTER_TO_LEADER
+        )
+    if prior == CollectiveScope.CLUSTER_LEADER:
+        return (
+            BarrierScope.GRID
+            if current == CollectiveScope.GRID
+            else BarrierScope.LEADER_TO_CLUSTER
         )
     if current == CollectiveScope.BLOCK_LEADER:
         return BarrierScope.BLOCK_TO_LEADER
@@ -140,6 +158,15 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     if barrier == BarrierScope.LEADER_TO_BLOCK:
         # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
+    if barrier == BarrierScope.CLUSTER_TO_LEADER:
+        return scope == CollectiveScope.THREAD  # gather: nothing cross-thread
+    if barrier == BarrierScope.LEADER_TO_CLUSTER:
+        # broadcast: the cluster leader's work, including its narrower scopes
+        return scope in (
+            CollectiveScope.THREAD,
+            CollectiveScope.BLOCK_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+        )
     if barrier == BarrierScope.BLOCK:
         return scope not in (
             CollectiveScope.CLUSTER_LEADER,

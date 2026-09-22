@@ -447,6 +447,10 @@ class LowerToPtxTemplate(LoweringPass):
         if lock_type.kind != "mbar":
             return [], [None]
         is_multicast = _lock_has_tma_multicast(op.result())
+        # Every CTA owns a local mbarrier at this shared-memory offset, and a
+        # multicast signals each selected CTA's instance. The CTA-local bar.sync
+        # publishes each initialization locally; this cluster rendezvous ensures
+        # all instances are initialized before rank 0 can issue the multicast.
         cluster_sync = (
             """barrier.cluster.arrive.release;
             barrier.cluster.wait.acquire;
@@ -1033,7 +1037,11 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
-        elif scope == "cluster":
+        elif scope in (
+            "cluster_to_leader", "leader_to_cluster", "cluster",
+        ):
+            # Retain direction in the IR, but conservatively implement both
+            # handoffs as a full-cluster rendezvous for now.
             template = textwrap.dedent("""\
                 barrier.cluster.arrive.release;
                 barrier.cluster.wait.acquire;
