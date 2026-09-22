@@ -9,7 +9,7 @@ from .registry import register_gemm
 # BM=128, BN=128, BK=64, 128 threads.
 @register_gemm
 def loop_8x8_matmul_4096_module():
-    return gpu_dialect.parse(textwrap.dedent("""\
+    return gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @loop_8x8_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[32, 32, 1] block_dim=[16, 16, 1] {
             %cx: index, %cy: index, %cz: index = block_ids()

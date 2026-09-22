@@ -30,6 +30,9 @@ from ._utils import label_matches
 class UnrollLoop(LoweringPass):
     """Unroll all ForOps by `unroll_factor`."""
 
+    unroll_factor: int
+    label_filter: str | None
+
     def __init__(self, unroll_factor: int, label_filter: str | None = None) -> None:
         super().__init__(
             unroll_factor=unroll_factor,

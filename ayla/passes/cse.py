@@ -50,37 +50,38 @@ def _attr_key(v) -> tuple | object:
     )
 
 
+def _cse_block(block: Block, parent_canonical: dict[int, Value]) -> None:
+    canonical_value = dict(parent_canonical)
+    cache: dict[tuple, Op] = {}
+    new_ops: list[Op] = []
+
+    for op in block.ops:
+        op.operands = [
+            canonical_value.get(id(v), v) for v in op.operands
+        ]
+
+        for inner in op.blocks:
+            _cse_block(inner, canonical_value)
+
+        if is_side_effect_free(op):
+            key = _op_key(op)
+            if key in cache:
+                original = cache[key]
+                for old_r, new_r in zip(op.results, original.results):
+                    canonical_value[id(old_r)] = new_r
+                continue
+            cache[key] = op
+        new_ops.append(op)
+
+    block.ops = new_ops
+
+
 class CSE(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
         for block in module.blocks:
-            self.run_block(block, {})
+            _cse_block(block, {})
         return module
-
-    def run_block(self, block: Block, parent_canonical: dict[int, Value]) -> None:
-        canonical_value = dict(parent_canonical)
-        cache: dict[tuple, Op] = {}
-        new_ops: list[Op] = []
-
-        for op in block.ops:
-            op.operands = [
-                canonical_value.get(id(v), v) for v in op.operands
-            ]
-
-            for inner in op.blocks:
-                self.run_block(inner, canonical_value)
-
-            if is_side_effect_free(op):
-                key = _op_key(op)
-                if key in cache:
-                    original = cache[key]
-                    for old_r, new_r in zip(op.results, original.results):
-                        canonical_value[id(old_r)] = new_r
-                    continue
-                cache[key] = op
-            new_ops.append(op)
-
-        block.ops = new_ops
 
 
 def cse(module: ModuleOp) -> ModuleOp:
