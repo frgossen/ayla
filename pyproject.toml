@@ -51,6 +51,8 @@ include = [
     "ayla/passes/canonicalize.py",
     "ayla/passes/dce.py",
     "ayla/passes/fuse_async.py",
+    "ayla/passes/pack_smem_allocs.py",
+    "ayla/passes/pipeline_loop.py",
     "ayla/passes/schedule_async.py",
     "ayla/pytree.py",
 ]
