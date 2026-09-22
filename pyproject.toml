@@ -55,6 +55,7 @@ include = [
     "ayla/passes/pack_smem_allocs.py",
     "ayla/passes/pipeline_loop.py",
     "ayla/passes/schedule_async.py",
+    "ayla/passes/unroll_loop.py",
     "ayla/pytree.py",
 ]
 pythonVersion = "3.12"
