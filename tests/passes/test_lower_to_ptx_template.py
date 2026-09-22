@@ -66,6 +66,38 @@ def test_lower_barrier_block_leader_is_named_barrier():
         """)
 
 
+def test_lower_cluster_to_leader_barrier_uses_its_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %lock: lock<cluster_mbar> = alloc()
+            barrier(%lock: lock<cluster_mbar>) attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
+    assert (
+        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 2;"
+        in ptx
+    )
+    assert_contains_in_order(
+        ptx,
+        "fence.mbarrier_init.release.cluster;",
+        "bar.sync 0;",
+        "barrier.cluster.arrive.release;",
+        "barrier.cluster.wait.acquire;",
+        "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
+        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
+        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+    )
+
+
 def test_lower_smem_arena_and_reinterpret():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

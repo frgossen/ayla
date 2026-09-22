@@ -945,6 +945,8 @@ class LockType(Type):
 
     The ``kind`` attribute encodes the hardware mechanism:
       - ``"mbar"``: mbarrier-based (lock value = mbarrier smem address)
+      - ``"cluster_mbar"``: cluster-to-leader rendezvous mbarrier in shared
+        memory (lock value = the rank-0 CTA's mbarrier address)
       - ``"wgmma"``: wgmma commit-group counter (lock value unused)
       - ``"bulk"``: bulk async commit-group (TMA stores)
       - ``None``: unspecified (set by lower_to_async before PTX lowering)
@@ -1006,10 +1008,11 @@ class BarrierOp(Op):
     """A rendezvous / synchronization point across a set of threads.
 
     It only establishes a happens-before across its participating threads.
-    Hardware-backed scopes need no operand; a software grid barrier carries
-    its zero-initialized global-memory synchronization buffer. Kernels using a
-    grid barrier must be scheduled so all participating blocks can be resident
-    concurrently.
+    Most hardware-backed scopes need no operand. A ``cluster_to_leader`` barrier
+    may carry the mbarrier used for an optimized gather at the cluster leader,
+    while a software grid barrier carries its zero-initialized global-memory
+    synchronization buffer. Kernels using a grid barrier must be scheduled so
+    all participating blocks can be resident concurrently.
 
     The ``scope`` attribute records the participant set and direction, one of:
     ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
@@ -1032,8 +1035,8 @@ class BarrierOp(Op):
     def scope(self) -> str:
         return self.attrs["scope"]  # type: ignore[return-value]
 
-    # TODO: Replace this explicit operand once scratch global-memory allocation
-    # for fused operations has an owner.
+    # TODO: Replace explicit synchronization operands once their scratch
+    # allocations have an owner.
     @property
     def sync(self) -> Value | None:
         return self.operands[0] if self.operands else None

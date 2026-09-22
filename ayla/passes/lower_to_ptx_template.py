@@ -444,6 +444,8 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         lock_type = op.result().type
         assert isinstance(lock_type, LockType)
+        if lock_type.kind == "cluster_mbar":
+            return self._lower_alloc_cluster_mbar(op)
         if lock_type.kind != "mbar":
             return [], [None]
         is_multicast = _lock_has_tma_multicast(op.result())
@@ -473,6 +475,44 @@ class LowerToPtxTemplate(LoweringPass):
             ${{label:after_init}}:
             bar.sync 0;
             {cluster_sync}\
+        """)
+        new_op = PTXTemplateOp.build(
+            operands=[], result_types=[lock_type], template=template,
+            operand_names=[], result_names=["dst"],
+            description=str(op),
+        )
+        return [new_op], [new_op.result()]
+
+    def _lower_alloc_cluster_mbar(
+        self, op: AllocOp,
+    ) -> tuple[list[Op], list[object]]:
+        lock_type = op.result().type
+        assert isinstance(lock_type, LockType)
+        assert lock_type.kind == "cluster_mbar"
+        kernel = find_ancestor_of_type(op, KernelOp)
+        assert kernel is not None
+        cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+        # Nonzero ranks arrive remotely at rank 0's mbarrier. Publish rank 0's
+        # initialization cluster-wide before any CTA can reach its first use.
+        template = textwrap.dedent(f"""\
+            .shared .align 8 .b64 ${{smem:bar}}[1];
+            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:tid_x}}, %tid.x;
+            mov.u32 ${{b32:tid_y}}, %tid.y;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+            mov.u32 ${{b32:tid_z}}, %tid.z;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+            @${{pred:not_t0}} bra ${{label:after_init}};
+            mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
+            setp.ne.u32 ${{pred:not_rank0}}, ${{b32:cluster_rank}}, 0;
+            @${{pred:not_rank0}} bra ${{label:after_init}};
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {cluster_size};
+            fence.mbarrier_init.release.cluster;
+            ${{label:after_init}}:
+            bar.sync 0;
+            barrier.cluster.arrive.release;
+            barrier.cluster.wait.acquire;
         """)
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
@@ -1037,11 +1077,39 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
+        elif scope == "cluster_to_leader" and op.sync is not None:
+            sync = self.value_map[op.sync]
+            assert isinstance(sync, Value)
+            template = textwrap.dedent("""\
+                bar.sync 0;
+                mov.u32 ${b32:cl_tid}, %tid.x;
+                mov.u32 ${b32:cl_tidy}, %tid.y;
+                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidy};
+                mov.u32 ${b32:cl_tidz}, %tid.z;
+                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidz};
+                setp.ne.u32 ${pred:cl_not_t0}, ${b32:cl_tid}, 0;
+                @${pred:cl_not_t0} bra ${label:cl_done};
+                mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
+                setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;
+                @${pred:rank0} bra ${label:cl_rank0};
+                mov.u32 ${b32:cluster_rank}, 0;
+                mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};
+                mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
+                bra ${label:cl_done};
+                ${label:cl_rank0}:
+                mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];
+                ${label:cl_wait}:
+                mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};
+                @!${pred:ready} bra ${label:cl_wait};
+                ${label:cl_done}:
+                """)
+            operands = [sync]
+            operand_names = ["sync"]
         elif scope in (
             "cluster_to_leader", "leader_to_cluster", "cluster",
         ):
-            # Retain direction in the IR, but conservatively implement both
-            # handoffs as a full-cluster rendezvous for now.
+            # Retain direction in the IR. Handoffs without a synchronization
+            # operand use the parent's conservative full-cluster rendezvous.
             template = textwrap.dedent("""\
                 barrier.cluster.arrive.release;
                 barrier.cluster.wait.acquire;

@@ -323,6 +323,33 @@ def test_tma_multicast_rejects_invalid_context(kernel_attrs, move_attrs, error):
         verify_gpu_dialect(module)
 
 
+def test_cluster_to_leader_barrier_requires_cluster_mbar_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %lock: lock<mbar> = alloc()
+            barrier(%lock: lock<mbar>) attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="must be a cluster_mbar lock"):
+        verify_gpu_dialect(module)
+
+
+def test_cluster_mbar_cannot_be_used_as_an_async_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%src: gmem<1xf32>) grid_dim=[1, 1, 1] {
+            %dst: smem<1xf32> = alloc()
+            %lock: lock<cluster_mbar> = alloc()
+            async(%lock: lock<cluster_mbar>) move(%dst: smem<1xf32>, %src: gmem<1xf32>) attrs={tma: True}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="barrier resource, not an async lock"):
+        verify_gpu_dialect(module)
+
+
 def test_tma_multicast_async_collective_must_match_inner():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
