@@ -85,8 +85,6 @@ class ModuleOp(Op):
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=[])
         return cls.build(body, attrs=attrs)
-
-
 @gpu_dialect.register_op("kernel")
 class KernelOp(Op):
     @classmethod
