@@ -33,7 +33,7 @@ def pranjalssh_4096_module():
             move(%c_block: gmem<128x128xbf16 strides=[4096, 1]>, %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }""")  # noqa: E501
-    return gpu_dialect.parse(module_str)
+    return gpu_dialect.parse_module(module_str)
 
 
 # Async variant of pranjalssh_4096: issues both TMA loads concurrently before

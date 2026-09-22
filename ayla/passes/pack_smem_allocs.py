@@ -6,6 +6,10 @@ from ..base.ir import Block, find_ops
 from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
+    BF16Type,
+    F16Type,
+    F32Type,
+    F64Type,
     KernelOp,
     ModuleOp,
     ReinterpretOp,
@@ -23,7 +27,11 @@ def _alignment(op: AllocOp) -> int:
 def _size(op: AllocOp) -> int:
     typ = op.result().type
     assert isinstance(typ, SmemTensorType)
-    return typ.num_elements * typ.dtype.byte_size
+    num_elements = typ.num_elements
+    assert num_elements is not None
+    dtype = typ.dtype
+    assert isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type))
+    return num_elements * dtype.byte_size
 
 
 def _layout(allocs: list[AllocOp], start: int = 0) -> tuple[list[int], int]:
@@ -111,6 +119,7 @@ class ReuseSmemAllocs(Pass):
         base: AllocOp | None = None
         arena_alignment = 1
         for alloc in allocations:
+            assert isinstance(alloc, AllocOp)
             group = alloc.attrs.get("reuse_group")
             if group is None:
                 continue

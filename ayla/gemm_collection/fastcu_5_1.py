@@ -10,7 +10,13 @@ constant by hand; re-run the generator instead.
 import textwrap
 
 from ..base.ir import Value
-from ..gpu_dialect import PTXTemplateOp, TmaDescType, gpu_dialect
+from ..gpu_dialect import (
+    GmemTensorType,
+    KernelOp,
+    PTXTemplateOp,
+    TmaDescType,
+    gpu_dialect,
+)
 from .registry import register_gemm
 
 FASTCU_MATMUL_5_1_TEMPLATE = r'''.reg .pred 	%Kp<19>;
@@ -1261,15 +1267,17 @@ def fastcu_5_1_module():
     Shared memory is *static* (144 KB), which the driver auto-configures on
     sm_90 — so no dynamic-shared-memory launch opt-in is needed.
     """
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @fastcu_5_1(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[512, 1, 1] block_dim=[384, 1, 1] {
           }
         }"""))  # noqa: E501
     kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
     entry = kernel.body
     a, b, c = entry.arguments
     gmem_t = a.type
+    assert isinstance(gmem_t, GmemTensorType)
     # desc_a feeds matmul_5's A path (BM=128 tile) but is built from %b
     # (arg_idx=1); desc_b feeds the B path (BN=256 tile) built from %a
     # (arg_idx=0). The swap cancels matmul_5's column-major C store so the
