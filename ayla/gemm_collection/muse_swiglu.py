@@ -468,31 +468,42 @@ def make_muse_swiglu_launcher(m: int):
 
 
 class _MuseSwiGLULauncher:
-    """Adapt one tuned route to the repository's functional custom-op API."""
+    """Dispatch the one dynamic-M custom op to a cached tuned route."""
 
-    def __init__(self, m: int) -> None:
-        self.name = f"muse_swiglu_m{m}"
+    name = "muse_swiglu"
+
+    def __init__(self) -> None:
         bf16 = BF16Type()
         self.signature = [
-            GmemTensorType.build([m, _HIDDEN], bf16),
+            GmemTensorType.build([None, _HIDDEN], bf16),
             GmemTensorType.build([_PACKED_INTERMEDIATE, _HIDDEN], bf16),
             GmemTensorType.build([_HIDDEN, _INTERMEDIATE], bf16),
-            GmemTensorType.build([m, _HIDDEN], bf16),
+            GmemTensorType.build([None, _HIDDEN], bf16),
         ]
-        self._run = make_muse_swiglu_launcher(m)
+        self._routes: dict[tuple[torch.device, int], object] = {}
 
-    def __call__(self, *tensors: torch.Tensor) -> None:
-        self._run(*tensors)
+    def __call__(
+        self,
+        lhs: torch.Tensor,
+        packed_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        m = lhs.shape[0]
+        key = (lhs.device, m)
+        route = self._routes.get(key)
+        if route is None:
+            with torch.cuda.device(lhs.device):
+                route = make_muse_swiglu_launcher(m)
+            self._routes[key] = route
+        route(lhs, packed_weight, down_weight, output)
 
 
-def make_muse_swiglu(
-    m: int,
-    *,
-    namespace: str = DEFAULT_NAMESPACE,
-):
-    """Create the functional custom op selected for a concrete Muse M."""
-    return make_torch_custom_call(
-        _MuseSwiGLULauncher(m),
-        [OperandKind.R, OperandKind.R, OperandKind.R, OperandKind.RESULT],
-        namespace=namespace,
-    )
+make_torch_custom_call(
+    _MuseSwiGLULauncher(),
+    [OperandKind.R, OperandKind.R, OperandKind.R, OperandKind.RESULT],
+    namespace=DEFAULT_NAMESPACE,
+    infer_result_shapes=lambda lhs, _packed, _down: [
+        (lhs.shape[0], _HIDDEN),
+    ],
+)

@@ -28,7 +28,7 @@ def test_muse_swiglu_is_captured_and_run():
     torch.testing.assert_close(actual, expected, atol=.125, rtol=.006)
     calls = [
         line for line in code.splitlines()
-        if "torch.ops.ayla.muse_swiglu_m1.default(" in line
+        if "torch.ops.ayla.muse_swiglu.default(" in line
     ]
     assert len(calls) == 1
     assert code.count("async_compile.triton") == 0
