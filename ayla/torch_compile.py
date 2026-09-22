@@ -56,7 +56,7 @@ from . import gemm_collection  # noqa: F401 -- defines the ops below
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
 _MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
-_MUSE_SWIGLU_OPS: dict[int, object] = {}
+_MUSE_SWIGLU_OP = torch.ops.ayla.muse_swiglu.default
 
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
@@ -209,61 +209,3 @@ def _lower_mm(lhs, rhs, *, layout=None):
 _LOWERING_TARGET = torch.ops.aten.mm.default
 _displaced_user_lowering = None
 _displaced_backend = None
-_displaced_post_grad_pass = None
-_post_grad_installed = False
-
-
-def install() -> None:
-    """Install Ayla's graph rewrites, lowering, and CUDA scheduling."""
-    global _displaced_user_lowering, _displaced_backend
-    global _displaced_post_grad_pass, _post_grad_installed
-    init_backend_registration()
-    if not _post_grad_installed:
-        _displaced_post_grad_pass = inductor_config.post_grad_custom_post_pass
-        existing = _displaced_post_grad_pass
-        if existing is None:
-            passes = [_replace_muse_swiglu]
-        elif isinstance(existing, (list, tuple)):
-            passes = [*existing, _replace_muse_swiglu]
-        else:
-            passes = [existing, _replace_muse_swiglu]
-        inductor_config.post_grad_custom_post_pass = passes
-        _post_grad_installed = True
-    if _displaced_backend is None:
-        _displaced_backend = device_codegens["cuda"]
-        register_backend_for_device(
-            "cuda", AylaCombinedScheduling, PythonWrapperCodegen, CppWrapperGpu,
-        )
-
-    current = user_lowerings.get(_LOWERING_TARGET)
-    if current is _lower_mm:
-        return
-    _displaced_user_lowering = current
-    user_lowerings[_LOWERING_TARGET] = _lower_mm
-
-
-def uninstall() -> None:
-    """Restore the displaced graph pass, ``aten.mm``, and CUDA scheduling."""
-    global _displaced_backend, _post_grad_installed
-    if _post_grad_installed:
-        current = inductor_config.post_grad_custom_post_pass
-        if (
-            isinstance(current, (list, tuple))
-            and _replace_muse_swiglu in current
-        ):
-            inductor_config.post_grad_custom_post_pass = (
-                _displaced_post_grad_pass
-            )
-        _post_grad_installed = False
-    # Stand down if someone has claimed cuda since, rather than overwrite them.
-    installed = device_codegens.get("cuda")
-    if installed is not None and installed.scheduling is AylaCombinedScheduling:
-        assert _displaced_backend is not None
-        device_codegens["cuda"] = _displaced_backend
-        _displaced_backend = None
-
-    if user_lowerings.get(_LOWERING_TARGET) is not _lower_mm:
-        return
-    del user_lowerings[_LOWERING_TARGET]
-    if _displaced_user_lowering is not None:
-        user_lowerings[_LOWERING_TARGET] = _displaced_user_lowering

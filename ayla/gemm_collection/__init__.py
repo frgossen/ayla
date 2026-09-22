@@ -21,6 +21,7 @@ from . import (  # noqa: F401,E402  (each import registers its op)
     fastcu_5_1,
     loop_4x4_matmul_4096,
     loop_8x8_matmul_4096,
+    muse_swiglu,
     naive_matmul_4096_loop,
     pranjalssh_4096,
     pranjalssh_4096_pipelined,
@@ -29,11 +30,4 @@ from . import (  # noqa: F401,E402  (each import registers its op)
 from .dynamic_m import (  # noqa: E402,F401
     dynamic_m_matmul_template,
     make_dynamic_m_matmul,
-)
-from .muse_swiglu import (  # noqa: E402,F401
-    MUSE_SWIGLU_LARGE_M_CONFIGS,
-    MUSE_SWIGLU_M_VALUES,
-    make_muse_swiglu,
-    make_muse_swiglu_launcher,
-    muse_swiglu_module,
 )
