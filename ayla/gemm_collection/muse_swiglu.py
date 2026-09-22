@@ -1,14 +1,10 @@
-#!/usr/bin/env python3
-"""Benchmark shape-routed Ayla Muse SwiGLU against ``torch.compile``."""
+"""Shape-routed kernels for the Muse Glimmer SwiGLU MLP."""
 from __future__ import annotations
-
-import argparse
-from pathlib import Path
 
 import torch
 
-from ayla.base.ir import Block, Op, Value
-from ayla.gpu_dialect import (
+from ..base.ir import Block, Op, Value
+from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BarrierOp,
@@ -25,37 +21,26 @@ from ayla.gpu_dialect import (
     TileOp,
     WrmemTensorType,
 )
-from ayla.gemm_collection.gemm import (
+from .gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
     schedule_register_matmul,
     schedule_tiled_matmul,
 )
-from ayla.passes.canonicalize import Canonicalize
-from ayla.passes.fuse_async import FuseAsync
-from ayla.passes.lower_to_async import LowerToAsync
-from ayla.passes.schedule_async import ScheduleAsync
-from ayla.passes.stage_register_writeback import StageRegisterWriteback
-from ayla.passes.tile_matmul import TileMatmul
-from ayla.ptx_codegen import make_ptx_kernel
-from ayla.ptx_runtime import make_ptx_launcher
-from benchmarks.common import (
-    BenchConfig,
-    BenchResult,
-    error_metrics,
-    print_results,
-    run_bench,
-    write_csv,
-)
+from ..passes.canonicalize import Canonicalize
+from ..passes.fuse_async import FuseAsync
+from ..passes.lower_to_async import LowerToAsync
+from ..passes.schedule_async import ScheduleAsync
+from ..passes.stage_register_writeback import StageRegisterWriteback
+from ..passes.tile_matmul import TileMatmul
+from ..ptx_codegen import make_ptx_kernel
+from ..ptx_runtime import make_ptx_launcher
+from ..torch_custom_call import DEFAULT_NAMESPACE, OperandKind, make_torch_custom_call
 
 
 _HIDDEN = 6_656
 _INTERMEDIATE = 19_968
 _PACKED_INTERMEDIATE = 2 * _INTERMEDIATE
-_M_VALUES = (1, 4, 32, 64, 512, 2048)
-_OUTPUT = (
-    Path(__file__).resolve().parents[1]
-    / ".benchmarks/bf16_muse_swiglu.csv"
-)
+MUSE_SWIGLU_M_VALUES = (1, 4, 32, 64, 512, 2048)
 
 _LARGE_M_VALUES = (512, 2048)
 _OUTPUT_M_TILE = 64
@@ -84,7 +69,7 @@ def _retained_cache_policy(
 
 # Retained winners from the historical Muse cold-cache sweep. These are
 # benchmark choices, not general-purpose dynamic-M heuristics.
-_LARGE_M_CONFIGS: dict[tuple[int, str], dict[str, object]] = {
+MUSE_SWIGLU_LARGE_M_CONFIGS: dict[tuple[int, str], dict[str, object]] = {
     (512, "projection"): {
         "output_m_tile": 128,
         "output_n_tile": 208,
@@ -329,10 +314,8 @@ def _schedule_down_projection(
     ).run(module)
 
 
-# TODO: Move this construction into the torch.compile integration once its
-# Muse MLP matcher and lowering exist.
-def _small_muse_swiglu_module(*, m: int) -> ModuleOp:
-    """Build the benchmark-only one-wave fused Muse MLP."""
+def muse_swiglu_module(*, m: int) -> ModuleOp:
+    """Build the one-wave fused Muse MLP used for small M."""
     if m not in (1, 4, 32, 64):
         raise ValueError(f"unsupported small M={m}")
     down_operand_stages = 5 if m <= 32 else 6
@@ -387,19 +370,6 @@ def _small_muse_swiglu_module(*, m: int) -> ModuleOp:
     return Canonicalize().run(module)
 
 
-def _torch_swiglu(
-    lhs: torch.Tensor,
-    packed_weight: torch.Tensor,
-    down_weight: torch.Tensor,
-) -> torch.Tensor:
-    """Muse's packed SwiGLU projection followed by its down projection."""
-    projection = lhs @ packed_weight.T
-    gate = projection[:, :_INTERMEDIATE]
-    up = projection[:, _INTERMEDIATE:]
-    hidden = torch.nn.functional.silu(gate) * up
-    return hidden @ down_weight.T
-
-
 def _torch_projection_swiglu(
     lhs: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -416,33 +386,26 @@ def _swiglu_from_projection(projection: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.silu(gate) * up
 
 
-def _gemm(
+def _gemm_launcher(
     *,
     m: int,
     n: int,
     k: int,
     config: dict[str, object],
 ):
-    launcher = make_ptx_launcher(make_ptx_kernel(
+    return make_ptx_launcher(make_ptx_kernel(
         auto_matmul_4096_wgmma256_wg_tma_store_module(
             m=m, n=n, k=k, **config,
         ),
     ))
-    output = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-
-    def run(lhs: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        launcher(lhs, weight, output)
-        return output
-
-    return run
 
 
 def _large_m_ayla_swiglu(m: int):
-    down = _gemm(
+    down = _gemm_launcher(
         m=m,
         n=_HIDDEN,
         k=_INTERMEDIATE,
-        config=_LARGE_M_CONFIGS[(m, "down")],
+        config=MUSE_SWIGLU_LARGE_M_CONFIGS[(m, "down")],
     )
     if m == 2048:
         # At M=2048 the archived Ayla projection is not profitable with the
@@ -453,13 +416,17 @@ def _large_m_ayla_swiglu(m: int):
             fullgraph=True,
             dynamic=False,
         )
-        route = "torch_projection+ayla_m192n192_down"
     else:
-        projection = _gemm(
+        projection = _gemm_launcher(
             m=m,
             n=_PACKED_INTERMEDIATE,
             k=_HIDDEN,
-            config=_LARGE_M_CONFIGS[(m, "projection")],
+            config=MUSE_SWIGLU_LARGE_M_CONFIGS[(m, "projection")],
+        )
+        projection_output = torch.empty(
+            (m, _PACKED_INTERMEDIATE),
+            device="cuda",
+            dtype=torch.bfloat16,
         )
         activation = torch.compile(
             _swiglu_from_projection,
@@ -468,155 +435,64 @@ def _large_m_ayla_swiglu(m: int):
         )
 
         def projection_swiglu(lhs, packed_weight):
-            return activation(projection(lhs, packed_weight))
+            projection(lhs, packed_weight, projection_output)
+            return activation(projection_output)
 
-        route = "ayla_m128n208_projection+ayla_m128n208_down"
+    def run(lhs, packed_weight, down_weight, output):
+        down(projection_swiglu(lhs, packed_weight), down_weight, output)
 
-    def run(lhs, packed_weight, down_weight):
-        return down(projection_swiglu(lhs, packed_weight), down_weight)
-
-    return run, route
+    return run
 
 
-def build_ayla_swiglu(m: int):
-    """Build the benchmark route selected for a supported Muse M shape."""
-    if m not in _M_VALUES:
-        raise ValueError(f"unsupported M={m}; expected one of {_M_VALUES}")
+def make_muse_swiglu_launcher(m: int):
+    """Build the tuned out-parameter route for one supported Muse M."""
+    if m not in MUSE_SWIGLU_M_VALUES:
+        raise ValueError(
+            f"unsupported M={m}; expected one of {MUSE_SWIGLU_M_VALUES}"
+        )
     if m in _LARGE_M_VALUES:
         return _large_m_ayla_swiglu(m)
 
     hidden = torch.empty(
         (m, _INTERMEDIATE), device="cuda", dtype=torch.bfloat16,
     )
-    output = torch.empty(
-        (m, _HIDDEN), device="cuda", dtype=torch.bfloat16,
-    )
     sync = torch.zeros(2, device="cuda", dtype=torch.float32)
     launcher = make_ptx_launcher(make_ptx_kernel(
-        _small_muse_swiglu_module(m=m),
+        muse_swiglu_module(m=m),
     ))
 
-    def run(lhs, packed_weight, down_weight):
+    def run(lhs, packed_weight, down_weight, output):
         launcher(lhs, packed_weight, down_weight, hidden, output, sync)
-        return output
 
-    return run, "fused_persistent"
-
-
-def _inputs(m: int) -> list[torch.Tensor]:
-    torch.manual_seed(20260921 + m)
-    return [
-        torch.randn((m, _HIDDEN), device="cuda", dtype=torch.bfloat16),
-        torch.randn(
-            (_PACKED_INTERMEDIATE, _HIDDEN),
-            device="cuda",
-            dtype=torch.bfloat16,
-        ) * .01,
-        torch.randn(
-            (_HIDDEN, _INTERMEDIATE),
-            device="cuda",
-            dtype=torch.bfloat16,
-        ) * .01,
-    ]
+    return run
 
 
-def _check(
-    name: str,
-    actual: torch.Tensor,
-    expected: torch.Tensor,
-) -> tuple[float, float]:
-    if actual.shape != expected.shape or actual.dtype != expected.dtype:
-        raise RuntimeError(
-            f"{name}: produced {actual.shape} {actual.dtype}; "
-            f"expected {expected.shape} {expected.dtype}"
-        )
-    max_abs, relative_rms = error_metrics(actual, expected)
-    if max_abs > .125 or relative_rms > .006:
-        raise RuntimeError(
-            f"{name}: max abs {max_abs}, relative RMS {relative_rms}"
-        )
-    return max_abs, relative_rms
+class _MuseSwiGLULauncher:
+    """Adapt one tuned route to the repository's functional custom-op API."""
+
+    def __init__(self, m: int) -> None:
+        self.name = f"muse_swiglu_m{m}"
+        bf16 = BF16Type()
+        self.signature = [
+            GmemTensorType.build([m, _HIDDEN], bf16),
+            GmemTensorType.build([_PACKED_INTERMEDIATE, _HIDDEN], bf16),
+            GmemTensorType.build([_HIDDEN, _INTERMEDIATE], bf16),
+            GmemTensorType.build([m, _HIDDEN], bf16),
+        ]
+        self._run = make_muse_swiglu_launcher(m)
+
+    def __call__(self, *tensors: torch.Tensor) -> None:
+        self._run(*tensors)
 
 
-def _run_case(
+def make_muse_swiglu(
     m: int,
-    torch_swiglu,
-) -> tuple[list[BenchResult], dict[str, object]]:
-    inputs = _inputs(m)
-    expected = _torch_swiglu(*inputs)
-
-    ayla_swiglu, route = build_ayla_swiglu(m)
-
-    # Compile/load both implementations before the shared harness captures
-    # them in CUDA graphs.
-    ayla_output = ayla_swiglu(*inputs)
-    torch_output = torch_swiglu(*inputs)
-    torch.cuda.synchronize()
-    max_abs, relative_rms = _check("Ayla", ayla_output, expected)
-    _check("torch.compile", torch_output, expected)
-
-    def make_inputs() -> list[torch.Tensor]:
-        return inputs
-
-    ayla_name = "Ayla fused" if route == "fused_persistent" else "Ayla routed"
-    results = run_bench([
-        BenchConfig(
-            name=f"{ayla_name} M={m}",
-            make_inputs=make_inputs,
-            compute=ayla_swiglu,
-        ),
-        BenchConfig(
-            name=f"torch.compile M={m}",
-            make_inputs=make_inputs,
-            compute=torch_swiglu,
-        ),
-    ])
-    ayla_result, torch_result = results
-    return results, {
-        "m": m,
-        "ayla_ms": ayla_result.median_ms,
-        "ayla_stdev_ms": ayla_result.stdev_ms,
-        "torch_compile_ms": torch_result.median_ms,
-        "torch_compile_stdev_ms": torch_result.stdev_ms,
-        "ayla_speedup": torch_result.median_ms / ayla_result.median_ms,
-        "ayla_route": route,
-        "correctness_max_abs": max_abs,
-        "correctness_relative_rms": relative_rms,
-        "gpu": torch.cuda.get_device_name(),
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-    }
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ms", nargs="+", type=int, default=list(_M_VALUES))
-    parser.add_argument("--output", type=Path, default=_OUTPUT)
-    args = parser.parse_args()
-    if any(m not in _M_VALUES for m in args.ms):
-        parser.error(f"--ms must be selected from {_M_VALUES}")
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA required")
-
-    torch_swiglu = torch.compile(
-        _torch_swiglu,
-        fullgraph=True,
-        dynamic=False,
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+):
+    """Create the functional custom op selected for a concrete Muse M."""
+    return make_torch_custom_call(
+        _MuseSwiGLULauncher(m),
+        [OperandKind.R, OperandKind.R, OperandKind.R, OperandKind.RESULT],
+        namespace=namespace,
     )
-    results = []
-    rows = []
-    with torch.inference_mode():
-        for m in args.ms:
-            case_results, row = _run_case(m, torch_swiglu)
-            results.extend(case_results)
-            rows.append(row)
-            torch.cuda.empty_cache()
-
-    print_results(results)
-    write_csv(rows, args.output)
-    print(f"Raw results: {args.output.resolve()}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
