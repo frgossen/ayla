@@ -43,6 +43,7 @@ include = [
     "ayla/gemm_collection/naive_matmul_4096_loop.py",
     "ayla/gemm_collection/pranjalssh_4096.py",
     "ayla/gemm_collection/pranjalssh_4096_pipelined.py",
+    "ayla/gemm_collection/registry.py",
     "ayla/gemm_collection/tma_matmul_4096.py",
     "ayla/gpu_dialect.py",
     "ayla/passes/__init__.py",

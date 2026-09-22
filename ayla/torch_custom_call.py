@@ -9,7 +9,7 @@ from typing import Protocol
 
 import torch
 
-from .gpu_dialect import BF16Type, F16Type, F32Type, F64Type
+from .gpu_dialect import BF16Type, F16Type, F32Type, F64Type, Type
 
 _TORCH_DTYPES = [
     (F16Type(), torch.float16),
@@ -37,8 +37,11 @@ class OperandKind(Enum):
 
 
 class _Launcher(Protocol):
-    name: str
-    signature: list
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def signature(self) -> list[Type]: ...
 
     def __call__(self, *tensors: torch.Tensor) -> None: ...
 

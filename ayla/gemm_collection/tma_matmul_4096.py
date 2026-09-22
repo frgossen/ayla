@@ -43,4 +43,4 @@ def tma_matmul_4096_module():
             move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)
           }
         }""")  # noqa: E501
-    return gpu_dialect.parse(module_str)
+    return gpu_dialect.parse_module(module_str)
