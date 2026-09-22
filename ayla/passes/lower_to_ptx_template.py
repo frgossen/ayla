@@ -448,29 +448,28 @@ class LowerToPtxTemplate(LoweringPass):
             return [], [None]
         is_multicast = _lock_has_tma_multicast(op.result())
         cluster_sync = (
-            textwrap.dedent("""\
-                barrier.cluster.arrive.release;
-                barrier.cluster.wait.acquire;
-            """)
+            """barrier.cluster.arrive.release;
+            barrier.cluster.wait.acquire;
+            """
             if is_multicast else ""
         )
-        template = textwrap.dedent("""\
-            .shared .align 8 .b64 ${smem:bar}[1];
-            mov.u32 ${b32:result.dst.val}, ${smem:bar};
-            mov.u32 ${b32:result.dst.parity}, 0;
-            mov.u32 ${b32:tid_x}, %tid.x;
-            mov.u32 ${b32:tid_y}, %tid.y;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
-            mov.u32 ${b32:tid_z}, %tid.z;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
-            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
-            @${pred:not_t0} bra ${label:after_init};
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
+        template = textwrap.dedent(f"""\
+            .shared .align 8 .b64 ${{smem:bar}}[1];
+            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:result.dst.parity}}, 0;
+            mov.u32 ${{b32:tid_x}}, %tid.x;
+            mov.u32 ${{b32:tid_y}}, %tid.y;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+            mov.u32 ${{b32:tid_z}}, %tid.z;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+            @${{pred:not_t0}} bra ${{label:after_init}};
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], 1;
             fence.mbarrier_init.release.cluster;
-            ${label:after_init}:
+            ${{label:after_init}}:
             bar.sync 0;
-            CLUSTER_SYNC
-        """).replace("CLUSTER_SYNC", cluster_sync)
+            {cluster_sync}\
+        """)
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
             operand_names=[], result_names=["dst"],
