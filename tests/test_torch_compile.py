@@ -8,6 +8,33 @@ from tests.testing_utils import requires_cuda
 
 
 @requires_cuda
+def test_muse_swiglu_is_captured_and_run():
+    from benchmarks.bench_torch_compile.corpus.muse_swiglu import build_config
+
+    config = build_config(1)
+    inputs = config.make_inputs()
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        expected = torch.compile(config.compute, dynamic=False)(*inputs)
+        from ayla import torch_compile
+
+        torch_compile.install()
+        try:
+            actual, (code,) = run_and_get_code(
+                torch.compile(config.compute, dynamic=False), *inputs,
+            )
+        finally:
+            torch_compile.uninstall()
+
+    torch.testing.assert_close(actual, expected, atol=.125, rtol=.006)
+    calls = [
+        line for line in code.splitlines()
+        if "torch.ops.ayla.muse_swiglu_m1.default(" in line
+    ]
+    assert len(calls) == 1
+    assert code.count("async_compile.triton") == 0
+
+
+@requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
 @pytest.mark.parametrize("fn,op", [
     pytest.param(
