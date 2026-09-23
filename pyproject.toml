@@ -48,7 +48,6 @@ exclude = [
     "ayla/passes/promote_buffers.py",
     "ayla/passes/tile_matmul.py",
     "ayla/ptx_codegen.py",
-    "ayla/ptx_runtime.py",
     "ayla/torch_compile.py",
 ]
 pythonVersion = "3.12"
