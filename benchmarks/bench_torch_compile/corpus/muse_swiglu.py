@@ -17,6 +17,9 @@ def muse_swiglu(
     down_weight: torch.Tensor,
 ) -> torch.Tensor:
     """Run Muse's packed SwiGLU projection and down projection in Torch."""
+    # The captured vLLM post-grad FX graph represents its packed gate/up
+    # projection as one matmul followed by two slices; preserve that structure
+    # so this corpus exercises the graph pattern we intend to replace.
     projection = lhs @ packed_weight.T
     gate = projection[:, :_INTERMEDIATE]
     up = projection[:, _INTERMEDIATE:]
