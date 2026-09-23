@@ -12,6 +12,8 @@ overlap data movement with compute.
 """
 from __future__ import annotations
 
+from typing import cast
+
 from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
@@ -75,8 +77,8 @@ class LowerToAsync(LoweringPass):
     ) -> tuple[list[Op], list[object]] | None:
         if not op.attrs.get("tma"):
             return None
-        dst = self.value_map[op.dst]
-        src = self.value_map[op.src]
+        dst = cast(Value, self.value_map[op.dst])
+        src = cast(Value, self.value_map[op.src])
         move = MoveOp.build(
             dst=dst,
             src=src,
@@ -90,9 +92,9 @@ class LowerToAsync(LoweringPass):
     def lower_tma_move(
         self, op: TmaMoveOp,
     ) -> tuple[list[Op], list[object]]:
-        dst = self.value_map[op.dst]
-        src = self.value_map[op.src]
-        indices = [self.value_map[v] for v in op.indices]
+        dst = cast(Value, self.value_map[op.dst])
+        src = cast(Value, self.value_map[op.src])
+        indices = [cast(Value, self.value_map[v]) for v in op.indices]
         attrs = dict(op.attrs)
         attrs.pop("multicast", None)
         tma = TmaMoveOp.build(
@@ -109,9 +111,9 @@ class LowerToAsync(LoweringPass):
     def lower_matmul(
         self, op: MatmulOp,
     ) -> tuple[list[Op], list[object]] | None:
-        lhs = self.value_map[op.lhs]
-        rhs = self.value_map[op.rhs]
-        dst = self.value_map[op.dst]
+        lhs = cast(Value, self.value_map[op.lhs])
+        rhs = cast(Value, self.value_map[op.rhs])
+        dst = cast(Value, self.value_map[op.dst])
         # Only wgmma matmuls (smem×smem→wgrmem, 4 warps) are async; plain FMA
         # matmuls stay synchronous. Same idea as ``lower_move``'s tma gate.
         # TODO: lower *all* matmuls as async (FMA ones too), wrapping every
