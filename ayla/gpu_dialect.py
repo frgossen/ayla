@@ -1009,8 +1009,8 @@ class BarrierOp(Op):
 
     It only establishes a happens-before across its participating threads.
     Most hardware-backed scopes need no operand. A ``cluster_to_leader`` barrier
-    may carry the mbarrier used for an optimized gather at the cluster leader,
-    while a software grid barrier carries its zero-initialized global-memory
+    carries its cluster mbarrier, while a software grid barrier carries its
+    zero-initialized global-memory
     synchronization buffer. Kernels using a grid barrier must be scheduled so
     all participating blocks can be resident concurrently.
 

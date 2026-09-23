@@ -7,9 +7,9 @@ from ..analysis.sync import (
     BarrierTargetsType,
     SyncAnalysis,
 )
-from ..base.ir import Block, Op, find_op
+from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
-from ..gpu_dialect import BarrierOp, KernelOp, ModuleOp
+from ..gpu_dialect import AllocOp, BarrierOp, KernelOp, LockType, ModuleOp
 
 
 # BarrierScope -> the BarrierOp ``scope`` attr.
@@ -26,6 +26,7 @@ def _insert_barriers(
     block: Block,
     targets: BarrierTargetsType,
     num_threads: int | None,
+    barrier_syncs: dict[Op, Value] | None = None,
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
@@ -49,15 +50,37 @@ def _insert_barriers(
                         f"warps; got {num_threads} threads"
                     )
                 attrs["num_threads"] = num_threads
-            new_ops.append(
-                BarrierOp.build(
-                    scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs,
-                )
+            sync = (
+                barrier_syncs.get(op) if barrier_syncs is not None else None
             )
+            new_ops.append(BarrierOp.build(
+                scope=_BARRIER_OP_SCOPE[target.scope],
+                sync=sync,
+                attrs=attrs,
+            ))
         new_ops.append(op)
         for inner in op.blocks:
-            _insert_barriers(inner, targets, num_threads)
+            _insert_barriers(inner, targets, num_threads, barrier_syncs)
     block.ops = new_ops
+
+
+def _materialize_cluster_mbars(
+    kernel: KernelOp,
+    targets: BarrierTargetsType,
+) -> dict[Op, Value]:
+    """Allocate one cluster mbarrier per cluster-to-leader barrier site."""
+    barrier_syncs: dict[Op, Value] = {}
+    allocs: list[AllocOp] = []
+    for op, target in targets.items():
+        if target.scope != BarrierScope.CLUSTER_TO_LEADER:
+            continue
+        alloc = AllocOp.build_with_fresh_id(
+            LockType.build(kind="cluster_mbar"),
+        )
+        allocs.append(alloc)
+        barrier_syncs[op] = alloc.result()
+    kernel.body.ops[0:0] = allocs
+    return barrier_syncs
 
 
 class InsertSyncs(Pass):
@@ -67,8 +90,11 @@ class InsertSyncs(Pass):
         analysis.analyze(module)
         kernel = find_op(module, lambda op: isinstance(op, KernelOp))
         assert isinstance(kernel, KernelOp)
+        barrier_syncs = _materialize_cluster_mbars(kernel, analysis.targets)
         # Transform: insert the barriers with the kernel-wide participant count.
-        _insert_barriers(module.body, analysis.targets, kernel.num_threads)
+        _insert_barriers(
+            module.body, analysis.targets, kernel.num_threads, barrier_syncs,
+        )
         return module
 
 

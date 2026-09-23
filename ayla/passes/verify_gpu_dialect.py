@@ -180,21 +180,26 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(BarrierOp)
     def _verify_barrier(self, op: BarrierOp) -> None:
-        if op.scope == "cluster_to_leader":
-            if len(op.operands) > 1:
+        if op.scope in (
+            "cluster_to_leader", "leader_to_cluster", "cluster",
+        ):
+            kernel = find_ancestor_of_type(op, KernelOp)
+            if kernel is None or not any(
+                dim is not None for dim in kernel.cluster_dim
+            ):
                 raise ValueError(
-                    "BarrierOp: cluster_to_leader scope accepts at most one "
-                    "sync operand"
+                    "cluster barrier requires an enclosing clustered kernel"
                 )
-        else:
-            expected_operands = 1 if op.scope == "grid" else 0
-            if len(op.operands) != expected_operands:
-                requirement = (
-                    "one sync operand" if expected_operands else "no operands"
-                )
-                raise ValueError(
-                    f"BarrierOp: {op.scope} scope requires {requirement}"
-                )
+        expected_operands = (
+            1 if op.scope in ("cluster_to_leader", "grid") else 0
+        )
+        if len(op.operands) != expected_operands:
+            requirement = (
+                "one sync operand" if expected_operands else "no operands"
+            )
+            raise ValueError(
+                f"BarrierOp: {op.scope} scope requires {requirement}"
+            )
         if op.scope == "grid":
             sync_type = op.operands[0].type
             if not isinstance(sync_type, GmemTensorType):
@@ -208,24 +213,13 @@ class VerifyGpuDialect(VerificationPass):
                 raise ValueError(
                     "BarrierOp: grid sync must contain at least 8 bytes"
                 )
-        elif op.scope == "cluster_to_leader" and op.sync is not None:
+        elif op.scope == "cluster_to_leader":
             if not isinstance(op.operands[0].type, LockType) or (
                 op.operands[0].type.kind != "cluster_mbar"
             ):
                 raise ValueError(
                     "cluster_to_leader barrier sync must be a cluster_mbar lock"
                 )
-        if op.scope in (
-            "cluster_to_leader", "leader_to_cluster", "cluster",
-        ):
-            kernel = find_ancestor_of_type(op, KernelOp)
-            if kernel is None or not any(
-                dim is not None for dim in kernel.cluster_dim
-            ):
-                raise ValueError(
-                    "cluster barrier requires an enclosing clustered kernel"
-                )
-
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
         _verify_collective_attr(op)

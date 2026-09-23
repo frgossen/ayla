@@ -39,10 +39,6 @@ def _lower_barrier(scope: str) -> str:
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
-    ("cluster_to_leader", textwrap.dedent("""\
-        barrier.cluster.arrive.release;
-        barrier.cluster.wait.acquire;
-    """)),
     ("leader_to_cluster", textwrap.dedent("""\
         barrier.cluster.arrive.release;
         barrier.cluster.wait.acquire;

@@ -336,6 +336,18 @@ def test_cluster_to_leader_barrier_requires_cluster_mbar_lock():
         verify_gpu_dialect(module)
 
 
+def test_cluster_to_leader_barrier_requires_sync_operand():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            barrier() attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="requires one sync operand"):
+        verify_gpu_dialect(module)
+
+
 def test_cluster_mbar_cannot_be_used_as_an_async_lock():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

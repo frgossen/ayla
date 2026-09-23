@@ -1075,7 +1075,8 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
-        elif scope == "cluster_to_leader" and op.sync is not None:
+        elif scope == "cluster_to_leader":
+            assert op.sync is not None
             sync = self.value_map[op.sync]
             assert isinstance(sync, Value)
             template = textwrap.dedent("""\
@@ -1103,11 +1104,7 @@ class LowerToPtxTemplate(LoweringPass):
                 """)
             operands = [sync]
             operand_names = ["sync"]
-        elif scope in (
-            "cluster_to_leader", "leader_to_cluster", "cluster",
-        ):
-            # Retain direction in the IR. Handoffs without a synchronization
-            # operand use the parent's conservative full-cluster rendezvous.
+        elif scope in ("leader_to_cluster", "cluster"):
             template = textwrap.dedent("""\
                 barrier.cluster.arrive.release;
                 barrier.cluster.wait.acquire;
