@@ -34,7 +34,9 @@ def _insert_barriers(
                 raise NotImplementedError(
                     f"no lowering for barrier {target.scope.name}"
                 )
-            attrs = {} if target.named_id is None else {"id": target.named_id}
+            attrs: dict[str, object] = (
+                {} if target.named_id is None else {"id": target.named_id}
+            )
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
                 assert num_threads is not None, (
                     "block-leader barriers require resolved block dimensions"
@@ -46,7 +48,9 @@ def _insert_barriers(
                     )
                 attrs["num_threads"] = num_threads
             new_ops.append(
-                BarrierOp.build(scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs)
+                BarrierOp.build(
+                    scope=_BARRIER_OP_SCOPE[target.scope], attrs=attrs,
+                )
             )
         new_ops.append(op)
         for inner in op.blocks:

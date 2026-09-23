@@ -37,7 +37,7 @@ def auto_matmul_4096_module():
             matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
           }
         }""")
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     pipeline = Pipeline()
     pipeline.add_instrumentation_pass(VerifyGpuDialect())
     pipeline.add_pass(TileMatmul(

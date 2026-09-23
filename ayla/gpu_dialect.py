@@ -11,7 +11,18 @@ from typing import ClassVar, Iterator, Literal, cast
 from .base.ir import Block, Dialect, Op, Type, Value
 from .base.printer import Printer
 
-gpu_dialect = Dialect("gpu")
+
+class GpuDialect(Dialect):
+    def __init__(self) -> None:
+        super().__init__("gpu")
+
+    def parse_module(self, source: str) -> ModuleOp:
+        module = self.parse(source)
+        assert isinstance(module, ModuleOp)
+        return module
+
+
+gpu_dialect = GpuDialect()
 
 
 @gpu_dialect.register_op("module")
@@ -75,8 +86,6 @@ class ModuleOp(Op):
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=[])
         return cls.build(body, attrs=attrs)
-
-
 @gpu_dialect.register_op("kernel")
 class KernelOp(Op):
     @classmethod
