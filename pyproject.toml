@@ -48,6 +48,7 @@ include = [
     "ayla/gemm_collection/pranjalssh_4096.py",
     "ayla/gemm_collection/pranjalssh_4096_pipelined.py",
     "ayla/gemm_collection/registry.py",
+    "ayla/gemm_collection/swiglu.py",
     "ayla/gemm_collection/tma_matmul_4096.py",
     "ayla/fx_pipeline.py",
     "ayla/fx_compiler.py",
