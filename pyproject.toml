@@ -38,7 +38,6 @@ include = [
 ]
 exclude = [
     "ayla/passes/lower_to_ptx_template.py",
-    "ayla/passes/promote_buffers.py",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
