@@ -10,7 +10,6 @@ from torch._inductor.pattern_matcher import (
 from ayla.base.ir import find_ops_of_type
 from ayla.fx_compiler import (
     FxRegionMatch,
-    FxToAylaCompiler,
     fx_region_to_module,
     make_fx_to_ayla_rewrite,
 )
@@ -23,7 +22,9 @@ from ayla.gpu_dialect import (
     TileOp,
 )
 from ayla.gemm_collection.gemm import schedule_matmul
+from ayla.jit_compiler import PtxRoutePlan
 from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
+from ayla.ptx_codegen import make_ptx_kernel
 from ayla.torch_custom_call import OperandKind
 
 
@@ -149,26 +150,13 @@ def _gemm_region() -> FxRegionMatch:
     return FxRegionMatch(output, (lhs, weight))
 
 
-def _schedule_gemm(module):
-    return schedule_matmul(
+def _compile_gemm(module):
+    scheduled = schedule_matmul(
         module,
         output_n_tile=64,
         output_tma_inner_size=None,
     )
-
-
-def test_fx_to_ayla_compiler_caches_emitted_ptx_by_tensor_signature():
-    match = _gemm_region()
-    compiler = FxToAylaCompiler(name="fx_gemm", schedule=_schedule_gemm)
-
-    compiler.prepare_region(match)
-    compiler.prepare_region(match)
-
-    assert compiler.cache_size == 1
-    [signature] = compiler._kernels
-    launcher = compiler.build_route(signature)
-    assert launcher.name == "fx_gemm"
-    assert ".entry fx_gemm" in launcher._kernel.ptx
+    return PtxRoutePlan(make_ptx_kernel(scheduled))
 
 
 def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
@@ -176,7 +164,7 @@ def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
 
     patterns = PatternMatcherPass(pass_name="compiled_fx_gemm_test")
     bf16 = BF16Type()
-    replacement = make_fx_to_ayla_rewrite(
+    make_fx_to_ayla_rewrite(
         patterns,
         pattern=CallFunction(
             torch.ops.aten.mm.default,
@@ -197,8 +185,11 @@ def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
         signature_mapping=[
             OperandKind.R, OperandKind.R, OperandKind.RESULT,
         ],
-        schedule=_schedule_gemm,
+        compile_region=_compile_gemm,
         namespace="ayla_compiled_fx_rewrite_test",
+    )
+    replacement = (
+        torch.ops.ayla_compiled_fx_rewrite_test.compiled_fx_gemm.default
     )
 
     module = GraphModule({}, match.output.graph)
