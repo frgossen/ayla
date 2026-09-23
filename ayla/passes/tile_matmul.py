@@ -453,7 +453,7 @@ def _build_tile_op(
         f"per arg dim ({arg.type.sizes})"
     )
     assert len(op_dims) == len(tile_idxs) == len(tile_sizes), (
-        "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the "
+        "_build_tile_op: op_dims, tile_idxs, and tile_sizes must have the "
         "same length"
     )
     name_to_idx = {n: i for i, n in enumerate(dim_names)}

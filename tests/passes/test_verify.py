@@ -11,7 +11,6 @@ from ayla.gpu_dialect import (
     F32Type,
     ForOp,
     GmemTensorType,
-    IndexType,
     LockType,
     ModuleOp,
     MoveOp,
@@ -47,6 +46,23 @@ def test_default_verification_allows_dynamic_shapes():
     assert verify_gpu_dialect(module) is module
 
 
+def test_kernel_warp_groups_require_128_x_threads_each():
+    invalid = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[192, 1, 1] num_warp_groups=1 {
+          }
+        }"""))
+    with pytest.raises(ValueError, match="128 threads per warp group"):
+        verify_gpu_dialect(invalid)
+
+    dynamic = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[None, 1, 1] num_warp_groups=2 {
+          }
+        }"""))
+    assert verify_gpu_dialect(dynamic) is dynamic
+
+
 @pytest.mark.parametrize("step", [0, -1])
 def test_default_verification_rejects_nonpositive_loop_step(step):
     module = ModuleOp.build(Block(ops=[ForOp.build(0, 4, step)]))
@@ -57,42 +73,79 @@ def test_default_verification_rejects_nonpositive_loop_step(step):
 
 def test_default_verification_checks_tma_move_structure():
     gmem_type = GmemTensorType.build([64, 64], F32Type())
+    gmem = Value(name="gmem", type=gmem_type)
+    smem = Value(
+        name="smem", type=SmemTensorType.build([64, 64], F32Type()),
+    )
     descriptor = Value(
         name="descriptor",
         type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
     )
-    smem = Value(
-        name="smem", type=SmemTensorType.build([64, 64], F32Type()),
-    )
-    gmem = Value(name="gmem", type=gmem_type)
-    indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
     collective = {
         axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
     }
 
     valid = ModuleOp.build(Block(ops=[TmaMoveOp.build(
-        smem, descriptor, indices=indices, collective=collective,
+        smem, gmem, descriptor, collective=collective,
     )]))
     assert verify_gpu_dialect(valid) is valid
 
-    wrong_index_count = ModuleOp.build(Block(ops=[TmaMoveOp.build(
-        smem, descriptor, indices=indices[:1], collective=collective,
+    missing_descriptor = ModuleOp.build(Block(ops=[TmaMoveOp(
+        operands=[smem, gmem], results=[], attrs={},
     )]))
-    with pytest.raises(ValueError, match="one index per TMA dimension"):
-        verify_gpu_dialect(wrong_index_count)
-
-    wrong_memory_space = ModuleOp.build(Block(ops=[TmaMoveOp.build(
-        gmem, descriptor, indices=indices, collective=collective,
-    )]))
-    with pytest.raises(ValueError, match="one TMA descriptor and one smem"):
-        verify_gpu_dialect(wrong_memory_space)
-
-    missing_descriptor = ModuleOp.build(Block(ops=[TmaMoveOp.build(
-        smem, gmem, indices=indices, collective=collective,
-    )]))
-    with pytest.raises(ValueError, match="one TMA descriptor and one smem"):
+    with pytest.raises(ValueError, match="expects dst, src, and descriptor"):
         verify_gpu_dialect(missing_descriptor)
 
+    wrong_memory_spaces = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        gmem, gmem, descriptor, collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="one gmem and one smem"):
+        verify_gpu_dialect(wrong_memory_spaces)
+
+    wrong_descriptor = ModuleOp.build(Block(ops=[TmaMoveOp.build(
+        smem, gmem, gmem, collective=collective,
+    )]))
+    with pytest.raises(ValueError, match="TMA descriptor"):
+        verify_gpu_dialect(wrong_descriptor)
+
+
+@pytest.mark.parametrize(
+    "level", [CollectiveLevel.WARP, CollectiveLevel.WG],
+)
+def test_collective_warp_levels_are_x_only(level):
+    typ = GmemTensorType.build([1], F32Type())
+    src = Value(name="src", type=typ)
+    dst = Value(name="dst", type=typ)
+    collective = {
+        CollectiveAxis.X: CollectiveLevel.THREAD,
+        CollectiveAxis.Y: level,
+        CollectiveAxis.Z: CollectiveLevel.THREAD,
+    }
+    move = MoveOp.build(dst, src, collective=collective)
+
+    with pytest.raises(ValueError, match="only supported on the x axis"):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[move])))
+
+
+@pytest.mark.parametrize(
+    "level,block_x,group_size",
+    [
+        ("warp", 48, 32),
+        ("wg", 192, 128),
+    ],
+)
+def test_sub_block_collectivity_requires_complete_groups(
+    level, block_x, group_size,
+):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k(%src: gmem<1xf32>, %dst: gmem<1xf32>) block_dim=[{block_x}, 1, 1] {{
+            move(%dst: gmem<1xf32>, %src: gmem<1xf32>) collective=[x.{level}, yz.thread]
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match=f"divisible by {group_size}"):
+        verify_gpu_dialect(module)
 
 def test_default_verification_checks_tile_result_type():
     source = Value(

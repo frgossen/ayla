@@ -17,6 +17,7 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
     BarrierScope.BLOCK_TO_LEADER: "block_leader",
     BarrierScope.BLOCK: "block",
     BarrierScope.CLUSTER: "cluster",
+    BarrierScope.GRID: "grid",
 }
 
 

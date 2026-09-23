@@ -409,30 +409,33 @@ def test_async_op_single_move():
 
 def test_tma_move_build_accepts_l2_cache_hint():
     gmem_type = GmemTensorType.build((64, 64), F32Type())
+    gmem = Value(name="gmem", type=gmem_type)
     desc = Value(
         name="desc",
         type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
     )
     smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
-    indices = [Value(name=f"i{i}", type=IndexType()) for i in range(2)]
+    collective = {
+        axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+    }
 
     op = TmaMoveOp.build(
         smem,
+        gmem,
         desc,
-        indices=indices,
-        collective={
-            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
-        },
+        collective=collective,
         l2_cache_hint="evict_last",
     )
 
     assert op.l2_cache_hint == "evict_last"
+    assert op.gmem is gmem
+    assert op.smem is smem
+    assert op.descriptor is desc
     assert_print_and_roundtrip(
         op,
-        "tma_move(%smem: smem<64x64xf32>, %desc: "
-        "tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %i0: index, "
-        "%i1: index) collective=xyz.block "
-        'attrs={l2_cache_hint: "evict_last"}',
+        "tma_move(%smem: smem<64x64xf32>, %gmem: gmem<64x64xf32>, "
+        "%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) "
+        "collective=xyz.block attrs={l2_cache_hint: \"evict_last\"}",
     )
 
 
@@ -443,13 +446,13 @@ def test_tma_move_build_accepts_l2_cache_hint():
             True,
             {
                 ("W", "smem", CollectiveScope.BLOCK_LEADER),
-                ("R", "desc", CollectiveScope.BLOCK_LEADER),
+                ("R", "gmem", CollectiveScope.GRID),
             },
         ),
         (
             False,
             {
-                ("W", "desc", CollectiveScope.BLOCK_LEADER),
+                ("W", "gmem", CollectiveScope.GRID),
                 ("R", "smem", CollectiveScope.BLOCK_LEADER),
             },
         ),
@@ -461,17 +464,15 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         name="desc",
         type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
     )
+    gmem = Value(name="gmem", type=gmem_type)
     smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
-    index = Value(name="index", type=IndexType())
-    dst, src = (smem, desc) if smem_is_dst else (desc, smem)
+    dst, src = (smem, gmem) if smem_is_dst else (gmem, smem)
 
     effects = memory_effects(TmaMoveOp.build(
         dst,
         src,
-        indices=[index],
-        collective={
-            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
-        },
+        desc,
+        collective={axis: CollectiveLevel.BLOCK for axis in CollectiveAxis},
     ))
 
     assert effects is not None

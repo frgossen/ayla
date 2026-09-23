@@ -298,6 +298,54 @@ class LowerToPtxTemplate(LoweringPass):
         policy = f"${{b64:operand.{policy_name}.ptr}}"
         return f"{opcode}.L2::cache_hint {arguments}, {policy};"
 
+    def _materialize_tma_indices(
+        self, op: TmaMoveOp,
+    ) -> tuple[list[Op], list[Value]]:
+        """Materialize root-relative TMA coordinates from the gmem tile chain."""
+        tiles: list[TileOp] = []
+        root = op.gmem
+        while isinstance(root.definition, TileOp):
+            tiles.append(root.definition)
+            root = root.definition.arg
+
+        assert isinstance(root.type, GmemTensorType)
+        zero = IndexConstantOp.build(0)
+        new_ops: list[Op] = [zero]
+        indices = [zero.result()] * root.type.rank
+
+        for tile in reversed(tiles):
+            for dim in range(len(tile.indices)):
+                offset_ops, offset = self._materialize_tile_element_offset(
+                    tile, dim,
+                )
+                new_ops.extend(offset_ops)
+                add_op = IndexAddOp.build(indices[dim], offset)
+                new_ops.append(add_op)
+                indices[dim] = add_op.result()
+
+        return new_ops, indices
+
+    def _materialize_tile_element_offset(
+        self, op: TileOp, dim: int,
+    ) -> tuple[list[Op], Value]:
+        """Materialize one tile dimension's parent-relative element offset."""
+        index = op.indices[dim]
+        new_ops: list[Op] = []
+        if isinstance(index, int):
+            index_op = IndexConstantOp.build(index)
+            new_ops.append(index_op)
+            index = index_op.result()
+        else:
+            mapped = self.value_map[index]
+            assert isinstance(mapped, Value)
+            index = mapped
+
+        size_op = IndexConstantOp.build(op.result().type.sizes[dim])
+        new_ops.append(size_op)
+        offset_op = IndexMulOp.build(index, size_op.result())
+        new_ops.append(offset_op)
+        return new_ops, offset_op.result()
+
     @lowers(TileOp)
     def lower_tile(
         self, op: TileOp,
@@ -346,19 +394,11 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops.append(zero)
         byte_offset = zero.result()
 
-        for dim, idx in enumerate(op.indices):
-            if isinstance(idx, int):
-                const_op = IndexConstantOp.build(idx)
-                new_ops.append(const_op)
-                idx = const_op.result()
-            else:
-                idx = self.value_map[idx]
-
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
-            new_ops.append(tile_size_op)
-            elem_off = IndexMulOp.build(idx, tile_size_op.result())
-            new_ops.append(elem_off)
-
+        for dim in range(len(op.indices)):
+            offset_ops, elem_off = self._materialize_tile_element_offset(
+                op, dim,
+            )
+            new_ops.extend(offset_ops)
             stride = view_root_type.strides[dim]
             if (
                 layout is not None
@@ -375,7 +415,7 @@ class LowerToPtxTemplate(LoweringPass):
             stride_bytes = stride * dtype_bytes
             stride_op = IndexConstantOp.build(stride_bytes)
             new_ops.append(stride_op)
-            byte_term = IndexMulOp.build(elem_off.result(), stride_op.result())
+            byte_term = IndexMulOp.build(elem_off, stride_op.result())
             new_ops.append(byte_term)
             add_op = IndexAddOp.build(byte_offset, byte_term.result())
             new_ops.append(add_op)
@@ -1718,9 +1758,11 @@ class LowerToPtxTemplate(LoweringPass):
         The barrier inserted before the async orders all threads' shared-memory
         writes before thread 0 starts the store.
         """
-        dst_value = self.value_map[op.dst]
+        dst_value = self.value_map[op.descriptor]
         src_value = self.value_map[op.src]
-        idx_values = [self.value_map[v] for v in op.indices]
+        assert isinstance(dst_value, Value)
+        assert isinstance(src_value, Value)
+        index_ops, idx_values = self._materialize_tma_indices(op)
         desc_type = dst_value.type
         assert isinstance(desc_type, TmaDescType)
 
@@ -1769,7 +1811,7 @@ class LowerToPtxTemplate(LoweringPass):
             result_names=[],
             description=str(op),
         )
-        return [new_op], []
+        return [*index_ops, new_op], []
 
 
     def _lower_async_tma_loads(
@@ -1792,9 +1834,12 @@ class LowerToPtxTemplate(LoweringPass):
         operand_names: list[str] = ["lock"]
         total_bytes = 0
         load_lines: list[str] = []
+        index_ops: list[Op] = []
         for i, tma in enumerate(tmas):
             dst_value = self.value_map[tma.dst]
-            desc_value = self.value_map[tma.src]
+            desc_value = self.value_map[tma.descriptor]
+            assert isinstance(dst_value, Value)
+            assert isinstance(desc_value, Value)
             assert isinstance(desc_value.type, TmaDescType), (
                 f"_lower_async_tma_loads: load src must be a TMA descriptor; "
                 f"got {desc_value.type}"
@@ -1803,7 +1848,8 @@ class LowerToPtxTemplate(LoweringPass):
             total_bytes += (
                 desc_type.tile_num_elements * desc_type.gmem_type.dtype.byte_size
             )
-            idx_values = [self.value_map[v] for v in tma.indices]
+            tma_index_ops, idx_values = self._materialize_tma_indices(tma)
+            index_ops.extend(tma_index_ops)
             dn, sn = f"dst{i}", f"desc{i}"
             idx_names = [f"idx{i}_{j}" for j in range(len(idx_values))]
             operands += [dst_value, desc_value] + idx_values
@@ -1855,7 +1901,7 @@ class LowerToPtxTemplate(LoweringPass):
             result_names=[],
             description=str(op),
         )
-        return [new_op], []
+        return [*index_ops, new_op], []
 
 
 
