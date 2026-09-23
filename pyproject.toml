@@ -37,7 +37,6 @@ include = [
     "ayla",
 ]
 exclude = [
-    "ayla/passes/folding.py",
     "ayla/passes/lower_to_ptx_template.py",
     "ayla/passes/promote_buffers.py",
     "ayla/passes/tile_matmul.py",

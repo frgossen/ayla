@@ -20,6 +20,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    MemTensorType,
     ModuleOp,
     PtrAddOp,
     SelectOp,
@@ -47,7 +48,6 @@ def _iv_loop(value: Value) -> ForOp | None:
 
 
 class Folding(LoweringPass):
-
     @lowers(ForOp)
     def lower_for(
         self, op: ForOp,
@@ -81,7 +81,8 @@ class Folding(LoweringPass):
 
     def _const_val(self, value: Value) -> int | None:
         mapped = self.value_map.get(value, value)
-        if isinstance(mapped, Value) and isinstance(mapped.definition, IndexConstantOp):
+        assert isinstance(mapped, Value)
+        if isinstance(mapped.definition, IndexConstantOp):
             return mapped.definition.value
         return None
 
@@ -93,13 +94,17 @@ class Folding(LoweringPass):
         Otherwise returns (value, 0).
         """
         mapped = self.value_map.get(value, value)
+        assert isinstance(mapped, Value)
         const = self._const_val(value)
         if const is not None:
             return None, const
         if isinstance(mapped.definition, IndexAddOp):
             rhs_const = self._const_val(mapped.definition.rhs)
             if rhs_const is not None:
-                lhs = self.value_map.get(mapped.definition.lhs, mapped.definition.lhs)
+                lhs = self.value_map.get(
+                    mapped.definition.lhs, mapped.definition.lhs,
+                )
+                assert isinstance(lhs, Value)
                 return lhs, rhs_const
         return mapped, 0
 
@@ -139,6 +144,7 @@ class Folding(LoweringPass):
 
         # Append combined constant on the rhs.
         if const_sum != 0:
+            assert result is not None
             c = IndexConstantOp.build(const_sum)
             add = IndexAddOp.build(result, c.result())
             new_ops.extend([c, add])
@@ -154,13 +160,17 @@ class Folding(LoweringPass):
         Otherwise returns (value, 1).
         """
         mapped = self.value_map.get(value, value)
+        assert isinstance(mapped, Value)
         const = self._const_val(value)
         if const is not None:
             return None, const
         if isinstance(mapped.definition, IndexMulOp):
             rhs_const = self._const_val(mapped.definition.rhs)
             if rhs_const is not None:
-                lhs = self.value_map.get(mapped.definition.lhs, mapped.definition.lhs)
+                lhs = self.value_map.get(
+                    mapped.definition.lhs, mapped.definition.lhs,
+                )
+                assert isinstance(lhs, Value)
                 return lhs, rhs_const
         return mapped, 1
 
@@ -173,6 +183,8 @@ class Folding(LoweringPass):
         # ``x * factor`` term to CSE across sibling affine coordinates.
         lhs = self.value_map.get(op.lhs, op.lhs)
         rhs = self.value_map.get(op.rhs, op.rhs)
+        assert isinstance(lhs, Value)
+        assert isinstance(rhs, Value)
         lhs_factor = self._const_val(op.lhs)
         rhs_factor = self._const_val(op.rhs)
         add_value, factor = (
@@ -184,9 +196,9 @@ class Folding(LoweringPass):
             add_const = self._const_val(add.rhs)
             if add_const is not None:
                 factor_op = IndexConstantOp.build(factor)
-                product = IndexMulOp.build(
-                    self.value_map.get(add.lhs, add.lhs), factor_op.result(),
-                )
+                add_lhs = self.value_map.get(add.lhs, add.lhs)
+                assert isinstance(add_lhs, Value)
+                product = IndexMulOp.build(add_lhs, factor_op.result())
                 offset = IndexConstantOp.build(add_const * factor)
                 result = IndexAddOp.build(product.result(), offset.result())
                 return [factor_op, product, offset, result], [result.result()]
@@ -228,6 +240,7 @@ class Folding(LoweringPass):
 
         # Append combined constant on the rhs.
         if const_prod != 1:
+            assert result is not None
             c = IndexConstantOp.build(const_prod)
             mul = IndexMulOp.build(result, c.result())
             new_ops.extend([c, mul])
@@ -272,7 +285,7 @@ class Folding(LoweringPass):
         # is (lb + c) % m for any m dividing the step.
         base, offset = self._decompose_add(op.lhs)
         loop = _iv_loop(base) if rhs_val and base is not None else None
-        if loop is not None and loop.step % rhs_val == 0:
+        if loop is not None and rhs_val is not None and loop.step % rhs_val == 0:
             new_op = IndexConstantOp.build((loop.lb + offset) % rhs_val)
             return [new_op], [new_op.result()]
         return None
@@ -282,6 +295,7 @@ class Folding(LoweringPass):
         self, op: PtrAddOp,
     ) -> tuple[list[Op], list[object]] | None:
         ptr = self.value_map[op.ptr]
+        assert isinstance(ptr, Value)
         offset_val = self._const_val(op.byte_offset)
         if offset_val == 0:
             return [], [ptr]
@@ -293,7 +307,12 @@ class Folding(LoweringPass):
         self, op: TileOp,
     ) -> tuple[list[Op], list[object]] | None:
         arg = self.value_map[op.arg]
-        if list(op.result().type.sizes) == list(arg.type.sizes):
+        assert isinstance(arg, Value)
+        result_type = op.result().type
+        arg_type = arg.type
+        assert isinstance(result_type, MemTensorType)
+        assert isinstance(arg_type, MemTensorType)
+        if list(result_type.sizes) == list(arg_type.sizes):
             return [], [arg]
         indices: list[int | Value] = []
         changed = False
@@ -302,6 +321,7 @@ class Folding(LoweringPass):
                 indices.append(index)
                 continue
             mapped = self.value_map.get(index, index)
+            assert isinstance(mapped, Value)
             constant = self._const_val(index)
             if constant is None:
                 indices.append(mapped)
