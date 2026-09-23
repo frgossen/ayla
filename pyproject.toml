@@ -50,6 +50,7 @@ include = [
     "ayla/gemm_collection/registry.py",
     "ayla/gemm_collection/tma_matmul_4096.py",
     "ayla/fx_pipeline.py",
+    "ayla/fx_compiler.py",
     "ayla/gpu_dialect.py",
     "ayla/passes/__init__.py",
     "ayla/passes/_loop_utils.py",
