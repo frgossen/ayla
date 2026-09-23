@@ -24,6 +24,9 @@ What makes this small is that ayla does not generate a fused kernel on demand:
 fusing is swapping in a different prebuilt op. A kernel built per epilogue
 would need real codegen here.
 
+Multi-operation regions such as Muse SwiGLU are handled earlier by the
+post-grad FX-to-Ayla pipeline, before their individual operations lower to
+Inductor IR.
 """
 from __future__ import annotations
 
@@ -51,10 +54,12 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from . import gemm_collection  # noqa: F401 -- defines the ops below
+from .fx_pipeline import PostGradFxPipeline
+from .gemm_collection.muse_swiglu import MUSE_SWIGLU_RULE
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
 _MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
-_MUSE_SWIGLU_OP = torch.ops.ayla.muse_swiglu.default
+_POST_GRAD_PIPELINE = PostGradFxPipeline([MUSE_SWIGLU_RULE])
 
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
@@ -184,3 +189,72 @@ def _lower_mm(lhs, rhs, *, layout=None):
     if not is_contiguous_strides_for_shape(
         tuple(reversed(rhs.get_stride())), tuple(reversed(rhs.get_size()))
     ):
+        return None
+
+    # TODO: generalize past a single hard-coded kernel. What is missing is
+    # deciding between the kernels that could serve a shape, without ayla
+    # grading its own kernels inside Inductor's autotuner.
+    if (m, k, n, lhs.get_dtype()) != (4096, 4096, 4096, torch.bfloat16):
+        return None
+
+    return TensorBox.create(
+        AylaTemplateBuffer(layout=layout, inputs=[lhs, rhs])
+    )
+
+
+_LOWERING_TARGET = torch.ops.aten.mm.default
+_displaced_user_lowering = None
+_displaced_backend = None
+_displaced_post_grad_pass = None
+
+
+def _post_grad_passes(configured) -> tuple:
+    if configured is None:
+        return ()
+    if isinstance(configured, (list, tuple)):
+        return tuple(configured)
+    return (configured,)
+
+
+def install() -> None:
+    """Install Ayla's graph rewrites, lowering, and CUDA scheduling."""
+    global _displaced_user_lowering, _displaced_backend
+    global _displaced_post_grad_pass
+    init_backend_registration()
+    existing = inductor_config.post_grad_custom_post_pass
+    existing_passes = _post_grad_passes(existing)
+    if _POST_GRAD_PIPELINE not in existing_passes:
+        _displaced_post_grad_pass = inductor_config.post_grad_custom_post_pass
+        inductor_config.post_grad_custom_post_pass = [
+            *existing_passes, _POST_GRAD_PIPELINE,
+        ]
+    if _displaced_backend is None:
+        _displaced_backend = device_codegens["cuda"]
+        register_backend_for_device(
+            "cuda", AylaCombinedScheduling, PythonWrapperCodegen, CppWrapperGpu,
+        )
+
+    current = user_lowerings.get(_LOWERING_TARGET)
+    if current is _lower_mm:
+        return
+    _displaced_user_lowering = current
+    user_lowerings[_LOWERING_TARGET] = _lower_mm
+
+
+def uninstall() -> None:
+    """Restore the displaced graph pass, ``aten.mm``, and CUDA scheduling."""
+    global _displaced_backend
+    current = inductor_config.post_grad_custom_post_pass
+    if _POST_GRAD_PIPELINE in _post_grad_passes(current):
+        inductor_config.post_grad_custom_post_pass = _displaced_post_grad_pass
+    # Stand down if someone has claimed cuda since, rather than overwrite them.
+    installed = device_codegens.get("cuda")
+    if installed is not None and installed.scheduling is AylaCombinedScheduling:
+        device_codegens["cuda"] = _displaced_backend
+        _displaced_backend = None
+
+    if user_lowerings.get(_LOWERING_TARGET) is not _lower_mm:
+        return
+    del user_lowerings[_LOWERING_TARGET]
+    if _displaced_user_lowering is not None:
+        user_lowerings[_LOWERING_TARGET] = _displaced_user_lowering
