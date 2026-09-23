@@ -46,7 +46,6 @@ exclude = [
     "ayla/passes/lower_to_tma_move.py",
     "ayla/passes/peel_loop.py",
     "ayla/passes/promote_buffers.py",
-    "ayla/passes/tile_elementwise.py",
     "ayla/passes/tile_matmul.py",
     "ayla/ptx_codegen.py",
     "ayla/ptx_runtime.py",
