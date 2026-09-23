@@ -8,7 +8,9 @@ from typing import cast
 import torch
 from torch.fx import Node
 from torch._inductor.pattern_matcher import (
+    MULTIPLE,
     CallFunction,
+    CallFunctionVarArgs,
     KeywordArg,
     Match,
     PatternExpr,
@@ -72,6 +74,63 @@ _DECOMPOSED_SILU = CallFunction(
     ),
     torch.bfloat16,
 )
+
+
+_SUPPORTED_FX_TARGETS = {
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.div.Tensor,
+    torch.ops.aten.exp.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.neg.default,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.sigmoid.default,
+    torch.ops.aten.silu.default,
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.view.default,
+    torch.ops.prims.convert_element_type.default,
+}
+
+
+def _is_supported_fx_node(node: Node) -> bool:
+    return node.op == "call_function" and node.target in _SUPPORTED_FX_TARGETS
+
+
+def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
+    """Find the maximal self-contained supported region ending at ``output``.
+
+    A node is considered an anchor only when no supported operation consumes
+    it. Walking backward then identifies supported computation and treats all
+    other producers as ordered region inputs. Values escaping from the middle
+    of the candidate make it ineligible for replacement.
+    """
+    if not _is_supported_fx_node(output) or any(
+        _is_supported_fx_node(user) for user in output.users
+    ):
+        return None
+
+    region: set[Node] = set()
+    boundary_set: set[Node] = set()
+    boundaries: list[Node] = []
+
+    def visit(node: Node) -> None:
+        if node in region or node in boundary_set:
+            return
+        if not _is_supported_fx_node(node):
+            boundary_set.add(node)
+            boundaries.append(node)
+            return
+        region.add(node)
+        for argument in node.all_input_nodes:
+            visit(argument)
+
+    visit(output)
+    if any(
+        node is not output and set(node.users) - region
+        for node in region
+    ):
+        return None
+    return FxRegionMatch(output=output, inputs=tuple(boundaries))
 
 
 def _node_type(node: Node) -> GmemTensorType:
@@ -329,13 +388,12 @@ def _match_signature(match: FxRegionMatch) -> TensorSignature:
 def make_fx_to_ayla_rewrite(
     patterns: PatternMatcherPass,
     *,
-    pattern: PatternExpr,
-    input_names: tuple[str, ...],
+    root: object,
     name: str,
     signature: list[Type],
     signature_mapping: list[OperandKind],
     compile_region: Callable[[ModuleOp], LauncherPlan],
-    extra_check: Callable[[Match], bool] | None = None,
+    accept: Callable[[FxRegionMatch], bool] | None = None,
     namespace: str = DEFAULT_NAMESPACE,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> None:
@@ -345,22 +403,102 @@ def make_fx_to_ayla_rewrite(
         signature=signature,
         compile_fn=compile_region,
     )
+    checked_match = make_fx_region_matcher(
+        signature=signature,
+        signature_mapping=signature_mapping,
+        accept=accept,
+    )
+
+    def region(torch_match: Match) -> FxRegionMatch | None:
+        return checked_match(torch_match.output_node())
+
+    def resolve_inputs(torch_match: Match) -> tuple[Node, ...]:
+        candidate = region(torch_match)
+        if candidate is None:
+            raise RuntimeError("accepted FX match no longer describes a region")
+        return candidate.inputs
 
     def prepare(torch_match: Match, inputs: tuple[Node, ...]) -> None:
-        region = FxRegionMatch(torch_match.output_node(), inputs)
+        candidate = FxRegionMatch(torch_match.output_node(), inputs)
         compiler.prepare_module(
-            _match_signature(region),
-            fx_region_to_module(region, name=name),
+            _match_signature(candidate),
+            fx_region_to_module(candidate, name=name),
         )
 
     register_fx_kernel_rewrite(
         patterns,
-        pattern=pattern,
-        input_names=input_names,
+        pattern=CallFunctionVarArgs(root, users=MULTIPLE),
+        resolve_inputs=resolve_inputs,
         compiler=compiler,
         signature_mapping=signature_mapping,
-        extra_check=extra_check,
+        extra_check=lambda torch_match: region(torch_match) is not None,
         namespace=namespace,
         infer_result_shapes=infer_result_shapes,
         prepare=prepare,
     )
+
+
+def make_fx_region_matcher(
+    *,
+    signature: list[Type],
+    signature_mapping: list[OperandKind],
+    accept: Callable[[FxRegionMatch], bool] | None = None,
+) -> Callable[[Node], FxRegionMatch | None]:
+    """Discover regions and restrict them to one custom-op signature."""
+
+    def checked_match(node: Node) -> FxRegionMatch | None:
+        candidate = discover_supported_fx_region(node)
+        if candidate is None or not _matches_signature(
+            candidate, signature, signature_mapping,
+        ):
+            return None
+        if accept is not None and not accept(candidate):
+            return None
+        return candidate
+
+    return checked_match
+
+
+def _matches_signature(
+    match: FxRegionMatch,
+    signature: list[Type],
+    signature_mapping: list[OperandKind],
+) -> bool:
+    if len(signature) != len(signature_mapping):
+        raise ValueError("signature and signature mapping must have equal length")
+    if signature_mapping.count(OperandKind.RESULT) != 1:
+        raise ValueError("FX regions currently require exactly one result")
+    nodes = iter(match.inputs)
+    actual: list[Node] = []
+    for kind in signature_mapping:
+        if kind == OperandKind.RESULT:
+            actual.append(match.output)
+            continue
+        node = next(nodes, None)
+        if node is None:
+            return False
+        actual.append(node)
+    if next(nodes, None) is not None:
+        return False
+
+    for node, expected in zip(actual, signature, strict=True):
+        if not isinstance(expected, GmemTensorType):
+            return False
+        found = _node_type(node)
+        if found.dtype != expected.dtype or found.rank != expected.rank:
+            return False
+        if any(
+            declared is not None and declared != concrete
+            for declared, concrete in zip(
+                expected.sizes, found.sizes, strict=True,
+            )
+        ):
+            return False
+        if any(
+            declared is not None and declared != concrete
+            for declared, concrete in zip(
+                expected.strides, found.strides, strict=True,
+            )
+        ):
+            return False
+    return True
