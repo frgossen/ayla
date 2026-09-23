@@ -14,6 +14,7 @@ from ..gpu_dialect import (
     KernelOp,
     MatmulOp,
     MemoryEffect,
+    MemTensorType,
     ModuleOp,
     ThreadIdsOp,
     TileOp,
@@ -126,6 +127,16 @@ class TileMatmul(LoweringPass):
     TMA.
     """
 
+    op_dims: list[str]
+    tile_sizes: list[int]
+    iteration_bindings: list[
+        tuple[CollectiveLevel, CollectiveAxis] | None
+    ]
+    for_loop_labels: list[str | None]
+    op_label_filter: str | None
+    epilogue_label_filter: str | None
+    allow_partial_tiles: bool
+
     def __init__(
         self,
         op_dims: list[str],
@@ -189,7 +200,7 @@ class TileMatmul(LoweringPass):
         self, op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
         self._kernel = op
-        heroes = find_ops(op, self._is_hero)
+        heroes = cast(list[MatmulOp], find_ops(op, self._is_hero))
         bounds = {hero: self._iteration_bounds(hero) for hero in heroes}
         self._resolve_launch_extents(bounds)
         self._rewrite_block(op.body, bounds)
@@ -218,6 +229,7 @@ class TileMatmul(LoweringPass):
                 new_ops.append(op)
                 i += 1
                 continue
+            assert isinstance(op, MatmulOp)
             epilogue = self._epilogue(ops, i)
             new_ops.extend(self._tile(op, epilogue, bounds[op]))
             i += 1 + len(epilogue)
@@ -237,7 +249,9 @@ class TileMatmul(LoweringPass):
         stepped over, or absorbing what follows would reorder the two.
         """
         found: list[Op] = []
-        dst = ops[hero].dst
+        hero_op = ops[hero]
+        assert isinstance(hero_op, MatmulOp)
+        dst = hero_op.dst
         i = hero + 1
         while i < len(ops):
             op = ops[i]
@@ -255,6 +269,8 @@ class TileMatmul(LoweringPass):
 
     def _iteration_bounds(self, hero: MatmulOp) -> list[int]:
         lhs, rhs, _ = hero.operands
+        assert isinstance(lhs.type, MemTensorType)
+        assert isinstance(rhs.type, MemTensorType)
         sizes_by_dim = {
             "M": lhs.type.sizes[0],
             "N": rhs.type.sizes[0],
@@ -270,6 +286,9 @@ class TileMatmul(LoweringPass):
                     f"got {op_dim!r}"
                 )
             op_dim_size = sizes_by_dim[op_dim]
+            assert isinstance(op_dim_size, int), (
+                f"TileMatmul: op_dim {op_dim} must be statically sized"
+            )
             is_partial = op_dim_size % tile_size != 0
             if is_partial and not (
                 self.allow_partial_tiles
@@ -437,8 +456,11 @@ class TileMatmul(LoweringPass):
                     ]
                 continue
             body = Block(arguments=[iv], ops=body_ops)
-            attrs = {"label": label} if label is not None else None
-            body_ops = [ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)]
+            attrs: dict[str, object] | None = (
+                {"label": label} if label is not None else None
+            )
+            loop: Op = ForOp.build(lb=0, ub=ub, body=body, attrs=attrs)
+            body_ops = [loop]
             if i == outside_of:
                 if hoist_dst:
                     body_ops[:0] = dst_ops
@@ -456,7 +478,7 @@ class TileMatmul(LoweringPass):
     ) -> None:
         level, axis = iteration_binding
         if level == CollectiveLevel.BLOCK:
-            required = [None, None, None]
+            required: list[int | None] = [None, None, None]
             required[axis] = ub
             self._kernel.grid_dim = _resolve_launch_dim_constraints(
                 list(self._kernel.grid_dim), required,
@@ -516,9 +538,11 @@ def _build_tile_op(
     subsequent steps operate on, so the same dim can be tiled
     multiple times (e.g. K=64 then K=16).
     """
-    assert len(dim_names) == len(arg.type.sizes), (
+    arg_type = arg.type
+    assert isinstance(arg_type, MemTensorType)
+    assert len(dim_names) == len(arg_type.sizes), (
         f"_build_tile_op: dim_names ({dim_names}) must have one entry "
-        f"per arg dim ({arg.type.sizes})"
+        f"per arg dim ({arg_type.sizes})"
     )
     assert len(op_dims) == len(tile_idxs) == len(tile_sizes), (
         "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the "
@@ -532,13 +556,20 @@ def _build_tile_op(
         d = name_to_idx.get(name)
         if d is None:
             continue
-        maybe_partial = name in maybe_partial_dims or cur.type.sizes[d] % ts != 0
+        cur_type = cur.type
+        assert isinstance(cur_type, MemTensorType)
+        size = cur_type.sizes[d]
+        assert isinstance(size, int)
+        maybe_partial = name in maybe_partial_dims or size % ts != 0
         if maybe_partial:
             maybe_partial_dims.add(name)
         new_type = clone_type(cur.type)
-        indices: list[Value | int] = [0] * len(new_type.sizes)
+        assert isinstance(new_type, MemTensorType)
+        sizes = list(new_type.sizes)
+        indices: list[Value | int] = [0] * len(sizes)
         indices[d] = iv
-        new_type.sizes[d] = ts
+        sizes[d] = ts
+        new_type.sizes = sizes
         tile_op = TileOp.build(
             cur, indices, new_type, maybe_partial=maybe_partial,
         )
