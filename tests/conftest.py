@@ -3,18 +3,18 @@ import itertools
 
 import pytest
 
-from ayla.gpu_dialect import AllocOp
+from ayla.gpu_dialect import AllocOp, MemoryEffect
 
 
 @pytest.fixture(autouse=True)
-def reset_alloc_ids():
-    """Number allocations from zero in every test.
+def reset_fresh_ids():
+    """Number allocations and tiling schemes from zero in every test.
 
     The ids come from a counter shared by the whole process, so without this a
-    test's expected IR would depend on how many allocations were built before
-    it -- importing the kernel collection alone burns over a hundred.
+    test's expected IR would depend on how many objects were built before it.
     """
     AllocOp._id_counter = itertools.count()
+    MemoryEffect._tiling_scheme_id_counter = itertools.count()
 
 
 @pytest.fixture
@@ -25,6 +25,7 @@ def ayla_installed():
     from ayla import torch_compile
 
     AllocOp._id_counter = itertools.count()
+    MemoryEffect._tiling_scheme_id_counter = itertools.count()
     torch_compile.install()
     try:
         yield

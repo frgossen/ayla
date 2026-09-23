@@ -19,6 +19,8 @@ Example — promote lhs/rhs to smem::
 
 from __future__ import annotations
 
+from typing import cast
+
 from ..base.ir import Block, Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
@@ -438,6 +440,7 @@ class PromoteBuffers(LoweringPass):
         src: Value,
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None,
+        writeback_tiling_scheme: int | None,
     ) -> list[Op]:
         """Stage a narrow distributed value for one block-wide TMA store.
 
@@ -507,8 +510,13 @@ class PromoteBuffers(LoweringPass):
                 if self.writeback_slices > 1 else []
             )
             store_dst_value = store_tiles[0].result() if store_tiles else block_dst
-            store_attrs = {"label": f"{matmul_label}_dst_tma", "tma": True}
+            store_attrs: dict[str, object] = {
+                "label": f"{matmul_label}_dst_tma",
+                "tma": True,
+            }
             store_attrs.update(self.move_attrs.get("dst", {}))
+            if writeback_tiling_scheme is not None:
+                store_attrs["dst_tiling_scheme"] = writeback_tiling_scheme
             store = MoveOp.build(
                 dst=store_dst_value,
                 src=smem.result(),
@@ -526,6 +534,7 @@ class PromoteBuffers(LoweringPass):
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
         epilogue: list[ElementwiseOp] | None = None,
+        writeback_tiling_scheme: int | None = None,
     ) -> tuple[list[Op], list[Value]]:
         target_level = _target_level(self.target_type)
         dst_level = _collective_level(dst)
@@ -564,10 +573,16 @@ class PromoteBuffers(LoweringPass):
             new_ops.extend(epilogue)
         if self.tma and self.target_type == "wrmem":
             new_ops.extend(self._build_tma_writeback(
-                dst, src, collective, matmul_label,
+                dst,
+                src,
+                collective,
+                matmul_label,
+                writeback_tiling_scheme,
             ))
             return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
+        if writeback_tiling_scheme is not None:
+            attrs["dst_tiling_scheme"] = writeback_tiling_scheme
         move = MoveOp.build(
             dst=dst, src=src, collective=collective, attrs=attrs,
         )
@@ -661,13 +676,16 @@ class PromoteBuffers(LoweringPass):
             if self.target_type != "smem":
                 init = None
 
+        matmul_attrs = op.extra_attrs
+        for operand_name in self.operand_names:
+            matmul_attrs.pop(f"{operand_name}_tiling_scheme", None)
         matmul = MatmulOp.build(
             lhs=new_lhs,
             rhs=new_rhs,
             dst=new_dst,
             collective=op.collective,
             init=init,
-            attrs=op.extra_attrs,
+            attrs=matmul_attrs,
         )
 
         # The epilogue runs on the promoted buffer, before it is written back:
@@ -678,8 +696,12 @@ class PromoteBuffers(LoweringPass):
             for e in epilogue
         ]
         if "dst" in self.operand_names:
+            writeback_tiling_scheme = cast(
+                int | None, op.attrs.get("dst_tiling_scheme")
+            )
             post_ops, _ = self._build_operand_writeback(
                 dst, new_dst, "dst", op.collective, label, post_ops,
+                writeback_tiling_scheme,
             )
 
         return pre_ops + [matmul] + post_ops

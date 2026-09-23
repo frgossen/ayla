@@ -143,10 +143,12 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
 @dataclasses.dataclass(frozen=True)
 class ConcurrentMemoryEffect:
     """One outstanding concurrent memory effect on a buffer: an "R"/"W" ``kind``
-    at collective ``scope``, with a ``pending_await`` on the lock that clears it
-    (``None`` if it's already live for barriers to order)."""
+    at collective ``scope``. Matching non-null ``tiling_scheme`` IDs prove two
+    accesses disjoint. ``pending_await`` names the lock that clears the effect,
+    or is ``None`` when it is already live for barriers to order."""
     kind: str
     scope: CollectiveScope
+    tiling_scheme: int | None
     pending_await: Value | None
 
 
@@ -259,6 +261,12 @@ def _transfer_memory_effects(
     for current in effects:
         for root in current.roots:
             for prior in live.concurrent_memory_effects.get(root, ()):
+                # Matching scheme IDs prove the runtime accesses pairwise disjoint.
+                if (
+                    current.tiling_scheme is not None
+                    and current.tiling_scheme == prior.tiling_scheme
+                ):
+                    continue
                 # A hazard needs a write (RAR is safe).
                 if prior.kind == "W" or current.kind == "W":
                     barrier_scope = barrier_scope.join(
@@ -337,7 +345,8 @@ def _transfer_memory_effects(
             else None
         )
         effect = ConcurrentMemoryEffect(
-            memory_effect.kind, memory_effect.scope, pending,
+            memory_effect.kind, memory_effect.scope,
+            memory_effect.tiling_scheme, pending,
         )
         for root in memory_effect.roots:
             live.concurrent_memory_effects.setdefault(root, set()).add(effect)

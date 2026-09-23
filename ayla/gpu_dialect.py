@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar, Iterator, Literal, cast
 
-from .base.ir import Block, Dialect, Op, Type, Value
+from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor_of_type
 from .base.printer import Printer
 
 
@@ -393,6 +393,9 @@ class MatmulOp(Op):
 
     def is_block_collective(self, *axes: CollectiveAxis) -> bool:
         return self._is_collective(CollectiveLevel.BLOCK, axes)
+
+    def is_grid_collective(self, *axes: CollectiveAxis) -> bool:
+        return self._is_collective(CollectiveLevel.GRID, axes)
 
     def is_thread_collective(self, *axes: CollectiveAxis) -> bool:
         return self._is_collective(CollectiveLevel.THREAD, axes)
@@ -2315,6 +2318,13 @@ class MemoryEffect:
     kind: Literal["R", "W"]
     value: Value
     scope: CollectiveScope
+    tiling_scheme: int | None = None
+
+    _tiling_scheme_id_counter: ClassVar[Iterator[int]] = itertools.count()
+
+    @classmethod
+    def fresh_tiling_scheme_id(cls) -> int:
+        return next(cls._tiling_scheme_id_counter)
 
     @property
     def roots(self) -> set[Value]:
@@ -2322,9 +2332,21 @@ class MemoryEffect:
 
 
 def _memory_effect(
-    kind: Literal["R", "W"], value: Value, scope: CollectiveScope,
+    kind: Literal["R", "W"],
+    value: Value,
+    scope: CollectiveScope,
+    tiling_scheme: int | None = None,
 ) -> list[MemoryEffect]:
-    return [MemoryEffect(kind, value, scope)]
+    return [MemoryEffect(kind, value, scope, tiling_scheme)]
+
+
+def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
+    if not isinstance(value.type, TmaDescType):
+        return value
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None:
+        return value
+    return kernel.body.arguments[value.type.arg_idx]
 
 
 def memory_effects(op: Op) -> list[MemoryEffect] | None:
@@ -2332,7 +2354,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
 
     Each effect retains the accessed view so consumers can recover its precise
     region. ``effect.roots`` provides its underlying allocations/arguments for
-    conservative alias checks.
+    conservative alias checks. A non-null ``tiling_scheme`` identifies a family
+    of accesses known to be pairwise disjoint.
 
     Returns ``None`` for ops we don't know how to model; callers must treat that
     as a worst-case conflict.
@@ -2353,26 +2376,57 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             else _type_collective_scope(op.dst.type)
         )
         return (
-            _memory_effect("W", op.dst, dst_scope)
-            + _memory_effect("R", op.src, src_scope)
+            _memory_effect(
+                "W", op.dst, dst_scope,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
+            + _memory_effect(
+                "R", op.src, src_scope,
+                cast(int | None, op.attrs.get("src_tiling_scheme")),
+            )
         )
     if isinstance(op, TmaMoveOp):
-        # The block leader issues both sides of the TMA transfer.
+        # The block leader issues the transfer, while global memory is shared
+        # across the grid. The descriptor is metadata, not memory.
+        dst_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if isinstance(op.dst.type, SmemTensorType)
+            else CollectiveScope.GRID
+        )
+        src_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if isinstance(op.src.type, SmemTensorType)
+            else CollectiveScope.GRID
+        )
         return (
-            _memory_effect("W", op.dst, CollectiveScope.BLOCK_LEADER)
-            + _memory_effect("R", op.src, CollectiveScope.BLOCK_LEADER)
+            _memory_effect(
+                "W", _resolve_tma_descriptor(op, op.dst), dst_scope,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
+            + _memory_effect(
+                "R", _resolve_tma_descriptor(op, op.src), src_scope,
+                cast(int | None, op.attrs.get("src_tiling_scheme")),
+            )
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         return (
             _memory_effect(
                 "R", op.lhs, _type_collective_scope(op.lhs.type),
+                cast(int | None, op.attrs.get("lhs_tiling_scheme")),
             )
             + _memory_effect(
                 "R", op.rhs, _type_collective_scope(op.rhs.type),
+                cast(int | None, op.attrs.get("rhs_tiling_scheme")),
             )
-            + _memory_effect("R", op.dst, CollectiveScope.THREAD)
-            + _memory_effect("W", op.dst, CollectiveScope.THREAD)
+            + _memory_effect(
+                "R", op.dst, CollectiveScope.THREAD,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
+            + _memory_effect(
+                "W", op.dst, CollectiveScope.THREAD,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
         )
     if isinstance(op, ElementwiseOp):
         effects = _memory_effect("W", op.dst, CollectiveScope.THREAD)

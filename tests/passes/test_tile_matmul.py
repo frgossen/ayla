@@ -41,7 +41,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
                 %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %m: index, 0)
                 %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
                 %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=xyz.grid
+                matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=xyz.grid attrs={lhs_tiling_scheme: 0}
               }
             }
           }
@@ -143,7 +143,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
               %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
               %2: gmem<32x16xbf16 strides=[64, 1]> = tile(%1: gmem<32x64xbf16>, 0, %k: index)
               %3: gmem<128x16xbf16 strides=[64, 1]> = tile(%b: gmem<128x64xbf16>, 0, %k: index)
-              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=[x.block, yz.grid] attrs={label: "mm"}
+              matmul(%2: gmem<32x16xbf16 strides=[64, 1]>, %3: gmem<128x16xbf16 strides=[64, 1]>, %0: gmem<32x128xf32>) collective=[x.block, yz.grid] attrs={label: "mm", lhs_tiling_scheme: 0}
             }
             elementwise sigmoid(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={label: "epilogue"}
           }
@@ -176,7 +176,7 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
             if(%0: pred) {
               %1: gmem<64x64xbf16> = tile(%b: gmem<192x64xbf16>, %bx: index, 0)
               %2: gmem<64x64xf32 strides=[192, 1]> = tile(%c: gmem<64x192xf32>, 0, %bx: index)
-              matmul(%a: gmem<64x64xbf16>, %1: gmem<64x64xbf16>, %2: gmem<64x64xf32 strides=[192, 1]>) collective=[x.block, yz.grid] attrs={label: "mm"}
+              matmul(%a: gmem<64x64xbf16>, %1: gmem<64x64xbf16>, %2: gmem<64x64xf32 strides=[192, 1]>) collective=[x.block, yz.grid] attrs={dst_tiling_scheme: 1, label: "mm", rhs_tiling_scheme: 0}
               elementwise sigmoid(%2: gmem<64x64xf32 strides=[192, 1]>, %2: gmem<64x64xf32 strides=[192, 1]>) attrs={label: "epi"}
             }
           }
@@ -332,3 +332,51 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
         op_label_filter="missing",
     )
     assert repr(unmatched) == before
+
+
+def test_tiling_schemes_are_refined_across_two_matmuls():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) {
+            matmul(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "up"}
+            matmul(%intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "down"}
+          }
+        }"""))  # noqa: E501
+
+    tile_matmul(
+        module,
+        op_dims=["N"], tile_sizes=[64],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.Y)],
+        for_loop_labels=[None],
+    )
+    matmuls = find_ops_of_type(module, MatmulOp)
+    assert [
+        {
+            name: op.attrs[name]
+            for name in op.attrs
+            if name.endswith("_tiling_scheme")
+        }
+        for op in matmuls
+    ] == [
+        {"rhs_tiling_scheme": 0, "dst_tiling_scheme": 1},
+        {"rhs_tiling_scheme": 2, "dst_tiling_scheme": 3},
+    ]
+
+    tile_matmul(
+        module,
+        op_dims=["M"], tile_sizes=[32],
+        iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+        for_loop_labels=[None],
+    )
+    matmuls = find_ops_of_type(module, MatmulOp)
+    assert [
+        {
+            name: op.attrs[name]
+            for name in op.attrs
+            if name.endswith("_tiling_scheme")
+        }
+        for op in matmuls
+    ] == [
+        {"dst_tiling_scheme": 1},
+        {"dst_tiling_scheme": 3},
+    ]

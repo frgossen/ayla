@@ -7,15 +7,72 @@ from ayla import Block, Op
 from ayla.analysis.sync import (
     BarrierScope,
     BarrierTarget,
+    SyncAnalysis,
     _barrier_covers,
     _barrier_scope,
 )
-from ayla.gpu_dialect import CollectiveScope, gpu_dialect
+from ayla.base.ir import find_ops_of_type
+from ayla.gpu_dialect import CollectiveScope, TmaMoveOp, gpu_dialect
 from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
+
+
+def test_tma_descriptors_for_the_same_argument_alias():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%h: gmem<2x2xf32>, %store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>) {
+            %c0: index = index_constant() attrs={value: 0}
+            %s0: smem<2x2xf32> = alloc()
+            %s1: smem<1x2xf32> = alloc()
+            tma_move(%store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %s0: smem<2x2xf32>, %c0: index, %c0: index)
+            tma_move(%s1: smem<1x2xf32>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>, %c0: index, %c0: index)
+          }
+        }"""))  # noqa: E501
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    store, load = find_ops_of_type(module, TmaMoveOp)
+
+    assert analysis.targets[load].scope == BarrierScope.GRID
+
+
+def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %tile: smem<64x64xbf16> = alloc()
+            %value: rmem<64x64xbf16> = alloc()
+            %lock: lock<bulk> = alloc()
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            await(%lock: lock<bulk>)
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+          }
+        }"""))  # noqa: E501
+    insert_syncs(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %tile: smem<64x64xbf16> = alloc()
+            %value: rmem<64x64xbf16> = alloc()
+            %lock: lock<bulk> = alloc()
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            await(%lock: lock<bulk>)
+            barrier() attrs={scope: "block"}
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+          }
+        }""")  # noqa: E501
+
 
 def test_block_leader_barrier_requires_whole_warps():
     op = Op(operands=[], results=[])
