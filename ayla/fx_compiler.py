@@ -1,7 +1,8 @@
 """Translate matched post-grad FX regions into high-level Ayla GPU IR."""
 from __future__ import annotations
 
-from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch.fx import Node
@@ -12,7 +13,6 @@ from torch._inductor.pattern_matcher import (
 )
 
 from .base.ir import Block, Op, Value
-from .fx_pipeline import FxRegionMatch
 from .gpu_dialect import (
     AllocOp,
     CollectiveAxis,
@@ -28,7 +28,21 @@ from .passes._utils import build_slice_tile
 from .torch_custom_call import from_torch_dtype
 
 
-_GRID = {axis: CollectiveLevel.GRID for axis in CollectiveAxis}
+_ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
+    torch.ops.prims.convert_element_type.default: ("convert", 1),
+    torch.ops.aten.sigmoid.default: ("sigmoid", 1),
+    torch.ops.aten.silu.default: ("silu", 1),
+    torch.ops.aten.mul.Tensor: ("mul", 2),
+}
+
+
+@dataclass(frozen=True)
+class FxRegionMatch:
+    """The boundary of one single-output FX region."""
+
+    output: Node
+    inputs: tuple[Node, ...]
+
 
 _SILU_SOURCE = KeywordArg("source")
 _DECOMPOSED_SILU = CallFunction(
@@ -99,6 +113,9 @@ def _decomposed_silu(
     node: Node,
 ) -> tuple[Node, set[Node]] | None:
     """Recognize the post-grad ``x * sigmoid(x)`` expansion ending in BF16."""
+    # TODO: Import the primitive math operations into Ayla IR, then recognize
+    # and lower compound expressions there. Keep this targeted FX match only
+    # until neg, exp, add, and div have complete Ayla lowering support.
     match = _DECOMPOSED_SILU.match(node)
     if not is_match(match):
         return None
@@ -121,6 +138,9 @@ def _allocate(
 
 
 def _transpose_source(node: Node) -> Node | None:
+    # TODO: Import arbitrary FX permutations once the GPU dialect can express
+    # strided aliasing views. For now, recognize only the 2D weight transpose
+    # that can be elided because Ayla matmul already expects an [N, K] RHS.
     if (
         node.op != "call_function"
         or node.target is not torch.ops.aten.permute.default
@@ -196,7 +216,9 @@ def fx_region_to_module(
                 values[lhs_node],
                 values[rhs_source],
                 dst,
-                collective=_GRID,
+                collective={
+                    axis: CollectiveLevel.GRID for axis in CollectiveAxis
+                },
                 init=0.0,
                 attrs={"label": node.name},
             ))
@@ -211,11 +233,12 @@ def fx_region_to_module(
             continue
 
         if node.target is torch.ops.aten.slice.Tensor:
-            source = _node_argument(node.args[0], owner=node)
+            source = cast(Node, node.args[0])
             dim, start, _end = node.args[1:4]
+            dim = cast(int, dim)
             step = node.args[4] if len(node.args) == 5 else 1
-            if not isinstance(dim, int) or not isinstance(start, int):
-                raise ValueError(f"{node.name}: slice indices must be static")
+            if not isinstance(start, int):
+                raise ValueError(f"{node.name}: slice start must be static")
             if not isinstance(step, int):
                 raise ValueError(f"{node.name}: slice step must be static")
             if step != 1:
@@ -235,28 +258,22 @@ def fx_region_to_module(
             values[node] = tile.result()
             continue
 
-        elementwise_fn: str | None = None
-        sources: Iterable[object] = ()
         if node in silu_sources:
             elementwise_fn = "silu"
-            sources = [silu_sources[node]]
-        elif node.target is torch.ops.prims.convert_element_type.default:
-            elementwise_fn = "convert"
-            sources = node.args[:1]
-        elif node.target is torch.ops.aten.sigmoid.default:
-            elementwise_fn = "sigmoid"
-            sources = node.args
-        elif node.target is torch.ops.aten.silu.default:
-            elementwise_fn = "silu"
-            sources = node.args
-        elif node.target is torch.ops.aten.mul.Tensor:
-            elementwise_fn = "mul"
-            sources = node.args
+            source_nodes = [silu_sources[node]]
+        else:
+            elementwise = _ELEMENTWISE_OPS.get(node.target)
+            if elementwise is None:
+                elementwise_fn = None
+                source_nodes = []
+            else:
+                elementwise_fn, num_sources = elementwise
+                source_nodes = [
+                    _node_argument(source, owner=node)
+                    for source in node.args[:num_sources]
+                ]
 
         if elementwise_fn is not None:
-            source_nodes = [
-                _node_argument(source, owner=node) for source in sources
-            ]
             dst = _allocate(node, match.output, output_value, ops)
             ops.append(ElementwiseOp.build(
                 dst,

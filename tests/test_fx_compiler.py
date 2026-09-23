@@ -4,8 +4,7 @@ import pytest
 import torch
 from torch.fx import Graph, Node
 
-from ayla.fx_compiler import fx_region_to_module
-from ayla.fx_pipeline import FxRegionMatch
+from ayla.fx_compiler import FxRegionMatch, fx_region_to_module
 from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
 
 
