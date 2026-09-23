@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 from ..gpu_dialect import (
     BlockIdsOp,
     CollectiveAxis,
@@ -11,13 +13,21 @@ from ..gpu_dialect import (
     IndexType,
     KernelOp,
     MatmulOp,
+    MemoryEffect,
     ModuleOp,
     ThreadIdsOp,
     TileOp,
     WarpGroupIdOp,
     is_elementwise,
 )
-from ..base.ir import Block, Op, Value, clone_type, find_ops
+from ..base.ir import (
+    Block,
+    Op,
+    Value,
+    clone_type,
+    find_ancestor_of_type,
+    find_ops,
+)
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
 
@@ -27,6 +37,58 @@ _PARALLEL_ID_OPS = {
     CollectiveLevel.THREAD: ThreadIdsOp,
     CollectiveLevel.WG: WarpGroupIdOp,
 }
+
+_OPERAND_DIMS = {
+    "lhs": frozenset(("M", "K")),
+    "rhs": frozenset(("N", "K")),
+    "dst": frozenset(("M", "N")),
+}
+
+
+def _refine_tiling_schemes(
+    hero: MatmulOp,
+    op_dims: list[str],
+    tile_counts: list[int],
+) -> dict[str, int]:
+    """Retain each operand's ID while its tiled accesses stay disjoint."""
+    partitioned_dims = {
+        dim
+        for dim, count in zip(op_dims, tile_counts, strict=True)
+        if count > 1
+    }
+    disjoint_operands = [
+        name
+        for name, dims in _OPERAND_DIMS.items()
+        if partitioned_dims <= dims
+    ]
+
+    existing = {
+        name: scheme_id
+        for name in _OPERAND_DIMS
+        if (
+            scheme_id := cast(
+                int | None, hero.attrs.get(f"{name}_tiling_scheme")
+            )
+        ) is not None
+    }
+    if existing:
+        return {
+            name: scheme_id
+            for name, scheme_id in existing.items()
+            if name in disjoint_operands
+        }
+
+    can_initialize = (
+        hero.is_grid_collective()
+        and find_ancestor_of_type(hero, ForOp) is None
+    )
+    if not can_initialize:
+        return {}
+
+    return {
+        name: MemoryEffect.fresh_tiling_scheme_id()
+        for name in disjoint_operands
+    }
 
 
 class TileMatmul(LoweringPass):
@@ -259,6 +321,7 @@ class TileMatmul(LoweringPass):
         ubs: list[int],
     ) -> list[Op]:
         lhs, rhs, dst = hero.operands
+        tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
         parallel_ids: dict[
@@ -333,13 +396,18 @@ class TileMatmul(LoweringPass):
                     axis,
                     level,
                 )
+        attrs = hero.extra_attrs
+        for name in _OPERAND_DIMS:
+            attrs.pop(f"{name}_tiling_scheme", None)
+        for name, scheme_id in tiling_schemes.items():
+            attrs[f"{name}_tiling_scheme"] = scheme_id
         body_ops.append(
             MatmulOp.build(
                 lhs=lhs,
                 rhs=rhs,
                 dst=dst,
                 collective=hero.collective,
-                attrs=hero.extra_attrs,
+                attrs=attrs,
                 init=hero.init,
             ),
         )

@@ -2,7 +2,9 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import AllocOp, gpu_dialect
+from ayla.gpu_dialect import AllocOp, TmaMoveOp, gpu_dialect
+from ayla.passes.lower_to_async import lower_to_async
+from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.promote_buffers import promote_buffers
 
 
@@ -28,6 +30,45 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
     assert "move(%3: smem<64x256xbf16>, %1: wrmem<64x256xbf16" in text
     assert "move(%c: gmem<128x256xbf16>" in text
     assert 'attrs={label: "mm_dst_tma", tma: True}' in text
+
+
+def test_wrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, init: 0.0, label: "mm", lhs_tiling_scheme: 6}
+          }
+        }"""))
+    promote_buffers(
+        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+    )
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem<64x256xbf16> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
+            %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", lhs_tiling_scheme: 6}
+            %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
+            %2: smem<128x256xbf16> = alloc() attrs={id: 2}
+            %3: smem<64x256xbf16> = tile(%2: smem<128x256xbf16>, %wgx: index, 0)
+            move(%3: smem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_smem"}
+            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, label: "mm_dst_tma", tma: True}
+          }
+        }""")  # noqa: E501
+
+    lower_to_tma_move(module)
+    lower_to_async(module)
+    [writeback] = [
+        op for op in find_ops_of_type(module, TmaMoveOp)
+        if op.attrs.get("label") == "mm_dst_tma"
+    ]
+    assert "src_tiling_scheme" not in writeback.attrs
+    assert writeback.attrs["dst_tiling_scheme"] == 7
 
 
 def test_wrmem_tma_writeback_can_use_one_arena_per_slice():

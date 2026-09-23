@@ -17,6 +17,43 @@ from ayla.passes.insert_syncs import (
 )
 from tests.testing_utils import assert_contains_in_order
 
+
+def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %tile: smem<64x64xbf16> = alloc()
+            %value: rmem<64x64xbf16> = alloc()
+            %lock: lock<bulk> = alloc()
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            await(%lock: lock<bulk>)
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+          }
+        }"""))  # noqa: E501
+    insert_syncs(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %tile: smem<64x64xbf16> = alloc()
+            %value: rmem<64x64xbf16> = alloc()
+            %lock: lock<bulk> = alloc()
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            await(%lock: lock<bulk>)
+            barrier() attrs={scope: "block"}
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+          }
+        }""")  # noqa: E501
+
+
 def test_block_leader_barrier_requires_whole_warps():
     op = Op(operands=[], results=[])
     block = Block(ops=[op])

@@ -225,6 +225,15 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
         _verify_collective_attr(op)
+        for operand_name in ("lhs", "rhs", "dst"):
+            attr_name = f"{operand_name}_tiling_scheme"
+            scheme_id = op.attrs.get(attr_name)
+            if scheme_id is not None and (
+                type(scheme_id) is not int or scheme_id < 0
+            ):
+                raise ValueError(
+                    f"matmul {attr_name} must be a non-negative integer"
+                )
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):

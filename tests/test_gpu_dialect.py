@@ -170,8 +170,10 @@ def test_matmul_program():
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
     assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
+    assert matmul.is_grid_collective()
     assert matmul.is_block_collective()
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
+    assert not matmul.is_grid_collective()
     assert matmul.is_wg_collective()
     assert not matmul.is_block_collective(CollectiveAxis.X)
     assert matmul.is_block_collective(CollectiveAxis.Y, CollectiveAxis.Z)
@@ -442,15 +444,15 @@ def test_tma_move_build_accepts_l2_cache_hint():
         (
             True,
             {
-                ("W", "smem", CollectiveScope.BLOCK_LEADER),
-                ("R", "desc", CollectiveScope.BLOCK_LEADER),
+                ("W", "smem", CollectiveScope.BLOCK_LEADER, 7),
+                ("R", "desc", CollectiveScope.GRID, 8),
             },
         ),
         (
             False,
             {
-                ("W", "desc", CollectiveScope.BLOCK_LEADER),
-                ("R", "smem", CollectiveScope.BLOCK_LEADER),
+                ("W", "desc", CollectiveScope.GRID, 7),
+                ("R", "smem", CollectiveScope.BLOCK_LEADER, 8),
             },
         ),
     ],
@@ -472,11 +474,12 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         collective={
             axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
         },
+        attrs={"dst_tiling_scheme": 7, "src_tiling_scheme": 8},
     ))
 
     assert effects is not None
     assert {
-        (effect.kind, root.name, effect.scope)
+        (effect.kind, root.name, effect.scope, effect.tiling_scheme)
         for effect in effects
         for root in effect.roots
     } == expected
