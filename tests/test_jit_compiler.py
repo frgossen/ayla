@@ -34,9 +34,14 @@ class _Tensor:
 
 
 def _patch_metadata(monkeypatch, compiler, m=4):
-    key = ("test", m)
+    signature = tuple(
+        (shape, tuple(reversed(range(1, len(shape) + 1))), torch.bfloat16)
+        for shape in _shapes(m)
+    )
     monkeypatch.setattr(
-        compiler, "_metadata", lambda tensors: (key, _shapes(m)),
+        compiler,
+        "_metadata",
+        lambda tensors: (torch.device("cuda"), signature),
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
@@ -59,7 +64,6 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
     compiler(*tensors)
     compiler(*tensors)
     assert len(compiled) == 1
-    assert compiler.cache_size == 1
     compiled_launcher = compiler._launcher(tensors)
     assert compiled_launcher.launches == 2
     assert "?" not in repr(compiled[0])
