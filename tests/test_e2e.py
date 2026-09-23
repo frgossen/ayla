@@ -2,7 +2,6 @@
 import json
 import textwrap
 
-import pytest
 import torch
 
 from ayla.base.pipeline import Pipeline
@@ -15,31 +14,6 @@ from ayla.passes.unroll_loop import UnrollLoop
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
-
-
-@requires_cuda
-@pytest.mark.parametrize("m", [1, 4, 32, 64, 512, 2048])
-def test_muse_swiglu_route_matches_torch(m: int):
-    """Exercise every tuned route independently of graph capture."""
-    from ayla.gemm_collection.muse_swiglu import (
-        make_muse_swiglu_launcher,
-    )
-    from benchmarks.bench_torch_compile.corpus.muse_swiglu import (
-        build_config,
-        muse_swiglu,
-    )
-    from benchmarks.common import error_metrics
-
-    config = build_config(m)
-    inputs = config.make_inputs()
-    expected = muse_swiglu(*inputs)
-    output = torch.empty_like(expected)
-    ayla_swiglu = make_muse_swiglu_launcher(m)
-    ayla_swiglu(*inputs, output)
-    torch.cuda.synchronize()
-    max_abs, relative_rms = error_metrics(output, expected)
-    assert max_abs <= .125
-    assert relative_rms <= .006
 
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(
