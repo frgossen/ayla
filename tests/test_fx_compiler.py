@@ -2,10 +2,23 @@ import textwrap
 
 import pytest
 import torch
-from torch.fx import Graph, Node
+from torch.fx import Graph, GraphModule, Node
+from torch._inductor.pattern_matcher import (
+    CallFunction,
+    KeywordArg,
+    PatternMatcherPass,
+)
 
-from ayla.fx_compiler import FxRegionMatch, fx_region_to_module
+from ayla.fx_compiler import (
+    FxRegionMatch,
+    FxToAylaCompiler,
+    fx_region_to_module,
+    make_fx_to_ayla_rewrite,
+)
+from ayla.gpu_dialect import BF16Type, GmemTensorType
+from ayla.gemm_collection.gemm import schedule_matmul
 from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
+from ayla.torch_custom_call import OperandKind
 
 
 def _meta(node: Node, shape, dtype=torch.bfloat16, strides=None) -> Node:
@@ -129,3 +142,85 @@ def test_fx_region_import_rejects_intermediate_external_users():
 
     with pytest.raises(ValueError, match="region value has external users"):
         fx_region_to_module(match, name="swiglu")
+
+
+def _gemm_region() -> FxRegionMatch:
+    graph = Graph()
+    lhs = _meta(graph.placeholder("lhs"), (128, 64))
+    weight = _meta(graph.placeholder("weight"), (64, 64))
+    weight_t = _meta(graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, [1, 0]),
+    ), (64, 64), strides=(1, 64))
+    output = _meta(graph.call_function(
+        torch.ops.aten.mm.default, args=(lhs, weight_t),
+    ), (128, 64))
+    graph.output(output)
+    return FxRegionMatch(output, (lhs, weight))
+
+
+def _schedule_gemm(module):
+    return schedule_matmul(
+        module,
+        output_n_tile=64,
+        output_tma_inner_size=None,
+    )
+
+
+def test_fx_to_ayla_compiler_caches_emitted_ptx_by_tensor_signature():
+    match = _gemm_region()
+    compiler = FxToAylaCompiler(name="fx_gemm", schedule=_schedule_gemm)
+
+    compiler.prepare_region(match)
+    compiler.prepare_region(match)
+
+    assert compiler.cache_size == 1
+    [signature] = compiler._kernels
+    launcher = compiler.build_route(signature)
+    assert launcher.name == "fx_gemm"
+    assert ".entry fx_gemm" in launcher._kernel.ptx
+
+
+def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
+    match = _gemm_region()
+
+    patterns = PatternMatcherPass(pass_name="compiled_fx_gemm_test")
+    bf16 = BF16Type()
+    replacement = make_fx_to_ayla_rewrite(
+        patterns,
+        pattern=CallFunction(
+            torch.ops.aten.mm.default,
+            KeywordArg("lhs"),
+            CallFunction(
+                torch.ops.aten.permute.default,
+                KeywordArg("weight"),
+                [1, 0],
+            ),
+        ),
+        input_names=("lhs", "weight"),
+        name="compiled_fx_gemm",
+        signature=[
+            GmemTensorType.build([128, 64], bf16),
+            GmemTensorType.build([64, 64], bf16),
+            GmemTensorType.build([128, 64], bf16),
+        ],
+        signature_mapping=[
+            OperandKind.R, OperandKind.R, OperandKind.RESULT,
+        ],
+        schedule=_schedule_gemm,
+        namespace="ayla_compiled_fx_rewrite_test",
+    )
+
+    module = GraphModule({}, match.output.graph)
+    assert patterns.apply(module) == 1
+
+    calls = [
+        node for node in module.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert len(calls) == 1
+    assert calls[0].target is replacement
+    result = replacement(
+        torch.empty((128, 64), dtype=torch.bfloat16, device="meta"),
+        torch.empty((64, 64), dtype=torch.bfloat16, device="meta"),
+    )
+    assert result.shape == (128, 64)
