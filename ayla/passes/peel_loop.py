@@ -28,6 +28,10 @@ from ._utils import label_matches
 class PeelLoop(LoweringPass):
     """Peel matching loops at both ends by fixed iteration counts."""
 
+    label_filter: str
+    front_iterations: int
+    back_iterations: int
+
     def __init__(
         self,
         label_filter: str,
