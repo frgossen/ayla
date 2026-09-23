@@ -58,7 +58,7 @@ class LowerToTmaMove(LoweringPass):
         leaving the body as just the ``tma_move``(s) that ``lower_async`` (PTX
         lowering) expects.
         """
-        op.operands = [self.value_map[v] for v in op.operands]
+        op.operands = [cast(Value, self.value_map[v]) for v in op.operands]
         body = op.body
         self.lower_block(body)
         hoisted = [o for o in body.ops if is_side_effect_free(o)]
@@ -72,7 +72,7 @@ class LowerToTmaMove(LoweringPass):
         smem_operand = move.dst if is_load else move.src
 
         index_ops, root, indices = _build_tile_chain_indices(gmem_operand)
-        smem = self.value_map[smem_operand]
+        smem = cast(Value, self.value_map[smem_operand])
 
         assert isinstance(root.type, GmemTensorType), (
             f"lower_to_tma_move: tiled operand must be gmem; got {root.type}"
@@ -88,10 +88,12 @@ class LowerToTmaMove(LoweringPass):
         desc_attrs: dict[str, object] = {}
         if layout is not None:
             desc_attrs["physical_layout"] = layout
+        tile_shape = list(smem.type.sizes)
+        assert all(isinstance(size, int) for size in tile_shape)
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=root.type,
-            tile_shape=list(smem.type.sizes),
+            tile_shape=cast(list[int], tile_shape),
             swizzle=smem.type.swizzle,
             l2_promotion=cast(str | None, move.attrs.get("l2_promotion")),
             attrs=desc_attrs or None,
@@ -111,8 +113,8 @@ class LowerToTmaMove(LoweringPass):
             entry_block.append_argument(desc_value)
 
         attrs = dict(move.attrs)
-        l2_cache_hint = attrs.pop("l2_cache_hint", None)
-        multicast = attrs.pop("multicast", False)
+        l2_cache_hint = cast(str | None, attrs.pop("l2_cache_hint", None))
+        multicast = cast(bool, attrs.pop("multicast", False))
         if is_load:
             tma_op = TmaMoveOp.build(
                 dst=smem,
@@ -121,7 +123,7 @@ class LowerToTmaMove(LoweringPass):
                 collective=move.collective,
                 attrs=attrs,
                 l2_cache_hint=l2_cache_hint,
-                multicast=multicast,  # type: ignore[arg-type]
+                multicast=multicast,
             )
         else:
             tma_op = TmaMoveOp.build(
@@ -131,7 +133,7 @@ class LowerToTmaMove(LoweringPass):
                 collective=move.collective,
                 attrs=attrs,
                 l2_cache_hint=l2_cache_hint,
-                multicast=multicast,  # type: ignore[arg-type]
+                multicast=multicast,
             )
         return index_ops, tma_op
 
@@ -150,20 +152,27 @@ def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value
         v = v.definition.arg
     root = v
 
-    ndims = root.type.rank
+    root_type = root.type
+    assert isinstance(root_type, GmemTensorType)
+    ndims = root_type.rank
     zero = IndexConstantOp.build(0)
     new_ops: list[Op] = [zero]
     indices = [zero.result()] * ndims
 
     for tile_op in reversed(tiles):
-        result_sizes = list(tile_op.result().type.sizes)
+        result_type = tile_op.result().type
+        assert isinstance(result_type, GmemTensorType)
+        result_sizes = list(result_type.sizes)
+        assert all(isinstance(size, int) for size in result_sizes)
         for dim, idx in enumerate(tile_op.indices):
             if isinstance(idx, int):
                 const_op = IndexConstantOp.build(idx)
                 new_ops.append(const_op)
                 idx = const_op.result()
 
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
+            tile_size_op = IndexConstantOp.build(
+                cast(int, result_sizes[dim]),
+            )
             new_ops.append(tile_size_op)
             mul_op = IndexMulOp.build(idx, tile_size_op.result())
             new_ops.append(mul_op)
