@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar, Iterator, Literal, cast
 
-from .base.ir import Block, Dialect, Op, Type, Value
+from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor_of_type
 from .base.printer import Printer
 
 gpu_dialect = Dialect("gpu")
@@ -2284,6 +2284,15 @@ def _memory_effect(
     return [MemoryEffect(kind, value, scope, tiling_scheme)]
 
 
+def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
+    if not isinstance(value.type, TmaDescType):
+        return value
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None:
+        return value
+    return kernel.body.arguments[value.type.arg_idx]
+
+
 def memory_effects(op: Op) -> list[MemoryEffect] | None:
     """Best-effort memory effect summary for ``op``.
 
@@ -2335,11 +2344,11 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         )
         return (
             _memory_effect(
-                "W", op.dst, dst_scope,
+                "W", _resolve_tma_descriptor(op, op.dst), dst_scope,
                 cast(int | None, op.attrs.get("dst_tiling_scheme")),
             )
             + _memory_effect(
-                "R", op.src, src_scope,
+                "R", _resolve_tma_descriptor(op, op.src), src_scope,
                 cast(int | None, op.attrs.get("src_tiling_scheme")),
             )
         )
