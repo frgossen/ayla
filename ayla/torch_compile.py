@@ -52,16 +52,18 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
 )
+from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from . import gemm_collection  # noqa: F401 -- defines the ops below
-from .fx_pipeline import PostGradFxPipeline
-from .gemm_collection.muse_swiglu import MUSE_SWIGLU_RULE
+from .gemm_collection.muse_swiglu import register_muse_swiglu
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
 _MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
-_POST_GRAD_PIPELINE = PostGradFxPipeline([MUSE_SWIGLU_RULE])
+_POST_GRAD_PATTERNS = PatternMatcherPass(pass_name="ayla")
+register_muse_swiglu(_POST_GRAD_PATTERNS)
+_POST_GRAD_PASS = _POST_GRAD_PATTERNS.apply
 
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
@@ -232,10 +234,10 @@ def install() -> None:
     init_backend_registration()
     existing = inductor_config.post_grad_custom_post_pass
     existing_passes = _post_grad_passes(existing)
-    if _POST_GRAD_PIPELINE not in existing_passes:
+    if _POST_GRAD_PASS not in existing_passes:
         _displaced_post_grad_pass = inductor_config.post_grad_custom_post_pass
         inductor_config.post_grad_custom_post_pass = [
-            *existing_passes, _POST_GRAD_PIPELINE,
+            *existing_passes, _POST_GRAD_PASS,
         ]
     if _displaced_backend is None:
         _displaced_backend = device_codegens["cuda"]
@@ -254,7 +256,7 @@ def uninstall() -> None:
     """Restore the displaced graph pass, ``aten.mm``, and CUDA scheduling."""
     global _displaced_backend
     current = inductor_config.post_grad_custom_post_pass
-    if _POST_GRAD_PIPELINE in _post_grad_passes(current):
+    if _POST_GRAD_PASS in _post_grad_passes(current):
         inductor_config.post_grad_custom_post_pass = _displaced_post_grad_pass
     # Stand down if someone has claimed cuda since, rather than overwrite them.
     installed = device_codegens.get("cuda")
