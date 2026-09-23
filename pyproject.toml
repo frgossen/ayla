@@ -33,7 +33,7 @@ ignore = ["E501"]
 
 [tool.pyright]
 # Expand this boundary as the transformation layer gains precise annotations.
-include = ["ayla/base"]
+include = ["ayla/base", "ayla/gpu_dialect.py"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 

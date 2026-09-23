@@ -73,28 +73,30 @@ class Parser:
         self.skip_whitespace()
         return result
 
-    def read_shape(self, with_dtype: bool = True):
-        """Read `NxMx...` or `NxMx...xDTYPE`.
+    def read_dim(self) -> int | None:
+        if self.can_read_literal("?"):
+            self.read_literal("?")
+            return None
+        return self.read_int()
+
+    def read_shape(self) -> list[int | None]:
+        """Read `NxMx...`.
 
         A ``?`` dimension is represented as ``None``.
-
-        Returns `(sizes, dtype)` if `with_dtype` is True, else just `sizes`.
         """
-        sizes: list[int | None] = []
-        while True:
-            if self.can_read_literal("?"):
-                self.read_literal("?")
-                sizes.append(None)
-            elif self.can_read_int():
-                sizes.append(self.read_int())
-            else:
-                break
-            if not with_dtype and not self.can_read_literal("x"):
-                break
+        sizes = [self.read_dim()]
+        while self.can_read_literal("x"):
             self.read_literal("x")
-        if with_dtype:
-            return sizes, self.read_type()
+            sizes.append(self.read_dim())
         return sizes
+
+    def read_shape_with_dtype(self) -> tuple[list[int | None], Any]:
+        """Read `NxMx...xDTYPE`."""
+        sizes: list[int | None] = []
+        while self.can_read_literal("?") or self.can_read_int():
+            sizes.append(self.read_dim())
+            self.read_literal("x")
+        return sizes, self.read_type()
 
     def read_identifier(self, allow_leading_digits: bool = False) -> str:
         """Consume an identifier. By default `[A-Za-z_][A-Za-z0-9_]*`; with
