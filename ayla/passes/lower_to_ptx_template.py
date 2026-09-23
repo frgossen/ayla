@@ -487,8 +487,6 @@ class LowerToPtxTemplate(LoweringPass):
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
         lock_type = op.result().type
-        assert isinstance(lock_type, LockType)
-        assert lock_type.kind == "cluster_mbar"
         kernel = find_ancestor_of_type(op, KernelOp)
         assert kernel is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
