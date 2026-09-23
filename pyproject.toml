@@ -37,7 +37,6 @@ include = [
     "ayla",
 ]
 exclude = [
-    "ayla/analysis",
     "ayla/gemm_collection/dynamic_m.py",
     "ayla/gemm_collection/gemm.py",
     "ayla/jit_compiler.py",
@@ -47,7 +46,6 @@ exclude = [
     "ayla/passes/lower_to_tma_move.py",
     "ayla/passes/peel_loop.py",
     "ayla/passes/promote_buffers.py",
-    "ayla/passes/reuse_buffers.py",
     "ayla/passes/tile_elementwise.py",
     "ayla/passes/tile_matmul.py",
     "ayla/ptx_codegen.py",
