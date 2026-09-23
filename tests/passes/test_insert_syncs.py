@@ -172,6 +172,9 @@ def test_cluster_leader_barrier_coverage_is_directional():
         BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.CLUSTER_LEADER,
     )
     assert not _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK_LEADER,
+    )
+    assert not _barrier_covers(
         BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
     )
 

@@ -2295,66 +2295,43 @@ class CollectiveScope(enum.IntEnum):
 
     def join(self, other: CollectiveScope) -> CollectiveScope:
         """The join (least upper bound) on the CollectiveScope lattice."""
-        if self == CollectiveScope.GRID:
-            return self
-        if other == CollectiveScope.GRID:
-            return other
-        if self == CollectiveScope.THREAD:
-            return other
-        if self == CollectiveScope.CLUSTER:
-            return other if other == CollectiveScope.GRID else self
-        if self == CollectiveScope.CLUSTER_LEADER:
-            if other in {
-                CollectiveScope.THREAD,
-                CollectiveScope.BLOCK_LEADER,
-                CollectiveScope.CLUSTER_LEADER,
-            }:
-                return self
-            return CollectiveScope.CLUSTER
-        if self == CollectiveScope.BLOCK:
-            if other == CollectiveScope.CLUSTER_LEADER:
-                return CollectiveScope.CLUSTER
-            return other if other in {
-                CollectiveScope.CLUSTER, CollectiveScope.GRID,
-            } else self
-        if self == CollectiveScope.BLOCK_LEADER:
-            if other in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
-                return self
-            if other in {
-                CollectiveScope.BLOCK,
-                CollectiveScope.CLUSTER_LEADER,
-                CollectiveScope.CLUSTER,
-                CollectiveScope.GRID,
-            }:
-                return other
-            return CollectiveScope.BLOCK  # other is WARP or WARPGROUP
-        if self == CollectiveScope.WARPGROUP:
-            if other in {
-                CollectiveScope.BLOCK,
-                CollectiveScope.CLUSTER,
-                CollectiveScope.GRID,
-            }:
-                return other
-            if other == CollectiveScope.BLOCK_LEADER:
-                return CollectiveScope.BLOCK
-            if other == CollectiveScope.CLUSTER_LEADER:
-                return CollectiveScope.CLUSTER
-            return self  # other is THREAD, WARP, or WARPGROUP
-        if self == CollectiveScope.WARP:
-            if other in {CollectiveScope.WARP, CollectiveScope.THREAD}:
-                return self
-            if other == CollectiveScope.BLOCK_LEADER:
-                return CollectiveScope.BLOCK
-            if other == CollectiveScope.CLUSTER_LEADER:
-                return CollectiveScope.CLUSTER
-            return other  # other is WARPGROUP, BLOCK, or GRID
-        raise NotImplementedError(
-            f"CollectiveScope.join: unhandled pair {self!r}, {other!r}"
+        common_upper_bounds = [
+            scope for scope in CollectiveScope
+            if self.leq(scope) and other.leq(scope)
+        ]
+        least_upper_bounds = [
+            candidate for candidate in common_upper_bounds
+            if all(candidate.leq(scope) for scope in common_upper_bounds)
+        ]
+        assert len(least_upper_bounds) == 1, (
+            f"CollectiveScope has no unique join for {self!r} and {other!r}"
         )
+        return least_upper_bounds[0]
 
     def leq(self, other: CollectiveScope) -> bool:
         """The partial order (<=) of the CollectiveScope lattice."""
-        return self.join(other) == other
+        return self == other or any(
+            upper.leq(other)
+            for upper in _COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS[self]
+        )
+
+
+_COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
+    CollectiveScope.THREAD: (
+        CollectiveScope.WARP,
+        CollectiveScope.BLOCK_LEADER,
+    ),
+    CollectiveScope.WARP: (CollectiveScope.WARPGROUP,),
+    CollectiveScope.WARPGROUP: (CollectiveScope.BLOCK,),
+    CollectiveScope.BLOCK_LEADER: (
+        CollectiveScope.BLOCK,
+        CollectiveScope.CLUSTER_LEADER,
+    ),
+    CollectiveScope.BLOCK: (CollectiveScope.CLUSTER,),
+    CollectiveScope.CLUSTER_LEADER: (CollectiveScope.CLUSTER,),
+    CollectiveScope.CLUSTER: (CollectiveScope.GRID,),
+    CollectiveScope.GRID: (),
+}
 
 
 def _type_collective_scope(t: Type) -> CollectiveScope:
@@ -2430,6 +2407,10 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             if isinstance(op.src.type, WrmemTensorType)
             else _type_collective_scope(op.src.type)
         )
+        # TODO: Derive the issuing scope from ``op.collective`` once collective
+        # levels can express leader-only execution. For now, the destination
+        # memory space distinguishes a TMA load from a store, while ``multicast``
+        # distinguishes the cluster leader from an ordinary block leader.
         if op.multicast is True:
             dst_scope = CollectiveScope.CLUSTER_LEADER
         elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):

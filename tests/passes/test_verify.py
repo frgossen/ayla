@@ -338,6 +338,30 @@ def test_tma_multicast_async_collective_must_match_inner():
         verify_gpu_dialect(module)
 
 
+@pytest.mark.parametrize("separate_groups", [False, True])
+def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
+    middle = """\
+          }
+          async(%lock: lock<mbar>) collective=xyz.cluster {
+    """ if separate_groups else ""
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {{
+            %c0: index = index_constant() attrs={{value: 0}}
+            %dst0: smem<16x16xf32> = alloc() attrs={{id: 0}}
+            %dst1: smem<16x16xf32> = alloc() attrs={{id: 1}}
+            %lock: lock<mbar> = alloc() attrs={{id: 2}}
+            async(%lock: lock<mbar>) collective=xyz.cluster {{
+              tma_move(%dst0: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster
+              {middle}tma_move(%dst1: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={{multicast: True}}
+            }}
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match="same multicast mode"):
+        verify_gpu_dialect(module)
+
+
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
         verify_gpu_dialect(

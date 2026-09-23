@@ -46,19 +46,16 @@ class BarrierScope(enum.IntEnum):
     correspond one-to-one except for the asymmetric block- and cluster-leader
     syncs::
 
-                       GRID
-                        |
-                     CLUSTER
-                    /   |   \
-                   /    |    CLUSTER_TO_LEADER / LEADER_TO_CLUSTER
-                  /     |     |
-               BLOCK    |     |
-               /   \    |     |
-       WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
-              |         |     |
-            WARP        |     |
-               \       /     /
-                    THREAD
+    Direct cover edges, from wider to narrower scope::
+
+        GRID -> CLUSTER
+        CLUSTER -> {BLOCK, CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
+        BLOCK -> {WARPGROUP, BLOCK_TO_LEADER, LEADER_TO_BLOCK}
+        WARPGROUP -> WARP
+        {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK,
+         CLUSTER_TO_LEADER, LEADER_TO_CLUSTER} -> THREAD
+
+    The four directional scopes are pairwise independent.
     """
     THREAD = 0
     WARP = 1
@@ -161,10 +158,9 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     if barrier == BarrierScope.CLUSTER_TO_LEADER:
         return scope == CollectiveScope.THREAD  # gather: nothing cross-thread
     if barrier == BarrierScope.LEADER_TO_CLUSTER:
-        # broadcast: the cluster leader's work, including its narrower scopes
+        # broadcast: the single cluster leader's work, not every block leader
         return scope in (
             CollectiveScope.THREAD,
-            CollectiveScope.BLOCK_LEADER,
             CollectiveScope.CLUSTER_LEADER,
         )
     if barrier == BarrierScope.BLOCK:

@@ -315,6 +315,17 @@ def test_cluster_leader_collective_scope_is_directional():
         for b in scopes
         for c in scopes
     )
+    assert all(
+        a.leq(a.join(b)) and b.leq(a.join(b))
+        for a in scopes
+        for b in scopes
+    )
+    assert all(
+        not (a.leq(upper) and b.leq(upper)) or a.join(b).leq(upper)
+        for a in scopes
+        for b in scopes
+        for upper in scopes
+    )
 
 
 def test_for_loop():

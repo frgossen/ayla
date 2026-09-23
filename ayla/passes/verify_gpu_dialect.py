@@ -218,6 +218,25 @@ class VerifyGpuDialect(VerificationPass):
                     f"contained operation; got {op.collective} and "
                     f"{collective}"
                 )
+        multicast_modes = [
+            inner.multicast
+            for user in op.lock.users()
+            if isinstance(user, AsyncOp)
+            for inner in user.body.ops
+            if (
+                isinstance(inner, TmaMoveOp)
+                or (
+                    isinstance(inner, MoveOp)
+                    and inner.attrs.get("tma") is True
+                )
+            )
+        ]
+        if multicast_modes and any(
+            mode != multicast_modes[0] for mode in multicast_modes[1:]
+        ):
+            raise ValueError(
+                "TMA operations sharing a lock must use the same multicast mode"
+            )
         if (
             op.is_tma_multicast
             and min(op.collective.values()) < CollectiveLevel.CLUSTER
