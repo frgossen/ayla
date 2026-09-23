@@ -19,7 +19,7 @@ class LICM(LoweringPass):
 
     @lowers(ForOp)
     def lower_block_op(
-        self, op: Op,
+        self, op: ForOp,
     ) -> tuple[list[Op], list[object]]:
         body = op.body
         # Defined inside the loop: block arguments (e.g. the iv) plus the

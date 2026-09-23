@@ -8,11 +8,15 @@ from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    BF16Type,
     BarrierOp,
     ClusterBlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
+    F16Type,
+    F32Type,
+    F64Type,
     ForOp,
     GmemTensorType,
     KernelOp,
@@ -123,6 +127,7 @@ class VerifyGpuDialect(VerificationPass):
                 "tile operand and result must be address-backed memory "
                 "tensors or wrmem"
             )
+        assert isinstance(result_type, (AddrMemTensorType, WrmemTensorType))
         if not (
             arg_type.rank == result_type.rank == len(op.indices)
         ):
@@ -131,15 +136,13 @@ class VerifyGpuDialect(VerificationPass):
                 f"match; got {arg_type.rank}, {result_type.rank}, and "
                 f"{len(op.indices)}"
             )
-        if (
-            isinstance(arg_type, AddrMemTensorType)
-            and isinstance(result_type, AddrMemTensorType)
-            and arg_type.strides != result_type.strides
-        ):
-            raise ValueError(
-                f"tile result strides {result_type.strides} must match "
-                f"operand strides {arg_type.strides}"
-            )
+        if isinstance(arg_type, AddrMemTensorType):
+            assert isinstance(result_type, AddrMemTensorType)
+            if arg_type.strides != result_type.strides:
+                raise ValueError(
+                    f"tile result strides {result_type.strides} must match "
+                    f"operand strides {arg_type.strides}"
+                )
 
     @verifies(ClusterBlockIdsOp)
     def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:
@@ -161,9 +164,11 @@ class VerifyGpuDialect(VerificationPass):
             sync_type = op.operands[0].type
             if not isinstance(sync_type, GmemTensorType):
                 raise ValueError("BarrierOp: grid sync must be global memory")
+            dtype = sync_type.dtype
+            assert isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type))
             if (
                 sync_type.num_elements is not None
-                and sync_type.num_elements * sync_type.dtype.byte_size < 8
+                and sync_type.num_elements * dtype.byte_size < 8
             ):
                 raise ValueError(
                     "BarrierOp: grid sync must contain at least 8 bytes"
@@ -227,7 +232,11 @@ class VerifyGpuDialect(VerificationPass):
         _verify_collective_attr(op)
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
-        if not all(isinstance(typ, MemTensorType) for typ in (lhs, rhs, dst)):
+        if (
+            not isinstance(lhs, MemTensorType)
+            or not isinstance(rhs, MemTensorType)
+            or not isinstance(dst, MemTensorType)
+        ):
             raise ValueError("matmul operands must be memory tensors")
         if any(typ.rank != 2 for typ in (lhs, rhs, dst)):
             raise ValueError(
@@ -273,11 +282,10 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError("reshape must preserve the element type")
         # TODO: Accept non-canonical strides when the reshape preserves the
         # underlying linear element order.
-        if isinstance(arg, AddrMemTensorType) and (
-            not arg.is_canonical_strides
-            or not result.is_canonical_strides
-        ):
-            raise ValueError("reshape operands must have canonical strides")
+        if isinstance(arg, AddrMemTensorType):
+            assert isinstance(result, AddrMemTensorType)
+            if not arg.is_canonical_strides or not result.is_canonical_strides:
+                raise ValueError("reshape operands must have canonical strides")
         if (
             arg.num_elements is not None
             and result.num_elements is not None

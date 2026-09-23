@@ -54,7 +54,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install
-        run: pip install pyright
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pyright
 
       - name: pyright
         run: pyright

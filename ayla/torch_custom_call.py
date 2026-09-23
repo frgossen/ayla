@@ -5,11 +5,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
-from typing import Protocol
+from typing import Protocol, cast
 
 import torch
 
-from .gpu_dialect import BF16Type, F16Type, F32Type, F64Type
+from .gpu_dialect import (
+    BF16Type,
+    F16Type,
+    F32Type,
+    F64Type,
+    MemTensorType,
+    Type,
+)
 
 _TORCH_DTYPES = [
     (F16Type(), torch.float16),
@@ -37,8 +44,11 @@ class OperandKind(Enum):
 
 
 class _Launcher(Protocol):
-    name: str
-    signature: list
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def signature(self) -> list[Type]: ...
 
     def __call__(self, *tensors: torch.Tensor) -> None: ...
 
@@ -85,13 +95,13 @@ def make_torch_custom_call(
     lib.define(schema)
 
     def allocate_results(*input_tensors: torch.Tensor) -> list[torch.Tensor]:
-        result_types = [
-            arg_type
-            for kind, arg_type in zip(signature_mapping, launcher.signature)
-            if kind == OperandKind.RESULT
-        ]
+        result_types: list[MemTensorType] = []
+        for kind, arg_type in zip(signature_mapping, launcher.signature):
+            if kind == OperandKind.RESULT:
+                assert isinstance(arg_type, MemTensorType)
+                result_types.append(arg_type)
         result_shapes = (
-            [arg_type.sizes for arg_type in result_types]
+            [cast(tuple[int, ...], arg_type.sizes) for arg_type in result_types]
             if infer_result_shapes is None
             else infer_result_shapes(*input_tensors)
         )

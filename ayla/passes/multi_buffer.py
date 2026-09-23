@@ -35,6 +35,9 @@ from ._utils import label_matches
 class MultiBuffer(LoweringPass):
     """Clone loop-local allocations `depth` times and select per iteration."""
 
+    depth: int
+    label_filter: str | None
+
     def __init__(self, depth: int, label_filter: str | None = None) -> None:
         super().__init__(depth=depth, label_filter=label_filter)
 

@@ -6,6 +6,10 @@ from ..base.ir import Block, find_ops_of_type
 from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
+    BF16Type,
+    F16Type,
+    F32Type,
+    F64Type,
     KernelOp,
     ModuleOp,
     ReinterpretOp,
@@ -23,7 +27,11 @@ def _alignment(op: AllocOp) -> int:
 def _size(op: AllocOp) -> int:
     typ = op.result().type
     assert isinstance(typ, SmemTensorType)
-    return typ.num_elements * typ.dtype.byte_size
+    num_elements = typ.num_elements
+    assert num_elements is not None
+    dtype = typ.dtype
+    assert isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type))
+    return num_elements * dtype.byte_size
 
 
 def _layout(allocs: list[AllocOp], start: int = 0) -> tuple[list[int], int]:
@@ -110,6 +118,7 @@ class ReuseSmemAllocs(Pass):
         arena_template: AllocOp | None = None
         arena_alignment = 1
         for alloc in allocations:
+            assert isinstance(alloc, AllocOp)
             group = alloc.attrs.get("reuse_group")
             if group is None:
                 continue
@@ -141,7 +150,9 @@ class ReuseSmemAllocs(Pass):
         assert arena_template is not None
         template_type = arena_template.result().type
         assert isinstance(template_type, SmemTensorType)
-        dtype_bytes = template_type.dtype.byte_size
+        dtype = template_type.dtype
+        assert isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type))
+        dtype_bytes = dtype.byte_size
         assert arena_bytes % dtype_bytes == 0
         type_attrs = {
             key: value for key, value in template_type.attrs.items()

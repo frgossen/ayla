@@ -56,6 +56,8 @@ class SpecializeShapes(Pass):
     TODO: Propagate dynamic shapes introduced elsewhere through the IR.
     """
 
+    argument_shapes: list[tuple[int, ...]]
+
     def __init__(self, argument_shapes: list[tuple[int, ...]]) -> None:
         super().__init__(argument_shapes=argument_shapes)
 
