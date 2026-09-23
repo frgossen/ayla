@@ -38,8 +38,6 @@ include = [
 ]
 exclude = [
     "ayla/gemm_collection/dynamic_m.py",
-    "ayla/gemm_collection/gemm.py",
-    "ayla/jit_compiler.py",
     "ayla/passes/folding.py",
     "ayla/passes/lower_to_async.py",
     "ayla/passes/lower_to_ptx_template.py",
