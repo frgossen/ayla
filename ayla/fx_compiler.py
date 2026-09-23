@@ -20,7 +20,11 @@ from torch._inductor.pattern_matcher import (
 
 from .base.ir import Block, Op, Value
 from .fx_pipeline import register_fx_kernel_rewrite
-from .jit_compiler import JITCompiler, LauncherPlan, TensorSignature
+from .jit_compiler import (
+    JITCompiler,
+    LauncherPlan,
+    TensorSignature,
+)
 from .gpu_dialect import (
     AllocOp,
     CollectiveAxis,

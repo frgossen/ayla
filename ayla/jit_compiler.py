@@ -1,7 +1,8 @@
 """JIT compilation, tensor specialization, and launch dispatch."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from enum import Enum, auto
 from typing import cast
 
 import torch
@@ -98,14 +99,67 @@ class JITCompiler:
         self._launcher(tuple(tensors))(*tensors)
 
 
-class PtxRoutePlan:
-    """A single compiled PTX kernel route."""
+class ScratchInit(Enum):
+    EMPTY = auto()
+    ZERO = auto()
 
-    def __init__(self, kernel: PtxKernel) -> None:
+
+class PtxRoutePlan:
+    """A PTX kernel and the runtime source of each gmem argument."""
+
+    def __init__(
+        self,
+        kernel: PtxKernel,
+        bindings: Iterable[int | ScratchInit] | None = None,
+    ) -> None:
         self.kernel = kernel
+        gmem_types = [
+            typ for typ in kernel.signature
+            if isinstance(typ, GmemTensorType)
+        ]
+        self.bindings = tuple(range(len(gmem_types))) if bindings is None else (
+            tuple(bindings)
+        )
+        if len(self.bindings) != len(gmem_types):
+            raise ValueError(
+                f"{kernel.name}: expected {len(gmem_types)} argument "
+                f"bindings, got {len(self.bindings)}"
+            )
 
     def __call__(self) -> Launcher:
-        return make_ptx_launcher(self.kernel)
+        launcher = make_ptx_launcher(self.kernel)
+        arguments: list[int | torch.Tensor] = []
+        gmem_types = (
+            typ for typ in self.kernel.signature
+            if isinstance(typ, GmemTensorType)
+        )
+        for typ, binding in zip(gmem_types, self.bindings, strict=True):
+            if type(binding) is int:
+                if binding < 0:
+                    raise ValueError("runtime tensor index must be non-negative")
+                arguments.append(binding)
+                continue
+            if any(size is None for size in typ.sizes):
+                raise ValueError(
+                    f"{self.kernel.name}: scratch buffer shape must be static"
+                )
+            sizes = cast(tuple[int, ...], typ.sizes)
+            allocate = (
+                torch.zeros if binding is ScratchInit.ZERO else torch.empty
+            )
+            arguments.append(allocate(
+                sizes,
+                dtype=to_torch_dtype(typ.dtype),
+                device="cuda",
+            ))
+
+        def run(*tensors: torch.Tensor) -> None:
+            launcher(*(
+                tensors[arg] if type(arg) is int else arg
+                for arg in arguments
+            ))
+
+        return run
 
 
 class ShapeSpecializingJITCompiler(JITCompiler):
