@@ -7,15 +7,35 @@ from ayla import Block, Op
 from ayla.analysis.sync import (
     BarrierScope,
     BarrierTarget,
+    SyncAnalysis,
     _barrier_covers,
     _barrier_scope,
 )
-from ayla.gpu_dialect import CollectiveScope, gpu_dialect
+from ayla.base.ir import find_ops_of_type
+from ayla.gpu_dialect import CollectiveScope, TmaMoveOp, gpu_dialect
 from ayla.passes.insert_syncs import (
     _insert_barriers,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
+
+
+def test_tma_descriptors_for_the_same_argument_alias():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%h: gmem<2x2xf32>, %store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>) {
+            %c0: index = index_constant() attrs={value: 0}
+            %s0: smem<2x2xf32> = alloc()
+            %s1: smem<1x2xf32> = alloc()
+            tma_move(%store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %s0: smem<2x2xf32>, %c0: index, %c0: index)
+            tma_move(%s1: smem<1x2xf32>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>, %c0: index, %c0: index)
+          }
+        }"""))  # noqa: E501
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    store, load = find_ops_of_type(module, TmaMoveOp)
+
+    assert analysis.targets[load].scope == BarrierScope.GRID
 
 
 def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
