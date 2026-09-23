@@ -1,13 +1,16 @@
 """Translate matched post-grad FX regions into high-level Ayla GPU IR."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 from torch.fx import Node
+from torch._inductor.pattern_matcher import Match, PatternExpr, PatternMatcherPass
 
 from .base.ir import Block, Op, Value
+from .fx_pipeline import register_fx_kernel_rewrite
 from .gpu_dialect import (
     AllocOp,
     CollectiveAxis,
@@ -19,8 +22,16 @@ from .gpu_dialect import (
     ModuleOp,
     ReshapeOp,
     TileOp,
+    Type,
 )
-from .torch_custom_call import from_torch_dtype
+from .ptx_codegen import PtxKernel, make_ptx_kernel
+from .ptx_runtime import PtxLauncher, make_ptx_launcher
+from .jit_compiler import TensorSignature
+from .torch_custom_call import (
+    DEFAULT_NAMESPACE,
+    OperandKind,
+    from_torch_dtype,
+)
 
 
 _ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
@@ -179,6 +190,7 @@ def fx_region_to_module(
     }
     output_value = Value(match.output.name, _node_type(match.output))
     ops: list[Op] = []
+    matmul_index = 0
 
     silu_sources: dict[Node, Node] = {}
     skipped: set[Node] = set()
@@ -220,6 +232,8 @@ def fx_region_to_module(
                     f"{node.name}: matmul RHS must be a 2D transpose"
                 )
             dst = _allocate(node, match.output, output_value, ops)
+            label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
+            matmul_index += 1
             ops.append(MatmulOp.build(
                 values[lhs_node],
                 values[rhs_source],
@@ -228,7 +242,7 @@ def fx_region_to_module(
                     axis: CollectiveLevel.GRID for axis in CollectiveAxis
                 },
                 init=0.0,
-                attrs={"label": node.name},
+                attrs={"label": label},
             ))
             values[node] = dst
             continue
@@ -299,3 +313,89 @@ def fx_region_to_module(
         ),
     )
     return ModuleOp.build(Block(ops=[kernel]))
+
+
+def _match_signature(match: FxRegionMatch) -> TensorSignature:
+    tensors = []
+    for node in (*match.inputs, match.output):
+        tensor = node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{node.name}: missing tensor metadata")
+        tensors.append((
+            tuple(int(size) for size in tensor.shape),
+            tuple(int(stride) for stride in tensor.stride()),
+            tensor.dtype,
+        ))
+    return tuple(tensors)
+
+
+class FxToAylaCompiler:
+    """Compile each concrete matched FX signature to one reusable PTX kernel."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        schedule: Callable[[ModuleOp], ModuleOp],
+        compile_module: Callable[[ModuleOp], PtxKernel] = make_ptx_kernel,
+    ) -> None:
+        self.name = name
+        self._schedule = schedule
+        self._compile_module = compile_module
+        self._kernels: dict[TensorSignature, PtxKernel] = {}
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._kernels)
+
+    def prepare(
+        self,
+        torch_match: Match,
+        inputs: tuple[Node, ...],
+    ) -> None:
+        self.prepare_region(FxRegionMatch(torch_match.output_node(), inputs))
+
+    def prepare_region(self, region: FxRegionMatch) -> None:
+        signature = _match_signature(region)
+        if signature in self._kernels:
+            return
+        module = fx_region_to_module(region, name=self.name)
+        self._kernels[signature] = self._compile_module(self._schedule(module))
+
+    def build_route(self, signature: TensorSignature) -> PtxLauncher:
+        kernel = self._kernels.get(signature)
+        if kernel is None:
+            raise RuntimeError(
+                f"{self.name}: no compiled FX region for tensor signature"
+            )
+        return make_ptx_launcher(kernel)
+
+
+def make_fx_to_ayla_rewrite(
+    patterns: PatternMatcherPass,
+    *,
+    pattern: PatternExpr,
+    input_names: tuple[str, ...],
+    name: str,
+    signature: list[Type],
+    signature_mapping: list[OperandKind],
+    schedule: Callable[[ModuleOp], ModuleOp],
+    extra_check: Callable[[Match], bool] | None = None,
+    namespace: str = DEFAULT_NAMESPACE,
+    infer_result_shapes: Callable[..., list[tuple]] | None = None,
+) -> torch._ops.OpOverload:
+    """Build a rewrite that compiles matched FX regions through Ayla."""
+    compiler = FxToAylaCompiler(name=name, schedule=schedule)
+    return register_fx_kernel_rewrite(
+        patterns,
+        pattern=pattern,
+        input_names=input_names,
+        name=name,
+        signature=signature,
+        signature_mapping=signature_mapping,
+        build_route=compiler.build_route,
+        extra_check=extra_check,
+        namespace=namespace,
+        infer_result_shapes=infer_result_shapes,
+        prepare=compiler.prepare,
+    )
