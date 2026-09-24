@@ -166,6 +166,26 @@ def test_lower_tile_uses_the_reinterpreted_view_strides():
     assert tile.byte_offset.definition.value == 32
 
 
+def test_lower_nested_tile_uses_root_block_major_coordinates():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %root: smem<128x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
+            %rows: smem<64x128xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%root: smem<128x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 1, 0)
+            %inner: smem<64x16xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%rows: smem<64x128xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 0, 5)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    Folding().run(module)
+
+    ptr_adds = find_ops_of_type(module, PtrAddOp)
+    assert len(ptr_adds) == 2
+    inner_offset = ptr_adds[-1].byte_offset.definition
+    assert isinstance(inner_offset, IndexConstantOp)
+    assert inner_offset.value == 24608
+
+
 def test_grid_barrier_uses_last_arriver_to_release_waiters():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

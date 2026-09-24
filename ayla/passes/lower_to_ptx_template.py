@@ -52,6 +52,88 @@ from ..gpu_dialect import (
 )
 
 
+def _tile_chain(value: Value) -> tuple[Value, list[TileOp]]:
+    """Return a tile view's root and its TileOps in root-to-leaf order."""
+    tiles: list[TileOp] = []
+    while isinstance(value.definition, TileOp):
+        tiles.append(value.definition)
+        value = value.definition.arg
+    return value, list(reversed(tiles))
+
+
+def _tile_origin_terms(
+    value: Value,
+) -> tuple[Value, list[tuple[int, dict[Value, int]]]]:
+    """Return affine logical-origin terms relative to the tile-chain root."""
+    root, tiles = _tile_chain(value)
+    origin = [(0, {}) for _ in range(value.type.rank)]
+    for tile in tiles:
+        for dim, index in enumerate(tile.indices):
+            size = tile.result().type.sizes[dim]
+            assert isinstance(size, int)
+            constant, coefficients = origin[dim]
+            if isinstance(index, Value):
+                if isinstance(index.definition, IndexConstantOp):
+                    constant += index.definition.value * size
+                else:
+                    coefficients = dict(coefficients)
+                    coefficients[index] = coefficients.get(index, 0) + size
+            else:
+                constant += index * size
+            origin[dim] = constant, coefficients
+    return root, origin
+
+
+def _tile_physical_delta(value: Value, base: Value) -> int | None:
+    """Return a static physical-element delta when dynamic origins cancel."""
+    value_root, value_terms = _tile_origin_terms(value)
+    base_root, base_terms = _tile_origin_terms(base)
+    if value_root is not base_root:
+        return None
+    deltas: list[int] = []
+    for (value_constant, value_coeffs), (base_constant, base_coeffs) in zip(
+        value_terms, base_terms, strict=True,
+    ):
+        if value_coeffs != base_coeffs:
+            return None
+        deltas.append(value_constant - base_constant)
+
+    root_type = value_root.type
+    assert isinstance(root_type, AddrMemTensorType)
+    layout = (
+        physical_layout(root_type)
+        if isinstance(root_type, SmemTensorType) else None
+    )
+    if layout is None or layout[1] == "row_major":
+        return sum(
+            delta * stride
+            for delta, stride in zip(
+                deltas, root_type.strides, strict=True,
+            )
+        )
+
+    block_width, _ = layout
+    assert root_type.rank == 2
+    rows = root_type.sizes[0]
+    assert isinstance(rows, int)
+    value_col_constant, value_col_coeffs = value_terms[1]
+    base_col_constant, base_col_coeffs = base_terms[1]
+    if value_col_coeffs:
+        # A constant displacement of a dynamic column can cross a physical
+        # block boundary at runtime, so it is reusable only when unchanged.
+        if value_col_constant != base_col_constant:
+            return None
+        column_delta = 0
+    else:
+        value_block, value_inner = divmod(value_col_constant, block_width)
+        base_block, base_inner = divmod(base_col_constant, block_width)
+        column_delta = (
+            (value_block - base_block) * rows * block_width
+            + value_inner - base_inner
+        )
+    return deltas[0] * block_width + column_delta
+
+
 def _lower_mul_registers(
     dst_regs: list[str], lhs_regs: list[str], rhs_regs: list[str],
 ) -> str:
@@ -325,71 +407,132 @@ class LowerToPtxTemplate(LoweringPass):
             assert isinstance(arg, Value)
             return [], [arg]
 
-        # First tile: convert tensor to ptr.
-        if isinstance(arg, Value) and isinstance(arg.type, AddrMemTensorType):
-            to_ptr = ToPtrOp.build(arg)
-            new_ops.append(to_ptr)
-            ptr = to_ptr.result()
-        elif isinstance(arg, Value) and isinstance(arg.type, PtrType):
-            ptr = arg
-        else:
-            raise NotImplementedError(
-                f"lower_tile: unexpected arg type {type(arg)}"
-            )
-
-        view_root = op.arg
-        while isinstance(view_root.definition, TileOp):
-            view_root = view_root.definition.arg
+        view_root, tiles = _tile_chain(op.result())
         view_root_type = view_root.type
         assert isinstance(view_root_type, AddrMemTensorType)
         dtype_bytes = view_root_type.dtype.byte_size
-        result_sizes = list(op.result().type.sizes)
         layout = (
             physical_layout(view_root_type)
             if isinstance(view_root_type, SmemTensorType) else None
         )
 
-        # Accumulate byte offset for each dimension.
+        if layout is None or layout[1] != "block_major":
+            # Affine layouts compose by adding each tile's offset to its
+            # already-lowered parent pointer. Keep this compact path so nested
+            # ordinary views do not duplicate their ancestors' arithmetic.
+            if isinstance(arg, Value) and isinstance(
+                arg.type, AddrMemTensorType,
+            ):
+                to_ptr = ToPtrOp.build(arg)
+                new_ops.append(to_ptr)
+                ptr = to_ptr.result()
+            elif isinstance(arg, Value) and isinstance(arg.type, PtrType):
+                ptr = arg
+            else:
+                raise NotImplementedError(
+                    f"lower_tile: unexpected arg type {type(arg)}"
+                )
+            zero = IndexConstantOp.build(0)
+            new_ops.append(zero)
+            byte_offset = zero.result()
+            result_sizes = op.result().type.sizes
+            for dim, index in enumerate(op.indices):
+                if isinstance(index, int):
+                    index_op = IndexConstantOp.build(index)
+                    new_ops.append(index_op)
+                    mapped_index = index_op.result()
+                else:
+                    mapped_index = self.value_map[index]
+                    assert isinstance(mapped_index, Value)
+                size = result_sizes[dim]
+                stride = view_root_type.strides[dim]
+                assert isinstance(size, int) and isinstance(stride, int)
+                stride_op = IndexConstantOp.build(size * stride * dtype_bytes)
+                new_ops.append(stride_op)
+                term = IndexMulOp.build(mapped_index, stride_op.result())
+                new_ops.append(term)
+                added = IndexAddOp.build(byte_offset, term.result())
+                new_ops.append(added)
+                byte_offset = added.result()
+            ptr_add = PtrAddOp.build(ptr, byte_offset)
+            new_ops.append(ptr_add)
+            return new_ops, [ptr_add.result()]
+
+        # A block-major layout is non-affine in the logical column. Resolve the
+        # complete logical origin, then map it once against the physical root.
+        root = self.value_map[view_root]
+        if isinstance(root, Value) and isinstance(
+            root.type, AddrMemTensorType,
+        ):
+            to_ptr = ToPtrOp.build(root)
+            new_ops.append(to_ptr)
+            ptr = to_ptr.result()
+        elif isinstance(root, Value) and isinstance(root.type, PtrType):
+            ptr = root
+        else:
+            raise NotImplementedError(
+                f"lower_tile: unexpected root type {type(root)}"
+            )
+
+        # Accumulate the logical element origin across every nested tile.
         zero = IndexConstantOp.build(0)
         new_ops.append(zero)
-        byte_offset = zero.result()
+        logical_origin = [zero.result() for _ in range(view_root_type.rank)]
+        for tile in tiles:
+            for dim, index in enumerate(tile.indices):
+                if isinstance(index, int):
+                    index_op = IndexConstantOp.build(index)
+                    new_ops.append(index_op)
+                    mapped_index = index_op.result()
+                else:
+                    mapped_index = self.value_map[index]
+                    assert isinstance(mapped_index, Value)
+                size = tile.result().type.sizes[dim]
+                assert isinstance(size, int)
+                size_op = IndexConstantOp.build(size)
+                new_ops.append(size_op)
+                term = IndexMulOp.build(mapped_index, size_op.result())
+                new_ops.append(term)
+                added = IndexAddOp.build(
+                    logical_origin[dim], term.result(),
+                )
+                new_ops.append(added)
+                logical_origin[dim] = added.result()
 
-        for dim, idx in enumerate(op.indices):
-            if isinstance(idx, int):
-                const_op = IndexConstantOp.build(idx)
-                new_ops.append(const_op)
-                idx = const_op.result()
-            else:
-                idx = self.value_map[idx]
+        block_width, _ = layout
+        assert view_root_type.rank == 2
+        rows = view_root_type.sizes[0]
+        assert isinstance(rows, int)
+        width_op = IndexConstantOp.build(block_width)
+        new_ops.append(width_op)
+        block = IndexDivOp.build(logical_origin[1], width_op.result())
+        inner = IndexModOp.build(logical_origin[1], width_op.result())
+        new_ops.extend([block, inner])
+        block_stride_op = IndexConstantOp.build(rows * block_width)
+        new_ops.append(block_stride_op)
+        block_term = IndexMulOp.build(
+            block.result(), block_stride_op.result(),
+        )
+        row_stride_op = IndexConstantOp.build(block_width)
+        new_ops.append(row_stride_op)
+        row_term = IndexMulOp.build(
+            logical_origin[0], row_stride_op.result(),
+        )
+        new_ops.extend([block_term, row_term])
+        outer = IndexAddOp.build(block_term.result(), row_term.result())
+        element_offset_op = IndexAddOp.build(
+            outer.result(), inner.result(),
+        )
+        new_ops.extend([outer, element_offset_op])
+        element_offset = element_offset_op.result()
 
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
-            new_ops.append(tile_size_op)
-            elem_off = IndexMulOp.build(idx, tile_size_op.result())
-            new_ops.append(elem_off)
-
-            stride = view_root_type.strides[dim]
-            if (
-                layout is not None
-                and layout[1] == "block_major"
-            ):
-                block_width, _ = layout
-                assert view_root_type.rank == 2
-                if dim == 0:
-                    stride = block_width
-                elif dim == 1:
-                    assert result_sizes[1] % block_width == 0
-                    stride = view_root_type.sizes[0]
-
-            stride_bytes = stride * dtype_bytes
-            stride_op = IndexConstantOp.build(stride_bytes)
-            new_ops.append(stride_op)
-            byte_term = IndexMulOp.build(elem_off.result(), stride_op.result())
-            new_ops.append(byte_term)
-            add_op = IndexAddOp.build(byte_offset, byte_term.result())
-            new_ops.append(add_op)
-            byte_offset = add_op.result()
-
-        ptr_add = PtrAddOp.build(ptr, byte_offset)
+        dtype_op = IndexConstantOp.build(dtype_bytes)
+        new_ops.append(dtype_op)
+        byte_offset_op = IndexMulOp.build(
+            element_offset, dtype_op.result(),
+        )
+        new_ops.append(byte_offset_op)
+        ptr_add = PtrAddOp.build(ptr, byte_offset_op.result())
         new_ops.append(ptr_add)
         return new_ops, [ptr_add.result()]
 
@@ -838,51 +981,15 @@ class LowerToPtxTemplate(LoweringPass):
             return t
 
         def _tile_delta(value: Value, base: Value, group: int) -> int | None:
-            if group == 0 or not (
-                isinstance(value.definition, TileOp)
-                and isinstance(base.definition, TileOp)
-            ):
+            if group == 0 or value.type != base.type:
                 return None
-            tile = value.definition
-            base_tile = base.definition
-            # TODO: Support arbitrary-length TileOp chains. Currently descriptor
-            # reuse is limited to siblings in one WGMMA commit group that share
-            # the same direct parent/base.
-            if (
-                tile.arg is not base_tile.arg
-                or tile.result().type != base_tile.result().type
-            ):
+            element_delta = _tile_physical_delta(value, base)
+            if element_delta is None:
                 return None
-
-            typ = tile.result().type
-            assert isinstance(typ, AddrMemTensorType)
-            assert len(tile.indices) == len(base_tile.indices) == typ.rank, (
-                "_tile_delta: TileOp indices must match the result rank; "
-                f"got {len(tile.indices)}, {len(base_tile.indices)}, and {typ.rank}"
-            )
-
-            def constant(index: Value | int) -> int | None:
-                if isinstance(index, int):
-                    return index
-                if isinstance(index.definition, IndexConstantOp):
-                    return index.definition.value
-                return None
-
-            indices = [constant(index) for index in tile.indices]
-            base_indices = [constant(index) for index in base_tile.indices]
-            if any(index is None for index in indices + base_indices):
-                return None
-            # Non-affine layouts need a root-aware address mapping. Rebuild
-            # their descriptors until that support is introduced with K=128.
-            if typ.attrs.get("physical_layout") is not None:
-                return None
-            delta = sum(
-                (int(index) - int(base_index)) * size * stride
-                for index, base_index, size, stride in zip(
-                    indices, base_indices, typ.sizes, typ.strides,
-                )
-            )
-            byte_delta = delta * typ.dtype.byte_size
+            value_root, _ = _tile_chain(value)
+            root_type = value_root.type
+            assert isinstance(root_type, AddrMemTensorType)
+            byte_delta = element_delta * root_type.dtype.byte_size
             return byte_delta if byte_delta >= 0 and byte_delta % 16 == 0 else None
 
         # Each distinct operand value gets a single unique placeholder name —
@@ -948,8 +1055,20 @@ class LowerToPtxTemplate(LoweringPass):
 
             m_iters = m_dim // 64
             num_regs_per_wgmma = 64 * n_dim // (dst_type.warps * 32)
-            lhs_row_stride_bytes = lhs_type.strides[0] * lhs_type.dtype.byte_size
-            rhs_row_stride_bytes = rhs_type.strides[0] * rhs_type.dtype.byte_size
+            lhs_layout = physical_layout(lhs_type)
+            rhs_layout = physical_layout(rhs_type)
+            lhs_row_stride = (
+                lhs_layout[0]
+                if lhs_layout is not None and lhs_layout[1] == "block_major"
+                else lhs_type.strides[0]
+            )
+            rhs_row_stride = (
+                rhs_layout[0]
+                if rhs_layout is not None and rhs_layout[1] == "block_major"
+                else rhs_type.strides[0]
+            )
+            lhs_row_stride_bytes = lhs_row_stride * lhs_type.dtype.byte_size
+            rhs_row_stride_bytes = rhs_row_stride * rhs_type.dtype.byte_size
 
             assert lhs_type.swizzle in _swizzle_to_bits, (
                 f"_lower_async_matmul_wgmma: lhs has unknown swizzle {lhs_type.swizzle!r}"
