@@ -31,7 +31,7 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
 
 
@@ -146,12 +146,12 @@ class VerifyGpuDialect(VerificationPass):
         result_type = op.result().type
         if type(arg_type) is not type(result_type):
             raise ValueError("tile must preserve its operand's memory space")
-        if not isinstance(arg_type, (AddrMemTensorType, WrmemTensorType)):
+        if not isinstance(arg_type, (AddrMemTensorType, WgrmemTensorType)):
             raise ValueError(
                 "tile operand and result must be address-backed memory "
-                "tensors or wrmem"
+                "tensors or wgrmem"
             )
-        assert isinstance(result_type, (AddrMemTensorType, WrmemTensorType))
+        assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType))
         if not (
             arg_type.rank == result_type.rank == len(op.indices)
         ):

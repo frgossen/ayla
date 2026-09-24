@@ -36,7 +36,7 @@ def schedule_register_matmul(
 ) -> Pipeline:
     """Schedule a pre-tiled GEMM with an explicit register accumulator.
 
-    The caller owns output tiling, the WRMEM destination, its epilogue, and
+    The caller owns output tiling, the WGRMEM destination, its epilogue, and
     any live-out moves. This pipeline only schedules the reduction and its
     operand movement.
     """
@@ -139,7 +139,7 @@ def schedule_tiled_matmul(
         allow_partial_tiles=(wg_dim == "M" and output_m_tile % wg_size != 0),
     ))
     pipeline.add_pass(PromoteBuffers(
-        target_type="wrmem", operands=["dst"], swizzle=None,
+        target_type="wgrmem", operands=["dst"], swizzle=None,
         layout="wgmma_layout_0", warps=4, tma=True,
         physical_layout=(
             {

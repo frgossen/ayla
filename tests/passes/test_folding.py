@@ -48,9 +48,9 @@ def test_fold_constants():
 def test_fold_constant_tile_indices_to_static_indices():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @test(%a: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+          kernel @test(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             %c3: index = index_constant() attrs={value: 3}
-            %tile: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%a: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %c3: index)
+            %tile: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %c3: index)
           }
         }"""))  # noqa: E501
 

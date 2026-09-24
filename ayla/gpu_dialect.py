@@ -1228,7 +1228,7 @@ class MemTensorType(Type):
 
     Subclasses split along the addressing model:
       - AddrMemTensorType: byte-addressable linear memory (gmem, smem).
-      - RegMemTensorType: SIMT-distributed registers (rmem, wrmem).
+      - RegMemTensorType: SIMT-distributed registers (rmem, wgrmem).
 
     All subclasses encode as `<NAME><N x M x ... x DTYPE [extra] attrs={...}>`,
     differing only in the `[extra]` clauses they print/parse (strides for
@@ -1394,7 +1394,7 @@ class AddrMemTensorType(MemTensorType):
 class RegMemTensorType(MemTensorType):
     """Register-resident tensor: SIMT-distributed registers, no byte
     addressing. Storage is a fixed set of named registers per thread
-    (rmem) or per warp (wrmem); no pointer arithmetic, no aliasing.
+    (rmem) or per warp (wgrmem); no pointer arithmetic, no aliasing.
     """
 
 
@@ -1710,9 +1710,9 @@ class RmemTensorType(RegMemTensorType):
     """
 
 
-@gpu_dialect.register_type("wrmem")
-class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
-    """Warp register-memory tensor.
+@gpu_dialect.register_type("wgrmem")
+class WgrmemTensorType(RegMemTensorType):
+    """Warp-group register-memory tensor.
 
     Logical tensor distributed across multiple warps. Each thread holds
     a fragment in its own registers; the full value is the union of all
@@ -1725,7 +1725,7 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
     Supported layouts:
       - ``"mma"``: mma.sync m16n8k16, warps=1
       - ``"wgmma_layout_0"``: warp group MMA m64nNk16, warps=4
-    All lowerings that read from a wrmem tensor (store, convert, matmul)
+    All lowerings that read from a wgrmem tensor (store, convert, matmul)
     must check the layout to emit correct code.
     """
 
@@ -1739,7 +1739,7 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
         attrs: dict[str, object] | None = None,
     ):
         assert layout in ("mma", "wgmma_layout_0"), (
-            f"WrmemTensorType: layout must be 'mma' or 'wgmma_layout_0'; "
+            f"WgrmemTensorType: layout must be 'mma' or 'wgmma_layout_0'; "
             f"got {layout!r}"
         )
         return cls(attrs={
@@ -2340,7 +2340,7 @@ _COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
 def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, RmemTensorType):
         return CollectiveScope.THREAD
-    if isinstance(t, WrmemTensorType):
+    if isinstance(t, WgrmemTensorType):
         return CollectiveScope.WARPGROUP
     if isinstance(t, SmemTensorType):
         return CollectiveScope.BLOCK
@@ -2407,7 +2407,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         # for multicast. A cooperative move writes at the buffer's own scope.
         src_scope = (
             CollectiveScope.THREAD
-            if isinstance(op.src.type, WrmemTensorType)
+            if isinstance(op.src.type, WgrmemTensorType)
             else _type_collective_scope(op.src.type)
         )
         # TODO: Derive the issuing scope from ``op.collective`` once collective
@@ -2500,11 +2500,11 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return effects
     if isinstance(op, AllocOp):
         # Only an initialized alloc writes (fills the buffer); an uninitialized
-        # one is side-effect-free, handled above. A wrmem accumulator is per-thread.
+        # one is side-effect-free, handled above. A wgrmem accumulator is per-thread.
         buf = op.result()
         scope = (
             CollectiveScope.THREAD
-            if isinstance(buf.type, WrmemTensorType)
+            if isinstance(buf.type, WgrmemTensorType)
             else _type_collective_scope(buf.type)
         )
         return _memory_effect("W", buf, scope)

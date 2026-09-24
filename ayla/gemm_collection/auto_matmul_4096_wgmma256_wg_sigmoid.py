@@ -79,7 +79,7 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
         op_label_filter="mm", epilogue_label_filter="epi",
     ))
     pipeline.add_pass(PromoteBuffers(
-        target_type="wrmem", operands=["dst"],
+        target_type="wgrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
         epilogue_label_filter="epi",
@@ -87,7 +87,7 @@ def auto_matmul_4096_wgmma256_wg_sigmoid_module():
     pipeline.add_pass(TileElementwise(
         tile_dims=[1], tile_sizes=[64],
         tile_levels=["for"], tile_labels=["outn"],
-        label_filter="epi|mm_dst_convert|mm_dst_wrmem|mm_dst_smem",
+        label_filter="epi|mm_dst_convert|mm_dst_wgrmem|mm_dst_smem",
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[64],
