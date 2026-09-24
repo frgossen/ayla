@@ -1,4 +1,5 @@
 """Import matching, scheduling, and compilation for packed SwiGLU."""
+
 from __future__ import annotations
 
 from typing import cast
@@ -22,12 +23,18 @@ from ..gpu_dialect import (
     CollectiveLevel,
     ElementwiseOp,
     F32Type,
+    ForOp,
     GmemTensorType,
+    IndexAddOp,
+    IndexConstantOp,
+    IndexMulOp,
     KernelOp,
     MatmulOp,
+    MemoryEffect,
     ModuleOp,
     MoveOp,
     TileOp,
+    WarpGroupIdOp,
     WrmemTensorType,
 )
 from ..passes.canonicalize import Canonicalize
@@ -61,9 +68,7 @@ def _match_swiglu_chain(
         raise ValueError("SwiGLU schedule requires one kernel")
     kernel = top_ops[0]
     if len(kernel.body.arguments) != 4:
-        raise ValueError(
-            "SwiGLU schedule requires three inputs and one result"
-        )
+        raise ValueError("SwiGLU schedule requires three inputs and one result")
     lhs, packed_weight, down_weight, output = kernel.body.arguments
     matmuls = find_ops_of_type(module, MatmulOp)
     tiles = find_ops_of_type(module, TileOp)
@@ -87,8 +92,7 @@ def _match_swiglu_chain(
         and up.indices[1] == intermediate
         and gate_convert.src(0) is gate.result()
         and silu.src(0) is gate_convert.dst
-        and set((multiply.src(0), multiply.src(1)))
-        == {silu.dst, up.result()}
+        and set((multiply.src(0), multiply.src(1))) == {silu.dst, up.result()}
         and down.lhs is multiply.dst
         and down.rhs is down_weight
         and down.dst is output
@@ -111,6 +115,8 @@ def _projection_ops(
     lhs: Value,
     packed_weight: Value,
     hidden: Value,
+    m_index: Value,
+    n_index: Value,
     *,
     m: int,
     k: int,
@@ -118,7 +124,6 @@ def _projection_ops(
     m_tile: int,
     n_tile: int,
 ) -> tuple[list[Op], MoveOp]:
-    block_ids = BlockIdsOp.build()
     packed_type = _gmem(packed_weight)
     lhs_type = _gmem(lhs)
     hidden_type = _gmem(hidden)
@@ -126,7 +131,8 @@ def _projection_ops(
         packed_weight,
         [0, 0],
         GmemTensorType.build(
-            [intermediate, k], packed_type.dtype,
+            [intermediate, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
     )
@@ -134,50 +140,91 @@ def _projection_ops(
         packed_weight,
         [1, 0],
         GmemTensorType.build(
-            [intermediate, k], packed_type.dtype,
+            [intermediate, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
     )
-    lhs_tile = TileOp.build(
+    lhs_block_tile = TileOp.build(
         lhs,
-        [block_ids.y, 0],
+        [m_index, 0],
         GmemTensorType.build(
-            [m_tile, k], lhs_type.dtype, strides=list(lhs_type.strides),
+            [m_tile, k],
+            lhs_type.dtype,
+            strides=list(lhs_type.strides),
         ),
         maybe_partial=m % m_tile != 0,
     )
     gate_tile = TileOp.build(
         gate_weight.result(),
-        [block_ids.x, 0],
+        [n_index, 0],
         GmemTensorType.build(
-            [n_tile, k], packed_type.dtype,
+            [n_tile, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
+        maybe_partial=intermediate % n_tile != 0,
     )
     up_tile = TileOp.build(
         up_weight.result(),
-        [block_ids.x, 0],
+        [n_index, 0],
         GmemTensorType.build(
-            [n_tile, k], packed_type.dtype,
+            [n_tile, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
+        maybe_partial=intermediate % n_tile != 0,
     )
-    hidden_tile = TileOp.build(
+    hidden_block_tile = TileOp.build(
         hidden,
-        [block_ids.y, block_ids.x],
+        [m_index, n_index],
         GmemTensorType.build(
-            [m_tile, n_tile], hidden_type.dtype,
+            [m_tile, n_tile],
+            hidden_type.dtype,
             strides=list(hidden_type.strides),
         ),
         maybe_partial=m % m_tile != 0,
     )
+    m_warp_groups = m_tile // 64
+    parallel_ops: list[Op] = []
+    if m_warp_groups > 1:
+        warp_group_ids = WarpGroupIdOp.build()
+        parallel_ops.append(warp_group_ids)
+        lhs_tile = TileOp.build(
+            lhs_block_tile.result(),
+            [warp_group_ids.x, 0],
+            GmemTensorType.build(
+                [64, k],
+                lhs_type.dtype,
+                strides=list(lhs_type.strides),
+            ),
+            maybe_partial=m % m_tile != 0,
+        )
+        hidden_tile = TileOp.build(
+            hidden_block_tile.result(),
+            [warp_group_ids.x, 0],
+            GmemTensorType.build(
+                [64, n_tile],
+                hidden_type.dtype,
+                strides=list(hidden_type.strides),
+            ),
+            maybe_partial=m % m_tile != 0,
+        )
+    else:
+        lhs_tile = lhs_block_tile
+        hidden_tile = hidden_block_tile
 
     accumulator_type = WrmemTensorType.build(
-        [m_tile, n_tile], F32Type(), warps=4, layout="wgmma_layout_0",
+        [64, n_tile],
+        F32Type(),
+        warps=4,
+        layout="wgmma_layout_0",
     )
     epilogue_type = WrmemTensorType.build(
-        [m_tile, n_tile], _gmem(hidden).dtype,
-        warps=4, layout="wgmma_layout_0",
+        [64, n_tile],
+        _gmem(hidden).dtype,
+        warps=4,
+        layout="wgmma_layout_0",
     )
     gate_acc = AllocOp.build_with_fresh_id(accumulator_type, init=0.0)
     up_acc = AllocOp.build_with_fresh_id(accumulator_type, init=0.0)
@@ -189,42 +236,65 @@ def _projection_ops(
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
     gate_matmul = MatmulOp.build(
-        lhs_tile.result(), gate_tile.result(), gate_acc.result(),
-        collective=collective, attrs={"label": "gate"},
+        lhs_tile.result(),
+        gate_tile.result(),
+        gate_acc.result(),
+        collective=collective,
+        attrs={"label": "gate"},
     )
     up_matmul = MatmulOp.build(
-        lhs_tile.result(), up_tile.result(), up_acc.result(),
-        collective=collective, attrs={"label": "up"},
+        lhs_tile.result(),
+        up_tile.result(),
+        up_acc.result(),
+        collective=collective,
+        attrs={"label": "up"},
     )
     round_gate = ElementwiseOp.build(
-        activation.result(), [gate_acc.result()], "convert",
+        activation.result(),
+        [gate_acc.result()],
+        "convert",
     )
     widen_gate = ElementwiseOp.build(
-        gate_acc.result(), [activation.result()], "convert",
+        gate_acc.result(),
+        [activation.result()],
+        "convert",
     )
     activate = ElementwiseOp.build(
-        activation.result(), [gate_acc.result()], "silu",
+        activation.result(),
+        [gate_acc.result()],
+        "silu",
         attrs={"label": "gate_epi"},
     )
     round_up = ElementwiseOp.build(
-        product.result(), [up_acc.result()], "convert",
+        product.result(),
+        [up_acc.result()],
+        "convert",
     )
     multiply = ElementwiseOp.build(
-        product.result(), [product.result(), activation.result()], "mul",
+        product.result(),
+        [product.result(), activation.result()],
+        "mul",
         attrs={"label": "up_epi"},
     )
     writeback = MoveOp.build(
-        hidden_tile.result(), product.result(), collective=collective,
-        attrs={"label": "up_dst_wrmem"},
+        hidden_tile.result(),
+        product.result(),
+        collective=collective,
+        attrs={
+            "label": "up_dst_wrmem",
+            "dst_tiling_scheme": MemoryEffect.fresh_tiling_scheme_id(),
+        },
     )
     return [
-        block_ids,
         gate_weight,
         up_weight,
-        lhs_tile,
+        lhs_block_tile,
         gate_tile,
         up_tile,
-        hidden_tile,
+        hidden_block_tile,
+        *parallel_ops,
+        *([] if lhs_tile is lhs_block_tile else [lhs_tile]),
+        *([] if hidden_tile is hidden_block_tile else [hidden_tile]),
         gate_acc,
         up_acc,
         activation,
@@ -234,7 +304,7 @@ def _projection_ops(
         # later by ReuseSmemAllocs. Keep ScheduleAsync from hoisting up's TMA
         # loads above gate completion and clobbering that shared arena. Thread
         # scope is only an IR ordering fence here and emits no PTX instruction.
-        BarrierOp.build("thread"),
+        BarrierOp.build("thread" if m_warp_groups == 1 else "block"),
         up_matmul,
         round_gate,
         widen_gate,
@@ -245,7 +315,12 @@ def _projection_ops(
     ], writeback
 
 
-def _schedule_projection(module: ModuleOp) -> None:
+def _schedule_projection(
+    module: ModuleOp,
+    *,
+    stages: int,
+    num_warp_groups: int,
+) -> None:
     move_attrs: dict[str, dict[str, object]] = {
         "lhs": {
             "l2_cache_hint": "evict_last",
@@ -259,21 +334,22 @@ def _schedule_projection(module: ModuleOp) -> None:
     for label in ("gate", "up"):
         schedule_register_matmul(
             label=label,
-            operand_stages=3,
+            operand_stages=stages,
             operand_k_tile=64,
             unsafe_reuse_smem=True,
             operand_move_attrs=move_attrs,
             loop_label_prefix=label,
         ).run(module)
 
-    PromoteBuffers(
-        target_type="wgrmem",
-        operands=["dst"],
-        tma=True,
-        unsafe_reuse_smem=True,
-        move_attrs={"dst": {"l2_cache_hint": "evict_last"}},
-        label_filter="up_dst_wrmem",
-    ).run(module)
+    if num_warp_groups == 1:
+        PromoteBuffers(
+            target_type="wgrmem",
+            operands=["dst"],
+            tma=True,
+            unsafe_reuse_smem=True,
+            move_attrs={"dst": {"l2_cache_hint": "evict_last"}},
+            label_filter="up_dst_wrmem",
+        ).run(module)
     LowerToAsync().run(module)
     FuseAsync().run(module)
     ScheduleAsync().run(module)
@@ -294,6 +370,11 @@ def _schedule_down(
         op_label_filter="down",
         allow_partial_tiles=True,
     ).run(module)
+    for loop in find_ops_of_type(module, ForOp):
+        if loop.attrs.get("label") != "down_m":
+            continue
+        if loop.trip_count > 1:
+            loop.body.ops.append(BarrierOp.build("block"))
     schedule_tiled_matmul(
         label="down",
         output_m_tile=m_tile,
@@ -323,7 +404,7 @@ def schedule_swiglu(
     output_m_tile: int = 64,
     projection_n_tile: int = 192,
 ) -> ModuleOp:
-    """Schedule a one-wave packed SwiGLU GEMM chain as one kernel."""
+    """Schedule a packed SwiGLU GEMM chain as one kernel."""
     source_kernel, projection, down = _match_swiglu_chain(module)
     lhs_type = _gmem(projection.lhs)
     packed_type = _gmem(projection.rhs)
@@ -343,18 +424,16 @@ def schedule_swiglu(
         or _static_pair(down.dst) != (m, output_n)
     ):
         raise ValueError("inconsistent packed SwiGLU dimensions")
-    if m > output_m_tile:
-        raise ValueError(
-            f"SwiGLU schedule supports M <= {output_m_tile}, got {m}"
-        )
+    if output_m_tile not in (64, 128, 192, 256):
+        raise ValueError("SwiGLU M tile must be 64, 128, 192, or 256")
+    num_warp_groups = output_m_tile // 64
     if intermediate % projection_n_tile or output_n % 64:
         raise ValueError("SwiGLU output dimensions must divide schedule tiles")
     projection_blocks = intermediate // projection_n_tile
     down_blocks = output_n // 64
-    if projection_blocks != down_blocks:
-        raise ValueError(
-            "SwiGLU schedule requires equal projection and down block counts"
-        )
+    if projection_blocks % down_blocks:
+        raise ValueError("SwiGLU projection blocks must be a multiple of down blocks")
+    grid_blocks = down_blocks
 
     lhs = Value("lhs", clone_type(lhs_type))
     packed_weight = Value("packed_weight", clone_type(packed_type))
@@ -365,16 +444,67 @@ def schedule_swiglu(
         GmemTensorType.build([m, intermediate], lhs_type.dtype),
     )
     sync = Value("sync", GmemTensorType.build([2], F32Type()))
+    block_ids = BlockIdsOp.build()
+    projection_tiles = (m + output_m_tile - 1) // output_m_tile
+    projection_n_waves = projection_blocks // grid_blocks
+    projection_m = (
+        block_ids.y
+        if projection_tiles == 1
+        else Value("projection_m", block_ids.y.type)
+    )
+    projection_n_wave = Value("projection_n", block_ids.x.type)
+    projection_index_ops: list[Op] = []
+    if projection_n_waves == 1:
+        projection_n = block_ids.x
+    else:
+        grid_size = IndexConstantOp.build(grid_blocks)
+        wave_offset = IndexMulOp.build(
+            projection_n_wave,
+            grid_size.result(),
+        )
+        projection_n_op = IndexAddOp.build(
+            wave_offset.result(),
+            block_ids.x,
+        )
+        projection_index_ops = [grid_size, wave_offset, projection_n_op]
+        projection_n = projection_n_op.result()
     projection_ops, _writeback = _projection_ops(
         lhs,
         packed_weight,
         hidden,
+        projection_m,
+        projection_n,
         m=m,
         k=k,
         intermediate=intermediate,
         m_tile=output_m_tile,
         n_tile=projection_n_tile,
     )
+    projection_phase: list[Op] = [*projection_index_ops, *projection_ops]
+    if projection_n_waves > 1:
+        projection_phase.append(BarrierOp.build("block"))
+        projection_phase = [
+            ForOp.build(
+                0,
+                projection_n_waves,
+                body=Block(
+                    arguments=[projection_n_wave],
+                    ops=projection_phase,
+                ),
+                attrs={"label": "projection_n"},
+            ),
+        ]
+    if projection_tiles > 1:
+        if projection_n_waves == 1:
+            projection_phase.append(BarrierOp.build("block"))
+        projection_phase = [
+            ForOp.build(
+                0,
+                projection_tiles,
+                body=Block(arguments=[projection_m], ops=projection_phase),
+                attrs={"label": "projection_m"},
+            ),
+        ]
     down_op = MatmulOp.build(
         hidden,
         down_weight,
@@ -387,25 +517,35 @@ def schedule_swiglu(
         source_kernel.name,
         Block(
             arguments=[
-                lhs, packed_weight, down_weight, hidden, output, sync,
+                lhs,
+                packed_weight,
+                down_weight,
+                hidden,
+                output,
+                sync,
             ],
             ops=[
-                *projection_ops,
+                block_ids,
+                *projection_phase,
                 BarrierOp.build("grid", sync=sync),
                 down_op,
             ],
         ),
-        grid_dim=(projection_blocks, 1, 1),
-        block_dim=(128, 1, 1),
-        num_warp_groups=1,
-        ptx_optimization_level=4,
+        grid_dim=(grid_blocks, 1, 1),
+        block_dim=(128 * num_warp_groups, 1, 1),
+        num_warp_groups=num_warp_groups,
+        ptx_optimization_level=1 if m == 512 else 4,
     )
     scheduled = ModuleOp.build(Block(ops=[kernel]))
-    _schedule_projection(scheduled)
+    _schedule_projection(
+        scheduled,
+        stages=5 if m == 512 else 3,
+        num_warp_groups=num_warp_groups,
+    )
     _schedule_down(
         scheduled,
         m_tile=output_m_tile,
-        stages=5 if m <= 32 else 6,
+        stages=5 if m == 512 else (5 if m <= 32 else 6),
     )
     ScheduleAsync().run(scheduled)
     return Canonicalize().run(scheduled)
@@ -413,8 +553,16 @@ def schedule_swiglu(
 
 def compile_swiglu(module: ModuleOp) -> PtxRoutePlan:
     """Compile an imported packed SwiGLU region."""
+    _, projection, _ = _match_swiglu_chain(module)
+    m, _ = _static_pair(projection.lhs)
     return PtxRoutePlan(
-        make_ptx_kernel(schedule_swiglu(module)),
+        make_ptx_kernel(
+            schedule_swiglu(
+                module,
+                output_m_tile=256 if m == 512 else 64,
+                projection_n_tile=96 if m == 512 else 192,
+            )
+        ),
         bindings=[
             0,
             1,
