@@ -71,6 +71,8 @@ class LoweringPass(Pass):
 
     def __init__(self, **options: object) -> None:
         super().__init__(**options)
+        # TODO: Give one-to-one rewrites a typed value map so lowering passes
+        # do not need to assert that a general pytree replacement is a Value.
         self.value_map: dict[Value, object] = {}
 
     def run(self, module: ModuleOp) -> ModuleOp:
