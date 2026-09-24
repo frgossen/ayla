@@ -26,6 +26,7 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     MoveOp,
+    ReduceOp,
     ReshapeOp,
     SmemTensorType,
     TileOp,
@@ -334,6 +335,40 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 f"inconsistent matmul shapes: {lhs.sizes}, {rhs.sizes}, "
                 f"{dst.sizes}"
+            )
+
+    @verifies(ReduceOp)
+    def _verify_reduce(self, op: ReduceOp) -> None:
+        dst, src = op.dst.type, op.src.type
+        if not isinstance(dst, MemTensorType) or not isinstance(
+            src, MemTensorType,
+        ):
+            raise ValueError("reduce operands must be memory tensors")
+        if src.rank == 0 or dst.rank != src.rank:
+            raise ValueError(
+                "reduce source and destination must have the same nonzero "
+                f"rank; got {src.sizes} and {dst.sizes}"
+            )
+        if any(
+            src_size != dst_size
+            for src_size, dst_size in zip(
+                src.sizes[:-1], dst.sizes[:-1], strict=True,
+            )
+        ):
+            raise ValueError(
+                "reduce source and destination parallel dimensions must "
+                f"match; got {src.sizes} and {dst.sizes}"
+            )
+        src_reduction_size = src.sizes[-1]
+        dst_reduction_size = dst.sizes[-1]
+        if (
+            src_reduction_size is not None
+            and dst_reduction_size is not None
+            and dst_reduction_size > src_reduction_size
+        ):
+            raise ValueError(
+                "reduce destination reduction dimension cannot exceed the "
+                f"source; got {src.sizes} and {dst.sizes}"
             )
 
     @verifies(ElementwiseOp)
