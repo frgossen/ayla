@@ -339,6 +339,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ReduceOp)
     def _verify_reduce(self, op: ReduceOp) -> None:
+        _verify_collective_attr(op)
         dst, src = op.dst.type, op.src.type
         if not isinstance(dst, MemTensorType) or not isinstance(
             src, MemTensorType,
