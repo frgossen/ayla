@@ -1,13 +1,16 @@
 """Materialize register-to-global writes through shared memory when requested."""
 from __future__ import annotations
 
-from ..base.ir import Op, Value
+from ..base.ir import Op, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
     CollectiveLevel,
     ElementwiseOp,
     GmemTensorType,
+    IndexAddOp,
+    IndexConstantOp,
+    IndexMulOp,
     ModuleOp,
     MoveOp,
     SmemTensorType,
@@ -17,9 +20,70 @@ from ..gpu_dialect import (
 from ._utils import (
     build_slice_tile,
     label_matches,
-    rebuild_tile,
     tile_introduces_narrow_level,
 )
+
+
+def _rebuild_noncolumn_tile(tile: TileOp, new_arg: Value) -> TileOp | None:
+    """Replay the row portion of a destination tile on a sliced SMEM tile."""
+    tile_type = tile.result().type
+    arg_type = tile.arg.type
+    new_type = clone_type(new_arg.type)
+    indices = list(tile.indices)
+    changed = False
+    for dim in range(new_type.rank - 1):
+        if tile_type.sizes[dim] != arg_type.sizes[dim]:
+            new_type.sizes[dim] = tile_type.sizes[dim]
+            changed = True
+    indices[-1] = 0
+    if not changed:
+        return None
+    return TileOp.build(
+        new_arg, indices, new_type, maybe_partial=tile.maybe_partial,
+    )
+
+
+def _column_owner_index(
+    column_tiles: list[TileOp], slice_cols: int,
+) -> tuple[list[Op], Value]:
+    """Return the output-slice coordinate encoded by nested column tiles."""
+    ops: list[Op] = []
+    terms: list[Value] = []
+    constant = 0
+    for tile in column_tiles:
+        width = tile.result().type.sizes[-1]
+        if width % slice_cols:
+            raise ValueError(
+                "warpgroup-column tiles must align with writeback slices"
+            )
+        scale = width // slice_cols
+        index = tile.indices[-1]
+        if isinstance(index, int):
+            constant += index * scale
+            continue
+        term = index
+        if scale != 1:
+            scale_op = IndexConstantOp.build(scale)
+            scaled = IndexMulOp.build(index, scale_op.result())
+            ops.extend([scale_op, scaled])
+            term = scaled.result()
+        terms.append(term)
+
+    if not terms:
+        raise ValueError(
+            "warpgroup-column writeback needs a dynamic column owner"
+        )
+    owner = terms[0]
+    for term in terms[1:]:
+        added = IndexAddOp.build(owner, term)
+        ops.append(added)
+        owner = added.result()
+    if constant:
+        constant_op = IndexConstantOp.build(constant)
+        added = IndexAddOp.build(owner, constant_op.result())
+        ops.extend([constant_op, added])
+        owner = added.result()
+    return ops, owner
 
 
 class StageRegisterWriteback(LoweringPass):
@@ -140,36 +204,45 @@ class StageRegisterWriteback(LoweringPass):
         new_ops.extend(smems)
 
         slice_cols = smem_sizes[-1]
-        wg_column_tile = next((
+        wg_column_tiles = [
             tile for tile in narrow_tiles
             if tile.result().type.sizes[-1] != tile.arg.type.sizes[-1]
-        ), None)
+        ]
         expected_slices = block_dst.type.sizes[-1] // src.type.sizes[-1]
-        if wg_column_tile is not None and self.writeback_slices != expected_slices:
+        if wg_column_tiles and self.writeback_slices != expected_slices:
             raise ValueError(
                 "warpgroup-column writeback needs one slice per warpgroup"
             )
+        writer_ops: list[Op] = []
+        writer_index: Value | None = None
+        if wg_column_tiles:
+            writer_ops, writer_index = _column_owner_index(
+                list(reversed(wg_column_tiles)), slice_cols,
+            )
+            new_ops.extend(writer_ops)
 
         for slice_index in range(self.writeback_slices):
             smem = smems[slice_index if self.writeback_buffers > 1 else 0]
             gather_dst = smem.result()
             for tile in reversed(narrow_tiles):
-                if tile is wg_column_tile:
+                rebuilt = _rebuild_noncolumn_tile(tile, gather_dst)
+                if rebuilt is None:
                     continue
-                rebuilt = rebuild_tile(tile, gather_dst)
                 new_ops.append(rebuilt)
                 gather_dst = rebuilt.result()
             gather_attrs = (
                 {} if owner is None else {"label": f"{owner}_dst_smem"}
             )
-            if wg_column_tile is not None:
+            gather_indices = None
+            if writer_index is not None:
                 gather_attrs["writer_wg"] = slice_index
+                gather_indices = [writer_index]
             elif self.writeback_slices > 1:
                 # TODO: Express this source slice with a tile op instead of the
                 # wgmma_col_start attribute.
                 gather_attrs["wgmma_col_start"] = slice_index * slice_cols
             new_ops.append(MoveOp.build(
-                gather_dst, src,
+                gather_dst, src, gather_indices,
                 collective=op.collective, attrs=gather_attrs,
             ))
 
@@ -183,9 +256,13 @@ class StageRegisterWriteback(LoweringPass):
             store_attrs["tma"] = True
             if owner is not None:
                 store_attrs["label"] = f"{owner}_dst_tma"
+            store_collective = {
+                axis: level.join(CollectiveLevel.BLOCK)
+                for axis, level in op.collective.items()
+            }
             new_ops.append(MoveOp.build(
                 store_dst, smem.result(),
-                collective=op.collective, attrs=store_attrs,
+                collective=store_collective, attrs=store_attrs,
             ))
         return new_ops, []
 

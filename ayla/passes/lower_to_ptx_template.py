@@ -251,6 +251,46 @@ class LowerToPtxTemplate(LoweringPass):
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
 
+    def _wgmma_writer_predicate(
+        self,
+        op: MoveOp,
+        operands: list[Value],
+        operand_names: list[str],
+    ) -> tuple[str, str]:
+        """Build an optional warp-group-uniform predicate for a sliced gather.
+
+        StageRegisterWriteback passes the column coordinate recovered from the
+        destination's TileOp chain as the move's lone index. Legacy hand-built
+        moves without that index continue to compare the physical warp-group
+        id directly.
+        """
+        writer_wg = op.attrs.get("writer_wg")
+        if writer_wg is None:
+            return "", ""
+        if not isinstance(writer_wg, int) or writer_wg < 0:
+            raise ValueError("writer_wg must be a non-negative integer")
+        if op.indices:
+            if len(op.indices) != 1:
+                raise ValueError(
+                    "writer-owned WGMMA moves require one owner index"
+                )
+            writer = self.value_map[op.indices[0]]
+            assert isinstance(writer, Value)
+            operands.append(writer)
+            operand_names.append("writer")
+            actual = "${b32:operand.writer.val}"
+            setup = ""
+        else:
+            actual = "${b32:st_wg}"
+            setup = textwrap.dedent("""\
+                mov.u32 ${b32:st_full_tid}, %tid.x;
+                shr.u32 ${b32:st_wg}, ${b32:st_full_tid}, 7;
+            """)
+        setup += (
+            f"setp.eq.u32 ${{pred:st_writer}}, {actual}, {writer_wg};\n"
+        )
+        return setup, "@${pred:st_writer} "
+
     @lowers(KernelOp)
     def lower_kernel(
         self, op: KernelOp,
@@ -1469,15 +1509,20 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes, dtype_bytes,
         )
+        operands = [dst_value, src_value, byte_offset]
+        operand_names = ["dst", "src", "offset"]
+        writer_setup, predicate = self._wgmma_writer_predicate(
+            op, operands, operand_names,
+        )
         if isinstance(dst_type, GmemTensorType):
-            template = textwrap.dedent(r"""
+            template = writer_setup + textwrap.dedent(r"""
                 cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
                 add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
             """)
             address = "${b64:base}"
             instruction = "st.global.b32"
         else:
-            template = (
+            template = writer_setup + (
                 "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
                 "${b32:operand.offset.val};\n"
             )
@@ -1487,14 +1532,14 @@ class LowerToPtxTemplate(LoweringPass):
         for pair, di, dj in pairs:
             offset = di * row_stride_bytes + dj * dtype_bytes
             template += (
-                f"{instruction} [{address}+{offset}], "
+                f"{predicate}{instruction} [{address}+{offset}], "
                 f"${{b32:operand.src.r{pair}}};\n"
             )
 
         new_op = PTXTemplateOp.build(
-            operands=[dst_value, src_value, byte_offset],
+            operands=operands,
             result_types=[], template=template,
-            operand_names=["dst", "src", "offset"], result_names=[],
+            operand_names=operand_names, result_names=[],
             description=str(op),
         )
         new_ops.append(new_op)
@@ -1521,19 +1566,11 @@ class LowerToPtxTemplate(LoweringPass):
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = root_type.sizes
-        # TODO: Model writer ownership as a warpgroup-uniform IR condition so
-        # loop peeling/unrolling can specialize each slice and lower the whole
-        # gather to one branch instead of predicating every stmatrix.
-        writer_wg = op.attrs.get("writer_wg")
-        predicate = ""
-        writer_setup = ""
-        if writer_wg is not None:
-            predicate = "@${pred:st_writer} "
-            writer_setup = textwrap.dedent(f"""\
-                mov.u32 ${{b32:st_full_tid}}, %tid.x;
-                shr.u32 ${{b32:st_wg}}, ${{b32:st_full_tid}}, 7;
-                setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
-            """)
+        operands = [dst, src]
+        operand_names = ["dst", "src"]
+        writer_setup, predicate = self._wgmma_writer_predicate(
+            op, operands, operand_names,
+        )
         template = writer_setup + textwrap.dedent("""\
             mov.u32 ${b32:st_lane}, %laneid;
             mov.u32 ${b32:st_tid}, %tid.x;
@@ -1586,8 +1623,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"[${{b32:st_addr}}], {{{regs}}};\n"
             )
         lowered = PTXTemplateOp.build(
-            operands=[dst, src], result_types=[], template=template,
-            operand_names=["dst", "src"], result_names=[],
+            operands=operands, result_types=[], template=template,
+            operand_names=operand_names, result_names=[],
             description=str(op),
         )
         return [lowered], []

@@ -72,6 +72,48 @@ def test_lowers_legacy_attribute_column_slice():
     assert template.count("stmatrix.sync") == 8
 
 
+def test_writer_predicate_uses_column_owner_from_tile_chain():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[512, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c2: index = index_constant() attrs={value: 2}
+            %row: index = index_div(%wgx: index, %c2: index)
+            %col: index = index_mod(%wgx: index, %c2: index)
+            %s: smem<128x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
+            %s_rows: smem<64x128xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%s: smem<128x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %row: index, 0)
+            %r: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s_rows: smem<64x128xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">, %col: index) attrs={writer_wg: 1}
+          }
+        }"""))
+
+    module = lower_to_ptx_template(module)
+    template = next(
+        op.template for op in find_ops_of_type(module, PTXTemplateOp)
+        if "stmatrix.sync" in op.template
+    )
+    assert "${b32:operand.writer.val}, 1" in template
+    assert "shr.u32 ${b32:st_wg}" not in template
+
+
+def test_column_owner_also_predicates_scalar_fallback():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%writer: index) block_dim=[512, 1, 1] {
+            %s: smem<64x128xbf16> = alloc() attrs={id: 0}
+            %r: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s: smem<64x128xbf16>, %r: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">, %writer: index) attrs={writer_wg: 1}
+          }
+        }"""))
+
+    module = lower_to_ptx_template(module)
+    template = "".join(
+        op.template for op in find_ops_of_type(module, PTXTemplateOp)
+    )
+    assert "${b32:operand.writer.val}, 1" in template
+    assert "@${pred:st_writer} st.shared.b32" in template
+
+
 def test_unswizzled_move_uses_scalar_store_fallback():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
