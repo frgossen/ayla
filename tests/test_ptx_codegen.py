@@ -14,6 +14,7 @@ from ayla import (
     make_ptx_kernel,
 )
 from ayla.gpu_dialect import (
+    BarrierOp,
     BlockIdsOp,
     ClusterBlockIdsOp,
     F32Type,
@@ -51,6 +52,7 @@ def test_codegen_cwise_add():
     assert kernel.grid_dim == (4, 1, 1)
     assert kernel.block_dim == (256, 1, 1)
     assert kernel.ptx_optimization_level == 1
+    assert not kernel.requires_resident_grid
     assert kernel.ptx == textwrap.dedent("""\
         .version 9.0
         .target sm_90a
@@ -78,6 +80,21 @@ def test_codegen_cwise_add():
 
           ret;
         }""")
+
+
+def test_codegen_marks_kernels_with_software_grid_barriers():
+    sync_type = GmemTensorType.build((2,), F32Type())
+    sync = Value(name="sync", type=sync_type)
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "grid_sync",
+        Block(arguments=[sync], ops=[BarrierOp.build("grid", sync)]),
+        grid_dim=(2, 1, 1),
+        block_dim=(32, 1, 1),
+    )]))
+
+    kernel = make_ptx_kernel(module)
+
+    assert kernel.requires_resident_grid
 
 
 def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():

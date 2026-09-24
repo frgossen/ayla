@@ -7,9 +7,10 @@ from enum import Enum
 from typing import cast
 
 from . import pytree
-from .base.ir import Op, Printer, Value
+from .base.ir import Op, Printer, Value, find_ops_of_type
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
+    BarrierOp,
     BlockIdsOp,
     ClusterBlockIdsOp,
     ForOp,
@@ -276,6 +277,7 @@ class PtxKernel:
     cluster_dim: tuple[int, int, int] | None = None
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
+    requires_resident_grid: bool = False
 
 
 def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
@@ -295,6 +297,10 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
+    requires_resident_grid = any(
+        barrier.scope == "grid"
+        for barrier in find_ops_of_type(kernel, BarrierOp)
+    )
 
     module = PtxLoweringPipeline().run(module)
 
@@ -323,6 +329,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         block_dim=block_dim,
         cluster_dim=cluster_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
+        requires_resident_grid=requires_resident_grid,
     )
 
 
