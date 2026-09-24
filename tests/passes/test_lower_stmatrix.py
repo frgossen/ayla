@@ -89,6 +89,42 @@ def test_unswizzled_move_uses_scalar_store_fallback():
     assert "st.shared.b32" in template
 
 
+def test_n8_fragment_uses_scalar_store_fallback():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[128, 1, 1] {
+            %s: smem<64x40xbf16> = alloc() attrs={id: 0}
+            %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s: smem<64x40xbf16>, %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    templates = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )
+    template = "".join(op.template for op in templates)
+    assert "stmatrix.sync" not in template
+    assert template.count("st.shared.b32") == 10
+    assert "${b32:operand.src.r9}" in template
+
+
+def test_n8_fragment_scalar_store_supports_global_memory():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%g: gmem<64x40xbf16>) block_dim=[128, 1, 1] {
+            %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            move(%g: gmem<64x40xbf16>, %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    templates = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )
+    template = "".join(op.template for op in templates)
+    assert template.count("st.global.b32") == 10
+    assert "${b32:operand.src.r9}" in template
+
+
 def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

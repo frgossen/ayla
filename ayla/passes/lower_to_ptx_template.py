@@ -1545,8 +1545,8 @@ class LowerToPtxTemplate(LoweringPass):
         assert m_dim % 64 == 0, (
             f"wgmma store: m must be a multiple of 64; got {m_dim}"
         )
-        assert root_n % 16 == 0 and 8 <= root_n <= 256, (
-            f"wgmma store: n must be a multiple of 16 in [8, 256]; got {root_n}"
+        assert root_n % 8 == 0 and 8 <= root_n <= 256, (
+            f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
         )
         dtype_bytes = dst_type.dtype.byte_size
         row_stride_bytes = dst_type.strides[0] * dtype_bytes
@@ -2048,9 +2048,13 @@ def _wgmma_pair_static_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
     returns the additional logical ``(row, column)`` offset for ``pair_index``
     in that thread's register fragment.
     """
-    n_groups = n_dim // 16
-    m, w = divmod(pair_index // 4, n_groups)
-    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][pair_index % 4]
+    assert n_dim % 8 == 0
+    pairs_per_m_tile = n_dim // 4
+    m, pair_in_m_tile = divmod(pair_index, pairs_per_m_tile)
+    w, pair_in_16_columns = divmod(pair_in_m_tile, 4)
+    di, dj = [
+        (0, 0), (8, 0), (0, 8), (8, 8)
+    ][pair_in_16_columns]
     return (m * 64 + di, w * 16 + dj)
 
 
