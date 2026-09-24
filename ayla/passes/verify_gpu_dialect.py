@@ -56,6 +56,12 @@ def _verify_static_shape(typ: Type) -> None:
         raise ValueError(f"unresolved dynamic shape {typ}")
     if isinstance(typ, TmaDescType):
         _verify_static_shape(typ.gmem_type)
+        box_dimensions = typ.encoded_box_dimensions
+        if any(not 1 <= dimension <= 256 for dimension in box_dimensions):
+            raise ValueError(
+                "TMA box dimensions must each be in [1, 256]; got "
+                f"{list(box_dimensions)}"
+            )
 
 
 def _verify_collective_attr(op: Op) -> None:

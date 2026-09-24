@@ -95,6 +95,61 @@ def test_default_verification_checks_tma_move_structure():
         verify_gpu_dialect(missing_descriptor)
 
 
+def _tma_descriptor_module(
+    tile_shape: list[int],
+    physical_layout: dict[str, object] | None = None,
+) -> ModuleOp:
+    typ = TmaDescType.build(
+        0,
+        GmemTensorType.build([512, 512], F32Type()),
+        tile_shape=tile_shape,
+        attrs=(
+            {"physical_layout": physical_layout}
+            if physical_layout is not None else None
+        ),
+    )
+    descriptor = Value(name="descriptor", type=typ)
+    return ModuleOp.build(Block(arguments=[descriptor]))
+
+
+def test_ptx_verification_rejects_oversized_tma_box_dimension():
+    module = _tma_descriptor_module([512, 64])
+    descriptor_type = module.body.arguments[0].type
+    assert isinstance(descriptor_type, TmaDescType)
+    assert descriptor_type.encoded_box_dimensions == (64, 512)
+
+    with pytest.raises(ValueError, match=r"TMA box dimensions.*\[64, 512\]"):
+        verify_gpu_dialect(module, VerificationStage.PTX_LOWERING)
+
+
+def test_ptx_verification_accepts_explicitly_sliced_tma_box():
+    module = _tma_descriptor_module([256, 64])
+
+    assert verify_gpu_dialect(module, VerificationStage.PTX_LOWERING) is module
+
+
+@pytest.mark.parametrize(
+    "order,expected_box",
+    [("row_major", (64, 8, 64)), ("block_major", (64, 64, 8))],
+)
+def test_ptx_verification_checks_physical_tma_box_dimensions(
+    order, expected_box,
+):
+    legal = _tma_descriptor_module(
+        [64, 512], {"block_width": 64, "order": order},
+    )
+    assert verify_gpu_dialect(legal, VerificationStage.PTX_LOWERING) is legal
+    descriptor_type = legal.body.arguments[0].type
+    assert isinstance(descriptor_type, TmaDescType)
+    assert descriptor_type.encoded_box_dimensions == expected_box
+
+    invalid = _tma_descriptor_module(
+        [512, 64], {"block_width": 64, "order": order},
+    )
+    with pytest.raises(ValueError, match="TMA box dimensions"):
+        verify_gpu_dialect(invalid, VerificationStage.PTX_LOWERING)
+
+
 def test_default_verification_checks_tile_result_type():
     source = Value(
         name="source",

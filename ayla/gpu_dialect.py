@@ -1755,6 +1755,37 @@ class TmaDescType(Type):
         return math.prod(self.tile_sizes)
 
     @property
+    def encoded_box_dimensions(self) -> tuple[int, ...]:
+        """Physical box dimensions passed to ``cuTensorMapEncodeTiled``."""
+        if self.gmem_type.rank != 2 or len(self.tile_sizes) != 2:
+            raise ValueError(
+                "TMA encoding currently requires a logical rank-2 tensor"
+            )
+        tile_rows, tile_columns = self.tile_sizes
+        layout = physical_layout(self)
+        if layout is None:
+            return tile_columns, tile_rows
+        block_width, order = layout
+        global_columns = self.gmem_type.sizes[1]
+        if (
+            global_columns is not None
+            and global_columns % block_width
+        ):
+            raise ValueError(
+                "TMA physical block width must divide global columns"
+            )
+        if tile_columns % block_width:
+            raise ValueError(
+                "TMA physical block width must divide tile columns"
+            )
+        tile_blocks = tile_columns // block_width
+        return (
+            (block_width, tile_rows, tile_blocks)
+            if order == "block_major"
+            else (block_width, tile_blocks, tile_rows)
+        )
+
+    @property
     def l2_promotion(self) -> str | None:
         return self.attrs.get("l2_promotion")  # type: ignore[return-value]
 
