@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from typing import cast
 
 from ..gpu_dialect import (
     AllocOp,
@@ -20,6 +21,7 @@ from ..gpu_dialect import (
     IndexModOp,
     IndexMulOp,
     LaneIdOp,
+    LockType,
     MatmulOp,
     MoveOp,
     PTXTemplateOp,
@@ -262,6 +264,7 @@ _MAX_BARRIER_IDS = 16
 
 def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
     """Largest memory-effect scope completed by awaiting ``op``."""
+    assert isinstance(op.lock.type, LockType)
     kind = op.lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
@@ -359,7 +362,11 @@ def _transfer_memory_effects(
             named_id = min(available_ids)
         # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
         # an mbar await is an all-thread rendezvous that ends this handoff.
-        if async_lock is not None and async_lock.type.kind == "mbar":
+        assert async_lock is None or isinstance(async_lock.type, LockType)
+        if (
+            async_lock is not None
+            and cast(LockType, async_lock.type).kind == "mbar"
+        ):
             live.named_barrier_ids_pending_await.setdefault(
                 async_lock, set(),
             ).add(named_id)

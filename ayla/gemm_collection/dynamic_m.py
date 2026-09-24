@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import textwrap
+from typing import NotRequired, TypedDict
 
 from .. import ptx_runtime, torch_custom_call
-from ..gpu_dialect import ModuleOp, gpu_dialect
+from ..gpu_dialect import GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from ..jit_compiler import ShapeSpecializingJITCompiler
 from ..ptx_codegen import make_ptx_kernel
 from ..torch_custom_call import DEFAULT_NAMESPACE, OperandKind
@@ -21,9 +22,18 @@ def _cache_policy_heuristic(
     }
 
 
+class _DynamicMSchedule(TypedDict):
+    output_m_tile: int
+    output_n_tile: int
+    operand_k_tile: int
+    operand_stages: int
+    operand_move_attrs: dict[str, dict[str, object]]
+    output_tma_inner_size: NotRequired[int | None]
+
+
 def _dynamic_m_schedule_heuristic(
     m: int, n: int, k: int,
-) -> dict[str, object]:
+) -> _DynamicMSchedule:
     """Broad schedule regimes distilled from the Muse cold-cache sweep."""
     square = n == k
 
@@ -87,7 +97,12 @@ def make_dynamic_m_matmul(
     module = dynamic_m_matmul_template(n, k, name=name)
 
     def compile_specialization(module: ModuleOp):
-        m = int(module.body.ops[0].signature[0].sizes[0])
+        [kernel] = module.body.ops
+        assert isinstance(kernel, KernelOp)
+        lhs_type = kernel.signature[0]
+        assert isinstance(lhs_type, GmemTensorType)
+        m = lhs_type.sizes[0]
+        assert isinstance(m, int)
         scheduled = schedule_matmul(
             module,
             **_dynamic_m_schedule_heuristic(m, n, k),

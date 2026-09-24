@@ -38,10 +38,12 @@ class ShapeSpecializingJITCompiler:
             raise ValueError(
                 "ShapeSpecializingJITCompiler currently supports only gmem arguments"
             )
-        if not all(typ.is_canonical_strides for typ in kernel.signature):
-            raise ValueError(
-                "ShapeSpecializingJITCompiler requires canonical gmem layouts"
-            )
+        for typ in kernel.signature:
+            assert isinstance(typ, GmemTensorType)
+            if not typ.is_canonical_strides:
+                raise ValueError(
+                    "ShapeSpecializingJITCompiler requires canonical gmem layouts"
+                )
 
         self._module = module
         self._compile_fn = compile_fn
@@ -81,6 +83,7 @@ class ShapeSpecializingJITCompiler:
         if any(tensor.device != device for tensor in tensors[1:]):
             raise ValueError(f"{self.name}: all tensors must be on one CUDA device")
         for tensor, typ in zip(tensors, self.signature, strict=True):
+            assert isinstance(typ, GmemTensorType)
             if tensor.dtype != to_torch_dtype(typ.dtype):
                 raise ValueError(
                     f"{self.name}: expected dtype {typ.dtype}, got {tensor.dtype}"

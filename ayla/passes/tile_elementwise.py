@@ -1,6 +1,8 @@
 """Tile element-wise operations over sequential iteration spaces."""
 from __future__ import annotations
 
+from typing import cast
+
 from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..base.pipeline import op_label_matches
@@ -8,6 +10,7 @@ from ..gpu_dialect import (
     ElementwiseOp,
     ForOp,
     IndexType,
+    MemTensorType,
     ModuleOp,
     MoveOp,
     TileOp,
@@ -71,7 +74,13 @@ class TileElementwise(LoweringPass):
             raise ValueError(
                 "TileElementwise cannot tile an indexed move"
             )
-        shapes = [list(value.type.sizes) for value in op.operands]
+        assert all(
+            isinstance(value.type, MemTensorType) for value in op.operands
+        )
+        shapes = [
+            list(cast(MemTensorType, value.type).sizes)
+            for value in op.operands
+        ]
         rank = len(shapes[0])
         if any(len(shape) != rank for shape in shapes[1:]):
             raise ValueError("TileElementwise requires operands of equal rank")
@@ -118,7 +127,10 @@ class TileElementwise(LoweringPass):
                 self.tile_dims, self.tile_sizes, ivs,
             ):
                 typ = clone_type(current.type)
-                typ.sizes[dim] = tile_size
+                assert isinstance(typ, MemTensorType)
+                sizes = list(typ.sizes)
+                sizes[dim] = tile_size
+                typ.sizes = sizes
                 indices: list[Value | int] = [0] * typ.rank
                 indices[dim] = iv
                 tile = TileOp.build(current, indices, typ)
@@ -130,14 +142,15 @@ class TileElementwise(LoweringPass):
         for iv, bound, label in zip(
             reversed(ivs), reversed(bounds), reversed(self.tile_labels),
         ):
-            attrs = {"label": label} if label is not None else None
-            body_ops = [
-                ForOp.build(
-                    lb=0, ub=bound,
-                    body=Block(arguments=[iv], ops=body_ops),
-                    attrs=attrs,
-                )
-            ]
+            attrs: dict[str, object] | None = (
+                {"label": label} if label is not None else None
+            )
+            loop: Op = ForOp.build(
+                lb=0, ub=bound,
+                body=Block(arguments=[iv], ops=body_ops),
+                attrs=attrs,
+            )
+            body_ops = [loop]
         return body_ops, []
 
 

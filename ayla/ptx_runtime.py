@@ -13,6 +13,7 @@ side-effects out.
 from __future__ import annotations
 
 from functools import cache
+from typing import Protocol, cast
 
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -293,15 +294,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 
+class _LauncherExtension(Protocol):
+    def module_load_data(self, ptx: str, optimization_level: int) -> int: ...
+
+    def module_unload(self, module: int) -> None: ...
+
+    def module_get_function(self, module: int, name: str) -> int: ...
+
+    def launch_kernel(
+        self,
+        function: int,
+        grid_dim: tuple[int, int, int],
+        block_dim: tuple[int, int, int],
+        params: list[object],
+        shared_mem_bytes: int,
+    ) -> None: ...
+
+
 @cache
-def _get_ext():
+def _get_ext() -> _LauncherExtension:
     """JIT-build the C++ launcher extension (cached after first call)."""
-    return load_inline(
-        name="ayla_ptx_launcher",
-        cpp_sources=[_LAUNCHER_CPP],
-        extra_ldflags=["-lcuda"],  # CUDA Driver API
-        with_cuda=True,
-        verbose=False,
+    return cast(
+        _LauncherExtension,
+        load_inline(
+            name="ayla_ptx_launcher",
+            cpp_sources=[_LAUNCHER_CPP],
+            extra_ldflags=["-lcuda"],  # CUDA Driver API
+            with_cuda=True,
+            verbose=False,
+        ),
     )
 
 
@@ -319,11 +340,11 @@ class PtxLauncher:
         self,
         kernel: PtxKernel,
     ):
-        self._ext = None
+        self._ext: _LauncherExtension | None = None
         self._kernel = kernel
         self._optimization_level = kernel.ptx_optimization_level
-        self._module = None
-        self._function = None
+        self._module: int | None = None
+        self._function: int | None = None
         # Map kernel arg index → user tensor index.
         self._arg_to_tensor: dict[int, int] = {}
         ti = 0
@@ -355,6 +376,8 @@ class PtxLauncher:
 
     def __call__(self, *tensors) -> None:
         self.ensure_loaded()
+        assert self._ext is not None
+        assert self._function is not None
         params = self._build_params(tensors)
         self._assert_params(params)
         self._ext.launch_kernel(
@@ -413,7 +436,7 @@ class PtxLauncher:
                 raise TypeError(f"param {i}: expected Tensor or tuple, got {type(p)}")
 
     def __del__(self):
-        if self._module is None:
+        if self._module is None or self._ext is None:
             return
         try:
             self._ext.module_unload(self._module)
