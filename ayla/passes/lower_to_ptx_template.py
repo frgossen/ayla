@@ -11,7 +11,7 @@ import math
 import struct
 import textwrap
 
-from ..base.ir import Op, Type, Value, find_ops_of_type
+from ..base.ir import Op, Type, Value, find_ancestor_of_type, find_ops_of_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AddrMemTensorType,
@@ -244,6 +244,14 @@ _ELEMENTWISE_LOWERERS = {
 }
 
 
+def _lock_has_tma_multicast(lock: Value) -> bool:
+    """Whether this specific lock coordinates a multicast TMA async group."""
+    return any(
+        isinstance(user, AsyncOp) and user.is_tma_multicast
+        for user in lock.users()
+    )
+
+
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -436,23 +444,73 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         lock_type = op.result().type
         assert isinstance(lock_type, LockType)
+        if lock_type.kind == "cluster_mbar":
+            return self._lower_alloc_cluster_mbar(op)
         if lock_type.kind != "mbar":
             return [], [None]
-        template = textwrap.dedent("""\
-            .shared .align 8 .b64 ${smem:bar}[1];
-            mov.u32 ${b32:result.dst.val}, ${smem:bar};
-            mov.u32 ${b32:result.dst.parity}, 0;
-            mov.u32 ${b32:tid_x}, %tid.x;
-            mov.u32 ${b32:tid_y}, %tid.y;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
-            mov.u32 ${b32:tid_z}, %tid.z;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
-            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
-            @${pred:not_t0} bra ${label:after_init};
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
+        is_multicast = _lock_has_tma_multicast(op.result())
+        # Every CTA owns a local mbarrier at this shared-memory offset, and a
+        # multicast signals each selected CTA's instance. The CTA-local bar.sync
+        # publishes each initialization locally; this cluster rendezvous ensures
+        # all instances are initialized before rank 0 can issue the multicast.
+        cluster_sync = (
+            """barrier.cluster.arrive.release;
+            barrier.cluster.wait.acquire;
+            """
+            if is_multicast else ""
+        )
+        template = textwrap.dedent(f"""\
+            .shared .align 8 .b64 ${{smem:bar}}[1];
+            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:result.dst.parity}}, 0;
+            mov.u32 ${{b32:tid_x}}, %tid.x;
+            mov.u32 ${{b32:tid_y}}, %tid.y;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+            mov.u32 ${{b32:tid_z}}, %tid.z;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+            @${{pred:not_t0}} bra ${{label:after_init}};
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], 1;
             fence.mbarrier_init.release.cluster;
-            ${label:after_init}:
+            ${{label:after_init}}:
             bar.sync 0;
+            {cluster_sync}\
+        """)
+        new_op = PTXTemplateOp.build(
+            operands=[], result_types=[lock_type], template=template,
+            operand_names=[], result_names=["dst"],
+            description=str(op),
+        )
+        return [new_op], [new_op.result()]
+
+    def _lower_alloc_cluster_mbar(
+        self, op: AllocOp,
+    ) -> tuple[list[Op], list[object]]:
+        lock_type = op.result().type
+        kernel = find_ancestor_of_type(op, KernelOp)
+        assert kernel is not None
+        cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+        # Nonzero ranks arrive remotely at rank 0's mbarrier. Publish rank 0's
+        # initialization cluster-wide before any CTA can reach its first use.
+        template = textwrap.dedent(f"""\
+            .shared .align 8 .b64 ${{smem:bar}}[1];
+            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:tid_x}}, %tid.x;
+            mov.u32 ${{b32:tid_y}}, %tid.y;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+            mov.u32 ${{b32:tid_z}}, %tid.z;
+            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+            @${{pred:not_t0}} bra ${{label:after_init}};
+            mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
+            setp.ne.u32 ${{pred:not_rank0}}, ${{b32:cluster_rank}}, 0;
+            @${{pred:not_rank0}} bra ${{label:after_init}};
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {cluster_size};
+            fence.mbarrier_init.release.cluster;
+            ${{label:after_init}}:
+            bar.sync 0;
+            barrier.cluster.arrive.release;
+            barrier.cluster.wait.acquire;
         """)
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
@@ -1017,7 +1075,36 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
-        elif scope == "cluster":
+        elif scope == "cluster_to_leader":
+            assert op.sync is not None
+            sync = self.value_map[op.sync]
+            assert isinstance(sync, Value)
+            template = textwrap.dedent("""\
+                bar.sync 0;
+                mov.u32 ${b32:cl_tid}, %tid.x;
+                mov.u32 ${b32:cl_tidy}, %tid.y;
+                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidy};
+                mov.u32 ${b32:cl_tidz}, %tid.z;
+                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidz};
+                setp.ne.u32 ${pred:cl_not_t0}, ${b32:cl_tid}, 0;
+                @${pred:cl_not_t0} bra ${label:cl_done};
+                mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
+                setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;
+                @${pred:rank0} bra ${label:cl_rank0};
+                mov.u32 ${b32:cluster_rank}, 0;
+                mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};
+                mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
+                bra ${label:cl_done};
+                ${label:cl_rank0}:
+                mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];
+                ${label:cl_wait}:
+                mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};
+                @!${pred:ready} bra ${label:cl_wait};
+                ${label:cl_done}:
+                """)
+            operands = [sync]
+            operand_names = ["sync"]
+        elif scope in ("leader_to_cluster", "cluster"):
             template = textwrap.dedent("""\
                 barrier.cluster.arrive.release;
                 barrier.cluster.wait.acquire;
@@ -1035,12 +1122,8 @@ class LowerToPtxTemplate(LoweringPass):
                 """)
         elif scope == "grid":
             assert op.sync is not None
-            ancestor: Op | None = op
-            while not isinstance(ancestor, KernelOp):
-                parent_block = ancestor.parent_block
-                assert parent_block is not None
-                ancestor = parent_block.parent_op
-                assert ancestor is not None
+            ancestor = find_ancestor_of_type(op, KernelOp)
+            assert ancestor is not None
             grid_size = math.prod(
                 dim if dim is not None else 1 for dim in ancestor.grid_dim
             )
@@ -1088,12 +1171,14 @@ class LowerToPtxTemplate(LoweringPass):
         # Materializing the optional hint in a virtual register lets ptxas
         # select the compact fused wait; an immediate or test_wait expands
         # into substantially more phase-check, sleep, or yield instructions.
-        template = textwrap.dedent(r"""
-            mov.u32 ${b32:ticks}, 0x989680;
-            ${label:wait}:
-            mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ${pred:mbar_done}, [${b32:operand.lock.val}], ${b32:operand.lock.parity}, ${b32:ticks};
-            @!${pred:mbar_done} bra ${label:wait};
-            xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;
+        multicast_async = _lock_has_tma_multicast(op.lock)
+        acquire_scope = "cluster" if multicast_async else "cta"
+        template = textwrap.dedent(fr"""
+            mov.u32 ${{b32:ticks}}, 0x989680;
+            ${{label:wait}}:
+            mbarrier.try_wait.parity.acquire.{acquire_scope}.shared::cta.b64 ${{pred:mbar_done}}, [${{b32:operand.lock.val}}], ${{b32:operand.lock.parity}}, ${{b32:ticks}};
+            @!${{pred:mbar_done}} bra ${{label:wait}};
+            xor.b32 ${{b32:operand.lock.parity}}, ${{b32:operand.lock.parity}}, 1;
         """)
         new_op = PTXTemplateOp.build(
             operands=[lock],
@@ -1790,6 +1875,13 @@ class LowerToPtxTemplate(LoweringPass):
 
         operands: list[Value] = [lock_value]
         operand_names: list[str] = ["lock"]
+        multicast_mask: int | None = None
+        if op.is_tma_multicast:
+            kernel = find_ancestor_of_type(op, KernelOp)
+            assert kernel is not None
+            cluster_dim = kernel.cluster_dim
+            cluster_size = math.prod(dim or 1 for dim in cluster_dim)
+            multicast_mask = (1 << cluster_size) - 1
         total_bytes = 0
         load_lines: list[str] = []
         for i, tma in enumerate(tmas):
@@ -1814,17 +1906,42 @@ class LowerToPtxTemplate(LoweringPass):
             tensor_rank = len(coordinates)
             indices = ", ".join(coordinates)
             load_lines.extend(coordinate_lines)
-            load_lines.append(self._tma_instruction(
-                tma,
+            opcode = (
                 f"cp.async.bulk.tensor.{tensor_rank}d.shared::cluster.global."
-                "mbarrier::complete_tx::bytes",
+                "mbarrier::complete_tx::bytes"
+            )
+            arguments = (
                 f"[${{b32:operand.{dn}.ptr}}], "
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
-                f"[${{b32:operand.lock.val}}]",
-                operands,
-                operand_names,
-                f"cache_policy{i}",
-            ))
+                f"[${{b32:operand.lock.val}}]"
+            )
+            if tma.multicast is not True:
+                load_lines.append(self._tma_instruction(
+                    tma,
+                    opcode,
+                    arguments,
+                    operands,
+                    operand_names,
+                    f"cache_policy{i}",
+                ))
+            else:
+                assert multicast_mask is not None
+                load_lines.extend([
+                    "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;",
+                    "setp.ne.u32 ${pred:not_cluster_leader}, "
+                    "${b32:cluster_rank}, 0;",
+                    f"@${{pred:not_cluster_leader}} bra "
+                    f"${{label:after_multicast_{i}}};",
+                    self._tma_instruction(
+                        tma,
+                        f"{opcode}.multicast::cluster",
+                        f"{arguments}, {multicast_mask}",
+                        operands,
+                        operand_names,
+                        f"cache_policy{i}",
+                    ),
+                    f"${{label:after_multicast_{i}}}:",
+                ])
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
         # the byte count are interpolated, so we avoid f-string/dedent brace and

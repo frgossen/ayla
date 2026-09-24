@@ -3,7 +3,7 @@ import textwrap
 
 import pytest
 
-from ayla import Block, Op
+from ayla import Block, Op, Value
 from ayla.analysis.sync import (
     BarrierScope,
     BarrierTarget,
@@ -12,9 +12,18 @@ from ayla.analysis.sync import (
     _barrier_scope,
 )
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import CollectiveScope, TmaMoveOp, gpu_dialect
+from ayla.gpu_dialect import (
+    AllocOp,
+    BarrierOp,
+    CollectiveScope,
+    KernelOp,
+    LockType,
+    TmaMoveOp,
+    gpu_dialect,
+)
 from ayla.passes.insert_syncs import (
     _insert_barriers,
+    _materialize_cluster_mbars,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
@@ -90,6 +99,171 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
     )
     assert _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.CLUSTER)
     assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
+
+
+def test_barrier_scopes_form_a_lattice():
+    scopes = list(BarrierScope)
+    assert all(a.join(b) == b.join(a) for a in scopes for b in scopes)
+    assert all(a.join(a) == a for a in scopes)
+    assert all(
+        a.join(b).join(c) == a.join(b.join(c))
+        for a in scopes
+        for b in scopes
+        for c in scopes
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior", "current", "expected"),
+    [
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.THREAD,
+        ),
+        (
+            CollectiveScope.THREAD,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.THREAD,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+        (
+            CollectiveScope.BLOCK_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.BLOCK_LEADER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+        (
+            CollectiveScope.CLUSTER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+    ],
+)
+def test_cluster_leader_hazards_choose_a_sufficient_barrier(
+    prior, current, expected,
+):
+    assert _barrier_scope(prior, current) == expected
+
+
+def test_block_barrier_does_not_cover_a_cluster_leader_effect():
+    assert not _barrier_covers(
+        BarrierScope.BLOCK, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert _barrier_covers(
+        BarrierScope.CLUSTER, CollectiveScope.CLUSTER_LEADER,
+    )
+
+
+def test_cluster_leader_barrier_coverage_is_directional():
+    assert not _barrier_covers(
+        BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert not _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK_LEADER,
+    )
+    assert not _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        (BarrierScope.CLUSTER_TO_LEADER, "cluster_to_leader"),
+        (BarrierScope.LEADER_TO_CLUSTER, "leader_to_cluster"),
+    ],
+)
+def test_insert_syncs_preserves_cluster_barrier_direction(scope, expected):
+    op = Op(operands=[], results=[])
+    block = Block(ops=[op])
+    sync = (
+        Value(name="sync", type=LockType.build(kind="cluster_mbar"))
+        if scope == BarrierScope.CLUSTER_TO_LEADER
+        else None
+    )
+    barrier_syncs = {op: sync} if sync is not None else None
+
+    _insert_barriers(
+        block, {op: BarrierTarget(scope)}, num_threads=32,
+        barrier_syncs=barrier_syncs,
+    )
+
+    barrier = block.ops[0]
+    assert isinstance(barrier, BarrierOp)
+    assert barrier.scope == expected
+    assert barrier.sync is sync
+
+
+def test_cluster_mbar_materialization_depends_on_barrier_scope():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test() grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %r: rmem<1xf32> = alloc() attrs={id: 0}
+          }
+        }"""))
+    kernel = find_ops_of_type(module, KernelOp)[0]
+    target_op = kernel.body.ops[0]
+
+    syncs = _materialize_cluster_mbars(
+        kernel,
+        {target_op: BarrierTarget(BarrierScope.CLUSTER_TO_LEADER)},
+    )
+
+    sync = syncs[target_op]
+    assert isinstance(sync.type, LockType)
+    assert sync.type.kind == "cluster_mbar"
+    assert isinstance(kernel.body.ops[0], AllocOp)
+    assert kernel.body.ops[0].result() is sync
+
+
+def test_tma_multicast_reuse_waits_for_every_recipient_cta():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%lock: lock<mbar>)
+            %rmem: rmem<16x16xf32> = alloc()
+            move(%rmem: rmem<16x16xf32>, %smem: smem<16x16xf32>)
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    insert_syncs(module)
+
+    text = repr(module)
+    # The parent multicast lowering synchronizes mbarrier initialization. This
+    # pass only needs the one-way reuse handoff to the next multicast issuer.
+    assert 'barrier() attrs={scope: "cluster"}' not in text
+    barriers = [
+        op for op in find_ops_of_type(module, BarrierOp)
+        if op.scope == "cluster_to_leader"
+    ]
+    assert len(barriers) == 1
+    sync = barriers[0].sync
+    assert sync is not None
+    assert isinstance(sync.type, LockType)
+    assert sync.type.kind == "cluster_mbar"
 
 
 def test_preexisting_barrier_updates_dataflow_state():

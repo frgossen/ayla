@@ -10,13 +10,18 @@ import torch
 
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
+    AllocOp,
     BarrierOp,
     ClusterBlockIdsOp,
+    CollectiveAxis,
+    CollectiveLevel,
     F32Type,
     GmemTensorType,
     KernelOp,
     ModuleOp,
+    MoveOp,
     PTXTemplateOp,
+    SmemTensorType,
 )
 from ayla.ptx_codegen import PtxKernel, make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -179,3 +184,55 @@ def test_grid_barrier_makes_prior_block_writes_visible():
 
     torch.cuda.synchronize()
     assert torch.equal(data_tensor, torch.tensor([2.0, 2.0], device="cuda"))
+
+
+@requires_cuda
+def test_tma_multicast_copies_to_every_cluster_block():
+    input_type = GmemTensorType.build((16, 16), F32Type())
+    output_type = GmemTensorType.build((2,), F32Type())
+    input_value = Value("input", input_type)
+    output = Value("output", output_type)
+    smem = AllocOp.build(SmemTensorType.build((16, 16), F32Type()), id=0)
+    load = MoveOp.build(
+        smem.result(),
+        input_value,
+        collective={
+            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
+        },
+        attrs={
+            "l2_cache_hint": "evict_last",
+            "tma": True,
+        },
+        multicast=True,
+    )
+    ids = ClusterBlockIdsOp.build()
+    write = PTXTemplateOp.build(
+        operands=[smem.result(), output, ids.x],
+        result_types=[],
+        template=textwrap.dedent("""\
+            ld.shared.f32 ${f32:value}, [${b32:operand.smem.ptr}];
+            mul.wide.u32 ${b64:offset}, ${b32:operand.rank.val}, 4;
+            add.u64 ${b64:dst}, ${b64:operand.output.ptr}, ${b64:offset};
+            st.global.f32 [${b64:dst}], ${f32:value};
+        """),
+        operand_names=["smem", "output", "rank"],
+        result_names=[],
+        description="write multicast result",
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "tma_multicast",
+        Block(arguments=[input_value, output], ops=[smem, load, ids, write]),
+        grid_dim=(2, 1, 1),
+        block_dim=(32, 1, 1),
+        cluster_dim=(2, 1, 1),
+    )]))
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    input_tensor = torch.full(
+        (16, 16), 7.0, dtype=torch.float32, device="cuda",
+    )
+    actual = torch.empty(2, dtype=torch.float32, device="cuda")
+
+    launcher(input_tensor, actual)
+    torch.cuda.synchronize()
+
+    assert actual.cpu().tolist() == [7.0, 7.0]

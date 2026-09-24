@@ -39,6 +39,10 @@ def _lower_barrier(scope: str) -> str:
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
+    ("leader_to_cluster", textwrap.dedent("""\
+        barrier.cluster.arrive.release;
+        barrier.cluster.wait.acquire;
+    """)),
     ("cluster", textwrap.dedent("""\
         barrier.cluster.arrive.release;
         barrier.cluster.wait.acquire;
@@ -56,6 +60,38 @@ def test_lower_barrier_block_leader_is_named_barrier():
         @${pred:bl_w0} bar.sync 1, 128;
         @!${pred:bl_w0} bar.arrive 1, 128;
         """)
+
+
+def test_lower_cluster_to_leader_barrier_uses_its_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %lock: lock<cluster_mbar> = alloc()
+            barrier(%lock: lock<cluster_mbar>) attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
+    assert (
+        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 2;"
+        in ptx
+    )
+    assert_contains_in_order(
+        ptx,
+        "fence.mbarrier_init.release.cluster;",
+        "bar.sync 0;",
+        "barrier.cluster.arrive.release;",
+        "barrier.cluster.wait.acquire;",
+        "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
+        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
+        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+    )
 
 
 def test_lower_smem_arena_and_reinterpret():
@@ -165,6 +201,51 @@ def test_lower_tma_load_with_l2_cache_hint():
     )
     assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
     assert "mbarrier::complete_tx::bytes.L2::cache_hint" in ptx
+
+
+def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @load(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={l2_cache_hint: "evict_last", multicast: True}
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    leader = "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;"
+    multicast = (
+        "mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+    )
+    arrive = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
+    wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+    assert_contains_in_order(
+        ptx,
+        "fence.mbarrier_init.release.cluster;",
+        "bar.sync 0;",
+        "barrier.cluster.arrive.release;",
+        "barrier.cluster.wait.acquire;",
+    )
+    assert (
+        ptx.index("barrier.cluster.wait.acquire;")
+        < ptx.index(leader)
+        < ptx.index(multicast)
+        < ptx.index(arrive)
+        < ptx.index(wait)
+    )
+    assert ptx.count(multicast) == 1
+    assert (
+        "[${b32:operand.lock.val}], 3, "
+        "${b64:operand.cache_policy0.ptr};"
+    ) in ptx
 
 
 def test_lower_tma_store_with_l2_cache_hint():

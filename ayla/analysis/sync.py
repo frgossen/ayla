@@ -43,20 +43,19 @@ class BarrierScope(enum.IntEnum):
 
     Mirrors CollectiveScope, but where that names the granularity at which an
     access *executes*, this names the *sync* between those granularities. The two
-    correspond one-to-one except for the asymmetric block leader syncs,
-    BLOCK_TO_LEADER and LEADER_TO_BLOCK::
+    correspond one-to-one except for the asymmetric block- and cluster-leader
+    syncs::
 
-             GRID
-              |
-           CLUSTER
-              |
-            BLOCK
-            /   \
-    WARPGROUP   BLOCK_TO_LEADER / LEADER_TO_BLOCK
-           |     |
-         WARP    |
-            \   /
-            THREAD
+    Direct cover edges, from wider to narrower scope::
+
+        GRID -> CLUSTER
+        CLUSTER -> {BLOCK, CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
+        BLOCK -> {WARPGROUP, BLOCK_TO_LEADER, LEADER_TO_BLOCK}
+        WARPGROUP -> WARP
+        {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK,
+         CLUSTER_TO_LEADER, LEADER_TO_CLUSTER} -> THREAD
+
+    The four directional scopes are pairwise independent.
     """
     THREAD = 0
     WARP = 1
@@ -64,8 +63,10 @@ class BarrierScope(enum.IntEnum):
     BLOCK_TO_LEADER = 3
     LEADER_TO_BLOCK = 4
     BLOCK = 5
-    CLUSTER = 6
-    GRID = 7
+    CLUSTER_TO_LEADER = 6
+    LEADER_TO_CLUSTER = 7
+    CLUSTER = 8
+    GRID = 9
 
     def join(self, other: BarrierScope) -> BarrierScope:
         """The join (least upper bound) on the BarrierScope lattice."""
@@ -78,6 +79,14 @@ class BarrierScope(enum.IntEnum):
         if self == BarrierScope.GRID or other == BarrierScope.GRID:
             return BarrierScope.GRID
         if self == BarrierScope.CLUSTER or other == BarrierScope.CLUSTER:
+            return BarrierScope.CLUSTER
+        if self in (
+            BarrierScope.CLUSTER_TO_LEADER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ) or other in (
+            BarrierScope.CLUSTER_TO_LEADER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ):
             return BarrierScope.CLUSTER
         if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
             return BarrierScope.BLOCK
@@ -92,8 +101,23 @@ class BarrierScope(enum.IntEnum):
 
 def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
     """The barrier scope needed to order a r/w hazard from ``prior`` to ``current``."""
-    if prior == current == CollectiveScope.BLOCK_LEADER:
+    if prior == current and prior in (
+        CollectiveScope.BLOCK_LEADER,
+        CollectiveScope.CLUSTER_LEADER,
+    ):
         return BarrierScope.THREAD
+    if current == CollectiveScope.CLUSTER_LEADER:
+        return (
+            BarrierScope.GRID
+            if prior == CollectiveScope.GRID
+            else BarrierScope.CLUSTER_TO_LEADER
+        )
+    if prior == CollectiveScope.CLUSTER_LEADER:
+        return (
+            BarrierScope.GRID
+            if current == CollectiveScope.GRID
+            else BarrierScope.LEADER_TO_CLUSTER
+        )
     if current == CollectiveScope.BLOCK_LEADER:
         return BarrierScope.BLOCK_TO_LEADER
     if prior == CollectiveScope.BLOCK_LEADER:
@@ -131,8 +155,20 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     if barrier == BarrierScope.LEADER_TO_BLOCK:
         # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
+    if barrier == BarrierScope.CLUSTER_TO_LEADER:
+        return scope == CollectiveScope.THREAD  # gather: nothing cross-thread
+    if barrier == BarrierScope.LEADER_TO_CLUSTER:
+        # broadcast: the single cluster leader's work, not every block leader
+        return scope in (
+            CollectiveScope.THREAD,
+            CollectiveScope.CLUSTER_LEADER,
+        )
     if barrier == BarrierScope.BLOCK:
-        return scope not in (CollectiveScope.CLUSTER, CollectiveScope.GRID)
+        return scope not in (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER,
+            CollectiveScope.GRID,
+        )
     if barrier == BarrierScope.CLUSTER:
         return scope != CollectiveScope.GRID
     if barrier == BarrierScope.GRID:
@@ -224,23 +260,28 @@ BarrierTargetsType = dict["Op", "BarrierTarget"]
 _MAX_BARRIER_IDS = 16
 
 
-def _async_collective_scope(lock: Value) -> CollectiveScope:
-    """The collective scope an async op on ``lock`` synchronizes when awaited."""
-    kind = lock.type.kind
+def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
+    """Largest memory-effect scope completed by awaiting ``op``."""
+    kind = op.lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
     if kind == "mbar":
-        # A TMA-load mbar await is a leader completion: t0 issues the copy, all
-        # threads wait the mbarrier for it. So it closes BLOCK_LEADER (the leader
-        # write) but not a full-block all-thread effect.
-        return CollectiveScope.BLOCK_LEADER
+        # A TMA-load mbar await completes the issuing leader's write. Multicast
+        # uses one leader for the cluster; ordinary TMA uses one per block.
+        return (
+            CollectiveScope.CLUSTER_LEADER
+            if op.is_tma_multicast
+            else CollectiveScope.BLOCK_LEADER
+        )
     if kind == "bulk":
         # Bulk async-groups are per issuing thread, not warp-group-wide. TMA
         # stores are issued and committed by t0, so t0's wait completes the
         # leader-owned read of shared memory. This is the completed memory
         # effect's collective scope, not the execution width of wait_group.
         return CollectiveScope.BLOCK_LEADER
-    raise NotImplementedError(f"_async_collective_scope: unmodeled lock kind {kind!r}")
+    raise NotImplementedError(
+        f"_async_completion_scope: unmodeled lock kind {kind!r}"
+    )
 
 
 def _transfer_memory_effects(
@@ -333,7 +374,7 @@ def _transfer_memory_effects(
     # orders -- and every synchronous op's effect -- is live immediately, left for
     # a later barrier to order.
     async_scope = (
-        _async_collective_scope(async_lock) if async_lock is not None else None
+        _async_completion_scope(op) if isinstance(op, AsyncOp) else None
     )
     for memory_effect in effects:
         pending = (

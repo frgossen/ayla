@@ -272,6 +272,8 @@ def test_default_verification_rejects_cluster_that_does_not_divide_grid():
             "%cbx: index, %cby: index, %cbz: index "
             "= cluster_block_ids()"
         ),
+        'barrier() attrs={scope: "cluster_to_leader"}',
+        'barrier() attrs={scope: "leader_to_cluster"}',
         'barrier() attrs={scope: "cluster"}',
     ],
 )
@@ -284,6 +286,118 @@ def test_cluster_operations_require_a_clustered_kernel(op):
         }}"""))
 
     with pytest.raises(ValueError, match="enclosing clustered kernel"):
+        verify_gpu_dialect(module)
+
+
+def test_tma_multicast_accepts_clustered_load():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @valid(%src: gmem<16x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %dst: smem<16x16xf32> = alloc() attrs={id: 0}
+            move(%dst: smem<16x16xf32>, %src: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
+          }
+        }"""))
+
+    assert verify_gpu_dialect(module) is module
+
+
+@pytest.mark.parametrize(
+    "kernel_attrs,move_attrs,error",
+    [
+        ('grid_dim=[1, 1, 1]', 'multicast: True, tma: True', "clustered kernel"),
+        ('grid_dim=[1, 1, 1] cluster_dim=[1, 1, 1]', 'multicast: True, tma: True', "at least two CTAs"),
+        ('grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1]', 'multicast: 1, tma: True', "must be a bool"),
+        ('grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1]', 'multicast: True', "requires a TMA move"),
+    ],
+)
+def test_tma_multicast_rejects_invalid_context(kernel_attrs, move_attrs, error):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid(%src: gmem<16x16xf32>) {kernel_attrs} {{
+            %dst: smem<16x16xf32> = alloc() attrs={{id: 0}}
+            move(%dst: smem<16x16xf32>, %src: gmem<16x16xf32>) collective=xyz.cluster attrs={{{move_attrs}}}
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match=error):
+        verify_gpu_dialect(module)
+
+
+def test_cluster_to_leader_barrier_requires_cluster_mbar_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %lock: lock<mbar> = alloc()
+            barrier(%lock: lock<mbar>) attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="must be a cluster_mbar lock"):
+        verify_gpu_dialect(module)
+
+
+def test_cluster_to_leader_barrier_requires_sync_operand():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            barrier() attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="requires one sync operand"):
+        verify_gpu_dialect(module)
+
+
+def test_cluster_mbar_cannot_be_used_as_an_async_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%src: gmem<1xf32>) grid_dim=[1, 1, 1] {
+            %dst: smem<1xf32> = alloc()
+            %lock: lock<cluster_mbar> = alloc()
+            async(%lock: lock<cluster_mbar>) move(%dst: smem<1xf32>, %src: gmem<1xf32>) attrs={tma: True}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="barrier resource, not an async lock"):
+        verify_gpu_dialect(module)
+
+
+def test_tma_multicast_async_collective_must_match_inner():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %dst: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) tma_move(%dst: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="async collective must match"):
+        verify_gpu_dialect(module)
+
+
+@pytest.mark.parametrize("separate_groups", [False, True])
+def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
+    middle = """\
+          }
+          async(%lock: lock<mbar>) collective=xyz.cluster {
+    """ if separate_groups else ""
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {{
+            %c0: index = index_constant() attrs={{value: 0}}
+            %dst0: smem<16x16xf32> = alloc() attrs={{id: 0}}
+            %dst1: smem<16x16xf32> = alloc() attrs={{id: 1}}
+            %lock: lock<mbar> = alloc() attrs={{id: 2}}
+            async(%lock: lock<mbar>) collective=xyz.cluster {{
+              tma_move(%dst0: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster
+              {middle}tma_move(%dst1: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={{multicast: True}}
+            }}
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match="same multicast mode"):
         verify_gpu_dialect(module)
 
 

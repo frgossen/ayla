@@ -301,6 +301,33 @@ def test_cluster_collective_scope_is_between_block_and_grid():
     )
 
 
+def test_cluster_leader_collective_scope_is_directional():
+    leader = CollectiveScope.CLUSTER_LEADER
+    assert CollectiveScope.BLOCK_LEADER.join(leader) == leader
+    assert leader.join(CollectiveScope.BLOCK_LEADER) == leader
+    assert CollectiveScope.BLOCK.join(leader) == CollectiveScope.CLUSTER
+    assert leader.join(CollectiveScope.BLOCK) == CollectiveScope.CLUSTER
+    scopes = list(CollectiveScope)
+    assert all(a.join(b) == b.join(a) for a in scopes for b in scopes)
+    assert all(
+        a.join(b).join(c) == a.join(b.join(c))
+        for a in scopes
+        for b in scopes
+        for c in scopes
+    )
+    assert all(
+        a.leq(a.join(b)) and b.leq(a.join(b))
+        for a in scopes
+        for b in scopes
+    )
+    assert all(
+        not (a.leq(upper) and b.leq(upper)) or a.join(b).leq(upper)
+        for a in scopes
+        for b in scopes
+        for upper in scopes
+    )
+
+
 def test_for_loop():
     op = ForOp.build(0, 64, 4)
     op.body.append(Op(operands=[op.iv], results=[]))
@@ -483,6 +510,36 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         for effect in effects
         for root in effect.roots
     } == expected
+
+
+def test_tma_multicast_reports_cluster_leader_write():
+    gmem_type = GmemTensorType.build((64, 64), F32Type())
+    desc = Value(
+        name="desc",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
+    index = Value(name="index", type=IndexType())
+
+    effects = memory_effects(TmaMoveOp.build(
+        smem,
+        desc,
+        indices=[index],
+        collective={
+            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
+        },
+        multicast=True,
+    ))
+
+    assert effects is not None
+    assert {
+        (effect.kind, root.name, effect.scope)
+        for effect in effects
+        for root in effect.roots
+        } == {
+            ("W", "smem", CollectiveScope.CLUSTER_LEADER),
+            ("R", "desc", CollectiveScope.GRID),
+        }
 
 
 def test_tma_descriptor_validates_l2_promotion():

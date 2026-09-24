@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+import math
 
 from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
@@ -20,6 +21,7 @@ from ..gpu_dialect import (
     ForOp,
     GmemTensorType,
     KernelOp,
+    LockType,
     MatmulOp,
     MemTensorType,
     ModuleOp,
@@ -68,6 +70,28 @@ def _verify_collective_attr(op: Op) -> None:
         raise ValueError(
             f"{op.op_id} collective attribute must list x, y, and z"
         )
+
+
+def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
+    multicast = op.multicast
+    if type(multicast) is not bool:
+        raise ValueError("multicast must be a bool")
+    if not multicast:
+        return
+    if isinstance(op, MoveOp) and not op.attrs.get("tma"):
+        raise ValueError("multicast requires a TMA move")
+    if not isinstance(op.dst.type, SmemTensorType):
+        raise ValueError("TMA multicast is only supported for loads into smem")
+    if min(op.collective.values()) < CollectiveLevel.CLUSTER:
+        raise ValueError("TMA multicast must be cluster-collective")
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None or not any(dim is not None for dim in kernel.cluster_dim):
+        raise ValueError("TMA multicast requires an enclosing clustered kernel")
+    cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+    if cluster_size < 2:
+        raise ValueError("TMA multicast requires at least two CTAs per cluster")
+    if cluster_size > 16:
+        raise ValueError("TMA multicast supports at most 16 CTAs per cluster")
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -156,10 +180,26 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(BarrierOp)
     def _verify_barrier(self, op: BarrierOp) -> None:
-        expected_operands = 1 if op.scope == "grid" else 0
+        if op.scope in (
+            "cluster_to_leader", "leader_to_cluster", "cluster",
+        ):
+            kernel = find_ancestor_of_type(op, KernelOp)
+            if kernel is None or not any(
+                dim is not None for dim in kernel.cluster_dim
+            ):
+                raise ValueError(
+                    "cluster barrier requires an enclosing clustered kernel"
+                )
+        expected_operands = (
+            1 if op.scope in ("cluster_to_leader", "grid") else 0
+        )
         if len(op.operands) != expected_operands:
-            requirement = "one sync operand" if expected_operands else "no operands"
-            raise ValueError(f"BarrierOp: {op.scope} scope requires {requirement}")
+            requirement = (
+                "one sync operand" if expected_operands else "no operands"
+            )
+            raise ValueError(
+                f"BarrierOp: {op.scope} scope requires {requirement}"
+            )
         if op.scope == "grid":
             sync_type = op.operands[0].type
             if not isinstance(sync_type, GmemTensorType):
@@ -173,15 +213,13 @@ class VerifyGpuDialect(VerificationPass):
                 raise ValueError(
                     "BarrierOp: grid sync must contain at least 8 bytes"
                 )
-        elif op.scope == "cluster":
-            kernel = find_ancestor_of_type(op, KernelOp)
-            if kernel is None or not any(
-                dim is not None for dim in kernel.cluster_dim
+        elif op.scope == "cluster_to_leader":
+            if not isinstance(op.operands[0].type, LockType) or (
+                op.operands[0].type.kind != "cluster_mbar"
             ):
                 raise ValueError(
-                    "cluster barrier requires an enclosing clustered kernel"
+                    "cluster_to_leader barrier sync must be a cluster_mbar lock"
                 )
-
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
         _verify_collective_attr(op)
@@ -193,10 +231,41 @@ class VerifyGpuDialect(VerificationPass):
                     f"contained operation; got {op.collective} and "
                     f"{collective}"
                 )
+        multicast_modes = [
+            inner.multicast
+            for user in op.lock.users()
+            if isinstance(user, AsyncOp)
+            for inner in user.body.ops
+            if (
+                isinstance(inner, TmaMoveOp)
+                or (
+                    isinstance(inner, MoveOp)
+                    and inner.attrs.get("tma") is True
+                )
+            )
+        ]
+        if multicast_modes and any(
+            mode != multicast_modes[0] for mode in multicast_modes[1:]
+        ):
+            raise ValueError(
+                "TMA operations sharing a lock must use the same multicast mode"
+            )
+        if (
+            op.is_tma_multicast
+            and min(op.collective.values()) < CollectiveLevel.CLUSTER
+        ):
+            raise ValueError(
+                "TMA multicast async must be cluster-collective"
+            )
+        if op.lock.type.kind == "cluster_mbar":
+            raise ValueError(
+                "cluster_mbar is a barrier resource, not an async lock"
+            )
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
+        _verify_tma_multicast(op)
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
@@ -226,6 +295,7 @@ class VerifyGpuDialect(VerificationPass):
                 f"{descriptor_type.gmem_type.rank}"
             )
         _verify_collective_attr(op)
+        _verify_tma_multicast(op)
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
