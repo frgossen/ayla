@@ -27,13 +27,11 @@ from ..gpu_dialect import (
     IndexType,
     ModuleOp,
     effective_operands,
-    has_ordering_effect,
     is_side_effect_free,
-    memory_effects,
 )
 from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
-from ._utils import label_matches
+from ._utils import can_reorder, label_matches
 
 
 class PipelineLoop(LoweringPass):
@@ -138,31 +136,6 @@ class PipelineLoop(LoweringPass):
                     )
 
 
-    def _can_reorder(self, earlier: Op, later: Op) -> bool:
-        """Whether `earlier` and `later` may be swapped without
-        changing observable semantics.
-
-        Strategy: side-effect-free ops are always safe to move. Other
-        ops are checked via ``_memory_effects``: two ops conflict only
-        if they touch the same root buffer and at least one is a
-        write. Unknown effects (``None``) are treated as worst-case.
-        """
-        if has_ordering_effect(earlier) or has_ordering_effect(later):
-            return False
-        if is_side_effect_free(earlier) or is_side_effect_free(later):
-            return True
-        eff_earlier = memory_effects(earlier)
-        eff_later = memory_effects(later)
-        if eff_earlier is None or eff_later is None:
-            return False
-        for effect_a in eff_earlier:
-            for effect_b in eff_later:
-                if effect_a.roots & effect_b.roots and (
-                    effect_a.kind == "W" or effect_b.kind == "W"
-                ):
-                    return False
-        return True
-
     def _check_legal_for_offset_one(
         self, body_ops: list[Op], labeled_set: set[Op],
         shared_set: set[Op],
@@ -178,13 +151,13 @@ class PipelineLoop(LoweringPass):
         and do not cause reordering conflicts.
 
         We walk each such pair and reject if the swap cannot be shown
-        safe by ``_can_reorder``.
+        safe by ``can_reorder``.
         """
         unlabeled_seen: list[Op] = []
         for body_op in body_ops:
             if body_op in labeled_set:
                 for earlier in unlabeled_seen:
-                    if not self._can_reorder(earlier, body_op):
+                    if not can_reorder(earlier, body_op):
                         raise ValueError(
                             f"Pipeline: pipelining_offset=1 would "
                             f"reorder unlabeled op {earlier.op_id} and "
@@ -208,7 +181,7 @@ class PipelineLoop(LoweringPass):
         and do not cause reordering conflicts.
 
         Memory effects don't carry iteration info, so a single
-        ``_can_reorder(U, L)`` check suffices per pair: if U and L
+        ``can_reorder(U, L)`` check suffices per pair: if U and L
         touch the same root buffer with a write, they conflict no
         matter which iteration's data they're operating on. This will
         typically force the user to multi-buffer before pipelining
@@ -221,7 +194,7 @@ class PipelineLoop(LoweringPass):
         ]
         for u in unlabeled:
             for l_op in labeled:
-                if not self._can_reorder(u, l_op):
+                if not can_reorder(u, l_op):
                     raise ValueError(
                         f"Pipeline: pipelining_offset>1 would reorder "
                         f"unlabeled op {u.op_id} and labeled op "

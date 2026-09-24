@@ -1,9 +1,30 @@
 """Tests for the CSE pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect, IndexConstantOp
+from ayla.gpu_dialect import gpu_dialect, IndexConstantOp, MoveOp, TileOp
 from ayla.base.ir import find_ops_of_type
 from ayla.passes.cse import cse
+
+
+def test_cse_matches_a_zero_origin_nested_tile_to_its_root_view():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<64x96xf32>, %x: rmem<64x16xf32>, %y: rmem<64x16xf32>) {
+            %prefix: gmem<64x64xf32 strides=[96, 1]> = tile(%a: gmem<64x96xf32>, 0, 0)
+            for (%k: index = 0 to 4) {
+              %nested: gmem<64x16xf32 strides=[96, 1]> = tile(%prefix: gmem<64x64xf32 strides=[96, 1]>, 0, %k: index)
+              %direct: gmem<64x16xf32 strides=[96, 1]> = tile(%a: gmem<64x96xf32>, 0, %k: index)
+              move(%x: rmem<64x16xf32>, %nested: gmem<64x16xf32 strides=[96, 1]>)
+              move(%y: rmem<64x16xf32>, %direct: gmem<64x16xf32 strides=[96, 1]>)
+            }
+          }
+        }"""))  # noqa: E501
+
+    cse(module)
+
+    assert len(find_ops_of_type(module, TileOp)) == 2
+    first, second = find_ops_of_type(module, MoveOp)
+    assert first.src is second.src
 
 
 def test_cse_deduplicates_index_constants():

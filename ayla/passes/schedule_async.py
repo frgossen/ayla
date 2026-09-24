@@ -1,9 +1,9 @@
 """Schedule async ops for maximum overlap.
 
-Sinks ``await`` ops as late as possible — just before the first
-consumer of the guarded buffer — and hoists ``async_move`` ops as
-early as possible. This maximizes the window where async loads
-overlap with compute.
+Sinks ``await`` ops as late as possible — just before the first consumer of
+the guarded buffer — and hoists asynchronous moves as early as possible. TMA
+``move`` ops may be scheduled before ``LowerToAsync`` wraps them. This
+maximizes the window where async loads overlap with compute.
 
 Hoisting an async op drags its full dependency cone of
 side-effect-free ops (alloc, index arithmetic, tile ops) up with it,
@@ -19,23 +19,24 @@ from ..gpu_dialect import (
     AwaitOp,
     TmaMoveOp,
     effective_operands,
-    has_ordering_effect,
     is_side_effect_free,
-    memory_effects,
     ModuleOp,
     MoveOp,
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
+from ._utils import can_reorder, label_matches
 
 
 def _is_async_move(op: Op) -> bool:
     """The hoistable subset of async starts: data movement, not compute.
 
-    Covers a TMA descriptor move and an ``async`` wrapping only moves; an
-    ``async`` wrapping a matmul is tracked as a lock peer but never hoisted.
+    Covers TMA moves before or after async lowering. An ``async`` wrapping a
+    matmul is tracked as a lock peer but never hoisted.
     """
-    if isinstance(op, TmaMoveOp):
+    if isinstance(op, TmaMoveOp) or (
+        isinstance(op, MoveOp) and bool(op.attrs.get("tma"))
+    ):
         return True
     return isinstance(op, AsyncOp) and all(
         isinstance(o, MoveOp) for o in op.body.ops
@@ -44,45 +45,6 @@ def _is_async_move(op: Op) -> bool:
 
 def _is_await(op: Op) -> bool:
     return isinstance(op, AwaitOp)
-
-
-def _can_swap(upper: Op, lower: Op) -> bool:
-
-    if has_ordering_effect(upper) or has_ordering_effect(lower):
-        return False
-
-    # SSA dependency: lower consumes a result of upper.
-    upper_results = set(upper.results)
-    if any(v in upper_results for v in effective_operands(lower)):
-        return False
-
-    # Memory effects (an await resolves to its lock peers via memory_effects).
-    upper_effs = memory_effects(upper)
-    lower_effs = memory_effects(lower)
-    if upper_effs is None or lower_effs is None:
-        return False
-
-    # RAW, WAR, or WAW conflict on the same buffer.
-    upper_r = {
-        root for effect in upper_effs if effect.kind == "R"
-        for root in effect.roots
-    }
-    upper_w = {
-        root for effect in upper_effs if effect.kind == "W"
-        for root in effect.roots
-    }
-    lower_r = {
-        root for effect in lower_effs if effect.kind == "R"
-        for root in effect.roots
-    }
-    lower_w = {
-        root for effect in lower_effs if effect.kind == "W"
-        for root in effect.roots
-    }
-    if lower_w & upper_r or lower_r & upper_w or lower_w & upper_w:
-        return False
-
-    return True
 
 
 def _side_effect_free_operand_closure(seeds: list[Op], ops: list[Op]) -> list[Op]:
@@ -116,51 +78,70 @@ def _bubble(
     *,
     step: int,
 ) -> None:
-    """Bubble each target through its neighbours as far as `_can_swap` allows.
+    """Bubble each target through its neighbours as far as allowed.
 
     ``step`` is ``-1`` to move up (toward index 0) or ``+1`` to move down.
-    Targets are processed in block order. Each move is a single adjacent swap
-    gated by `_can_swap`, which is inherently SSA-safe: a consumer can never be
+    Targets are processed front-to-back when hoisting and back-to-front when
+    sinking, and never cross one another. Each move is a single adjacent swap
+    gated by ``can_reorder``, which is inherently SSA-safe: a consumer cannot be
     swapped above its producer, since that swap would require
-    ``_can_swap(producer, consumer)``, which the SSA check rejects. Valid SSA
+    ``can_reorder(producer, consumer)``, which the SSA check rejects. Valid SSA
     input therefore stays valid, and producers settle before the consumers
     stacked on them.
     """
     assert step in (-1, 1), f"step must be -1 or +1; got {step}"
-    for op in targets:
+    target_set = set(targets)
+    ordered_targets = targets if step == -1 else reversed(targets)
+    for op in ordered_targets:
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
             lo, hi = sorted((j, j + step))
-            if not _can_swap(ops[lo], ops[hi]):
+            if ops[j + step] in target_set:
+                break
+            if not can_reorder(ops[lo], ops[hi]):
                 break
             ops[j], ops[j + step] = ops[j + step], ops[j]
             j += step
 
 
-def _hoist_async_moves(ops: list[Op]) -> None:
+def _hoist_async_moves(ops: list[Op], label_filter: str | None) -> None:
     # Targets: the async moves (matmuls are tracked as lock peers but never
     # moved) plus the side-effect-free dependency cone feeding each. Then hoist
     # each up.
     targets = _side_effect_free_operand_closure(
-        [op for op in ops if _is_async_move(op)], ops
+        [
+            op for op in ops
+            if _is_async_move(op) and label_matches(op, label_filter)
+        ],
+        ops,
     )
     _bubble(ops, targets, step=-1)
 
 
-def _sink_awaits(ops: list[Op]) -> None:
+def _sink_awaits(ops: list[Op], label_filter: str | None) -> None:
     # Targets: the awaits; then sink each toward its first consumer.
-    targets = [op for op in ops if _is_await(op)]
+    targets = [
+        op for op in ops
+        if _is_await(op) and label_matches(op, label_filter)
+    ]
     _bubble(ops, targets, step=+1)
 
 
 class ScheduleAsync(Pass):
 
+    label_filter: str | None
+
+    def __init__(self, label_filter: str | None = None) -> None:
+        super().__init__(label_filter=label_filter)
+
     def run_block(self, block: Block) -> None:
-        _hoist_async_moves(block.ops)
-        _sink_awaits(block.ops)
+        _hoist_async_moves(block.ops, self.label_filter)
+        _sink_awaits(block.ops, self.label_filter)
         super().run_block(block)
 
 
-def schedule_async(module: ModuleOp) -> ModuleOp:
+def schedule_async(
+    module: ModuleOp, label_filter: str | None = None,
+) -> ModuleOp:
     """Convenience entry point."""
-    return ScheduleAsync().run(module)
+    return ScheduleAsync(label_filter).run(module)

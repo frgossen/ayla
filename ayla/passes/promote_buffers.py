@@ -45,6 +45,7 @@ from ..gpu_dialect import (
 )
 from ._utils import (
     build_slice_tile,
+    can_reorder,
     label_matches,
     rebuild_tile,
     tile_introduces_narrow_level,
@@ -410,17 +411,42 @@ class PromoteBuffers(LoweringPass):
 
         ops = list(block.ops)
         new_ops: list[Op] = []
+        reusable: dict[tuple[object, ...], Value] = {}
+        reuse_group: list[MatmulOp] = []
         i = 0
         while i < len(ops):
             op = ops[i]
             if not self._promotes(op):
                 new_ops.append(op)
+                reusable.clear()
+                reuse_group.clear()
                 i += 1
                 continue
             epilogue = self._epilogue(ops, i)
-            new_ops.extend(self._promote(op, epilogue))
+            assert isinstance(op, MatmulOp)
+            if any(not can_reorder(prior, op) for prior in reuse_group):
+                reusable.clear()
+                reuse_group.clear()
+            new_ops.extend(self._promote(op, epilogue, reusable))
+            reuse_group.append(op)
             i += 1 + len(epilogue)
         block.ops = new_ops
+
+    def _promotion_key(
+        self, op: MatmulOp, operand_name: str, value: Value,
+    ) -> tuple[object, ...]:
+        collective = tuple(sorted(
+            op.collective.items(), key=lambda item: item[0].value,
+        ))
+        return (
+            operand_name,
+            value,
+            repr(value.type),
+            collective,
+            self.tma_load_slices.get(operand_name, 1),
+            repr(self.move_attrs.get(operand_name, {})),
+            repr(self.physical_layout),
+        )
 
     def _promotes(self, op: Op) -> bool:
         return isinstance(op, MatmulOp) and label_matches(op, self.label_filter)
@@ -451,7 +477,12 @@ class PromoteBuffers(LoweringPass):
             found.append(op)
         return found
 
-    def _promote(self, op: MatmulOp, epilogue: list[Op]) -> list[Op]:
+    def _promote(
+        self,
+        op: MatmulOp,
+        epilogue: list[Op],
+        reusable: dict[tuple[object, ...], Value],
+    ) -> list[Op]:
         lhs, rhs, dst = op.operands
 
         label = op.attrs.get("label")
@@ -459,15 +490,25 @@ class PromoteBuffers(LoweringPass):
         new_lhs, new_rhs, new_dst = lhs, rhs, dst
 
         if "lhs" in self.operand_names:
-            ops, [new_lhs] = self._build_operand_promotion(
-                lhs, "lhs", op.collective, label,
-            )
-            pre_ops.extend(ops)
+            key = self._promotion_key(op, "lhs", lhs)
+            if key in reusable:
+                new_lhs = reusable[key]
+            else:
+                ops, [new_lhs] = self._build_operand_promotion(
+                    lhs, "lhs", op.collective, label,
+                )
+                pre_ops.extend(ops)
+                reusable[key] = new_lhs
         if "rhs" in self.operand_names:
-            ops, [new_rhs] = self._build_operand_promotion(
-                rhs, "rhs", op.collective, label,
-            )
-            pre_ops.extend(ops)
+            key = self._promotion_key(op, "rhs", rhs)
+            if key in reusable:
+                new_rhs = reusable[key]
+            else:
+                ops, [new_rhs] = self._build_operand_promotion(
+                    rhs, "rhs", op.collective, label,
+                )
+                pre_ops.extend(ops)
+                reusable[key] = new_rhs
         init = op.init
         if "dst" in self.operand_names:
             ops, [new_dst] = self._build_operand_promotion(

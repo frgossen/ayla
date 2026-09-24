@@ -21,6 +21,9 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
     WrmemTensorType,
+    effective_operands,
+    has_ordering_effect,
+    memory_effects,
 )
 
 
@@ -103,3 +106,21 @@ def build_slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
     indices = [0] * typ.rank
     indices[dim] = index
     return TileOp.build(value, indices, typ)
+
+
+def can_reorder(earlier: Op, later: Op) -> bool:
+    """Whether adjacent operations may be swapped without changing meaning."""
+    if has_ordering_effect(earlier) or has_ordering_effect(later):
+        return False
+    if any(value in earlier.results for value in effective_operands(later)):
+        return False
+    earlier_effects = memory_effects(earlier)
+    later_effects = memory_effects(later)
+    if earlier_effects is None or later_effects is None:
+        return False
+    return not any(
+        first.roots & second.roots
+        and (first.kind == "W" or second.kind == "W")
+        for first in earlier_effects
+        for second in later_effects
+    )

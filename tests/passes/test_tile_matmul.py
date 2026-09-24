@@ -7,6 +7,7 @@ from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
+    ElementwiseOp,
     ForOp,
     IfOp,
     IndexConstantOp,
@@ -15,6 +16,8 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
+from ayla.passes.cse import CSE
+from ayla.passes.fuse_loops import FuseLoops
 from ayla.passes.tile_matmul import TileMatmul, tile_matmul
 
 
@@ -148,6 +151,76 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
             elementwise sigmoid(%0: gmem<32x128xf32>, %0: gmem<32x128xf32>) attrs={label: "epilogue"}
           }
         }""")  # noqa: E501
+
+
+def test_fuses_common_k_prefix_then_runs_remaining_hero_tail():
+    """Finish one hero before running the other hero's remaining K tail.
+
+    The short GEMM reads a prefix of the long GEMM's lhs. Their common K
+    iterations should share that lhs tile and execute in one loop. Once the
+    short GEMM is complete, its epilogue can run before the long GEMM's tail.
+    """
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @dual_tail(%a: gmem<64x96xbf16>, %short_w: gmem<64x64xbf16>, %long_w: gmem<64x96xbf16>, %short_out: gmem<64x64xf32>, %long_out: gmem<64x64xf32>) {
+            %a_prefix: gmem<64x64xbf16 strides=[96, 1]> = tile(%a: gmem<64x96xbf16>, 0, 0)
+            matmul(%a_prefix: gmem<64x64xbf16 strides=[96, 1]>, %short_w: gmem<64x64xbf16>, %short_out: gmem<64x64xf32>) collective=xyz.grid attrs={label: "short"}
+            elementwise sigmoid(%short_out: gmem<64x64xf32>, %short_out: gmem<64x64xf32>) attrs={label: "short_epilogue"}
+            matmul(%a: gmem<64x96xbf16>, %long_w: gmem<64x96xbf16>, %long_out: gmem<64x64xf32>) collective=xyz.grid attrs={label: "long"}
+          }
+        }"""))  # noqa: E501
+
+    TileMatmul(
+        op_dims=["K"],
+        tile_sizes=[16],
+        iteration_bindings=[None],
+        for_loop_labels=["k"],
+        op_label_filter="short|long",
+        epilogue_label_filter="short_epilogue",
+    ).run(module)
+    FuseLoops(loop_label_filter="k").run(module)
+    CSE().run(module)
+
+    common_loop, tail_loop = find_ops_of_type(module, ForOp)
+    assert (common_loop.lb, common_loop.ub) == (0, 4)
+    assert (tail_loop.lb, tail_loop.ub) == (4, 6)
+
+    common_matmuls = find_ops_of_type(common_loop, MatmulOp)
+    assert [op.attrs.get("label") for op in common_matmuls] == [
+        "short", "long",
+    ]
+    assert common_matmuls[0].lhs is common_matmuls[1].lhs
+    assert [
+        op.attrs.get("label")
+        for op in find_ops_of_type(tail_loop, MatmulOp)
+    ] == ["long"]
+
+    [epilogue] = find_ops_of_type(module, ElementwiseOp)
+    kernel_ops = module.body.ops[0].body.ops
+    assert kernel_ops.index(common_loop) < kernel_ops.index(epilogue)
+    assert kernel_ops.index(epilogue) < kernel_ops.index(tail_loop)
+
+
+def test_does_not_fuse_a_consumer_with_its_unfinished_producer():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @dependent(%a: gmem<64x64xf32>, %b: gmem<64x64xf32>, %c: gmem<64x64xf32>, %x: gmem<64x64xf32>, %y: gmem<64x64xf32>) {
+            matmul(%a: gmem<64x64xf32>, %b: gmem<64x64xf32>, %x: gmem<64x64xf32>) collective=xyz.grid attrs={label: "producer"}
+            matmul(%x: gmem<64x64xf32>, %c: gmem<64x64xf32>, %y: gmem<64x64xf32>) collective=xyz.grid attrs={label: "consumer"}
+          }
+        }"""))  # noqa: E501
+
+    TileMatmul(
+        op_dims=["K"],
+        tile_sizes=[16],
+        iteration_bindings=[None],
+        for_loop_labels=["k"],
+        op_label_filter="producer|consumer",
+    ).run(module)
+
+    FuseLoops(loop_label_filter="k").run(module)
+
+    assert len(find_ops_of_type(module, ForOp)) == 2
 
 
 def test_block_x_tiling_guards_more_blocks_than_tiles():

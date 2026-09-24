@@ -2,11 +2,72 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import AllocOp, TmaMoveOp, gpu_dialect
+from ayla.gpu_dialect import (
+    AllocOp,
+    MatmulOp,
+    MoveOp,
+    SmemTensorType,
+    TmaMoveOp,
+    gpu_dialect,
+)
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.stage_register_writeback import stage_register_writeback
+
+
+def test_operand_reuse_requires_matching_collectivity():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @pair(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: gmem<64x16xbf16>, %x: gmem<64x64xf32>, %y: gmem<64x64xf32>) block_dim=[128, 1, 1] {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %x: gmem<64x64xf32>) collective=xyz.grid attrs={label: "first"}
+            matmul(%a: gmem<64x16xbf16>, %c: gmem<64x16xbf16>, %y: gmem<64x64xf32>) collective=[x.wg, yz.grid] attrs={label: "second"}
+          }
+        }"""))  # noqa: E501
+
+    promote_buffers(
+        module,
+        target_type="smem",
+        operands=["lhs", "rhs"],
+        swizzle="128B",
+        tma=True,
+        label_filter="first|second",
+    )
+
+    loads = [
+        op for op in find_ops_of_type(module, MoveOp)
+        if isinstance(op.dst.type, SmemTensorType)
+    ]
+    assert len(loads) == 4
+
+
+def test_operand_reuse_does_not_reschedule_the_matmuls():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @pair(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: gmem<64x16xbf16>, %x: gmem<64x64xf32>, %y: gmem<64x64xf32>) {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %x: gmem<64x64xf32>) collective=xyz.grid attrs={label: "first"}
+            matmul(%a: gmem<64x16xbf16>, %c: gmem<64x16xbf16>, %y: gmem<64x64xf32>) collective=xyz.grid attrs={label: "second"}
+          }
+        }"""))  # noqa: E501
+
+    promote_buffers(
+        module,
+        target_type="smem",
+        operands=["lhs", "rhs"],
+        swizzle="128B",
+        tma=True,
+        label_filter="first|second",
+    )
+
+    ops = module.body.ops[0].body.ops
+    matmuls = find_ops_of_type(module, MatmulOp)
+    loads = [op for op in ops if isinstance(op, MoveOp)]
+    assert len(loads) == 3
+    assert matmuls[0].lhs is matmuls[1].lhs
+    second_rhs_load = next(
+        op for op in loads if op.attrs.get("label") == "second_rhs_smem"
+    )
+    assert ops.index(matmuls[0]) < ops.index(second_rhs_load)
 
 
 def test_wrmem_tma_writeback_stages_block_tile_in_smem():

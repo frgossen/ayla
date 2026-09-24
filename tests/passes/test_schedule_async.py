@@ -6,6 +6,22 @@ from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.schedule_async import schedule_async
 
 
+def test_pre_lowered_tma_load_hoists_across_independent_compute():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x4xf32>, %b: gmem<4x4xf32>, %w: smem<4x4xf32>, %out: rmem<4x4xf32>) {
+            %first: smem<4x4xf32> = alloc() attrs={id: 0}
+            %second: smem<4x4xf32> = alloc() attrs={id: 1}
+            move(%first: smem<4x4xf32>, %a: gmem<4x4xf32>) attrs={label: "first", tma: true}
+            matmul(%first: smem<4x4xf32>, %w: smem<4x4xf32>, %out: rmem<4x4xf32>) attrs={label: "compute"}
+            move(%second: smem<4x4xf32>, %b: gmem<4x4xf32>) attrs={label: "second", tma: true}
+          }
+        }"""))  # noqa: E501
+
+    text = repr(schedule_async(module))
+    assert text.index('label: "second"') < text.index('label: "compute"')
+
+
 def test_bulk_await_sinks_until_shared_source_is_overwritten():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

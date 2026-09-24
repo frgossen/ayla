@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from ..gpu_dialect import (
     ModuleOp,
+    TileOp,
     is_side_effect_free,
 )
 from ..base.ir import Block, Op, Type, Value
@@ -19,6 +20,27 @@ from ..base.pipeline import Pass
 
 
 def _op_key(op: Op) -> tuple:
+    if isinstance(op, TileOp):
+        arg = op.arg
+        parent = arg.definition
+        while (
+            isinstance(parent, TileOp)
+            and not parent.extra_attrs
+            and not parent.maybe_partial
+            and all(index == 0 for index in parent.indices)
+        ):
+            arg = parent.arg
+            parent = arg.definition
+        return (
+            type(op),
+            id(arg),
+            tuple(
+                index if isinstance(index, int) else id(index)
+                for index in op.indices
+            ),
+            tuple(_type_key(result.type) for result in op.results),
+            _attr_key(op.attrs),
+        )
     return (
         type(op),
         tuple(id(v) for v in op.operands),

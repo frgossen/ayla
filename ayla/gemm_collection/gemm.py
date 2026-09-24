@@ -12,7 +12,9 @@ from ..gpu_dialect import (
     gpu_dialect,
 )
 from ..passes.canonicalize import Canonicalize
+from ..passes.cse import CSE
 from ..passes.fuse_async import FuseAsync
+from ..passes.fuse_loops import FuseLoops
 from ..passes.licm import LICM
 from ..passes.lower_to_async import LowerToAsync
 from ..passes.multi_buffer import MultiBuffer
@@ -39,7 +41,7 @@ def schedule_register_matmul(
 
     The caller owns output tiling, the WRMEM destination, its epilogue, and
     any live-out moves. This pipeline only schedules the reduction and its
-    operand movement.
+    operand movement. Compatible selected reductions are fused automatically.
     """
     if rhs_tma_load_slices < 1:
         raise ValueError("rhs_tma_load_slices must be positive")
@@ -53,6 +55,11 @@ def schedule_register_matmul(
         op_label_filter=label,
         epilogue_label_filter=epilogue_label_filter,
     ))
+    pipeline.add_pass(FuseLoops(
+        loop_label_filter=k_label,
+        body_label_filter=label,
+    ))
+    pipeline.add_pass(CSE())
     pipeline.add_pass(PromoteBuffers(
         target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None, tma=True,
@@ -68,6 +75,9 @@ def schedule_register_matmul(
         unsafe_reuse_smem=unsafe_reuse_smem,
         label_filter=label,
     ))
+    pipeline.add_pass(ScheduleAsync(
+        label_filter=rf"(?:{label})_(?:lhs|rhs)_smem",
+    ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[16],
         iteration_bindings=[None], for_loop_labels=[kk_label],
@@ -75,10 +85,12 @@ def schedule_register_matmul(
         epilogue_label_filter=epilogue_label_filter,
     ))
     pipeline.add_pass(MultiBuffer(
-        depth=operand_stages, label_filter=f"{label}_lhs_smem",
+        depth=operand_stages,
+        label_filter=rf"(?:{label})_lhs_smem",
     ))
     pipeline.add_pass(MultiBuffer(
-        depth=operand_stages, label_filter=f"{label}_rhs_smem",
+        depth=operand_stages,
+        label_filter=rf"(?:{label})_rhs_smem",
     ))
     pipeline.add_pass(LICM())
     pipeline.add_pass(UnrollLoop(
@@ -91,7 +103,7 @@ def schedule_register_matmul(
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(PipelineLoop(
         label_filter_loop=k_label,
-        label_filter_op=rf"{label}_(lhs|rhs)_smem_iter\d+_async",
+        label_filter_op=rf"(?:{label})_(lhs|rhs)_smem_iter\d+_async",
         pipelining_offset=1,
     ))
     pipeline.add_pass(UnrollLoop(
