@@ -15,6 +15,7 @@ from ayla.gpu_dialect import (
     LockType,
     ModuleOp,
     MoveOp,
+    ReduceOp,
     ReshapeOp,
     RmemTensorType,
     SmemTensorType,
@@ -176,6 +177,34 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
 
     with pytest.raises(ValueError, match="inconsistent matmul shapes"):
         verify_gpu_dialect(module)
+
+
+def test_default_verification_checks_reduce_shapes():
+    def reduce(src_sizes, dst_sizes):
+        src = Value(
+            name="src", type=GmemTensorType.build(src_sizes, F32Type()),
+        )
+        dst = Value(
+            name="dst", type=GmemTensorType.build(dst_sizes, F32Type()),
+        )
+        return ModuleOp.build(Block(ops=[
+            ReduceOp.build(dst, src, fn="sum"),
+        ]))
+
+    assert verify_gpu_dialect(reduce([8, 32], [8, 32]))
+    assert verify_gpu_dialect(reduce([8, 32], [8, 1]))
+    assert verify_gpu_dialect(reduce([None, 32], [None, 1]))
+
+    with pytest.raises(ValueError, match="same nonzero rank"):
+        verify_gpu_dialect(reduce([8, 32], [8]))
+    with pytest.raises(ValueError, match="parallel dimensions must match"):
+        verify_gpu_dialect(reduce([8, 32], [7, 1]))
+    with pytest.raises(ValueError, match="parallel dimensions must match"):
+        verify_gpu_dialect(reduce([None, 32], [8, 1]))
+    with pytest.raises(
+        ValueError, match="destination reduction dimension cannot exceed",
+    ):
+        verify_gpu_dialect(reduce([8, 32], [8, 64]))
 
 
 def test_default_verification_checks_reshape():

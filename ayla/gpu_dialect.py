@@ -583,11 +583,9 @@ class ReshapeOp(Op):
 class ReduceOp(Op):
     """Accumulate a reduction into a destination.
 
-    The final source dimension is always the reduction dimension. All preceding
-    dimensions are parallel dimensions.
-
-    TODO: Verify that the final source dimension is the only reduction
-    dimension.
+    The final source dimension is always the reduction dimension. Source and
+    destination have the same rank, and all preceding dimensions are matching
+    parallel dimensions.
 
     TODO: Add a ``collective`` attribute describing the collective level at
     which the reduction is executed. Output ownership remains encoded by the
