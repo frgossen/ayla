@@ -461,6 +461,8 @@ class MatmulOp(Op):
 class TileOp(Op):
     """Select a sub-region (view) of a buffer.
 
+    Each index advances the view origin by the corresponding result size.
+
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
     defined out-of-bounds behavior.
@@ -561,7 +563,6 @@ class TileOp(Op):
             attrs={"static_indices": static_indices, **attrs},
         )
 
-
 @gpu_dialect.register_op("reshape")
 class ReshapeOp(Op):
     """Reinterpret a dense tensor with a different shape without moving data."""
@@ -576,6 +577,99 @@ class ReshapeOp(Op):
     @property
     def arg(self) -> Value:
         return self.operands[0]
+
+
+@gpu_dialect.register_op("reduce")
+class ReduceOp(Op):
+    """Accumulate a reduction into a destination.
+
+    The final source dimension is always the reduction dimension. All preceding
+    dimensions are parallel dimensions.
+
+    TODO: Verify that the final source dimension is the only reduction
+    dimension.
+
+    TODO: Add a ``collective`` attribute describing the collective level at
+    which the reduction is executed. Output ownership remains encoded by the
+    destination type, for example ``wrmem``.
+
+    Equal source and destination shapes represent a partial-reduction step;
+    a smaller destination combines those partials.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        dst: Value,
+        src: Value,
+        fn: str,
+        attrs: dict[str, object] | None = None,
+        init: float | int | None = None,
+    ) -> "ReduceOp":
+        a: dict[str, object] = dict(attrs or {})
+        if "fn" in a:
+            raise ValueError("pass fn as an explicit argument")
+        if "init" in a:
+            raise ValueError("pass init as an explicit argument")
+        a["fn"] = fn
+        if init is not None:
+            a["init"] = init
+        return cls(
+            operands=[dst, src],
+            results=[],
+            attrs=a,
+        )
+
+    @property
+    def dst(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def src(self) -> Value:
+        return self.operands[1]
+
+    @property
+    def fn(self) -> str:
+        return self.attrs["fn"]  # type: ignore[return-value]
+
+    @property
+    def init(self) -> float | int | None:
+        return self.attrs.get("init")  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write(f"{self.op_id} {self.fn}(")
+        for index, operand in enumerate(self.operands):
+            if index:
+                p.write(", ")
+            operand.print(p)
+        p.write(")")
+        p.write_extra_attrs(self.attrs, skip_keys=("fn",))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ReduceOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        fn = p.read_identifier()
+        p.read_literal("(")
+        operands: list[Value] = []
+        if not p.can_read_literal(")"):
+            operands.append(Value.parse(p))
+            while p.can_read_literal(","):
+                p.read_literal(",")
+                operands.append(Value.parse(p))
+        p.read_literal(")")
+        attrs = p.read_extra_attrs()
+        if "fn" in attrs:
+            raise ValueError("reduce function must not also appear in attrs")
+        return cls(
+            operands=operands,
+            results=results,
+            attrs={"fn": fn, **attrs},
+        )
 
 
 @gpu_dialect.register_op("elementwise")
@@ -2048,6 +2142,31 @@ class WarpGroupIdOp(Op):
         return self.results[2]
 
 
+@gpu_dialect.register_op("warp_ids")
+class WarpIdsOp(Op):
+    """Produce the 3D warp index within the block."""
+
+    @classmethod
+    def build(cls) -> "WarpIdsOp":
+        idx = IndexType()
+        return cls(
+            operands=[],
+            results=[Value(name=name, type=idx) for name in ["wx", "wy", "wz"]],
+        )
+
+    @property
+    def x(self) -> Value:
+        return self.results[0]
+
+    @property
+    def y(self) -> Value:
+        return self.results[1]
+
+    @property
+    def z(self) -> Value:
+        return self.results[2]
+
+
 @gpu_dialect.register_op("index_constant")
 class IndexConstantOp(Op):
     """Produce a constant index value."""
@@ -2483,6 +2602,27 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
                 "R", op.src(i), CollectiveScope.THREAD,
             )
         return effects
+    if isinstance(op, ReduceOp):
+        # Register accumulators are independently read and updated by each
+        # thread; the source determines whether the reduction is collective.
+        dst_scope = (
+            CollectiveScope.THREAD
+            if isinstance(
+                op.dst.type,
+                (RmemTensorType, WgrmemTensorType),
+            )
+            else _type_collective_scope(op.dst.type)
+        )
+        effects = (
+            [] if op.init is not None else _memory_effect("R", op.dst, dst_scope)
+        )
+        return (
+            effects
+            + _memory_effect("W", op.dst, dst_scope)
+            + _memory_effect(
+                "R", op.src, _type_collective_scope(op.src.type),
+            )
+        )
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
@@ -2559,6 +2699,7 @@ def is_side_effect_free(op: Op) -> bool:
         TileOp,
         ToPtrOp,
         ReshapeOp,
+        WarpIdsOp,
         WarpGroupIdOp,
     ))
 
