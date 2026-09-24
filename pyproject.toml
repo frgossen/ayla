@@ -37,7 +37,6 @@ include = [
     "ayla",
 ]
 exclude = [
-    "ayla/passes/tile_reduce.py",
     "ayla/passes/verify_gpu_dialect.py",
 ]
 pythonVersion = "3.12"
