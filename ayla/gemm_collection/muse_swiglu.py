@@ -147,7 +147,7 @@ def _compile_muse_swiglu(module: ModuleOp) -> LauncherPlan:
     if not isinstance(lhs_type, GmemTensorType):
         raise ValueError("Muse SwiGLU lhs must be a gmem tensor")
     m = cast(int, lhs_type.sizes[0])
-    if m <= 64:
+    if m <= 512:
         return compile_swiglu(module)
     return _compile_large_m(m)
 
