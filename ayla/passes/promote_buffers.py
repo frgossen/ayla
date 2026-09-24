@@ -183,6 +183,30 @@ def _slice_tile(value: Value, dim: int, index: int, size: int) -> TileOp:
     return TileOp.build(value, indices, typ)
 
 
+def _build_move(
+    dst: Value,
+    src: Value,
+    *,
+    collective: dict[CollectiveAxis, CollectiveLevel],
+    attrs: dict[str, object],
+) -> MoveOp:
+    """Build a promoted move, handling first-class move options explicitly."""
+    attrs = dict(attrs)
+    multicast = attrs.pop("multicast", False)
+    if multicast is True:
+        collective = {
+            axis: level.join(CollectiveLevel.CLUSTER)
+            for axis, level in collective.items()
+        }
+    return MoveOp.build(
+        dst,
+        src,
+        collective=collective,
+        multicast=cast(bool, multicast),
+        attrs=attrs,
+    )
+
+
 def _sliced_moves(
     dst: Value,
     src: Value,
@@ -192,7 +216,7 @@ def _sliced_moves(
     attrs: dict[str, object],
 ) -> list[Op]:
     if count == 1:
-        return [MoveOp.build(
+        return [_build_move(
             dst, src, collective=collective, attrs=attrs,
         )]
     src_type = src.type
@@ -205,7 +229,7 @@ def _sliced_moves(
     ops: list[Op] = []
     for index in range(count):
         src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
-        move = MoveOp.build(
+        move = _build_move(
             dst_tile.result(), src_tile.result(),
             collective=collective, attrs=attrs,
         )
@@ -560,7 +584,7 @@ class PromoteBuffers(LoweringPass):
                 # TODO: Express this source slice with a tile op instead of the
                 # wgmma_col_start attribute.
                 gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
-            gather = MoveOp.build(
+            gather = _build_move(
                 dst=gather_dst,
                 src=src,
                 collective=collective,
@@ -578,7 +602,7 @@ class PromoteBuffers(LoweringPass):
             store_attrs.update(self.move_attrs.get("dst", {}))
             if writeback_tiling_scheme is not None:
                 store_attrs["dst_tiling_scheme"] = writeback_tiling_scheme
-            store = MoveOp.build(
+            store = _build_move(
                 dst=store_dst_value,
                 src=smem.result(),
                 collective=collective,
@@ -646,7 +670,7 @@ class PromoteBuffers(LoweringPass):
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         if writeback_tiling_scheme is not None:
             attrs["dst_tiling_scheme"] = writeback_tiling_scheme
-        move = MoveOp.build(
+        move = _build_move(
             dst=dst, src=src, collective=collective, attrs=attrs,
         )
         new_ops.append(move)

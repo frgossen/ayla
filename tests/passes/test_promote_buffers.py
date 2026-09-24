@@ -2,7 +2,13 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import AllocOp, TmaMoveOp, gpu_dialect
+from ayla.gpu_dialect import (
+    AllocOp,
+    CollectiveLevel,
+    MoveOp,
+    TmaMoveOp,
+    gpu_dialect,
+)
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.promote_buffers import promote_buffers
@@ -180,6 +186,33 @@ def test_promote_gmem_matmul_operands_to_smem():
           }
         }""")
     assert text == expected
+
+
+def test_promote_selectively_multicasts_tma_operands():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "mm"}
+          }
+        }"""))
+
+    promote_buffers(
+        module,
+        target_type="smem",
+        operands=["lhs", "rhs"],
+        swizzle="128B",
+        tma=True,
+        move_attrs={"lhs": {"multicast": True}},
+        label_filter="mm",
+    )
+
+    loads = [
+        move for move in find_ops_of_type(module, MoveOp)
+        if move.attrs.get("tma")
+    ]
+    assert [move.multicast for move in loads] == [True, False]
+    assert min(loads[0].collective.values()) == CollectiveLevel.CLUSTER
+    assert max(loads[1].collective.values()) == CollectiveLevel.BLOCK
 
 
 def test_promote_can_slice_tma_operand_loads():

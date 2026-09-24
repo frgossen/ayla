@@ -2,8 +2,9 @@
 
 import textwrap
 
+from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import schedule_register_matmul
-from ayla.gpu_dialect import ModuleOp, gpu_dialect
+from ayla.gpu_dialect import AsyncOp, ModuleOp, MoveOp, gpu_dialect
 
 
 def test_register_matmul_schedules_side_by_side_gemms():
@@ -57,3 +58,28 @@ def test_register_matmul_schedules_side_by_side_gemms():
             elementwise mul(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "product"}
           }
         }""")  # noqa: E501
+
+
+def test_register_matmul_keeps_multicast_and_local_loads_separate():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
+            %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "mm"}
+          }
+        }"""))
+
+    schedule_register_matmul(
+        label="mm",
+        operand_stages=1,
+        operand_k_tile=16,
+        operand_move_attrs={"lhs": {"multicast": True}},
+    ).run(module)
+
+    load_groups = [
+        op for op in find_ops_of_type(module, AsyncOp)
+        if op.body.ops and isinstance(op.body.ops[0], MoveOp)
+    ]
+    assert len(load_groups) == 2
+    assert [group.is_tma_multicast for group in load_groups] == [True, False]
+    assert load_groups[0].collective != load_groups[1].collective
