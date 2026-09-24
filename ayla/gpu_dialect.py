@@ -2695,7 +2695,11 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
 
 def has_ordering_effect(op: Op) -> bool:
     """Whether ``op`` or a nested operation constrains operation ordering."""
-    if isinstance(op, BarrierOp):
+    # A conditional is an ordering boundary even when its visible memory
+    # effects are independent. Moving an async start or completion across the
+    # branch changes which dynamic path owns the synchronization protocol and
+    # can strand a CTA at a barrier introduced by later lowering.
+    if isinstance(op, (BarrierOp, IfOp)):
         return True
     return any(
         has_ordering_effect(nested)

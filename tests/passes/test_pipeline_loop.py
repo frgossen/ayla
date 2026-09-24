@@ -1,8 +1,37 @@
 """Tests for the pipeline_loop pass."""
 import textwrap
 
+import pytest
+
 from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.pipeline_loop import pipeline_loop
+
+
+def test_pipeline_does_not_move_work_across_a_conditional():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x4xf32>) grid_dim=[2, 1, 1] block_dim=[1, 1, 1] {
+            %buf: smem<4x1xf32> = alloc() attrs={id: 0}
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c1: index = index_constant() attrs={value: 1}
+            %condition: pred = index_lt(%bx: index, %c1: index)
+            for (%k: index = 0 to 4) attrs={label: "k"} {
+              if(%condition: pred) {
+                %guarded: index = index_constant() attrs={value: 7}
+              }
+              %tile: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %k: index)
+              move(%buf: smem<4x1xf32>, %tile: gmem<4x1xf32 strides=[4, 1]>) attrs={label: "load"}
+            }
+          }
+        }"""))  # noqa: E501
+
+    with pytest.raises(ValueError, match="cannot be proven independent"):
+        pipeline_loop(
+            module,
+            label_filter_loop="k",
+            label_filter_op="load",
+            pipelining_offset=1,
+        )
 
 
 def test_pipeline_reorders_across_inner_loop():
