@@ -257,7 +257,9 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 "TMA multicast async must be cluster-collective"
             )
-        if op.lock.type.kind == "cluster_mbar":
+        lock_type = op.lock.type
+        assert isinstance(lock_type, LockType)
+        if lock_type.kind == "cluster_mbar":
             raise ValueError(
                 "cluster_mbar is a barrier resource, not an async lock"
             )

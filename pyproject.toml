@@ -36,9 +36,6 @@ ignore = ["E501"]
 include = [
     "ayla",
 ]
-exclude = [
-    "ayla/passes/verify_gpu_dialect.py",
-]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 
