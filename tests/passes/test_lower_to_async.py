@@ -64,6 +64,23 @@ def test_tma_multicast_gets_cluster_collective_async():
     assert "lock<mbar attrs=" not in text
 
 
+def test_tma_move_preserves_explicit_and_extra_attrs():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) {
+            %c0: index = index_constant() attrs={value: 0}
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={l2_cache_hint: "evict_last", label: "load", multicast: True}
+          }
+        }"""))
+
+    lower_to_async(module)
+
+    text = repr(module)
+    assert 'attrs={label: "load_async"}' in text
+    assert 'l2_cache_hint: "evict_last", label: "load", multicast: True' in text
+
+
 def test_sync_matmul_stays_as_matmul():
     """Non-wgmma matmul stays as MatmulOp."""
     module_str = textwrap.dedent("""\

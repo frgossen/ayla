@@ -112,9 +112,8 @@ class LowerToTmaMove(LoweringPass):
             )
             entry_block.append_argument(desc_value)
 
-        attrs = dict(move.attrs)
+        attrs = move.extra_attrs
         l2_cache_hint = cast(str | None, attrs.pop("l2_cache_hint", None))
-        multicast = cast(bool, attrs.pop("multicast", False))
         if is_load:
             tma_op = TmaMoveOp.build(
                 dst=smem,
@@ -123,7 +122,7 @@ class LowerToTmaMove(LoweringPass):
                 collective=move.collective,
                 attrs=attrs,
                 l2_cache_hint=l2_cache_hint,
-                multicast=multicast,
+                multicast=move.multicast,
             )
         else:
             tma_op = TmaMoveOp.build(
@@ -133,7 +132,7 @@ class LowerToTmaMove(LoweringPass):
                 collective=move.collective,
                 attrs=attrs,
                 l2_cache_hint=l2_cache_hint,
-                multicast=multicast,
+                multicast=move.multicast,
             )
         return index_ops, tma_op
 

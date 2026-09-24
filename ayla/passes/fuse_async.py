@@ -124,7 +124,7 @@ class FuseAsync(Pass):
                 if group_collective is None:
                     group_lock = op.lock
                     group_kind = kind
-                    group_attrs = dict(op.attrs) if op.attrs else None
+                    group_attrs = op.extra_attrs or None
                     group_collective = op.collective
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)

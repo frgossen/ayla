@@ -175,7 +175,7 @@ class KernelOp(Op):
             k: v for k, v in self.attrs.items()
             if k not in (
                 "name", "grid_dim", "block_dim", "cluster_dim",
-                "num_warp_groups",
+                "num_warp_groups", "ptx_optimization_level",
             )
         }
 
@@ -517,6 +517,13 @@ class TileOp(Op):
     def maybe_partial(self) -> bool:
         return bool(self.attrs.get("maybe_partial", False))
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("static_indices", "maybe_partial")
+        }
+
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):
             if i:
@@ -713,6 +720,10 @@ class ElementwiseOp(Op):
     def fn(self) -> str:
         return self.attrs["fn"]  # type: ignore[return-value]
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {key: value for key, value in self.attrs.items() if key != "fn"}
+
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id} {self.fn}(")
         for index, operand in enumerate(self.operands):
@@ -803,7 +814,10 @@ class AllocOp(Op):
 
     @property
     def extra_attrs(self) -> dict[str, object]:
-        return {k: v for k, v in self.attrs.items() if k != "init"}
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("id", "init")
+        }
 
 
 @gpu_dialect.register_op("reinterpret")
@@ -992,6 +1006,13 @@ class TmaMoveOp(Op):
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("collective", "l2_cache_hint", "multicast")
+        }
+
     def print(self, p: Printer) -> None:
         p.write("tma_move(")
         for i, operand in enumerate(self.operands):
@@ -1127,6 +1148,13 @@ class BarrierOp(Op):
     def scope(self) -> str:
         return self.attrs["scope"]  # type: ignore[return-value]
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "scope"
+        }
+
     # TODO: Replace explicit synchronization operands once their scratch
     # allocations have an owner.
     @property
@@ -1227,6 +1255,13 @@ class AsyncOp(Op):
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "collective"
+        }
 
     @property
     def is_tma_multicast(self) -> bool:
