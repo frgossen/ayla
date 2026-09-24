@@ -16,6 +16,7 @@ from ayla import (
 )
 from ayla.gpu_dialect import (
     AddrMemTensorType,
+    AllocOp,
     AsyncOp,
     BarrierOp,
     BF16Type,
@@ -36,6 +37,7 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    TileOp,
     gpu_dialect,
     has_ordering_effect,
     memory_effects,
@@ -48,6 +50,40 @@ def assert_print_and_roundtrip(op, expected):
     text = repr(op)
     assert text == expected
     assert repr(gpu_dialect.parse(text)) == text
+
+
+@pytest.mark.parametrize(
+    ("op_type", "explicit_attrs"),
+    [
+        (KernelOp, {
+            "name": "k",
+            "grid_dim": [],
+            "block_dim": [],
+            "cluster_dim": [],
+            "num_warp_groups": 1,
+            "ptx_optimization_level": 1,
+        }),
+        (MatmulOp, {"collective": {}, "init": 0.0}),
+        (TileOp, {"static_indices": [], "maybe_partial": True}),
+        (ElementwiseOp, {"fn": "relu"}),
+        (AllocOp, {"id": 1, "init": 0.0}),
+        (MoveOp, {"collective": {}, "multicast": True}),
+        (TmaMoveOp, {
+            "collective": {},
+            "l2_cache_hint": "evict_last",
+            "multicast": True,
+        }),
+        (BarrierOp, {"scope": "block"}),
+        (AsyncOp, {"collective": {}}),
+        (PTXTemplateOp, {"template": "ret;", "description": "test"}),
+        (ForOp, {"lb": 0, "ub": 1, "step": 1}),
+    ],
+)
+def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
+    op = op_type(
+        operands=[], results=[], attrs={**explicit_attrs, "label": "keep"},
+    )
+    assert op.extra_attrs == {"label": "keep"}
 
 
 def test_reinterpret_op():

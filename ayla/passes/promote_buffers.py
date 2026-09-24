@@ -621,7 +621,7 @@ class PromoteBuffers(LoweringPass):
                 assert final.dst is src and final.src(0) is src
                 new_ops.append(ElementwiseOp.build(
                     dst=tmp_alloc.result(), srcs=[src], fn=final.fn,
-                    attrs=final.attrs,
+                    attrs=final.extra_attrs,
                 ))
             else:
                 new_ops.append(ElementwiseOp.build(
