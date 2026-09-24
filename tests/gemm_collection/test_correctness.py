@@ -24,6 +24,7 @@ from ayla.gpu_dialect import (
     WgrmemTensorType,
 )
 from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
 
 
@@ -86,6 +87,42 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
     assert kernel.name.startswith("auto_matmul_m512_n19968_k6656_")
     assert kernel.grid_dim == (2, 78, 1)
     assert kernel.block_dim == (256, 1, 1)
+
+
+def test_k128_block_major_nested_tiles_lower_to_ptx():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=128,
+            n=256,
+            k=128,
+            operand_k_tile=128,
+            output_slices=2,
+        )
+    )
+    assert "wgmma.mma_async" in kernel.ptx
+    assert kernel.ptx.count("wgmma.mma_async") == 8
+
+
+@requires_cuda
+def test_k128_block_major_nested_tiles_match_torch():
+    m, n, k = 128, 256, 128
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        operand_k_tile=128,
+        output_slices=2,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(7)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))
 
 
 def test_four_tile_output_evict_first_reaches_tma_stores():
