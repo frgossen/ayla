@@ -26,7 +26,7 @@ def auto_matmul_4096_module():
 
     Starts from a single matmul op and applies:
       1. Block-level tiling (M=128, N=128)
-      2. Promote dst to wrmem (wgmma accumulator)
+      2. Promote dst to wgrmem (wgmma accumulator)
       3. K-tiling (K=64) sequential loop
       4. Promote lhs/rhs to smem (TMA loads)
       5. Inner K-tiling (K=16) sequential loop
@@ -50,7 +50,7 @@ def auto_matmul_4096_module():
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
-        target_type="wrmem", operands=["dst"],
+        target_type="wgrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
     ))

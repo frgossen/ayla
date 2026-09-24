@@ -281,7 +281,7 @@ def test_experimental_auto_matmul_4096_with_excess_block():
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
-        target_type="wrmem", operands=["dst"],
+        target_type="wgrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
     ))
@@ -346,7 +346,7 @@ def test_dbg_module():
         op_label_filter="mm",
     ))
     pipeline.add_pass(PromoteBuffers(
-        target_type="wrmem", operands=["dst"],
+        target_type="wgrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32", label_filter="mm",
     ))

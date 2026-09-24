@@ -6,7 +6,7 @@ single ``await``. The kind is decided by the op *inside* the async (see
 :func:`_fusion_kind`), so what fuses is fixed by what codegen supports:
 
 - **wgmma** matmuls — launch into one wgmma commit group, awaited once. Safe
-  with no buffer-conflict analysis: a wgmma reads smem and writes wrmem, so one
+  with no buffer-conflict analysis: a wgmma reads smem and writes wgrmem, so one
   matmul's output is never another's input; the only shared buffer is the
   accumulator (read+written by accumulating matmuls), ordered by the hardware
   within a commit group.

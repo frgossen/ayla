@@ -49,7 +49,7 @@ from ..gpu_dialect import (
     ThreadIdsOp,
     TileOp,
     WarpGroupIdOp,
-    WrmemTensorType,
+    WgrmemTensorType,
     is_elementwise,
 )
 from ._utils import label_matches
@@ -58,7 +58,7 @@ from ._utils import label_matches
 def _target_level(target_type: str) -> str:
     if target_type == "smem":
         return "block"
-    if target_type == "wrmem":
+    if target_type == "wgrmem":
         return "wg"
     if target_type == "rmem":
         return "thread"
@@ -100,7 +100,7 @@ def _collective_level(value: Value) -> str:
         ty = value.type
         if isinstance(ty, SmemTensorType):
             return "block"
-        if isinstance(ty, WrmemTensorType):
+        if isinstance(ty, WgrmemTensorType):
             return "wg"
         if isinstance(ty, (RmemTensorType, GmemTensorType)):
             return "thread"
@@ -142,8 +142,8 @@ def _resolve_type(name: str):
         return SmemTensorType
     if name == "rmem":
         return RmemTensorType
-    if name == "wrmem":
-        return WrmemTensorType
+    if name == "wgrmem":
+        return WgrmemTensorType
     if name == "gmem":
         return GmemTensorType
     raise ValueError(f"unsupported type {name!r}")
@@ -215,17 +215,17 @@ class PromoteBuffers(LoweringPass):
     Parameters
     ----------
     target_type : str
-        Memory space to promote into: ``"gmem"``, ``"smem"``, ``"rmem"``, ``"wrmem"``.
+        Memory space to promote into: ``"gmem"``, ``"smem"``, ``"rmem"``, ``"wgrmem"``.
     operands : list[str]
         Which matmul operands to promote: ``"lhs"``, ``"rhs"``, ``"dst"``.
     swizzle : str or None
         Smem swizzle mode (``"128B"``, ``"64B"``, ``"32B"``).
     layout : str or None
-        Wrmem layout (``"mma"``, ``"wgmma_layout_0"``).
+        Wgrmem layout (``"mma"``, ``"wgmma_layout_0"``).
     warps : int or None
-        Wrmem warp count (``1``, ``4``).
+        Wgrmem warp count (``1``, ``4``).
     tma : bool
-        Use TMA for the move. A WRMEM destination is written back through a
+        Use TMA for the move. A WGRMEM destination is written back through a
         block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
         Non-coherent cache hint for scalar gmem→rmem loads.
@@ -315,8 +315,8 @@ class PromoteBuffers(LoweringPass):
             return self._build_smem_type(sizes, dtype)
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
-        if tensor_cls is WrmemTensorType:
-            return WrmemTensorType.build(sizes, dtype, warps=self.warps, layout=self.layout)
+        if tensor_cls is WgrmemTensorType:
+            return WgrmemTensorType.build(sizes, dtype, warps=self.warps, layout=self.layout)
         raise ValueError(f"unsupported target type {self.target_type!r}")
 
     def _build_buffer_attrs(
@@ -571,7 +571,7 @@ class PromoteBuffers(LoweringPass):
             src = tmp_alloc.result()
         else:
             new_ops.extend(epilogue)
-        if self.tma and self.target_type == "wrmem":
+        if self.tma and self.target_type == "wgrmem":
             new_ops.extend(self._build_tma_writeback(
                 dst,
                 src,

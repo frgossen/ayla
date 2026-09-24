@@ -35,7 +35,7 @@ from .gpu_dialect import (
     TmaDescType,
     ToPtrOp,
     WarpGroupIdOp,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
 from .passes.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
@@ -163,7 +163,7 @@ def map_type_to_registers(type):
                 "cvta.param.u64 {reg}, {reg};"
             ),
         )
-    if isinstance(type, WrmemTensorType):
+    if isinstance(type, WgrmemTensorType):
         num_elements_per_thread = type.num_elements_per_thread
         if type.dtype.name in ("bf16", "f16"):
             n_regs = num_elements_per_thread // 2
@@ -173,7 +173,7 @@ def map_type_to_registers(type):
             ptx_dtype = PtxType.F32
         else:
             raise NotImplementedError(
-                f"map_type_to_registers: wrmem dtype {type.dtype.name}"
+                f"map_type_to_registers: wgrmem dtype {type.dtype.name}"
             )
         return TypeRegisterMapping(
             member_register_types=tuple(ptx_dtype for _ in range(n_regs)),

@@ -329,7 +329,7 @@ def test_lower_elementwise_sigmoid_mma():
     (0fBFB8AA3B). dst doubles as the scratch register -- src is read by the
     first instruction and not after, which is what lets dst be src.
     """
-    w = 'wrmem<16x8xf32 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
@@ -355,8 +355,8 @@ def test_lower_elementwise_sigmoid_mma():
 
 
 def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
-    w = 'wrmem<16x8xf32 layout="mma">'
-    b = 'wrmem<16x8xbf16 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
+    b = 'wgrmem<16x8xbf16 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
@@ -381,9 +381,9 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
-            %src: wrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
-            %dst: wrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
-            elementwise sigmoid(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">)
+            %src: wgrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
+            %dst: wgrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
+            elementwise sigmoid(%dst: wgrmem<16x8xf16 layout="mma">, %src: wgrmem<16x8xf32 layout="mma">)
           }
         }"""))  # noqa: E501
 
@@ -395,15 +395,15 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
     assert template.count("cvt.rn.f16x2.f32") == 2
 
 
-def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
+def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
-            %dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
-            %dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise convert(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %src_tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
+            %dst_tail: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
+            elementwise convert(%dst_tail: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -417,13 +417,13 @@ def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
     assert "operand.dst.r47" not in template
 
 
-def test_lower_elementwise_uses_root_registers_for_wrmem_view():
+def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
-            %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise sigmoid(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
+            elementwise sigmoid(%tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -447,7 +447,7 @@ def test_lower_elementwise_uses_root_registers_for_wrmem_view():
 
 
 def test_lower_elementwise_mul():
-    w = 'wrmem<16x8xf32 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
@@ -469,7 +469,7 @@ def test_lower_elementwise_mul():
 
 
 def test_lower_elementwise_silu():
-    w = 'wrmem<16x8xf32 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
@@ -501,8 +501,8 @@ def test_lower_elementwise_silu():
 
 
 def test_lower_elementwise_silu_with_bf16_output():
-    w = 'wrmem<16x8xf32 layout="mma">'
-    b = 'wrmem<16x8xbf16 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
+    b = 'wgrmem<16x8xbf16 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{

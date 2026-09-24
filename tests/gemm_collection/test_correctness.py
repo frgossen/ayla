@@ -21,7 +21,7 @@ from ayla.gpu_dialect import (
     ForOp,
     TileOp,
     TmaDescType,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from tests.testing_utils import requires_cuda
@@ -193,12 +193,12 @@ def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
 
     loops = find_ops_of_type(module, ForOp)
     assert all(loop.attrs.get("label") != "outn" for loop in loops)
-    wrmem_tiles = [
+    wgrmem_tiles = [
         op for op in find_ops_of_type(module, TileOp)
-        if isinstance(op.result().type, WrmemTensorType)
+        if isinstance(op.result().type, WgrmemTensorType)
     ]
-    assert wrmem_tiles
-    assert all(None not in tile.static_indices for tile in wrmem_tiles)
+    assert wgrmem_tiles
+    assert all(None not in tile.static_indices for tile in wgrmem_tiles)
 
     epilogues = [
         op for op in find_ops_of_type(module, ElementwiseOp)

@@ -97,7 +97,7 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
     """
     module = _tiled()
     module = promote_buffers(
-        module, target_type="wrmem", operands=["dst"],
+        module, target_type="wgrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32",
         label_filter="mm", epilogue_label_filter="epilogue",
@@ -109,8 +109,8 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
 def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            elementwise sigmoid(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+          kernel @epilogue(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+            elementwise sigmoid(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
     tile_elementwise(
@@ -158,7 +158,7 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         op_label_filter="mm", epilogue_label_filter="epilogue",
     )
     promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4,
         label_filter="mm", epilogue_label_filter="epilogue",
     )
@@ -167,7 +167,7 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         tile_dims=[1], tile_sizes=[64],
         tile_levels=["for"], tile_labels=["outn"],
         label_filter=(
-            "epilogue|mm_dst_convert|mm_dst_wrmem|mm_dst_smem"
+            "epilogue|mm_dst_convert|mm_dst_wgrmem|mm_dst_smem"
         ),
     )
 
@@ -315,10 +315,10 @@ PROMOTED_IR = textwrap.dedent("""\
         %wgx: index, %wgy: index, %wgz: index = warp_group_id()
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-        %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
-        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
-        %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-        elementwise sigmoid(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
-        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={dst_tiling_scheme: 0, label: "mm_dst_wrmem"}
+        %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
+        %7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+        elementwise sigmoid(%7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={dst_tiling_scheme: 0, label: "mm_dst_wgrmem"}
       }
     }""")

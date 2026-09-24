@@ -15,7 +15,7 @@ def pranjalssh_4096_pipelined_module():
             %smem_b0: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             %smem_a1: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 2}
             %smem_b1: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 3}
-            %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 4, init: 0.0}
+            %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 4, init: 0.0}
             %a_block: gmem<128x4096xbf16 strides=[4096, 1]> = tile(%a: gmem<4096x4096xbf16>, %by: index, 0)
             %bt_block: gmem<128x4096xbf16 strides=[4096, 1]> = tile(%bt: gmem<4096x4096xbf16>, %bx: index, 0)
             %a_tile_pro: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem<128x4096xbf16 strides=[4096, 1]>, 0, 0)
@@ -40,7 +40,7 @@ def pranjalssh_4096_pipelined_module():
               for (%ki0: index = 0 to 4) {
                 %a_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a0: smem<128x64xbf16 swizzle="128B">, 0, %ki0: index)
                 %b_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b0: smem<128x64xbf16 swizzle="128B">, 0, %ki0: index)
-                matmul(%a_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+                matmul(%a_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               }
               %a_tile_next: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a_block: gmem<128x4096xbf16 strides=[4096, 1]>, 0, %k2: index)
               %bt_tile_next: gmem<128x64xbf16 strides=[4096, 1]> = tile(%bt_block: gmem<128x4096xbf16 strides=[4096, 1]>, 0, %k2: index)
@@ -53,7 +53,7 @@ def pranjalssh_4096_pipelined_module():
               for (%ki1: index = 0 to 4) {
                 %a_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a1: smem<128x64xbf16 swizzle="128B">, 0, %ki1: index)
                 %b_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b1: smem<128x64xbf16 swizzle="128B">, 0, %ki1: index)
-                matmul(%a_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+                matmul(%a_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               }
               await(%lock_a0_next: lock<mbar>)
               await(%lock_b0_next: lock<mbar>)
@@ -68,19 +68,19 @@ def pranjalssh_4096_pipelined_module():
             for (%ki0e: index = 0 to 4) {
               %a_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a0: smem<128x64xbf16 swizzle="128B">, 0, %ki0e: index)
               %b_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b0: smem<128x64xbf16 swizzle="128B">, 0, %ki0e: index)
-              matmul(%a_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              matmul(%a_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_0e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
             await(%lock_a1_e: lock<mbar>)
             await(%lock_b1_e: lock<mbar>)
             for (%ki1e: index = 0 to 4) {
               %a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_a1: smem<128x64xbf16 swizzle="128B">, 0, %ki1e: index)
               %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B"> = tile(%smem_b1: smem<128x64xbf16 swizzle="128B">, 0, %ki1e: index)
-              matmul(%a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              matmul(%a_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %b_inner_1e: smem<128x16xbf16 strides=[64, 1] swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
-            %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 13}
-            elementwise convert(%acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
+            %acc_bf: wgrmem<128x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 13}
+            elementwise convert(%acc_bf: wgrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">)
             %c_block: gmem<128x128xbf16 strides=[4096, 1]> = tile(%c: gmem<4096x4096xbf16>, %by: index, %bx: index)
-            move(%c_block: gmem<128x128xbf16 strides=[4096, 1]>, %acc_bf: wrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">)
+            move(%c_block: gmem<128x128xbf16 strides=[4096, 1]>, %acc_bf: wgrmem<128x128xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }""")  # noqa: E501
     return gpu_dialect.parse_module(module_str)

@@ -2,7 +2,7 @@
 
 Wraps the ops that run asynchronously on the hardware — a TMA bulk transfer
 (``move`` with ``tma=True`` or a lowered ``tma_move``) and a wgmma matmul
-(smem×smem→wrmem with 4 warps) — in an ``async`` block carrying the lock,
+(smem×smem→wgrmem with 4 warps) — in an ``async`` block carrying the lock,
 followed by an ``await``. The lock kind is ``mbar`` for a TMA load, ``bulk``
 for a TMA store, ``wgmma`` for a matmul.
 
@@ -22,7 +22,7 @@ from ..gpu_dialect import (
     MoveOp,
     SmemTensorType,
     TmaMoveOp,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
 from ..base.ir import Block, Op, Value
 from ..base.lowering_pass import LoweringPass, lowers
@@ -112,7 +112,7 @@ class LowerToAsync(LoweringPass):
         lhs = self.value_map[op.lhs]
         rhs = self.value_map[op.rhs]
         dst = self.value_map[op.dst]
-        # Only wgmma matmuls (smem×smem→wrmem, 4 warps) are async; plain FMA
+        # Only wgmma matmuls (smem×smem→wgrmem, 4 warps) are async; plain FMA
         # matmuls stay synchronous. Same idea as ``lower_move``'s tma gate.
         # TODO: lower *all* matmuls as async (FMA ones too), wrapping every
         # matmul uniformly — the non-async ones get a trivial lock whose await
@@ -120,7 +120,7 @@ class LowerToAsync(LoweringPass):
         # and the sync/async split entirely.
         if not (isinstance(lhs.type, SmemTensorType)
                 and isinstance(rhs.type, SmemTensorType)
-                and isinstance(dst.type, WrmemTensorType)
+                and isinstance(dst.type, WgrmemTensorType)
                 and dst.type.warps == 4):
             return None
         matmul = MatmulOp.build(
