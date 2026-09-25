@@ -25,8 +25,16 @@ class GpuDialect(Dialect):
 gpu_dialect = GpuDialect()
 
 
+class GpuOp(Op):
+    """Base for GPU operations with no operation-defined attributes."""
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return dict(self.attrs)
+
+
 @gpu_dialect.register_op("module")
-class ModuleOp(Op):
+class ModuleOp(GpuOp):
     _DEFAULT_ATTRS = {
         "version": "9.0",
         "target": "sm_90a",
@@ -66,6 +74,13 @@ class ModuleOp(Op):
         assert isinstance(value, int)
         return value
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in self._DEFAULT_ATTRS
+        }
+
     def print(self, p: Printer) -> None:
         p.write("module")
         non_default = {
@@ -87,7 +102,7 @@ class ModuleOp(Op):
         body = Block.parse(brace, p, arguments=[])
         return cls.build(body, attrs=attrs)
 @gpu_dialect.register_op("kernel")
-class KernelOp(Op):
+class KernelOp(GpuOp):
     @classmethod
     def build(
         cls,
@@ -349,7 +364,7 @@ def _parse_collective(p) -> dict[CollectiveAxis, CollectiveLevel]:
 
 
 @gpu_dialect.register_op("matmul")
-class MatmulOp(Op):
+class MatmulOp(GpuOp):
     @classmethod
     def build(
         cls,
@@ -442,7 +457,7 @@ class MatmulOp(Op):
 
 
 @gpu_dialect.register_op("tile")
-class TileOp(Op):
+class TileOp(GpuOp):
     """Select a sub-region (view) of a buffer.
 
     Each index advances the view origin by the corresponding result size.
@@ -555,7 +570,7 @@ class TileOp(Op):
         )
 
 @gpu_dialect.register_op("reshape")
-class ReshapeOp(Op):
+class ReshapeOp(GpuOp):
     """Reinterpret a dense tensor with a different shape without moving data."""
 
     @classmethod
@@ -571,7 +586,7 @@ class ReshapeOp(Op):
 
 
 @gpu_dialect.register_op("reduce")
-class ReduceOp(Op):
+class ReduceOp(GpuOp):
     """Accumulate a reduction into a destination.
 
     The final source dimension is always the reduction dimension. Source and
@@ -683,7 +698,7 @@ class ReduceOp(Op):
 
 
 @gpu_dialect.register_op("elementwise")
-class ElementwiseOp(Op):
+class ElementwiseOp(GpuOp):
     """One scalar function over corresponding elements of its sources.
 
     ``fn`` names the function and is part of the op's textual syntax. Exp,
@@ -768,7 +783,7 @@ class ElementwiseOp(Op):
 
 
 @gpu_dialect.register_op("alloc")
-class AllocOp(Op):
+class AllocOp(GpuOp):
     """Allocate a register- or shared-memory tensor.
 
     Optional `init` attr fills the allocation with a constant value.
@@ -826,7 +841,7 @@ class AllocOp(Op):
 
 
 @gpu_dialect.register_op("reinterpret")
-class ReinterpretOp(Op):
+class ReinterpretOp(GpuOp):
     """Reinterpret a typed region at a byte offset into existing storage.
 
     The operation does not allocate, convert, or move data. Its result aliases
@@ -862,9 +877,16 @@ class ReinterpretOp(Op):
     def byte_offset(self) -> int:
         return self.attrs["byte_offset"]  # type: ignore[return-value]
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "byte_offset"
+        }
+
 
 @gpu_dialect.register_op("move")
-class MoveOp(Op):
+class MoveOp(GpuOp):
     """Move data into a destination, with optional indices and collectivity."""
 
     @classmethod
@@ -951,7 +973,7 @@ class MoveOp(Op):
 
 
 @gpu_dialect.register_op("tma_move")
-class TmaMoveOp(Op):
+class TmaMoveOp(GpuOp):
     """Synchronous TMA bulk transfer with explicit collectivity.
 
     One operand is a TMA descriptor (gmem side), the other is smem. Indices are
@@ -1102,7 +1124,7 @@ class LockType(Type):
 
 
 @gpu_dialect.register_op("await")
-class AwaitOp(Op):
+class AwaitOp(GpuOp):
     """Wait for all async work registered on a lock."""
 
     @classmethod
@@ -1122,7 +1144,7 @@ class AwaitOp(Op):
 
 
 @gpu_dialect.register_op("barrier")
-class BarrierOp(Op):
+class BarrierOp(GpuOp):
     """A rendezvous / synchronization point across a set of threads.
 
     It only establishes a happens-before across its participating threads.
@@ -1168,7 +1190,7 @@ class BarrierOp(Op):
 
 
 @gpu_dialect.register_op("if")
-class IfOp(Op):
+class IfOp(GpuOp):
     """Execute a region when its predicate is true."""
 
     @classmethod
@@ -1213,7 +1235,7 @@ class IfOp(Op):
 
 
 @gpu_dialect.register_op("async")
-class AsyncOp(Op):
+class AsyncOp(GpuOp):
     """A group of async work issued together and completed by one ``await``.
 
     Wraps a body block of ops that run asynchronously under one ``lock``. The
@@ -1311,7 +1333,7 @@ class AsyncOp(Op):
 
 
 @gpu_dialect.register_op("ptx_template")
-class PTXTemplateOp(Op):
+class PTXTemplateOp(GpuOp):
     @classmethod
     def build(
         cls,
@@ -1642,7 +1664,7 @@ class PtrType(Type):
 
 
 @gpu_dialect.register_op("to_ptr")
-class ToPtrOp(Op):
+class ToPtrOp(GpuOp):
     """Convert an addressable memory tensor to a raw pointer.
 
     Takes the base address of the tensor.
@@ -1670,7 +1692,7 @@ class ToPtrOp(Op):
 
 
 @gpu_dialect.register_op("ptr_add")
-class PtrAddOp(Op):
+class PtrAddOp(GpuOp):
     """Add a byte offset to a pointer, returning a new pointer."""
 
     @classmethod
@@ -1930,7 +1952,7 @@ class WgrmemTensorType(RegMemTensorType):
 
 
 @gpu_dialect.register_op("for")
-class ForOp(Op):
+class ForOp(GpuOp):
     """Sequential loop over a 1D range: for (iv = lb to ub [step s])."""
 
     @classmethod
@@ -2078,7 +2100,7 @@ class F64Type(Type):
 
 
 @gpu_dialect.register_op("thread_ids")
-class ThreadIdsOp(Op):
+class ThreadIdsOp(GpuOp):
     """Produce the 3D thread index (tid.x, tid.y, tid.z)."""
 
     @classmethod
@@ -2103,7 +2125,7 @@ class ThreadIdsOp(Op):
 
 
 @gpu_dialect.register_op("block_ids")
-class BlockIdsOp(Op):
+class BlockIdsOp(GpuOp):
     """Produce the 3D block index (ctaid.x, ctaid.y, ctaid.z)."""
 
     @classmethod
@@ -2128,7 +2150,7 @@ class BlockIdsOp(Op):
 
 
 @gpu_dialect.register_op("cluster_block_ids")
-class ClusterBlockIdsOp(Op):
+class ClusterBlockIdsOp(GpuOp):
     """Produce the 3D CTA index within the enclosing cluster."""
 
     @classmethod
@@ -2156,7 +2178,7 @@ class ClusterBlockIdsOp(Op):
 
 
 @gpu_dialect.register_op("warp_group_id")
-class WarpGroupIdOp(Op):
+class WarpGroupIdOp(GpuOp):
     """Produce the 3D warp group index within the block."""
 
     @classmethod
@@ -2181,7 +2203,7 @@ class WarpGroupIdOp(Op):
 
 
 @gpu_dialect.register_op("warp_ids")
-class WarpIdsOp(Op):
+class WarpIdsOp(GpuOp):
     """Produce the 3D warp index within the block."""
 
     @classmethod
@@ -2206,7 +2228,7 @@ class WarpIdsOp(Op):
 
 
 @gpu_dialect.register_op("index_constant")
-class IndexConstantOp(Op):
+class IndexConstantOp(GpuOp):
     """Produce a constant index value."""
 
     @classmethod
@@ -2220,12 +2242,19 @@ class IndexConstantOp(Op):
         assert isinstance(value, int)
         return value
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "value"
+        }
+
     def expr_str(self, prec=0, val_str=None) -> str:
         return str(self.value)
 
 
 @gpu_dialect.register_op("index_lt")
-class IndexLtOp(Op):
+class IndexLtOp(GpuOp):
     """Compare two index values using unsigned less-than."""
 
     @classmethod
@@ -2272,7 +2301,7 @@ def _binop_expr_str(op, operand, prec, parent_prec, val_str):
 
 
 @gpu_dialect.register_op("index_add")
-class IndexAddOp(Op):
+class IndexAddOp(GpuOp):
     """Add two index values: result = lhs + rhs."""
 
     @classmethod
@@ -2293,7 +2322,7 @@ class IndexAddOp(Op):
 
 
 @gpu_dialect.register_op("index_mul")
-class IndexMulOp(Op):
+class IndexMulOp(GpuOp):
     """Multiply two index values: result = lhs * rhs."""
 
     @classmethod
@@ -2314,7 +2343,7 @@ class IndexMulOp(Op):
 
 
 @gpu_dialect.register_op("index_div")
-class IndexDivOp(Op):
+class IndexDivOp(GpuOp):
     """Unsigned integer division: result = lhs / rhs."""
 
     @classmethod
@@ -2335,7 +2364,7 @@ class IndexDivOp(Op):
 
 
 @gpu_dialect.register_op("index_mod")
-class IndexModOp(Op):
+class IndexModOp(GpuOp):
     """Unsigned integer remainder: result = lhs % rhs."""
 
     @classmethod
@@ -2356,7 +2385,7 @@ class IndexModOp(Op):
 
 
 @gpu_dialect.register_op("select")
-class SelectOp(Op):
+class SelectOp(GpuOp):
     """Pick one of several values by index: ``result = cases[index]``.
 
     Introduced to name a choice the IR cannot yet make statically -- notably
@@ -2384,7 +2413,7 @@ class SelectOp(Op):
 
 
 @gpu_dialect.register_op("lane_id")
-class LaneIdOp(Op):
+class LaneIdOp(GpuOp):
     """Produce the lane index within the warp (0..31)."""
 
     @classmethod
