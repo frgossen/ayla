@@ -48,6 +48,9 @@ def schedule_register_matmul(
         raise ValueError("rhs_tma_load_slices must be positive")
     k_label = f"{loop_label_prefix}_k" if loop_label_prefix else "k"
     kk_label = f"{loop_label_prefix}_kk" if loop_label_prefix else "kk"
+    scheduled_label = (
+        rf"(?:{label})(?:_(?:tail|iter)\d+)?" if k_tail_tiles else label
+    )
 
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
@@ -61,6 +64,13 @@ def schedule_register_matmul(
         body_label_filter=label,
         tail_iterations=k_tail_tiles,
     ))
+    if k_tail_tiles:
+        pipeline.add_pass(UnrollLoop(
+            # One larger than the peeled trip count deliberately emits the
+            # entire short loop as straight-line tail iterations.
+            unroll_factor=k_tail_tiles + 1,
+            label_filter=rf"{k_label}_(?:first|second)_tail",
+        ))
     pipeline.add_pass(CSE())
     pipeline.add_pass(PromoteBuffers(
         target_type="smem", operands=["lhs", "rhs"],
@@ -75,34 +85,29 @@ def schedule_register_matmul(
         ),
         move_attrs=operand_move_attrs,
         unsafe_reuse_smem=unsafe_reuse_smem,
-        label_filter=label,
+        label_filter=scheduled_label,
     ))
     pipeline.add_pass(ScheduleAsync(
-        label_filter=rf"(?:{label})_(?:lhs|rhs)_smem",
+        label_filter=rf"(?:{scheduled_label})_(?:lhs|rhs)_smem",
     ))
     pipeline.add_pass(TileMatmul(
         op_dims=["K"], tile_sizes=[16],
         iteration_bindings=[None], for_loop_labels=[kk_label],
-        op_label_filter=label,
+        op_label_filter=scheduled_label,
         epilogue_label_filter=epilogue_label_filter,
     ))
     pipeline.add_pass(MultiBuffer(
         depth=operand_stages,
-        label_filter=rf"(?:{label})_lhs_smem",
+        label_filter=rf"(?:{scheduled_label})_lhs_smem",
     ))
     pipeline.add_pass(MultiBuffer(
         depth=operand_stages,
-        label_filter=rf"(?:{label})_rhs_smem",
+        label_filter=rf"(?:{scheduled_label})_rhs_smem",
     ))
     pipeline.add_pass(LICM())
     pipeline.add_pass(UnrollLoop(
         unroll_factor=operand_stages, label_filter=k_label,
     ))
-    if k_tail_tiles:
-        pipeline.add_pass(UnrollLoop(
-            unroll_factor=max(2, k_tail_tiles),
-            label_filter=rf"{k_label}_(?:first|second)_tail",
-        ))
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(LowerToAsync())
     pipeline.add_pass(FuseAsync())
@@ -110,7 +115,7 @@ def schedule_register_matmul(
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(PipelineLoop(
         label_filter_loop=k_label,
-        label_filter_op=rf"(?:{label})_(lhs|rhs)_smem_iter\d+_async",
+        label_filter_op=rf"(?:{scheduled_label})_(lhs|rhs)_smem_iter\d+_async",
         pipelining_offset=1,
     ))
     pipeline.add_pass(UnrollLoop(

@@ -17,10 +17,12 @@ single ``await``. The kind is decided by the op *inside* the async (see
   fused (no fused-store codegen, and unvalidated).
 
 Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
-the run. An already-fused (multi-op) async returns ``None`` and is left
-untouched, so the pass is idempotent. Side-effect-free ops between members (lock
-allocs, tile views) are transparent — emitted before the merged block — and the
-per-member awaits are dropped.
+the run. An already-fused WGMMA group may fuse with the next WGMMA group, which
+lets separately tiled reductions share one final wait. Multi-op TMA groups stay
+untouched because fusing them after pipelining would invalidate their barrier
+protocol. Side-effect-free ops between members (lock allocs, tile views) are
+transparent — emitted before the merged block — and the per-member awaits are
+dropped.
 
 **Placement matters** (caller's responsibility): fuse TMA loads *before*
 pipelining, while each stage's loads and awaits are still adjacent. After
@@ -47,17 +49,27 @@ from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
-def _fusion_kind(op: Op) -> str | None:
-    """Fusion category of ``op`` if it is a single-op async we can fuse, else
-    ``None``. Multi-op (already-fused) asyncs return ``None`` — idempotency."""
+def _fusion_kind(
+    op: Op, *, fuse_wgmma_groups: bool = False,
+) -> object | None:
+    """Return the supported fusion category for an asynchronous group."""
     if not isinstance(op, AsyncOp):
         return None
     body = op.body.ops
+    if body and all(isinstance(inner, MatmulOp) for inner in body):
+        matmuls = [inner for inner in body if isinstance(inner, MatmulOp)]
+        if len(matmuls) == 1:
+            return "wgmma"
+        if not fuse_wgmma_groups:
+            return None
+        if all(matmul.dst is matmuls[0].dst for matmul in matmuls):
+            # Different accumulators must remain separate groups: one may be
+            # awaited for its epilogue while the other continues in flight.
+            return ("wgmma", matmuls[0].dst)
+        return None
     if len(body) != 1:
         return None
     inner = body[0]
-    if isinstance(inner, MatmulOp):
-        return "wgmma"  # matmuls → one wgmma commit group
     if (isinstance(inner, MoveOp)
             and inner.attrs.get("tma")
             and isinstance(inner.dst.type, SmemTensorType)):  # dst smem ⇒ load
@@ -67,13 +79,18 @@ def _fusion_kind(op: Op) -> str | None:
 
 class FuseAsync(Pass):
 
+    fuse_wgmma_groups: bool
+
+    def __init__(self, fuse_wgmma_groups: bool = False) -> None:
+        super().__init__(fuse_wgmma_groups=fuse_wgmma_groups)
+
     def run_block(self, block: Block) -> None:
         super().run_block(block)
 
         new_ops: list[Op] = []
         group_inner: list[Op] = []
         group_lock: Value | None = None
-        group_kind: str | None = None
+        group_kind: object | None = None
         group_attrs: dict[str, object] | None = None
         group_collective: dict[CollectiveAxis, CollectiveLevel] | None = None
         # Member locks still awaiting their (to-be-dropped) await. Each fused
@@ -110,7 +127,9 @@ class FuseAsync(Pass):
             in_flight_locks = set()
 
         for op in block.ops:
-            kind = _fusion_kind(op)
+            kind = _fusion_kind(
+                op, fuse_wgmma_groups=self.fuse_wgmma_groups,
+            )
             if kind is not None:
                 assert isinstance(op, AsyncOp)
                 if group_kind is not None:

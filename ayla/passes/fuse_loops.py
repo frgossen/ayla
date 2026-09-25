@@ -113,15 +113,21 @@ class FuseLoops(Pass):
         second_tail: list[Op] = []
         if first.ub > common_ub:
             first.lb = common_ub
-            first.attrs["peeled"] = True
-            if isinstance(label := first.attrs.get("label"), str):
-                first.attrs["label"] = f"{label}_first_tail"
+            if self.tail_iterations:
+                first.attrs["peeled"] = True
+                for body_op in first.body.ops:
+                    body_op.attrs["peeled"] = True
+                if isinstance(label := first.attrs.get("label"), str):
+                    first.attrs["label"] = f"{label}_first_tail"
             first_tail.append(first)
         if second.ub > common_ub:
             second.lb = common_ub
-            second.attrs["peeled"] = True
-            if isinstance(label := second.attrs.get("label"), str):
-                second.attrs["label"] = f"{label}_second_tail"
+            if self.tail_iterations:
+                second.attrs["peeled"] = True
+                for body_op in second.body.ops:
+                    body_op.attrs["peeled"] = True
+                if isinstance(label := second.attrs.get("label"), str):
+                    second.attrs["label"] = f"{label}_second_tail"
             second_tail.append(second)
         if self.tail_iterations and first_tail and second_tail:
             # The peeled loops may reuse storage owned by the common pipeline.

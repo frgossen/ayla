@@ -48,6 +48,8 @@ class MultiBuffer(LoweringPass):
         loop = find_ancestor_of_type(op, ForOp)
         if self.depth <= 1 or loop is None:
             return None
+        if op.attrs.get("peeled") is True:
+            return None
         # A peeled loop is finite straight-line cleanup, not a software
         # pipeline. Its allocation is hoisted once before later unrolling.
         if loop.attrs.get("peeled") is True:

@@ -301,12 +301,12 @@ def _projection_ops(
         up_acc,
         activation,
         product,
-        up_matmul,
-        round_up,
         gate_matmul,
         round_gate,
         widen_gate,
         activate,
+        up_matmul,
+        round_up,
         multiply,
         writeback,
     ], writeback
@@ -339,16 +339,28 @@ def _schedule_projection(
         loop_label_prefix="projection",
         k_tail_tiles=k_tail_tiles,
     ).run(module)
+    if k_tail_tiles:
+        FuseAsync(fuse_wgmma_groups=True).run(module)
 
     # Both projections execute concurrently, so their private operand buffers
     # must not be overlaid. They may still share an arena with later phases.
     for alloc in find_ops_of_type(module, AllocOp):
-        if alloc.attrs.get("reuse_group") in {"up_compute", "gate_compute"}:
+        reuse_group = alloc.attrs.get("reuse_group")
+        if (
+            isinstance(reuse_group, str)
+            and reuse_group.startswith(("up", "gate"))
+            and reuse_group.endswith("_compute")
+        ):
             alloc.attrs["reuse_group"] = (
                 "projection_tail_compute"
                 if alloc.attrs.get("peeled") is True
                 else "projection_compute"
             )
+
+    if num_warp_groups > 1:
+        for barrier in find_ops_of_type(module, BarrierOp):
+            if barrier.scope == "thread":
+                barrier.attrs["scope"] = "block"
 
     if num_warp_groups == 1:
         writeback.attrs["tma"] = True

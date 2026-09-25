@@ -19,10 +19,10 @@ def _side_by_side_module():
     return gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @pair(%a: gmem<64x64xbf16>, %first_w: gmem<64x64xbf16>, %second_w: gmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %first_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
-            %second_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101, init: 0.0}
-            matmul(%a: gmem<64x64xbf16>, %first_w: gmem<64x64xbf16>, %first_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "first"}
-            matmul(%a: gmem<64x64xbf16>, %second_w: gmem<64x64xbf16>, %second_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "second"}
+            %first_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
+            %second_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101, init: 0.0}
+            matmul(%a: gmem<64x64xbf16>, %first_w: gmem<64x64xbf16>, %first_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "first"}
+            matmul(%a: gmem<64x64xbf16>, %second_w: gmem<64x64xbf16>, %second_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "second"}
           }
         }"""))  # noqa: E501
 
@@ -67,11 +67,11 @@ def test_register_matmul_pipeline_keeps_epilogue_before_unequal_tail():
         module {
           kernel @tail(%a: gmem<64x96xbf16>, %short_w: gmem<64x64xbf16>, %long_w: gmem<64x96xbf16>) block_dim=[128, 1, 1] {
             %prefix: gmem<64x64xbf16 strides=[96, 1]> = tile(%a: gmem<64x96xbf16>, 0, 0)
-            %short_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
-            %long_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101, init: 0.0}
-            matmul(%prefix: gmem<64x64xbf16 strides=[96, 1]>, %short_w: gmem<64x64xbf16>, %short_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "short"}
-            elementwise sigmoid(%short_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %short_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "short_epilogue"}
-            matmul(%a: gmem<64x96xbf16>, %long_w: gmem<64x96xbf16>, %long_out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "long"}
+            %short_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
+            %long_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101, init: 0.0}
+            matmul(%prefix: gmem<64x64xbf16 strides=[96, 1]>, %short_w: gmem<64x64xbf16>, %short_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "short"}
+            elementwise sigmoid(%short_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %short_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "short_epilogue"}
+            matmul(%a: gmem<64x96xbf16>, %long_w: gmem<64x96xbf16>, %long_out: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "long"}
           }
         }"""))  # noqa: E501
 

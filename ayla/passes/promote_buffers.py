@@ -41,11 +41,12 @@ from ..gpu_dialect import (
     SmemTensorType,
     TileOp,
     WrmemTensorType,
+    memory_effects,
+    root_buffers,
     is_elementwise,
 )
 from ._utils import (
     build_slice_tile,
-    can_reorder,
     label_matches,
     rebuild_tile,
     tile_introduces_narrow_level,
@@ -412,23 +413,34 @@ class PromoteBuffers(LoweringPass):
         ops = list(block.ops)
         new_ops: list[Op] = []
         reusable: dict[tuple[object, ...], Value] = {}
-        reuse_group: list[MatmulOp] = []
         i = 0
         while i < len(ops):
             op = ops[i]
+            effects = memory_effects(op)
+            if effects is None:
+                reusable.clear()
+            else:
+                writes = {
+                    root
+                    for effect in effects
+                    if effect.kind == "W"
+                    for root in effect.roots
+                }
+                if writes:
+                    reusable = {
+                        key: promoted
+                        for key, promoted in reusable.items()
+                        if not writes & (
+                            root_buffers(key[1]) | root_buffers(promoted)
+                        )
+                    }
             if not self._promotes(op):
                 new_ops.append(op)
-                reusable.clear()
-                reuse_group.clear()
                 i += 1
                 continue
             epilogue = self._epilogue(ops, i)
             assert isinstance(op, MatmulOp)
-            if any(not can_reorder(prior, op) for prior in reuse_group):
-                reusable.clear()
-                reuse_group.clear()
             new_ops.extend(self._promote(op, epilogue, reusable))
-            reuse_group.append(op)
             i += 1 + len(epilogue)
         block.ops = new_ops
 
@@ -519,6 +531,11 @@ class PromoteBuffers(LoweringPass):
             # owns initialization until the destination reaches registers.
             if self.target_type != "smem":
                 init = None
+
+        if op.attrs.get("peeled") is True:
+            for pre_op in pre_ops:
+                if isinstance(pre_op, AllocOp):
+                    pre_op.attrs["peeled"] = True
 
         matmul_attrs = op.extra_attrs
         for operand_name in self.operand_names:
