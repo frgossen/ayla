@@ -61,6 +61,7 @@ include = [
     "tests/passes/test_unroll_loop.py",
     "tests/test_e2e.py",
     "tests/test_gemm.py",
+    "tests/test_pass_interactions.py",
     "tests/test_pytree.py",
     "tests/test_ptx_codegen.py",
     "tests/test_torch_custom_call.py",
