@@ -1,7 +1,7 @@
 """Tests for scheduling asynchronous work around independent operations."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.schedule_async import schedule_async
 
@@ -18,6 +18,7 @@ def test_bulk_await_sinks_until_shared_source_is_overwritten():
             move(%s: smem<4x4xf32>, %r: rmem<4x4xf32>) attrs={label: "reuse"}
           }
         }"""))
+    assert isinstance(module, ModuleOp)
     text = repr(schedule_async(lower_to_async(module)))
     store = text.index('label: "store_async"')
     compute = text.index('label: "next_compute"')
