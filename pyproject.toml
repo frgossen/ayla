@@ -37,6 +37,7 @@ include = [
     "ayla",
     "tests/base/test_ir.py",
     "tests/passes/test_canonicalize.py",
+    "tests/passes/test_dce.py",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
