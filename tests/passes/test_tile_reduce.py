@@ -1,6 +1,11 @@
 import textwrap
 
-from ayla.gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
+from ayla.gpu_dialect import (
+    CollectiveAxis,
+    CollectiveLevel,
+    ModuleOp,
+    gpu_dialect,
+)
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.tile_reduce import tile_reduce
 
@@ -13,6 +18,7 @@ def test_tile_reduce_maps_one_dimension_to_block_y():
             elementwise div(%output: gmem<256x128x1xf32>, %output: gmem<256x128x1xf32>) attrs={divisor: 6656, label: "mean_epilogue"}
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     module = tile_reduce(
         module,
@@ -47,6 +53,7 @@ def test_tile_reduce_combines_parallel_and_sequential_dimensions():
             elementwise div(%output: gmem<256x128x1xf32>, %output: gmem<256x128x1xf32>) attrs={divisor: 6656, label: "mean_epilogue"}
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     module = tile_reduce(
         module,
@@ -83,6 +90,7 @@ def test_tile_reduce_maps_two_dimensions_to_one_parallel_iteration_space():
             elementwise div(%output: gmem<256x128x1xf32>, %output: gmem<256x128x1xf32>) attrs={divisor: 6656, label: "mean_epilogue"}
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     module = tile_reduce(
         module,
