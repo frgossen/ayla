@@ -3,14 +3,21 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
+    ModuleOp,
     PTXTemplateOp,
     gpu_dialect,
 )
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 
 
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
+
+
 def test_lowers_128b_block_major_move_with_stmatrix():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -30,7 +37,7 @@ def test_lowers_128b_block_major_move_with_stmatrix():
 
 
 def test_lowers_128b_block_major_column_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -54,7 +61,7 @@ def test_lowers_128b_block_major_column_slice():
 
 
 def test_lowers_legacy_attribute_column_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -73,7 +80,7 @@ def test_lowers_legacy_attribute_column_slice():
 
 
 def test_unswizzled_move_uses_scalar_store_fallback():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16> = alloc() attrs={id: 0}
@@ -126,7 +133,7 @@ def test_n8_fragment_scalar_store_supports_global_memory():
 
 
 def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x64xbf16> = alloc() attrs={id: 0}
