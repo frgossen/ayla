@@ -52,6 +52,7 @@ include = [
     "tests/passes/test_pack_smem_allocs.py",
     "tests/passes/test_peel_loop.py",
     "tests/passes/test_pipeline_loop.py",
+    "tests/passes/test_promote_buffers.py",
     "tests/passes/test_schedule_async.py",
     "tests/passes/test_specialize_shapes.py",
     "tests/passes/test_tile_reduce.py",
