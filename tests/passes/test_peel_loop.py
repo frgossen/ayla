@@ -4,12 +4,18 @@ import textwrap
 import pytest
 
 from ayla.base.ir import iter_ops
-from ayla.gpu_dialect import ForOp, gpu_dialect
+from ayla.gpu_dialect import ForOp, ModuleOp, gpu_dialect
 from ayla.passes.peel_loop import PeelLoop, peel_loop
 
 
-def _strided_loop_module():
-    return gpu_dialect.parse(textwrap.dedent("""\
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
+
+
+def _strided_loop_module() -> ModuleOp:
+    return _parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4x14xf32>) {
             for (%k: index = 2 to 14 step 2) attrs={label: "k", marker: "keep"} {
@@ -23,7 +29,7 @@ def _strided_loop_module():
 
 def test_label_filter_is_required():
     with pytest.raises(TypeError, match="label_filter"):
-        peel_loop(_strided_loop_module())
+        peel_loop(_strided_loop_module())  # type: ignore[call-arg]
 
 
 def test_peel_front_and_back_with_a_non_unit_step():
@@ -66,7 +72,7 @@ def test_peel_front_and_back_with_a_non_unit_step():
 
 
 def test_exact_peel_omits_the_empty_middle_loop():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4x4xf32>) {
             for (%k: index = 0 to 4) attrs={label: "k"} {
@@ -109,7 +115,7 @@ def test_rejects_invalid_iteration_counts():
 
 
 def test_matching_nested_loop_is_peeled_through_nonmatching_parent():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<2x3xf32>) {
             for (%i: index = 0 to 2) attrs={label: "outer"} {
