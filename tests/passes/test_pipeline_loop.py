@@ -1,7 +1,7 @@
 """Tests for the pipeline_loop pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.passes.pipeline_loop import pipeline_loop
 
 
@@ -29,6 +29,7 @@ def test_pipeline_reorders_across_inner_loop():
           }
         }""")  # noqa: E501
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     pipelined = pipeline_loop(
         module, label_filter_loop="k", label_filter_op="load", pipelining_offset=1,
     )
@@ -88,6 +89,7 @@ def test_pipeline_matmul_smem_skeleton():
         }""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     pipelined = pipeline_loop(module, label_filter_loop=".*", label_filter_op="load", pipelining_offset=1)
     text = repr(pipelined)
     expected = textwrap.dedent("""\
