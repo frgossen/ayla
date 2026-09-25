@@ -5,6 +5,7 @@ import pytest
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     AsyncOp,
+    BarrierOp,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
@@ -12,6 +13,7 @@ from ayla.gpu_dialect import (
     ForOp,
     GmemTensorType,
     IndexType,
+    KernelOp,
     LockType,
     ModuleOp,
     MoveOp,
@@ -464,3 +466,55 @@ def test_verification_rejects_undersized_grid_barrier_sync():
 
     with pytest.raises(ValueError, match="at least 8 bytes"):
         verify_gpu_dialect(module)
+
+
+def _grid_barrier_module(
+    grid_dim: tuple[int, int, int],
+    *,
+    target: str = "sm_90a",
+    cluster_dim: tuple[int | None, int | None, int | None] = (None, None, None),
+) -> ModuleOp:
+    sync = Value(name="sync", type=GmemTensorType.build((2,), F32Type()))
+    kernel = KernelOp.build(
+        "grid_sync",
+        Block(arguments=[sync], ops=[BarrierOp.build("grid", sync)]),
+        grid_dim=grid_dim,
+        block_dim=(32, 1, 1),
+        cluster_dim=cluster_dim,
+    )
+    return ModuleOp.build(Block(ops=[kernel]), attrs={"target": target})
+
+
+@pytest.mark.parametrize(
+    "target,grid_dim,cluster_dim",
+    [
+        ("sm_90a", (8, 16, 1), (None, None, None)),
+        ("sm_90a", (8, 16, 1), (2, 1, 1)),
+        ("sm_100a", (148, 1, 1), (None, None, None)),
+    ],
+)
+def test_ptx_verification_accepts_resident_grid_barrier(
+    target, grid_dim, cluster_dim,
+):
+    module = _grid_barrier_module(
+        grid_dim, target=target, cluster_dim=cluster_dim,
+    )
+
+    assert verify_gpu_dialect(module, VerificationStage.PTX_LOWERING) is module
+
+
+def test_ptx_verification_rejects_nonresident_grid_barrier():
+    module = _grid_barrier_module((9, 16, 1))
+
+    with pytest.raises(
+        ValueError,
+        match=r"grid_sync.*launches 144 physical CTAs.*at most 132",
+    ):
+        make_ptx_kernel(module)
+
+
+def test_ptx_verification_rejects_unknown_grid_barrier_target():
+    module = _grid_barrier_module((1, 1, 1), target="sm_101a")
+
+    with pytest.raises(ValueError, match="no residency limit.*sm_101a"):
+        verify_gpu_dialect(module, VerificationStage.PTX_LOWERING)
