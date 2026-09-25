@@ -36,6 +36,7 @@ ignore = ["E501"]
 include = [
     "ayla",
     "tests/base/test_ir.py",
+    "tests/passes/test_canonicalize.py",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
