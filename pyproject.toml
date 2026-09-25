@@ -39,6 +39,7 @@ include = [
     "tests/base/test_pipeline.py",
     "tests/gemm_collection/test_correctness.py",
     "tests/passes/test_canonicalize.py",
+    "tests/passes/test_cse.py",
     "tests/passes/test_dce.py",
     "tests/passes/test_lower_to_tma_move.py",
     "tests/passes/test_multi_buffer.py",
