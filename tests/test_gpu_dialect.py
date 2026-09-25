@@ -26,6 +26,7 @@ from ayla.gpu_dialect import (
     F32Type,
     ForOp,
     IfOp,
+    IndexConstantOp,
     IndexLtOp,
     IndexType,
     LockType,
@@ -57,6 +58,11 @@ def assert_print_and_roundtrip(op, expected):
 @pytest.mark.parametrize(
     ("op_type", "explicit_attrs"),
     [
+        (ModuleOp, {
+            "version": "9.0",
+            "target": "sm_90a",
+            "address_size": 64,
+        }),
         (KernelOp, {
             "name": "k",
             "grid_dim": [],
@@ -70,6 +76,7 @@ def assert_print_and_roundtrip(op, expected):
         (TileOp, {"static_indices": [], "maybe_partial": True}),
         (ElementwiseOp, {"fn": "relu"}),
         (AllocOp, {"id": 1, "init": 0.0}),
+        (ReinterpretOp, {"byte_offset": 0}),
         (MoveOp, {"collective": {}, "multicast": True}),
         (TmaMoveOp, {
             "collective": {},
@@ -80,6 +87,7 @@ def assert_print_and_roundtrip(op, expected):
         (AsyncOp, {"collective": {}}),
         (PTXTemplateOp, {"template": "ret;", "description": "test"}),
         (ForOp, {"lb": 0, "ub": 1, "step": 1}),
+        (IndexConstantOp, {"value": 0}),
     ],
 )
 def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
@@ -87,6 +95,20 @@ def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
         operands=[], results=[], attrs={**explicit_attrs, "label": "keep"},
     )
     assert op.extra_attrs == {"label": "keep"}
+
+
+@pytest.mark.parametrize(
+    "op_type",
+    set(gpu_dialect._ops.values()) - {Op},
+)
+def test_every_gpu_op_exposes_extra_attrs(op_type):
+    op = op_type(operands=[], results=[], attrs={"label": "keep"})
+    assert op.extra_attrs == {"label": "keep"}
+
+
+def test_alloc_id_accessor():
+    op = AllocOp(operands=[], results=[], attrs={"id": 3})
+    assert op.id == 3
 
 
 def test_reinterpret_op():
