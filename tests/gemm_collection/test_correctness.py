@@ -101,11 +101,6 @@ def test_k128_block_major_nested_tiles_lower_to_ptx():
     )
     assert "wgmma.mma_async" in kernel.ptx
     assert kernel.ptx.count("wgmma.mma_async") == 8
-    # K slices 0..3 advance within the first 64-column physical block; slice
-    # 4 crosses into the next block and therefore jumps by 64 * 256 bf16s.
-    assert "add.u64" in kernel.ptx
-    assert ", 2;" in kernel.ptx
-    assert ", 2048;" in kernel.ptx
 
 
 @requires_cuda

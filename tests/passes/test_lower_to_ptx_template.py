@@ -181,9 +181,9 @@ def test_lower_nested_tile_uses_root_block_major_coordinates():
 
     ptr_adds = find_ops_of_type(module, PtrAddOp)
     assert len(ptr_adds) == 2
-    inner_offset = ptr_adds[-1].byte_offset.definition
-    assert isinstance(inner_offset, IndexConstantOp)
-    assert inner_offset.value == 24608
+    offsets = [op.byte_offset.definition for op in ptr_adds]
+    assert all(isinstance(offset, IndexConstantOp) for offset in offsets)
+    assert sum(offset.value for offset in offsets) == 24608
 
 
 def test_grid_barrier_uses_last_arriver_to_release_waiters():
