@@ -1,11 +1,30 @@
 import textwrap
 
-from ayla.gpu_dialect import AllocOp, ElementwiseOp, MatmulOp, gpu_dialect
+from ayla.gpu_dialect import (
+    AllocOp,
+    ElementwiseOp,
+    KernelOp,
+    MatmulOp,
+    ModuleOp,
+    gpu_dialect,
+)
 from ayla.passes.reuse_buffers import reuse_buffers
 
 
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
+
+
+def _kernel(module: ModuleOp) -> KernelOp:
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    return kernel
+
+
 def test_reuses_output_buffer_for_matmul_temporary():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -26,7 +45,7 @@ def test_reuses_output_buffer_for_matmul_temporary():
 
 
 def test_reuses_output_buffer_between_matmuls():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -59,7 +78,7 @@ def test_reuses_output_buffer_between_matmuls():
 
 
 def test_reuses_one_buffer_for_elementwise_chain():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @elementwise_chain(%src: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -86,7 +105,7 @@ def test_reuses_one_buffer_for_elementwise_chain():
 
 
 def test_does_not_reuse_buffer_that_remains_live_after_handoff():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -98,17 +117,17 @@ def test_does_not_reuse_buffer_that_remains_live_after_handoff():
 
     reuse_buffers(module)
 
-    assert any(isinstance(op, AllocOp) for op in module.body.ops[0].body.ops)
+    assert any(isinstance(op, AllocOp) for op in _kernel(module).body.ops)
     [elementwise] = [
-        op for op in module.body.ops[0].body.ops
+        op for op in _kernel(module).body.ops
         if isinstance(op, ElementwiseOp)
     ]
     assert elementwise.src(0) is not elementwise.dst
-    assert any(isinstance(op, MatmulOp) for op in module.body.ops[0].body.ops)
+    assert any(isinstance(op, MatmulOp) for op in _kernel(module).body.ops)
 
 
 def test_reuse_union_includes_lifetimes_of_previous_members():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0, label: "a"}
@@ -123,13 +142,13 @@ def test_reuse_union_includes_lifetimes_of_previous_members():
     reuse_buffers(module)
 
     allocations = [
-        op for op in module.body.ops[0].body.ops if isinstance(op, AllocOp)
+        op for op in _kernel(module).body.ops if isinstance(op, AllocOp)
     ]
     assert [op.attrs["label"] for op in allocations] == ["b"]
 
 
 def test_allocation_starts_a_reuse_set():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -142,7 +161,7 @@ def test_allocation_starts_a_reuse_set():
 
     reuse_buffers(module)
 
-    kernel = module.body.ops[0]
+    kernel = _kernel(module)
     allocations = [op for op in kernel.body.ops if isinstance(op, AllocOp)]
     matmuls = [op for op in kernel.body.ops if isinstance(op, MatmulOp)]
     assert len(allocations) == 1
@@ -163,7 +182,7 @@ def test_does_not_reuse_async_locks():
             await(%b_lock: lock<mbar>)
           }
         }""")
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
 
     reuse_buffers(module)
 
