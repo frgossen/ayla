@@ -3,12 +3,26 @@ import textwrap
 import pytest
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import ElementwiseOp, ForOp, MoveOp, TileOp, gpu_dialect
+from ayla.gpu_dialect import (
+    ElementwiseOp,
+    ForOp,
+    MemTensorType,
+    ModuleOp,
+    MoveOp,
+    TileOp,
+    gpu_dialect,
+)
 from ayla.passes.tile_elementwise import tile_elementwise
 
 
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
+
+
 def test_tiles_elementwise_into_a_sequential_iteration_space():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             elementwise sigmoid(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
@@ -34,7 +48,7 @@ def test_tiles_elementwise_into_a_sequential_iteration_space():
 
 
 def test_tiles_multiple_dimensions_in_one_invocation():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: gmem<128x256xf32>) {
             elementwise sigmoid(%value: gmem<128x256xf32>, %value: gmem<128x256xf32>) attrs={label: "epilogue"}
@@ -63,7 +77,7 @@ def test_tiles_multiple_dimensions_in_one_invocation():
 
 
 def test_tiles_distinct_conversion_operands_inside_one_loop():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             elementwise convert(%dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "convert"}
@@ -83,12 +97,16 @@ def test_tiles_distinct_conversion_operands_inside_one_loop():
         op for op in find_ops_of_type(module, ElementwiseOp)
         if op.fn == "convert"
     ]
-    assert tuple(convert.dst.type.sizes) == (64, 64)
-    assert tuple(convert.src(0).type.sizes) == (64, 64)
+    dst_type = convert.dst.type
+    src_type = convert.src(0).type
+    assert isinstance(dst_type, MemTensorType)
+    assert isinstance(src_type, MemTensorType)
+    assert tuple(dst_type.sizes) == (64, 64)
+    assert tuple(src_type.sizes) == (64, 64)
 
 
 def test_rejects_negative_dimension():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: gmem<64x256xf32>) {
             elementwise sigmoid(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={label: "epilogue"}
@@ -105,7 +123,7 @@ def test_rejects_negative_dimension():
 
 
 def test_rejects_nonuniform_partition():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: gmem<64x256xf32>) {
             elementwise sigmoid(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={label: "epilogue"}
@@ -124,7 +142,7 @@ def test_rejects_nonuniform_partition():
 def test_rejects_parallel_iteration_binding():
     with pytest.raises(ValueError, match="only the .*for.* tile level"):
         tile_elementwise(
-            gpu_dialect.parse(textwrap.dedent("""\
+            _parse_module(textwrap.dedent("""\
                 module {
                   kernel @epilogue(%value: gmem<64x256xf32>) {
                     elementwise sigmoid(%value: gmem<64x256xf32>, %value: gmem<64x256xf32>) attrs={label: "epilogue"}
@@ -137,7 +155,7 @@ def test_rejects_parallel_iteration_binding():
 
 
 def test_tiles_an_explicitly_selected_move():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
             move(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "writeback"}
@@ -153,12 +171,16 @@ def test_tiles_an_explicitly_selected_move():
 
     assert len(find_ops_of_type(module, ForOp)) == 1
     [move] = find_ops_of_type(module, MoveOp)
-    assert tuple(move.dst.type.sizes) == (64, 64)
-    assert tuple(move.src.type.sizes) == (64, 64)
+    dst_type = move.dst.type
+    src_type = move.src.type
+    assert isinstance(dst_type, MemTensorType)
+    assert isinstance(src_type, MemTensorType)
+    assert tuple(dst_type.sizes) == (64, 64)
+    assert tuple(src_type.sizes) == (64, 64)
 
 
 def test_does_not_tile_moves_without_an_explicit_label_filter():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
             move(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
