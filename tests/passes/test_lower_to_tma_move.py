@@ -1,6 +1,6 @@
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
 
 
@@ -12,6 +12,7 @@ def test_lower_move_preserves_collective():
             move(%s: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     lower_to_tma_move(module)
 
