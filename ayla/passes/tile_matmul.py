@@ -20,6 +20,7 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
     is_elementwise,
+    is_grid_collective,
 )
 from ..base.ir import (
     Block,
@@ -80,7 +81,7 @@ def _refine_tiling_schemes(
         }
 
     can_initialize = (
-        hero.is_grid_collective()
+        is_grid_collective(hero.collective)
         and find_ancestor_of_type(hero, ForOp) is None
     )
     if not can_initialize:

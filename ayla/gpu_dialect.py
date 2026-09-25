@@ -289,6 +289,15 @@ class CollectiveAxis(enum.IntEnum):
     Z = 2
 
 
+def is_grid_collective(
+    collective: dict[CollectiveAxis, CollectiveLevel],
+    axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
+) -> bool:
+    return all(
+        collective[axis] >= CollectiveLevel.GRID for axis in axes
+    )
+
+
 def _print_collective(
     p: Printer,
     collective: dict[CollectiveAxis, CollectiveLevel],
@@ -390,31 +399,6 @@ class MatmulOp(Op):
         current = self.collective_level(axis)
         assert level.join(current) == current
         self.collective[axis] = level
-
-    def is_block_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(CollectiveLevel.BLOCK, axes)
-
-    def is_grid_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(CollectiveLevel.GRID, axes)
-
-    def is_thread_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(CollectiveLevel.THREAD, axes)
-
-    def is_wg_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(
-            CollectiveLevel.WG, axes, valid_axes=(CollectiveAxis.X,),
-        )
-
-    def _is_collective(
-        self,
-        level: CollectiveLevel,
-        axes: tuple[CollectiveAxis, ...],
-        valid_axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
-    ) -> bool:
-        if not axes:
-            axes = valid_axes
-        assert all(axis in valid_axes for axis in axes)
-        return all(self.collective_level(axis) >= level for axis in axes)
 
     @property
     def extra_attrs(self) -> dict[str, object]:
