@@ -3,7 +3,6 @@
 import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
 import pytest
 import torch
-from torch.ops import ayla
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import (
@@ -25,6 +24,9 @@ from ayla.gpu_dialect import (
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from tests.testing_utils import requires_cuda
+
+
+ayla = torch.ops.ayla
 
 
 F32 = torch.float32
@@ -307,7 +309,7 @@ def test_every_registered_kernel_is_covered():
     and the collection.
     """
     parametrize = next(
-        mark for mark in test_gemm_correctness.pytestmark
+        mark for mark in getattr(test_gemm_correctness, "pytestmark")
         if mark.args and mark.args[0] == "op,dtype,epilogue"
     )
     covered = {param.id for param in parametrize.args[1]}
