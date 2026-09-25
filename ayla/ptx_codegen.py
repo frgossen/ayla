@@ -17,6 +17,7 @@ from .gpu_dialect import (
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
+    IndexEqOp,
     IndexLtOp,
     IndexModOp,
     IndexMulOp,
@@ -334,6 +335,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_index_mul(p, op)
     elif isinstance(op, IndexDivOp):
         _emit_index_div(p, op)
+    elif isinstance(op, IndexEqOp):
+        _emit_index_eq(p, op)
     elif isinstance(op, IndexLtOp):
         _emit_index_lt(p, op)
     elif isinstance(op, IndexModOp):
@@ -584,6 +587,13 @@ def _emit_index_lt(p: PtxPrinter, op: IndexLtOp) -> None:
     lhs = p.unique_ptx_names_for_value(op.lhs)
     rhs = p.unique_ptx_names_for_value(op.rhs)
     _write_with_comment(p, f"setp.lt.u32 {dst}, {lhs}, {rhs};", op)
+
+
+def _emit_index_eq(p: PtxPrinter, op: IndexEqOp) -> None:
+    dst = p.unique_ptx_names_for_value(op.result())
+    lhs = p.unique_ptx_names_for_value(op.lhs)
+    rhs = p.unique_ptx_names_for_value(op.rhs)
+    _write_with_comment(p, f"setp.eq.u32 {dst}, {lhs}, {rhs};", op)
 
 
 def _emit_index_mul(p: PtxPrinter, op: IndexMulOp) -> None:

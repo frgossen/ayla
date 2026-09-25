@@ -25,6 +25,7 @@ from ayla.gpu_dialect import (
     F32Type,
     ForOp,
     IfOp,
+    IndexEqOp,
     IndexLtOp,
     IndexType,
     LockType,
@@ -346,6 +347,16 @@ def test_index_lt_op():
         IndexLtOp.build(not_index, rhs)
     with pytest.raises(AssertionError, match="expected IndexType rhs"):
         IndexLtOp.build(lhs, not_index)
+
+
+def test_index_eq_op():
+    lhs = Value(name="lhs", type=IndexType())
+    rhs = Value(name="rhs", type=IndexType())
+    op = IndexEqOp.build(lhs, rhs)
+    assert_print_and_roundtrip(
+        op,
+        "%0: pred = index_eq(%lhs: index, %rhs: index)",
+    )
 
 
 def test_async_op():

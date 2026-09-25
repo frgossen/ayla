@@ -19,6 +19,7 @@ from ayla.gpu_dialect import (
     F32Type,
     IfOp,
     IndexConstantOp,
+    IndexEqOp,
     IndexLtOp,
     ThreadIdsOp,
     gpu_dialect,
@@ -145,6 +146,20 @@ def test_codegen_if_branches_over_its_body():
     ptx = make_ptx_kernel(module).ptx
     assert "setp.lt.u32 %p0" in ptx
     assert "@!%p0 bra" in ptx
+
+
+def test_codegen_index_equality():
+    lhs = IndexConstantOp.build(3)
+    rhs = IndexConstantOp.build(3)
+    condition = IndexEqOp.build(lhs.result(), rhs.result())
+    guarded = PTXTemplateOp.build([], [], template="nop;\n")
+    conditional = IfOp.build(condition.result(), Block(ops=[guarded]))
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "equality", Block(ops=[lhs, rhs, condition, conditional]),
+        grid_dim=(1, 1, 1), block_dim=(32, 1, 1),
+    )]))
+
+    assert "setp.eq.u32 %p0" in make_ptx_kernel(module).ptx
 
 
 def test_codegen_naive_matmul_4096():

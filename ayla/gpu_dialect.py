@@ -2053,6 +2053,32 @@ class IndexLtOp(Op):
         return self.operands[1]
 
 
+@gpu_dialect.register_op("index_eq")
+class IndexEqOp(Op):
+    """Compare two index values for equality."""
+
+    @classmethod
+    def build(cls, lhs: Value, rhs: Value) -> "IndexEqOp":
+        assert isinstance(lhs.type, IndexType), (
+            f"IndexEqOp: expected IndexType lhs; got {lhs.type}"
+        )
+        assert isinstance(rhs.type, IndexType), (
+            f"IndexEqOp: expected IndexType rhs; got {rhs.type}"
+        )
+        return cls(
+            operands=[lhs, rhs],
+            results=[Value(name=None, type=PredicateType())],
+        )
+
+    @property
+    def lhs(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def rhs(self) -> Value:
+        return self.operands[1]
+
+
 def _resolve_val_str(v, prec, val_str):
     """Resolve a value to a string. Try val_str first, then expr_str on the definition."""
     if hasattr(v, "definition") and hasattr(v.definition, "expr_str"):
@@ -2499,6 +2525,7 @@ def is_side_effect_free(op: Op) -> bool:
         IndexAddOp,
         IndexConstantOp,
         IndexDivOp,
+        IndexEqOp,
         IndexLtOp,
         IndexModOp,
         IndexMulOp,

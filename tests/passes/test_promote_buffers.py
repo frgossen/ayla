@@ -60,7 +60,7 @@ def test_wrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
             %2: smem<128x256xbf16> = alloc() attrs={id: 2}
             %3: smem<64x256xbf16> = tile(%2: smem<128x256xbf16>, %wgx: index, 0)
             move(%3: smem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_smem"}
-            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=xyz.block attrs={dst_tiling_scheme: 7, label: "mm_dst_tma", tma: True}
+            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, label: "mm_dst_tma", tma: True}
           }
         }""")  # noqa: E501
 
@@ -100,10 +100,10 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
             %3: smem<64x128xbf16> = alloc() attrs={id: 3}
             move(%2: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_smem", wgmma_col_start: 0}
             %4: gmem<64x128xbf16 strides=[256, 1]> = tile(%c: gmem<64x256xbf16>, 0, 0)
-            move(%4: gmem<64x128xbf16 strides=[256, 1]>, %2: smem<64x128xbf16>) collective=xyz.block attrs={label: "mm_dst_tma", tma: True}
+            move(%4: gmem<64x128xbf16 strides=[256, 1]>, %2: smem<64x128xbf16>) collective=[xy.block, z.thread] attrs={label: "mm_dst_tma", tma: True}
             move(%3: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_smem", wgmma_col_start: 128}
             %5: gmem<64x128xbf16 strides=[256, 1]> = tile(%c: gmem<64x256xbf16>, 0, 1)
-            move(%5: gmem<64x128xbf16 strides=[256, 1]>, %3: smem<64x128xbf16>) collective=xyz.block attrs={label: "mm_dst_tma", tma: True}
+            move(%5: gmem<64x128xbf16 strides=[256, 1]>, %3: smem<64x128xbf16>) collective=[xy.block, z.thread] attrs={label: "mm_dst_tma", tma: True}
           }
         }""")
 

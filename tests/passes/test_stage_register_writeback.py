@@ -3,13 +3,17 @@ import textwrap
 
 import pytest
 
-from ayla.base.ir import find_ops_of_type
+from ayla.base.ir import Value, find_ops_of_type
 from ayla.gpu_dialect import (
     AllocOp,
     BarrierOp,
     CollectiveAxis,
     CollectiveLevel,
+    IfOp,
+    IndexConstantOp,
+    IndexEqOp,
     MoveOp,
+    SmemTensorType,
     TileOp,
     gpu_dialect,
 )
@@ -17,6 +21,7 @@ from ayla.passes.insert_syncs import insert_syncs
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.stage_register_writeback import stage_register_writeback
+from ayla.ptx_codegen import make_ptx_kernel
 
 
 def test_ignores_direct_register_writeback():
@@ -68,41 +73,59 @@ def test_materializes_sliced_double_buffered_tma_store():
 def test_multi_wg_rows_and_columns_keep_their_staging_ownership():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @writeback(%src: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">, %dst: gmem<128x256xbf16>) block_dim=[512, 1, 1] {
+          kernel @writeback(%src: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">, %dst: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[512, 1, 1] {
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c2: index = index_constant() attrs={value: 2}
             %row: index = index_div(%wgx: index, %c2: index)
             %col: index = index_mod(%wgx: index, %c2: index)
             %rows: gmem<64x256xbf16 strides=[256, 1]> = tile(%dst: gmem<128x256xbf16>, %row: index, 0)
             %tile: gmem<64x128xbf16 strides=[256, 1]> = tile(%rows: gmem<64x256xbf16 strides=[256, 1]>, 0, %col: index)
-            move(%tile: gmem<64x128xbf16 strides=[256, 1]>, %src: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "mm_dst_wrmem", tma: True}
+            move(%tile: gmem<64x128xbf16 strides=[256, 1]>, %src: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={dst_tiling_scheme: 7, label: "mm_dst_wrmem", tma: True}
           }
         }"""))
 
     stage_register_writeback(
-        module, writeback_slices=2, label_filter="mm_dst_wrmem",
+        module,
+        writeback_slices=2,
+        physical_layout={
+            "swizzle": "128B",
+            "block_width": 64,
+            "order": "block_major",
+        },
+        label_filter="mm_dst_wrmem",
     )
 
     moves = find_ops_of_type(module, MoveOp)
-    gathers, stores = moves[::2], moves[1::2]
+    gathers = [move for move in moves if not move.attrs.get("tma")]
+    stores = [move for move in moves if move.attrs.get("tma")]
     assert len(gathers) == len(stores) == 2
-    assert all(len(move.indices) == 1 for move in gathers)
-    assert all(move.indices[0].name == "col" for move in gathers)
-    assert [move.attrs["writer_wg"] for move in gathers] == [0, 1]
+    conditions = find_ops_of_type(module, IndexEqOp)
+    assert all(condition.lhs.name == "col" for condition in conditions)
+    slice_ids = []
+    for condition in conditions:
+        definition = condition.rhs.definition
+        assert isinstance(definition, IndexConstantOp)
+        slice_ids.append(definition.value)
+    assert slice_ids == [0, 1]
+    guards = find_ops_of_type(module, IfOp)
+    assert [guard.condition for guard in guards] == [
+        condition.result() for condition in conditions
+    ]
+    assert [guard.body.ops for guard in guards] == [[move] for move in gathers]
+    for move in gathers:
+        tile = move.dst.definition
+        assert isinstance(tile, TileOp)
+        row = tile.indices[0]
+        assert isinstance(row, Value) and row.name == "row"
+        assert isinstance(move.dst.type, SmemTensorType)
+        assert move.dst.type.sizes == [64, 128]
     assert all(
-        isinstance(move.dst.definition, TileOp)
-        and move.dst.definition.indices[0].name == "row"
-        and move.dst.type.sizes == [64, 128]
-        for move in gathers
-    )
-    assert all(
-        all(level >= CollectiveLevel.BLOCK for level in move.collective.values())
+        move.collective[CollectiveAxis.X] == CollectiveLevel.WG
         for move in stores
     )
-    assert all(
-        move.collective[CollectiveAxis.X] == CollectiveLevel.BLOCK
-        for move in stores
-    )
+    ptx = make_ptx_kernel(module).ptx
+    assert ptx.count("setp.eq.u32") == 2
+    assert ptx.count("stmatrix.sync") == 16
 
 
 def test_four_row_warp_groups_sync_before_block_wide_tma_store():
@@ -117,12 +140,13 @@ def test_four_row_warp_groups_sync_before_block_wide_tma_store():
 
     stage_register_writeback(module, label_filter="mm_dst_wrmem")
     [gather, store] = find_ops_of_type(module, MoveOp)
+    assert isinstance(gather.dst.type, SmemTensorType)
     assert gather.dst.type.sizes == [64, 64]
-    assert isinstance(gather.dst.definition, TileOp)
-    assert gather.dst.definition.indices[0].name == "wgx"
-    assert all(
-        level >= CollectiveLevel.BLOCK for level in store.collective.values()
-    )
+    tile = gather.dst.definition
+    assert isinstance(tile, TileOp)
+    row = tile.indices[0]
+    assert isinstance(row, Value) and row.name == "wgx"
+    assert store.collective[CollectiveAxis.X] == CollectiveLevel.WG
 
     lower_to_tma_move(module)
     lower_to_async(module)
