@@ -59,6 +59,7 @@ include = [
     "tests/passes/test_tile_elementwise.py",
     "tests/passes/test_tile_reduce.py",
     "tests/passes/test_unroll_loop.py",
+    "tests/passes/test_verify.py",
     "tests/test_e2e.py",
     "tests/test_gemm.py",
     "tests/test_pass_interactions.py",

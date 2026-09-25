@@ -30,14 +30,19 @@ from ayla.passes.verify_gpu_dialect import (
 from ayla.ptx_codegen import make_ptx_kernel
 
 
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
+
+
 def _dynamic_matmul_module() -> ModuleOp:
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @dynamic(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) block_dim=[128, None, None] {
             matmul(%a: gmem<?x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<?x13xbf16>) collective=xyz.grid
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     return module
 
 
@@ -167,7 +172,7 @@ def test_async_and_body_collectives_must_match():
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid(%a: gmem<7x11xbf16>, %b: gmem<13x12xbf16>, %c: gmem<7x13xbf16>) {
             matmul(%a: gmem<7x11xbf16>, %b: gmem<13x12xbf16>, %c: gmem<7x13xbf16>) collective=xyz.grid
@@ -244,7 +249,7 @@ def test_elementwise_function_and_arity_are_verified():
 
 @pytest.mark.parametrize("cluster_dim", [(2, 0, 1), (2, 1)])
 def test_default_verification_rejects_invalid_cluster_dimensions(cluster_dim):
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @invalid() grid_dim=[4, 1, 1] cluster_dim={list(cluster_dim)} {{
           }}
@@ -255,7 +260,7 @@ def test_default_verification_rejects_invalid_cluster_dimensions(cluster_dim):
 
 
 def test_default_verification_rejects_cluster_that_does_not_divide_grid():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid() grid_dim=[10, 1, 1] cluster_dim=[3, 1, 1] {
           }
@@ -278,7 +283,7 @@ def test_default_verification_rejects_cluster_that_does_not_divide_grid():
     ],
 )
 def test_cluster_operations_require_a_clustered_kernel(op):
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @invalid() grid_dim=[1, 1, 1] {{
             {op}
@@ -290,7 +295,7 @@ def test_cluster_operations_require_a_clustered_kernel(op):
 
 
 def test_tma_multicast_accepts_clustered_load():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @valid(%src: gmem<16x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
             %dst: smem<16x16xf32> = alloc() attrs={id: 0}
@@ -311,7 +316,7 @@ def test_tma_multicast_accepts_clustered_load():
     ],
 )
 def test_tma_multicast_rejects_invalid_context(kernel_attrs, move_attrs, error):
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @invalid(%src: gmem<16x16xf32>) {kernel_attrs} {{
             %dst: smem<16x16xf32> = alloc() attrs={{id: 0}}
@@ -324,7 +329,7 @@ def test_tma_multicast_rejects_invalid_context(kernel_attrs, move_attrs, error):
 
 
 def test_cluster_to_leader_barrier_requires_cluster_mbar_lock():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid() grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
             %lock: lock<mbar> = alloc()
@@ -337,7 +342,7 @@ def test_cluster_to_leader_barrier_requires_cluster_mbar_lock():
 
 
 def test_cluster_to_leader_barrier_requires_sync_operand():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid() grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
             barrier() attrs={scope: "cluster_to_leader"}
@@ -349,7 +354,7 @@ def test_cluster_to_leader_barrier_requires_sync_operand():
 
 
 def test_cluster_mbar_cannot_be_used_as_an_async_lock():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid(%src: gmem<1xf32>) grid_dim=[1, 1, 1] {
             %dst: smem<1xf32> = alloc()
@@ -363,7 +368,7 @@ def test_cluster_mbar_cannot_be_used_as_an_async_lock():
 
 
 def test_tma_multicast_async_collective_must_match_inner():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -383,7 +388,7 @@ def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
           }
           async(%lock: lock<mbar>) collective=xyz.cluster {
     """ if separate_groups else ""
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @invalid(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {{
             %c0: index = index_constant() attrs={{value: 0}}
@@ -414,7 +419,7 @@ def test_ptx_codegen_verifies_static_shapes():
 
 
 def test_verification_rejects_parsed_grid_barrier_without_sync():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             barrier() attrs={scope: "grid"}
@@ -426,7 +431,7 @@ def test_verification_rejects_parsed_grid_barrier_without_sync():
 
 
 def test_verification_rejects_undersized_grid_barrier_sync():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @invalid(%sync: gmem<1xf32>) {
             barrier(%sync: gmem<1xf32>) attrs={scope: "grid"}
