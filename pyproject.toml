@@ -57,6 +57,7 @@ include = [
     "tests/passes/test_schedule_async.py",
     "tests/passes/test_specialize_shapes.py",
     "tests/passes/test_tile_elementwise.py",
+    "tests/passes/test_tile_matmul.py",
     "tests/passes/test_tile_reduce.py",
     "tests/passes/test_unroll_loop.py",
     "tests/passes/test_verify.py",
