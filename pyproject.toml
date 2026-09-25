@@ -37,6 +37,7 @@ include = [
     "ayla",
     "tests/base/test_ir.py",
     "tests/passes/test_canonicalize.py",
+    "tests/passes/test_dce.py",
 ]
 exclude = [
     "ayla/passes/lower_to_ptx_template.py",
