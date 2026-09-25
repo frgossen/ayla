@@ -2736,7 +2736,6 @@ def is_side_effect_free(op: Op) -> bool:
         ThreadIdsOp,
         TileOp,
         ToPtrOp,
-        ReshapeOp,
         WarpIdsOp,
         WarpGroupIdOp,
     ))
