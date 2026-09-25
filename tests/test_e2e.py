@@ -5,7 +5,12 @@ import textwrap
 import torch
 
 from ayla.base.pipeline import Pipeline
-from ayla.gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
+from ayla.gpu_dialect import (
+    CollectiveAxis,
+    CollectiveLevel,
+    ModuleOp,
+    gpu_dialect,
+)
 from ayla.passes.licm import LICM
 from ayla.passes.pipeline_loop import PipelineLoop
 from ayla.passes.promote_buffers import PromoteBuffers
@@ -14,7 +19,6 @@ from ayla.passes.unroll_loop import UnrollLoop
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
-
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(
     """\
@@ -50,6 +54,7 @@ def test_cwise_add_from_ir():
         }}""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     ptx_kernel = make_ptx_kernel(module)
 
     print()
@@ -77,6 +82,7 @@ def test_reshape_from_ir():
             move(%dst: gmem<1x4xf32>, %values: rmem<1x4xf32>)
           }
         }"""))  # noqa: E501
+    assert isinstance(module, ModuleOp)
 
     kernel = make_ptx_kernel(module)
     src = torch.randn(2, 2, dtype=torch.float32, device="cuda")
@@ -140,6 +146,7 @@ def test_matmul_16_from_ir():
         }}""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     ptx_kernel = make_ptx_kernel(module)
 
     print()
@@ -185,6 +192,7 @@ def test_naive_matmul_4096_from_ir():
         }""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     ptx_kernel = make_ptx_kernel(module)
 
     torch.manual_seed(0)
@@ -215,6 +223,7 @@ def test_tma():
         }""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     assert repr(module) == module_str
 
     ptx_kernel = make_ptx_kernel(module)
@@ -246,6 +255,7 @@ def test_tma_lowered():
         }""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
 
     ptx_kernel = make_ptx_kernel(module)
 
@@ -270,6 +280,7 @@ def test_experimental_auto_matmul_4096_with_excess_block():
           }
         }""")
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
         op_dims=["M", "N"], tile_sizes=[128, 128],
@@ -335,6 +346,7 @@ def test_dbg_module():
           }
         }""")
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
         op_dims=["M", "N"], tile_sizes=[128, 256],
