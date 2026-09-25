@@ -25,8 +25,8 @@ def _op_key(op: Op) -> tuple:
         parent = arg.definition
         while (
             isinstance(parent, TileOp)
-            and not parent.extra_attrs
             and not parent.maybe_partial
+            and set(parent.attrs) <= {"static_indices", "maybe_partial"}
             and all(index == 0 for index in parent.indices)
         ):
             arg = parent.arg

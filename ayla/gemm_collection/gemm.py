@@ -36,6 +36,7 @@ def schedule_register_matmul(
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
     loop_label_prefix: str | None = None,
+    k_tail_tiles: int = 0,
 ) -> Pipeline:
     """Schedule a pre-tiled GEMM with an explicit register accumulator.
 
@@ -58,6 +59,7 @@ def schedule_register_matmul(
     pipeline.add_pass(FuseLoops(
         loop_label_filter=k_label,
         body_label_filter=label,
+        tail_iterations=k_tail_tiles,
     ))
     pipeline.add_pass(CSE())
     pipeline.add_pass(PromoteBuffers(
@@ -96,6 +98,11 @@ def schedule_register_matmul(
     pipeline.add_pass(UnrollLoop(
         unroll_factor=operand_stages, label_filter=k_label,
     ))
+    if k_tail_tiles:
+        pipeline.add_pass(UnrollLoop(
+            unroll_factor=max(2, k_tail_tiles),
+            label_filter=rf"{k_label}_(?:first|second)_tail",
+        ))
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(LowerToAsync())
     pipeline.add_pass(FuseAsync())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import cast
 
 from ..base.ir import Block, Op, Value, clone_type, find_ops_of_type
@@ -300,17 +301,12 @@ def _projection_ops(
         up_acc,
         activation,
         product,
-        gate_matmul,
-        # Gate and up have distinct logical SMEM allocations that are overlaid
-        # later by ReuseSmemAllocs. Keep ScheduleAsync from hoisting up's TMA
-        # loads above gate completion and clobbering that shared arena. Thread
-        # scope is only an IR ordering fence here and emits no PTX instruction.
-        BarrierOp.build("thread" if m_warp_groups == 1 else "block"),
         up_matmul,
+        round_up,
+        gate_matmul,
         round_gate,
         widen_gate,
         activate,
-        round_up,
         multiply,
         writeback,
     ], writeback
@@ -322,6 +318,7 @@ def _schedule_projection(
     *,
     stages: int,
     num_warp_groups: int,
+    k_tail_tiles: int,
 ) -> None:
     move_attrs: dict[str, dict[str, object]] = {
         "lhs": {
@@ -333,15 +330,25 @@ def _schedule_projection(
             "l2_promotion": "256B",
         },
     }
-    for label in ("gate", "up"):
-        schedule_register_matmul(
-            label=label,
-            operand_stages=stages,
-            operand_k_tile=64,
-            unsafe_reuse_smem=True,
-            operand_move_attrs=move_attrs,
-            loop_label_prefix=label,
-        ).run(module)
+    schedule_register_matmul(
+        label="up|gate",
+        operand_stages=stages,
+        operand_k_tile=64,
+        unsafe_reuse_smem=True,
+        operand_move_attrs=move_attrs,
+        loop_label_prefix="projection",
+        k_tail_tiles=k_tail_tiles,
+    ).run(module)
+
+    # Both projections execute concurrently, so their private operand buffers
+    # must not be overlaid. They may still share an arena with later phases.
+    for alloc in find_ops_of_type(module, AllocOp):
+        if alloc.attrs.get("reuse_group") in {"up_compute", "gate_compute"}:
+            alloc.attrs["reuse_group"] = (
+                "projection_tail_compute"
+                if alloc.attrs.get("peeled") is True
+                else "projection_compute"
+            )
 
     if num_warp_groups == 1:
         writeback.attrs["tma"] = True
@@ -402,6 +409,7 @@ def schedule_swiglu(
     *,
     output_m_tile: int = 64,
     projection_n_tile: int = 192,
+    projection_k_tail_tiles: int = 0,
 ) -> ModuleOp:
     """Schedule a packed SwiGLU GEMM chain as one kernel."""
     source_kernel, projection, down = _match_swiglu_chain(module)
@@ -539,8 +547,9 @@ def schedule_swiglu(
     _schedule_projection(
         scheduled,
         writeback,
-        stages=5 if m == 512 else 3,
+        stages=4,
         num_warp_groups=num_warp_groups,
+        k_tail_tiles=projection_k_tail_tiles,
     )
     _schedule_down(
         scheduled,
@@ -561,6 +570,9 @@ def compile_swiglu(module: ModuleOp) -> PtxRoutePlan:
                 module,
                 output_m_tile=256 if m == 512 else 64,
                 projection_n_tile=96 if m == 512 else 192,
+                projection_k_tail_tiles=int(
+                    os.environ.get("AYLA_SWIGLU_K_TAIL_TILES", "0")
+                ),
             )
         ),
         bindings=[

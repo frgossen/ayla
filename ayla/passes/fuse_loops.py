@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
-from ..gpu_dialect import ForOp, IndexType, ModuleOp, is_side_effect_free
+from ..gpu_dialect import (
+    BarrierOp,
+    ForOp,
+    IndexType,
+    ModuleOp,
+    is_side_effect_free,
+)
 from ._loop_utils import clone_loop_iteration
 from ._utils import can_reorder, label_matches
 
@@ -34,15 +40,20 @@ class FuseLoops(Pass):
 
     loop_label_filter: str | None
     body_label_filter: str | None
+    tail_iterations: int
 
     def __init__(
         self,
         loop_label_filter: str | None = None,
         body_label_filter: str | None = None,
+        tail_iterations: int = 0,
     ) -> None:
+        if tail_iterations < 0:
+            raise ValueError("FuseLoops: tail_iterations must be non-negative")
         super().__init__(
             loop_label_filter=loop_label_filter,
             body_label_filter=body_label_filter,
+            tail_iterations=tail_iterations,
         )
 
     def _selected(self, op: Op) -> bool:
@@ -77,7 +88,9 @@ class FuseLoops(Pass):
         if not _all_reorderable(between, second.body.ops):
             return None
 
-        common_ub = min(first.ub, second.ub)
+        common_ub = min(first.ub, second.ub) - self.tail_iterations * first.step
+        if common_ub <= first.lb:
+            return None
         iv = Value(name=first.iv.name, type=IndexType())
         cloned_first = _split_body(clone_loop_iteration(first, iv))
         cloned_second = _split_body(clone_loop_iteration(second, iv))
@@ -96,13 +109,31 @@ class FuseLoops(Pass):
         )
 
         result: list[Op] = [common]
+        first_tail: list[Op] = []
+        second_tail: list[Op] = []
         if first.ub > common_ub:
             first.lb = common_ub
-            result.append(first)
-        result.extend(between)
+            first.attrs["peeled"] = True
+            if isinstance(label := first.attrs.get("label"), str):
+                first.attrs["label"] = f"{label}_first_tail"
+            first_tail.append(first)
         if second.ub > common_ub:
             second.lb = common_ub
-            result.append(second)
+            second.attrs["peeled"] = True
+            if isinstance(label := second.attrs.get("label"), str):
+                second.attrs["label"] = f"{label}_second_tail"
+            second_tail.append(second)
+        if self.tail_iterations and first_tail and second_tail:
+            # The peeled loops may reuse storage owned by the common pipeline.
+            # Keep asynchronous tail loads behind that lifetime boundary.
+            result.append(BarrierOp.build("thread"))
+            result.extend(first_tail)
+            result.extend(second_tail)
+            result.extend(between)
+        else:
+            result.extend(first_tail)
+            result.extend(between)
+            result.extend(second_tail)
         return result
 
     def run_block(self, block: Block) -> None:
@@ -138,11 +169,16 @@ class FuseLoops(Pass):
                 changed = True
                 i = j + 1
             block.ops = result
+            if self.tail_iterations:
+                break
 
 
 def fuse_loops(
     module: ModuleOp,
     loop_label_filter: str | None = None,
     body_label_filter: str | None = None,
+    tail_iterations: int = 0,
 ) -> ModuleOp:
-    return FuseLoops(loop_label_filter, body_label_filter).run(module)
+    return FuseLoops(
+        loop_label_filter, body_label_filter, tail_iterations,
+    ).run(module)
