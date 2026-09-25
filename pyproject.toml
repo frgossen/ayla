@@ -36,6 +36,7 @@ ignore = ["E501"]
 include = [
     "ayla",
     "tests/base/test_ir.py",
+    "tests/base/test_pipeline.py",
     "tests/passes/test_canonicalize.py",
     "tests/passes/test_dce.py",
     "tests/passes/test_lower_to_tma_move.py",
