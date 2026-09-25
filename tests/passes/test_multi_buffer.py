@@ -1,7 +1,7 @@
 """Tests for the multi_buffer pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.passes.multi_buffer import multi_buffer
 
 
@@ -18,8 +18,10 @@ def test_clones_the_buffer_and_selects_per_iteration():
           }
         }""")
 
+    module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
     module = multi_buffer(
-        gpu_dialect.parse(module_str),
+        module,
         depth=2,
         label_filter="lhs",
     )
