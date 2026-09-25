@@ -75,17 +75,6 @@ class FuseAsync(Pass):
             op.lock for op in ops if isinstance(op, AwaitOp)
         }
 
-        def has_adjacent_await(index: int, lock: Value) -> bool:
-            """Whether the next effectful op is this async's await."""
-            for candidate in ops[index + 1:]:
-                if is_side_effect_free(candidate):
-                    continue
-                return (
-                    isinstance(candidate, AwaitOp)
-                    and candidate.lock is lock
-                )
-            return False
-
         new_ops: list[Op] = []
         group_inner: list[Op] = []
         group_lock: Value | None = None
@@ -127,16 +116,27 @@ class FuseAsync(Pass):
 
         for index, op in enumerate(ops):
             kind = _fusion_kind(op)
-            if (
-                kind is not None
-                and isinstance(op, AsyncOp)
-                and op.lock in awaited_locks
-                and not has_adjacent_await(index, op.lock)
-            ):
-                # Scheduling may deliberately move an await away from its
-                # singleton async. That pair has already been processed and
-                # cannot safely participate in a new fusion run.
-                kind = None
+            if kind is not None:
+                # Guaranteed by _fusion_kind; the assertion narrows the type.
+                assert isinstance(op, AsyncOp)
+                if op.lock in awaited_locks:
+                    next_effectful = next(
+                        (
+                            candidate
+                            for candidate in ops[index + 1:]
+                            if not is_side_effect_free(candidate)
+                        ),
+                        None,
+                    )
+                    if not (
+                        isinstance(next_effectful, AwaitOp)
+                        and next_effectful.lock is op.lock
+                    ):
+                        # Scheduling may deliberately move an await away from
+                        # its singleton async. That pair has already been
+                        # processed and cannot join a new fusion run.
+                        kind = None
+
             if kind is not None:
                 assert isinstance(op, AsyncOp)
                 if group_kind is not None:
