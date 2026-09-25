@@ -341,6 +341,7 @@ def test_clone_subtree_no_double_count():
     assert len(a.users()) == 2
 
     # ...until it is spliced into the same one.
+    assert outer.parent_block is not None
     outer.parent_block.ops.append(cloned)
     assert len(a.users()) == 4
 
