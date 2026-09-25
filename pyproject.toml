@@ -46,6 +46,7 @@ include = [
     "tests/passes/test_dce.py",
     "tests/passes/test_folding.py",
     "tests/passes/test_fuse_async.py",
+    "tests/passes/test_insert_syncs.py",
     "tests/passes/test_lower_to_tma_move.py",
     "tests/passes/test_multi_buffer.py",
     "tests/passes/test_pack_smem_allocs.py",

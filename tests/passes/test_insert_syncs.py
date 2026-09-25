@@ -18,6 +18,7 @@ from ayla.gpu_dialect import (
     CollectiveScope,
     KernelOp,
     LockType,
+    ModuleOp,
     TmaMoveOp,
     gpu_dialect,
 )
@@ -27,7 +28,6 @@ from ayla.passes.insert_syncs import (
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
-
 
 def test_tma_descriptors_for_the_same_argument_alias():
     module = gpu_dialect.parse(textwrap.dedent("""\
@@ -40,6 +40,7 @@ def test_tma_descriptors_for_the_same_argument_alias():
             tma_move(%s1: smem<1x2xf32>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>, %c0: index, %c0: index)
           }
         }"""))  # noqa: E501
+    assert isinstance(module, ModuleOp)
     analysis = SyncAnalysis()
     analysis.analyze(module)
     store, load = find_ops_of_type(module, TmaMoveOp)
@@ -62,6 +63,7 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
             async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
           }
         }"""))  # noqa: E501
+    assert isinstance(module, ModuleOp)
     insert_syncs(module)
 
     assert repr(module) == textwrap.dedent("""\
@@ -218,6 +220,7 @@ def test_cluster_mbar_materialization_depends_on_barrier_scope():
             %r: rmem<1xf32> = alloc() attrs={id: 0}
           }
         }"""))
+    assert isinstance(module, ModuleOp)
     kernel = find_ops_of_type(module, KernelOp)[0]
     target_op = kernel.body.ops[0]
 
@@ -248,6 +251,7 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
             await(%lock: lock<mbar>)
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     insert_syncs(module)
 
@@ -277,17 +281,21 @@ def test_preexisting_barrier_updates_dataflow_state():
           }
         }"""
 
+    block_module = gpu_dialect.parse(textwrap.dedent(
+        source.replace("__SCOPE__", "block"),
+    ))
+    assert isinstance(block_module, ModuleOp)
+
     # A block barrier cannot discharge a grid-scoped global-memory effect.
     with pytest.raises(NotImplementedError, match="barrier GRID"):
-        insert_syncs(gpu_dialect.parse(textwrap.dedent(
-            source.replace("__SCOPE__", "block"),
-        )))
+        insert_syncs(block_module)
 
     # Scheduling passes may author structural barriers before InsertSyncs. The
     # grid barrier discharges the effect, so the pass must not insert another.
     module = gpu_dialect.parse(textwrap.dedent(
         source.replace("__SCOPE__", "grid"),
     ))
+    assert isinstance(module, ModuleOp)
     insert_syncs(module)
     assert repr(module).count("barrier()") == 1
 
@@ -313,6 +321,7 @@ def test_war_on_shared_buffer_gets_barrier():
             }
           }
         }"""))  # noqa: E501
+    assert isinstance(module, ModuleOp)
 
     insert_syncs(module)
 
@@ -541,6 +550,7 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wgrmem"}
           }
         }"""))  # noqa: E501
+    assert isinstance(module, ModuleOp)
     insert_syncs(module)
 
     # One named (block_leader) barrier per stage reload (WAR: the next TMA load
@@ -561,8 +571,6 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             barrier() attrs={id: 4, num_threads: 256, scope: "block_leader"}
             async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
     )
-
-
 def test_named_barrier_id_is_reused_after_mbar_await():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -595,6 +603,7 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             }
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     insert_syncs(module)
     barriers = [
@@ -625,6 +634,7 @@ def test_bulk_await_does_not_release_named_barrier_id():
             async(%l1: lock<bulk>) tma_move(%d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>, %s1: smem<64x64xf32>, %c0: index, %c0: index)
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     insert_syncs(module)
     barriers = [
@@ -659,6 +669,7 @@ def test_full_block_sync_releases_all_named_barrier_ids():
             async(%l1: lock<bulk>) tma_move(%d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>, %s1: smem<64x64xf32>, %c0: index, %c0: index)
           }
         }"""))
+    assert isinstance(module, ModuleOp)
 
     insert_syncs(module)
     barriers = [
