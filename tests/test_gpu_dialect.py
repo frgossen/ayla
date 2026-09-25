@@ -41,6 +41,7 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
     has_ordering_effect,
+    is_grid_collective,
     memory_effects,
     root_buffer,
     root_buffers,
@@ -198,6 +199,7 @@ def test_reduce_op():
         CollectiveAxis.Y: CollectiveLevel.BLOCK,
         CollectiveAxis.Z: CollectiveLevel.THREAD,
     }
+    assert not is_grid_collective(reduce.collective)
     assert_print_and_roundtrip(
         reduce,
         "reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x32xf32>) "
@@ -240,13 +242,12 @@ def test_matmul_program():
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
     assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
-    assert matmul.is_grid_collective()
-    assert matmul.is_block_collective()
+    assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
-    assert not matmul.is_grid_collective()
-    assert matmul.is_wg_collective()
-    assert not matmul.is_block_collective(CollectiveAxis.X)
-    assert matmul.is_block_collective(CollectiveAxis.Y, CollectiveAxis.Z)
+    assert not is_grid_collective(matmul.collective, (CollectiveAxis.X,))
+    assert is_grid_collective(
+        matmul.collective, (CollectiveAxis.Y, CollectiveAxis.Z),
+    )
     with pytest.raises(AssertionError):
         matmul.narrow_collective_level(
             CollectiveAxis.X, CollectiveLevel.BLOCK,
