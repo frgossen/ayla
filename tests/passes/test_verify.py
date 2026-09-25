@@ -188,7 +188,14 @@ def test_default_verification_checks_reduce_shapes():
             name="dst", type=GmemTensorType.build(dst_sizes, F32Type()),
         )
         return ModuleOp.build(Block(ops=[
-            ReduceOp.build(dst, src, fn="sum"),
+            ReduceOp.build(
+                dst,
+                src,
+                fn="sum",
+                collective={
+                    axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+                },
+            ),
         ]))
 
     assert verify_gpu_dialect(reduce([8, 32], [8, 32]))
@@ -205,6 +212,24 @@ def test_default_verification_checks_reduce_shapes():
         ValueError, match="destination reduction dimension cannot exceed",
     ):
         verify_gpu_dialect(reduce([8, 32], [8, 64]))
+
+
+def test_default_verification_checks_reduce_collective():
+    src = Value(
+        name="src", type=GmemTensorType.build([8, 32], F32Type()),
+    )
+    dst = Value(
+        name="dst", type=GmemTensorType.build([8, 1], F32Type()),
+    )
+    op = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={CollectiveAxis.X: CollectiveLevel.THREAD},
+    )
+
+    with pytest.raises(ValueError, match="must list x, y, and z"):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[op])))
 
 
 def test_default_verification_checks_reshape():

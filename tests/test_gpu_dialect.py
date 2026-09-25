@@ -31,6 +31,7 @@ from ayla.gpu_dialect import (
     LockType,
     MoveOp,
     PredicateType,
+    ReduceOp,
     ReinterpretOp,
     ReshapeOp,
     SelectOp,
@@ -64,6 +65,7 @@ def assert_print_and_roundtrip(op, expected):
             "ptx_optimization_level": 1,
         }),
         (MatmulOp, {"collective": {}, "init": 0.0}),
+        (ReduceOp, {"fn": "sum", "collective": {}, "init": 0.0}),
         (TileOp, {"static_indices": [], "maybe_partial": True}),
         (ElementwiseOp, {"fn": "relu"}),
         (AllocOp, {"id": 1, "init": 0.0}),
@@ -168,6 +170,38 @@ def test_reshape_op():
     assert_print_and_roundtrip(
         reshape,
         "%0: gmem<6x4xf32> = reshape(%source: gmem<2x3x4xf32>)",
+    )
+
+
+def test_reduce_op():
+    src = Value(
+        name="src", type=GmemTensorType.build([8, 32], F32Type()),
+    )
+    dst = Value(
+        name="dst", type=GmemTensorType.build([8, 1], F32Type()),
+    )
+    reduce = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={
+            CollectiveAxis.X: CollectiveLevel.THREAD,
+            CollectiveAxis.Y: CollectiveLevel.BLOCK,
+            CollectiveAxis.Z: CollectiveLevel.THREAD,
+        },
+        attrs={"label": "sum"},
+        init=0.0,
+    )
+
+    assert reduce.collective == {
+        CollectiveAxis.X: CollectiveLevel.THREAD,
+        CollectiveAxis.Y: CollectiveLevel.BLOCK,
+        CollectiveAxis.Z: CollectiveLevel.THREAD,
+    }
+    assert_print_and_roundtrip(
+        reduce,
+        "reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x32xf32>) "
+        "collective=[xz.thread, y.block] attrs={init: 0.0, label: \"sum\"}",
     )
 
 

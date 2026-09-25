@@ -594,9 +594,9 @@ class ReduceOp(Op):
     destination have the same rank, and all preceding dimensions are matching
     parallel dimensions.
 
-    TODO: Add a ``collective`` attribute describing the collective level at
-    which the reduction is executed. Output ownership remains encoded by the
-    destination type, for example ``wrmem``.
+    The ``collective`` attribute describes the collective level at which the
+    reduction is executed. Output ownership remains encoded by the destination
+    type, for example ``wrmem``.
 
     Equal source and destination shapes represent a partial-reduction step;
     a smaller destination combines those partials.
@@ -608,15 +608,19 @@ class ReduceOp(Op):
         dst: Value,
         src: Value,
         fn: str,
+        collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
     ) -> "ReduceOp":
         a: dict[str, object] = dict(attrs or {})
         if "fn" in a:
             raise ValueError("pass fn as an explicit argument")
+        if "collective" in a:
+            raise ValueError("pass collective as an explicit argument")
         if "init" in a:
             raise ValueError("pass init as an explicit argument")
         a["fn"] = fn
+        a["collective"] = dict(collective)
         if init is not None:
             a["init"] = init
         return cls(
@@ -641,6 +645,17 @@ class ReduceOp(Op):
     def init(self) -> float | int | None:
         return self.attrs.get("init")  # type: ignore[return-value]
 
+    @property
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("collective", "fn", "init")
+        }
+
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id} {self.fn}(")
         for index, operand in enumerate(self.operands):
@@ -648,7 +663,8 @@ class ReduceOp(Op):
                 p.write(", ")
             operand.print(p)
         p.write(")")
-        p.write_extra_attrs(self.attrs, skip_keys=("fn",))
+        _print_collective(p, self.collective)
+        p.write_extra_attrs(self.attrs, skip_keys=("collective", "fn"))
 
     @classmethod
     def parse_infix(
@@ -667,13 +683,18 @@ class ReduceOp(Op):
                 p.read_literal(",")
                 operands.append(Value.parse(p))
         p.read_literal(")")
+        collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
         if "fn" in attrs:
             raise ValueError("reduce function must not also appear in attrs")
+        if "collective" in attrs:
+            raise ValueError(
+                "reduce collective must not also appear in attrs"
+            )
         return cls(
             operands=operands,
             results=results,
-            attrs={"fn": fn, **attrs},
+            attrs={"fn": fn, "collective": collective, **attrs},
         )
 
 
