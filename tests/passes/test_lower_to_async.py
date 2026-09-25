@@ -1,8 +1,14 @@
 """Tests for the lower_to_async pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.passes.lower_to_async import lower_to_async
+
+
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
 
 
 def test_sync_move_stays_as_move():
@@ -15,7 +21,7 @@ def test_sync_move_stays_as_move():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     lowered = lower_to_async(module)
     text = repr(lowered)
 
@@ -32,7 +38,7 @@ def test_tma_to_async_move_await():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     lowered = lower_to_async(module)
     text = repr(lowered)
 
@@ -49,7 +55,7 @@ def test_tma_to_async_move_await():
 
 
 def test_tma_multicast_gets_cluster_collective_async():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
             %smem: smem<16x16xf32> = alloc() attrs={id: 0}
@@ -76,7 +82,7 @@ def test_sync_matmul_stays_as_matmul():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     lowered = lower_to_async(module)
     text = repr(lowered)
 
@@ -92,7 +98,7 @@ def test_wgmma_matmul_to_async_await():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     lowered = lower_to_async(module)
     text = repr(lowered)
 
