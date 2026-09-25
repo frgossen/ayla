@@ -7,6 +7,7 @@ import pytest
 from ayla.base.ir import find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
     IndexConstantOp,
+    ModuleOp,
     PtrAddOp,
     PTXTemplateOp,
     ReinterpretOp,
@@ -20,10 +21,16 @@ from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
 
 
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
+
+
 def _lower_barrier(scope: str) -> str:
     """Lower a single ``barrier`` op of the given scope and return its PTX."""
     num_threads = ", num_threads: 128" if scope == "block_leader" else ""
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             barrier() attrs={{scope: "{scope}"{num_threads}}}
@@ -31,7 +38,7 @@ def _lower_barrier(scope: str) -> str:
         }}"""))
     lowered = lower_to_ptx_template(module)
     return "".join(
-        t.attrs["template"]
+        t.template
         for t in find_ops_of_type(lowered, PTXTemplateOp)
     )
 
@@ -63,7 +70,7 @@ def test_lower_barrier_block_leader_is_named_barrier():
 
 
 def test_lower_cluster_to_leader_barrier_uses_its_lock():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
             %lock: lock<cluster_mbar> = alloc()
@@ -73,8 +80,8 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
 
     lower_to_ptx_template(module)
     ptx = "".join(
-        op.attrs["template"]
-        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+        op.template
+        for op in find_ops_of_type(module, PTXTemplateOp)
     )
     assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
     assert (
@@ -95,7 +102,7 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
 
 
 def test_lower_smem_arena_and_reinterpret():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %arena: smem<6144xbf16> = alloc() attrs={allocation_alignment: 1024, id: 0}
@@ -105,7 +112,7 @@ def test_lower_smem_arena_and_reinterpret():
 
     lower_to_ptx_template(module)
     templates = [
-        op.attrs["template"]
+        op.template
         for op in find_ops_of_type(module, PTXTemplateOp)
     ]
     assert sum(".shared" in template for template in templates) == 1
@@ -120,7 +127,7 @@ def test_lower_smem_arena_and_reinterpret():
 
 
 def test_lower_zero_offset_reinterpret_is_elided():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %arena: smem<64x64xbf16> = alloc() attrs={id: 0}
@@ -136,7 +143,7 @@ def test_lower_zero_offset_reinterpret_is_elided():
 
 
 def test_lower_reshape_is_elided():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k(%arg: gmem<2x3x4xf32>) {
             %view: gmem<6x4xf32> = reshape(%arg: gmem<2x3x4xf32>)
@@ -149,7 +156,7 @@ def test_lower_reshape_is_elided():
 
 
 def test_lower_tile_uses_the_reinterpreted_view_strides():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %arena: smem<4096xbf16> = alloc() attrs={id: 0}
@@ -161,22 +168,20 @@ def test_lower_tile_uses_the_reinterpreted_view_strides():
     lower_to_ptx_template(module)
     Folding().run(module)
 
-    [tile] = find_ops(module, lambda op: isinstance(op, PtrAddOp))
+    [tile] = find_ops_of_type(module, PtrAddOp)
     assert isinstance(tile.byte_offset.definition, IndexConstantOp)
     assert tile.byte_offset.definition.value == 32
 
 
 def test_grid_barrier_uses_last_arriver_to_release_waiters():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k(%sync: gmem<2xf32>) grid_dim=[8, 1, 1] block_dim=[128, 1, 1] {
             barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}
           }
         }"""))
     lower_to_ptx_template(module)
-    template = find_ops(
-        module, lambda op: isinstance(op, PTXTemplateOp),
-    )[0].attrs["template"]
+    template = find_ops_of_type(module, PTXTemplateOp)[0].template
     assert template.count("bar.sync 0;") == 2
     assert "atom.acq_rel.gpu.global.inc.u32" in template
     assert "setp.eq.u32 ${pred:grid_last}, ${b32:grid_ticket}, 7;" in template
@@ -185,7 +190,7 @@ def test_grid_barrier_uses_last_arriver_to_release_waiters():
 
 
 def test_lower_tma_load_with_l2_cache_hint():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @load(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %x: index, %y: index, %z: index = block_ids()
@@ -196,7 +201,7 @@ def test_lower_tma_load_with_l2_cache_hint():
         }"""))
     lower_to_ptx_template(module)
     ptx = "".join(
-        op.attrs["template"]
+        op.template
         for op in find_ops_of_type(module, PTXTemplateOp)
     )
     assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
@@ -204,7 +209,7 @@ def test_lower_tma_load_with_l2_cache_hint():
 
 
 def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @load(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -218,8 +223,8 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
     lower_to_ptx_template(module)
 
     ptx = "".join(
-        op.attrs["template"]
-        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+        op.template
+        for op in find_ops_of_type(module, PTXTemplateOp)
     )
     leader = "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;"
     multicast = (
@@ -249,7 +254,7 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
 
 
 def test_lower_tma_store_with_l2_cache_hint():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @store(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %x: index, %y: index, %z: index = block_ids()
@@ -260,7 +265,7 @@ def test_lower_tma_store_with_l2_cache_hint():
         }"""))
     lower_to_ptx_template(module)
     ptx = "".join(
-        op.attrs["template"]
+        op.template
         for op in find_ops_of_type(module, PTXTemplateOp)
     )
     assert ptx.count("createpolicy.fractional.L2::evict_first") == 1
@@ -281,11 +286,11 @@ def test_lower_move_gmem_to_smem():
         }"""
     )  # noqa: E501
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     module = lower_to_async(module)
     lowered = lower_to_ptx_template(module)
     templates = find_ops_of_type(lowered, PTXTemplateOp)
-    template = templates[-1].attrs["template"]
+    template = templates[-1].template
 
     assert_contains_in_order(
         template,
@@ -330,7 +335,7 @@ def test_lower_elementwise_sigmoid_mma():
     first instruction and not after, which is what lets dst be src.
     """
     w = 'wgrmem<16x8xf32 layout="mma">'
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
@@ -340,7 +345,7 @@ def test_lower_elementwise_sigmoid_mma():
         }}"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops_of_type(lowered, PTXTemplateOp)[-1].attrs["template"]
+    template = find_ops_of_type(lowered, PTXTemplateOp)[-1].template
 
     expected = "".join(
         textwrap.dedent(f"""\
@@ -357,7 +362,7 @@ def test_lower_elementwise_sigmoid_mma():
 def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
     w = 'wgrmem<16x8xf32 layout="mma">'
     b = 'wgrmem<16x8xbf16 layout="mma">'
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
@@ -367,18 +372,18 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
         }}"""))
 
     [template] = [
-        op.attrs["template"]
+        op.template
         for op in find_ops_of_type(
             lower_to_ptx_template(module), PTXTemplateOp,
         )
-        if "ex2." in op.attrs["template"]
+        if "ex2." in op.template
     ]
     assert "ex2.approx.ftz.f32" in template
     assert "rcp.approx.ftz.f32" in template
 
 
 def test_lower_sigmoid_can_convert_its_result_to_f16():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %src: wgrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
@@ -389,14 +394,14 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
 
     template = find_ops_of_type(
         lower_to_ptx_template(module), PTXTemplateOp,
-    )[-1].attrs["template"]
+    )[-1].template
     assert "ex2.approx.f32" in template
     assert "ex2.approx.ftz.f32" not in template
     assert template.count("cvt.rn.f16x2.f32") == 2
 
 
 def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
@@ -410,7 +415,7 @@ def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
     lowered = lower_to_ptx_template(module)
     template = find_ops_of_type(
         lowered, PTXTemplateOp,
-    )[-1].attrs["template"]
+    )[-1].template
     assert template.count("cvt.rn.bf16x2.f32") == 16
     assert "operand.dst.r48" in template
     assert "operand.src.r97" in template
@@ -418,7 +423,7 @@ def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
 
 
 def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = _parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
@@ -430,7 +435,7 @@ def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
     lowered = lower_to_ptx_template(module)
     template = find_ops_of_type(
         lowered, PTXTemplateOp,
-    )[-1].attrs["template"]
+    )[-1].template
     assert template.count("mul.f32") == 32
     assert template.count("ex2.approx.f32") == 32
     assert template.count("add.f32") == 32
@@ -448,7 +453,7 @@ def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
 
 def test_lower_elementwise_mul():
     w = 'wgrmem<16x8xf32 layout="mma">'
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %lhs: {w} = alloc() attrs={{id: 0}}
@@ -458,9 +463,7 @@ def test_lower_elementwise_mul():
         }}"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops(
-        lowered, lambda o: isinstance(o, PTXTemplateOp)
-    )[-1].attrs["template"]
+    template = find_ops_of_type(lowered, PTXTemplateOp)[-1].template
     assert template == "".join(
         f"mul.f32 ${{f32:operand.dst.r{reg}}}, "
         f"${{f32:operand.lhs.r{reg}}}, ${{f32:operand.rhs.r{reg}}};\n"
@@ -470,7 +473,7 @@ def test_lower_elementwise_mul():
 
 def test_lower_elementwise_silu():
     w = 'wgrmem<16x8xf32 layout="mma">'
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
@@ -479,9 +482,7 @@ def test_lower_elementwise_silu():
         }}"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops(
-        lowered, lambda op: isinstance(op, PTXTemplateOp)
-    )[-1].attrs["template"]
+    template = find_ops_of_type(lowered, PTXTemplateOp)[-1].template
 
     expected = "".join(
         textwrap.dedent(f"""\
@@ -503,7 +504,7 @@ def test_lower_elementwise_silu():
 def test_lower_elementwise_silu_with_bf16_output():
     w = 'wgrmem<16x8xf32 layout="mma">'
     b = 'wgrmem<16x8xbf16 layout="mma">'
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = _parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %src: {w} = alloc() attrs={{id: 0}}
@@ -513,9 +514,7 @@ def test_lower_elementwise_silu_with_bf16_output():
         }}"""))
 
     lowered = lower_to_ptx_template(module)
-    template = find_ops(
-        lowered, lambda op: isinstance(op, PTXTemplateOp)
-    )[-1].attrs["template"]
+    template = find_ops_of_type(lowered, PTXTemplateOp)[-1].template
 
     assert template.count("ex2.approx.ftz.f32") == 4
     assert template.count("rcp.approx.ftz.f32") == 4
