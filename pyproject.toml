@@ -42,6 +42,7 @@ include = [
     "tests/passes/test_cse.py",
     "tests/passes/test_licm.py",
     "tests/passes/test_lower_to_async.py",
+    "tests/passes/test_lower_stmatrix.py",
     "tests/passes/test_dce.py",
     "tests/passes/test_fuse_async.py",
     "tests/passes/test_lower_to_tma_move.py",
