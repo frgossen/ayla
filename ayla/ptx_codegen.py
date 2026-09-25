@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import cast
+
+import torch
 
 from . import pytree
 from .base.ir import Op, Printer, Value, find_ops_of_type
@@ -277,7 +280,6 @@ class PtxKernel:
     cluster_dim: tuple[int, int, int] | None = None
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
-    requires_resident_grid: bool = False
 
 
 def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
@@ -297,7 +299,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    requires_resident_grid = any(
+    has_grid_barrier = any(
         barrier.scope == "grid"
         for barrier in find_ops_of_type(kernel, BarrierOp)
     )
@@ -310,6 +312,22 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         tuple[int, int, int],
         tuple(d if d is not None else 1 for d in kernel.grid_dim),
     )
+    if has_grid_barrier:
+        # A software grid barrier deadlocks if resident CTAs wait while
+        # unscheduled CTAs cannot reach it. Limiting the physical grid to one
+        # CTA per visible SM guarantees co-residency.
+        device = torch.cuda.current_device()
+        multiprocessors = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        grid_size = math.prod(grid_dim)
+        if grid_size > multiprocessors:
+            raise ValueError(
+                f"kernel {kernel.name!r} uses a software grid barrier and "
+                f"launches {grid_size} physical CTAs, but the logical CUDA "
+                f"device has only {multiprocessors} SMs"
+            )
+
     block_dim = _resolve_block_dim(kernel)
     cluster_dim = (
         cast(
@@ -329,7 +347,6 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         block_dim=block_dim,
         cluster_dim=cluster_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
-        requires_resident_grid=requires_resident_grid,
     )
 
 

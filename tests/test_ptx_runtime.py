@@ -6,10 +6,8 @@ result.
 """
 import textwrap
 
-import pytest
 import torch
 
-import ayla.ptx_runtime as ptx_runtime
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     AllocOp,
@@ -70,101 +68,6 @@ SIMPLE_ADD_PTX = textwrap.dedent("""\
         ret;
     }
 """)
-
-
-class _FakeLauncherExtension:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.occupancy_args = None
-
-    def module_load_data(self, ptx, optimization_level):
-        return 1
-
-    def module_unload(self, module):
-        pass
-
-    def module_get_function(self, module, name):
-        return 2
-
-    def max_resident_grid_blocks(
-        self, function, grid_dim, block_dim, shared_mem_bytes, cluster_dim,
-    ):
-        self.occupancy_args = (
-            function, grid_dim, block_dim, shared_mem_bytes, cluster_dim,
-        )
-        return self.capacity
-
-
-@pytest.mark.parametrize(
-    ("cluster_dim", "capacity"),
-    [(None, 8), ((2, 1, 1), 12)],
-)
-def test_resident_grid_rejects_unsafe_launch_before_execution(
-    monkeypatch, cluster_dim, capacity,
-):
-    fake = _FakeLauncherExtension(capacity)
-    monkeypatch.setattr(ptx_runtime, "_get_ext", lambda: fake)
-    kernel = PtxKernel(
-        ptx=SIMPLE_ADD_PTX,
-        name="grid_sync",
-        signature=[],
-        grid_dim=(16, 1, 1),
-        block_dim=(256, 1, 1),
-        cluster_dim=cluster_dim,
-        shared_mem_bytes=32768,
-        requires_resident_grid=True,
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=rf"grid_sync.*requires 16 resident blocks.*capacity is {capacity}",
-    ):
-        make_ptx_launcher(kernel).ensure_loaded()
-
-    assert fake.occupancy_args == (
-        2,
-        (16, 1, 1),
-        (256, 1, 1),
-        32768,
-        cluster_dim or (0, 0, 0),
-    )
-
-
-@requires_cuda
-def test_real_occupancy_rejects_an_oversubscribed_resident_grid():
-    torch.empty(1, device="cuda")
-    kernel = PtxKernel(
-        ptx=SIMPLE_ADD_PTX,
-        name="cwise_add",
-        signature=[],
-        grid_dim=(1_000_000, 1, 1),
-        block_dim=(256, 1, 1),
-        requires_resident_grid=True,
-    )
-
-    with pytest.raises(
-        RuntimeError, match="requires 1000000 resident blocks",
-    ):
-        make_ptx_launcher(kernel).ensure_loaded()
-
-
-@requires_cuda
-def test_real_cluster_occupancy_rejects_an_oversubscribed_resident_grid():
-    torch.empty(1, device="cuda")
-    sync_type = GmemTensorType.build((2,), F32Type())
-    sync = Value("sync", sync_type)
-    module = ModuleOp.build(Block(ops=[KernelOp.build(
-        "cluster_grid_sync",
-        Block(arguments=[sync], ops=[BarrierOp.build("grid", sync)]),
-        grid_dim=(1_000_000, 1, 1),
-        block_dim=(128, 1, 1),
-        cluster_dim=(2, 1, 1),
-    )]))
-
-    with pytest.raises(
-        RuntimeError, match="requires 1000000 resident blocks",
-    ):
-        make_ptx_launcher(make_ptx_kernel(module)).ensure_loaded()
 
 
 @requires_cuda

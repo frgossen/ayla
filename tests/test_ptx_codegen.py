@@ -3,6 +3,7 @@
 import textwrap
 
 import pytest
+import torch
 
 from ayla import (
     Block,
@@ -52,7 +53,6 @@ def test_codegen_cwise_add():
     assert kernel.grid_dim == (4, 1, 1)
     assert kernel.block_dim == (256, 1, 1)
     assert kernel.ptx_optimization_level == 1
-    assert not kernel.requires_resident_grid
     assert kernel.ptx == textwrap.dedent("""\
         .version 9.0
         .target sm_90a
@@ -82,19 +82,50 @@ def test_codegen_cwise_add():
         }""")
 
 
-def test_codegen_marks_kernels_with_software_grid_barriers():
+@pytest.mark.parametrize("cluster_dim", [(None, None, None), (2, 1, 1)])
+def test_codegen_accepts_resident_grid_barrier(monkeypatch, cluster_dim):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: type("Props", (), {"multi_processor_count": 132})(),
+    )
     sync_type = GmemTensorType.build((2,), F32Type())
     sync = Value(name="sync", type=sync_type)
     module = ModuleOp.build(Block(ops=[KernelOp.build(
         "grid_sync",
         Block(arguments=[sync], ops=[BarrierOp.build("grid", sync)]),
-        grid_dim=(2, 1, 1),
+        grid_dim=(8, 16, 1),
         block_dim=(32, 1, 1),
+        cluster_dim=cluster_dim,
     )]))
 
     kernel = make_ptx_kernel(module)
 
-    assert kernel.requires_resident_grid
+    assert kernel.grid_dim == (8, 16, 1)
+
+
+def test_codegen_rejects_grid_barrier_with_more_ctas_than_sms(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: type("Props", (), {"multi_processor_count": 132})(),
+    )
+    sync_type = GmemTensorType.build((2,), F32Type())
+    sync = Value(name="sync", type=sync_type)
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "grid_sync",
+        Block(arguments=[sync], ops=[BarrierOp.build("grid", sync)]),
+        grid_dim=(9, 16, 1),
+        block_dim=(32, 1, 1),
+    )]))
+
+    with pytest.raises(
+        ValueError,
+        match=r"grid_sync.*launches 144 physical CTAs.*only 132 SMs",
+    ):
+        make_ptx_kernel(module)
 
 
 def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():

@@ -13,7 +13,6 @@ side-effects out.
 from __future__ import annotations
 
 from functools import cache
-import math
 from typing import Protocol, cast
 
 import torch
@@ -85,56 +84,6 @@ static uintptr_t module_get_function(
     CUfunction fn = nullptr;
     CU_CHECK(cuModuleGetFunction(&fn, mod, name.c_str()));
     return reinterpret_cast<uintptr_t>(fn);
-}
-
-static int max_resident_grid_blocks(
-    uintptr_t function_handle,
-    std::tuple<int, int, int> grid_dim,
-    std::tuple<int, int, int> block_dim,
-    int64_t dynamic_shared_mem_bytes,
-    std::tuple<int, int, int> cluster_dim
-) {
-    auto fn = reinterpret_cast<CUfunction>(function_handle);
-    auto [gx, gy, gz] = grid_dim;
-    auto [bx, by, bz] = block_dim;
-    auto [cx, cy, cz] = cluster_dim;
-
-    if (cx > 0) {
-        CUlaunchAttribute cluster_attr{};
-        cluster_attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-        cluster_attr.value.clusterDim.x = static_cast<unsigned int>(cx);
-        cluster_attr.value.clusterDim.y = static_cast<unsigned int>(cy);
-        cluster_attr.value.clusterDim.z = static_cast<unsigned int>(cz);
-        CUlaunchConfig config{};
-        config.gridDimX = static_cast<unsigned int>(gx);
-        config.gridDimY = static_cast<unsigned int>(gy);
-        config.gridDimZ = static_cast<unsigned int>(gz);
-        config.blockDimX = static_cast<unsigned int>(bx);
-        config.blockDimY = static_cast<unsigned int>(by);
-        config.blockDimZ = static_cast<unsigned int>(bz);
-        config.sharedMemBytes = static_cast<unsigned int>(
-            dynamic_shared_mem_bytes
-        );
-        config.hStream = at::cuda::getCurrentCUDAStream().stream();
-        config.attrs = &cluster_attr;
-        config.numAttrs = 1;
-        int clusters = 0;
-        CU_CHECK(cuOccupancyMaxActiveClusters(&clusters, fn, &config));
-        return clusters * cx * cy * cz;
-    }
-
-    int blocks_per_sm = 0;
-    CU_CHECK(cuOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm, fn, bx * by * bz,
-        static_cast<size_t>(dynamic_shared_mem_bytes)
-    ));
-    CUdevice device;
-    CU_CHECK(cuCtxGetDevice(&device));
-    int multiprocessors = 0;
-    CU_CHECK(cuDeviceGetAttribute(
-        &multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device
-    ));
-    return blocks_per_sm * multiprocessors;
 }
 
 static CUtensorMapL2promotion parse_l2_promotion(
@@ -335,12 +284,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ptx"), py::arg("optimization_level") = -1);
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
-    m.def("max_resident_grid_blocks", &max_resident_grid_blocks,
-          py::arg("function_handle"),
-          py::arg("grid_dim"),
-          py::arg("block_dim"),
-          py::arg("shared_mem_bytes"),
-          py::arg("cluster_dim"));
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -357,15 +300,6 @@ class _LauncherExtension(Protocol):
     def module_unload(self, module: int) -> None: ...
 
     def module_get_function(self, module: int, name: str) -> int: ...
-
-    def max_resident_grid_blocks(
-        self,
-        function: int,
-        grid_dim: tuple[int, int, int],
-        block_dim: tuple[int, int, int],
-        shared_mem_bytes: int,
-        cluster_dim: tuple[int, int, int],
-    ) -> int: ...
 
     def launch_kernel(
         self,
@@ -431,23 +365,6 @@ class PtxLauncher:
             self._function = self._ext.module_get_function(
                 self._module, self._kernel.name,
             )
-            if self._kernel.requires_resident_grid:
-                cluster_dim = self._kernel.cluster_dim or (0, 0, 0)
-                capacity = self._ext.max_resident_grid_blocks(
-                    self._function,
-                    self._kernel.grid_dim,
-                    self._kernel.block_dim,
-                    self._kernel.shared_mem_bytes,
-                    cluster_dim,
-                )
-                grid_size = math.prod(self._kernel.grid_dim)
-                if grid_size > capacity:
-                    raise RuntimeError(
-                        f"kernel {self._kernel.name!r} uses a software grid "
-                        f"barrier and requires {grid_size} resident blocks, "
-                        f"but this launch configuration's capacity is "
-                        f"{capacity}"
-                    )
 
     @property
     def name(self):
