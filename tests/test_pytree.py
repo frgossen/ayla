@@ -8,6 +8,9 @@ def test_flatten():
 
 
 def test_map():
+    def increment(x: int) -> int:
+        return x + 1
+
     tree = ((1, 2), 3, (4, (5,)))
     expected = ((2, 3), 4, (5, (6,)))
-    assert pytree.map(lambda x: x + 1, tree) == expected
+    assert pytree.map(increment, tree) == expected
