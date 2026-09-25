@@ -3,8 +3,14 @@ import textwrap
 
 import pytest
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.passes.fuse_async import fuse_async
+
+
+def _parse_module(text: str) -> ModuleOp:
+    module = gpu_dialect.parse(text)
+    assert isinstance(module, ModuleOp)
+    return module
 
 
 def test_fuse_same_accumulator():
@@ -22,7 +28,7 @@ def test_fuse_same_accumulator():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     module = fuse_async(module)
     text = repr(module)
 
@@ -60,7 +66,7 @@ def test_fuse_tma_loads():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     module = fuse_async(module)
     text = repr(module)
 
@@ -108,7 +114,7 @@ def test_does_not_fuse_incompatible_tma_loads(
           }}
         }}""")
 
-    module = fuse_async(gpu_dialect.parse(module_str))
+    module = fuse_async(_parse_module(module_str))
 
     assert repr(module) == module_str
 
@@ -127,7 +133,7 @@ def test_fuse_different_accumulators():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = _parse_module(module_str)
     module = fuse_async(module)
     text = repr(module)
 
