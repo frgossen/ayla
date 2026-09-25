@@ -1,8 +1,11 @@
+from typing import cast
+
 import pytest
 import torch
 
 from ayla.gpu_dialect import ModuleOp, gpu_dialect
 from ayla.jit_compiler import ShapeSpecializingJITCompiler
+from ayla.ptx_runtime import PtxLauncher
 
 
 def _template(name="dispatch_test") -> ModuleOp:
@@ -42,12 +45,13 @@ def _patch_metadata(monkeypatch, compiler, m=4):
 
 
 def test_jit_compiler_caches_by_shape(monkeypatch):
-    compiled = []
+    compiled: list[ModuleOp] = []
     template = _template()
+    launcher = _Launcher()
 
-    def compile_fn(module):
+    def compile_fn(module: ModuleOp) -> PtxLauncher:
         compiled.append(module)
-        return _Launcher()
+        return cast(PtxLauncher, launcher)
 
     compiler = ShapeSpecializingJITCompiler(
         template,
@@ -55,13 +59,14 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
     )
     _patch_metadata(monkeypatch, compiler)
 
-    tensors = (_Tensor(), _Tensor(), _Tensor())
+    tensors = cast(
+        tuple[torch.Tensor, ...], (_Tensor(), _Tensor(), _Tensor())
+    )
     compiler(*tensors)
     compiler(*tensors)
     assert len(compiled) == 1
     assert compiler.cache_size == 1
-    compiled_launcher = compiler._launcher(tensors)
-    assert compiled_launcher.launches == 2
+    assert launcher.launches == 2
     assert "?" not in repr(compiled[0])
     assert "?" in repr(template)
 
@@ -69,13 +74,13 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
 def test_jit_compiler_rejects_capture_time_cache_miss(monkeypatch):
     compiler = ShapeSpecializingJITCompiler(
         _template("dispatch_capture_miss"),
-        lambda module: _Launcher(),
+        lambda module: cast(PtxLauncher, _Launcher()),
     )
     _patch_metadata(monkeypatch, compiler)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with pytest.raises(RuntimeError, match="before capture"):
-        compiler(_Tensor(), _Tensor(), _Tensor())
+        compiler(*cast(tuple[torch.Tensor, ...], (_Tensor(), _Tensor(), _Tensor())))
 
 
 def test_jit_compiler_rejects_noncontiguous_tensors():
@@ -87,7 +92,8 @@ def test_jit_compiler_rejects_noncontiguous_tensors():
             return False
 
     compiler = ShapeSpecializingJITCompiler(
-        _template(), lambda module: _Launcher(),
+        _template(), lambda module: cast(PtxLauncher, _Launcher()),
     )
+    tensor = cast(torch.Tensor, Tensor())
     with pytest.raises(ValueError, match="contiguous"):
-        compiler(Tensor(), Tensor(), Tensor())
+        compiler(tensor, tensor, tensor)
