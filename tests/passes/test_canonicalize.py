@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.passes.canonicalize import Canonicalize
-from ayla.gpu_dialect import gpu_dialect
+from ayla.gpu_dialect import ModuleOp, gpu_dialect
 
 
 def test_inline_single_trip_for():
@@ -20,6 +20,7 @@ def test_inline_single_trip_for():
         }""")  # noqa: E501
 
     module = gpu_dialect.parse(module_str)
+    assert isinstance(module, ModuleOp)
 
     module = Canonicalize().run(module)
     expected_after_first = textwrap.dedent("""\
