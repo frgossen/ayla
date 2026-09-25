@@ -42,6 +42,7 @@ include = [
     "tests/passes/test_multi_buffer.py",
     "tests/passes/test_schedule_async.py",
     "tests/passes/test_specialize_shapes.py",
+    "tests/test_gemm.py",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
