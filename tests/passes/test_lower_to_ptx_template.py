@@ -581,3 +581,24 @@ def test_lower_elementwise_silu_with_bf16_output():
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r0}, ${f32:silu_result1}, ${f32:silu_result0};
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r1}, ${f32:silu_result3}, ${f32:silu_result2};
         """))
+
+
+def test_lower_elementwise_silu_can_reuse_f32_source_registers():
+    src = 'wgrmem<16x8xf32 layout="mma">'
+    dst = 'wgrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
+            %src: {src} = alloc() attrs={{id: 0}}
+            %dst: {dst} = alloc() attrs={{id: 1}}
+            elementwise silu(%dst: {dst}, %src: {src}) attrs={{reuse_src: True}}
+          }}
+        }}"""))
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("ex2.approx.ftz.f32") == 4
+    assert "${f32:silu_tmp}" in template
+    assert "silu_result" not in template
+    assert template.count("cvt.rn.bf16x2.f32") == 2

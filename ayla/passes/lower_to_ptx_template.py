@@ -218,6 +218,29 @@ def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
         )
 
     src_regs = _elementwise_operand_regs(src, "src")
+    if op.attrs.get("reuse_src"):
+        if not isinstance(dst_dtype, BF16Type):
+            raise NotImplementedError(
+                "destructive silu currently requires a BF16 destination"
+            )
+        dst_regs = _elementwise_operand_regs(op.dst, "dst")
+        assert len(src_regs) == 2 * len(dst_regs)
+        template = ""
+        tmp = "${f32:silu_tmp}"
+        for dst, src_lo, src_hi in zip(
+            dst_regs, src_regs[::2], src_regs[1::2], strict=True,
+        ):
+            for value in (src_lo, src_hi):
+                template += (
+                    f"mul.f32 {tmp}, {value}, 0fBFB8AA3B;\n"
+                    f"ex2.approx.ftz.f32 {tmp}, {tmp};\n"
+                    f"fma.rn.f32 {tmp}, {tmp}, 0f3E800000, 0f3E800000;\n"
+                    f"rcp.approx.ftz.f32 {tmp}, {tmp};\n"
+                    f"mul.f32 {tmp}, {tmp}, 0f3E800000;\n"
+                    f"mul.f32 {value}, {value}, {tmp};\n"
+                )
+            template += f"cvt.rn.bf16x2.f32 {dst}, {src_hi}, {src_lo};\n"
+        return template
     if src_dtype == dst_dtype:
         result_regs = _elementwise_operand_regs(op.dst, "dst")
     else:
