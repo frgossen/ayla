@@ -281,6 +281,7 @@ def test_elementwise_syntax():
     op = ElementwiseOp.build(
         dst, [src], fn="sigmoid", attrs={"label": "activation"},
     )
+    assert op.inplace is True
 
     assert_print_and_roundtrip(
         op,
@@ -292,6 +293,16 @@ def test_elementwise_syntax():
             'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
             'attrs={fn: "convert"}'
         )
+
+    not_inplace = ElementwiseOp.build(
+        dst, [src], fn="sigmoid", inplace=False,
+    )
+    assert not_inplace.inplace is False
+    assert_print_and_roundtrip(
+        not_inplace,
+        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+        'attrs={inplace: False}',
+    )
 
 
 def test_kernel_op():

@@ -407,6 +407,10 @@ class VerifyGpuDialect(VerificationPass):
                 f"elementwise {op.fn} expects {expected} sources, "
                 f"got {op.num_srcs}"
             )
+        if type(op.inplace) is not bool:
+            raise ValueError(
+                f"elementwise inplace must be a bool; got {op.inplace!r}"
+            )
 
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:

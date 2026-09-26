@@ -713,6 +713,12 @@ class ElementwiseOp(GpuOp):
     The first operand is the destination and the rest are sources. Passing the
     same value as the destination and first source computes in place.
 
+    ``inplace`` defaults to true and asks lowering to minimize temporary
+    register live ranges. Set it to false to prefer a wider schedule with more
+    instruction-level parallelism. A source is only overwritten when it is
+    also the destination; the backend remains responsible for register reuse
+    between distinct values.
+
     TODO: generalize to several destinations.
     """
 
@@ -723,11 +729,20 @@ class ElementwiseOp(GpuOp):
         srcs: list[Value],
         fn: str,
         attrs: dict[str, object] | None = None,
+        *,
+        inplace: bool = True,
     ) -> "ElementwiseOp":
+        if type(inplace) is not bool:
+            raise ValueError(
+                f"elementwise inplace must be a bool; got {inplace!r}"
+            )
+        attrs = dict(attrs or {})
+        if not inplace:
+            attrs["inplace"] = False
         return cls(
             operands=[dst, *srcs],
             results=[],
-            attrs={"fn": fn, **(attrs or {})},
+            attrs={"fn": fn, **attrs},
         )
 
     @property
@@ -744,6 +759,11 @@ class ElementwiseOp(GpuOp):
     @property
     def fn(self) -> str:
         return self.attrs["fn"]  # type: ignore[return-value]
+
+    @property
+    def inplace(self) -> bool:
+        """Whether lowering should prefer a minimum-register schedule."""
+        return self.attrs.get("inplace", True)  # type: ignore[return-value]
 
     @property
     def extra_attrs(self) -> dict[str, object]:
