@@ -34,6 +34,7 @@ from ayla.gpu_dialect import (
     ReduceOp,
     ReinterpretOp,
     ReshapeOp,
+    ScalarOp,
     SelectOp,
     SmemTensorType,
     TmaDescType,
@@ -52,6 +53,13 @@ def assert_print_and_roundtrip(op, expected):
     text = repr(op)
     assert text == expected
     assert repr(gpu_dialect.parse(text)) == text
+
+
+def test_scalar_prints_and_roundtrips():
+    assert_print_and_roundtrip(
+        ScalarOp.build(1e-5, F32Type()),
+        "%0: f32 = scalar() attrs={value: 1e-05}",
+    )
 
 
 @pytest.mark.parametrize(

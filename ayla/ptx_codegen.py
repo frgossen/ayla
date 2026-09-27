@@ -12,6 +12,10 @@ from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdsOp,
     ClusterBlockIdsOp,
+    BF16Type,
+    F16Type,
+    F32Type,
+    F64Type,
     ForOp,
     GmemTensorType,
     IfOp,
@@ -124,6 +128,21 @@ PTX_PARAM_NAMESPACE = "ptx_params"
 
 
 def map_type_to_registers(type):
+    if isinstance(type, (F16Type, BF16Type)):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.B16,
+            member_names="",
+        )
+    if isinstance(type, F32Type):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.F32,
+            member_names="",
+        )
+    if isinstance(type, F64Type):
+        return TypeRegisterMapping(
+            member_register_types=PtxType.F64,
+            member_names="",
+        )
     if isinstance(type, GmemTensorType):
         return TypeRegisterMapping(
             member_register_types=PtxType.B64,

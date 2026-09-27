@@ -2077,6 +2077,29 @@ class F64Type(Type):
     byte_size = 8
 
 
+@gpu_dialect.register_op("scalar")
+class ScalarOp(Op):
+    """Produce a typed floating-point scalar value."""
+
+    @classmethod
+    def build(cls, value: int | float, dtype: Type) -> "ScalarOp":
+        if type(value) not in (int, float):
+            raise ValueError("scalar value must be an int or float")
+        if not isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type)):
+            raise ValueError("scalar dtype must be a floating-point type")
+        return cls(
+            operands=[],
+            results=[Value(name=None, type=dtype)],
+            attrs={"value": value},
+        )
+
+    @property
+    def value(self) -> int | float:
+        value = self.attrs["value"]
+        assert type(value) in (int, float)
+        return cast(int | float, value)
+
+
 @gpu_dialect.register_op("thread_ids")
 class ThreadIdsOp(Op):
     """Produce the 3D thread index (tid.x, tid.y, tid.z)."""
@@ -2730,6 +2753,7 @@ def is_side_effect_free(op: Op) -> bool:
         IndexMulOp,
         LaneIdOp,
         PtrAddOp,
+        ScalarOp,
         SelectOp,
         ReinterpretOp,
         ReshapeOp,

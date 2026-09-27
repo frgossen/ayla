@@ -40,6 +40,7 @@ from ..gpu_dialect import (
     ReinterpretOp,
     ReshapeOp,
     RmemTensorType,
+    ScalarOp,
     SmemTensorType,
     ThreadIdsOp,
     TileOp,
@@ -258,6 +259,27 @@ class LowerToPtxTemplate(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
+
+    @lowers(ScalarOp)
+    def lower_scalar(
+        self, op: ScalarOp,
+    ) -> tuple[list[Op], list[object]]:
+        dtype = op.result().type
+        register_type = (
+            "b16" if isinstance(dtype, (F16Type, BF16Type)) else dtype.name
+        )
+        lowered = PTXTemplateOp.build(
+            operands=[],
+            result_types=[dtype],
+            template=(
+                f"mov.{register_type} "
+                f"${{{register_type}:result.value}}, "
+                f"{_ptx_literal(dtype, op.value)};\n"
+            ),
+            result_names=["value"],
+            description=str(op),
+        )
+        return [lowered], [lowered.result()]
 
     @lowers(KernelOp)
     def lower_kernel(
@@ -2256,6 +2278,8 @@ def _ptx_literal(dtype, value) -> str:
     if name == "bf16":
         bits = struct.unpack(">I", struct.pack(">f", float(value)))[0] >> 16
         return f"0x{bits:04X}"
+    if name == "f16":
+        return "0x" + struct.pack(">e", float(value)).hex().upper()
     raise NotImplementedError(f"_ptx_literal: dtype {name}")
 
 
