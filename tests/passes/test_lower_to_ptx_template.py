@@ -4,13 +4,19 @@ import textwrap
 
 import pytest
 
-from ayla.base.ir import find_ops, find_ops_of_type
+from ayla.base.ir import Block, find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
+    BF16Type,
+    F16Type,
+    F32Type,
+    F64Type,
     IndexConstantOp,
+    ModuleOp,
     PtrAddOp,
     PTXTemplateOp,
     ReinterpretOp,
     ReshapeOp,
+    ScalarOp,
     ToPtrOp,
     gpu_dialect,
 )
@@ -18,6 +24,27 @@ from ayla.passes.folding import Folding
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value", "expected"),
+    [
+        (F16Type(), 1.0, "mov.b16 ${b16:result.value}, 0x3C00;"),
+        (BF16Type(), 1.0, "mov.b16 ${b16:result.value}, 0x3F80;"),
+        (F32Type(), 1e-5, "mov.f32 ${f32:result.value}, 0f3727C5AC;"),
+        (F64Type(), 1.0, "mov.f64 ${f64:result.value}, 0d3FF0000000000000;"),
+    ],
+)
+def test_lower_scalar(dtype, value, expected):
+    scalar = ScalarOp.build(value, dtype)
+    module = ModuleOp.build(Block(ops=[scalar]))
+
+    lower_to_ptx_template(module)
+
+    [lowered] = module.body.ops
+    assert isinstance(lowered, PTXTemplateOp)
+    assert lowered.template == expected + "\n"
+    assert lowered.result().type == scalar.result().type
 
 
 def _lower_barrier(scope: str) -> str:

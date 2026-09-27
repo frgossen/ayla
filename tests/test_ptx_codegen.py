@@ -20,9 +20,28 @@ from ayla.gpu_dialect import (
     IfOp,
     IndexConstantOp,
     IndexLtOp,
+    ScalarOp,
     ThreadIdsOp,
     gpu_dialect,
 )
+
+
+def test_codegen_scalar():
+    scalar = ScalarOp.build(1e-5, F32Type())
+    consume = PTXTemplateOp.build(
+        operands=[scalar.result()],
+        result_types=[],
+        template="mov.f32 ${f32:sink}, ${f32:operand[0]};\n",
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "scalar", Block(ops=[scalar, consume]),
+        grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+    )]))
+
+    ptx = make_ptx_kernel(module).ptx
+
+    assert "mov.f32 %f0, 0f3727C5AC;" in ptx
+    assert "mov.f32 %f1, %f0;" in ptx
 
 
 def test_codegen_cwise_add():

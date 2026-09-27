@@ -28,6 +28,7 @@ from ..gpu_dialect import (
     MoveOp,
     ReduceOp,
     ReshapeOp,
+    ScalarOp,
     SmemTensorType,
     TileOp,
     TmaDescType,
@@ -143,6 +144,17 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 f"for step must be a positive integer, got {op.step!r}"
             )
+
+    @verifies(ScalarOp)
+    def _verify_scalar(self, op: ScalarOp) -> None:
+        if op.operands or len(op.results) != 1:
+            raise ValueError("scalar must have no operands and one result")
+        if not isinstance(
+            op.result().type, (F16Type, BF16Type, F32Type, F64Type),
+        ):
+            raise ValueError("scalar result must have a floating-point type")
+        if type(op.attrs.get("value")) not in (int, float):
+            raise ValueError("scalar value must be an int or float")
 
     @verifies(TileOp)
     def _verify_tile(self, op: TileOp) -> None:
