@@ -386,7 +386,9 @@ class LowerToPtxTemplate(LoweringPass):
             if layout is not None and layout[1] == "block_major" and dim == 1:
                 block_width, _ = layout
                 if result_sizes[1] % block_width:
-                    parent_width = op.arg.type.sizes[1]
+                    parent_type = op.arg.type
+                    assert isinstance(parent_type, AddrMemTensorType)
+                    parent_width = parent_type.sizes[1]
                     assert isinstance(parent_width, int)
                     assert parent_width % block_width == 0
                     assert isinstance(idx, int), (
@@ -396,7 +398,9 @@ class LowerToPtxTemplate(LoweringPass):
                         idx * result_sizes[1], block_width,
                     )
                     byte_delta = (
-                        block * view_root_type.sizes[0] * block_width
+                        block
+                        * _static_dim(view_root_type.sizes[0])
+                        * block_width
                         + inner
                     ) * dtype_bytes
                     byte_term = IndexConstantOp.build(byte_delta)
