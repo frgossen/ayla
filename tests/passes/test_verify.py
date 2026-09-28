@@ -31,8 +31,7 @@ from ayla.ptx_codegen import make_ptx_kernel
 
 
 def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse(text)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(text)
     return module
 
 
