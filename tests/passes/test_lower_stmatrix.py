@@ -11,8 +11,7 @@ from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 
 
 def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse(text)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(text)
     return module
 
 
