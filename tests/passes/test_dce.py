@@ -1,7 +1,7 @@
 """Tests for the DCE pass."""
 import textwrap
 
-from ayla.gpu_dialect import ModuleOp, gpu_dialect
+from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.dce import dce
 
 
@@ -24,8 +24,7 @@ def test_dce_removes_unused_index_ops():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = dce(module)
 
     assert repr(module) == textwrap.dedent("""\
