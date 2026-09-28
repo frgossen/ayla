@@ -13,16 +13,10 @@ from ayla.gpu_dialect import (
     IndexLtOp,
     KernelOp,
     MatmulOp,
-    ModuleOp,
     TileOp,
     gpu_dialect,
 )
 from ayla.passes.tile_matmul import TileMatmul, tile_matmul
-
-
-def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse_module(text)
-    return module
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -35,7 +29,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
           }
         }""")
 
-    module = _parse_module(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = tile_matmul(module, ["M", "K"], [32, 16], [None, None], ["m", "k"])
     text = repr(module)
 
@@ -57,7 +51,7 @@ def test_tiles_gmem_matmul_along_m_and_k():
 
 
 def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) collective=xyz.grid attrs={label: "mm"}
@@ -81,7 +75,7 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
 
 
 def test_warp_group_tiling_sets_block_dim():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
@@ -102,7 +96,7 @@ def test_warp_group_tiling_sets_block_dim():
 
 
 def test_partial_block_tile_rounds_up_the_grid():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) {
             matmul(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) collective=xyz.grid attrs={label: "mm"}
@@ -136,7 +130,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
         }""")  # noqa: E501
 
     module = tile_matmul(
-        _parse_module(module_str),
+        gpu_dialect.parse_module(module_str),
         ["M", "K"], [32, 16],
         [(CollectiveLevel.BLOCK, CollectiveAxis.X), None], [None, "k"],
         op_label_filter="mm", epilogue_label_filter="epilogue",
@@ -159,7 +153,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
 
 
 def test_block_x_tiling_guards_more_blocks_than_tiles():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) collective=xyz.grid attrs={label: "mm"}
@@ -227,7 +221,7 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
 def test_parallel_tiling_guards_every_supported_binding(
     op_dim, iteration_binding, launch_dims, index_name,
 ):
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @mm(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) {launch_dims} {{
             matmul(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
@@ -250,7 +244,7 @@ def test_parallel_tiling_guards_every_supported_binding(
 
 
 def test_parallel_tiling_guards_multiple_dimensions():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) grid_dim=[4, 5, 1] {
             matmul(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
@@ -294,7 +288,7 @@ def test_parallel_tiling_rejects_two_dims_on_one_hardware_axis():
 
 
 def test_block_x_tiling_rejects_a_smaller_fixed_grid():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) collective=xyz.grid attrs={label: "mm"}
@@ -318,7 +312,7 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
             matmul(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) collective=xyz.grid
           }
         }""")
-    module = _parse_module(source)
+    module = gpu_dialect.parse_module(source)
     tile_matmul(
         module,
         op_dims=["N"], tile_sizes=[64],
@@ -331,7 +325,7 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
     assert not find_ops_of_type(module, ForOp)
     assert not find_ops_of_type(module, IfOp)
 
-    unmatched = _parse_module(source)
+    unmatched = gpu_dialect.parse_module(source)
     before = repr(unmatched)
     tile_matmul(
         unmatched,
@@ -344,7 +338,7 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
 
 
 def test_tiling_schemes_are_refined_across_two_matmuls():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) {
             matmul(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "up"}
