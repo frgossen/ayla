@@ -7,7 +7,6 @@ import pytest
 from ayla.base.ir import find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
     IndexConstantOp,
-    ModuleOp,
     PtrAddOp,
     PTXTemplateOp,
     ReinterpretOp,
@@ -21,15 +20,10 @@ from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
 
 
-def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse_module(text)
-    return module
-
-
 def _lower_barrier(scope: str) -> str:
     """Lower a single ``barrier`` op of the given scope and return its PTX."""
     num_threads = ", num_threads: 128" if scope == "block_leader" else ""
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             barrier() attrs={{scope: "{scope}"{num_threads}}}
@@ -69,7 +63,7 @@ def test_lower_barrier_block_leader_is_named_barrier():
 
 
 def test_lower_cluster_to_leader_barrier_uses_its_lock():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
             %lock: lock<cluster_mbar> = alloc()
@@ -101,7 +95,7 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
 
 
 def test_lower_smem_arena_and_reinterpret():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %arena: smem<6144xbf16> = alloc() attrs={allocation_alignment: 1024, id: 0}
@@ -126,7 +120,7 @@ def test_lower_smem_arena_and_reinterpret():
 
 
 def test_lower_zero_offset_reinterpret_is_elided():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %arena: smem<64x64xbf16> = alloc() attrs={id: 0}
@@ -142,7 +136,7 @@ def test_lower_zero_offset_reinterpret_is_elided():
 
 
 def test_lower_reshape_is_elided():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k(%arg: gmem<2x3x4xf32>) {
             %view: gmem<6x4xf32> = reshape(%arg: gmem<2x3x4xf32>)
@@ -155,7 +149,7 @@ def test_lower_reshape_is_elided():
 
 
 def test_lower_tile_uses_the_reinterpreted_view_strides():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %arena: smem<4096xbf16> = alloc() attrs={id: 0}
@@ -173,7 +167,7 @@ def test_lower_tile_uses_the_reinterpreted_view_strides():
 
 
 def test_grid_barrier_uses_last_arriver_to_release_waiters():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k(%sync: gmem<2xf32>) grid_dim=[8, 1, 1] block_dim=[128, 1, 1] {
             barrier(%sync: gmem<2xf32>) attrs={scope: "grid"}
@@ -189,7 +183,7 @@ def test_grid_barrier_uses_last_arriver_to_release_waiters():
 
 
 def test_lower_tma_load_with_l2_cache_hint():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @load(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %x: index, %y: index, %z: index = block_ids()
@@ -208,7 +202,7 @@ def test_lower_tma_load_with_l2_cache_hint():
 
 
 def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @load(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -253,7 +247,7 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
 
 
 def test_lower_tma_store_with_l2_cache_hint():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @store(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %x: index, %y: index, %z: index = block_ids()
@@ -285,7 +279,7 @@ def test_lower_move_gmem_to_smem():
         }"""
     )  # noqa: E501
 
-    module = _parse_module(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = lower_to_async(module)
     lowered = lower_to_ptx_template(module)
     templates = find_ops_of_type(lowered, PTXTemplateOp)
@@ -334,7 +328,7 @@ def test_lower_elementwise_sigmoid_mma():
     first instruction and not after, which is what lets dst be src.
     """
     w = 'wgrmem<16x8xf32 layout="mma">'
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
@@ -361,7 +355,7 @@ def test_lower_elementwise_sigmoid_mma():
 def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
     w = 'wgrmem<16x8xf32 layout="mma">'
     b = 'wgrmem<16x8xbf16 layout="mma">'
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
@@ -382,7 +376,7 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
 
 
 def test_lower_sigmoid_can_convert_its_result_to_f16():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %src: wgrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
@@ -400,7 +394,7 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
 
 
 def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
@@ -422,7 +416,7 @@ def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
 
 
 def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
@@ -452,7 +446,7 @@ def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
 
 def test_lower_elementwise_mul():
     w = 'wgrmem<16x8xf32 layout="mma">'
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %lhs: {w} = alloc() attrs={{id: 0}}
@@ -472,7 +466,7 @@ def test_lower_elementwise_mul():
 
 def test_lower_elementwise_silu():
     w = 'wgrmem<16x8xf32 layout="mma">'
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %a: {w} = alloc() attrs={{id: 0}}
@@ -503,7 +497,7 @@ def test_lower_elementwise_silu():
 def test_lower_elementwise_silu_with_bf16_output():
     w = 'wgrmem<16x8xf32 layout="mma">'
     b = 'wgrmem<16x8xbf16 layout="mma">'
-    module = _parse_module(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %src: {w} = alloc() attrs={{id: 0}}
