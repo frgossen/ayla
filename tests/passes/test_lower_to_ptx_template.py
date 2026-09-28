@@ -437,6 +437,42 @@ def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
     assert "operand.dst.r47" not in template
 
 
+def test_lower_elementwise_convert_supports_n8_wgrmem_fragment():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %src: wgrmem<64x80xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %src_tail: wgrmem<64x40xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wgrmem<64x80xf32 warps=4 layout="wgmma_layout_0">, 0, 1)
+            elementwise convert(%dst: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wgrmem<64x40xf32 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("cvt.rn.bf16x2.f32") == 10
+    assert "operand.dst.r9" in template
+    assert "operand.src.r39" in template
+
+
+@pytest.mark.parametrize("n", range(8, 257, 8))
+def test_lower_elementwise_supports_every_wgmma_n_extent(n):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %src: wgrmem<64x{n}xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+            %dst: wgrmem<64x{n}xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 1}}
+            elementwise convert(%dst: wgrmem<64x{n}xbf16 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x{n}xf32 warps=4 layout="wgmma_layout_0">)
+          }}
+        }}"""))  # noqa: E501
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("cvt.rn.bf16x2.f32") == n // 4
+
+
 def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
