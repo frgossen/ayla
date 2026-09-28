@@ -355,6 +355,29 @@ class LowerToPtxTemplate(LoweringPass):
         byte_offset = zero.result()
 
         for dim, idx in enumerate(op.indices):
+            if layout is not None and layout[1] == "block_major" and dim == 1:
+                block_width, _ = layout
+                if result_sizes[1] % block_width:
+                    parent_width = op.arg.type.sizes[1]
+                    assert isinstance(parent_width, int)
+                    assert parent_width % block_width == 0
+                    assert isinstance(idx, int), (
+                        "block-major sub-block tiles require a static index"
+                    )
+                    block, inner = divmod(
+                        idx * result_sizes[1], block_width,
+                    )
+                    byte_delta = (
+                        block * view_root_type.sizes[0] * block_width
+                        + inner
+                    ) * dtype_bytes
+                    byte_term = IndexConstantOp.build(byte_delta)
+                    new_ops.append(byte_term)
+                    add_op = IndexAddOp.build(byte_offset, byte_term.result())
+                    new_ops.append(add_op)
+                    byte_offset = add_op.result()
+                    continue
+
             if isinstance(idx, int):
                 const_op = IndexConstantOp.build(idx)
                 new_ops.append(const_op)
@@ -368,16 +391,12 @@ class LowerToPtxTemplate(LoweringPass):
             new_ops.append(elem_off)
 
             stride = view_root_type.strides[dim]
-            if (
-                layout is not None
-                and layout[1] == "block_major"
-            ):
+            if layout is not None and layout[1] == "block_major":
                 block_width, _ = layout
                 assert view_root_type.rank == 2
                 if dim == 0:
                     stride = block_width
                 elif dim == 1:
-                    assert result_sizes[1] % block_width == 0
                     stride = view_root_type.sizes[0]
 
             stride_bytes = stride * dtype_bytes
@@ -845,9 +864,8 @@ class LowerToPtxTemplate(LoweringPass):
                 return None
             tile = value.definition
             base_tile = base.definition
-            # TODO: Support arbitrary-length TileOp chains. Currently descriptor
-            # reuse is limited to siblings in one WGMMA commit group that share
-            # the same direct parent/base.
+            # Descriptor reuse is limited to siblings in one WGMMA commit
+            # group that share the same direct parent/base.
             if (
                 tile.arg is not base_tile.arg
                 or tile.result().type != base_tile.result().type
@@ -872,8 +890,8 @@ class LowerToPtxTemplate(LoweringPass):
             base_indices = [constant(index) for index in base_tile.indices]
             if any(index is None for index in indices + base_indices):
                 return None
-            # Non-affine layouts need a root-aware address mapping. Rebuild
-            # their descriptors until that support is introduced with K=128.
+            # A physical layout is not affine in the logical coordinates, so
+            # rematerialize its descriptors from the already-lowered pointers.
             if typ.attrs.get("physical_layout") is not None:
                 return None
             delta = sum(
@@ -948,8 +966,20 @@ class LowerToPtxTemplate(LoweringPass):
 
             m_iters = m_dim // 64
             num_regs_per_wgmma = 64 * n_dim // (dst_type.warps * 32)
-            lhs_row_stride_bytes = lhs_type.strides[0] * lhs_type.dtype.byte_size
-            rhs_row_stride_bytes = rhs_type.strides[0] * rhs_type.dtype.byte_size
+            lhs_layout = physical_layout(lhs_type)
+            rhs_layout = physical_layout(rhs_type)
+            lhs_row_stride = (
+                lhs_layout[0]
+                if lhs_layout is not None and lhs_layout[1] == "block_major"
+                else lhs_type.strides[0]
+            )
+            rhs_row_stride = (
+                rhs_layout[0]
+                if rhs_layout is not None and rhs_layout[1] == "block_major"
+                else rhs_type.strides[0]
+            )
+            lhs_row_stride_bytes = lhs_row_stride * lhs_type.dtype.byte_size
+            rhs_row_stride_bytes = rhs_row_stride * rhs_type.dtype.byte_size
 
             assert lhs_type.swizzle in _swizzle_to_bits, (
                 f"_lower_async_matmul_wgmma: lhs has unknown swizzle {lhs_type.swizzle!r}"
