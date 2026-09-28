@@ -2,13 +2,13 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import AllocOp, ModuleOp, TmaMoveOp, gpu_dialect
+from ayla.gpu_dialect import AllocOp, TmaMoveOp, gpu_dialect
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.promote_buffers import promote_buffers
 
 def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
@@ -16,7 +16,6 @@ def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={init: 0.0, label: "mm"}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     module = promote_buffers(
         module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
@@ -33,7 +32,7 @@ def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
 
 
 def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
@@ -41,7 +40,6 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, init: 0.0, label: "mm", lhs_tiling_scheme: 6}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     promote_buffers(
         module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
@@ -73,13 +71,12 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
 
 
 def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) collective=[xy.block, z.thread] attrs={init: 0.0, label: "mm"}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     module = promote_buffers(
         module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True,
@@ -105,13 +102,12 @@ def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
 
 
 def test_promotions_can_mark_unsafe_smem_reuse_groups():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<64x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", tma=True, unsafe_reuse_smem=True, label_filter="mm",
@@ -121,13 +117,12 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
         for op in find_ops_of_type(module, AllocOp)
     } == {"mm_compute"}
 
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) attrs={init: 0.0, label: "mm"}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     promote_buffers(
         module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True,
@@ -142,13 +137,12 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
 
 
 def test_wgrmem_tma_writeback_propagates_destination_move_attrs():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) collective=[xy.block, z.thread] attrs={init: 0.0, label: "mm"}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     module = promote_buffers(
         module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True,
@@ -168,8 +162,7 @@ def test_promote_gmem_matmul_operands_to_smem():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = promote_buffers(module, target_type="smem", operands=["lhs", "rhs", "dst"], swizzle="128B", tma=True)
     text = repr(module)
 
@@ -189,13 +182,12 @@ def test_promote_gmem_matmul_operands_to_smem():
 
 
 def test_promote_can_slice_tma_operand_loads():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<384x64xbf16>, %c: rmem<128x384xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<384x64xbf16>, %c: rmem<128x384xf32>) collective=[xy.block, z.thread] attrs={label: "mm"}
           }
         }"""))
-    assert isinstance(module, ModuleOp)
     promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", tma=True, tma_load_slices={"rhs": 3},
@@ -219,8 +211,7 @@ def test_promote_lhs_rhs_preserves_init_on_matmul():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = promote_buffers(module, target_type="smem", operands=["lhs", "rhs"], swizzle="128B", tma=True)
     text = repr(module)
 
@@ -270,8 +261,7 @@ def test_promote_smem_with_warp_group_dependent_lhs():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = promote_buffers(
         module, target_type="smem", operands=["lhs", "rhs"],
         swizzle="128B", layout=None, warps=None,
@@ -326,14 +316,13 @@ def test_epilogue_runs_on_the_promoted_accumulator():
     Promoting the destination is what makes fusing it possible, so the ops
     behind the matmul are promoted with it.
     """
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) collective=[xy.block, z.thread] attrs={init: 0.0, label: "mm"}
             elementwise sigmoid(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
-    assert isinstance(module, ModuleOp)
 
     module = promote_buffers(
         module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
