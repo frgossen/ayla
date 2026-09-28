@@ -65,7 +65,7 @@ def test_tma_multicast_gets_cluster_collective_async():
 
 
 def test_tma_move_preserves_explicit_and_extra_attrs():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) {
             %c0: index = index_constant() attrs={value: 0}
