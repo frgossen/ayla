@@ -493,14 +493,14 @@ def _grid_barrier_module(
         ("sm_100a", (148, 1, 1), (None, None, None)),
     ],
 )
-def test_ptx_verification_accepts_resident_grid_barrier(
+def test_verification_accepts_resident_grid_barrier(
     target, grid_dim, cluster_dim,
 ):
     module = _grid_barrier_module(
         grid_dim, target=target, cluster_dim=cluster_dim,
     )
 
-    assert verify_gpu_dialect(module, VerificationStage.PTX_LOWERING) is module
+    assert verify_gpu_dialect(module) is module
 
 
 def test_ptx_verification_rejects_nonresident_grid_barrier():
@@ -513,8 +513,8 @@ def test_ptx_verification_rejects_nonresident_grid_barrier():
         make_ptx_kernel(module)
 
 
-def test_ptx_verification_rejects_unknown_grid_barrier_target():
+def test_verification_rejects_unknown_grid_barrier_target():
     module = _grid_barrier_module((1, 1, 1), target="sm_101a")
 
     with pytest.raises(ValueError, match="no residency limit.*sm_101a"):
-        verify_gpu_dialect(module, VerificationStage.PTX_LOWERING)
+        verify_gpu_dialect(module)

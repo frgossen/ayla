@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum, auto
 import math
 
-from ..base.ir import Op, Type, find_ancestor_of_type, find_ops_of_type
+from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
@@ -43,8 +43,8 @@ _ELEMENTWISE_ARITIES = {
     "silu": 1,
 }
 
-# Until compilation carries an explicit device description, grid-barrier
-# schedules target full H100/B200 GPUs and conservatively assume one CTA per SM.
+# The target is the device description currently available to compilation.
+# Grid-barrier schedules conservatively assume one CTA per SM.
 _RESIDENT_GRID_CTAS_BY_TARGET = {
     "sm_90a": 132,  # H100/H200 SXM
     "sm_100a": 148,  # B200
@@ -137,29 +137,6 @@ class VerifyGpuDialect(VerificationPass):
         ):
             raise ValueError("cluster_dim must divide grid_dim")
 
-    @verifies(KernelOp, stage=VerificationStage.PTX_LOWERING)
-    def _verify_grid_barrier_residency(self, op: KernelOp) -> None:
-        if not any(
-            barrier.scope == "grid"
-            for barrier in find_ops_of_type(op, BarrierOp)
-        ):
-            return
-        module = find_ancestor_of_type(op, ModuleOp)
-        assert module is not None
-        max_ctas = _RESIDENT_GRID_CTAS_BY_TARGET.get(module.target)
-        if max_ctas is None:
-            raise ValueError(
-                "software grid barrier has no residency limit for target "
-                f"{module.target!r}"
-            )
-        grid_size = math.prod(dim or 1 for dim in op.grid_dim)
-        if grid_size > max_ctas:
-            raise ValueError(
-                f"kernel {op.name!r} uses a software grid barrier and "
-                f"launches {grid_size} physical CTAs, but target "
-                f"{module.target!r} permits at most {max_ctas}"
-            )
-
     @verifies(ForOp)
     def _verify_for(self, op: ForOp) -> None:
         if type(op.step) is not int or op.step <= 0:
@@ -243,6 +220,22 @@ class VerifyGpuDialect(VerificationPass):
             ):
                 raise ValueError(
                     "BarrierOp: grid sync must contain at least 8 bytes"
+                )
+            kernel = find_ancestor_of_type(op, KernelOp)
+            module = find_ancestor_of_type(op, ModuleOp)
+            assert kernel is not None and module is not None
+            max_ctas = _RESIDENT_GRID_CTAS_BY_TARGET.get(module.target)
+            if max_ctas is None:
+                raise ValueError(
+                    "software grid barrier has no residency limit for target "
+                    f"{module.target!r}"
+                )
+            grid_size = math.prod(dim or 1 for dim in kernel.grid_dim)
+            if grid_size > max_ctas:
+                raise ValueError(
+                    f"kernel {kernel.name!r} uses a software grid barrier and "
+                    f"launches {grid_size} physical CTAs, but target "
+                    f"{module.target!r} permits at most {max_ctas}"
                 )
         elif op.scope == "cluster_to_leader":
             if not isinstance(op.operands[0].type, LockType) or (
