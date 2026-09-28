@@ -46,11 +46,6 @@ from ayla.ptx_codegen import make_ptx_kernel
 from tests.testing_utils import assert_contains_in_order
 
 
-def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse_module(text)
-    return module
-
-
 MODULE_STR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) {
@@ -60,7 +55,7 @@ MODULE_STR = textwrap.dedent("""\
     }""")
 
 def _block_tiled() -> ModuleOp:
-    module = _parse_module(MODULE_STR)
+    module = gpu_dialect.parse_module(MODULE_STR)
     return tile_matmul(
         module,
         op_dims=["M", "N"], tile_sizes=[128, 256],
@@ -116,7 +111,7 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
 
 
 def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @epilogue(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             elementwise sigmoid(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
@@ -195,7 +190,7 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
 
 
 def test_two_matmuls_share_block_x_with_different_n_tile_counts():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<192x64xbf16>, %intermediate: gmem<64x192xbf16>, %w_down: gmem<256x192xbf16>, %out: gmem<64x256xbf16>) {
             matmul(%a: gmem<64x64xbf16>, %w_up: gmem<192x64xbf16>, %intermediate: gmem<64x192xbf16>) collective=xyz.grid attrs={label: "up"}
@@ -220,7 +215,7 @@ def test_two_matmuls_share_block_x_with_different_n_tile_counts():
 
 
 def test_separately_tiled_matmul_chain_keeps_raw_dependency():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) {
             matmul(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "up"}
@@ -263,7 +258,7 @@ def test_separately_tiled_matmul_chain_keeps_raw_dependency():
 
 
 def test_local_and_multicast_tma_loads_keep_separate_completion():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @loads(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %sa: smem<16x16xf32> = alloc() attrs={id: 0}
