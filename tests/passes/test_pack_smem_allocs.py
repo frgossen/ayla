@@ -17,8 +17,7 @@ from ayla.passes.pack_smem_allocs import pack_smem_allocs, reuse_smem_allocs
 
 
 def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse(text)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(text)
     return module
 
 
