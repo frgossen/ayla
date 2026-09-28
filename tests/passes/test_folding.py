@@ -2,15 +2,10 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import ModuleOp, TileOp, gpu_dialect
+from ayla.gpu_dialect import TileOp, gpu_dialect
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
-
-
-def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse_module(text)
-    return module
 
 
 def test_fold_constants():
@@ -28,7 +23,7 @@ def test_fold_constants():
           }
         }""")
 
-    module = _parse_module(module_str)
+    module = gpu_dialect.parse_module(module_str)
     before = repr(module)
     assert "index_mul(%c0: index, %c4096: index)" in before
     assert "index_add" in before
@@ -51,7 +46,7 @@ def test_fold_constants():
 
 
 def test_fold_constant_tile_indices_to_static_indices():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             %c3: index = index_constant() attrs={value: 3}
@@ -91,7 +86,7 @@ def test_per_iteration_buffer_choice_folds_after_unrolling():
           }
         }""")
 
-    module = _parse_module(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = unroll_loop(module, unroll_factor=2, label_filter="k")
     module = Canonicalize().run(folding(module))
 
@@ -131,7 +126,7 @@ def test_buffer_choice_stays_dynamic_when_depth_does_not_divide_the_unroll():
           }
         }""")
 
-    module = _parse_module(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = unroll_loop(module, unroll_factor=2, label_filter="k")
     module = Canonicalize().run(folding(module))
 
@@ -153,7 +148,7 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
           }
         }""")
 
-    module = folding(_parse_module(module_str))
+    module = folding(gpu_dialect.parse_module(module_str))
     after = repr(module)
 
     # 5 % 3 == 2, on every iteration.
@@ -164,7 +159,7 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
 
 
 def test_distribute_constant_multiply_over_affine_offset():
-    module = _parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test() {
             %bx: index, %by: index, %bz: index = block_ids()
@@ -205,7 +200,7 @@ def test_for_that_never_runs_is_erased():
           }
         }""")
 
-    after = repr(folding(_parse_module(module_str)))
+    after = repr(folding(gpu_dialect.parse_module(module_str)))
 
     assert "for (" not in after
     assert "alloc()" not in after
