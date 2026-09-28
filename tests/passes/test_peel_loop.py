@@ -9,8 +9,7 @@ from ayla.passes.peel_loop import PeelLoop, peel_loop
 
 
 def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse(text)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(text)
     return module
 
 
