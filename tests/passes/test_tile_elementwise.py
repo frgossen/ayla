@@ -16,8 +16,7 @@ from ayla.passes.tile_elementwise import tile_elementwise
 
 
 def _parse_module(text: str) -> ModuleOp:
-    module = gpu_dialect.parse(text)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(text)
     return module
 
 
