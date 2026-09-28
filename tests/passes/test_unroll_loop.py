@@ -1,7 +1,7 @@
 """Tests for the unroll_loop pass."""
 import textwrap
 
-from ayla.gpu_dialect import AllocOp, ForOp, ModuleOp, MoveOp, gpu_dialect
+from ayla.gpu_dialect import AllocOp, ForOp, MoveOp, gpu_dialect
 from ayla.base.ir import iter_ops
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
@@ -31,8 +31,7 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = unroll_loop(module, unroll_factor=3, label_filter="k")
 
     assert repr(module) == textwrap.dedent("""\
@@ -85,8 +84,7 @@ def test_unroll_wider_than_the_trip_count_leaves_an_empty_main_loop():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = unroll_loop(module, unroll_factor=4, label_filter="k")
 
     loops = [o for o in iter_ops(module) if isinstance(o, ForOp)]
