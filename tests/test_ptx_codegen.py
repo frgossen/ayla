@@ -24,7 +24,6 @@ from ayla.gpu_dialect import (
     gpu_dialect,
 )
 
-
 def test_codegen_cwise_add():
     n = 1 << 20
     buf_type = GmemTensorType.build((n,), F32Type())
@@ -81,12 +80,13 @@ def test_codegen_cwise_add():
 
 
 def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, None, None] num_warp_groups=1 {
           }
         }"""))
     [input_kernel] = module.body.ops
+    assert isinstance(input_kernel, KernelOp)
 
     kernel = make_ptx_kernel(module)
     assert input_kernel.block_dim == (128, None, None)
@@ -95,13 +95,14 @@ def test_codegen_resolves_implicit_block_dimensions_without_mutating_ir():
 
 
 def test_codegen_resolves_implicit_cluster_dimensions_without_mutating_ir():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[4, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, None, None] {
             %cbx: index, %cby: index, %cbz: index = cluster_block_ids()
           }
         }"""))
     [input_kernel] = module.body.ops
+    assert isinstance(input_kernel, KernelOp)
     [ids] = input_kernel.body.ops
     assert isinstance(ids, ClusterBlockIdsOp)
     input_kernel.body.append(PTXTemplateOp.build(
@@ -121,7 +122,7 @@ def test_codegen_resolves_implicit_cluster_dimensions_without_mutating_ir():
 
 
 def test_codegen_rejects_cluster_dimension_after_grid_resolution():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[None, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
           }
@@ -174,7 +175,7 @@ def test_codegen_naive_matmul_4096():
           }
         }""")  # noqa: E501
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     kernel = make_ptx_kernel(module)
     assert kernel.name == "naive_matmul_4096"
     assert kernel.grid_dim == (64, 64, 1)
@@ -302,7 +303,7 @@ def test_codegen_tma_load():
           }
         }""")  # noqa: E501
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     kernel = make_ptx_kernel(module)
     assert kernel.name == "tma"
     assert kernel.grid_dim == (32, 64, 1)
