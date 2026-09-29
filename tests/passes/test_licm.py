@@ -1,7 +1,7 @@
 """Tests for the LICM (loop-invariant code motion) pass."""
 import textwrap
 
-from ayla.gpu_dialect import ModuleOp, gpu_dialect
+from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.licm import licm
 
 
@@ -18,8 +18,7 @@ def test_no_hoist_k_dependent_ops():
           }
         }""")  # noqa: E501
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     before = repr(module)
     module = licm(module)
     after = repr(module)
@@ -39,8 +38,7 @@ def test_hoist_alloc_without_init():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
-    assert isinstance(module, ModuleOp)
+    module = gpu_dialect.parse_module(module_str)
     module = licm(module)
     text = repr(module)
 
