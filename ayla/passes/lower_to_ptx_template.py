@@ -66,26 +66,6 @@ def _lower_mul_registers(
     )
 
 
-def _tensor_type(value: Value) -> MemTensorType:
-    typ = value.type
-    assert isinstance(typ, MemTensorType)
-    return typ
-
-
-def _dtype_byte_size(dtype: Type) -> int:
-    assert isinstance(dtype, (BF16Type, F16Type, F32Type, F64Type))
-    return dtype.byte_size
-
-
-def _static_dim(size: int | None) -> int:
-    assert size is not None
-    return size
-
-
-def _static_dims(sizes: tuple[int | None, ...]) -> tuple[int, ...]:
-    return tuple(_static_dim(size) for size in sizes)
-
-
 def _lower_elementwise_sigmoid_ptx(
     dst_regs: list[str], src_regs: list[str],
 ) -> str:
@@ -120,7 +100,7 @@ def _lower_elementwise_sigmoid_bf16_ptx(
 
 def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
     """Return the PTX-template registers occupied by one WGRMEM operand."""
-    dtype = _tensor_type(value).dtype
+    dtype = cast(MemTensorType, value.type).dtype
     if isinstance(dtype, F32Type):
         return [
             f"${{f32:operand.{operand_name}.r{reg}}}"
@@ -178,14 +158,14 @@ def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     return _lower_dtype_conversion_ptx(
         _elementwise_operand_regs(op.dst, "dst"),
         _elementwise_operand_regs(op.src(0), "src"),
-        _tensor_type(op.src(0)).dtype,
-        _tensor_type(op.dst).dtype,
+        cast(MemTensorType, op.src(0).type).dtype,
+        cast(MemTensorType, op.dst.type).dtype,
     )
 
 
 def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
-    src_dtype = _tensor_type(op.src(0)).dtype
-    dst_dtype = _tensor_type(op.dst).dtype
+    src_dtype = cast(MemTensorType, op.src(0).type).dtype
+    dst_dtype = cast(MemTensorType, op.dst.type).dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
@@ -217,7 +197,7 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
 
 def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
     if not all(
-        isinstance(_tensor_type(value).dtype, F32Type)
+        isinstance(cast(MemTensorType, value.type).dtype, F32Type)
         for value in op.operands
     ):
         raise NotImplementedError("lower_elementwise: mul supports only f32")
@@ -230,8 +210,8 @@ def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
 
 def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
     src = op.src(0)
-    src_dtype = _tensor_type(src).dtype
-    dst_dtype = _tensor_type(op.dst).dtype
+    src_dtype = cast(MemTensorType, src.type).dtype
+    dst_dtype = cast(MemTensorType, op.dst.type).dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: silu does not support {src_dtype} input"
@@ -368,10 +348,12 @@ class LowerToPtxTemplate(LoweringPass):
             view_root = view_root.definition.arg
         view_root_type = view_root.type
         assert isinstance(view_root_type, AddrMemTensorType)
-        dtype_bytes = _dtype_byte_size(view_root_type.dtype)
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, view_root_type.dtype,
+        ).byte_size
         result_type = op.result().type
         assert isinstance(result_type, AddrMemTensorType)
-        result_sizes = [_static_dim(size) for size in result_type.sizes]
+        result_sizes = cast(tuple[int, ...], result_type.sizes)
         layout = (
             physical_layout(view_root_type)
             if isinstance(view_root_type, SmemTensorType) else None
@@ -399,7 +381,7 @@ class LowerToPtxTemplate(LoweringPass):
                     )
                     byte_delta = (
                         block
-                        * _static_dim(view_root_type.sizes[0])
+                        * cast(int, view_root_type.sizes[0])
                         * block_width
                         + inner
                     ) * dtype_bytes
@@ -602,7 +584,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(result_type, WgrmemTensorType)
         n = result_type.num_elements_per_thread
         suffix = result_type.dtype.name
-        if _dtype_byte_size(result_type.dtype) == 2:  # bf16/f16 packed in pairs into b32
+        if cast(
+            BF16Type | F16Type | F32Type | F64Type, result_type.dtype,
+        ).byte_size == 2:  # bf16/f16 packed in pairs into b32
             n //= 2
             suffix = "b32"
 
@@ -631,7 +615,9 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError("lower_alloc: smem init not supported")
         num_elements = smem_type.num_elements
         assert num_elements is not None
-        n_bytes = num_elements * _dtype_byte_size(smem_type.dtype)
+        n_bytes = num_elements * cast(
+            BF16Type | F16Type | F32Type | F64Type, smem_type.dtype,
+        ).byte_size
         # TMA swizzling and the corresponding software address swizzle operate
         # within 1 KiB regions and require the shared-memory base to match.
         alignment = (
@@ -739,8 +725,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_async_matmul fma: dtype mismatch; got "
                 f"{lhs_type.dtype}, {rhs_type.dtype}, {dst_type.dtype}"
             )
-        m_dim, k_dim = map(_static_dim, lhs_type.sizes)
-        n_dim, k_dim2 = map(_static_dim, rhs_type.sizes)
+        m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
+        n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
         if k_dim != k_dim2:
             raise NotImplementedError(
                 f"lower_async_matmul fma: k-dim mismatch; got "
@@ -790,8 +776,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_async_matmul mma.sync: expected bf16/f16 inputs, f32 output; "
                 f"got {lhs_type.dtype}, {rhs_type.dtype} -> {dst_type.dtype}"
             )
-        m_dim, k_dim = map(_static_dim, lhs_type.sizes)
-        n_dim, k_dim2 = map(_static_dim, rhs_type.sizes)
+        m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
+        n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
         if k_dim != k_dim2:
             raise NotImplementedError(
                 f"lower_async_matmul mma.sync: k-dim mismatch; got "
@@ -954,7 +940,9 @@ class LowerToPtxTemplate(LoweringPass):
                 assert index is not None and base_index is not None
                 assert size is not None and stride is not None
                 delta += (index - base_index) * size * stride
-            byte_delta = delta * _dtype_byte_size(typ.dtype)
+            byte_delta = delta * cast(
+                BF16Type | F16Type | F32Type | F64Type, typ.dtype,
+            ).byte_size
             return byte_delta if byte_delta >= 0 and byte_delta % 16 == 0 else None
 
         # Each distinct operand value gets a single unique placeholder name —
@@ -1005,8 +993,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"_lower_async_matmul_wgmma: rhs innermost stride must be 1; "
                 f"got strides={list(rhs_type.strides)}"
             )
-            m_dim, k_dim = map(_static_dim, lhs_type.sizes)
-            n_dim, k_dim2 = map(_static_dim, rhs_type.sizes)
+            m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
+            n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
             assert k_dim == k_dim2
             assert k_dim == 16, (
                 f"_lower_async_matmul_wgmma: k must be 16; got {k_dim}"
@@ -1033,10 +1021,16 @@ class LowerToPtxTemplate(LoweringPass):
                 else rhs_type.strides[0]
             )
             lhs_row_stride_bytes = (
-                _static_dim(lhs_row_stride) * _dtype_byte_size(lhs_type.dtype)
+                cast(int, lhs_row_stride)
+                * cast(
+                    BF16Type | F16Type | F32Type | F64Type, lhs_type.dtype,
+                ).byte_size
             )
             rhs_row_stride_bytes = (
-                _static_dim(rhs_row_stride) * _dtype_byte_size(rhs_type.dtype)
+                cast(int, rhs_row_stride)
+                * cast(
+                    BF16Type | F16Type | F32Type | F64Type, rhs_type.dtype,
+                ).byte_size
             )
 
             assert lhs_type.swizzle in _swizzle_to_bits, (
@@ -1333,7 +1327,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(gmem_ir_type, GmemTensorType)
         assert isinstance(rmem_type, RmemTensorType)
         gmem_label = "src" if is_load else "dst"
-        dtype_bytes = _dtype_byte_size(gmem_ir_type.dtype)
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, gmem_ir_type.dtype,
+        ).byte_size
         suffix = _ptx_suffix(rmem_type.dtype)
 
         operands: list[Value] = [dst_value, src_value]
@@ -1343,9 +1339,11 @@ class LowerToPtxTemplate(LoweringPass):
         base_reg = f"${{b64:operand.{gmem_label}.ptr}}"
 
         for flat_idx, idx in enumerate(
-            itertools.product(*[range(s) for s in _static_dims(rmem_type.sizes)])
+            itertools.product(
+                *[range(s) for s in cast(tuple[int, ...], rmem_type.sizes)]
+            )
         ):
-            strides = _static_dims(gmem_ir_type.strides)
+            strides = cast(tuple[int, ...], gmem_ir_type.strides)
             offset = sum(
                 c * s for c, s in zip(idx, strides)
             ) * dtype_bytes
@@ -1397,7 +1395,9 @@ class LowerToPtxTemplate(LoweringPass):
             f"_lower_move_gmem_smem: dtype mismatch; "
             f"gmem {gmem_type.dtype} vs smem {smem_type.dtype}"
         )
-        dtype_bytes = _dtype_byte_size(gmem_type.dtype)
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, gmem_type.dtype,
+        ).byte_size
         suffix = _ptx_suffix(gmem_type.dtype)
 
         operands: list[Value] = [dst_value, src_value]
@@ -1416,9 +1416,9 @@ class LowerToPtxTemplate(LoweringPass):
             st_addr = "${b64:co_gaddr}"
 
         co_dim = smem_type.rank - 1
-        co_size = _static_dim(smem_type.sizes[co_dim])
-        gmem_co_stride_bytes = _static_dim(gmem_type.strides[-1]) * dtype_bytes
-        smem_co_stride_bytes = _static_dim(smem_type.strides[-1]) * dtype_bytes
+        co_size = cast(int, smem_type.sizes[co_dim])
+        gmem_co_stride_bytes = cast(int, gmem_type.strides[-1]) * dtype_bytes
+        smem_co_stride_bytes = cast(int, smem_type.strides[-1]) * dtype_bytes
 
         template += textwrap.dedent(f"""\
             mov.u32 ${{b32:co_idx}}, %tid.x;
@@ -1434,12 +1434,12 @@ class LowerToPtxTemplate(LoweringPass):
         # Unroll sequential dims at lowering time. For large tiles this
         # may produce too many instructions; consider emitting a PTX loop.
         for seq_dim in range(smem_type.rank - 1):
-            seq_size = _static_dim(smem_type.sizes[seq_dim])
+            seq_size = cast(int, smem_type.sizes[seq_dim])
             gmem_seq_stride_bytes = (
-                _static_dim(gmem_type.strides[seq_dim]) * dtype_bytes
+                cast(int, gmem_type.strides[seq_dim]) * dtype_bytes
             )
             smem_seq_stride_bytes = (
-                _static_dim(smem_type.strides[seq_dim]) * dtype_bytes
+                cast(int, smem_type.strides[seq_dim]) * dtype_bytes
             )
             for seq_idx in range(seq_size):
                 g_off = seq_idx * gmem_seq_stride_bytes
@@ -1614,12 +1614,12 @@ class LowerToPtxTemplate(LoweringPass):
             f"destination {dst_type.dtype} vs wgrmem {wgrmem_type.dtype}"
         )
 
-        m_dim, n_dim = _static_dims(wgrmem_type.sizes)
+        m_dim, n_dim = cast(tuple[int, int], wgrmem_type.sizes)
         root = root_buffer(op.src)
         assert root is not None
         root_type = root.type
         assert isinstance(root_type, WgrmemTensorType)
-        root_n = _static_dim(root_type.sizes[1])
+        root_n = cast(int, root_type.sizes[1])
         if isinstance(op.src.definition, TileOp):
             assert list(dst_type.sizes) == [m_dim, n_dim], (
                 f"wgmma store: destination shape {list(dst_type.sizes)} does "
@@ -1631,7 +1631,7 @@ class LowerToPtxTemplate(LoweringPass):
             # from an attribute-based slice to an explicit WGRMEM view.
             col_start = op.attrs.get("wgmma_col_start", 0)
             assert isinstance(col_start, int)
-            dst_m, dst_n = _static_dims(dst_type.sizes)
+            dst_m, dst_n = cast(tuple[int, int], dst_type.sizes)
             assert dst_m == m_dim and 0 <= col_start < n_dim
             assert col_start + dst_n <= n_dim
             pairs = [
@@ -1645,8 +1645,10 @@ class LowerToPtxTemplate(LoweringPass):
         assert root_n % 8 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
         )
-        dtype_bytes = _dtype_byte_size(dst_type.dtype)
-        row_stride_bytes = _static_dim(dst_type.strides[0]) * dtype_bytes
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, dst_type.dtype,
+        ).byte_size
+        row_stride_bytes = cast(int, dst_type.strides[0]) * dtype_bytes
 
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes, dtype_bytes,
@@ -1702,10 +1704,10 @@ class LowerToPtxTemplate(LoweringPass):
         assert src_root is not None and dst_root is not None
         src_root_type = src_root.type
         assert isinstance(src_root_type, WgrmemTensorType)
-        n_dim = _static_dim(src_root_type.sizes[1])
+        n_dim = cast(int, src_root_type.sizes[1])
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
-        root_sizes = _static_dims(root_type.sizes)
+        root_sizes = cast(tuple[int, ...], root_type.sizes)
         # TODO: Model writer ownership as a warpgroup-uniform IR condition so
         # loop peeling/unrolling can specialize each slice and lower the whole
         # gather to one branch instead of predicating every stmatrix.
@@ -1866,7 +1868,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_ir_type, SmemTensorType)
         assert isinstance(rmem_type, RmemTensorType)
         smem_label = "src" if is_load else "dst"
-        dtype_bytes = _dtype_byte_size(smem_ir_type.dtype)
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, smem_ir_type.dtype,
+        ).byte_size
         suffix = _ptx_suffix(rmem_type.dtype)
 
         operands: list[Value] = [dst_value, src_value]
@@ -1876,9 +1880,11 @@ class LowerToPtxTemplate(LoweringPass):
         base_reg = f"${{b32:operand.{smem_label}.ptr}}"
 
         for flat_idx, idx in enumerate(
-            itertools.product(*[range(s) for s in _static_dims(rmem_type.sizes)])
+            itertools.product(
+                *[range(s) for s in cast(tuple[int, ...], rmem_type.sizes)]
+            )
         ):
-            strides = _static_dims(smem_ir_type.strides)
+            strides = cast(tuple[int, ...], smem_ir_type.strides)
             offset = sum(
                 c * s for c, s in zip(idx, strides)
             ) * dtype_bytes
@@ -1997,7 +2003,10 @@ class LowerToPtxTemplate(LoweringPass):
             desc_type = desc_value.type
             total_bytes += (
                 desc_type.tile_num_elements
-                * _dtype_byte_size(desc_type.gmem_type.dtype)
+                * cast(
+                    BF16Type | F16Type | F32Type | F64Type,
+                    desc_type.gmem_type.dtype,
+                ).byte_size
             )
             idx_values = [
                 cast(Value, self.value_map[v]) for v in tma.indices
@@ -2178,7 +2187,7 @@ def _static_view_origin(value: Value) -> tuple[int, ...]:
                 )
             result_type = tile.result().type
             assert isinstance(result_type, WgrmemTensorType)
-            offsets[dim] += index * _static_dim(result_type.sizes[dim])
+            offsets[dim] += index * cast(int, result_type.sizes[dim])
         value = tile.arg
     return tuple(offsets)
 
@@ -2206,8 +2215,8 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     )
     assert root_type.num_elements_per_thread % 2 == 0
     row_start, col_start = _static_view_origin(value)
-    view_m, view_n = _static_dims(view_type.sizes)
-    root_n = _static_dim(root_type.sizes[1])
+    view_m, view_n = cast(tuple[int, int], view_type.sizes)
+    root_n = cast(int, root_type.sizes[1])
     pairs = [
         (pair_index, row - row_start, col - col_start)
         for pair_index in range(root_type.num_elements_per_thread // 2)
@@ -2318,16 +2327,16 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         not isinstance(root_type, SmemTensorType)
         or root_type.rank != 2
         or not root_type.is_canonical_strides
-        or _static_dim(root_type.sizes[0]) % 64
+        or cast(int, root_type.sizes[0]) % 64
     ):
         return None
 
-    m_dim, n_dim = _static_dims(src_type.sizes)
+    m_dim, n_dim = cast(tuple[int, int], src_type.sizes)
     src_root = root_buffer(op.src)
     assert src_root is not None
     src_root_type = src_root.type
     assert isinstance(src_root_type, WgrmemTensorType)
-    root_n = _static_dim(src_root_type.sizes[1])
+    root_n = cast(int, src_root_type.sizes[1])
     is_view = isinstance(op.src.definition, TileOp)
     if is_view:
         row_start, col_start = _static_view_origin(op.src)
@@ -2336,13 +2345,13 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         row_start = 0
         col_start = op.attrs.get("wgmma_col_start", 0)
         assert isinstance(col_start, int)
-        dst_n = _static_dim(dst_type.sizes[1])
+        dst_n = cast(int, dst_type.sizes[1])
         pairs = [
             (pair, row, col - col_start)
             for pair, row, col in _wgmma_view_pairs(op.src)
             if col_start <= col < col_start + dst_n
         ]
-    dst_m, dst_n = _static_dims(dst_type.sizes)
+    dst_m, dst_n = cast(tuple[int, int], dst_type.sizes)
     if (
         dst_m != m_dim
         or (is_view and dst_n != n_dim)
