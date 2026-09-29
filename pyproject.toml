@@ -61,7 +61,6 @@ include = [
 ]
 exclude = [
     "ayla/passes/lower_to_ptx_template.py",
-    "ayla/passes/verify_gpu_dialect.py",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
