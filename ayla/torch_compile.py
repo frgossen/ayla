@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TypeGuard, cast
 
 import torch
 from torch._inductor import ir
@@ -94,7 +95,7 @@ def _match_node_val(
     shape: tuple[int | None, ...] | None = None,
     strides: tuple[int | None, ...] | None = None,
     dtype: torch.dtype | None = None,
-) -> bool:
+) -> TypeGuard[Node]:
     if not isinstance(node, Node):
         return False
     tensor = node.meta.get("val")
@@ -132,7 +133,7 @@ def _match_node_target(
     target: object,
     *,
     num_args: int,
-) -> bool:
+) -> TypeGuard[Node]:
     return (
         isinstance(node, Node)
         and node.op == "call_function"
@@ -212,7 +213,7 @@ def _match_sigmoid(
     ):
         return None
     arg_node = node.args[0]
-    return arg_node
+    return arg_node if isinstance(arg_node, Node) else None
 
 
 def _match_reshape(
@@ -505,8 +506,9 @@ class AylaTemplateBuffer(ir.TemplateBuffer):
 class AylaScheduling(BaseScheduling):
     """Fusion decisions and codegen for ayla template nodes."""
 
-    @classmethod
-    def get_backend_features(cls, device) -> OrderedSet[BackendFeature]:
+    def get_backend_features(
+        self, device: torch.device,
+    ) -> OrderedSet[BackendFeature]:
         # Never asked: AylaCombinedScheduling answers for the device.
         raise NotImplementedError
 
@@ -552,14 +554,18 @@ class AylaScheduling(BaseScheduling):
         for node in epilogue_nodes:
             node.mark_run()
 
+        template_ir_node = template_node.node
+        assert template_ir_node is not None
         if epilogue_nodes:
-            dest = epilogue_nodes[0].node.get_name()
+            epilogue_ir_node = epilogue_nodes[0].node
+            assert epilogue_ir_node is not None
+            dest = epilogue_ir_node.get_name()
             # The unfused matmul's buffer has no reader left.
-            V.graph.removed_buffers.add(template_node.node.get_name())
+            V.graph.removed_buffers.add(template_ir_node.get_name())
         else:
-            dest = template_node.node.get_name()
+            dest = template_ir_node.get_name()
 
-        a, b = (inp.codegen_reference() for inp in template_node.node.inputs)
+        a, b = (inp.codegen_reference() for inp in template_ir_node.inputs)
         V.graph.wrapper_code.writeline(
             f"torch.ops.{ayla_op}({a}, {b}.t(), {dest})"
         )
@@ -568,10 +574,12 @@ class AylaScheduling(BaseScheduling):
 
 
 def _is_elementwise_sigmoid_node(node: BaseSchedulerNode) -> bool:
-    inner = getattr(node, "node", None)
+    inner = node.node
     if not isinstance(inner, ir.ComputedBuffer):
         return False
-    if not isinstance(inner.data, ir.Pointwise):
+    inner = cast(ir.ComputedBuffer, inner)
+    data = inner.data
+    if not isinstance(data, ir.Pointwise):
         return False
     _, body, _ = inner.get_default_sizes_body()
     ops = [n.target for n in body.root_block.graph.nodes if n.op == "call_method"]
@@ -667,6 +675,7 @@ def uninstall() -> None:
     # Stand down if someone has claimed cuda since, rather than overwrite them.
     installed = device_codegens.get("cuda")
     if installed is not None and installed.scheduling is AylaCombinedScheduling:
+        assert _displaced_backend is not None
         device_codegens["cuda"] = _displaced_backend
         _displaced_backend = None
 

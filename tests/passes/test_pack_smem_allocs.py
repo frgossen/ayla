@@ -16,7 +16,7 @@ from ayla.passes.pack_smem_allocs import pack_smem_allocs, reuse_smem_allocs
 
 
 def test_reorders_lower_aligned_allocs_when_footprint_does_not_grow():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %output: smem<16x32xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={label: "output"}
@@ -33,7 +33,7 @@ def test_reorders_lower_aligned_allocs_when_footprint_does_not_grow():
 
 
 def test_keeps_order_when_reordering_would_add_padding():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %output: smem<16x32xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={label: "output"}
@@ -49,7 +49,7 @@ def test_keeps_order_when_reordering_would_add_padding():
 
 
 def test_reuses_storage_between_named_allocation_groups():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %independent: smem<16x16xbf16> = alloc() attrs={label: "shared"}

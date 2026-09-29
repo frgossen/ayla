@@ -10,8 +10,8 @@ from ayla.passes.tile_elementwise import tile_elementwise
 def test_tiles_elementwise_into_a_sequential_iteration_space():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            elementwise sigmoid(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+          kernel @epilogue(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+            elementwise sigmoid(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
 
@@ -24,10 +24,10 @@ def test_tiles_elementwise_into_a_sequential_iteration_space():
 
     assert repr(module) == textwrap.dedent("""\
         module {
-          kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+          kernel @epilogue(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             for (%outn: index = 0 to 4) attrs={label: "outn"} {
-              %0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %outn: index)
-              elementwise sigmoid(%0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+              %0: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %outn: index)
+              elementwise sigmoid(%0: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
             }
           }
         }""")  # noqa: E501
@@ -65,8 +65,8 @@ def test_tiles_multiple_dimensions_in_one_invocation():
 def test_tiles_distinct_conversion_operands_inside_one_loop():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @epilogue(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            elementwise convert(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "convert"}
+          kernel @epilogue(%dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+            elementwise convert(%dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "convert"}
           }
         }"""))  # noqa: E501
 
@@ -139,8 +139,8 @@ def test_rejects_parallel_iteration_binding():
 def test_tiles_an_explicitly_selected_move():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @epilogue(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
-            move(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "writeback"}
+          kernel @epilogue(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
+            move(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "writeback"}
           }
         }"""))  # noqa: E501
 
@@ -160,8 +160,8 @@ def test_tiles_an_explicitly_selected_move():
 def test_does_not_tile_moves_without_an_explicit_label_filter():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @epilogue(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
-            move(%dst: smem<64x256xbf16>, %src: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
+          kernel @epilogue(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) {
+            move(%dst: smem<64x256xbf16>, %src: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))  # noqa: E501
 

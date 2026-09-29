@@ -31,7 +31,8 @@ def test_unroll_with_a_tail_and_a_shared_allocation():
           }
         }""")
 
-    module = unroll_loop(gpu_dialect.parse(module_str), unroll_factor=3, label_filter="k")
+    module = gpu_dialect.parse_module(module_str)
+    module = unroll_loop(module, unroll_factor=3, label_filter="k")
 
     assert repr(module) == textwrap.dedent("""\
         module {
@@ -83,7 +84,8 @@ def test_unroll_wider_than_the_trip_count_leaves_an_empty_main_loop():
           }
         }""")
 
-    module = unroll_loop(gpu_dialect.parse(module_str), unroll_factor=4, label_filter="k")
+    module = gpu_dialect.parse_module(module_str)
+    module = unroll_loop(module, unroll_factor=4, label_filter="k")
 
     loops = [o for o in iter_ops(module) if isinstance(o, ForOp)]
     assert len(loops) == 1 and loops[0].trip_count == 0

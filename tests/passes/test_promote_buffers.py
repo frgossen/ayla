@@ -2,11 +2,13 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import AllocOp, gpu_dialect
+from ayla.gpu_dialect import AllocOp, TmaMoveOp, gpu_dialect
+from ayla.passes.lower_to_async import lower_to_async
+from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.promote_buffers import promote_buffers
 
 
-def test_wrmem_tma_writeback_stages_block_tile_in_smem():
+def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
@@ -16,7 +18,7 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
           }
         }"""))
     module = promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
     )
     text = repr(module)
@@ -25,12 +27,51 @@ def test_wrmem_tma_writeback_stages_block_tile_in_smem():
     # shape (64x256 <- 64x256) instead of a size-mismatched 128x256 <- 64x256.
     assert "smem<64x256xbf16> = tile(" in text
     assert "smem<128x256xbf16>, %wgx: index, 0)" in text
-    assert "move(%3: smem<64x256xbf16>, %1: wrmem<64x256xbf16" in text
+    assert "move(%3: smem<64x256xbf16>, %1: wgrmem<64x256xbf16" in text
     assert "move(%c: gmem<128x256xbf16>" in text
     assert 'attrs={label: "mm_dst_tma", tma: True}' in text
 
 
-def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
+def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, init: 0.0, label: "mm", lhs_tiling_scheme: 6}
+          }
+        }"""))
+    promote_buffers(
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True, label_filter="mm",
+    )
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem<64x256xbf16> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
+            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", lhs_tiling_scheme: 6}
+            %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
+            %2: smem<128x256xbf16> = alloc() attrs={id: 2}
+            %3: smem<64x256xbf16> = tile(%2: smem<128x256xbf16>, %wgx: index, 0)
+            move(%3: smem<64x256xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_smem"}
+            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, label: "mm_dst_tma", tma: True}
+          }
+        }""")  # noqa: E501
+
+    lower_to_tma_move(module)
+    lower_to_async(module)
+    [writeback] = [
+        op for op in find_ops_of_type(module, TmaMoveOp)
+        if op.attrs.get("label") == "mm_dst_tma"
+    ]
+    assert "src_tiling_scheme" not in writeback.attrs
+    assert writeback.attrs["dst_tiling_scheme"] == 7
+
+
+def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
@@ -38,23 +79,23 @@ def test_wrmem_tma_writeback_can_use_one_arena_per_slice():
           }
         }"""))
     module = promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True,
         writeback_slices=2, writeback_buffers=2, label_filter="mm",
     )
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
-            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
-            %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise convert(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
+            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
+            %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
             %2: smem<64x128xbf16> = alloc() attrs={id: 2}
             %3: smem<64x128xbf16> = alloc() attrs={id: 3}
-            move(%2: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_smem", wgmma_col_start: 0}
+            move(%2: smem<64x128xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_smem", wgmma_col_start: 0}
             %4: gmem<64x128xbf16 strides=[256, 1]> = tile(%c: gmem<64x256xbf16>, 0, 0)
             move(%4: gmem<64x128xbf16 strides=[256, 1]>, %2: smem<64x128xbf16>) collective=[xy.block, z.thread] attrs={label: "mm_dst_tma", tma: True}
-            move(%3: smem<64x128xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_smem", wgmma_col_start: 128}
+            move(%3: smem<64x128xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_smem", wgmma_col_start: 128}
             %5: gmem<64x128xbf16 strides=[256, 1]> = tile(%c: gmem<64x256xbf16>, 0, 1)
             move(%5: gmem<64x128xbf16 strides=[256, 1]>, %3: smem<64x128xbf16>) collective=[xy.block, z.thread] attrs={label: "mm_dst_tma", tma: True}
           }
@@ -84,7 +125,7 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
           }
         }"""))
     promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True,
         writeback_slices=2, writeback_buffers=2, unsafe_reuse_smem=True,
         label_filter="mm",
@@ -96,7 +137,7 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
     } == {"mm_writeback"}
 
 
-def test_wrmem_tma_writeback_propagates_destination_move_attrs():
+def test_wgrmem_tma_writeback_propagates_destination_move_attrs():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
@@ -104,7 +145,7 @@ def test_wrmem_tma_writeback_propagates_destination_move_attrs():
           }
         }"""))
     module = promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, tma=True,
         move_attrs={"dst": {"l2_cache_hint": "evict_first"}},
         label_filter="mm",
@@ -209,15 +250,15 @@ def test_promote_smem_with_warp_group_dependent_lhs():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %3: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
             %4: gmem<64x256xbf16 strides=[4096, 1]> = tile(%2: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0}
+            %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0}
             for (%k: index = 0 to 64) attrs={label: "k"} {
               %6: gmem<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem<64x4096xbf16>, 0, %k: index)
               %7: gmem<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem<256x4096xbf16>, 0, %k: index)
-              matmul(%6: gmem<64x64xbf16 strides=[4096, 1]>, %7: gmem<256x64xbf16 strides=[4096, 1]>, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
+              matmul(%6: gmem<64x64xbf16 strides=[4096, 1]>, %7: gmem<256x64xbf16 strides=[4096, 1]>, %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
             }
-            %8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise convert(%8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
-            move(%4: gmem<64x256xbf16 strides=[4096, 1]>, %8: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+            %8: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%8: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            move(%4: gmem<64x256xbf16 strides=[4096, 1]>, %8: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wgrmem"}
           }
         }""")
 
@@ -248,7 +289,7 @@ def test_promote_smem_with_warp_group_dependent_lhs():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %3: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
             %4: gmem<64x256xbf16 strides=[4096, 1]> = tile(%2: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0}
+            %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0}
             for (%k: index = 0 to 64) attrs={label: "k"} {
               %6: gmem<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem<64x4096xbf16>, 0, %k: index)
               %7: gmem<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem<256x4096xbf16>, 0, %k: index)
@@ -258,11 +299,11 @@ def test_promote_smem_with_warp_group_dependent_lhs():
               %10: smem<64x64xbf16 swizzle="128B"> = tile(%9: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
               %11: smem<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "mm_rhs_smem"}
               move(%11: smem<256x64xbf16 swizzle="128B">, %7: gmem<256x64xbf16 strides=[4096, 1]>) collective=[x.wg, y.block, z.grid] attrs={label: "mm_rhs_smem", tma: True}
-              matmul(%10: smem<64x64xbf16 swizzle="128B">, %11: smem<256x64xbf16 swizzle="128B">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
+              matmul(%10: smem<64x64xbf16 swizzle="128B">, %11: smem<256x64xbf16 swizzle="128B">, %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
             }
-            %12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise convert(%12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
-            move(%4: gmem<64x256xbf16 strides=[4096, 1]>, %12: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+            %12: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%12: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            move(%4: gmem<64x256xbf16 strides=[4096, 1]>, %12: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wgrmem"}
           }
         }""")
     assert text == expected
@@ -285,7 +326,7 @@ def test_epilogue_runs_on_the_promoted_accumulator():
         }"""))  # noqa: E501
 
     module = promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4, label_filter="mm",
         epilogue_label_filter="epilogue",
     )
@@ -293,10 +334,10 @@ def test_epilogue_runs_on_the_promoted_accumulator():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
-            %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
-            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
-            %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            elementwise sigmoid(%1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
-            move(%c: gmem<64x256xbf16>, %1: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_wrmem"}
+            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
+            %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise sigmoid(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+            move(%c: gmem<64x256xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_wgrmem"}
           }
         }""")  # noqa: E501

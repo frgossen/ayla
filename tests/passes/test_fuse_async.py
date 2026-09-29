@@ -12,28 +12,28 @@ def test_fuse_same_accumulator():
     ordering within a commit group."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %l0: lock<wgmma> = alloc() attrs={id: 0}
-            async(%l0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+            async(%l0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             await(%l0: lock<wgmma>)
             %l1: lock<wgmma> = alloc() attrs={id: 1}
-            async(%l1: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+            async(%l1: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             await(%l1: lock<wgmma>)
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = fuse_async(module)
     text = repr(module)
 
     expected = textwrap.dedent("""\
         module {
-          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %l0: lock<wgmma> = alloc() attrs={id: 0}
             %l1: lock<wgmma> = alloc() attrs={id: 1}
             async(%l0: lock<wgmma>) {
-              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
             await(%l0: lock<wgmma>)
           }
@@ -60,7 +60,7 @@ def test_fuse_tma_loads():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = fuse_async(module)
     text = repr(module)
 
@@ -108,7 +108,7 @@ def test_does_not_fuse_incompatible_tma_loads(
           }}
         }}""")
 
-    module = fuse_async(gpu_dialect.parse(module_str))
+    module = fuse_async(gpu_dialect.parse_module(module_str))
 
     assert repr(module) == module_str
 
@@ -117,28 +117,28 @@ def test_fuse_different_accumulators():
     """Matmuls writing to different accumulators can fuse."""
     module_str = textwrap.dedent("""\
         module {
-          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">, %c1: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">, %c1: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %l0: lock<wgmma> = alloc() attrs={id: 0}
-            async(%l0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+            async(%l0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             await(%l0: lock<wgmma>)
             %l1: lock<wgmma> = alloc() attrs={id: 1}
-            async(%l1: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c1: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+            async(%l1: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c1: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             await(%l1: lock<wgmma>)
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     module = fuse_async(module)
     text = repr(module)
 
     expected = textwrap.dedent("""\
         module {
-          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">, %c1: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">, %c1: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %l0: lock<wgmma> = alloc() attrs={id: 0}
             %l1: lock<wgmma> = alloc() attrs={id: 1}
             async(%l0: lock<wgmma>) {
-              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c1: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c0: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c1: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
             await(%l0: lock<wgmma>)
           }

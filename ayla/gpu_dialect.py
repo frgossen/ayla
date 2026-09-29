@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar, Iterator, Literal, cast
 
-from .base.ir import Block, Dialect, Op, Type, Value
+from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor_of_type
 from .base.printer import Printer
 
 
@@ -175,7 +175,7 @@ class KernelOp(Op):
             k: v for k, v in self.attrs.items()
             if k not in (
                 "name", "grid_dim", "block_dim", "cluster_dim",
-                "num_warp_groups",
+                "num_warp_groups", "ptx_optimization_level",
             )
         }
 
@@ -289,6 +289,15 @@ class CollectiveAxis(enum.IntEnum):
     Z = 2
 
 
+def is_grid_collective(
+    collective: dict[CollectiveAxis, CollectiveLevel],
+    axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
+) -> bool:
+    return all(
+        collective[axis] >= CollectiveLevel.GRID for axis in axes
+    )
+
+
 def _print_collective(
     p: Printer,
     collective: dict[CollectiveAxis, CollectiveLevel],
@@ -391,28 +400,6 @@ class MatmulOp(Op):
         assert level.join(current) == current
         self.collective[axis] = level
 
-    def is_block_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(CollectiveLevel.BLOCK, axes)
-
-    def is_thread_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(CollectiveLevel.THREAD, axes)
-
-    def is_wg_collective(self, *axes: CollectiveAxis) -> bool:
-        return self._is_collective(
-            CollectiveLevel.WG, axes, valid_axes=(CollectiveAxis.X,),
-        )
-
-    def _is_collective(
-        self,
-        level: CollectiveLevel,
-        axes: tuple[CollectiveAxis, ...],
-        valid_axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
-    ) -> bool:
-        if not axes:
-            axes = valid_axes
-        assert all(axis in valid_axes for axis in axes)
-        return all(self.collective_level(axis) >= level for axis in axes)
-
     @property
     def extra_attrs(self) -> dict[str, object]:
         return {
@@ -457,6 +444,8 @@ class MatmulOp(Op):
 @gpu_dialect.register_op("tile")
 class TileOp(Op):
     """Select a sub-region (view) of a buffer.
+
+    Each index advances the view origin by the corresponding result size.
 
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
@@ -512,6 +501,13 @@ class TileOp(Op):
     def maybe_partial(self) -> bool:
         return bool(self.attrs.get("maybe_partial", False))
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("static_indices", "maybe_partial")
+        }
+
     def print(self, p: Printer) -> None:
         for i, v in enumerate(self.results):
             if i:
@@ -558,7 +554,6 @@ class TileOp(Op):
             attrs={"static_indices": static_indices, **attrs},
         )
 
-
 @gpu_dialect.register_op("reshape")
 class ReshapeOp(Op):
     """Reinterpret a dense tensor with a different shape without moving data."""
@@ -573,6 +568,118 @@ class ReshapeOp(Op):
     @property
     def arg(self) -> Value:
         return self.operands[0]
+
+
+@gpu_dialect.register_op("reduce")
+class ReduceOp(Op):
+    """Accumulate a reduction into a destination.
+
+    The final source dimension is always the reduction dimension. Source and
+    destination have the same rank, and all preceding dimensions are matching
+    parallel dimensions.
+
+    The ``collective`` attribute describes the collective level at which the
+    reduction is executed. Output ownership remains encoded by the destination
+    type, for example ``wrmem``.
+
+    Equal source and destination shapes represent a partial-reduction step;
+    a smaller destination combines those partials.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        dst: Value,
+        src: Value,
+        fn: str,
+        collective: dict[CollectiveAxis, CollectiveLevel],
+        attrs: dict[str, object] | None = None,
+        init: float | int | None = None,
+    ) -> "ReduceOp":
+        a: dict[str, object] = dict(attrs or {})
+        if "fn" in a:
+            raise ValueError("pass fn as an explicit argument")
+        if "collective" in a:
+            raise ValueError("pass collective as an explicit argument")
+        if "init" in a:
+            raise ValueError("pass init as an explicit argument")
+        a["fn"] = fn
+        a["collective"] = dict(collective)
+        if init is not None:
+            a["init"] = init
+        return cls(
+            operands=[dst, src],
+            results=[],
+            attrs=a,
+        )
+
+    @property
+    def dst(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def src(self) -> Value:
+        return self.operands[1]
+
+    @property
+    def fn(self) -> str:
+        return self.attrs["fn"]  # type: ignore[return-value]
+
+    @property
+    def init(self) -> float | int | None:
+        return self.attrs.get("init")  # type: ignore[return-value]
+
+    @property
+    def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
+        return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("collective", "fn", "init")
+        }
+
+    def print(self, p: Printer) -> None:
+        p.write(f"{self.op_id} {self.fn}(")
+        for index, operand in enumerate(self.operands):
+            if index:
+                p.write(", ")
+            operand.print(p)
+        p.write(")")
+        _print_collective(p, self.collective)
+        p.write_extra_attrs(self.attrs, skip_keys=("collective", "fn"))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ReduceOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        fn = p.read_identifier()
+        p.read_literal("(")
+        operands: list[Value] = []
+        if not p.can_read_literal(")"):
+            operands.append(Value.parse(p))
+            while p.can_read_literal(","):
+                p.read_literal(",")
+                operands.append(Value.parse(p))
+        p.read_literal(")")
+        collective = _parse_collective(p)
+        attrs = p.read_extra_attrs()
+        if "fn" in attrs:
+            raise ValueError("reduce function must not also appear in attrs")
+        if "collective" in attrs:
+            raise ValueError(
+                "reduce collective must not also appear in attrs"
+            )
+        return cls(
+            operands=operands,
+            results=results,
+            attrs={"fn": fn, "collective": collective, **attrs},
+        )
 
 
 @gpu_dialect.register_op("elementwise")
@@ -617,6 +724,10 @@ class ElementwiseOp(Op):
     @property
     def fn(self) -> str:
         return self.attrs["fn"]  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {key: value for key, value in self.attrs.items() if key != "fn"}
 
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id} {self.fn}(")
@@ -708,7 +819,10 @@ class AllocOp(Op):
 
     @property
     def extra_attrs(self) -> dict[str, object]:
-        return {k: v for k, v in self.attrs.items() if k != "init"}
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("id", "init")
+        }
 
 
 @gpu_dialect.register_op("reinterpret")
@@ -761,11 +875,16 @@ class MoveOp(Op):
         indices: list[Value] | None = None,
         *,
         collective: dict[CollectiveAxis, CollectiveLevel],
+        multicast: bool = False,
         attrs: dict[str, object] | None = None,
     ) -> "MoveOp":
         operands = [dst, src] + (indices or [])
         attrs = dict(attrs or {})
+        if "multicast" in attrs:
+            raise ValueError("pass multicast as an explicit argument")
         attrs["collective"] = dict(collective)
+        if multicast is not False:
+            attrs["multicast"] = multicast
         return cls(
             operands=operands, results=[], attrs=attrs,
         )
@@ -785,6 +904,17 @@ class MoveOp(Op):
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def multicast(self) -> bool:
+        return self.attrs.get("multicast", False)  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("collective", "multicast")
+        }
 
     def print(self, p: Printer) -> None:
         p.write("move(")
@@ -811,9 +941,12 @@ class MoveOp(Op):
         p.read_literal(")")
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
+        multicast = attrs.pop("multicast", False)
         return cls.build(
             operands[0], operands[1], operands[2:],
-            collective=collective, attrs=attrs,
+            collective=collective,
+            multicast=multicast,  # type: ignore[arg-type]
+            attrs=attrs,
         )
 
 
@@ -838,12 +971,17 @@ class TmaMoveOp(Op):
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         l2_cache_hint: str | None = None,
+        multicast: bool = False,
     ) -> "TmaMoveOp":
         operands = [dst, src] + indices
         attrs = dict(attrs or {})
+        if "multicast" in attrs:
+            raise ValueError("pass multicast as an explicit argument")
         attrs["collective"] = dict(collective)
         if l2_cache_hint is not None:
             attrs["l2_cache_hint"] = l2_cache_hint
+        if multicast is not False:
+            attrs["multicast"] = multicast
         return cls(operands=operands, results=[], attrs=attrs)
 
     @property
@@ -866,8 +1004,19 @@ class TmaMoveOp(Op):
         return hint  # type: ignore[return-value]
 
     @property
+    def multicast(self) -> bool:
+        return self.attrs.get("multicast", False)  # type: ignore[return-value]
+
+    @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key not in ("collective", "l2_cache_hint", "multicast")
+        }
 
     def print(self, p: Printer) -> None:
         p.write("tma_move(")
@@ -895,10 +1044,12 @@ class TmaMoveOp(Op):
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
         l2_cache_hint = attrs.pop("l2_cache_hint", None)
+        multicast = attrs.pop("multicast", False)
         return cls.build(
             operands[0], operands[1], indices=operands[2:],
             collective=collective, attrs=attrs,
             l2_cache_hint=l2_cache_hint,  # type: ignore[arg-type]
+            multicast=multicast,  # type: ignore[arg-type]
         )
 
 
@@ -912,6 +1063,8 @@ class LockType(Type):
 
     The ``kind`` attribute encodes the hardware mechanism:
       - ``"mbar"``: mbarrier-based (lock value = mbarrier smem address)
+      - ``"cluster_mbar"``: cluster-to-leader rendezvous mbarrier in shared
+        memory (lock value = the rank-0 CTA's mbarrier address)
       - ``"wgmma"``: wgmma commit-group counter (lock value unused)
       - ``"bulk"``: bulk async commit-group (TMA stores)
       - ``None``: unspecified (set by lower_to_async before PTX lowering)
@@ -973,14 +1126,15 @@ class BarrierOp(Op):
     """A rendezvous / synchronization point across a set of threads.
 
     It only establishes a happens-before across its participating threads.
-    Hardware-backed scopes need no operand; a software grid barrier carries
-    its zero-initialized global-memory synchronization buffer. Kernels using a
-    grid barrier must be scheduled so all participating blocks can be resident
-    concurrently.
+    Most hardware-backed scopes need no operand. A ``cluster_to_leader`` barrier
+    carries its cluster mbarrier, while a software grid barrier carries its
+    zero-initialized global-memory
+    synchronization buffer. Kernels using a grid barrier must be scheduled so
+    all participating blocks can be resident concurrently.
 
-    The ``scope`` attribute records the participant set the sync spans, one of:
+    The ``scope`` attribute records the participant set and direction, one of:
     ``thread``, ``warp``, ``warpgroup``, ``block_leader``, ``block``,
-    ``cluster``, ``grid``.
+    ``cluster_to_leader``, ``leader_to_cluster``, ``cluster``, ``grid``.
     """
 
     @classmethod
@@ -999,8 +1153,15 @@ class BarrierOp(Op):
     def scope(self) -> str:
         return self.attrs["scope"]  # type: ignore[return-value]
 
-    # TODO: Replace this explicit operand once scratch global-memory allocation
-    # for fused operations has an owner.
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "scope"
+        }
+
+    # TODO: Replace explicit synchronization operands once their scratch
+    # allocations have an owner.
     @property
     def sync(self) -> Value | None:
         return self.operands[0] if self.operands else None
@@ -1100,6 +1261,20 @@ class AsyncOp(Op):
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
 
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "collective"
+        }
+
+    @property
+    def is_tma_multicast(self) -> bool:
+        return any(
+            isinstance(op, (MoveOp, TmaMoveOp)) and op.multicast is True
+            for op in self.body.ops
+        )
+
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id}(")
         self.lock.print(p)
@@ -1185,7 +1360,7 @@ class MemTensorType(Type):
 
     Subclasses split along the addressing model:
       - AddrMemTensorType: byte-addressable linear memory (gmem, smem).
-      - RegMemTensorType: SIMT-distributed registers (rmem, wrmem).
+      - RegMemTensorType: SIMT-distributed registers (rmem, wgrmem).
 
     All subclasses encode as `<NAME><N x M x ... x DTYPE [extra] attrs={...}>`,
     differing only in the `[extra]` clauses they print/parse (strides for
@@ -1351,7 +1526,7 @@ class AddrMemTensorType(MemTensorType):
 class RegMemTensorType(MemTensorType):
     """Register-resident tensor: SIMT-distributed registers, no byte
     addressing. Storage is a fixed set of named registers per thread
-    (rmem) or per warp (wrmem); no pointer arithmetic, no aliasing.
+    (rmem) or per warp (wgrmem); no pointer arithmetic, no aliasing.
     """
 
 
@@ -1667,9 +1842,9 @@ class RmemTensorType(RegMemTensorType):
     """
 
 
-@gpu_dialect.register_type("wrmem")
-class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
-    """Warp register-memory tensor.
+@gpu_dialect.register_type("wgrmem")
+class WgrmemTensorType(RegMemTensorType):
+    """Warp-group register-memory tensor.
 
     Logical tensor distributed across multiple warps. Each thread holds
     a fragment in its own registers; the full value is the union of all
@@ -1682,7 +1857,7 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
     Supported layouts:
       - ``"mma"``: mma.sync m16n8k16, warps=1
       - ``"wgmma_layout_0"``: warp group MMA m64nNk16, warps=4
-    All lowerings that read from a wrmem tensor (store, convert, matmul)
+    All lowerings that read from a wgrmem tensor (store, convert, matmul)
     must check the layout to emit correct code.
     """
 
@@ -1696,7 +1871,7 @@ class WrmemTensorType(RegMemTensorType):# TODO: rename wrmem to wgrmem
         attrs: dict[str, object] | None = None,
     ):
         assert layout in ("mma", "wgmma_layout_0"), (
-            f"WrmemTensorType: layout must be 'mma' or 'wgmma_layout_0'; "
+            f"WgrmemTensorType: layout must be 'mma' or 'wgmma_layout_0'; "
             f"got {layout!r}"
         )
         return cls(attrs={
@@ -2005,6 +2180,31 @@ class WarpGroupIdOp(Op):
         return self.results[2]
 
 
+@gpu_dialect.register_op("warp_ids")
+class WarpIdsOp(Op):
+    """Produce the 3D warp index within the block."""
+
+    @classmethod
+    def build(cls) -> "WarpIdsOp":
+        idx = IndexType()
+        return cls(
+            operands=[],
+            results=[Value(name=name, type=idx) for name in ["wx", "wy", "wz"]],
+        )
+
+    @property
+    def x(self) -> Value:
+        return self.results[0]
+
+    @property
+    def y(self) -> Value:
+        return self.results[1]
+
+    @property
+    def z(self) -> Value:
+        return self.results[2]
+
+
 @gpu_dialect.register_op("index_constant")
 class IndexConstantOp(Op):
     """Produce a constant index value."""
@@ -2225,79 +2425,79 @@ def root_buffer(value: Value) -> Value | None:
 class CollectiveScope(enum.IntEnum):
     r"""The granularity at which an effect is completely independent of concurrent
     operations. A partial order, not a chain. ``BLOCK_LEADER`` is work at block
-    scope but performed exclusively by thread 0, e.g. a TMA::
+    scope but performed exclusively by thread 0, e.g. a TMA.
+    ``CLUSTER_LEADER`` is the corresponding single issuer acting for a cluster,
+    so ``BLOCK_LEADER <= CLUSTER_LEADER``. They coincide operationally for a
+    single-CTA cluster but remain distinct lattice elements. ``BLOCK`` (all
+    threads in one CTA) and ``CLUSTER_LEADER`` (one issuer for the cluster) are
+    incomparable::
 
              GRID
               |
            CLUSTER
-              |
-            BLOCK
-            /   \
-    WARPGROUP   BLOCK_LEADER
-           |     |
-         WARP    |
-            \   /
-            THREAD
+           /       \
+        BLOCK   CLUSTER_LEADER
+        /   \       |
+ WARPGROUP   BLOCK_LEADER
+        |       |
+      WARP      |
+         \     /
+          THREAD
     """
     THREAD = 0
     WARP = 1
     WARPGROUP = 2
     BLOCK_LEADER = 3
     BLOCK = 4
-    CLUSTER = 5
-    GRID = 6
+    CLUSTER_LEADER = 5
+    CLUSTER = 6
+    GRID = 7
 
     def join(self, other: CollectiveScope) -> CollectiveScope:
         """The join (least upper bound) on the CollectiveScope lattice."""
-        if self == CollectiveScope.GRID:
-            return self
-        if self == CollectiveScope.THREAD:
-            return other
-        if self == CollectiveScope.CLUSTER:
-            return other if other == CollectiveScope.GRID else self
-        if self == CollectiveScope.BLOCK:
-            return other if other in {
-                CollectiveScope.CLUSTER, CollectiveScope.GRID,
-            } else self
-        if self == CollectiveScope.BLOCK_LEADER:
-            if other in {CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER}:
-                return self
-            if other in {
-                CollectiveScope.BLOCK,
-                CollectiveScope.CLUSTER,
-                CollectiveScope.GRID,
-            }:
-                return other
-            return CollectiveScope.BLOCK  # other is WARP or WARPGROUP
-        if self == CollectiveScope.WARPGROUP:
-            if other in {
-                CollectiveScope.BLOCK,
-                CollectiveScope.CLUSTER,
-                CollectiveScope.GRID,
-            }:
-                return other
-            if other == CollectiveScope.BLOCK_LEADER:
-                return CollectiveScope.BLOCK
-            return self  # other is THREAD, WARP, or WARPGROUP
-        if self == CollectiveScope.WARP:
-            if other in {CollectiveScope.WARP, CollectiveScope.THREAD}:
-                return self
-            if other == CollectiveScope.BLOCK_LEADER:
-                return CollectiveScope.BLOCK
-            return other  # other is WARPGROUP, BLOCK, or GRID
-        raise NotImplementedError(
-            f"CollectiveScope.join: unhandled pair {self!r}, {other!r}"
+        common_upper_bounds = [
+            scope for scope in CollectiveScope
+            if self.leq(scope) and other.leq(scope)
+        ]
+        least_upper_bounds = [
+            candidate for candidate in common_upper_bounds
+            if all(candidate.leq(scope) for scope in common_upper_bounds)
+        ]
+        assert len(least_upper_bounds) == 1, (
+            f"CollectiveScope has no unique join for {self!r} and {other!r}"
         )
+        return least_upper_bounds[0]
 
     def leq(self, other: CollectiveScope) -> bool:
         """The partial order (<=) of the CollectiveScope lattice."""
-        return self.join(other) == other
+        return self == other or any(
+            upper.leq(other)
+            for upper in _COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS[self]
+        )
+
+
+_COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
+    CollectiveScope.THREAD: (
+        CollectiveScope.WARP,
+        CollectiveScope.BLOCK_LEADER,
+    ),
+    CollectiveScope.WARP: (CollectiveScope.WARPGROUP,),
+    CollectiveScope.WARPGROUP: (CollectiveScope.BLOCK,),
+    CollectiveScope.BLOCK_LEADER: (
+        CollectiveScope.BLOCK,
+        CollectiveScope.CLUSTER_LEADER,
+    ),
+    CollectiveScope.BLOCK: (CollectiveScope.CLUSTER,),
+    CollectiveScope.CLUSTER_LEADER: (CollectiveScope.CLUSTER,),
+    CollectiveScope.CLUSTER: (CollectiveScope.GRID,),
+    CollectiveScope.GRID: (),
+}
 
 
 def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, RmemTensorType):
         return CollectiveScope.THREAD
-    if isinstance(t, WrmemTensorType):
+    if isinstance(t, WgrmemTensorType):
         return CollectiveScope.WARPGROUP
     if isinstance(t, SmemTensorType):
         return CollectiveScope.BLOCK
@@ -2315,6 +2515,13 @@ class MemoryEffect:
     kind: Literal["R", "W"]
     value: Value
     scope: CollectiveScope
+    tiling_scheme: int | None = None
+
+    _tiling_scheme_id_counter: ClassVar[Iterator[int]] = itertools.count()
+
+    @classmethod
+    def fresh_tiling_scheme_id(cls) -> int:
+        return next(cls._tiling_scheme_id_counter)
 
     @property
     def roots(self) -> set[Value]:
@@ -2322,9 +2529,21 @@ class MemoryEffect:
 
 
 def _memory_effect(
-    kind: Literal["R", "W"], value: Value, scope: CollectiveScope,
+    kind: Literal["R", "W"],
+    value: Value,
+    scope: CollectiveScope,
+    tiling_scheme: int | None = None,
 ) -> list[MemoryEffect]:
-    return [MemoryEffect(kind, value, scope)]
+    return [MemoryEffect(kind, value, scope, tiling_scheme)]
+
+
+def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
+    if not isinstance(value.type, TmaDescType):
+        return value
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None:
+        return value
+    return kernel.body.arguments[value.type.arg_idx]
 
 
 def memory_effects(op: Op) -> list[MemoryEffect] | None:
@@ -2332,7 +2551,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
 
     Each effect retains the accessed view so consumers can recover its precise
     region. ``effect.roots`` provides its underlying allocations/arguments for
-    conservative alias checks.
+    conservative alias checks. A non-null ``tiling_scheme`` identifies a family
+    of accesses known to be pairwise disjoint.
 
     Returns ``None`` for ops we don't know how to model; callers must treat that
     as a worst-case conflict.
@@ -2340,39 +2560,78 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
     if is_side_effect_free(op):
         return []
     if isinstance(op, MoveOp):
-        # A TMA move is issued by the leader thread (t0), so its smem write is
-        # BLOCK_LEADER; a cooperative move writes at the buffer's own scope.
+        # A TMA move is issued by t0 of its block, or by t0 of cluster rank 0
+        # for multicast. A cooperative move writes at the buffer's own scope.
         src_scope = (
             CollectiveScope.THREAD
-            if isinstance(op.src.type, WrmemTensorType)
+            if isinstance(op.src.type, WgrmemTensorType)
             else _type_collective_scope(op.src.type)
         )
-        dst_scope = (
-            CollectiveScope.BLOCK_LEADER
-            if op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType)
-            else _type_collective_scope(op.dst.type)
-        )
+        # TODO: Derive the issuing scope from ``op.collective`` once collective
+        # levels can express leader-only execution. For now, the destination
+        # memory space distinguishes a TMA load from a store, while ``multicast``
+        # distinguishes the cluster leader from an ordinary block leader.
+        if op.multicast is True:
+            dst_scope = CollectiveScope.CLUSTER_LEADER
+        elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):
+            dst_scope = CollectiveScope.BLOCK_LEADER
+        else:
+            dst_scope = _type_collective_scope(op.dst.type)
         return (
-            _memory_effect("W", op.dst, dst_scope)
-            + _memory_effect("R", op.src, src_scope)
+            _memory_effect(
+                "W", op.dst, dst_scope,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
+            + _memory_effect(
+                "R", op.src, src_scope,
+                cast(int | None, op.attrs.get("src_tiling_scheme")),
+            )
         )
     if isinstance(op, TmaMoveOp):
-        # The block leader issues both sides of the TMA transfer.
+        # A block leader issues ordinary TMA, while the cluster leader issues
+        # multicast. Global memory is shared across the grid. The descriptor is
+        # metadata, so resolve it to the underlying kernel argument.
+        dst_scope = (
+            CollectiveScope.CLUSTER_LEADER
+            if op.multicast is True
+            else CollectiveScope.BLOCK_LEADER
+            if isinstance(op.dst.type, SmemTensorType)
+            else CollectiveScope.GRID
+        )
+        src_scope = (
+            CollectiveScope.BLOCK_LEADER
+            if isinstance(op.src.type, SmemTensorType)
+            else CollectiveScope.GRID
+        )
         return (
-            _memory_effect("W", op.dst, CollectiveScope.BLOCK_LEADER)
-            + _memory_effect("R", op.src, CollectiveScope.BLOCK_LEADER)
+            _memory_effect(
+                "W", _resolve_tma_descriptor(op, op.dst), dst_scope,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
+            + _memory_effect(
+                "R", _resolve_tma_descriptor(op, op.src), src_scope,
+                cast(int | None, op.attrs.get("src_tiling_scheme")),
+            )
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         return (
             _memory_effect(
                 "R", op.lhs, _type_collective_scope(op.lhs.type),
+                cast(int | None, op.attrs.get("lhs_tiling_scheme")),
             )
             + _memory_effect(
                 "R", op.rhs, _type_collective_scope(op.rhs.type),
+                cast(int | None, op.attrs.get("rhs_tiling_scheme")),
             )
-            + _memory_effect("R", op.dst, CollectiveScope.THREAD)
-            + _memory_effect("W", op.dst, CollectiveScope.THREAD)
+            + _memory_effect(
+                "R", op.dst, CollectiveScope.THREAD,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
+            + _memory_effect(
+                "W", op.dst, CollectiveScope.THREAD,
+                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            )
         )
     if isinstance(op, ElementwiseOp):
         effects = _memory_effect("W", op.dst, CollectiveScope.THREAD)
@@ -2381,6 +2640,27 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
                 "R", op.src(i), CollectiveScope.THREAD,
             )
         return effects
+    if isinstance(op, ReduceOp):
+        # Register accumulators are independently read and updated by each
+        # thread; the source determines whether the reduction is collective.
+        dst_scope = (
+            CollectiveScope.THREAD
+            if isinstance(
+                op.dst.type,
+                (RmemTensorType, WgrmemTensorType),
+            )
+            else _type_collective_scope(op.dst.type)
+        )
+        effects = (
+            [] if op.init is not None else _memory_effect("R", op.dst, dst_scope)
+        )
+        return (
+            effects
+            + _memory_effect("W", op.dst, dst_scope)
+            + _memory_effect(
+                "R", op.src, _type_collective_scope(op.src.type),
+            )
+        )
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
@@ -2398,11 +2678,11 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return effects
     if isinstance(op, AllocOp):
         # Only an initialized alloc writes (fills the buffer); an uninitialized
-        # one is side-effect-free, handled above. A wrmem accumulator is per-thread.
+        # one is side-effect-free, handled above. A wgrmem accumulator is per-thread.
         buf = op.result()
         scope = (
             CollectiveScope.THREAD
-            if isinstance(buf.type, WrmemTensorType)
+            if isinstance(buf.type, WgrmemTensorType)
             else _type_collective_scope(buf.type)
         )
         return _memory_effect("W", buf, scope)
@@ -2456,7 +2736,7 @@ def is_side_effect_free(op: Op) -> bool:
         ThreadIdsOp,
         TileOp,
         ToPtrOp,
-        ReshapeOp,
+        WarpIdsOp,
         WarpGroupIdOp,
     ))
 

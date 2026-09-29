@@ -4,6 +4,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
+from typing import cast
 
 from . import pytree
 from .base.ir import Op, Printer, Value
@@ -35,7 +36,7 @@ from .gpu_dialect import (
     TmaDescType,
     ToPtrOp,
     WarpGroupIdOp,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
 from .passes.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
@@ -134,6 +135,7 @@ def map_type_to_registers(type):
         )
     if isinstance(type, RmemTensorType):
         n = type.num_elements
+        assert n is not None
         # bf16 is stored in 16-bit registers (no native `mov.bf16`).
         ptx_dtype = (
             PtxType.B16 if type.dtype.name == "bf16"
@@ -163,7 +165,7 @@ def map_type_to_registers(type):
                 "cvta.param.u64 {reg}, {reg};"
             ),
         )
-    if isinstance(type, WrmemTensorType):
+    if isinstance(type, WgrmemTensorType):
         num_elements_per_thread = type.num_elements_per_thread
         if type.dtype.name in ("bf16", "f16"):
             n_regs = num_elements_per_thread // 2
@@ -173,7 +175,7 @@ def map_type_to_registers(type):
             ptx_dtype = PtxType.F32
         else:
             raise NotImplementedError(
-                f"map_type_to_registers: wrmem dtype {type.dtype.name}"
+                f"map_type_to_registers: wgrmem dtype {type.dtype.name}"
             )
         return TypeRegisterMapping(
             member_register_types=tuple(ptx_dtype for _ in range(n_regs)),
@@ -195,6 +197,11 @@ def map_type_to_registers(type):
             return TypeRegisterMapping(
                 member_register_types=(PtxType.B32, PtxType.B32),
                 member_names=("val", "parity"),
+            )
+        if type.kind == "cluster_mbar":
+            return TypeRegisterMapping(
+                member_register_types=PtxType.B32,
+                member_names="val",
             )
         return TypeRegisterMapping(
             member_register_types=(),
@@ -288,15 +295,20 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-
     module = PtxLoweringPipeline().run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
-    grid_dim = tuple(d if d is not None else 1 for d in kernel.grid_dim)
+    grid_dim = cast(
+        tuple[int, int, int],
+        tuple(d if d is not None else 1 for d in kernel.grid_dim),
+    )
     block_dim = _resolve_block_dim(kernel)
     cluster_dim = (
-        tuple(d if d is not None else 1 for d in kernel.cluster_dim)
+        cast(
+            tuple[int, int, int],
+            tuple(d if d is not None else 1 for d in kernel.cluster_dim),
+        )
         if any(d is not None for d in kernel.cluster_dim)
         else None
     )
@@ -483,9 +495,9 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
     def repl(m: re.Match) -> str:
         ty, name = m.group("ty"), m.group("name")
         if name not in placeholder_values:
-            placeholder_values[name] = p.unique_ptx_names(
-                (op, name),
-                PtxType(ty),
+            placeholder_values[name] = cast(
+                str,
+                p.unique_ptx_names((op, name), PtxType(ty)),
             )
         return placeholder_values[name]
 
@@ -643,6 +655,7 @@ def _emit_to_ptr(p: PtxPrinter, op: ToPtrOp) -> None:
     dst = p.unique_ptx_names_for_value(op.result())
     src = p.unique_ptx_names_for_value(op.arg)
     ptr_type = op.result().type
+    assert isinstance(ptr_type, PtrType)
     if ptr_type.space == "gmem":
         _write_with_comment(p, f"mov.u64 {dst}, {src};", op)
     else:
@@ -654,6 +667,7 @@ def _emit_ptr_add(p: PtxPrinter, op: PtrAddOp) -> None:
     ptr = p.unique_ptx_names_for_value(op.ptr)
     offset_val = _const_val(op.byte_offset)
     ptr_type = op.result().type
+    assert isinstance(ptr_type, PtrType)
     if ptr_type.space == "gmem":
         if offset_val is not None:
             _write_with_comment(p, f"add.u64 {dst}, {ptr}, {offset_val};", op)
@@ -676,9 +690,16 @@ def _op_description(p: PtxPrinter, op: Op, max_len: int = 80) -> str:
     Uses `expr_str` when available (with PTX register names),
     else `op.attrs["description"]`, else `str(op)`.
     """
-    if hasattr(op, "expr_str"):
-        return op.expr_str(val_str=lambda v, prec=0: p.unique_ptx_names_for_value(v))
-    s = op.attrs.get("description") if "description" in op.attrs else str(op)
+    expr_str = getattr(op, "expr_str", None)
+    if callable(expr_str):
+        return cast(
+            str,
+            expr_str(
+                val_str=lambda v, prec=0: p.unique_ptx_names_for_value(v),
+            ),
+        )
+    description = op.attrs.get("description")
+    s = description if isinstance(description, str) else str(op)
     nl = s.find("\n")
     cut = min(nl, max_len) if nl != -1 else min(len(s), max_len)
     if cut < len(s):

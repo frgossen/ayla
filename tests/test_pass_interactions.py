@@ -18,6 +18,8 @@ test.
 # flake8: noqa: E501
 import textwrap
 
+import pytest
+
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     CollectiveAxis,
@@ -30,10 +32,15 @@ from ayla.gpu_dialect import (
     gpu_dialect,
 )
 from ayla.passes.canonicalize import Canonicalize
+from ayla.passes.fuse_async import fuse_async
+from ayla.passes.insert_syncs import insert_syncs
+from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.tile_elementwise import tile_elementwise
 from ayla.passes.tile_matmul import tile_matmul
 from ayla.passes.unroll_loop import unroll_loop
+from ayla.ptx_codegen import make_ptx_kernel
+from tests.testing_utils import assert_contains_in_order
 
 MODULE_STR = textwrap.dedent("""\
     module {
@@ -42,7 +49,6 @@ MODULE_STR = textwrap.dedent("""\
         elementwise sigmoid(%c: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={label: "epilogue"}
       }
     }""")
-
 
 def _block_tiled():
     module = gpu_dialect.parse(MODULE_STR)
@@ -91,7 +97,7 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
     """
     module = _tiled()
     module = promote_buffers(
-        module, target_type="wrmem", operands=["dst"],
+        module, target_type="wgrmem", operands=["dst"],
         swizzle=None, layout="wgmma_layout_0", warps=4,
         tma=False, nc=False, target_dtype="f32",
         label_filter="mm", epilogue_label_filter="epilogue",
@@ -103,8 +109,8 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
 def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @epilogue(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
-            elementwise sigmoid(%value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+          kernel @epilogue(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
+            elementwise sigmoid(%value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %value: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
           }
         }"""))  # noqa: E501
     tile_elementwise(
@@ -152,7 +158,7 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         op_label_filter="mm", epilogue_label_filter="epilogue",
     )
     promote_buffers(
-        module, target_type="wrmem", target_dtype="f32", operands=["dst"],
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
         layout="wgmma_layout_0", warps=4,
         label_filter="mm", epilogue_label_filter="epilogue",
     )
@@ -161,7 +167,7 @@ def test_output_tiling_remains_in_explicit_loops_after_promotion():
         tile_dims=[1], tile_sizes=[64],
         tile_levels=["for"], tile_labels=["outn"],
         label_filter=(
-            "epilogue|mm_dst_convert|mm_dst_wrmem|mm_dst_smem"
+            "epilogue|mm_dst_convert|mm_dst_wgrmem|mm_dst_smem"
         ),
     )
 
@@ -200,6 +206,88 @@ def test_two_matmuls_share_block_x_with_different_n_tile_counts():
     assert matmuls[1].parent_block is kernel.body
 
 
+def test_separately_tiled_matmul_chain_keeps_raw_dependency():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) {
+            matmul(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "up"}
+            matmul(%intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "down"}
+          }
+        }"""))  # noqa: E501
+    tile_matmul(
+        module,
+        op_dims=["M", "N"], tile_sizes=[32, 64],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
+        for_loop_labels=[None, None],
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) grid_dim=[2, 4, None] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %0: gmem<32x64xbf16> = tile(%a: gmem<64x64xbf16>, %bx: index, 0)
+            %1: gmem<64x64xbf16> = tile(%w_up: gmem<256x64xbf16>, %by: index, 0)
+            %2: gmem<32x256xbf16> = tile(%intermediate: gmem<64x256xbf16>, %bx: index, 0)
+            %3: gmem<32x64xbf16 strides=[256, 1]> = tile(%2: gmem<32x256xbf16>, 0, %by: index)
+            matmul(%0: gmem<32x64xbf16>, %1: gmem<64x64xbf16>, %3: gmem<32x64xbf16 strides=[256, 1]>) collective=[xy.block, z.grid] attrs={dst_tiling_scheme: 0, label: "up"}
+            %bx1: index, %by1: index, %bz1: index = block_ids()
+            %4: gmem<32x256xbf16> = tile(%intermediate: gmem<64x256xbf16>, %bx1: index, 0)
+            %5: gmem<64x256xbf16> = tile(%w_down: gmem<256x256xbf16>, %by1: index, 0)
+            %6: gmem<32x256xbf16> = tile(%out: gmem<64x256xbf16>, %bx1: index, 0)
+            %7: gmem<32x64xbf16 strides=[256, 1]> = tile(%6: gmem<32x256xbf16>, 0, %by1: index)
+            matmul(%4: gmem<32x256xbf16>, %5: gmem<64x256xbf16>, %7: gmem<32x64xbf16 strides=[256, 1]>) collective=[xy.block, z.grid] attrs={dst_tiling_scheme: 1, label: "down"}
+          }
+        }""")  # noqa: E501
+
+    # The tiled producer and consumer still access the same intermediate.
+    # InsertSyncs must retain their grid-scoped RAW dependency rather than
+    # treating their independently created tiling schemes as equivalent.
+    with pytest.raises(NotImplementedError, match="barrier GRID"):
+        insert_syncs(module)
+
+
+def test_local_and_multicast_tma_loads_keep_separate_completion():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @loads(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %sa: smem<16x16xf32> = alloc() attrs={id: 0}
+            move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) attrs={tma: True}
+            %sb: smem<16x16xf32> = alloc() attrs={id: 1}
+            move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
+          }
+        }"""))
+
+    fuse_async(lower_to_async(module))
+    ptx = make_ptx_kernel(module).ptx
+
+    local = "mbarrier::complete_tx::bytes ["
+    multicast = "mbarrier::complete_tx::bytes.multicast::cluster"
+    expect = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
+    local_wait = "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+    cluster_wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+    local_expect_pos = ptx.index(expect)
+    cluster_expect_pos = ptx.index(expect, local_expect_pos + 1)
+    assert_contains_in_order(
+        ptx,
+        "fence.mbarrier_init.release.cluster;",
+        "barrier.cluster.arrive.release;",
+        "barrier.cluster.wait.acquire;",
+    )
+    assert (
+        ptx.index(local)
+        < local_expect_pos
+        < ptx.index(local_wait)
+        < ptx.index(multicast)
+        < cluster_expect_pos
+        < ptx.index(cluster_wait)
+    )
+    assert ptx.count(f"{expect} _,") == 2
+    assert ptx.count("], 1024;") == 2
+
+
 TILED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
@@ -211,7 +299,7 @@ TILED_IR = textwrap.dedent("""\
         %wgx: index, %wgy: index, %wgz: index = warp_group_id()
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>) collective=[x.wg, y.block, z.grid] attrs={init: 0.0, label: "mm"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>) collective=[x.wg, y.block, z.grid] attrs={dst_tiling_scheme: 0, init: 0.0, label: "mm"}
         elementwise sigmoid(%5: gmem<64x256xbf16 strides=[4096, 1]>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={label: "epilogue"}
       }
     }""")
@@ -227,10 +315,10 @@ PROMOTED_IR = textwrap.dedent("""\
         %wgx: index, %wgy: index, %wgz: index = warp_group_id()
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-        %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wrmem"}
-        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
-        %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-        elementwise sigmoid(%7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
-        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm_dst_wrmem"}
+        %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
+        %7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+        elementwise sigmoid(%7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}
+        move(%5: gmem<64x256xbf16 strides=[4096, 1]>, %7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={dst_tiling_scheme: 0, label: "mm_dst_wgrmem"}
       }
     }""")

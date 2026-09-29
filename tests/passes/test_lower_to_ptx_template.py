@@ -39,6 +39,10 @@ def _lower_barrier(scope: str) -> str:
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
+    ("leader_to_cluster", textwrap.dedent("""\
+        barrier.cluster.arrive.release;
+        barrier.cluster.wait.acquire;
+    """)),
     ("cluster", textwrap.dedent("""\
         barrier.cluster.arrive.release;
         barrier.cluster.wait.acquire;
@@ -56,6 +60,38 @@ def test_lower_barrier_block_leader_is_named_barrier():
         @${pred:bl_w0} bar.sync 1, 128;
         @!${pred:bl_w0} bar.arrive 1, 128;
         """)
+
+
+def test_lower_cluster_to_leader_barrier_uses_its_lock():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %lock: lock<cluster_mbar> = alloc()
+            barrier(%lock: lock<cluster_mbar>) attrs={scope: "cluster_to_leader"}
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
+    assert (
+        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 2;"
+        in ptx
+    )
+    assert_contains_in_order(
+        ptx,
+        "fence.mbarrier_init.release.cluster;",
+        "bar.sync 0;",
+        "barrier.cluster.arrive.release;",
+        "barrier.cluster.wait.acquire;",
+        "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
+        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
+        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+    )
 
 
 def test_lower_smem_arena_and_reinterpret():
@@ -130,6 +166,26 @@ def test_lower_tile_uses_the_reinterpreted_view_strides():
     assert tile.byte_offset.definition.value == 32
 
 
+def test_lower_nested_tile_uses_root_block_major_coordinates():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %root: smem<128x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
+            %rows: smem<64x128xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%root: smem<128x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 1, 0)
+            %inner: smem<64x16xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%rows: smem<64x128xbf16 strides=[128, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 0, 5)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+    Folding().run(module)
+
+    ptr_adds = find_ops_of_type(module, PtrAddOp)
+    assert len(ptr_adds) == 2
+    offsets = [op.byte_offset.definition for op in ptr_adds]
+    assert all(isinstance(offset, IndexConstantOp) for offset in offsets)
+    assert sum(offset.value for offset in offsets) == 24608
+
+
 def test_grid_barrier_uses_last_arriver_to_release_waiters():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -165,6 +221,51 @@ def test_lower_tma_load_with_l2_cache_hint():
     )
     assert ptx.count("createpolicy.fractional.L2::evict_last") == 1
     assert "mbarrier::complete_tx::bytes.L2::cache_hint" in ptx
+
+
+def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @load(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={l2_cache_hint: "evict_last", multicast: True}
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    lower_to_ptx_template(module)
+
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
+    )
+    leader = "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;"
+    multicast = (
+        "mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+    )
+    arrive = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
+    wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+    assert_contains_in_order(
+        ptx,
+        "fence.mbarrier_init.release.cluster;",
+        "bar.sync 0;",
+        "barrier.cluster.arrive.release;",
+        "barrier.cluster.wait.acquire;",
+    )
+    assert (
+        ptx.index("barrier.cluster.wait.acquire;")
+        < ptx.index(leader)
+        < ptx.index(multicast)
+        < ptx.index(arrive)
+        < ptx.index(wait)
+    )
+    assert ptx.count(multicast) == 1
+    assert (
+        "[${b32:operand.lock.val}], 3, "
+        "${b64:operand.cache_policy0.ptr};"
+    ) in ptx
 
 
 def test_lower_tma_store_with_l2_cache_hint():
@@ -248,7 +349,7 @@ def test_lower_elementwise_sigmoid_mma():
     (0fBFB8AA3B). dst doubles as the scratch register -- src is read by the
     first instruction and not after, which is what lets dst be src.
     """
-    w = 'wrmem<16x8xf32 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
@@ -274,8 +375,8 @@ def test_lower_elementwise_sigmoid_mma():
 
 
 def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
-    w = 'wrmem<16x8xf32 layout="mma">'
-    b = 'wrmem<16x8xbf16 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
+    b = 'wgrmem<16x8xbf16 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
@@ -300,9 +401,9 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
-            %src: wrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
-            %dst: wrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
-            elementwise sigmoid(%dst: wrmem<16x8xf16 layout="mma">, %src: wrmem<16x8xf32 layout="mma">)
+            %src: wgrmem<16x8xf32 layout="mma"> = alloc() attrs={id: 0}
+            %dst: wgrmem<16x8xf16 layout="mma"> = alloc() attrs={id: 1}
+            elementwise sigmoid(%dst: wgrmem<16x8xf16 layout="mma">, %src: wgrmem<16x8xf32 layout="mma">)
           }
         }"""))  # noqa: E501
 
@@ -314,15 +415,15 @@ def test_lower_sigmoid_can_convert_its_result_to_f16():
     assert template.count("cvt.rn.f16x2.f32") == 2
 
 
-def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
+def test_lower_elementwise_convert_uses_root_registers_for_wgrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
-            %dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
-            %dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise convert(%dst_tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %src_tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
+            %dst_tail: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%dst: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
+            elementwise convert(%dst_tail: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -336,13 +437,49 @@ def test_lower_elementwise_convert_uses_root_registers_for_wrmem_view():
     assert "operand.dst.r47" not in template
 
 
-def test_lower_elementwise_uses_root_registers_for_wrmem_view():
+def test_lower_elementwise_convert_supports_n8_wgrmem_fragment():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
-            %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
-            elementwise sigmoid(%tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            %src: wgrmem<64x80xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %src_tail: wgrmem<64x40xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wgrmem<64x80xf32 warps=4 layout="wgmma_layout_0">, 0, 1)
+            elementwise convert(%dst: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0">, %src_tail: wgrmem<64x40xf32 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("cvt.rn.bf16x2.f32") == 10
+    assert "operand.dst.r9" in template
+    assert "operand.src.r39" in template
+
+
+@pytest.mark.parametrize("n", range(8, 257, 8))
+def test_lower_elementwise_supports_every_wgmma_n_extent(n):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %src: wgrmem<64x{n}xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+            %dst: wgrmem<64x{n}xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 1}}
+            elementwise convert(%dst: wgrmem<64x{n}xbf16 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x{n}xf32 warps=4 layout="wgmma_layout_0">)
+          }}
+        }}"""))  # noqa: E501
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("cvt.rn.bf16x2.f32") == n // 4
+
+
+def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%src: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, 3)
+            elementwise sigmoid(%tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %tail: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -366,7 +503,7 @@ def test_lower_elementwise_uses_root_registers_for_wrmem_view():
 
 
 def test_lower_elementwise_mul():
-    w = 'wrmem<16x8xf32 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
@@ -388,7 +525,7 @@ def test_lower_elementwise_mul():
 
 
 def test_lower_elementwise_silu():
-    w = 'wrmem<16x8xf32 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
@@ -420,8 +557,8 @@ def test_lower_elementwise_silu():
 
 
 def test_lower_elementwise_silu_with_bf16_output():
-    w = 'wrmem<16x8xf32 layout="mma">'
-    b = 'wrmem<16x8xbf16 layout="mma">'
+    w = 'wgrmem<16x8xf32 layout="mma">'
+    b = 'wgrmem<16x8xbf16 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{

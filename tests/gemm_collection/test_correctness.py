@@ -3,7 +3,6 @@
 import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
 import pytest
 import torch
-from torch.ops import ayla
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import (
@@ -21,15 +20,18 @@ from ayla.gpu_dialect import (
     ForOp,
     TileOp,
     TmaDescType,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
 from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
+
+
+ayla = torch.ops.ayla
 
 
 F32 = torch.float32
 BF16 = torch.bfloat16
-
 
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -87,6 +89,42 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
     assert kernel.name.startswith("auto_matmul_m512_n19968_k6656_")
     assert kernel.grid_dim == (2, 78, 1)
     assert kernel.block_dim == (256, 1, 1)
+
+
+def test_k128_block_major_nested_tiles_lower_to_ptx():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=128,
+            n=256,
+            k=128,
+            operand_k_tile=128,
+            output_slices=2,
+        )
+    )
+    assert "wgmma.mma_async" in kernel.ptx
+    assert kernel.ptx.count("wgmma.mma_async") == 8
+
+
+@requires_cuda
+def test_k128_block_major_nested_tiles_match_torch():
+    m, n, k = 128, 256, 128
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        operand_k_tile=128,
+        output_slices=2,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(7)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))
 
 
 def test_four_tile_output_evict_first_reaches_tma_stores():
@@ -194,12 +232,12 @@ def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
 
     loops = find_ops_of_type(module, ForOp)
     assert all(loop.attrs.get("label") != "outn" for loop in loops)
-    wrmem_tiles = [
+    wgrmem_tiles = [
         op for op in find_ops_of_type(module, TileOp)
-        if isinstance(op.result().type, WrmemTensorType)
+        if isinstance(op.result().type, WgrmemTensorType)
     ]
-    assert wrmem_tiles
-    assert all(None not in tile.static_indices for tile in wrmem_tiles)
+    assert wgrmem_tiles
+    assert all(None not in tile.static_indices for tile in wgrmem_tiles)
 
     epilogues = [
         op for op in find_ops_of_type(module, ElementwiseOp)
@@ -308,7 +346,7 @@ def test_every_registered_kernel_is_covered():
     and the collection.
     """
     parametrize = next(
-        mark for mark in test_gemm_correctness.pytestmark
+        mark for mark in getattr(test_gemm_correctness, "pytestmark")
         if mark.args and mark.args[0] == "op,dtype,epilogue"
     )
     covered = {param.id for param in parametrize.args[1]}

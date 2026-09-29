@@ -6,7 +6,7 @@ single ``await``. The kind is decided by the op *inside* the async (see
 :func:`_fusion_kind`), so what fuses is fixed by what codegen supports:
 
 - **wgmma** matmuls — launch into one wgmma commit group, awaited once. Safe
-  with no buffer-conflict analysis: a wgmma reads smem and writes wrmem, so one
+  with no buffer-conflict analysis: a wgmma reads smem and writes wgrmem, so one
   matmul's output is never another's input; the only shared buffer is the
   accumulator (read+written by accumulating matmuls), ordered by the hardware
   within a commit group.
@@ -124,7 +124,7 @@ class FuseAsync(Pass):
                 if group_collective is None:
                     group_lock = op.lock
                     group_kind = kind
-                    group_attrs = dict(op.attrs) if op.attrs else None
+                    group_attrs = op.extra_attrs or None
                     group_collective = op.collective
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)

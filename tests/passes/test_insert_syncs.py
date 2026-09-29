@@ -3,19 +3,85 @@ import textwrap
 
 import pytest
 
-from ayla import Block, Op
+from ayla import Block, Op, Value
 from ayla.analysis.sync import (
     BarrierScope,
     BarrierTarget,
+    SyncAnalysis,
     _barrier_covers,
     _barrier_scope,
 )
-from ayla.gpu_dialect import CollectiveScope, gpu_dialect
+from ayla.base.ir import find_ops_of_type
+from ayla.gpu_dialect import (
+    AllocOp,
+    BarrierOp,
+    CollectiveScope,
+    KernelOp,
+    LockType,
+    TmaMoveOp,
+    gpu_dialect,
+)
 from ayla.passes.insert_syncs import (
     _insert_barriers,
+    _materialize_cluster_mbars,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
+
+
+def test_tma_descriptors_for_the_same_argument_alias():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%h: gmem<2x2xf32>, %store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>) {
+            %c0: index = index_constant() attrs={value: 0}
+            %s0: smem<2x2xf32> = alloc()
+            %s1: smem<1x2xf32> = alloc()
+            tma_move(%store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %s0: smem<2x2xf32>, %c0: index, %c0: index)
+            tma_move(%s1: smem<1x2xf32>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>, %c0: index, %c0: index)
+          }
+        }"""))  # noqa: E501
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    store, load = find_ops_of_type(module, TmaMoveOp)
+
+    assert analysis.targets[load].scope == BarrierScope.GRID
+
+
+def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %tile: smem<64x64xbf16> = alloc()
+            %value: rmem<64x64xbf16> = alloc()
+            %lock: lock<bulk> = alloc()
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            await(%lock: lock<bulk>)
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+          }
+        }"""))  # noqa: E501
+    insert_syncs(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %tile: smem<64x64xbf16> = alloc()
+            %value: rmem<64x64xbf16> = alloc()
+            %lock: lock<bulk> = alloc()
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            await(%lock: lock<bulk>)
+            barrier() attrs={scope: "block"}
+            move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
+            barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+          }
+        }""")  # noqa: E501
+
 
 def test_block_leader_barrier_requires_whole_warps():
     op = Op(operands=[], results=[])
@@ -33,6 +99,171 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
     )
     assert _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.CLUSTER)
     assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
+
+
+def test_barrier_scopes_form_a_lattice():
+    scopes = list(BarrierScope)
+    assert all(a.join(b) == b.join(a) for a in scopes for b in scopes)
+    assert all(a.join(a) == a for a in scopes)
+    assert all(
+        a.join(b).join(c) == a.join(b.join(c))
+        for a in scopes
+        for b in scopes
+        for c in scopes
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior", "current", "expected"),
+    [
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.THREAD,
+        ),
+        (
+            CollectiveScope.THREAD,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.THREAD,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+        (
+            CollectiveScope.BLOCK_LEADER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.BLOCK_LEADER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+        (
+            CollectiveScope.CLUSTER,
+            CollectiveScope.CLUSTER_LEADER,
+            BarrierScope.CLUSTER_TO_LEADER,
+        ),
+        (
+            CollectiveScope.CLUSTER_LEADER,
+            CollectiveScope.CLUSTER,
+            BarrierScope.LEADER_TO_CLUSTER,
+        ),
+    ],
+)
+def test_cluster_leader_hazards_choose_a_sufficient_barrier(
+    prior, current, expected,
+):
+    assert _barrier_scope(prior, current) == expected
+
+
+def test_block_barrier_does_not_cover_a_cluster_leader_effect():
+    assert not _barrier_covers(
+        BarrierScope.BLOCK, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert _barrier_covers(
+        BarrierScope.CLUSTER, CollectiveScope.CLUSTER_LEADER,
+    )
+
+
+def test_cluster_leader_barrier_coverage_is_directional():
+    assert not _barrier_covers(
+        BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.CLUSTER_LEADER,
+    )
+    assert not _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK_LEADER,
+    )
+    assert not _barrier_covers(
+        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        (BarrierScope.CLUSTER_TO_LEADER, "cluster_to_leader"),
+        (BarrierScope.LEADER_TO_CLUSTER, "leader_to_cluster"),
+    ],
+)
+def test_insert_syncs_preserves_cluster_barrier_direction(scope, expected):
+    op = Op(operands=[], results=[])
+    block = Block(ops=[op])
+    sync = (
+        Value(name="sync", type=LockType.build(kind="cluster_mbar"))
+        if scope == BarrierScope.CLUSTER_TO_LEADER
+        else None
+    )
+    barrier_syncs = {op: sync} if sync is not None else None
+
+    _insert_barriers(
+        block, {op: BarrierTarget(scope)}, num_threads=32,
+        barrier_syncs=barrier_syncs,
+    )
+
+    barrier = block.ops[0]
+    assert isinstance(barrier, BarrierOp)
+    assert barrier.scope == expected
+    assert barrier.sync is sync
+
+
+def test_cluster_mbar_materialization_depends_on_barrier_scope():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test() grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %r: rmem<1xf32> = alloc() attrs={id: 0}
+          }
+        }"""))
+    kernel = find_ops_of_type(module, KernelOp)[0]
+    target_op = kernel.body.ops[0]
+
+    syncs = _materialize_cluster_mbars(
+        kernel,
+        {target_op: BarrierTarget(BarrierScope.CLUSTER_TO_LEADER)},
+    )
+
+    sync = syncs[target_op]
+    assert isinstance(sync.type, LockType)
+    assert sync.type.kind == "cluster_mbar"
+    assert isinstance(kernel.body.ops[0], AllocOp)
+    assert kernel.body.ops[0].result() is sync
+
+
+def test_tma_multicast_reuse_waits_for_every_recipient_cta():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %smem: smem<16x16xf32> = alloc() attrs={id: 0}
+            %lock: lock<mbar> = alloc() attrs={id: 1}
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%lock: lock<mbar>)
+            %rmem: rmem<16x16xf32> = alloc()
+            move(%rmem: rmem<16x16xf32>, %smem: smem<16x16xf32>)
+            async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    insert_syncs(module)
+
+    text = repr(module)
+    # The parent multicast lowering synchronizes mbarrier initialization. This
+    # pass only needs the one-way reuse handoff to the next multicast issuer.
+    assert 'barrier() attrs={scope: "cluster"}' not in text
+    barriers = [
+        op for op in find_ops_of_type(module, BarrierOp)
+        if op.scope == "cluster_to_leader"
+    ]
+    assert len(barriers) == 1
+    sync = barriers[0].sync
+    assert sync is not None
+    assert isinstance(sync.type, LockType)
+    assert sync.type.kind == "cluster_mbar"
 
 
 def test_preexisting_barrier_updates_dataflow_state():
@@ -64,7 +295,7 @@ def test_preexisting_barrier_updates_dataflow_state():
 def test_war_on_shared_buffer_gets_barrier():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem<128x4096xbf16>, %b: gmem<128x4096xbf16>, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: gmem<128x4096xbf16>, %b: gmem<128x4096xbf16>, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %sa: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             %sb: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             for (%k: index = 0 to 4) attrs={label: "k"} {
@@ -77,7 +308,7 @@ def test_war_on_shared_buffer_gets_barrier():
               }
               await(%lm: lock<mbar>)
               %lw: lock<wgmma> = alloc() attrs={id: 3}
-              async(%lw: lock<wgmma>) matmul(%sa: smem<128x64xbf16 swizzle="128B">, %sb: smem<128x64xbf16 swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              async(%lw: lock<wgmma>) matmul(%sa: smem<128x64xbf16 swizzle="128B">, %sb: smem<128x64xbf16 swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               await(%lw: lock<wgmma>)
             }
           }
@@ -93,7 +324,7 @@ def test_war_on_shared_buffer_gets_barrier():
     # no barrier — the load's mbar await already covers it.
     assert repr(module) == textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem<128x4096xbf16>, %b: gmem<128x4096xbf16>, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+          kernel @test(%a: gmem<128x4096xbf16>, %b: gmem<128x4096xbf16>, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %sa: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             %sb: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             for (%k: index = 0 to 4) attrs={label: "k"} {
@@ -107,7 +338,7 @@ def test_war_on_shared_buffer_gets_barrier():
               }
               await(%lm: lock<mbar>)
               %lw: lock<wgmma> = alloc() attrs={id: 3}
-              async(%lw: lock<wgmma>) matmul(%sa: smem<128x64xbf16 swizzle="128B">, %sb: smem<128x64xbf16 swizzle="128B">, %acc: wrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+              async(%lw: lock<wgmma>) matmul(%sa: smem<128x64xbf16 swizzle="128B">, %sb: smem<128x64xbf16 swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               await(%lw: lock<wgmma>)
             }
           }
@@ -166,7 +397,7 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             %23: gmem<128x256xbf16 strides=[4096, 1]> = tile(%22: gmem<128x4096xbf16>, 0, %by: index)
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %24: gmem<64x256xbf16 strides=[4096, 1]> = tile(%23: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12, init: 0.0}
+            %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12, init: 0.0}
             %26: smem<64x64xbf16 swizzle="128B"> = tile(%11: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %27: smem<64x64xbf16 swizzle="128B"> = tile(%8: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %28: smem<64x64xbf16 swizzle="128B"> = tile(%5: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
@@ -226,10 +457,10 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
               %77: gmem<256x64xbf16 strides=[4096, 1]> = tile(%12: gmem<256x4096xbf16>, 0, %75: index)
               await(%10: lock<mbar>)
               async(%30: lock<wgmma>) attrs={label: "mm_iter0_async_iter0"} {
-                matmul(%34: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %35: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter0"}
-                matmul(%36: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %37: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter1"}
-                matmul(%38: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %39: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter2"}
-                matmul(%40: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %41: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter3"}
+                matmul(%34: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %35: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter0"}
+                matmul(%36: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %37: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter1"}
+                matmul(%38: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %39: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter2"}
+                matmul(%40: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %41: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter3"}
               }
               await(%30: lock<wgmma>)
               async(%10: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
@@ -238,10 +469,10 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
               }
               await(%7: lock<mbar>)
               async(%31: lock<wgmma>) attrs={label: "mm_iter1_async_iter0"} {
-                matmul(%42: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %43: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter0"}
-                matmul(%44: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %45: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter1"}
-                matmul(%46: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %47: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter2"}
-                matmul(%48: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %49: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter3"}
+                matmul(%42: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %43: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter0"}
+                matmul(%44: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %45: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter1"}
+                matmul(%46: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %47: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter2"}
+                matmul(%48: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %49: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter3"}
               }
               await(%31: lock<wgmma>)
               async(%7: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
@@ -250,10 +481,10 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
               }
               await(%4: lock<mbar>)
               async(%32: lock<wgmma>) attrs={label: "mm_iter2_async_iter0"} {
-                matmul(%50: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %51: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter0"}
-                matmul(%52: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %53: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter1"}
-                matmul(%54: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %55: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter2"}
-                matmul(%56: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %57: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter3"}
+                matmul(%50: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %51: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter0"}
+                matmul(%52: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %53: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter1"}
+                matmul(%54: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %55: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter2"}
+                matmul(%56: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %57: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter3"}
               }
               await(%32: lock<wgmma>)
               async(%4: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
@@ -262,10 +493,10 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
               }
               await(%1: lock<mbar>)
               async(%33: lock<wgmma>) attrs={label: "mm_iter3_async_iter0"} {
-                matmul(%58: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %59: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter0"}
-                matmul(%60: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %61: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter1"}
-                matmul(%62: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %63: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter2"}
-                matmul(%64: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %65: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter3"}
+                matmul(%58: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %59: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter0"}
+                matmul(%60: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %61: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter1"}
+                matmul(%62: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %63: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter2"}
+                matmul(%64: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %65: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter3"}
               }
               await(%33: lock<wgmma>)
               async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {
@@ -275,39 +506,39 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             }
             await(%10: lock<mbar>)
             async(%30: lock<wgmma>) attrs={label: "mm_iter0_async_iter0"} {
-              matmul(%34: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %35: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter0"}
-              matmul(%36: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %37: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter1"}
-              matmul(%38: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %39: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter2"}
-              matmul(%40: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %41: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter3"}
+              matmul(%34: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %35: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter0"}
+              matmul(%36: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %37: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter1"}
+              matmul(%38: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %39: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter2"}
+              matmul(%40: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %41: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter0_iter3"}
             }
             await(%30: lock<wgmma>)
             await(%7: lock<mbar>)
             async(%31: lock<wgmma>) attrs={label: "mm_iter1_async_iter0"} {
-              matmul(%42: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %43: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter0"}
-              matmul(%44: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %45: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter1"}
-              matmul(%46: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %47: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter2"}
-              matmul(%48: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %49: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter3"}
+              matmul(%42: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %43: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter0"}
+              matmul(%44: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %45: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter1"}
+              matmul(%46: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %47: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter2"}
+              matmul(%48: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %49: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter1_iter3"}
             }
             await(%31: lock<wgmma>)
             await(%4: lock<mbar>)
             async(%32: lock<wgmma>) attrs={label: "mm_iter2_async_iter0"} {
-              matmul(%50: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %51: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter0"}
-              matmul(%52: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %53: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter1"}
-              matmul(%54: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %55: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter2"}
-              matmul(%56: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %57: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter3"}
+              matmul(%50: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %51: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter0"}
+              matmul(%52: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %53: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter1"}
+              matmul(%54: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %55: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter2"}
+              matmul(%56: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %57: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter2_iter3"}
             }
             await(%32: lock<wgmma>)
             await(%1: lock<mbar>)
             async(%33: lock<wgmma>) attrs={label: "mm_iter3_async_iter0"} {
-              matmul(%58: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %59: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter0"}
-              matmul(%60: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %61: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter1"}
-              matmul(%62: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %63: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter2"}
-              matmul(%64: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %65: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter3"}
+              matmul(%58: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %59: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter0"}
+              matmul(%60: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %61: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter1"}
+              matmul(%62: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %63: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter2"}
+              matmul(%64: smem<64x16xbf16 strides=[64, 1] swizzle="128B">, %65: smem<256x16xbf16 strides=[64, 1] swizzle="128B">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_iter3_iter3"}
             }
-            %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 17}
+            %78: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 17}
             await(%33: lock<wgmma>)
-            elementwise convert(%78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
-            move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wrmem"}
+            elementwise convert(%78: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
+            move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wgrmem"}
           }
         }"""))  # noqa: E501
     insert_syncs(module)
@@ -340,7 +571,7 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             %sb: smem<64x64xbf16> = alloc()
             %sc: smem<64x64xbf16> = alloc()
             %sd: smem<64x64xbf16> = alloc()
-            %acc: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
             %l0: lock<mbar> = alloc()
             async(%l0: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
@@ -349,14 +580,14 @@ def test_named_barrier_id_is_reused_after_mbar_await():
               move(%sd: smem<64x64xbf16>, %d: gmem<64x64xbf16>) attrs={tma: True}
             }
             await(%l0: lock<mbar>)
-            matmul(%sa: smem<64x64xbf16>, %sb: smem<64x64xbf16>, %acc: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+            matmul(%sa: smem<64x64xbf16>, %sb: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             %l1: lock<mbar> = alloc()
             async(%l1: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
             }
             await(%l1: lock<mbar>)
-            matmul(%sc: smem<64x64xbf16>, %sd: smem<64x64xbf16>, %acc: wrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
+            matmul(%sc: smem<64x64xbf16>, %sd: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             %l2: lock<mbar> = alloc()
             async(%l2: lock<mbar>) {
               move(%sc: smem<64x64xbf16>, %c: gmem<64x64xbf16>) attrs={tma: True}

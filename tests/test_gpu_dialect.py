@@ -16,6 +16,7 @@ from ayla import (
 )
 from ayla.gpu_dialect import (
     AddrMemTensorType,
+    AllocOp,
     AsyncOp,
     BarrierOp,
     BF16Type,
@@ -30,14 +31,17 @@ from ayla.gpu_dialect import (
     LockType,
     MoveOp,
     PredicateType,
+    ReduceOp,
     ReinterpretOp,
     ReshapeOp,
     SelectOp,
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    TileOp,
     gpu_dialect,
     has_ordering_effect,
+    is_grid_collective,
     memory_effects,
     root_buffer,
     root_buffers,
@@ -48,6 +52,41 @@ def assert_print_and_roundtrip(op, expected):
     text = repr(op)
     assert text == expected
     assert repr(gpu_dialect.parse(text)) == text
+
+
+@pytest.mark.parametrize(
+    ("op_type", "explicit_attrs"),
+    [
+        (KernelOp, {
+            "name": "k",
+            "grid_dim": [],
+            "block_dim": [],
+            "cluster_dim": [],
+            "num_warp_groups": 1,
+            "ptx_optimization_level": 1,
+        }),
+        (MatmulOp, {"collective": {}, "init": 0.0}),
+        (ReduceOp, {"fn": "sum", "collective": {}, "init": 0.0}),
+        (TileOp, {"static_indices": [], "maybe_partial": True}),
+        (ElementwiseOp, {"fn": "relu"}),
+        (AllocOp, {"id": 1, "init": 0.0}),
+        (MoveOp, {"collective": {}, "multicast": True}),
+        (TmaMoveOp, {
+            "collective": {},
+            "l2_cache_hint": "evict_last",
+            "multicast": True,
+        }),
+        (BarrierOp, {"scope": "block"}),
+        (AsyncOp, {"collective": {}}),
+        (PTXTemplateOp, {"template": "ret;", "description": "test"}),
+        (ForOp, {"lb": 0, "ub": 1, "step": 1}),
+    ],
+)
+def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
+    op = op_type(
+        operands=[], results=[], attrs={**explicit_attrs, "label": "keep"},
+    )
+    assert op.extra_attrs == {"label": "keep"}
 
 
 def test_reinterpret_op():
@@ -135,6 +174,39 @@ def test_reshape_op():
     )
 
 
+def test_reduce_op():
+    src = Value(
+        name="src", type=GmemTensorType.build([8, 32], F32Type()),
+    )
+    dst = Value(
+        name="dst", type=GmemTensorType.build([8, 1], F32Type()),
+    )
+    reduce = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={
+            CollectiveAxis.X: CollectiveLevel.THREAD,
+            CollectiveAxis.Y: CollectiveLevel.BLOCK,
+            CollectiveAxis.Z: CollectiveLevel.THREAD,
+        },
+        attrs={"label": "sum"},
+        init=0.0,
+    )
+
+    assert reduce.collective == {
+        CollectiveAxis.X: CollectiveLevel.THREAD,
+        CollectiveAxis.Y: CollectiveLevel.BLOCK,
+        CollectiveAxis.Z: CollectiveLevel.THREAD,
+    }
+    assert not is_grid_collective(reduce.collective)
+    assert_print_and_roundtrip(
+        reduce,
+        "reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x32xf32>) "
+        "collective=[xz.thread, y.block] attrs={init: 0.0, label: \"sum\"}",
+    )
+
+
 def test_matmul_program():
     m, k, n = 64, 128, 32
     a_type = GmemTensorType.build((m, k), F32Type())
@@ -170,11 +242,12 @@ def test_matmul_program():
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
     assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
-    assert matmul.is_block_collective()
+    assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
-    assert matmul.is_wg_collective()
-    assert not matmul.is_block_collective(CollectiveAxis.X)
-    assert matmul.is_block_collective(CollectiveAxis.Y, CollectiveAxis.Z)
+    assert not is_grid_collective(matmul.collective, (CollectiveAxis.X,))
+    assert is_grid_collective(
+        matmul.collective, (CollectiveAxis.Y, CollectiveAxis.Z),
+    )
     with pytest.raises(AssertionError):
         matmul.narrow_collective_level(
             CollectiveAxis.X, CollectiveLevel.BLOCK,
@@ -296,6 +369,33 @@ def test_cluster_collective_scope_is_between_block_and_grid():
     assert (
         CollectiveScope.CLUSTER.join(CollectiveScope.GRID)
         == CollectiveScope.GRID
+    )
+
+
+def test_cluster_leader_collective_scope_is_directional():
+    leader = CollectiveScope.CLUSTER_LEADER
+    assert CollectiveScope.BLOCK_LEADER.join(leader) == leader
+    assert leader.join(CollectiveScope.BLOCK_LEADER) == leader
+    assert CollectiveScope.BLOCK.join(leader) == CollectiveScope.CLUSTER
+    assert leader.join(CollectiveScope.BLOCK) == CollectiveScope.CLUSTER
+    scopes = list(CollectiveScope)
+    assert all(a.join(b) == b.join(a) for a in scopes for b in scopes)
+    assert all(
+        a.join(b).join(c) == a.join(b.join(c))
+        for a in scopes
+        for b in scopes
+        for c in scopes
+    )
+    assert all(
+        a.leq(a.join(b)) and b.leq(a.join(b))
+        for a in scopes
+        for b in scopes
+    )
+    assert all(
+        not (a.leq(upper) and b.leq(upper)) or a.join(b).leq(upper)
+        for a in scopes
+        for b in scopes
+        for upper in scopes
     )
 
 
@@ -442,15 +542,15 @@ def test_tma_move_build_accepts_l2_cache_hint():
         (
             True,
             {
-                ("W", "smem", CollectiveScope.BLOCK_LEADER),
-                ("R", "desc", CollectiveScope.BLOCK_LEADER),
+                ("W", "smem", CollectiveScope.BLOCK_LEADER, 7),
+                ("R", "desc", CollectiveScope.GRID, 8),
             },
         ),
         (
             False,
             {
-                ("W", "desc", CollectiveScope.BLOCK_LEADER),
-                ("R", "smem", CollectiveScope.BLOCK_LEADER),
+                ("W", "desc", CollectiveScope.GRID, 7),
+                ("R", "smem", CollectiveScope.BLOCK_LEADER, 8),
             },
         ),
     ],
@@ -472,6 +572,34 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         collective={
             axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
         },
+        attrs={"dst_tiling_scheme": 7, "src_tiling_scheme": 8},
+    ))
+
+    assert effects is not None
+    assert {
+        (effect.kind, root.name, effect.scope, effect.tiling_scheme)
+        for effect in effects
+        for root in effect.roots
+    } == expected
+
+
+def test_tma_multicast_reports_cluster_leader_write():
+    gmem_type = GmemTensorType.build((64, 64), F32Type())
+    desc = Value(
+        name="desc",
+        type=TmaDescType.build(0, gmem_type, tile_shape=[64, 64]),
+    )
+    smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
+    index = Value(name="index", type=IndexType())
+
+    effects = memory_effects(TmaMoveOp.build(
+        smem,
+        desc,
+        indices=[index],
+        collective={
+            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
+        },
+        multicast=True,
     ))
 
     assert effects is not None
@@ -479,7 +607,10 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         (effect.kind, root.name, effect.scope)
         for effect in effects
         for root in effect.roots
-    } == expected
+        } == {
+            ("W", "smem", CollectiveScope.CLUSTER_LEADER),
+            ("R", "desc", CollectiveScope.GRID),
+        }
 
 
 def test_tma_descriptor_validates_l2_promotion():

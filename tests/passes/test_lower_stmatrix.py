@@ -10,12 +10,12 @@ from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 
 
 def test_lowers_128b_block_major_move_with_stmatrix():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
-            %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            move(%s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
+            %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -30,14 +30,14 @@ def test_lowers_128b_block_major_move_with_stmatrix():
 
 
 def test_lowers_128b_block_major_column_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
             %slice: smem<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 0, 1)
-            %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            %r_slice: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0"> = tile(%r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 1)
-            move(%slice: smem<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r_slice: wrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">)
+            %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %r_slice: wgrmem<64x128xbf16 warps=4 layout="wgmma_layout_0"> = tile(%r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 1)
+            move(%slice: smem<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r_slice: wgrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -54,13 +54,13 @@ def test_lowers_128b_block_major_column_slice():
 
 
 def test_lowers_legacy_attribute_column_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
             %slice: smem<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = tile(%s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, 0, 1)
-            %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            move(%slice: smem<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={wgmma_col_start: 128}
+            %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%slice: smem<64x128xbf16 strides=[256, 1] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={wgmma_col_start: 128}
           }
         }"""))
 
@@ -73,12 +73,12 @@ def test_lowers_legacy_attribute_column_slice():
 
 
 def test_unswizzled_move_uses_scalar_store_fallback():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16> = alloc() attrs={id: 0}
-            %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            move(%s: smem<64x256xbf16>, %r: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
+            %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s: smem<64x256xbf16>, %r: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
@@ -89,15 +89,51 @@ def test_unswizzled_move_uses_scalar_store_fallback():
     assert "st.shared.b32" in template
 
 
-def test_scalar_store_uses_root_registers_for_nested_wrmem_view():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+def test_n8_fragment_uses_scalar_store_fallback():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[128, 1, 1] {
+            %s: smem<64x40xbf16> = alloc() attrs={id: 0}
+            %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s: smem<64x40xbf16>, %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    templates = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )
+    template = "".join(op.template for op in templates)
+    assert "stmatrix.sync" not in template
+    assert template.count("st.shared.b32") == 10
+    assert "${b32:operand.src.r9}" in template
+
+
+def test_n8_fragment_scalar_store_supports_global_memory():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k(%g: gmem<64x40xbf16>) block_dim=[128, 1, 1] {
+            %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            move(%g: gmem<64x40xbf16>, %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))  # noqa: E501
+
+    templates = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )
+    template = "".join(op.template for op in templates)
+    assert template.count("st.global.b32") == 10
+    assert "${b32:operand.src.r9}" in template
+
+
+def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x64xbf16> = alloc() attrs={id: 0}
-            %r: wrmem<128x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
-            %rows: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = tile(%r: wrmem<128x256xbf16 warps=4 layout="wgmma_layout_0">, 1, 0)
-            %tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%rows: wrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
-            move(%s: smem<64x64xbf16>, %tail: wrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">)
+            %r: wgrmem<128x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            %rows: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = tile(%r: wgrmem<128x256xbf16 warps=4 layout="wgmma_layout_0">, 1, 0)
+            %tail: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = tile(%rows: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, 0, 3)
+            move(%s: smem<64x64xbf16>, %tail: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">)
           }
         }"""))
 
