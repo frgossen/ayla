@@ -10,6 +10,7 @@ import itertools
 import math
 import struct
 import textwrap
+from typing import cast
 
 from ..base.ir import Op, Type, Value, find_ancestor_of_type, find_ops_of_type
 from ..base.lowering_pass import LoweringPass, lowers
@@ -23,6 +24,7 @@ from ..gpu_dialect import (
     ElementwiseOp,
     F16Type,
     F32Type,
+    F64Type,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -32,6 +34,7 @@ from ..gpu_dialect import (
     KernelOp,
     LockType,
     MatmulOp,
+    MemTensorType,
     ModuleOp,
     MoveOp,
     PtrAddOp,
@@ -97,7 +100,7 @@ def _lower_elementwise_sigmoid_bf16_ptx(
 
 def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
     """Return the PTX-template registers occupied by one WGRMEM operand."""
-    dtype = value.type.dtype
+    dtype = cast(MemTensorType, value.type).dtype
     if isinstance(dtype, F32Type):
         return [
             f"${{f32:operand.{operand_name}.r{reg}}}"
@@ -155,14 +158,14 @@ def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     return _lower_dtype_conversion_ptx(
         _elementwise_operand_regs(op.dst, "dst"),
         _elementwise_operand_regs(op.src(0), "src"),
-        op.src(0).type.dtype,
-        op.dst.type.dtype,
+        cast(MemTensorType, op.src(0).type).dtype,
+        cast(MemTensorType, op.dst.type).dtype,
     )
 
 
 def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
-    src_dtype = op.src(0).type.dtype
-    dst_dtype = op.dst.type.dtype
+    src_dtype = cast(MemTensorType, op.src(0).type).dtype
+    dst_dtype = cast(MemTensorType, op.dst.type).dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
@@ -193,7 +196,10 @@ def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
 
 
 def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
-    if not all(isinstance(value.type.dtype, F32Type) for value in op.operands):
+    if not all(
+        isinstance(cast(MemTensorType, value.type).dtype, F32Type)
+        for value in op.operands
+    ):
         raise NotImplementedError("lower_elementwise: mul supports only f32")
     return _lower_mul_registers(
         _elementwise_operand_regs(op.dst, "dst"),
@@ -204,8 +210,8 @@ def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
 
 def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
     src = op.src(0)
-    src_dtype = src.type.dtype
-    dst_dtype = op.dst.type.dtype
+    src_dtype = cast(MemTensorType, src.type).dtype
+    dst_dtype = cast(MemTensorType, op.dst.type).dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: silu does not support {src_dtype} input"
@@ -317,7 +323,7 @@ class LowerToPtxTemplate(LoweringPass):
         corresponding root registers; mapping the result to the root value
         prevents the view from allocating another register tensor.
         """
-        arg = self.value_map[op.arg]
+        arg = cast(Value, self.value_map[op.arg])
         new_ops: list[Op] = []
 
         if isinstance(op.arg.type, WgrmemTensorType):
@@ -342,8 +348,12 @@ class LowerToPtxTemplate(LoweringPass):
             view_root = view_root.definition.arg
         view_root_type = view_root.type
         assert isinstance(view_root_type, AddrMemTensorType)
-        dtype_bytes = view_root_type.dtype.byte_size
-        result_sizes = list(op.result().type.sizes)
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, view_root_type.dtype,
+        ).byte_size
+        result_type = op.result().type
+        assert isinstance(result_type, AddrMemTensorType)
+        result_sizes = cast(tuple[int, ...], result_type.sizes)
         layout = (
             physical_layout(view_root_type)
             if isinstance(view_root_type, SmemTensorType) else None
@@ -358,7 +368,9 @@ class LowerToPtxTemplate(LoweringPass):
             if layout is not None and layout[1] == "block_major" and dim == 1:
                 block_width, _ = layout
                 if result_sizes[1] % block_width:
-                    parent_width = op.arg.type.sizes[1]
+                    parent_type = op.arg.type
+                    assert isinstance(parent_type, AddrMemTensorType)
+                    parent_width = parent_type.sizes[1]
                     assert isinstance(parent_width, int)
                     assert parent_width % block_width == 0
                     assert isinstance(idx, int), (
@@ -368,7 +380,9 @@ class LowerToPtxTemplate(LoweringPass):
                         idx * result_sizes[1], block_width,
                     )
                     byte_delta = (
-                        block * view_root_type.sizes[0] * block_width
+                        block
+                        * cast(int, view_root_type.sizes[0])
+                        * block_width
                         + inner
                     ) * dtype_bytes
                     byte_term = IndexConstantOp.build(byte_delta)
@@ -383,7 +397,7 @@ class LowerToPtxTemplate(LoweringPass):
                 new_ops.append(const_op)
                 idx = const_op.result()
             else:
-                idx = self.value_map[idx]
+                idx = cast(Value, self.value_map[idx])
 
             tile_size_op = IndexConstantOp.build(result_sizes[dim])
             new_ops.append(tile_size_op)
@@ -399,6 +413,7 @@ class LowerToPtxTemplate(LoweringPass):
                 elif dim == 1:
                     stride = view_root_type.sizes[0]
 
+            assert stride is not None
             stride_bytes = stride * dtype_bytes
             stride_op = IndexConstantOp.build(stride_bytes)
             new_ops.append(stride_op)
@@ -433,8 +448,7 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_reinterpret(
         self, op: ReinterpretOp,
     ) -> tuple[list[Op], list[object]]:
-        arg = self.value_map[op.arg]
-        assert isinstance(arg, Value)
+        arg = cast(Value, self.value_map[op.arg])
         if op.byte_offset == 0:
             return [], [arg]
 
@@ -456,7 +470,7 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_reshape(
         self, op: ReshapeOp,
     ) -> tuple[list[Op], list[object]]:
-        return [], [self.value_map[op.arg]]
+        return [], [cast(Value, self.value_map[op.arg])]
 
     def _lower_alloc_lock(
         self, op: AllocOp,
@@ -544,6 +558,7 @@ class LowerToPtxTemplate(LoweringPass):
         result_type = op.result().type
         assert isinstance(result_type, RmemTensorType)
         n = result_type.num_elements
+        assert n is not None
         suffix = _ptx_suffix(result_type.dtype)
 
         template = ""
@@ -569,7 +584,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(result_type, WgrmemTensorType)
         n = result_type.num_elements_per_thread
         suffix = result_type.dtype.name
-        if result_type.dtype.byte_size == 2:  # bf16/f16 packed in pairs into b32
+        if cast(
+            BF16Type | F16Type | F32Type | F64Type, result_type.dtype,
+        ).byte_size == 2:  # bf16/f16 packed in pairs into b32
             n //= 2
             suffix = "b32"
 
@@ -596,7 +613,11 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_type, SmemTensorType)
         if op.init is not None:
             raise NotImplementedError("lower_alloc: smem init not supported")
-        n_bytes = smem_type.num_elements * smem_type.dtype.byte_size
+        num_elements = smem_type.num_elements
+        assert num_elements is not None
+        n_bytes = num_elements * cast(
+            BF16Type | F16Type | F32Type | F64Type, smem_type.dtype,
+        ).byte_size
         # TMA swizzling and the corresponding software address swizzle operate
         # within 1 KiB regions and require the shared-memory base to match.
         alignment = (
@@ -628,8 +649,8 @@ class LowerToPtxTemplate(LoweringPass):
         destination dtype.
         """
         sources = [op.src(i) for i in range(op.num_srcs)]
-        dst_value = self.value_map[op.dst]
-        source_values = [self.value_map[src] for src in sources]
+        dst_value = cast(Value, self.value_map[op.dst])
+        source_values = [cast(Value, self.value_map[src]) for src in sources]
         dst_type = op.dst.type
 
         if not isinstance(dst_type, WgrmemTensorType):
@@ -686,26 +707,32 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_matmul_fma(
         self, op: MatmulOp,
     ) -> tuple[list[Op], list[object]]:
-        lhs = self.value_map[op.lhs]
-        rhs = self.value_map[op.rhs]
-        dst = self.value_map[op.dst]
-        if not isinstance(lhs.type.dtype, F32Type):
+        lhs = cast(Value, self.value_map[op.lhs])
+        rhs = cast(Value, self.value_map[op.rhs])
+        dst = cast(Value, self.value_map[op.dst])
+        lhs_type = lhs.type
+        rhs_type = rhs.type
+        dst_type = dst.type
+        assert isinstance(lhs_type, RmemTensorType)
+        assert isinstance(rhs_type, RmemTensorType)
+        assert isinstance(dst_type, RmemTensorType)
+        if not isinstance(lhs_type.dtype, F32Type):
             raise NotImplementedError(
-                f"lower_async_matmul fma: only f32 supported; got {lhs.type.dtype}"
+                f"lower_async_matmul fma: only f32 supported; got {lhs_type.dtype}"
             )
-        if not (lhs.type.dtype == rhs.type.dtype == dst.type.dtype):
+        if not (lhs_type.dtype == rhs_type.dtype == dst_type.dtype):
             raise NotImplementedError(
                 f"lower_async_matmul fma: dtype mismatch; got "
-                f"{lhs.type.dtype}, {rhs.type.dtype}, {dst.type.dtype}"
+                f"{lhs_type.dtype}, {rhs_type.dtype}, {dst_type.dtype}"
             )
-        m_dim, k_dim = lhs.type.sizes
-        n_dim, k_dim2 = rhs.type.sizes
+        m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
+        n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
         if k_dim != k_dim2:
             raise NotImplementedError(
                 f"lower_async_matmul fma: k-dim mismatch; got "
                 f"{lhs.type} @ {rhs.type}"
             )
-        if tuple(dst.type.sizes) != (m_dim, n_dim):
+        if tuple(dst_type.sizes) != (m_dim, n_dim):
             raise NotImplementedError(
                 f"lower_async_matmul fma: dst shape must be {m_dim}x{n_dim}; got {dst.type}"
             )
@@ -730,27 +757,33 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_matmul_mma_sync(
         self, op: MatmulOp,
     ) -> tuple[list[Op], list[object]]: # TODO: rename "mma" to "mma_layout_0, 1, 2" and impl it the right way
-        lhs = self.value_map[op.lhs]
-        rhs = self.value_map[op.rhs]
-        dst = self.value_map[op.dst]
-        assert dst.type.layout == "mma", (
-            f"_lower_async_matmul_mma_sync: dst layout must be 'mma'; got {dst.type.layout!r}"
+        lhs = cast(Value, self.value_map[op.lhs])
+        rhs = cast(Value, self.value_map[op.rhs])
+        dst = cast(Value, self.value_map[op.dst])
+        lhs_type = lhs.type
+        rhs_type = rhs.type
+        dst_type = dst.type
+        assert isinstance(lhs_type, WgrmemTensorType)
+        assert isinstance(rhs_type, WgrmemTensorType)
+        assert isinstance(dst_type, WgrmemTensorType)
+        assert dst_type.layout == "mma", (
+            f"_lower_async_matmul_mma_sync: dst layout must be 'mma'; got {dst_type.layout!r}"
         )
-        if not (isinstance(lhs.type.dtype, (BF16Type, F16Type))
-                and isinstance(rhs.type.dtype, (BF16Type, F16Type))
-                and isinstance(dst.type.dtype, F32Type)):
+        if not (isinstance(lhs_type.dtype, (BF16Type, F16Type))
+                and isinstance(rhs_type.dtype, (BF16Type, F16Type))
+                and isinstance(dst_type.dtype, F32Type)):
             raise NotImplementedError(
                 f"lower_async_matmul mma.sync: expected bf16/f16 inputs, f32 output; "
-                f"got {lhs.type.dtype}, {rhs.type.dtype} -> {dst.type.dtype}"
+                f"got {lhs_type.dtype}, {rhs_type.dtype} -> {dst_type.dtype}"
             )
-        m_dim, k_dim = lhs.type.sizes
-        n_dim, k_dim2 = rhs.type.sizes
+        m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
+        n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
         if k_dim != k_dim2:
             raise NotImplementedError(
                 f"lower_async_matmul mma.sync: k-dim mismatch; got "
                 f"{lhs.type} @ {rhs.type}"
             )
-        if tuple(dst.type.sizes) != (m_dim, n_dim):
+        if tuple(dst_type.sizes) != (m_dim, n_dim):
             raise NotImplementedError(
                 f"lower_async_matmul mma.sync: dst shape must be {m_dim}x{n_dim}; "
                 f"got {dst.type}"
@@ -760,7 +793,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_async_matmul mma.sync: need m=16, k%%16=0, n%%8=0; "
                 f"got {m_dim}x{k_dim} @ {k_dim}x{n_dim}"
             )
-        in_dtype = lhs.type.dtype.name
+        in_dtype = lhs_type.dtype.name
         template = ""
         for k_tile in range(k_dim // 16):
             a_base = k_tile * 4
@@ -800,22 +833,26 @@ class LowerToPtxTemplate(LoweringPass):
         self, op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:
         body_ops = op.body.ops
-        if body_ops and all(isinstance(o, TmaMoveOp) for o in body_ops):
-            kind = op.lock.type.kind
+        tmas = [body_op for body_op in body_ops if isinstance(body_op, TmaMoveOp)]
+        if body_ops and len(tmas) == len(body_ops):
+            lock_type = op.lock.type
+            assert isinstance(lock_type, LockType)
+            kind = lock_type.kind
             if kind == "mbar":  # one or more gmem→smem loads sharing the mbar
-                lock_value = self.value_map[op.lock]
-                return self._lower_async_tma_loads(op, body_ops, lock_value)
+                lock_value = cast(Value, self.value_map[op.lock])
+                return self._lower_async_tma_loads(op, tmas, lock_value)
             if kind == "bulk":  # smem→gmem store (single)
                 assert len(body_ops) == 1, (
                     f"lower_async: bulk TMA store group must be a single move; "
                     f"got {len(body_ops)}"
                 )
-                return self._lower_async_tma_store(body_ops[0])
+                return self._lower_async_tma_store(tmas[0])
             raise NotImplementedError(
                 f"lower_async: tma_move with lock kind {kind!r}"
             )
-        if body_ops and all(isinstance(o, MatmulOp) for o in body_ops):
-            return self._lower_async_matmul_wgmma(op, body_ops)
+        mms = [body_op for body_op in body_ops if isinstance(body_op, MatmulOp)]
+        if body_ops and len(mms) == len(body_ops):
+            return self._lower_async_matmul_wgmma(op, mms)
         raise NotImplementedError(
             f"lower_async: unsupported body ops "
             f"{[type(o).__name__ for o in body_ops]}"
@@ -834,8 +871,10 @@ class LowerToPtxTemplate(LoweringPass):
         ``wgmma``) emits the wait plus a ``bar.sync`` that closes the TMA-reload
         vs warpgroup-read WAR (see ``_lower_await_wgmma``).
         """
-        assert op.lock.type.kind == "wgmma", (
-            f"_lower_async_matmul_wgmma: expected lock kind 'wgmma'; got {op.lock.type.kind!r}"
+        lock_type = op.lock.type
+        assert isinstance(lock_type, LockType)
+        assert lock_type.kind == "wgmma", (
+            f"_lower_async_matmul_wgmma: expected lock kind 'wgmma'; got {lock_type.kind!r}"
         )
 
         _swizzle_to_bits = {None: 0, "128B": 1, "64B": 2, "32B": 3}
@@ -894,13 +933,16 @@ class LowerToPtxTemplate(LoweringPass):
             # rematerialize its descriptors from the already-lowered pointers.
             if typ.attrs.get("physical_layout") is not None:
                 return None
-            delta = sum(
-                (int(index) - int(base_index)) * size * stride
-                for index, base_index, size, stride in zip(
-                    indices, base_indices, typ.sizes, typ.strides,
-                )
-            )
-            byte_delta = delta * typ.dtype.byte_size
+            delta = 0
+            for index, base_index, size, stride in zip(
+                indices, base_indices, typ.sizes, typ.strides,
+            ):
+                assert index is not None and base_index is not None
+                assert size is not None and stride is not None
+                delta += (index - base_index) * size * stride
+            byte_delta = delta * cast(
+                BF16Type | F16Type | F32Type | F64Type, typ.dtype,
+            ).byte_size
             return byte_delta if byte_delta >= 0 and byte_delta % 16 == 0 else None
 
         # Each distinct operand value gets a single unique placeholder name —
@@ -921,7 +963,7 @@ class LowerToPtxTemplate(LoweringPass):
         def _desc(name, base, delta, value, hint, const, offset=None):
             if delta is not None:
                 return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
-            operand = _operand(self.value_map[value], hint)
+            operand = _operand(cast(Value, self.value_map[value]), hint)
             return _build_desc(
                 name, f"operand.{operand}.ptr", const, offset,
             )
@@ -951,8 +993,8 @@ class LowerToPtxTemplate(LoweringPass):
                 f"_lower_async_matmul_wgmma: rhs innermost stride must be 1; "
                 f"got strides={list(rhs_type.strides)}"
             )
-            m_dim, k_dim = lhs_type.sizes
-            n_dim, k_dim2 = rhs_type.sizes
+            m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
+            n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
             assert k_dim == k_dim2
             assert k_dim == 16, (
                 f"_lower_async_matmul_wgmma: k must be 16; got {k_dim}"
@@ -978,8 +1020,18 @@ class LowerToPtxTemplate(LoweringPass):
                 if rhs_layout is not None and rhs_layout[1] == "block_major"
                 else rhs_type.strides[0]
             )
-            lhs_row_stride_bytes = lhs_row_stride * lhs_type.dtype.byte_size
-            rhs_row_stride_bytes = rhs_row_stride * rhs_type.dtype.byte_size
+            lhs_row_stride_bytes = (
+                cast(int, lhs_row_stride)
+                * cast(
+                    BF16Type | F16Type | F32Type | F64Type, lhs_type.dtype,
+                ).byte_size
+            )
+            rhs_row_stride_bytes = (
+                cast(int, rhs_row_stride)
+                * cast(
+                    BF16Type | F16Type | F32Type | F64Type, rhs_type.dtype,
+                ).byte_size
+            )
 
             assert lhs_type.swizzle in _swizzle_to_bits, (
                 f"_lower_async_matmul_wgmma: lhs has unknown swizzle {lhs_type.swizzle!r}"
@@ -995,7 +1047,7 @@ class LowerToPtxTemplate(LoweringPass):
 
             lhs_delta = _tile_delta(mm.lhs, mms[0].lhs, j)
             rhs_delta = _tile_delta(mm.rhs, mms[0].rhs, j)
-            dst_name = _operand(self.value_map[mm.dst], "dst")
+            dst_name = _operand(cast(Value, self.value_map[mm.dst]), "dst")
 
             desc_rhs = f"desc_rhs{j}"
             desc_template += _desc(
@@ -1081,9 +1133,11 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_await(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
-        lock = self.value_map[op.lock]
-        kind = op.lock.type.kind
+        lock_type = op.lock.type
+        assert isinstance(lock_type, LockType)
+        kind = lock_type.kind
         if kind == "mbar":
+            lock = cast(Value, self.value_map[op.lock])
             return self._lower_await_mbar(op, lock)
         if kind == "wgmma":
             return self._lower_await_wgmma(op)
@@ -1157,8 +1211,7 @@ class LowerToPtxTemplate(LoweringPass):
             grid_size = math.prod(
                 dim if dim is not None else 1 for dim in ancestor.grid_dim
             )
-            sync = self.value_map[op.sync]
-            assert isinstance(sync, Value)
+            sync = cast(Value, self.value_map[op.sync])
             template = textwrap.dedent(f"""\
                 bar.sync 0;
                 mov.u32 ${{b32:grid_tid}}, %tid.x;
@@ -1265,8 +1318,8 @@ class LowerToPtxTemplate(LoweringPass):
         Each thread independently computes its address from tile indices
         and accesses its own elements.
         """
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
 
         is_load = isinstance(op.dst.type, RmemTensorType)
         gmem_ir_type = op.src.type if is_load else op.dst.type
@@ -1274,7 +1327,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(gmem_ir_type, GmemTensorType)
         assert isinstance(rmem_type, RmemTensorType)
         gmem_label = "src" if is_load else "dst"
-        dtype_bytes = gmem_ir_type.dtype.byte_size
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, gmem_ir_type.dtype,
+        ).byte_size
         suffix = _ptx_suffix(rmem_type.dtype)
 
         operands: list[Value] = [dst_value, src_value]
@@ -1284,10 +1339,13 @@ class LowerToPtxTemplate(LoweringPass):
         base_reg = f"${{b64:operand.{gmem_label}.ptr}}"
 
         for flat_idx, idx in enumerate(
-            itertools.product(*[range(s) for s in rmem_type.sizes])
+            itertools.product(
+                *[range(s) for s in cast(tuple[int, ...], rmem_type.sizes)]
+            )
         ):
+            strides = cast(tuple[int, ...], gmem_ir_type.strides)
             offset = sum(
-                c * s for c, s in zip(idx, gmem_ir_type.strides)
+                c * s for c, s in zip(idx, strides)
             ) * dtype_bytes
             if is_load:
                 nc = ".nc" if op.attrs.get("nc") else ""
@@ -1322,8 +1380,8 @@ class LowerToPtxTemplate(LoweringPass):
         The smem WAR/RAW hazards (prior readers/writers of the tile) are handled
         by insert_syncs, which emits a barrier before this move when needed.
         """
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
 
         is_load = isinstance(op.dst.type, SmemTensorType)
         smem_type = op.dst.type if is_load else op.src.type
@@ -1337,7 +1395,9 @@ class LowerToPtxTemplate(LoweringPass):
             f"_lower_move_gmem_smem: dtype mismatch; "
             f"gmem {gmem_type.dtype} vs smem {smem_type.dtype}"
         )
-        dtype_bytes = gmem_type.dtype.byte_size
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, gmem_type.dtype,
+        ).byte_size
         suffix = _ptx_suffix(gmem_type.dtype)
 
         operands: list[Value] = [dst_value, src_value]
@@ -1356,9 +1416,9 @@ class LowerToPtxTemplate(LoweringPass):
             st_addr = "${b64:co_gaddr}"
 
         co_dim = smem_type.rank - 1
-        co_size = smem_type.sizes[co_dim]
-        gmem_co_stride_bytes = gmem_type.strides[-1] * dtype_bytes
-        smem_co_stride_bytes = smem_type.strides[-1] * dtype_bytes
+        co_size = cast(int, smem_type.sizes[co_dim])
+        gmem_co_stride_bytes = cast(int, gmem_type.strides[-1]) * dtype_bytes
+        smem_co_stride_bytes = cast(int, smem_type.strides[-1]) * dtype_bytes
 
         template += textwrap.dedent(f"""\
             mov.u32 ${{b32:co_idx}}, %tid.x;
@@ -1374,9 +1434,13 @@ class LowerToPtxTemplate(LoweringPass):
         # Unroll sequential dims at lowering time. For large tiles this
         # may produce too many instructions; consider emitting a PTX loop.
         for seq_dim in range(smem_type.rank - 1):
-            seq_size = smem_type.sizes[seq_dim]
-            gmem_seq_stride_bytes = gmem_type.strides[seq_dim] * dtype_bytes
-            smem_seq_stride_bytes = smem_type.strides[seq_dim] * dtype_bytes
+            seq_size = cast(int, smem_type.sizes[seq_dim])
+            gmem_seq_stride_bytes = (
+                cast(int, gmem_type.strides[seq_dim]) * dtype_bytes
+            )
+            smem_seq_stride_bytes = (
+                cast(int, smem_type.strides[seq_dim]) * dtype_bytes
+            )
             for seq_idx in range(seq_size):
                 g_off = seq_idx * gmem_seq_stride_bytes
                 s_off = seq_idx * smem_seq_stride_bytes
@@ -1413,8 +1477,8 @@ class LowerToPtxTemplate(LoweringPass):
         # TODO: this needs unique wgrmem layouts
         raise NotImplementedError("this needs unique wgrmem layouts")
 
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
         smem_type = dst_value.type
         wgrmem_type = src_value.type
         assert isinstance(smem_type, SmemTensorType)
@@ -1533,8 +1597,8 @@ class LowerToPtxTemplate(LoweringPass):
         id upstream (see promote_buffers._build_tma_writeback), so the row offset
         is already folded into the destination pointer.
         """
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
         dst_type = op.dst.type
         wgrmem_type = op.src.type
         assert isinstance(dst_type, (GmemTensorType, SmemTensorType))
@@ -1550,10 +1614,12 @@ class LowerToPtxTemplate(LoweringPass):
             f"destination {dst_type.dtype} vs wgrmem {wgrmem_type.dtype}"
         )
 
-        m_dim, n_dim = wgrmem_type.sizes
+        m_dim, n_dim = cast(tuple[int, int], wgrmem_type.sizes)
         root = root_buffer(op.src)
         assert root is not None
-        root_n = root.type.sizes[1]
+        root_type = root.type
+        assert isinstance(root_type, WgrmemTensorType)
+        root_n = cast(int, root_type.sizes[1])
         if isinstance(op.src.definition, TileOp):
             assert list(dst_type.sizes) == [m_dim, n_dim], (
                 f"wgmma store: destination shape {list(dst_type.sizes)} does "
@@ -1563,8 +1629,9 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             # Keep accepting the legacy producer until PromoteBuffers switches
             # from an attribute-based slice to an explicit WGRMEM view.
-            col_start = int(op.attrs.get("wgmma_col_start", 0))
-            dst_m, dst_n = dst_type.sizes
+            col_start = op.attrs.get("wgmma_col_start", 0)
+            assert isinstance(col_start, int)
+            dst_m, dst_n = cast(tuple[int, int], dst_type.sizes)
             assert dst_m == m_dim and 0 <= col_start < n_dim
             assert col_start + dst_n <= n_dim
             pairs = [
@@ -1578,8 +1645,10 @@ class LowerToPtxTemplate(LoweringPass):
         assert root_n % 8 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
         )
-        dtype_bytes = dst_type.dtype.byte_size
-        row_stride_bytes = dst_type.strides[0] * dtype_bytes
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, dst_type.dtype,
+        ).byte_size
+        row_stride_bytes = cast(int, dst_type.strides[0]) * dtype_bytes
 
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes, dtype_bytes,
@@ -1618,8 +1687,8 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_move_wgrmem_wgmma_to_stmatrix(
         self, op: MoveOp, register_starts: list[int],
     ) -> tuple[list[Op], list[object]]:
-        dst = self.value_map[op.dst]
-        src = self.value_map[op.src]
+        dst = cast(Value, self.value_map[op.dst])
+        src = cast(Value, self.value_map[op.src])
         dst_type = op.dst.type
         src_type = op.src.type
         assert isinstance(dst_type, SmemTensorType)
@@ -1627,15 +1696,18 @@ class LowerToPtxTemplate(LoweringPass):
         col_start = (
             _static_view_origin(op.src)[1]
             if isinstance(op.src.definition, TileOp)
-            else int(op.attrs.get("wgmma_col_start", 0))
+            else op.attrs.get("wgmma_col_start", 0)
         )
+        assert isinstance(col_start, int)
         src_root = root_buffer(op.src)
         dst_root = root_buffer(op.dst)
         assert src_root is not None and dst_root is not None
-        n_dim = src_root.type.sizes[1]
+        src_root_type = src_root.type
+        assert isinstance(src_root_type, WgrmemTensorType)
+        n_dim = cast(int, src_root_type.sizes[1])
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
-        root_sizes = root_type.sizes
+        root_sizes = cast(tuple[int, ...], root_type.sizes)
         # TODO: Model writer ownership as a warpgroup-uniform IR condition so
         # loop peeling/unrolling can specialize each slice and lower the whole
         # gather to one branch instead of predicating every stmatrix.
@@ -1721,8 +1793,8 @@ class LowerToPtxTemplate(LoweringPass):
         # TODO: this needs unique wgrmem layouts
         raise NotImplementedError("this needs unique wgrmem layouts")
 
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
         wgrmem_type = dst_value.type
         smem_type = src_value.type
         assert isinstance(wgrmem_type, WgrmemTensorType)
@@ -1787,8 +1859,8 @@ class LowerToPtxTemplate(LoweringPass):
         The smem RAW/WAR hazards (prior writers/readers of the tile) are handled
         by insert_syncs; when the producer is a TMA load, its await orders this.
         """
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
 
         is_load = isinstance(op.dst.type, RmemTensorType)
         smem_ir_type = op.src.type if is_load else op.dst.type
@@ -1796,7 +1868,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(smem_ir_type, SmemTensorType)
         assert isinstance(rmem_type, RmemTensorType)
         smem_label = "src" if is_load else "dst"
-        dtype_bytes = smem_ir_type.dtype.byte_size
+        dtype_bytes = cast(
+            BF16Type | F16Type | F32Type | F64Type, smem_ir_type.dtype,
+        ).byte_size
         suffix = _ptx_suffix(rmem_type.dtype)
 
         operands: list[Value] = [dst_value, src_value]
@@ -1806,10 +1880,13 @@ class LowerToPtxTemplate(LoweringPass):
         base_reg = f"${{b32:operand.{smem_label}.ptr}}"
 
         for flat_idx, idx in enumerate(
-            itertools.product(*[range(s) for s in rmem_type.sizes])
+            itertools.product(
+                *[range(s) for s in cast(tuple[int, ...], rmem_type.sizes)]
+            )
         ):
+            strides = cast(tuple[int, ...], smem_ir_type.strides)
             offset = sum(
-                c * s for c, s in zip(idx, smem_ir_type.strides)
+                c * s for c, s in zip(idx, strides)
             ) * dtype_bytes
             reg = f"${{{suffix}:operand.{'dst' if is_load else 'src'}.r{flat_idx}}}"
             if is_load:
@@ -1833,9 +1910,9 @@ class LowerToPtxTemplate(LoweringPass):
         The barrier inserted before the async orders all threads' shared-memory
         writes before thread 0 starts the store.
         """
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
-        idx_values = [self.value_map[v] for v in op.indices]
+        dst_value = cast(Value, self.value_map[op.dst])
+        src_value = cast(Value, self.value_map[op.src])
+        idx_values = [cast(Value, self.value_map[v]) for v in op.indices]
         desc_type = dst_value.type
         assert isinstance(desc_type, TmaDescType)
 
@@ -1898,9 +1975,11 @@ class LowerToPtxTemplate(LoweringPass):
         arrive instead of one per load (fastcu's single-``full``-barrier idea).
         Thread 0 issues; the await op emits the wait.
         """
-        assert lock_value.type.kind == "mbar", (
+        lock_type = lock_value.type
+        assert isinstance(lock_type, LockType)
+        assert lock_type.kind == "mbar", (
             f"_lower_async_tma_loads: expected lock kind 'mbar'; got "
-            f"{lock_value.type.kind!r}"
+            f"{lock_type.kind!r}"
         )
 
         operands: list[Value] = [lock_value]
@@ -1915,17 +1994,23 @@ class LowerToPtxTemplate(LoweringPass):
         total_bytes = 0
         load_lines: list[str] = []
         for i, tma in enumerate(tmas):
-            dst_value = self.value_map[tma.dst]
-            desc_value = self.value_map[tma.src]
+            dst_value = cast(Value, self.value_map[tma.dst])
+            desc_value = cast(Value, self.value_map[tma.src])
             assert isinstance(desc_value.type, TmaDescType), (
                 f"_lower_async_tma_loads: load src must be a TMA descriptor; "
                 f"got {desc_value.type}"
             )
             desc_type = desc_value.type
             total_bytes += (
-                desc_type.tile_num_elements * desc_type.gmem_type.dtype.byte_size
+                desc_type.tile_num_elements
+                * cast(
+                    BF16Type | F16Type | F32Type | F64Type,
+                    desc_type.gmem_type.dtype,
+                ).byte_size
             )
-            idx_values = [self.value_map[v] for v in tma.indices]
+            idx_values = [
+                cast(Value, self.value_map[v]) for v in tma.indices
+            ]
             dn, sn = f"dst{i}", f"desc{i}"
             idx_names = [f"idx{i}_{j}" for j in range(len(idx_values))]
             operands += [dst_value, desc_value] + idx_values
@@ -2090,7 +2175,9 @@ def _wgmma_pair_static_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
 
 def _static_view_origin(value: Value) -> tuple[int, ...]:
     """Logical element coordinates of a static view's origin in its root."""
-    offsets = [0] * value.type.rank
+    value_type = value.type
+    assert isinstance(value_type, WgrmemTensorType)
+    offsets = [0] * value_type.rank
     while isinstance(value.definition, TileOp):
         tile = value.definition
         for dim, index in enumerate(tile.static_indices):
@@ -2098,7 +2185,9 @@ def _static_view_origin(value: Value) -> tuple[int, ...]:
                 raise NotImplementedError(
                     "WGRMEM views currently require static tile indices"
                 )
-            offsets[dim] += index * tile.result().type.sizes[dim]
+            result_type = tile.result().type
+            assert isinstance(result_type, WgrmemTensorType)
+            offsets[dim] += index * cast(int, result_type.sizes[dim])
         value = tile.arg
     return tuple(offsets)
 
@@ -2126,12 +2215,13 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     )
     assert root_type.num_elements_per_thread % 2 == 0
     row_start, col_start = _static_view_origin(value)
-    view_m, view_n = view_type.sizes
+    view_m, view_n = cast(tuple[int, int], view_type.sizes)
+    root_n = cast(int, root_type.sizes[1])
     pairs = [
         (pair_index, row - row_start, col - col_start)
         for pair_index in range(root_type.num_elements_per_thread // 2)
         for row, col in [
-            _wgmma_pair_static_offset(pair_index, root_type.sizes[1])
+            _wgmma_pair_static_offset(pair_index, root_n)
         ]
         if row_start <= row < row_start + view_m
         and col_start <= col < col_start + view_n
@@ -2159,7 +2249,9 @@ def _view_pair_indices(value: Value) -> list[int]:
 
 def _view_f32_register_indices(value: Value) -> list[int]:
     """Return root F32 register indices covered by a WGRMEM value or view."""
-    assert isinstance(value.type.dtype, F32Type)
+    value_type = value.type
+    assert isinstance(value_type, WgrmemTensorType)
+    assert isinstance(value_type.dtype, F32Type)
     return [
         2 * pair + element
         for pair in _view_pair_indices(value)
@@ -2235,35 +2327,40 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         not isinstance(root_type, SmemTensorType)
         or root_type.rank != 2
         or not root_type.is_canonical_strides
-        or root_type.sizes[0] % 64
+        or cast(int, root_type.sizes[0]) % 64
     ):
         return None
 
-    m_dim, n_dim = src_type.sizes
+    m_dim, n_dim = cast(tuple[int, int], src_type.sizes)
     src_root = root_buffer(op.src)
     assert src_root is not None
-    root_n = src_root.type.sizes[1]
+    src_root_type = src_root.type
+    assert isinstance(src_root_type, WgrmemTensorType)
+    root_n = cast(int, src_root_type.sizes[1])
     is_view = isinstance(op.src.definition, TileOp)
     if is_view:
         row_start, col_start = _static_view_origin(op.src)
         pairs = _wgmma_view_pairs(op.src)
     else:
         row_start = 0
-        col_start = int(op.attrs.get("wgmma_col_start", 0))
+        col_start = op.attrs.get("wgmma_col_start", 0)
+        assert isinstance(col_start, int)
+        dst_n = cast(int, dst_type.sizes[1])
         pairs = [
             (pair, row, col - col_start)
             for pair, row, col in _wgmma_view_pairs(op.src)
-            if col_start <= col < col_start + dst_type.sizes[1]
+            if col_start <= col < col_start + dst_n
         ]
+    dst_m, dst_n = cast(tuple[int, int], dst_type.sizes)
     if (
-        dst_type.sizes[0] != m_dim
-        or (is_view and dst_type.sizes[1] != n_dim)
+        dst_m != m_dim
+        or (is_view and dst_n != n_dim)
         or row_start != 0
         or col_start < 0
         or col_start % 16
-        or (not is_view and col_start + dst_type.sizes[1] > n_dim)
+        or (not is_view and col_start + dst_n > n_dim)
         or m_dim % 64
-        or dst_type.sizes[1] % 64
+        or dst_n % 64
         or root_n % 16
         or not (8 <= root_n <= 256)
     ):

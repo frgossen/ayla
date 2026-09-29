@@ -59,9 +59,6 @@ include = [
     "tests/test_pytree.py",
     "tests/test_torch_custom_call.py",
 ]
-exclude = [
-    "ayla/passes/lower_to_ptx_template.py",
-]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 
