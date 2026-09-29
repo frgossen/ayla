@@ -20,6 +20,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     KernelOp,
+    MemTensorType,
     ModuleOp,
     ReduceOp,
     ThreadIdsOp,
@@ -78,10 +79,13 @@ def _tile_value(
     tile_indices: dict[int, Value],
 ) -> tuple[list[Op], Value]:
     typ = clone_type(arg.type)
+    assert isinstance(typ, MemTensorType)
     indices: list[Value | int] = [0] * typ.rank
+    sizes = list(typ.sizes)
     for dim, tile_size in tile_sizes.items():
-        typ.sizes[dim] = tile_size
+        sizes[dim] = tile_size
         indices[dim] = tile_indices[dim]
+    typ.sizes = sizes
     tile_op = TileOp.build(arg, indices, typ)
     return [tile_op], tile_op.result()
 
@@ -95,6 +99,13 @@ class TileReduce(LoweringPass):
     A dimension without a parallel iteration space is lowered to a sequential
     loop whose label is derived from the dimension.
     """
+
+    tile_sizes: dict[int, int]
+    parallel_iteration_spaces: dict[
+        int, tuple[CollectiveLevel, CollectiveAxis]
+    ]
+    hero_label_filter: str | None
+    epilogue_label_filter: str | None
 
     def __init__(
         self,
@@ -154,7 +165,9 @@ class TileReduce(LoweringPass):
             for op in epilogue
             for operand in op.operands
         )
-        rank = hero.src.type.rank
+        src_type = hero.src.type
+        assert isinstance(src_type, MemTensorType)
+        rank = src_type.rank
         if rank - 1 in self.tile_sizes:
             raise NotImplementedError(
                 "TileReduce does not yet support tiling the reduction dimension"
@@ -186,12 +199,16 @@ class TileReduce(LoweringPass):
         self,
         hero: ReduceOp,
     ) -> tuple[list[Op], dict[int, Value], ForOp | None]:
+        src_type = hero.src.type
+        assert isinstance(src_type, MemTensorType)
         bounds: dict[int, int] = {}
         launch_dims: dict[
             tuple[CollectiveLevel, CollectiveAxis], int
         ] = {}
         for dim, tile_size in self.tile_sizes.items():
-            bounds[dim] = hero.src.type.sizes[dim] // tile_size
+            size = src_type.sizes[dim]
+            assert isinstance(size, int)
+            bounds[dim] = size // tile_size
             space = self.parallel_iteration_spaces.get(dim)
             if space is not None:
                 launch_dims[space] = (
