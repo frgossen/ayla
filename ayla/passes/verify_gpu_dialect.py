@@ -90,8 +90,8 @@ def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
         raise ValueError("multicast requires a TMA move")
     if not isinstance(op.dst.type, SmemTensorType):
         raise ValueError("TMA multicast is only supported for loads into smem")
-    if min(op.collective.values()) < CollectiveLevel.CLUSTER:
-        raise ValueError("TMA multicast must be cluster-collective")
+    if set(op.collective.values()) != {CollectiveLevel.CLUSTER}:
+        raise ValueError("TMA multicast must be exactly cluster-collective")
     kernel = find_ancestor_of_type(op, KernelOp)
     if kernel is None or not any(dim is not None for dim in kernel.cluster_dim):
         raise ValueError("TMA multicast requires an enclosing clustered kernel")
@@ -276,10 +276,10 @@ class VerifyGpuDialect(VerificationPass):
             )
         if (
             op.is_tma_multicast
-            and min(op.collective.values()) < CollectiveLevel.CLUSTER
+            and set(op.collective.values()) != {CollectiveLevel.CLUSTER}
         ):
             raise ValueError(
-                "TMA multicast async must be cluster-collective"
+                "TMA multicast async must be exactly cluster-collective"
             )
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)

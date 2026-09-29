@@ -357,6 +357,19 @@ def test_tma_multicast_accepts_clustered_load():
     assert verify_gpu_dialect(module) is module
 
 
+def test_tma_multicast_rejects_grid_collective():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%src: gmem<16x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {
+            %dst: smem<16x16xf32> = alloc() attrs={id: 0}
+            move(%dst: smem<16x16xf32>, %src: gmem<16x16xf32>) collective=xyz.grid attrs={multicast: True, tma: True}
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="exactly cluster-collective"):
+        verify_gpu_dialect(module)
+
+
 @pytest.mark.parametrize(
     "kernel_attrs,move_attrs,error",
     [

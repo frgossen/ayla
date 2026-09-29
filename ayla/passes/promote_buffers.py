@@ -195,8 +195,7 @@ def _sliced_moves(
     multicast = cast(bool, attrs.pop("multicast", False))
     if multicast is True:
         collective = {
-            axis: level.join(CollectiveLevel.CLUSTER)
-            for axis, level in collective.items()
+            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
         }
     if count == 1:
         return [MoveOp.build(
