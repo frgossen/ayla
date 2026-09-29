@@ -35,9 +35,22 @@ ignore = ["E501"]
 # Expand this boundary as the transformation layer gains precise annotations.
 include = [
     "ayla",
+    "tests/base/test_ir.py",
+    "tests/base/test_pipeline.py",
+    "tests/gemm_collection/test_correctness.py",
+    "tests/passes/test_canonicalize.py",
+    "tests/passes/test_dce.py",
+    "tests/passes/test_lower_to_tma_move.py",
+    "tests/passes/test_multi_buffer.py",
+    "tests/passes/test_schedule_async.py",
+    "tests/passes/test_specialize_shapes.py",
+    "tests/test_gemm.py",
+    "tests/test_pytree.py",
 ]
 exclude = [
     "ayla/passes/lower_to_ptx_template.py",
+    "ayla/passes/tile_reduce.py",
+    "ayla/passes/verify_gpu_dialect.py",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"

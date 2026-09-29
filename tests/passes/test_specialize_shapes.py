@@ -3,7 +3,13 @@ import textwrap
 import pytest
 
 from ayla.base.ir import Op, Value, clone_op
-from ayla.gpu_dialect import BF16Type, GmemTensorType, ModuleOp, gpu_dialect
+from ayla.gpu_dialect import (
+    BF16Type,
+    GmemTensorType,
+    KernelOp,
+    ModuleOp,
+    gpu_dialect,
+)
 from ayla.passes.specialize_shapes import SpecializeShapes, specialize_shapes
 from ayla.ptx_codegen import PtxLoweringPipeline
 
@@ -67,7 +73,9 @@ def test_specialization_rejects_unpropagated_dynamic_results():
         name="dynamic_result",
         type=GmemTensorType.build([None, 11], BF16Type()),
     )
-    module.body.ops[0].body.append(Op(operands=[], results=[dynamic_result]))
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    kernel.body.append(Op(operands=[], results=[dynamic_result]))
 
     with pytest.raises(NotImplementedError, match="propagate dynamic shape"):
         SpecializeShapes([(7, 11), (13, 11), (7, 13)]).run(module)
