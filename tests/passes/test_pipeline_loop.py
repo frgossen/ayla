@@ -28,7 +28,7 @@ def test_pipeline_reorders_across_inner_loop():
             }
           }
         }""")  # noqa: E501
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     pipelined = pipeline_loop(
         module, label_filter_loop="k", label_filter_op="load", pipelining_offset=1,
     )
@@ -87,7 +87,7 @@ def test_pipeline_matmul_smem_skeleton():
           }
         }""")  # noqa: E501
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     pipelined = pipeline_loop(module, label_filter_loop=".*", label_filter_op="load", pipelining_offset=1)
     text = repr(pipelined)
     expected = textwrap.dedent("""\

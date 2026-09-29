@@ -1,7 +1,7 @@
 """Tests for the CSE pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect, IndexConstantOp
+from ayla.gpu_dialect import IndexConstantOp, gpu_dialect
 from ayla.base.ir import find_ops_of_type
 from ayla.passes.cse import cse
 
@@ -21,7 +21,7 @@ def test_cse_deduplicates_index_constants():
           }
         }""")
 
-    module = gpu_dialect.parse(module_str)
+    module = gpu_dialect.parse_module(module_str)
     before_constants = find_ops_of_type(module, IndexConstantOp)
     assert sum(1 for op in before_constants if op.value == 64) == 2
 
@@ -61,7 +61,8 @@ def test_cse_deduplicates_allocations_by_id():
           }
         }""")
 
-    text = repr(cse(gpu_dialect.parse(module_str)))
+    module = gpu_dialect.parse_module(module_str)
+    text = repr(cse(module))
 
     assert text.count("alloc() attrs={id: 0}") == 1
     assert text.count("alloc() attrs={id: 1}") == 1

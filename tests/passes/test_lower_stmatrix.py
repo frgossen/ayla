@@ -10,7 +10,7 @@ from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 
 
 def test_lowers_128b_block_major_move_with_stmatrix():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -30,7 +30,7 @@ def test_lowers_128b_block_major_move_with_stmatrix():
 
 
 def test_lowers_128b_block_major_column_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -54,7 +54,7 @@ def test_lowers_128b_block_major_column_slice():
 
 
 def test_lowers_legacy_attribute_column_slice():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -73,7 +73,7 @@ def test_lowers_legacy_attribute_column_slice():
 
 
 def test_unswizzled_move_uses_scalar_store_fallback():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x256xbf16> = alloc() attrs={id: 0}
@@ -90,7 +90,7 @@ def test_unswizzled_move_uses_scalar_store_fallback():
 
 
 def test_n8_fragment_uses_scalar_store_fallback():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x40xbf16> = alloc() attrs={id: 0}
@@ -109,7 +109,7 @@ def test_n8_fragment_uses_scalar_store_fallback():
 
 
 def test_n8_fragment_scalar_store_supports_global_memory():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k(%g: gmem<64x40xbf16>) block_dim=[128, 1, 1] {
             %r: wgrmem<64x40xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
@@ -126,7 +126,7 @@ def test_n8_fragment_scalar_store_supports_global_memory():
 
 
 def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @k() block_dim=[128, 1, 1] {
             %s: smem<64x64xbf16> = alloc() attrs={id: 0}

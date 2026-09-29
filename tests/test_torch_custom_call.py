@@ -1,5 +1,6 @@
 import torch
 
+from ayla.base.ir import Type
 from ayla.gpu_dialect import BF16Type, GmemTensorType
 from ayla.torch_custom_call import OperandKind, make_torch_custom_call
 
@@ -7,7 +8,7 @@ from ayla.torch_custom_call import OperandKind, make_torch_custom_call
 def test_out_only_custom_call_has_meta_kernel():
     class Launcher:
         name = "out_only_meta_test"
-        signature = [
+        signature: list[Type] = [
             GmemTensorType.build([4, 8], BF16Type()),
             GmemTensorType.build([4, 16], BF16Type()),
         ]
@@ -29,7 +30,7 @@ def test_out_only_custom_call_has_meta_kernel():
 def test_result_shape_can_be_inferred_from_inputs():
     class Launcher:
         name = "dynamic_result_meta_test"
-        signature = [
+        signature: list[Type] = [
             GmemTensorType.build([1, 8], BF16Type()),
             GmemTensorType.build([1, 16], BF16Type()),
         ]
