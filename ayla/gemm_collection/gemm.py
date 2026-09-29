@@ -207,6 +207,7 @@ def schedule_matmul(
     if len(matmuls) != 1:
         raise ValueError("schedule_matmul requires exactly one matmul")
     matmul = matmuls[0]
+    assert isinstance(matmul, MatmulOp)
     assert isinstance(matmul.lhs.type, MemTensorType)
     assert isinstance(matmul.rhs.type, MemTensorType)
     m, k = matmul.lhs.type.sizes
