@@ -1063,6 +1063,12 @@ class LowerToPtxTemplate(LoweringPass):
                     lhs_offset if m_it > 0 else None,
                 )
 
+            input_dtype = lhs_type.dtype.name
+            if rhs_type.dtype.name != input_dtype:
+                raise NotImplementedError(
+                    "wgmma inputs must have the same dtype; got "
+                    f"{lhs_type.dtype} and {rhs_type.dtype}"
+                )
             reg_offset = 0
             for m_it in range(m_iters):
                 regs = ", ".join(
@@ -1070,7 +1076,7 @@ class LowerToPtxTemplate(LoweringPass):
                     for i in range(num_regs_per_wgmma)
                 )
                 mma_template += textwrap.dedent(f"""\
-                    wgmma.mma_async.sync.aligned.m64n{n_dim}k16.f32.bf16.bf16
+                    wgmma.mma_async.sync.aligned.m64n{n_dim}k16.f32.{input_dtype}.{input_dtype}
                       {{{regs}}},
                       ${{b64:desc_lhs{j}_{m_it}}},
                       ${{b64:{desc_rhs}}},
