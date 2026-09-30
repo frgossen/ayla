@@ -3,8 +3,28 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gemm_collection.gemm import schedule_register_matmul
+from ayla.gemm_collection.gemm import (
+    schedule_register_matmul,
+    schedule_tiled_matmul,
+)
 from ayla.gpu_dialect import AsyncOp, ModuleOp, MoveOp, gpu_dialect
+from ayla.passes.tile_matmul import TileMatmul
+
+
+def test_tiled_schedule_maps_two_output_dimensions_to_warp_groups():
+    pipeline = schedule_tiled_matmul(
+        label="mm",
+        output_m_tile=128,
+        output_n_tile=160,
+        warpgroup_m_tile=64,
+        warpgroup_n_tile=80,
+        operand_stages=1,
+    )
+
+    warpgroup_tiling = pipeline.passes[0]
+    assert isinstance(warpgroup_tiling, TileMatmul)
+    assert warpgroup_tiling.op_dims == ["M", "N"]
+    assert warpgroup_tiling.tile_sizes == [64, 80]
 
 
 def test_register_matmul_schedules_side_by_side_gemms():

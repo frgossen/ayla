@@ -113,6 +113,7 @@ def schedule_tiled_matmul(
     output_n_tile: int,
     operand_stages: int,
     operand_k_tile: int = 64,
+    warpgroup_m_tile: int | None = None,
     warpgroup_n_tile: int | None = None,
     output_slices: int = 1,
     output_store_buffers: int = 1,
@@ -130,15 +131,26 @@ def schedule_tiled_matmul(
         if output_m_tile == 64 or output_n_tile > 256
         else ("M", 64)
     )
+    wg_dims, wg_sizes = [wg_dim], [wg_size]
+    if warpgroup_m_tile is not None:
+        wg_dims, wg_sizes = ["M", "N"], [
+            warpgroup_m_tile, warpgroup_n_tile,
+        ]
 
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
-        op_dims=[wg_dim], tile_sizes=[wg_size],
-        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)],
-        for_loop_labels=[None],
+        op_dims=wg_dims, tile_sizes=wg_sizes,
+        iteration_bindings=[
+            (CollectiveLevel.WG, CollectiveAxis.X)
+        ] * len(wg_dims),
+        for_loop_labels=[None] * len(wg_dims),
         op_label_filter=label,
         epilogue_label_filter=epilogue_label_filter,
-        allow_partial_tiles=(wg_dim == "M" and output_m_tile % wg_size != 0),
+        allow_partial_tiles=(
+            len(wg_dims) == 1
+            and wg_dims[0] == "M"
+            and output_m_tile % wg_sizes[0] != 0
+        ),
     ))
     pipeline.add_pass(PromoteBuffers(
         target_type="wgrmem", operands=["dst"], swizzle=None,
@@ -183,6 +195,7 @@ def schedule_matmul(
     output_n_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
+    warpgroup_m_tile: int | None = None,
     warpgroup_n_tile: int | None = None,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
@@ -299,6 +312,7 @@ def schedule_matmul(
         output_n_tile=output_n_tile,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
+        warpgroup_m_tile=warpgroup_m_tile,
         warpgroup_n_tile=warpgroup_n_tile,
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
@@ -324,6 +338,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_n_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
+    warpgroup_m_tile: int | None = None,
     warpgroup_n_tile: int | None = None,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
@@ -364,6 +379,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_n{output_n_tile}"
     if resolved_warpgroup_n_tile not in (128, 256):
         name += f"_wg{resolved_warpgroup_n_tile}"
+    if warpgroup_m_tile is not None:
+        name += f"_wgm{warpgroup_m_tile}"
     if output_m_tiles_per_cta != 1:
         name += f"_{output_m_tiles_per_cta}tiles"
     if output_n_tiles_per_cta != 1:
@@ -388,6 +405,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_n_tiles_per_cta=output_n_tiles_per_cta,
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
+        warpgroup_m_tile=warpgroup_m_tile,
         warpgroup_n_tile=resolved_warpgroup_n_tile,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,

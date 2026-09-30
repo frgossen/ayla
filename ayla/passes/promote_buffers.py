@@ -536,14 +536,15 @@ class PromoteBuffers(LoweringPass):
         new_ops: list[Op] = list(smems)
         slice_cols = static_smem_sizes[-1]
         wg_column_tile = None
-        for tile in narrow_tiles:
-            result_type = tile.result().type
-            arg_type = tile.arg.type
-            assert isinstance(result_type, MemTensorType)
-            assert isinstance(arg_type, MemTensorType)
-            if result_type.sizes[-1] != arg_type.sizes[-1]:
-                wg_column_tile = tile
-                break
+        if self.writeback_slices > 1:
+            for tile in narrow_tiles:
+                result_type = tile.result().type
+                arg_type = tile.arg.type
+                assert isinstance(result_type, MemTensorType)
+                assert isinstance(arg_type, MemTensorType)
+                if result_type.sizes[-1] != arg_type.sizes[-1]:
+                    wg_column_tile = tile
+                    break
         dst_cols = block_dst.type.sizes[-1]
         src_cols = src.type.sizes[-1]
         assert dst_cols is not None and src_cols is not None
