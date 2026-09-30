@@ -184,6 +184,8 @@ def schedule_matmul(
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
+    cluster_m_ctas: int = 1,
+    cluster_n_ctas: int = 1,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
     output_slices: int = 1,
@@ -226,6 +228,10 @@ def schedule_matmul(
         )
     if output_m_tiles_per_cta > 1 and output_n_tiles_per_cta > 1:
         raise ValueError("output tiles may be grouped along only one axis")
+    if min(cluster_m_ctas, cluster_n_ctas) < 1:
+        raise ValueError("cluster dimensions must be positive")
+    if cluster_m_ctas > 1 and cluster_n_ctas > 1:
+        raise ValueError("only one multicast cluster axis is supported")
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (64, 128, 192, 256):
@@ -258,6 +264,12 @@ def schedule_matmul(
         tile_size = output_m_tile
         group_size = output_m_tiles_per_cta
         group_label = "outm"
+    grid_x = (m_blocks + output_m_tiles_per_cta - 1) // output_m_tiles_per_cta
+    grid_y = (n_blocks + output_n_tiles_per_cta - 1) // output_n_tiles_per_cta
+    if grid_x % cluster_m_ctas or grid_y % cluster_n_ctas:
+        raise ValueError("CTA grid must divide evenly by cluster dimensions")
+    if cluster_m_ctas > 1 or cluster_n_ctas > 1:
+        kernel.attrs["cluster_dim"] = [cluster_m_ctas, cluster_n_ctas, 1]
     pipeline = Pipeline()
     if group_size == 1:
         pipeline.add_pass(TileMatmul(
@@ -325,6 +337,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
+    cluster_m_ctas: int = 1,
+    cluster_n_ctas: int = 1,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
     output_slices: int = 1,
@@ -364,6 +378,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_n{output_n_tile}"
     if resolved_warpgroup_n_tile not in (128, 256):
         name += f"_wg{resolved_warpgroup_n_tile}"
+    if cluster_m_ctas > 1 or cluster_n_ctas > 1:
+        name += f"_cluster{cluster_m_ctas}x{cluster_n_ctas}"
     if output_m_tiles_per_cta != 1:
         name += f"_{output_m_tiles_per_cta}tiles"
     if output_n_tiles_per_cta != 1:
@@ -389,6 +405,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
         warpgroup_n_tile=resolved_warpgroup_n_tile,
+        cluster_m_ctas=cluster_m_ctas,
+        cluster_n_ctas=cluster_n_ctas,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
         output_slices=output_slices,
