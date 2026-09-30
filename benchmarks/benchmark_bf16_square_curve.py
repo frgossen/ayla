@@ -43,7 +43,7 @@ CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
     1024: (
         partial(
             _square_module,
-            1024, output_tiles_per_cta=2, operand_stages=4, output_slices=2,
+            1024, output_m_tiles_per_cta=2, operand_stages=4, output_slices=2,
         ),
         "m2x128n256_k64_s4_split2",
     ),
@@ -51,7 +51,7 @@ CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
         partial(
             _square_module,
             2048,
-            output_tiles_per_cta=4,
+            output_m_tiles_per_cta=4,
             operand_stages=3,
             output_slices=2,
             output_store_buffers=2,
@@ -63,7 +63,7 @@ CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
         partial(
             _square_module,
             4096,
-            output_tiles_per_cta=4,
+            output_m_tiles_per_cta=4,
             operand_stages=3,
             output_slices=2,
             output_store_buffers=2,
@@ -74,14 +74,14 @@ CONFIGS: dict[int, tuple[Callable[[], ModuleOp], str]] = {
     8192: (
         partial(
             _square_module,
-            8192, output_tiles_per_cta=4, operand_stages=4, output_slices=2,
+            8192, output_m_tiles_per_cta=4, operand_stages=4, output_slices=2,
         ),
         "m4x128n256_k64_s4_split2",
     ),
     16384: (
         partial(
             _square_module,
-            16384, output_tiles_per_cta=4, operand_stages=4, output_slices=2,
+            16384, output_m_tiles_per_cta=4, operand_stages=4, output_slices=2,
         ),
         "m4x128n256_k64_s4_split2",
     ),

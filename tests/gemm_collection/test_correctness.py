@@ -35,7 +35,7 @@ BF16 = torch.bfloat16
 
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_tiles_per_cta=2,
+        output_m_tiles_per_cta=2,
     ))
     lines = kernel.ptx.splitlines()
     stores = [i for i, line in enumerate(lines)
@@ -82,7 +82,7 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
         m=512,
         n=19968,
         k=6656,
-        output_tiles_per_cta=2,
+        output_m_tiles_per_cta=2,
         operand_stages=4,
         output_slices=2,
     ))
@@ -131,7 +131,7 @@ def test_multi_output_uses_requested_tile_geometry():
             m=768,
             n=128,
             k=64,
-            output_tiles_per_cta=2,
+            output_m_tiles_per_cta=2,
             output_m_tile=192,
             output_n_tile=64,
             warpgroup_n_tile=64,
@@ -151,10 +151,36 @@ def test_extended_output_tiles_per_cta(tiles_per_cta, expected_grid_x):
             m=2048,
             n=256,
             k=64,
-            output_tiles_per_cta=tiles_per_cta,
+            output_m_tiles_per_cta=tiles_per_cta,
         )
     )
     assert kernel.grid_dim == (expected_grid_x, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "m,n,k,m_tile,n_tile,n_group,expected_grid",
+    [
+        (12_544, 1_024, 512, 192, 128, 4, (66, 2, 1)),
+        (25_088, 256, 1_024, 192, 128, 2, (131, 1, 1)),
+        (8_192, 3_072, 768, 192, 128, 8, (43, 3, 1)),
+    ],
+)
+def test_n_output_groups_infer_the_grid(
+    m, n, k, m_tile, n_tile, n_group, expected_grid,
+):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=m,
+            n=n,
+            k=k,
+            output_n_tiles_per_cta=n_group,
+            output_m_tile=m_tile,
+            output_n_tile=n_tile,
+            warpgroup_n_tile=n_tile,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.grid_dim == expected_grid
 
 
 def test_k128_block_major_nested_tiles_lower_to_ptx():
@@ -195,7 +221,7 @@ def test_k128_block_major_nested_tiles_match_torch():
 
 def test_four_tile_output_evict_first_reaches_tma_stores():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_tiles_per_cta=4,
+        output_m_tiles_per_cta=4,
         operand_stages=3,
         output_slices=2,
         output_store_buffers=2,
@@ -212,7 +238,7 @@ def test_four_tile_output_evict_first_reaches_tma_stores():
 
 def test_lhs_l2_promotion_reaches_tma_descriptor():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_tiles_per_cta=4,
+        output_m_tiles_per_cta=4,
         operand_stages=3,
         output_slices=2,
         output_store_buffers=2,

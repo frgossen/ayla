@@ -49,16 +49,16 @@ PROJECTION_DIMS = {
 
 CONFIGS = {
     "one_tile_k3": {
-        "output_tiles_per_cta": 1,
+        "output_m_tiles_per_cta": 1,
         "operand_stages": 3,
     },
     "two_tile_k4_split2": {
-        "output_tiles_per_cta": 2,
+        "output_m_tiles_per_cta": 2,
         "operand_stages": 4,
         "output_slices": 2,
     },
     "four_tile_k3_split2": {
-        "output_tiles_per_cta": 4,
+        "output_m_tiles_per_cta": 4,
         "operand_stages": 3,
         "output_slices": 2,
         "output_store_buffers": 2,
