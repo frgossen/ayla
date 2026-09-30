@@ -91,6 +91,72 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
     assert kernel.block_dim == (256, 1, 1)
 
 
+@pytest.mark.parametrize("m_tile,expected_threads", [(64, 128), (256, 512)])
+def test_configurable_tma_gemm_supports_extended_m_tiles(
+    m_tile, expected_threads,
+):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=256,
+            n=64,
+            k=64,
+            output_m_tile=m_tile,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            operand_stages=2,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.block_dim == (expected_threads, 1, 1)
+
+
+@pytest.mark.parametrize("n_tile", [48, 80, 96, 128, 152, 160, 192])
+def test_configurable_tma_gemm_supports_general_n_tiles(n_tile):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=128,
+            n=192,
+            k=64,
+            output_n_tile=n_tile,
+            warpgroup_n_tile=n_tile,
+            output_tma_inner_size=None,
+        )
+    )
+    assert "wgmma.mma_async" in kernel.ptx
+
+
+def test_multi_output_uses_requested_tile_geometry():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=768,
+            n=128,
+            k=64,
+            output_tiles_per_cta=2,
+            output_m_tile=192,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.grid_dim == (2, 2, 1)
+    assert kernel.block_dim == (384, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "tiles_per_cta,expected_grid_x", [(3, 6), (6, 3), (8, 2), (16, 1)],
+)
+def test_extended_output_tiles_per_cta(tiles_per_cta, expected_grid_x):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=2048,
+            n=256,
+            k=64,
+            output_tiles_per_cta=tiles_per_cta,
+        )
+    )
+    assert kernel.grid_dim == (expected_grid_x, 1, 1)
+
+
 def test_k128_block_major_nested_tiles_lower_to_ptx():
     kernel = make_ptx_kernel(
         auto_matmul_4096_wgmma256_wg_tma_store_module(

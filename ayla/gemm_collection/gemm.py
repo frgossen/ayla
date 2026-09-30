@@ -218,16 +218,18 @@ def schedule_matmul(
         raise ValueError("matmul reduction dimensions must match")
     m, n, k = cast(tuple[int, int, int], (m, n, k))
 
-    if output_tiles_per_cta not in (1, 2, 4):
-        raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
+    if output_tiles_per_cta not in (1, 2, 3, 4, 6, 8, 16):
+        raise ValueError(
+            "output_tiles_per_cta must be 1, 2, 3, 4, 6, 8, or 16"
+        )
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
-    if output_m_tile not in (128, 192):
-        raise ValueError("output_m_tile must be 128 or 192")
-    if output_m_tile == 192 and output_tiles_per_cta != 1:
-        raise ValueError("M=192 currently requires one output tile per CTA")
-    if output_n_tile not in (64, 208, 256, 384):
-        raise ValueError("output_n_tile must be 64, 208, 256, or 384")
+    if output_m_tile not in (64, 128, 192, 256):
+        raise ValueError("output_m_tile must be 64, 128, 192, or 256")
+    if not 48 <= output_n_tile <= 384 or output_n_tile % 8:
+        raise ValueError(
+            "output_n_tile must be a multiple of 8 between 48 and 384"
+        )
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
     if warpgroup_n_tile is None:
@@ -259,7 +261,9 @@ def schedule_matmul(
     else:
         pipeline.add_pass(TileMatmul(
             op_dims=["M", "M", "N"],
-            tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
+            tile_sizes=[
+                grid_x * output_m_tile, output_m_tile, output_n_tile,
+            ],
             iteration_bindings=[
                 None,
                 (CollectiveLevel.BLOCK, CollectiveAxis.X),
@@ -269,6 +273,7 @@ def schedule_matmul(
             allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
+                or m_blocks % output_tiles_per_cta != 0
             ),
         ))
     pipeline.add_pass(schedule_tiled_matmul(
