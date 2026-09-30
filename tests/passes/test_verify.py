@@ -556,3 +556,21 @@ def test_verification_rejects_unknown_grid_barrier_target():
 
     with pytest.raises(ValueError, match="no residency limit.*sm_101a"):
         verify_gpu_dialect(module)
+
+
+def test_smem_reuse_verification_rejects_overlapping_async_lifetimes():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %a: smem<16xf32> = alloc() attrs={reuse_group: "first"}
+            %b: smem<16xf32> = alloc() attrs={reuse_group: "second"}
+            %r: rmem<16xf32> = alloc()
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) move(%r: rmem<16xf32>, %a: smem<16xf32>)
+            move(%b: smem<16xf32>, %r: rmem<16xf32>)
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="cannot prove shared-memory reuse"):
+        verify_gpu_dialect(module, VerificationStage.SMEM_REUSE)

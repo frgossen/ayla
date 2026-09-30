@@ -2,12 +2,22 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+from itertools import combinations
 import math
 
-from ..base.ir import Op, Type, find_ancestor_of_type
+from ..analysis.buffer_lifetime import BufferLifetimeAnalysis
+from ..base.ir import (
+    Op,
+    Type,
+    Value,
+    find_ancestor_of_type,
+    find_ops_of_type,
+    iter_ops,
+)
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
+    AllocOp,
     AsyncOp,
     BF16Type,
     BarrierOp,
@@ -33,6 +43,7 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
+    memory_effects,
 )
 
 
@@ -55,7 +66,32 @@ class VerificationStage(Enum):
     """The invariants that must hold when verification runs."""
 
     DEFAULT = auto()
+    SMEM_REUSE = auto()
     PTX_LOWERING = auto()
+
+
+def _smem_reuse_conflicts(
+    kernel: KernelOp,
+    lifetime: BufferLifetimeAnalysis,
+) -> dict[Value, set[Value]]:
+    conflicts: dict[Value, set[Value]] = {}
+    for op in iter_ops(kernel, lifetime.has_liveness):
+        if isinstance(op, KernelOp):
+            continue
+        effects = memory_effects(op)
+        if effects is None:
+            raise NotImplementedError(
+                f"unmodelled memory effects for {type(op).__name__}"
+            )
+        buffers = (
+            set(lifetime.live_in(op).buffers)
+            | set(lifetime.live_out(op).buffers)
+            | {root for effect in effects for root in effect.roots}
+        )
+        for lhs, rhs in combinations(buffers, 2):
+            conflicts.setdefault(lhs, set()).add(rhs)
+            conflicts.setdefault(rhs, set()).add(lhs)
+    return conflicts
 
 
 def _verify_static_shape(typ: Type) -> None:
@@ -109,6 +145,41 @@ class VerifyGpuDialect(VerificationPass):
         self, stage: VerificationStage = VerificationStage.DEFAULT,
     ) -> None:
         super().__init__(stage)
+
+    @verifies(KernelOp, stage=VerificationStage.SMEM_REUSE)
+    def _verify_smem_reuse(self, kernel: KernelOp) -> None:
+        groups: dict[str, list[AllocOp]] = {}
+        for alloc in find_ops_of_type(kernel, AllocOp):
+            if not isinstance(alloc.result().type, SmemTensorType):
+                continue
+            group = alloc.attrs.get("reuse_group")
+            if group is None:
+                continue
+            if not isinstance(group, str):
+                raise ValueError("reuse_group must be a string")
+            if "allocation_alignment" in alloc.attrs:
+                raise ValueError(
+                    "cannot reuse an allocation that already has a layout"
+                )
+            groups.setdefault(group, []).append(alloc)
+        if not groups:
+            return
+        if len(groups) < 2:
+            raise ValueError("at least two reuse groups are required")
+
+        lifetime = BufferLifetimeAnalysis()
+        lifetime.analyze(kernel)
+        conflicts = _smem_reuse_conflicts(kernel, lifetime)
+        for (lhs_name, lhs_group), (rhs_name, rhs_group) in combinations(
+            groups.items(), 2,
+        ):
+            for lhs in lhs_group:
+                for rhs in rhs_group:
+                    if rhs.result() in conflicts.get(lhs.result(), set()):
+                        raise ValueError(
+                            "cannot prove shared-memory reuse groups "
+                            f"{lhs_name!r} and {rhs_name!r} are exclusive"
+                        )
 
     @verifies(KernelOp)
     def _verify_kernel(self, op: KernelOp) -> None:

@@ -194,6 +194,7 @@ def schedule_matmul(
     # for faster TMA reads of the arena.
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
+    unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
 ) -> ModuleOp:
     """Apply the configurable WGMMA schedule to one concrete matmul.
@@ -303,6 +304,7 @@ def schedule_matmul(
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,
+        unsafe_reuse_smem=unsafe_reuse_smem,
         operand_move_attrs=operand_move_attrs,
     ))
     if group_size > 1:
@@ -331,6 +333,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
+    unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     ptx_optimization_level: int | None = None,
     dtype: str = "bf16",
@@ -395,5 +398,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,
         output_store=output_store,
+        unsafe_reuse_smem=unsafe_reuse_smem,
         operand_move_attrs=operand_move_attrs,
     )

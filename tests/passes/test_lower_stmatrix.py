@@ -29,6 +29,28 @@ def test_lowers_128b_block_major_move_with_stmatrix():
     assert "mad.lo.u32 ${b32:st_off}, ${b32:st_row}, 64" in template
 
 
+def test_reinterpreted_arena_preserves_stmatrix_address_geometry():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[128, 1, 1] {
+            %arena: smem<24576xbf16> = alloc() attrs={id: 0}
+            %view: smem<64x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = reinterpret(%arena: smem<24576xbf16>) attrs={byte_offset: 0}
+            %r: wgrmem<64x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%view: smem<64x128xbf16 swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>, %r: wgrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))
+
+    templates = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )
+    template = next(
+        op.template for op in templates if "stmatrix.sync" in op.template
+    )
+    assert template.count("stmatrix.sync") == 8
+    assert "3145728" not in template
+    assert "9216" in template
+
+
 def test_lowers_128b_block_major_column_slice():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {

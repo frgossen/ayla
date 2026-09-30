@@ -45,6 +45,7 @@ from ayla.gpu_dialect import (
     memory_effects,
     root_buffer,
     root_buffers,
+    tile_root,
 )
 
 
@@ -110,6 +111,21 @@ def test_reinterpret_op():
         ReinterpretOp.build(Value(name="value", type=F32Type()), view_type)
     with pytest.raises(ValueError, match="result"):
         ReinterpretOp.build(arg, F32Type())
+
+
+def test_tile_root_stops_at_reinterpret_view():
+    arena = Value(
+        name="arena", type=SmemTensorType.build((4096,), BF16Type()),
+    )
+    view = ReinterpretOp.build(
+        arena, SmemTensorType.build((64, 64), BF16Type()),
+    )
+    tile = TileOp.build(
+        view.result(), [0, 1], SmemTensorType.build((64, 16), BF16Type()),
+    )
+
+    assert tile_root(tile.result()) is view.result()
+    assert root_buffer(tile.result()) is arena
 
 
 def test_buffer_roots_support_no_root_and_multiple_roots():

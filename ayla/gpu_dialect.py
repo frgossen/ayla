@@ -2413,6 +2413,14 @@ def root_buffers(value: Value) -> set[Value]:
         return {value}
     return set()
 
+
+def tile_root(value: Value) -> Value:
+    """Return the value at the root of a chain of tiled views."""
+    while isinstance(value.definition, TileOp):
+        value = value.definition.arg
+    return value
+
+
 def root_buffer(value: Value) -> Value | None:
     """Return the unique physical buffer underlying ``value``, if any."""
     roots = root_buffers(value)

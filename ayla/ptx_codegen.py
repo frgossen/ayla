@@ -58,8 +58,9 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
-        self.add_pass(InsertSyncs())
+        self.add_pass(VerifyGpuDialect(VerificationStage.SMEM_REUSE))
         self.add_pass(ReuseSmemAllocs())
+        self.add_pass(InsertSyncs())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(Canonicalize())
 

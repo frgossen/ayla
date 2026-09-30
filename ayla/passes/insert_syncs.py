@@ -15,6 +15,7 @@ from ..gpu_dialect import AllocOp, BarrierOp, KernelOp, LockType, ModuleOp
 # BarrierScope -> the BarrierOp ``scope`` attr.
 _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
     BarrierScope.BLOCK_TO_LEADER: "block_leader",
+    BarrierScope.LEADER_TO_BLOCK: "block",
     BarrierScope.BLOCK: "block",
     BarrierScope.CLUSTER_TO_LEADER: "cluster_to_leader",
     BarrierScope.LEADER_TO_CLUSTER: "leader_to_cluster",

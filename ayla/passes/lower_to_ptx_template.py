@@ -52,6 +52,7 @@ from ..gpu_dialect import (
     WgrmemTensorType,
     physical_layout,
     root_buffer,
+    tile_root,
 )
 
 
@@ -343,9 +344,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"lower_tile: unexpected arg type {type(arg)}"
             )
 
-        view_root = op.arg
-        while isinstance(view_root.definition, TileOp):
-            view_root = view_root.definition.arg
+        view_root = tile_root(op.arg)
         view_root_type = view_root.type
         assert isinstance(view_root_type, AddrMemTensorType)
         dtype_bytes = cast(
@@ -1706,12 +1705,11 @@ class LowerToPtxTemplate(LoweringPass):
         )
         assert isinstance(col_start, int)
         src_root = root_buffer(op.src)
-        dst_root = root_buffer(op.dst)
-        assert src_root is not None and dst_root is not None
+        assert src_root is not None
         src_root_type = src_root.type
         assert isinstance(src_root_type, WgrmemTensorType)
         n_dim = cast(int, src_root_type.sizes[1])
-        root_type = dst_root.type
+        root_type = tile_root(op.dst).type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = cast(tuple[int, ...], root_type.sizes)
         # TODO: Model writer ownership as a warpgroup-uniform IR condition so
@@ -2326,9 +2324,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     ):
         return None
 
-    dst_root = root_buffer(op.dst)
-    assert dst_root is not None
-    root_type = dst_root.type
+    root_type = tile_root(op.dst).type
     if (
         not isinstance(root_type, SmemTensorType)
         or root_type.rank != 2

@@ -213,6 +213,79 @@ def test_configurable_tma_gemm_supports_fp16():
     assert ".f32.bf16.bf16" not in kernel.ptx
 
 
+def test_safe_smem_reuse_reduces_arena_and_orders_writeback():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=192,
+            n=64,
+            k=256,
+            output_m_tile=192,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            operand_k_tile=64,
+            operand_stages=3,
+            output_slices=1,
+            output_store_buffers=1,
+            unsafe_reuse_smem=True,
+        )
+    )
+    assert ".shared .align 1024 .b8 _smem_0[98304];" in kernel.ptx
+    assert kernel.ptx.count(".shared .align 1024") == 1
+    assert "wgmma.wait_group.sync.aligned 0;" in kernel.ptx
+    wait = kernel.ptx.rindex("wgmma.wait_group.sync.aligned 0;")
+    gather = kernel.ptx.index("stmatrix.sync", wait)
+    assert "bar.sync 0;" in kernel.ptx[wait:gather]
+
+
+def test_safe_smem_reuse_rejects_unproven_output_tile_loop():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=512,
+        n=256,
+        k=128,
+        output_m_tiles_per_cta=2,
+        output_m_tile=128,
+        output_n_tile=256,
+        warpgroup_n_tile=128,
+        operand_k_tile=128,
+        operand_stages=3,
+        output_slices=2,
+        output_store_buffers=1,
+        unsafe_reuse_smem=True,
+    )
+
+    with pytest.raises(ValueError, match="cannot prove shared-memory reuse"):
+        make_ptx_kernel(module)
+
+
+@requires_cuda
+def test_safe_smem_reuse_one_buffer_matches_torch_for_multiple_seeds():
+    m, n, k = 192, 64, 256
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_m_tile=192,
+        output_n_tile=64,
+        warpgroup_n_tile=64,
+        operand_k_tile=64,
+        operand_stages=3,
+        output_slices=1,
+        output_store_buffers=1,
+        unsafe_reuse_smem=True,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    for seed in (3, 17, 29):
+        torch.manual_seed(seed)
+        lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+        rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+        actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+        launcher(lhs, rhs, actual)
+        torch.cuda.synchronize()
+
+        assert torch.equal(actual, torch.mm(lhs, rhs.T))
+
+
 @requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128
