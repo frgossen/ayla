@@ -19,6 +19,22 @@ python -m benchmarks.bench_gemm_collection  # benchmark
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, % of peak, and
 throughput as a percentage of `torch.mm`) for a bf16 4096×4096 GEMM.
 
+The OSS GEMM seed tool maps an FP16 shape to 2–3 measured neighboring schedules and
+benchmarks them against `torch.mm`:
+
+```bash
+pixi run bench-oss-seed -- 8192 768 768
+pixi run bench-oss-seed -- 8192 768 768 --show-only
+pixi run bench-oss-seed -- 8192 768 768 --csv results.csv  # optional output
+python -m benchmarks.convert_oss_gemm_heuristic expand ayla/oss_gemm_heuristic.json /tmp/heuristic.json
+python -m benchmarks.convert_oss_gemm_heuristic collapse /tmp/heuristic.json ayla/oss_gemm_heuristic.json
+python -m benchmarks.convert_oss_gemm_heuristic update ayla/oss_gemm_heuristic.json /tmp/updated.json run-*.json
+```
+
+The converter provides lossless editing and merges any number of result files.
+The benchmark generates contiguous `A`/`BT` inputs; it does not replay captured
+tensor values or source strides.
+
 ### Using pixi
 
 If you don't already have pixi installed, get it with curl:
