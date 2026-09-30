@@ -191,9 +191,16 @@ def _sliced_moves(
     collective: dict[CollectiveAxis, CollectiveLevel],
     attrs: dict[str, object],
 ) -> list[Op]:
+    attrs = dict(attrs)
+    multicast = cast(bool, attrs.pop("multicast", False))
+    if multicast is True:
+        collective = {
+            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
+        }
     if count == 1:
         return [MoveOp.build(
-            dst, src, collective=collective, attrs=attrs,
+            dst, src, collective=collective,
+            multicast=multicast, attrs=attrs,
         )]
     src_type = src.type
     assert isinstance(src_type, MemTensorType)
@@ -207,7 +214,7 @@ def _sliced_moves(
         src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
         move = MoveOp.build(
             dst_tile.result(), src_tile.result(),
-            collective=collective, attrs=attrs,
+            collective=collective, multicast=multicast, attrs=attrs,
         )
         ops.extend([src_tile, dst_tile, move])
     return ops

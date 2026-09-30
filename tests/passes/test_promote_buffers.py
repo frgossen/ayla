@@ -2,7 +2,11 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import AllocOp, TmaMoveOp, gpu_dialect
+from ayla.gpu_dialect import (
+    AllocOp,
+    TmaMoveOp,
+    gpu_dialect,
+)
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
 from ayla.passes.promote_buffers import promote_buffers
@@ -180,6 +184,57 @@ def test_promote_gmem_matmul_operands_to_smem():
           }
         }""")
     assert text == expected
+
+
+def test_promote_selectively_multicasts_tma_operands():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "mm"}
+          }
+        }"""))
+
+    promote_buffers(
+        module,
+        target_type="smem",
+        operands=["lhs", "rhs"],
+        swizzle="128B",
+        tma=True,
+        move_attrs={"lhs": {"multicast": True}},
+        label_filter="mm",
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
+            %0: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0, label: "mm_lhs_smem"}
+            move(%0: smem<64x16xbf16 swizzle="128B">, %a: gmem<64x16xbf16>) collective=xyz.cluster attrs={label: "mm_lhs_smem", multicast: True, tma: True}
+            %1: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "mm_rhs_smem"}
+            move(%1: smem<64x16xbf16 swizzle="128B">, %b: gmem<64x16xbf16>) collective=xyz.block attrs={label: "mm_rhs_smem", tma: True}
+            matmul(%0: smem<64x16xbf16 swizzle="128B">, %1: smem<64x16xbf16 swizzle="128B">, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "mm"}
+          }
+        }""")
+
+
+def test_promote_multicast_narrows_grid_collective_to_cluster():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))
+
+    promote_buffers(
+        module,
+        target_type="smem",
+        operands=["lhs"],
+        swizzle="128B",
+        tma=True,
+        move_attrs={"lhs": {"multicast": True}},
+        label_filter="mm",
+    )
+
+    assert "collective=xyz.cluster attrs={label: \"mm_lhs_smem\", multicast: True" in repr(module)
 
 
 def test_promote_can_slice_tma_operand_loads():
