@@ -235,6 +235,33 @@ def test_k128_block_major_nested_tiles_match_torch():
     assert torch.equal(actual, torch.mm(lhs, rhs.T))
 
 
+@requires_cuda
+def test_two_dimensional_warpgroup_tiles_match_torch():
+    m, n, k = 256, 256, 128
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_m_tile=128,
+        output_n_tile=256,
+        warpgroup_m_tile=64,
+        warpgroup_n_tile=128,
+        operand_stages=3,
+    )
+    kernel = make_ptx_kernel(module)
+    launcher = make_ptx_launcher(kernel)
+    torch.manual_seed(17)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert kernel.block_dim == (512, 1, 1)
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+
+
 def test_four_tile_output_evict_first_reaches_tma_stores():
     kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_m_tiles_per_cta=4,
