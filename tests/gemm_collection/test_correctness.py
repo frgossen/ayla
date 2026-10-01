@@ -197,6 +197,22 @@ def test_k128_block_major_nested_tiles_lower_to_ptx():
     assert kernel.ptx.count("wgmma.mma_async") == 8
 
 
+def test_configurable_tma_gemm_supports_fp16():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=128,
+            n=64,
+            k=64,
+            dtype="f16",
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            output_tma_inner_size=None,
+        )
+    )
+    assert ".f32.f16.f16" in kernel.ptx
+    assert ".f32.bf16.bf16" not in kernel.ptx
+
+
 @requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128

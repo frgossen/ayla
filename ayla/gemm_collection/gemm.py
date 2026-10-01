@@ -333,13 +333,16 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     ptx_optimization_level: int | None = None,
+    dtype: str = "bf16",
 ) -> ModuleOp:
-    """Build and schedule a static BF16 GEMM module."""
+    """Build and schedule a static BF16 or FP16 GEMM module."""
     m = problem_size if m is None else m
     n = problem_size if n is None else n
     k = problem_size if k is None else k
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
+    if dtype not in ("bf16", "f16"):
+        raise ValueError("dtype must be 'bf16' or 'f16'")
     problem_name = (
         str(problem_size)
         if m == n == k == problem_size
@@ -351,6 +354,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
             output_n_tile if output_n_tile <= 256 else 128
         )
     name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
+    if dtype != "bf16":
+        name += f"_{dtype}"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
     if output_m_tile != 128:
@@ -372,8 +377,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
 
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
-            matmul(%a: gmem<{m}x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<{m}x{n}xbf16>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+          kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
+            matmul(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
           }}
         }}"""))
     assert isinstance(module, ModuleOp)
