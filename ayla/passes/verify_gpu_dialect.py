@@ -9,6 +9,7 @@ from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    AwaitOp,
     BF16Type,
     BarrierOp,
     ClusterBlockIdsOp,
@@ -287,6 +288,22 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 "cluster_mbar is a barrier resource, not an async lock"
             )
+
+    @verifies(AwaitOp)
+    def _verify_await(self, op: AwaitOp) -> None:
+        if len(op.operands) != 1 or not isinstance(
+            op.operands[0].type, LockType,
+        ):
+            raise ValueError("await expects exactly one lock operand")
+        pending = op.attrs.get("pending", 0)
+        if type(pending) is not int or pending < 0:
+            raise ValueError("await pending count must be a non-negative integer")
+        lock_type = op.operands[0].type
+        assert isinstance(lock_type, LockType)
+        if pending and not lock_type.supports_partial_await:
+            raise ValueError("pending async groups require a WGMMA lock")
+        if pending > 7:
+            raise ValueError("WGMMA pending async count must be in [0, 7]")
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:

@@ -61,6 +61,34 @@ def test_pipeline_reorders_across_inner_loop():
     assert repr(pipelined) == expected
 
 
+def test_pipeline_queued_async_completion():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) {
+            %l0: lock<wgmma> = alloc()
+            %l1: lock<wgmma> = alloc()
+            for (%k: index = 0 to 4) attrs={label: "k"} {
+              async(%l0: lock<wgmma>) attrs={label: "compute0"} matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+              await(%l0: lock<wgmma>)
+              async(%l1: lock<wgmma>) attrs={label: "compute1"} matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+              await(%l1: lock<wgmma>)
+            }
+          }
+        }"""))
+
+    pipeline_loop(
+        module,
+        label_filter_loop="k",
+        label_filter_op="compute.*",
+        pipelining_offset=1,
+    )
+
+    text = repr(module)
+    assert 'await(%l1: lock<wgmma>) attrs={pending: 1}' in text
+    assert 'await(%l0: lock<wgmma>) attrs={pending: 1}' in text
+    assert text.rfind('await(%l1: lock<wgmma>)') > text.rfind("for (%k")
+
+
 def test_pipeline_matmul_smem_skeleton():
     module_str = textwrap.dedent("""\
         module {

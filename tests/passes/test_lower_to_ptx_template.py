@@ -36,6 +36,28 @@ def _lower_barrier(scope: str) -> str:
     )
 
 
+def test_wgmma_pipeline_controls_reach_ptx():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) {
+            %l0: lock<wgmma> = alloc() attrs={id: 0}
+            %l1: lock<wgmma> = alloc() attrs={id: 1}
+            async(%l0: lock<wgmma>) matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            await(%l0: lock<wgmma>) attrs={pending: 1}
+            async(%l1: lock<wgmma>) matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">)
+            await(%l1: lock<wgmma>)
+          }
+        }"""))
+
+    lowered = lower_to_ptx_template(module)
+    ptx = "".join(
+        op.attrs["template"]
+        for op in find_ops_of_type(lowered, PTXTemplateOp)
+    )
+
+    assert "wgmma.wait_group.sync.aligned 1;" in ptx
+
+
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
