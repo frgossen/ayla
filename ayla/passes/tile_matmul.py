@@ -8,10 +8,12 @@ from ..gpu_dialect import (
     CollectiveLevel,
     ForOp,
     IfOp,
+    IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
+    IndexMulOp,
     IndexType,
     KernelOp,
     MatmulOp,
@@ -105,9 +107,9 @@ class TileMatmul(LoweringPass):
       - ``iteration_bindings[i]``: where the iteration lives — ``None`` for a
         sequential ``for`` loop, or a ``(CollectiveLevel, CollectiveAxis)``
         pair for a hardware dimension. An existing parallel launch extent may
-        be larger than the logical tile count; excess workers are guarded. A
-        smaller extent remains a launch conflict; express multiple waves with
-        an explicit outer ``for`` tiling level.
+        be larger than the logical tile count; excess workers are guarded.
+        ``grid_stride_loop_label`` permits a smaller block-level extent by
+        emitting a labeled grid-stride loop over the logical iteration space.
       - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
         ``None`` for an iteration mapped to a hardware dimension.
 
@@ -139,6 +141,7 @@ class TileMatmul(LoweringPass):
     op_label_filter: str | None
     epilogue_label_filter: str | None
     allow_partial_tiles: bool
+    grid_stride_loop_label: str | None
 
     def __init__(
         self,
@@ -151,6 +154,7 @@ class TileMatmul(LoweringPass):
         op_label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
         allow_partial_tiles: bool = False,
+        grid_stride_loop_label: str | None = None,
     ) -> None:
         super().__init__(
             op_dims=list(op_dims),
@@ -160,6 +164,7 @@ class TileMatmul(LoweringPass):
             op_label_filter=op_label_filter,
             epilogue_label_filter=epilogue_label_filter,
             allow_partial_tiles=allow_partial_tiles,
+            grid_stride_loop_label=grid_stride_loop_label,
         )
         assert (
             len(op_dims)
@@ -319,8 +324,14 @@ class TileMatmul(LoweringPass):
 
         for binding, extent in required.items():
             current = self._launch_extent(binding)
-            if current is not None and current > extent:
-                continue
+            if current is not None:
+                if current >= extent:
+                    continue
+                if (
+                    self.grid_stride_loop_label is not None
+                    and binding[0] == CollectiveLevel.BLOCK
+                ):
+                    continue
             self._accumulate_constraint(binding, extent)
 
     def _launch_extent(
@@ -360,6 +371,56 @@ class TileMatmul(LoweringPass):
                 parallel_ids[level] = ids
                 new_ops.append(ids)
 
+        parallel_extents: dict[
+            tuple[CollectiveLevel, CollectiveAxis], int
+        ] = {}
+        for binding, ub in zip(self.iteration_bindings, ubs, strict=True):
+            if binding is not None:
+                parallel_extents[binding] = (
+                    parallel_extents.get(binding, 1) * ub
+                )
+
+        waved_bindings = [
+            binding for binding, logical_extent in parallel_extents.items()
+            if (
+                (launch_extent := self._launch_extent(binding)) is not None
+                and launch_extent < logical_extent
+            )
+        ]
+        if len(waved_bindings) > 1:
+            raise ValueError(
+                "TileMatmul: grid-stride tiling supports one hardware "
+                "dimension per pass"
+            )
+        wave_binding = waved_bindings[0] if waved_bindings else None
+        wave_loop: ForOp | None = None
+        effective_ids: dict[
+            tuple[CollectiveLevel, CollectiveAxis], Value
+        ] = {}
+        wave_ops: list[Op] = []
+        if wave_binding is not None:
+            if self.grid_stride_loop_label is None:
+                raise ValueError(
+                    "TileMatmul: launch dim conflict; set "
+                    "grid_stride_loop_label to express multiple waves"
+                )
+            level, axis = wave_binding
+            assert level == CollectiveLevel.BLOCK
+            launch_extent = self._launch_extent(wave_binding)
+            assert launch_extent is not None
+            logical_extent = parallel_extents[wave_binding]
+            wave_loop = ForOp.build(
+                lb=0,
+                ub=(logical_extent + launch_extent - 1) // launch_extent,
+                attrs={"label": self.grid_stride_loop_label},
+            )
+            stride = IndexConstantOp.build(launch_extent)
+            offset = IndexMulOp.build(wave_loop.iv, stride.result())
+            linear_id = parallel_ids[level].results[axis]
+            advanced = IndexAddOp.build(linear_id, offset.result())
+            wave_ops.extend([stride, offset, advanced])
+            effective_ids[wave_binding] = advanced.result()
+
         ivs: list[Value] = []
         iteration_ops: list[Op] = []
         divisors: dict[
@@ -373,7 +434,10 @@ class TileMatmul(LoweringPass):
                 iv = Value(name=label, type=IndexType())
             else:
                 level, axis = binding
-                linear_id = parallel_ids[level].results[axis]
+                linear_id = effective_ids.get(
+                    binding, parallel_ids[level].results[axis],
+                )
+                effective_ids[binding] = linear_id
                 if self.iteration_bindings.count(binding) == 1:
                     divisors[binding] = ub
                     ivs.insert(0, linear_id)
@@ -391,7 +455,7 @@ class TileMatmul(LoweringPass):
                 ]
                 iv = mod.result()
             ivs.insert(0, iv)
-        new_ops.extend(iteration_ops)
+        iteration_ops[:0] = wave_ops
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
@@ -463,20 +527,26 @@ class TileMatmul(LoweringPass):
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
 
-        parallel_extents = dict(divisors)
+        remaining_parallel_extents = dict(divisors)
         for i, iv, ub, binding, label in zip(
             reversed(range(len(self.iteration_bindings))),
             reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
             reversed(self.for_loop_labels),
         ):
             if binding is not None:
-                logical_extent = parallel_extents.pop(binding, None)
+                logical_extent = remaining_parallel_extents.pop(binding, None)
                 if logical_extent is None:
                     continue
                 launch_extent = self._launch_extent(binding)
-                if launch_extent is not None and launch_extent > logical_extent:
-                    level, axis = binding
-                    linear_id = parallel_ids[level].results[axis]
+                needs_guard = launch_extent is not None and (
+                    launch_extent > logical_extent
+                    or (
+                        binding == wave_binding
+                        and logical_extent % launch_extent != 0
+                    )
+                )
+                if needs_guard:
+                    linear_id = effective_ids[binding]
                     limit = IndexConstantOp.build(logical_extent)
                     condition = IndexLtOp.build(linear_id, limit.result())
                     body_ops = [
@@ -498,6 +568,10 @@ class TileMatmul(LoweringPass):
                 tiled_epilogue = []
 
         assert not tiled_epilogue, "TileMatmul: epilogue was never placed"
+        body_ops[:0] = iteration_ops
+        if wave_loop is not None:
+            wave_loop.body.ops = body_ops
+            body_ops = [wave_loop]
         new_ops.extend(body_ops)
         return new_ops
 
@@ -619,9 +693,11 @@ def tile_matmul(
     op_label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
     allow_partial_tiles: bool = False,
+    grid_stride_loop_label: str | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
         op_dims, tile_sizes, iteration_bindings, for_loop_labels,
         op_label_filter, epilogue_label_filter, allow_partial_tiles,
+        grid_stride_loop_label,
     ).run(module)
