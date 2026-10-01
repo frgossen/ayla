@@ -24,5 +24,5 @@ def test_register_rejects_a_builder_that_takes_arguments():
     with pytest.raises(TypeError, match="take no arguments"):
 
         @register_gemm
-        def variant_module(output_tiles_per_cta: int = 1):
+        def variant_module(output_m_tiles_per_cta: int = 1):
             raise AssertionError("builder should not run")

@@ -179,7 +179,8 @@ def schedule_tiled_matmul(
 def schedule_matmul(
     module: ModuleOp,
     *,
-    output_tiles_per_cta: int = 1,
+    output_m_tiles_per_cta: int = 1,
+    output_n_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -218,16 +219,21 @@ def schedule_matmul(
         raise ValueError("matmul reduction dimensions must match")
     m, n, k = cast(tuple[int, int, int], (m, n, k))
 
-    if output_tiles_per_cta not in (1, 2, 4):
-        raise ValueError("output_tiles_per_cta must be 1, 2, or 4")
+    output_groups = (output_m_tiles_per_cta, output_n_tiles_per_cta)
+    if any(group not in (1, 2, 3, 4, 6, 8, 16) for group in output_groups):
+        raise ValueError(
+            "output tile groups must each be 1, 2, 3, 4, 6, 8, or 16"
+        )
+    if output_m_tiles_per_cta > 1 and output_n_tiles_per_cta > 1:
+        raise ValueError("output tiles may be grouped along only one axis")
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
-    if output_m_tile not in (128, 192):
-        raise ValueError("output_m_tile must be 128 or 192")
-    if output_m_tile == 192 and output_tiles_per_cta != 1:
-        raise ValueError("M=192 currently requires one output tile per CTA")
-    if output_n_tile not in (64, 208, 256, 384):
-        raise ValueError("output_n_tile must be 64, 208, 256, or 384")
+    if output_m_tile not in (64, 128, 192, 256):
+        raise ValueError("output_m_tile must be 64, 128, 192, or 256")
+    if not 48 <= output_n_tile <= 384 or output_n_tile % 8:
+        raise ValueError(
+            "output_n_tile must be a multiple of 8 between 48 and 384"
+        )
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
     if warpgroup_n_tile is None:
@@ -239,9 +245,21 @@ def schedule_matmul(
     if output_store == "scalar":
         output_tma_inner_size = None
     m_blocks = (m + output_m_tile - 1) // output_m_tile
-    grid_x = (m_blocks + output_tiles_per_cta - 1) // output_tiles_per_cta
+    n_blocks = (n + output_n_tile - 1) // output_n_tile
+    if output_n_tiles_per_cta > 1:
+        group_dim = "N"
+        blocks = n_blocks
+        tile_size = output_n_tile
+        group_size = output_n_tiles_per_cta
+        group_label = "outn"
+    else:
+        group_dim = "M"
+        blocks = m_blocks
+        tile_size = output_m_tile
+        group_size = output_m_tiles_per_cta
+        group_label = "outm"
     pipeline = Pipeline()
-    if output_tiles_per_cta == 1:
+    if group_size == 1:
         pipeline.add_pass(TileMatmul(
             op_dims=["M", "N"],
             tile_sizes=[output_m_tile, output_n_tile],
@@ -257,18 +275,22 @@ def schedule_matmul(
             ),
         ))
     else:
+        grid = (blocks + group_size - 1) // group_size
         pipeline.add_pass(TileMatmul(
-            op_dims=["M", "M", "N"],
-            tile_sizes=[grid_x * output_m_tile, output_m_tile, 256],
+            op_dims=[group_dim, "M", "N"],
+            tile_sizes=[
+                grid * tile_size, output_m_tile, output_n_tile,
+            ],
             iteration_bindings=[
                 None,
                 (CollectiveLevel.BLOCK, CollectiveAxis.X),
                 (CollectiveLevel.BLOCK, CollectiveAxis.Y),
             ],
-            for_loop_labels=["outm", None, None], op_label_filter="mm",
+            for_loop_labels=[group_label, None, None], op_label_filter="mm",
             allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
+                or blocks % group_size != 0
             ),
         ))
     pipeline.add_pass(schedule_tiled_matmul(
@@ -283,10 +305,10 @@ def schedule_matmul(
         output_tma_inner_size=output_tma_inner_size,
         operand_move_attrs=operand_move_attrs,
     ))
-    if output_tiles_per_cta != 1:
+    if group_size > 1:
         pipeline.add_pass(UnrollLoop(
-            unroll_factor=output_tiles_per_cta,
-            label_filter="outm",
+            unroll_factor=group_size,
+            label_filter=group_label,
         ))
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
@@ -298,7 +320,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     m: int | None = None,
     n: int | None = None,
     k: int | None = None,
-    output_tiles_per_cta: int = 1,
+    output_m_tiles_per_cta: int = 1,
+    output_n_tiles_per_cta: int = 1,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -336,8 +359,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_n{output_n_tile}"
     if resolved_warpgroup_n_tile not in (128, 256):
         name += f"_wg{resolved_warpgroup_n_tile}"
-    if output_tiles_per_cta != 1:
-        name += f"_{output_tiles_per_cta}tiles"
+    if output_m_tiles_per_cta != 1:
+        name += f"_{output_m_tiles_per_cta}tiles"
+    if output_n_tiles_per_cta != 1:
+        name += f"_n{output_n_tiles_per_cta}tiles"
     if output_slices != 1:
         name += f"_split{output_slices}"
     if output_store_buffers != 1:
@@ -354,7 +379,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     assert isinstance(module, ModuleOp)
     return schedule_matmul(
         module,
-        output_tiles_per_cta=output_tiles_per_cta,
+        output_m_tiles_per_cta=output_m_tiles_per_cta,
+        output_n_tiles_per_cta=output_n_tiles_per_cta,
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
         warpgroup_n_tile=resolved_warpgroup_n_tile,
