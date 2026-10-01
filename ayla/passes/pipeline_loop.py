@@ -17,14 +17,22 @@ source loop. The transformation produces:
     iterations.
 
 Legality: see ``_check_legality``.
+
+When the selected operations issue work to a partially awaitable hardware
+queue, the loop already represents an unrolled software pipeline.  In that
+case the pass pipelines completion instead: each stage partially awaits the
+preceding stage and a full await after the loop drains the queue.
 """
 from __future__ import annotations
 
 from ..gpu_dialect import (
+    AsyncOp,
+    AwaitOp,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
     IndexType,
+    LockType,
     ModuleOp,
     effective_operands,
     has_ordering_effect,
@@ -54,6 +62,41 @@ class PipelineLoop(LoweringPass):
             label_filter_op=label_filter_op,
             pipelining_offset=pipelining_offset,
         )
+
+    def _pipeline_queued_async(
+        self, op: ForOp, selected: list[AsyncOp],
+    ) -> tuple[list[Op], list[object]]:
+        """Pipeline completion of an unrolled hardware async queue.
+
+        Each selected issue keeps its own lock.  Replace its immediate await
+        with a partial wait for the preceding issue, wrapping the first issue
+        around to the last stage from the prior loop iteration.  A full wait
+        after the loop drains the final outstanding issue.
+        """
+        waits: list[AwaitOp] = []
+        for issue in selected:
+            matching = [
+                user for user in issue.lock.users()
+                if isinstance(user, AwaitOp) and user.parent_block is op.body
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    "Pipeline: queued async issue must have exactly one "
+                    "await in the same loop body"
+                )
+            waits.append(matching[0])
+
+        replacements = {
+            wait: AwaitOp.build(
+                selected[index - 1].lock,
+                attrs={**wait.attrs, "pending": 1},
+            )
+            for index, wait in enumerate(waits)
+        }
+        op.body.ops = [
+            replacements.get(body_op, body_op) for body_op in op.body.ops
+        ]
+        return [op, AwaitOp.build(selected[-1].lock)], []
 
     def _compute_labeled_and_shared(
         self, body_ops: list[Op],
@@ -271,6 +314,25 @@ class PipelineLoop(LoweringPass):
             )
 
         body_ops = op.body.ops
+        selected_async = [
+            body_op for body_op in body_ops
+            if isinstance(body_op, AsyncOp)
+            and label_matches(body_op, self.label_filter_op)
+        ]
+        if selected_async:
+            if not all(
+                isinstance(issue.lock.type, LockType)
+                and issue.lock.type.supports_partial_await
+                for issue in selected_async
+            ):
+                selected_async = []
+            elif self.pipelining_offset != 1:
+                raise ValueError(
+                    "Pipeline: queued async completion requires offset one"
+                )
+            else:
+                return self._pipeline_queued_async(op, selected_async)
+
         labeled_set, shared_set = self._compute_labeled_and_shared(body_ops)
         labeled = [o for o in body_ops if o in labeled_set]
         shared = [o for o in body_ops if o in shared_set]
@@ -327,4 +389,8 @@ def pipeline_loop(
     pipelining_offset: int,
 ) -> ModuleOp:
     """Convenience entry point."""
-    return PipelineLoop(label_filter_loop, label_filter_op, pipelining_offset).run(module)
+    return PipelineLoop(
+        label_filter_loop,
+        label_filter_op,
+        pipelining_offset,
+    ).run(module)
