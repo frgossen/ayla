@@ -16,6 +16,7 @@ from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_sigmoid import (
     auto_matmul_4096_wgmma256_wg_sigmoid_module,
 )
 from ayla.gpu_dialect import (
+    CollectiveAxis,
     ElementwiseOp,
     ForOp,
     TileOp,
@@ -123,6 +124,53 @@ def test_configurable_tma_gemm_supports_general_n_tiles(n_tile):
         )
     )
     assert "wgmma.mma_async" in kernel.ptx
+
+
+@pytest.mark.parametrize(
+    "axes,expected_grid",
+    [
+        ((CollectiveAxis.X, CollectiveAxis.Y), (4, 3, 1)),
+        ((CollectiveAxis.Y, CollectiveAxis.X), (3, 4, 1)),
+    ],
+)
+def test_output_grid_axis_bindings(axes, expected_grid):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=256,
+            n=192,
+            k=64,
+            output_m_tile=64,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            output_grid_axes=axes,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.grid_dim == expected_grid
+
+
+@pytest.mark.parametrize(
+    "axes,expected_grid",
+    [
+        ((CollectiveAxis.X, CollectiveAxis.Y), (3, 1, 1)),
+        ((CollectiveAxis.Y, CollectiveAxis.X), (1, 3, 1)),
+    ],
+)
+def test_grouped_output_grid_axis_bindings(axes, expected_grid):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=384,
+            n=256,
+            k=64,
+            output_n_tiles_per_cta=4,
+            output_m_tile=128,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            output_grid_axes=axes,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.grid_dim == expected_grid
 
 
 def test_multi_output_uses_requested_tile_geometry():

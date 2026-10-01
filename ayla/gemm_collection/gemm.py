@@ -181,6 +181,9 @@ def schedule_matmul(
     *,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
+    output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
+        CollectiveAxis.X, CollectiveAxis.Y,
+    ),
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -258,14 +261,15 @@ def schedule_matmul(
         tile_size = output_m_tile
         group_size = output_m_tiles_per_cta
         group_label = "outm"
+    m_axis, n_axis = output_grid_axes
     pipeline = Pipeline()
     if group_size == 1:
         pipeline.add_pass(TileMatmul(
             op_dims=["M", "N"],
             tile_sizes=[output_m_tile, output_n_tile],
             iteration_bindings=[
-                (CollectiveLevel.BLOCK, CollectiveAxis.X),
-                (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+                (CollectiveLevel.BLOCK, m_axis),
+                (CollectiveLevel.BLOCK, n_axis),
             ],
             for_loop_labels=[None, None],
             op_label_filter="mm",
@@ -283,8 +287,8 @@ def schedule_matmul(
             ],
             iteration_bindings=[
                 None,
-                (CollectiveLevel.BLOCK, CollectiveAxis.X),
-                (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+                (CollectiveLevel.BLOCK, m_axis),
+                (CollectiveLevel.BLOCK, n_axis),
             ],
             for_loop_labels=[group_label, None, None], op_label_filter="mm",
             allow_partial_tiles=(
@@ -322,6 +326,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     k: int | None = None,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
+    output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
+        CollectiveAxis.X, CollectiveAxis.Y,
+    ),
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -368,6 +375,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_{output_m_tiles_per_cta}tiles"
     if output_n_tiles_per_cta != 1:
         name += f"_n{output_n_tiles_per_cta}tiles"
+    if output_grid_axes != (CollectiveAxis.X, CollectiveAxis.Y):
+        axes = "".join(axis.name.lower() for axis in output_grid_axes)
+        name += f"_grid{axes}"
     if output_slices != 1:
         name += f"_split{output_slices}"
     if output_store_buffers != 1:
@@ -386,6 +396,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         module,
         output_m_tiles_per_cta=output_m_tiles_per_cta,
         output_n_tiles_per_cta=output_n_tiles_per_cta,
+        output_grid_axes=output_grid_axes,
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
         warpgroup_n_tile=resolved_warpgroup_n_tile,
