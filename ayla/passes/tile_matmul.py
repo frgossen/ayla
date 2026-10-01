@@ -9,7 +9,9 @@ from ..gpu_dialect import (
     ForOp,
     IfOp,
     IndexConstantOp,
+    IndexDivOp,
     IndexLtOp,
+    IndexModOp,
     IndexType,
     KernelOp,
     MatmulOp,
@@ -178,13 +180,6 @@ class TileMatmul(LoweringPass):
         parallel_bindings = [
             binding for binding in iteration_bindings if binding is not None
         ]
-        # TODO: Linearize multiple matmul tile dimensions onto one hardware
-        # axis (for example, map the M x N tile space onto block.x).
-        if len(parallel_bindings) != len(set(parallel_bindings)):
-            raise ValueError(
-                "TileMatmul: one hardware dimension cannot tile multiple "
-                "matmul dimensions"
-            )
         for binding in parallel_bindings:
             level, axis = binding
             if (
@@ -313,9 +308,14 @@ class TileMatmul(LoweringPass):
     ) -> None:
         required: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
         for ubs in bounds.values():
+            extents: dict[
+                tuple[CollectiveLevel, CollectiveAxis], int
+            ] = {}
             for binding, ub in zip(self.iteration_bindings, ubs):
                 if binding is not None:
-                    required[binding] = max(required.get(binding, 0), ub)
+                    extents[binding] = extents.get(binding, 1) * ub
+            for binding, extent in extents.items():
+                required[binding] = max(required.get(binding, 0), extent)
 
         for binding, extent in required.items():
             current = self._launch_extent(binding)
@@ -361,14 +361,37 @@ class TileMatmul(LoweringPass):
                 new_ops.append(ids)
 
         ivs: list[Value] = []
-        for iteration_binding, loop_label in zip(
-            self.iteration_bindings, self.for_loop_labels,
-        ):
-            if iteration_binding is None:
-                ivs.append(Value(name=loop_label, type=IndexType()))
+        iteration_ops: list[Op] = []
+        divisors: dict[
+            tuple[CollectiveLevel, CollectiveAxis], int
+        ] = {}
+        for ub, binding, label in reversed(list(zip(
+            ubs, self.iteration_bindings, self.for_loop_labels,
+            strict=True,
+        ))):
+            if binding is None:
+                iv = Value(name=label, type=IndexType())
             else:
-                level, axis = iteration_binding
-                ivs.append(parallel_ids[level].results[axis])
+                level, axis = binding
+                linear_id = parallel_ids[level].results[axis]
+                if self.iteration_bindings.count(binding) == 1:
+                    divisors[binding] = ub
+                    ivs.insert(0, linear_id)
+                    continue
+                divisor = divisors.get(binding, 1)
+                divisors[binding] = divisor * ub
+                cdivisor = IndexConstantOp.build(divisor)
+                div = IndexDivOp.build(
+                    linear_id, cdivisor.result(),
+                )
+                cbound = IndexConstantOp.build(ub)
+                mod = IndexModOp.build(div.result(), cbound.result())
+                iteration_ops = [
+                    cdivisor, div, cbound, mod, *iteration_ops,
+                ]
+                iv = mod.result()
+            ivs.insert(0, iv)
+        new_ops.extend(iteration_ops)
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
@@ -440,16 +463,22 @@ class TileMatmul(LoweringPass):
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
 
+        parallel_extents = dict(divisors)
         for i, iv, ub, binding, label in zip(
             reversed(range(len(self.iteration_bindings))),
             reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
             reversed(self.for_loop_labels),
         ):
             if binding is not None:
+                logical_extent = parallel_extents.pop(binding, None)
+                if logical_extent is None:
+                    continue
                 launch_extent = self._launch_extent(binding)
-                if launch_extent is not None and launch_extent > ub:
-                    limit = IndexConstantOp.build(ub)
-                    condition = IndexLtOp.build(iv, limit.result())
+                if launch_extent is not None and launch_extent > logical_extent:
+                    level, axis = binding
+                    linear_id = parallel_ids[level].results[axis]
+                    limit = IndexConstantOp.build(logical_extent)
+                    condition = IndexLtOp.build(linear_id, limit.result())
                     body_ops = [
                         limit,
                         condition,
