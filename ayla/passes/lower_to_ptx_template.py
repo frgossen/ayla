@@ -310,21 +310,25 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_constant(
         self, op: ConstantOp,
     ) -> tuple[list[Op], list[object]]:
-        result_type = op.result().type
-        if not isinstance(result_type, RmemTensorType):
-            raise NotImplementedError(
-                "lower_constant: only rmem materialization is supported; "
-                f"got {result_type}"
-            )
+        result_type = cast(RmemTensorType, op.result().type)
         dtype = result_type.dtype
         register_type = "b16" if isinstance(
             dtype, (F16Type, BF16Type),
         ) else dtype.name
+        value = op.value
+        values = (
+            iter(value)
+            if isinstance(value, list)
+            else itertools.repeat(
+                cast(int | float, value),
+                cast(int, result_type.num_elements),
+            )
+        )
         template = "".join(
             f"mov.{register_type} "
             f"${{{register_type}:result.value.r{i}}}, "
             f"{_ptx_literal(dtype, value)};\n"
-            for i, value in enumerate(op.values)
+            for i, value in enumerate(values)
         )
         lowered = PTXTemplateOp.build(
             operands=[],

@@ -2143,19 +2143,6 @@ class ConstantOp(Op):
     def value(self) -> object:
         return self.attrs["value"]
 
-    @property
-    def values(self) -> Iterator[int | float]:
-        value = self.value
-        if isinstance(value, list):
-            return iter(value)
-        result_type = self.result().type
-        assert isinstance(result_type, MemTensorType)
-        assert result_type.num_elements is not None
-        assert type(value) in (int, float)
-        return itertools.repeat(
-            cast(int | float, value), result_type.num_elements,
-        )
-
 
 @gpu_dialect.register_op("thread_ids")
 class ThreadIdsOp(GpuOp):

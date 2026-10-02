@@ -61,6 +61,17 @@ def test_constant_value_count_must_match_its_shape():
         verify_gpu_dialect(module)
 
 
+def test_ptx_lowering_requires_rmem_constants():
+    constant = ConstantOp.build(
+        1.0, GmemTensorType.build([], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[constant]))
+
+    assert verify_gpu_dialect(module) is module
+    with pytest.raises(ValueError, match="only in rmem"):
+        verify_gpu_dialect(module, VerificationStage.PTX_LOWERING)
+
+
 @pytest.mark.parametrize("step", [0, -1])
 def test_default_verification_rejects_nonpositive_loop_step(step):
     module = ModuleOp.build(Block(ops=[ForOp.build(0, 4, step)]))
