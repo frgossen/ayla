@@ -51,7 +51,8 @@ class BarrierScope(enum.IntEnum):
     Direct cover edges, from wider to narrower scope::
 
         GRID -> CLUSTER
-        CLUSTER -> {BLOCK, CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
+        CLUSTER -> {CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
+        CLUSTER_TO_LEADER -> BLOCK
         BLOCK -> {WARPGROUP, BLOCK_TO_LEADER, LEADER_TO_BLOCK}
         WARPGROUP -> WARP
         {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK,
@@ -82,12 +83,21 @@ class BarrierScope(enum.IntEnum):
             return BarrierScope.GRID
         if self == BarrierScope.CLUSTER or other == BarrierScope.CLUSTER:
             return BarrierScope.CLUSTER
-        if self in (
-            BarrierScope.CLUSTER_TO_LEADER,
-            BarrierScope.LEADER_TO_CLUSTER,
-        ) or other in (
-            BarrierScope.CLUSTER_TO_LEADER,
-            BarrierScope.LEADER_TO_CLUSTER,
+        if (
+            self == BarrierScope.CLUSTER_TO_LEADER
+            or other == BarrierScope.CLUSTER_TO_LEADER
+        ):
+            return (
+                BarrierScope.CLUSTER
+                if (
+                    self == BarrierScope.LEADER_TO_CLUSTER
+                    or other == BarrierScope.LEADER_TO_CLUSTER
+                )
+                else BarrierScope.CLUSTER_TO_LEADER
+            )
+        if (
+            self == BarrierScope.LEADER_TO_CLUSTER
+            or other == BarrierScope.LEADER_TO_CLUSTER
         ):
             return BarrierScope.CLUSTER
         if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
@@ -158,7 +168,17 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
         # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
     if barrier == BarrierScope.CLUSTER_TO_LEADER:
-        return scope == CollectiveScope.THREAD  # gather: nothing cross-thread
+        # Lowering first executes a local ``bar.sync 0`` in every CTA, then
+        # has each CTA leader arrive at rank 0's cluster mbarrier. The local
+        # gather settles every block-or-narrower effect before the cluster
+        # leader proceeds.
+        return scope in (
+            CollectiveScope.THREAD,
+            CollectiveScope.WARP,
+            CollectiveScope.WARPGROUP,
+            CollectiveScope.BLOCK_LEADER,
+            CollectiveScope.BLOCK,
+        )
     if barrier == BarrierScope.LEADER_TO_CLUSTER:
         # broadcast: the single cluster leader's work, not every block leader
         return scope in (

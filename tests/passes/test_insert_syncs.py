@@ -181,6 +181,16 @@ def test_cluster_leader_barrier_coverage_is_directional():
     assert not _barrier_covers(
         BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
     )
+    assert _barrier_covers(
+        BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.BLOCK,
+    )
+
+
+def test_cluster_to_leader_join_retains_its_local_gather():
+    assert (
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK)
+        == BarrierScope.CLUSTER_TO_LEADER
+    )
 
 
 @pytest.mark.parametrize(
