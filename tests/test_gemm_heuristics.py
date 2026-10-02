@@ -78,3 +78,23 @@ def test_swapped_m_grouped_winners_route_existing_builder_controls():
         assert seed.builder_config["output_grid_axes"] == (
             CollectiveAxis.Y, CollectiveAxis.X,
         )
+
+
+def test_additional_swapped_m_groups_route_existing_builder_controls():
+    for shape, group in (
+        ((30522, 768, 2048), 6),
+        ((9521, 512, 7936), 2),
+    ):
+        selection = select_gemm_schedules(*shape)
+        seed = next(
+            seed for seed in selection.seeds
+            if seed.source_shape == shape
+            and seed.captured_config["swap_output_grid_axes"] is True
+            and seed.captured_config["output_tiles_per_cta"] == group
+        )
+
+        assert seed.builder_config is not None
+        assert seed.builder_config["output_m_tiles_per_cta"] == group
+        assert seed.builder_config["output_grid_axes"] == (
+            CollectiveAxis.Y, CollectiveAxis.X,
+        )
