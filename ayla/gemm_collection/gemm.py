@@ -220,9 +220,9 @@ def schedule_matmul(
     m, n, k = cast(tuple[int, int, int], (m, n, k))
 
     output_groups = (output_m_tiles_per_cta, output_n_tiles_per_cta)
-    if any(group not in (1, 2, 3, 4, 6, 8, 16) for group in output_groups):
+    if any(group not in (1, 2, 3, 4, 5, 6, 8, 16) for group in output_groups):
         raise ValueError(
-            "output tile groups must each be 1, 2, 3, 4, 6, 8, or 16"
+            "output tile groups must each be 1, 2, 3, 4, 5, 6, 8, or 16"
         )
     if output_m_tiles_per_cta > 1 and output_n_tiles_per_cta > 1:
         raise ValueError("output tiles may be grouped along only one axis")

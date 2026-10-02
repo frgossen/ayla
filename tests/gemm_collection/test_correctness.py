@@ -143,7 +143,8 @@ def test_multi_output_uses_requested_tile_geometry():
 
 
 @pytest.mark.parametrize(
-    "tiles_per_cta,expected_grid_x", [(3, 6), (6, 3), (8, 2), (16, 1)],
+    "tiles_per_cta,expected_grid_x",
+    [(3, 6), (5, 4), (6, 3), (8, 2), (16, 1)],
 )
 def test_extended_output_tiles_per_cta(tiles_per_cta, expected_grid_x):
     kernel = make_ptx_kernel(
