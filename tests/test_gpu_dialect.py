@@ -22,6 +22,7 @@ from ayla.gpu_dialect import (
     BF16Type,
     ClusterBlockIdsOp,
     CollectiveScope,
+    ConstantOp,
     ElementwiseOp,
     F32Type,
     ForOp,
@@ -34,7 +35,7 @@ from ayla.gpu_dialect import (
     ReduceOp,
     ReinterpretOp,
     ReshapeOp,
-    ScalarOp,
+    RmemTensorType,
     SelectOp,
     SmemTensorType,
     TmaDescType,
@@ -55,10 +56,34 @@ def assert_print_and_roundtrip(op, expected):
     assert repr(gpu_dialect.parse(text)) == text
 
 
-def test_scalar_prints_and_roundtrips():
+def test_constant_prints_and_roundtrips():
     assert_print_and_roundtrip(
-        ScalarOp.build(1e-5, F32Type()),
-        "%0: f32 = scalar() attrs={value: 1e-05}",
+        ConstantOp.build(1e-5, RmemTensorType.build([], F32Type())),
+        "%0: rmem<f32> = constant() attrs={value: 1e-05}",
+    )
+    assert_print_and_roundtrip(
+        ConstantOp.build(
+            [1.0, 2.0, 3.0, 4.0],
+            RmemTensorType.build([2, 2], F32Type()),
+        ),
+        "%0: rmem<2x2xf32> = constant() "
+        "attrs={value: [1.0, 2.0, 3.0, 4.0]}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("result_type", "expected_type"),
+    [
+        (GmemTensorType.build([], F32Type()), "gmem<f32>"),
+        (SmemTensorType.build([], F32Type()), "smem<f32>"),
+    ],
+)
+def test_constant_represents_address_backed_memory_spaces(
+    result_type, expected_type,
+):
+    assert_print_and_roundtrip(
+        ConstantOp.build(1.0, result_type),
+        f"%0: {expected_type} = constant() attrs={{value: 1.0}}",
     )
 
 

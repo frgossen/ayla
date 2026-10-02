@@ -7,6 +7,7 @@ import pytest
 from ayla.base.ir import Block, find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
     BF16Type,
+    ConstantOp,
     F16Type,
     F32Type,
     F64Type,
@@ -16,7 +17,7 @@ from ayla.gpu_dialect import (
     PTXTemplateOp,
     ReinterpretOp,
     ReshapeOp,
-    ScalarOp,
+    RmemTensorType,
     ToPtrOp,
     gpu_dialect,
 )
@@ -35,16 +36,32 @@ from tests.testing_utils import assert_contains_in_order
         (F64Type(), 1.0, "mov.f64 ${f64:result.value}, 0d3FF0000000000000;"),
     ],
 )
-def test_lower_scalar(dtype, value, expected):
-    scalar = ScalarOp.build(value, dtype)
-    module = ModuleOp.build(Block(ops=[scalar]))
+def test_lower_rank_zero_constant(dtype, value, expected):
+    constant = ConstantOp.build(value, RmemTensorType.build([], dtype))
+    module = ModuleOp.build(Block(ops=[constant]))
 
     lower_to_ptx_template(module)
 
     [lowered] = module.body.ops
     assert isinstance(lowered, PTXTemplateOp)
-    assert lowered.template == expected + "\n"
-    assert lowered.result().type == scalar.result().type
+    assert lowered.template == expected.replace("result.value", "result.value.r0") + "\n"
+    assert lowered.result().type == constant.result().type
+
+
+def test_lower_dense_constant():
+    constant = ConstantOp.build(
+        [1.0, 2.0], RmemTensorType.build([2], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[constant]))
+
+    lower_to_ptx_template(module)
+
+    [lowered] = module.body.ops
+    assert isinstance(lowered, PTXTemplateOp)
+    assert lowered.template == (
+        "mov.f32 ${f32:result.value.r0}, 0f3F800000;\n"
+        "mov.f32 ${f32:result.value.r1}, 0f40000000;\n"
+    )
 
 
 def _lower_barrier(scope: str) -> str:

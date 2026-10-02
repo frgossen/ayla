@@ -7,6 +7,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
     F32Type,
     ForOp,
@@ -46,6 +47,16 @@ def test_default_verification_allows_dynamic_shapes():
     module = _dynamic_matmul_module()
 
     assert verify_gpu_dialect(module) is module
+
+
+def test_constant_value_count_must_match_its_shape():
+    constant = ConstantOp.build(
+        [1.0, 2.0], RmemTensorType.build([2, 2], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[constant]))
+
+    with pytest.raises(ValueError, match="2 values for tensor shape"):
+        verify_gpu_dialect(module)
 
 
 @pytest.mark.parametrize("step", [0, -1])

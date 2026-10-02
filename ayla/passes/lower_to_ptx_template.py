@@ -40,7 +40,7 @@ from ..gpu_dialect import (
     ReinterpretOp,
     ReshapeOp,
     RmemTensorType,
-    ScalarOp,
+    ConstantOp,
     SmemTensorType,
     ThreadIdsOp,
     TileOp,
@@ -260,22 +260,30 @@ class LowerToPtxTemplate(LoweringPass):
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
 
-    @lowers(ScalarOp)
-    def lower_scalar(
-        self, op: ScalarOp,
+    @lowers(ConstantOp)
+    def lower_constant(
+        self, op: ConstantOp,
     ) -> tuple[list[Op], list[object]]:
-        dtype = op.result().type
-        register_type = (
-            "b16" if isinstance(dtype, (F16Type, BF16Type)) else dtype.name
+        result_type = op.result().type
+        if not isinstance(result_type, RmemTensorType):
+            raise NotImplementedError(
+                "lower_constant: only rmem materialization is supported; "
+                f"got {result_type}"
+            )
+        dtype = result_type.dtype
+        register_type = "b16" if isinstance(
+            dtype, (F16Type, BF16Type),
+        ) else dtype.name
+        template = "".join(
+            f"mov.{register_type} "
+            f"${{{register_type}:result.value.r{i}}}, "
+            f"{_ptx_literal(dtype, value)};\n"
+            for i, value in enumerate(op.values)
         )
         lowered = PTXTemplateOp.build(
             operands=[],
-            result_types=[dtype],
-            template=(
-                f"mov.{register_type} "
-                f"${{{register_type}:result.value}}, "
-                f"{_ptx_literal(dtype, op.value)};\n"
-            ),
+            result_types=[result_type],
+            template=template,
             result_names=["value"],
             description=str(op),
         )

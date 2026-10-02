@@ -28,7 +28,7 @@ from ..gpu_dialect import (
     MoveOp,
     ReduceOp,
     ReshapeOp,
-    ScalarOp,
+    ConstantOp,
     SmemTensorType,
     TileOp,
     TmaDescType,
@@ -138,16 +138,31 @@ class VerifyGpuDialect(VerificationPass):
                 f"for step must be a positive integer, got {op.step!r}"
             )
 
-    @verifies(ScalarOp)
-    def _verify_scalar(self, op: ScalarOp) -> None:
+    @verifies(ConstantOp)
+    def _verify_constant(self, op: ConstantOp) -> None:
         if op.operands or len(op.results) != 1:
-            raise ValueError("scalar must have no operands and one result")
+            raise ValueError("constant must have no operands and one result")
+        result_type = op.result().type
+        if not isinstance(result_type, MemTensorType):
+            raise ValueError("constant result must be a memory tensor")
         if not isinstance(
-            op.result().type, (F16Type, BF16Type, F32Type, F64Type),
+            result_type.dtype, (F16Type, BF16Type, F32Type, F64Type),
         ):
-            raise ValueError("scalar result must have a floating-point type")
-        if type(op.attrs.get("value")) not in (int, float):
-            raise ValueError("scalar value must be an int or float")
+            raise ValueError("constant result must have a floating-point dtype")
+        value = op.attrs.get("value")
+        if type(value) in (int, float):
+            return
+        if not isinstance(value, list) or any(
+            type(element) not in (int, float) for element in value
+        ):
+            raise ValueError(
+                "constant value must be an int, float, or flat numerical list"
+            )
+        if result_type.num_elements != len(value):
+            raise ValueError(
+                f"constant has {len(value)} values for tensor shape "
+                f"{result_type.sizes}"
+            )
 
     @verifies(TileOp)
     def _verify_tile(self, op: TileOp) -> None:
