@@ -81,9 +81,49 @@ def _update(expanded: dict, paths: list[Path]) -> dict:
     return expanded
 
 
+def _from_mapper(mapper: dict) -> dict:
+    """Translate the measured-seed mapper into the production schema."""
+    def node(value: dict) -> dict:
+        if value["kind"] == "split":
+            return {
+                "feature": value["feature"],
+                "threshold": value["threshold"],
+                "left": node(value["left"]),
+                "right": node(value["right"]),
+            }
+        return {
+            "leaf": value["id"],
+            "seeds": [
+                {
+                    "configuration": seed["configuration"],
+                    "source": seed["source_shape"],
+                    "source_percentage_of_torch": (
+                        seed["source_percentage_of_torch"]
+                    ),
+                }
+                for seed in value["seeds"]
+            ],
+        }
+
+    return {
+        "version": mapper["version"],
+        "workload": "gemm",
+        "source_shape_count": mapper["source_shape_count"],
+        "layout": mapper["layout"],
+        "features": mapper["features"],
+        "source_fields": ["m", "n", "k"],
+        "fallback": mapper["fallback_seeds"][0]["configuration"],
+        "groups": {
+            name: node(tree) for name, tree in mapper["groups"].items()
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("expand", "collapse", "update"))
+    parser.add_argument(
+        "mode", choices=("expand", "collapse", "update", "from-mapper"),
+    )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("results", type=Path, nargs="*")
@@ -96,12 +136,15 @@ def main() -> int:
     elif args.mode == "collapse":
         result = collapse_gemm_heuristic(source)
         text = json.dumps(result, separators=(",", ":")) + "\n"
-    else:
+    elif args.mode == "update":
         if not args.results:
             parser.error("update requires at least one result file")
         result = collapse_gemm_heuristic(
             _update(expand_gemm_heuristic(source), args.results),
         )
+        text = json.dumps(result, separators=(",", ":")) + "\n"
+    else:
+        result = collapse_gemm_heuristic(_from_mapper(source))
         text = json.dumps(result, separators=(",", ":")) + "\n"
     args.output.write_text(text)
     return 0
