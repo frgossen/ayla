@@ -9,6 +9,8 @@ from functools import cache
 from importlib.resources import files
 from typing import Any
 
+from .gpu_dialect import CollectiveAxis
+
 
 @dataclass(frozen=True)
 class GemmScheduleSeed:
@@ -261,6 +263,10 @@ def _adapt_config(
     }
     if preferred_ctas is not None:
         builder["output_grid_size"] = ctas
+    if captured.get("swap_output_grid_axes") is True:
+        builder["output_grid_axes"] = (
+            CollectiveAxis.Y, CollectiveAxis.X,
+        )
     optional = (
         "warpgroup_m_tile", "warpgroup_fast_axis", "rhs_tma_load_slices",
         "cluster_m_ctas", "cluster_n_ctas",

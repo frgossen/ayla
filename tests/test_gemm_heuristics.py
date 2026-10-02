@@ -1,4 +1,5 @@
 from ayla.gemm_heuristics import select_gemm_schedules
+from ayla.gpu_dialect import CollectiveAxis
 
 
 def test_small_cta_seed_retains_the_measured_fixed_grid():
@@ -43,3 +44,18 @@ def test_n_grouped_winner_routes_existing_builder_controls():
     assert seed.builder_config["output_m_tiles_per_cta"] == 1
     assert seed.builder_config["output_n_tiles_per_cta"] == 2
     assert seed.builder_config["cyclic_operand_pipeline"] is True
+
+
+def test_swapped_n_grouped_winner_routes_existing_builder_controls():
+    selection = select_gemm_schedules(2856, 3072, 768)
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.captured_config["name"] == "ng2856tune_swap1"
+    )
+
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_m_tiles_per_cta"] == 1
+    assert seed.builder_config["output_n_tiles_per_cta"] == 3
+    assert seed.builder_config["output_grid_axes"] == (
+        CollectiveAxis.Y, CollectiveAxis.X,
+    )
