@@ -2117,27 +2117,44 @@ class F64Type(Type):
     byte_size = 8
 
 
-@gpu_dialect.register_op("scalar")
-class ScalarOp(Op):
-    """Produce a typed floating-point scalar value."""
+@gpu_dialect.register_op("constant")
+class ConstantOp(Op):
+    """Produce an immutable floating-point tensor constant.
+
+    A scalar payload is a splat; a list payload is flat row-major data. A
+    rank-0 tensor is the canonical scalar data value. Unlike
+    ``IndexConstantOp``, this operation represents numerical program data
+    rather than an index used for addressing or control flow.
+    """
 
     @classmethod
-    def build(cls, value: int | float, dtype: Type) -> "ScalarOp":
-        if type(value) not in (int, float):
-            raise ValueError("scalar value must be an int or float")
-        if not isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type)):
-            raise ValueError("scalar dtype must be a floating-point type")
+    def build(
+        cls,
+        value: int | float | list[int | float],
+        result_type: MemTensorType,
+    ) -> "ConstantOp":
         return cls(
             operands=[],
-            results=[Value(name=None, type=dtype)],
+            results=[Value(name=None, type=result_type)],
             attrs={"value": value},
         )
 
     @property
-    def value(self) -> int | float:
-        value = self.attrs["value"]
+    def value(self) -> object:
+        return self.attrs["value"]
+
+    @property
+    def values(self) -> Iterator[int | float]:
+        value = self.value
+        if isinstance(value, list):
+            return iter(value)
+        result_type = self.result().type
+        assert isinstance(result_type, MemTensorType)
+        assert result_type.num_elements is not None
         assert type(value) in (int, float)
-        return cast(int | float, value)
+        return itertools.repeat(
+            cast(int | float, value), result_type.num_elements,
+        )
 
 
 @gpu_dialect.register_op("thread_ids")
@@ -2802,7 +2819,7 @@ def is_side_effect_free(op: Op) -> bool:
         IndexMulOp,
         LaneIdOp,
         PtrAddOp,
-        ScalarOp,
+        ConstantOp,
         SelectOp,
         ReinterpretOp,
         ReshapeOp,
