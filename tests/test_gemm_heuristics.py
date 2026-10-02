@@ -137,3 +137,21 @@ def test_30522_group_five_family_routes_existing_builder_controls():
         assert seed.builder_config["output_grid_axes"] == (
             CollectiveAxis.Y, CollectiveAxis.X,
         )
+
+
+def test_4000_n_group_six_routes_existing_builder_controls():
+    selection = select_gemm_schedules(4000, 4000, 1024)
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.captured_config["name"] == "confirm4000_g6_swap"
+    )
+
+    assert seed.source_shape == (4000, 4000, 1024)
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_m_tiles_per_cta"] == 1
+    assert seed.builder_config["output_n_tiles_per_cta"] == 6
+    assert seed.builder_config["operand_stages"] == 4
+    assert seed.builder_config["cyclic_operand_pipeline"] is False
+    assert seed.builder_config["output_grid_axes"] == (
+        CollectiveAxis.Y, CollectiveAxis.X,
+    )
