@@ -5,8 +5,10 @@ from typing import cast
 from ..base.ir import find_ops_of_type
 from ..base.pipeline import Pipeline
 from ..gpu_dialect import (
+    BarrierOp,
     CollectiveAxis,
     CollectiveLevel,
+    ForOp,
     KernelOp,
     MatmulOp,
     MemTensorType,
@@ -181,6 +183,7 @@ def schedule_matmul(
     *,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
+    output_grid_size: int | None = None,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -226,6 +229,14 @@ def schedule_matmul(
         )
     if output_m_tiles_per_cta > 1 and output_n_tiles_per_cta > 1:
         raise ValueError("output tiles may be grouped along only one axis")
+    if output_grid_size is not None:
+        if output_grid_size < 1:
+            raise ValueError("output_grid_size must be positive")
+        if output_groups != (1, 1):
+            raise ValueError(
+                "a fixed output grid and static output grouping are "
+                "mutually exclusive"
+            )
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (64, 128, 192, 256):
@@ -260,15 +271,24 @@ def schedule_matmul(
         group_label = "outm"
     pipeline = Pipeline()
     if group_size == 1:
+        if output_grid_size is not None:
+            kernel.grid_dim = (output_grid_size, 1, 1)
         pipeline.add_pass(TileMatmul(
             op_dims=["M", "N"],
             tile_sizes=[output_m_tile, output_n_tile],
             iteration_bindings=[
                 (CollectiveLevel.BLOCK, CollectiveAxis.X),
-                (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+                (
+                    CollectiveLevel.BLOCK,
+                    CollectiveAxis.X if output_grid_size is not None
+                    else CollectiveAxis.Y,
+                ),
             ],
             for_loop_labels=[None, None],
             op_label_filter="mm",
+            grid_stride_loop_label=(
+                "outmn" if output_grid_size is not None else None
+            ),
             allow_partial_tiles=(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
@@ -305,6 +325,25 @@ def schedule_matmul(
         output_tma_inner_size=output_tma_inner_size,
         operand_move_attrs=operand_move_attrs,
     ))
+    if output_grid_size is not None:
+        # Promotion allocations are guarded by the partial final wave. Hoist
+        # them through both that guard and the grid-stride loop before async
+        # scheduling, then separate successive tiles reusing the same arenas.
+        pipeline.add_pass(LICM())
+        pipeline.add_pass(LICM())
+        module = pipeline.run(module)
+        loops = [
+            loop for loop in find_ops_of_type(module, ForOp)
+            if loop.attrs.get("label") == "outmn"
+        ]
+        logical_tiles = m_blocks * n_blocks
+        if len(loops) > 1 or (
+            not loops and logical_tiles > output_grid_size
+        ):
+            raise ValueError("expected one fixed output-grid wave loop")
+        if loops:
+            loops[0].body.ops.append(BarrierOp.build("block"))
+        pipeline = Pipeline()
     if group_size > 1:
         pipeline.add_pass(UnrollLoop(
             unroll_factor=group_size,
@@ -322,6 +361,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     k: int | None = None,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
+    output_grid_size: int | None = None,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -368,6 +408,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_{output_m_tiles_per_cta}tiles"
     if output_n_tiles_per_cta != 1:
         name += f"_n{output_n_tiles_per_cta}tiles"
+    if output_grid_size is not None:
+        name += f"_grid{output_grid_size}"
     if output_slices != 1:
         name += f"_split{output_slices}"
     if output_store_buffers != 1:
@@ -386,6 +428,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         module,
         output_m_tiles_per_cta=output_m_tiles_per_cta,
         output_n_tiles_per_cta=output_n_tiles_per_cta,
+        output_grid_size=output_grid_size,
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
         warpgroup_n_tile=resolved_warpgroup_n_tile,

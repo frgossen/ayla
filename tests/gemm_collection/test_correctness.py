@@ -16,6 +16,7 @@ from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_sigmoid import (
     auto_matmul_4096_wgmma256_wg_sigmoid_module,
 )
 from ayla.gpu_dialect import (
+    BarrierOp,
     ElementwiseOp,
     ForOp,
     TileOp,
@@ -123,6 +124,56 @@ def test_configurable_tma_gemm_supports_general_n_tiles(n_tile):
         )
     )
     assert "wgmma.mma_async" in kernel.ptx
+
+
+def test_fixed_output_grid_uses_one_linearized_grid_stride_loop():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=512,
+        n=256,
+        k=64,
+        output_grid_size=3,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+    [loop] = [
+        op for op in find_ops_of_type(module, ForOp)
+        if op.attrs.get("label") == "outmn"
+    ]
+    [kernel] = module.body.ops
+
+    assert kernel.grid_dim == (3, 1, 1)
+    assert len(find_ops_of_type(loop, BarrierOp)) == 1
+
+
+@requires_cuda
+def test_fixed_output_grid_matches_torch():
+    m, n, k = 512, 256, 64
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_grid_size=3,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(23)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
 
 
 def test_multi_output_uses_requested_tile_geometry():
