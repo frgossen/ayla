@@ -197,16 +197,23 @@ def _adapt_config(
         return None, ("unsafe shared-memory lifetime reuse is not supported",)
     if "output_m_tiles_per_cta" in captured:
         return dict(captured), ()
-    m_group, n_group, ctas = _output_groups(captured, m, n)
-    adaptations = []
     preferred_ctas = captured["output_cta_count"]
+    if preferred_ctas is None:
+        m_group, n_group, ctas = _output_groups(captured, m, n)
+    else:
+        m_group, n_group, ctas = 1, 1, _as_int(preferred_ctas)
+    adaptations = []
     if preferred_ctas is not None:
         adaptations.append(
             f"output_cta_count={preferred_ctas} -> "
-            f"output groups {m_group}x{n_group} ({ctas} CTAs)"
+            f"fixed output grid of {ctas} CTAs"
         )
     if captured["unroll_output_tiles"] is False:
-        adaptations.append("synchronized output loop -> static output grouping")
+        adaptations.append(
+            "retain synchronized grid-stride output loop"
+            if preferred_ctas is not None
+            else "synchronized output loop -> static output grouping"
+        )
 
     lhs = {"l2_cache_hint": captured["lhs_l2_cache_hint"]}
     if captured["lhs_l2_promotion"] is not None:
@@ -236,6 +243,8 @@ def _adapt_config(
         },
         "ptx_optimization_level": captured["ptx_optimization_level"],
     }
+    if preferred_ctas is not None:
+        builder["output_grid_size"] = ctas
     optional = (
         "warpgroup_m_tile", "warpgroup_fast_axis", "rhs_tma_load_slices",
         "cluster_m_ctas", "cluster_n_ctas",
