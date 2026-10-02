@@ -690,6 +690,29 @@ def test_bulk_await_does_not_release_named_barrier_id():
     ]
 
 
+def test_loop_backedge_upgrades_live_named_barrier_to_block_sync():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%d: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %s: smem<64x64xf32> = alloc()
+            %r: rmem<64x64xf32> = alloc()
+            %l: lock<bulk> = alloc()
+            move(%s: smem<64x64xf32>, %r: rmem<64x64xf32>)
+            for (%i: index = 0 to 2) {
+              async(%l: lock<bulk>) tma_move(%d: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %s: smem<64x64xf32>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0}
+              await(%l: lock<bulk>)
+            }
+          }
+        }"""))
+
+    insert_syncs(module)
+
+    barriers = find_ops_of_type(module, BarrierOp)
+    assert len(barriers) == 1
+    assert barriers[0].scope == "block"
+
+
 def test_full_block_sync_releases_all_named_barrier_ids():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
