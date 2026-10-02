@@ -316,12 +316,14 @@ def _transfer_memory_effects(
                     barrier_scope = barrier_scope.join(
                         _barrier_scope(prior.scope, current.scope)
                     )
+    recorded = targets.get(op)
+    if recorded is not None:
+        barrier_scope = barrier_scope.join(recorded.scope)
     # A block-leader barrier is named. Its id remains in use until either a
     # full-block sync, or (for an mbar async) the await where everyone waits for
     # t0. Reuse any id whose prior lifetime has ended.
     named_id = None
     if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
-        recorded = targets.get(op)
         pending_await_ids = {
             barrier_id
             for ids in live.named_barrier_ids_pending_await.values()
@@ -330,16 +332,14 @@ def _transfer_memory_effects(
         used_ids = live.named_barrier_ids | pending_await_ids
         if recorded is not None and recorded.named_id is not None:
             named_id = recorded.named_id
-            # TODO: Insert or upgrade to a full-block sync when a loop backedge
-            # keeps this named barrier live, instead of rejecting the program.
-            assert named_id not in used_ids, (
-                f"named barrier {named_id} remains in use across a loop "
-                f"backedge before {op}; named barriers are only released by a "
-                "full-block sync or their mbar await, so add a full-block sync "
-                "before the backedge; "
-                f"pending awaits={live.named_barrier_ids_pending_await}"
-            )
-        if named_id is None:
+            if named_id in used_ids:
+                # The same static site has reached us through a loop backedge
+                # before its named barrier was released. Upgrade the site to a
+                # full-block sync, which both performs the gather and releases
+                # every named barrier for the next iteration.
+                barrier_scope = BarrierScope.BLOCK
+                named_id = None
+        if barrier_scope == BarrierScope.BLOCK_TO_LEADER and named_id is None:
             # A barrier can first become necessary on a later loop-fixpoint
             # iteration. Do not let it steal an id already assigned to another
             # static barrier site that has not been revisited yet.
@@ -362,16 +362,18 @@ def _transfer_memory_effects(
             named_id = min(available_ids)
         # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
         # an mbar await is an all-thread rendezvous that ends this handoff.
-        assert async_lock is None or isinstance(async_lock.type, LockType)
-        if (
-            async_lock is not None
-            and cast(LockType, async_lock.type).kind == "mbar"
-        ):
-            live.named_barrier_ids_pending_await.setdefault(
-                async_lock, set(),
-            ).add(named_id)
-        else:
-            live.named_barrier_ids.add(named_id)
+        if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
+            assert named_id is not None
+            assert async_lock is None or isinstance(async_lock.type, LockType)
+            if (
+                async_lock is not None
+                and cast(LockType, async_lock.type).kind == "mbar"
+            ):
+                live.named_barrier_ids_pending_await.setdefault(
+                    async_lock, set(),
+                ).add(named_id)
+            else:
+                live.named_barrier_ids.add(named_id)
     targets[op] = BarrierTarget(barrier_scope, named_id)
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
