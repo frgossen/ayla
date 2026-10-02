@@ -103,3 +103,22 @@ def test_additional_swapped_m_groups_route_existing_builder_controls():
         assert seed.builder_config["output_grid_axes"] == (
             CollectiveAxis.Y, CollectiveAxis.X,
         )
+
+
+def test_large_shape_static_groups_route_existing_builder_controls():
+    cases = (
+        ((6400, 2048, 512), 5, 1),
+        ((512, 50272, 768), 1, 6),
+    )
+    for shape, m_group, n_group in cases:
+        selection = select_gemm_schedules(*shape)
+        seed = next(
+            seed for seed in selection.seeds
+            if seed.source_shape == shape
+            and seed.captured_config["output_m_tile"] == 128
+        )
+
+        assert seed.builder_config is not None
+        assert seed.builder_config["output_m_tiles_per_cta"] == m_group
+        assert seed.builder_config["output_n_tiles_per_cta"] == n_group
+        assert seed.builder_config["ptx_optimization_level"] == 1
