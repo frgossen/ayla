@@ -33,6 +33,16 @@ def test_incremental_winner_preserves_existing_leaf_seeds():
     assert "waveconfirm_native" in names
 
 
+def test_addmm_uses_an_independent_operation_group():
+    mm = select_gemm_schedules(128, 4096, 4096)
+    addmm = select_gemm_schedules(
+        128, 4096, 4096, operation="addmm",
+    )
+
+    assert addmm.leaf.startswith("addmm_")
+    assert mm.leaf != addmm.leaf
+
+
 def test_n_grouped_winner_routes_existing_builder_controls():
     selection = select_gemm_schedules(3136, 2048, 1024)
     seed = next(
