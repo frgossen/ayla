@@ -2288,10 +2288,14 @@ def _tma_coordinates(
             for name in reversed(index_names)
         ]
 
-    assert desc_type.gmem_type.rank == 2
-    assert len(index_names) == 2
-    row = f"${{b32:operand.{index_names[0]}.val}}"
-    col = f"${{b32:operand.{index_names[1]}.val}}"
+    assert desc_type.gmem_type.rank >= 2
+    assert len(index_names) == desc_type.gmem_type.rank
+    row = f"${{b32:operand.{index_names[-2]}.val}}"
+    col = f"${{b32:operand.{index_names[-1]}.val}}"
+    outer = [
+        f"${{b32:operand.{name}.val}}"
+        for name in reversed(index_names[:-2])
+    ]
     block = f"${{b32:{prefix}_block}}"
     inner = f"${{b32:{prefix}_inner}}"
     block_width, order = layout
@@ -2300,9 +2304,9 @@ def _tma_coordinates(
         f"rem.u32 {inner}, {col}, {block_width};",
     ]
     if order == "row_major":
-        coordinates = [inner, block, row]
+        coordinates = [inner, block, row, *outer]
     else:
-        coordinates = [inner, row, block]
+        coordinates = [inner, row, block, *outer]
     return lines, coordinates
 
 
