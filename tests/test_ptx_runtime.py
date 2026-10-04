@@ -12,6 +12,7 @@ from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     AllocOp,
     BarrierOp,
+    BlockIdOp,
     ClusterBlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
@@ -21,7 +22,9 @@ from ayla.gpu_dialect import (
     ModuleOp,
     MoveOp,
     PTXTemplateOp,
+    ReshapeOp,
     SmemTensorType,
+    TileOp,
 )
 from ayla.ptx_codegen import PtxKernel, make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -236,3 +239,60 @@ def test_tma_multicast_copies_to_every_cluster_block():
     torch.cuda.synchronize()
 
     assert actual.cpu().tolist() == [7.0, 7.0]
+
+
+@requires_cuda
+def test_rank3_tma_load_through_singleton_batch_view():
+    input_type = GmemTensorType.build((2, 16, 16), F32Type())
+    output_type = GmemTensorType.build((2,), F32Type())
+    input_value = Value("input", input_type)
+    output = Value("output", output_type)
+    batch_id = BlockIdOp.build(CollectiveAxis.Z)
+    batch = TileOp.build(
+        input_value,
+        [batch_id.value, 0, 0],
+        GmemTensorType.build((1, 16, 16), F32Type()),
+    )
+    matrix = ReshapeOp.build(
+        batch.result(), GmemTensorType.build((16, 16), F32Type()),
+    )
+    smem = AllocOp.build(SmemTensorType.build((16, 16), F32Type()), id=0)
+    load = MoveOp.build(
+        smem.result(),
+        matrix.result(),
+        collective={
+            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
+        },
+        attrs={"tma": True},
+    )
+    write = PTXTemplateOp.build(
+        operands=[smem.result(), output, batch_id.value],
+        result_types=[],
+        template=textwrap.dedent("""\
+            ld.shared.f32 ${f32:value}, [${b32:operand.smem.ptr}];
+            mul.wide.u32 ${b64:offset}, ${b32:operand.batch.val}, 4;
+            add.u64 ${b64:dst}, ${b64:operand.output.ptr}, ${b64:offset};
+            st.global.f32 [${b64:dst}], ${f32:value};
+        """),
+        operand_names=["smem", "output", "batch"],
+        result_names=[],
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "rank3_tma_load",
+        Block(arguments=[input_value, output], ops=[
+            batch_id, batch, matrix, smem, load, write,
+        ]),
+        grid_dim=(1, 1, 2),
+        block_dim=(32, 1, 1),
+    )]))
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    input_tensor = torch.stack([
+        torch.full((16, 16), 3.0, device="cuda"),
+        torch.full((16, 16), 7.0, device="cuda"),
+    ])
+    actual = torch.empty(2, dtype=torch.float32, device="cuda")
+
+    launcher(input_tensor, actual)
+    torch.cuda.synchronize()
+
+    assert actual.cpu().tolist() == [3.0, 7.0]
