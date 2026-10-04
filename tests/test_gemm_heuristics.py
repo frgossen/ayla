@@ -1,3 +1,5 @@
+import pytest
+
 from ayla.gemm_heuristics import select_gemm_schedules
 from ayla.gpu_dialect import CollectiveAxis
 
@@ -41,6 +43,46 @@ def test_addmm_uses_an_independent_operation_group():
 
     assert addmm.leaf.startswith("addmm_")
     assert mm.leaf != addmm.leaf
+
+
+def test_bmm_uses_batch_aware_operation_group_and_partial_edge_tiles():
+    partial = select_gemm_schedules(
+        64, 16, 128, operation="bmm", batch=128,
+    )
+    small_batch = select_gemm_schedules(
+        768, 64, 64, operation="bmm", batch=12,
+    )
+    large_batch = select_gemm_schedules(
+        768, 64, 64, operation="bmm", batch=144,
+    )
+
+    assert partial.leaf.startswith("bmm_")
+    assert partial.seeds
+    assert any(
+        seed.builder_config is not None
+        and seed.builder_config["output_n_tile"] > 16
+        for seed in partial.seeds
+    )
+    assert small_batch.leaf != large_batch.leaf
+
+
+def test_batch_is_rejected_for_non_bmm_operations():
+    with pytest.raises(ValueError, match="only meaningful for BMM"):
+        select_gemm_schedules(128, 128, 128, batch=2)
+
+
+def test_bmm_filters_illegal_blocked_output_tma_transfers():
+    selection = select_gemm_schedules(
+        128, 32, 128, operation="bmm", batch=128,
+    )
+
+    assert selection.seeds
+    assert all(
+        seed.builder_config is None
+        or seed.builder_config["output_store"] == "scalar"
+        or seed.builder_config["output_tma_inner_size"] is None
+        for seed in selection.seeds
+    )
 
 
 def test_addmm_transfer_winners_seed_matching_mm_leaves():

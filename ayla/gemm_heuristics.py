@@ -144,13 +144,18 @@ def _mapper() -> dict[str, Any]:
     return expand_gemm_heuristic(json.loads(resource.read_text()))
 
 
-def _features(m: int, n: int, k: int) -> dict[str, float]:
+def _features(
+    m: int, n: int, k: int, batch: int = 1,
+) -> dict[str, float]:
     return {
+        "batch": float(batch),
         "m": float(m),
         "n": float(n),
         "k": float(k),
         "aspect_m_over_n": m / n,
-        "output_tiles_64": float(((m + 63) // 64) * ((n + 63) // 64)),
+        "output_tiles_64": float(
+            batch * ((m + 63) // 64) * ((n + 63) // 64)
+        ),
         "reduction_tiles_64": float((k + 63) // 64),
     }
 
@@ -281,16 +286,27 @@ def _adapt_config(
     return builder, tuple(adaptations)
 
 
-def _legal(config: dict[str, object], m: int, n: int, k: int) -> bool:
+def _legal(
+    config: dict[str, object],
+    m: int,
+    n: int,
+    k: int,
+    *,
+    allow_partial_output_tiles: bool = False,
+) -> bool:
     m_tile = _as_int(config["output_m_tile"])
     n_tile = _as_int(config["output_n_tile"])
     k_tile = _as_int(config["operand_k_tile"])
     m_group = _as_int(config["output_m_tiles_per_cta"])
     n_group = _as_int(config["output_n_tiles_per_cta"])
+    blocked_output = (
+        config["output_store"] != "scalar"
+        and config["output_tma_inner_size"] is not None
+    )
     return (
-        m >= m_tile
-        and n >= n_tile
+        (allow_partial_output_tiles or (m >= m_tile and n >= n_tile))
         and k % k_tile == 0
+        and (not blocked_output or (n % 64 == 0 and n_tile % 64 == 0))
         and math.ceil(m / m_tile) >= m_group
         and math.ceil(n / n_tile) >= n_group
     )
@@ -302,17 +318,22 @@ def select_gemm_schedules(
     k: int,
     *,
     operation: str = "mm",
+    batch: int = 1,
     dtype: str = "float16",
     layout: str = "canonical_nt",
 ) -> GemmHeuristicSelection:
     """Return nearby captured configurations and current-library adaptations."""
     if min(m, n, k) <= 0:
         raise ValueError("GEMM dimensions must be positive")
+    if batch <= 0:
+        raise ValueError("GEMM batch must be positive")
     mapper = _mapper()
     if layout != mapper["layout"]:
         raise ValueError(f"no GEMM heuristic for layout {layout}")
-    if operation not in {"mm", "addmm"}:
+    if operation not in {"mm", "addmm", "bmm"}:
         raise ValueError(f"no GEMM heuristic for operation {operation}")
+    if operation != "bmm" and batch != 1:
+        raise ValueError("batch is only meaningful for BMM heuristics")
     group = (
         f"{operation}/{dtype}/{'k128' if k % 128 == 0 else 'k64'}"
     )
@@ -321,7 +342,7 @@ def select_gemm_schedules(
     except KeyError as error:
         raise ValueError(f"no GEMM heuristic for {group}") from error
 
-    values = _features(m, n, k)
+    values = _features(m, n, k, batch)
     path = []
     while "feature" in node:
         feature = node["feature"]
@@ -334,7 +355,13 @@ def select_gemm_schedules(
     for seed in node["seeds"]:
         captured = dict(seed["configuration"])
         builder, adaptations = _adapt_config(captured, m, n)
-        if builder is not None and not _legal(builder, m, n, k):
+        if builder is not None and not _legal(
+            builder,
+            m,
+            n,
+            k,
+            allow_partial_output_tiles=operation == "bmm",
+        ):
             continue
         source = seed["source"]
         seeds.append(GemmScheduleSeed(
@@ -348,7 +375,13 @@ def select_gemm_schedules(
     if not any(seed.builder_config is not None for seed in seeds):
         captured = dict(mapper["fallback"])
         builder, adaptations = _adapt_config(captured, m, n)
-        if builder is not None and _legal(builder, m, n, k):
+        if builder is not None and _legal(
+            builder,
+            m,
+            n,
+            k,
+            allow_partial_output_tiles=operation == "bmm",
+        ):
             seeds.append(GemmScheduleSeed(
                 captured, builder, adaptations, None, None,
             ))

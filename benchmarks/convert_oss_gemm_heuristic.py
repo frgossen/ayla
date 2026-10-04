@@ -132,10 +132,31 @@ def _from_mapper(mapper: dict) -> dict:
     }
 
 
+def _merge_mapper(expanded: dict, mapper: dict) -> dict:
+    """Add disjoint measured operation groups without rebuilding old trees."""
+    addition = _from_mapper(mapper)
+    for field in ("version", "workload", "layout", "source_fields"):
+        if addition[field] != expanded[field]:
+            raise ValueError(
+                f"incompatible heuristic {field}: "
+                f"{addition[field]!r} != {expanded[field]!r}"
+            )
+    for field in addition["features"]:
+        if field not in expanded["features"]:
+            expanded["features"].append(field)
+    for name, tree in addition["groups"].items():
+        if name in expanded["groups"]:
+            raise ValueError(f"heuristic group already exists: {name}")
+        expanded["groups"][name] = tree
+    expanded["source_shape_count"] += addition["source_shape_count"]
+    return expanded
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "mode", choices=("expand", "collapse", "update", "from-mapper"),
+        "mode",
+        choices=("expand", "collapse", "update", "from-mapper", "merge-mapper"),
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
@@ -163,8 +184,16 @@ def main() -> int:
             ),
         )
         text = json.dumps(result, separators=(",", ":")) + "\n"
-    else:
+    elif args.mode == "from-mapper":
         result = collapse_gemm_heuristic(_from_mapper(source))
+        text = json.dumps(result, separators=(",", ":")) + "\n"
+    else:
+        if len(args.results) != 1:
+            parser.error("merge-mapper requires exactly one mapper file")
+        mapper = json.loads(args.results[0].read_text())
+        result = collapse_gemm_heuristic(
+            _merge_mapper(expand_gemm_heuristic(source), mapper),
+        )
         text = json.dumps(result, separators=(",", ":")) + "\n"
     args.output.write_text(text)
     return 0
