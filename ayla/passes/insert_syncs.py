@@ -9,7 +9,14 @@ from ..analysis.sync import (
 )
 from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
-from ..gpu_dialect import AllocOp, BarrierOp, KernelOp, LockType, ModuleOp
+from ..gpu_dialect import (
+    AllocOp,
+    AsyncOp,
+    BarrierOp,
+    KernelOp,
+    LockType,
+    ModuleOp,
+)
 
 
 # BarrierScope -> the BarrierOp ``scope`` attr.
@@ -30,7 +37,15 @@ def _insert_barriers(
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
+    pending_init: set[BarrierScope] = set()
     for op in block.ops:
+        if pending_init and not isinstance(op, AllocOp):
+            new_ops.extend(
+                BarrierOp.build(_BARRIER_OP_SCOPE[scope])
+                for scope in (BarrierScope.BLOCK, BarrierScope.CLUSTER)
+                if scope in pending_init
+            )
+            pending_init.clear()
         target = targets.get(op)
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
@@ -59,8 +74,14 @@ def _insert_barriers(
                 attrs=attrs,
             ))
         new_ops.append(op)
+        pending_init.update(_lock_init_barriers(op))
         for inner in op.blocks:
             _insert_barriers(inner, targets, num_threads, barrier_syncs)
+    new_ops.extend(
+        BarrierOp.build(_BARRIER_OP_SCOPE[scope])
+        for scope in (BarrierScope.BLOCK, BarrierScope.CLUSTER)
+        if scope in pending_init
+    )
     block.ops = new_ops
 
 
@@ -84,6 +105,28 @@ def _materialize_cluster_mbars(
         barrier_syncs[op] = alloc.result()
     kernel.body.ops[0:0] = allocs
     return barrier_syncs
+
+
+def _lock_init_barriers(op: Op) -> tuple[BarrierScope, ...]:
+    """Publication barriers required by an implicitly initialized lock."""
+    if not isinstance(op, AllocOp):
+        return ()
+    lock_type = op.result().type
+    if not isinstance(lock_type, LockType):
+        return ()
+    if lock_type.kind == "cluster_mbar":
+        return (BarrierScope.BLOCK, BarrierScope.CLUSTER)
+    if lock_type.kind != "mbar":
+        return ()
+    multicast = any(
+        isinstance(user, AsyncOp) and user.is_tma_multicast
+        for user in op.result().users()
+    )
+    return (
+        (BarrierScope.BLOCK, BarrierScope.CLUSTER)
+        if multicast
+        else (BarrierScope.BLOCK,)
+    )
 
 
 class InsertSyncs(Pass):
