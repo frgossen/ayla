@@ -481,33 +481,21 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_alloc_cluster_mbar(op)
         if lock_type.kind != "mbar":
             return [], [None]
-        is_multicast = _lock_has_tma_multicast(op.result())
-        # Every CTA owns a local mbarrier at this shared-memory offset, and a
-        # multicast signals each selected CTA's instance. The CTA-local bar.sync
-        # publishes each initialization locally; this cluster rendezvous ensures
-        # all instances are initialized before rank 0 can issue the multicast.
-        cluster_sync = (
-            """barrier.cluster.arrive.release;
-            barrier.cluster.wait.acquire;
-            """
-            if is_multicast else ""
-        )
-        template = textwrap.dedent(f"""\
-            .shared .align 8 .b64 ${{smem:bar}}[1];
-            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
-            mov.u32 ${{b32:result.dst.parity}}, 0;
-            mov.u32 ${{b32:tid_x}}, %tid.x;
-            mov.u32 ${{b32:tid_y}}, %tid.y;
-            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
-            mov.u32 ${{b32:tid_z}}, %tid.z;
-            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
-            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
-            @${{pred:not_t0}} bra ${{label:after_init}};
-            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], 1;
+        # InsertSyncs represents publication explicitly with BarrierOps.
+        template = textwrap.dedent("""\
+            .shared .align 8 .b64 ${smem:bar}[1];
+            mov.u32 ${b32:result.dst.val}, ${smem:bar};
+            mov.u32 ${b32:result.dst.parity}, 0;
+            mov.u32 ${b32:tid_x}, %tid.x;
+            mov.u32 ${b32:tid_y}, %tid.y;
+            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
+            mov.u32 ${b32:tid_z}, %tid.z;
+            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
+            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
+            @${pred:not_t0} bra ${label:after_init};
+            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
             fence.mbarrier_init.release.cluster;
-            ${{label:after_init}}:
-            bar.sync 0;
-            {cluster_sync}\
+            ${label:after_init}:
         """)
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
@@ -523,8 +511,7 @@ class LowerToPtxTemplate(LoweringPass):
         kernel = find_ancestor_of_type(op, KernelOp)
         assert kernel is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
-        # Nonzero ranks arrive remotely at rank 0's mbarrier. Publish rank 0's
-        # initialization cluster-wide before any CTA can reach its first use.
+        # InsertSyncs represents publication explicitly with BarrierOps.
         template = textwrap.dedent(f"""\
             .shared .align 8 .b64 ${{smem:bar}}[1];
             mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
@@ -541,9 +528,6 @@ class LowerToPtxTemplate(LoweringPass):
             mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {cluster_size};
             fence.mbarrier_init.release.cluster;
             ${{label:after_init}}:
-            bar.sync 0;
-            barrier.cluster.arrive.release;
-            barrier.cluster.wait.acquire;
         """)
         new_op = PTXTemplateOp.build(
             operands=[], result_types=[lock_type], template=template,
