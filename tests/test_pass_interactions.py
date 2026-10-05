@@ -249,7 +249,7 @@ def test_separately_tiled_matmul_chain_keeps_raw_dependency():
         insert_syncs(module)
 
 
-def test_local_and_multicast_tma_loads_keep_separate_completion():
+def test_local_and_multicast_tma_loads_share_completion():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @loads(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
@@ -266,10 +266,8 @@ def test_local_and_multicast_tma_loads_keep_separate_completion():
     local = "mbarrier::complete_tx::bytes ["
     multicast = "mbarrier::complete_tx::bytes.multicast::cluster"
     expect = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
-    local_wait = "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
     cluster_wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-    local_expect_pos = ptx.index(expect)
-    cluster_expect_pos = ptx.index(expect, local_expect_pos + 1)
+    expect_pos = ptx.index(expect)
     assert_contains_in_order(
         ptx,
         "fence.mbarrier_init.release.cluster;",
@@ -278,14 +276,12 @@ def test_local_and_multicast_tma_loads_keep_separate_completion():
     )
     assert (
         ptx.index(local)
-        < local_expect_pos
-        < ptx.index(local_wait)
         < ptx.index(multicast)
-        < cluster_expect_pos
+        < expect_pos
         < ptx.index(cluster_wait)
     )
-    assert ptx.count(f"{expect} _,") == 2
-    assert ptx.count("], 1024;") == 2
+    assert ptx.count(f"{expect} _,") == 1
+    assert "], 2048;" in ptx
 
 
 TILED_IR = textwrap.dedent("""\

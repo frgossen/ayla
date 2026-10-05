@@ -140,7 +140,10 @@ class FuseAsync(Pass):
                     if (
                         kind != group_kind
                         or op.lock.type != group_lock.type
-                        or op.collective != group_collective
+                        or (
+                            kind != "tma_load"
+                            and op.collective != group_collective
+                        )
                     ):
                         finalize()  # incompatible async ends the run
                 if group_collective is None:
@@ -148,6 +151,13 @@ class FuseAsync(Pass):
                     group_kind = kind
                     group_attrs = op.extra_attrs or None
                     group_collective = op.collective
+                elif kind == "tma_load":
+                    group_collective = {
+                        axis: group_collective[axis].join(
+                            op.collective[axis]
+                        )
+                        for axis in CollectiveAxis
+                    }
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:
