@@ -175,6 +175,10 @@ def test_reshape_op():
 
 
 def test_reduce_op():
+    assert ReduceOp.NEUTRAL_ELEMENTS == {
+        "max": float("-inf"),
+        "sum": 0.0,
+    }
     src = Value(
         name="src", type=GmemTensorType.build([8, 32], F32Type()),
     )

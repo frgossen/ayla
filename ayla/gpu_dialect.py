@@ -591,6 +591,11 @@ class ReduceOp(Op):
     a smaller destination combines those partials.
     """
 
+    NEUTRAL_ELEMENTS: ClassVar[dict[str, float | int | None]] = {
+        "max": float("-inf"),
+        "sum": 0.0,
+    }
+
     @classmethod
     def build(
         cls,
@@ -700,6 +705,13 @@ class ElementwiseOp(Op):
 
     TODO: generalize to several destinations.
     """
+
+    ARITIES: ClassVar[dict[str, int]] = {
+        "convert": 1,
+        "mul": 2,
+        "sigmoid": 1,
+        "silu": 1,
+    }
 
     @classmethod
     def build(
