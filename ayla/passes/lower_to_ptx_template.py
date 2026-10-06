@@ -133,6 +133,30 @@ def _lower_f32_to_packed16_ptx(
     )
 
 
+def _lower_packed16_to_f32_ptx(
+    dst_regs: list[str],
+    src_regs: list[str],
+    src_dtype: Type,
+    dst_dtype: Type,
+) -> str:
+    """Unpack paired BF16/F16 registers and convert each element to F32."""
+    assert isinstance(src_dtype, (BF16Type, F16Type))
+    assert isinstance(dst_dtype, F32Type)
+    assert len(dst_regs) == 2 * len(src_regs)
+    template = ""
+    for index, (src, dst_lo, dst_hi) in enumerate(zip(
+        src_regs, dst_regs[::2], dst_regs[1::2], strict=True,
+    )):
+        src_lo = f"${{b16:convert_lo{index}}}"
+        src_hi = f"${{b16:convert_hi{index}}}"
+        template += (
+            f"mov.b32 {{{src_lo}, {src_hi}}}, {src};\n"
+            f"cvt.f32.{src_dtype.name} {dst_lo}, {src_lo};\n"
+            f"cvt.f32.{src_dtype.name} {dst_hi}, {src_hi};\n"
+        )
+    return template
+
+
 def _lower_dtype_conversion_ptx(
     dst_regs: list[str],
     src_regs: list[str],
@@ -140,6 +164,13 @@ def _lower_dtype_conversion_ptx(
     dst_dtype: Type,
 ) -> str:
     """Lower a conversion independently of the element-wise function."""
+    if (
+        isinstance(src_dtype, (BF16Type, F16Type))
+        and isinstance(dst_dtype, F32Type)
+    ):
+        return _lower_packed16_to_f32_ptx(
+            dst_regs, src_regs, src_dtype, dst_dtype,
+        )
     if not (
         isinstance(src_dtype, F32Type)
         and isinstance(dst_dtype, (BF16Type, F16Type))
@@ -1051,6 +1082,8 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_move_smem_rmem(op)
         if {type(dst_type), type(src_type)} == {SmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_smem(op)
+        if isinstance(dst_type, WgrmemTensorType) and isinstance(src_type, AddrMemTensorType) and dst_type.layout == "wgmma_layout_0":
+            return self._lower_move_wgrmem_wgmma_addrmem(op)
         if isinstance(dst_type, WgrmemTensorType) and isinstance(src_type, SmemTensorType) and dst_type.layout == "mma":
             return self._lower_move_smem_to_wgrmem_mma(op)
         if isinstance(dst_type, SmemTensorType) and isinstance(src_type, WgrmemTensorType) and src_type.layout == "mma":
@@ -1507,59 +1540,55 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         register_starts = _stmatrix_register_starts(op)
         if register_starts is None:
-            return self._lower_move_wgrmem_wgmma_to_addrmem(op)
+            return self._lower_move_wgrmem_wgmma_addrmem(op)
         return self._lower_move_wgrmem_wgmma_to_stmatrix(op, register_starts)
 
-    def _lower_move_wgrmem_wgmma_to_addrmem(
+    def _lower_move_wgrmem_wgmma_addrmem(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
-        """Store a wgmma fragment to shared or global address memory.
+        """Store a wgmma fragment to, or load it from, address memory.
 
         The register layout and static element offsets are identical for both
-        destinations; only the address width and PTX memory space differ. The
-        destination is the writer warp group's own tile, so its shape matches
-        the fragment -- the block-wide SMEM staging tile is tiled by warp-group
-        id upstream (see promote_buffers._build_tma_writeback), so the row offset
-        is already folded into the destination pointer.
+        directions and memories; only the instruction, address width and PTX
+        memory space differ. The memory is the warp group's own tile, so its
+        shape matches the fragment -- the block-wide SMEM staging tile is tiled
+        by warp-group id upstream (see promote_buffers._build_tma_writeback), so
+        the row offset is already folded into the memory pointer.
         """
-        dst_value = self.value_map[op.dst]
-        src_value = self.value_map[op.src]
-        dst_type = op.dst.type
-        wgrmem_type = op.src.type
-        assert isinstance(dst_type, (GmemTensorType, SmemTensorType))
+        is_load = isinstance(op.dst.type, WgrmemTensorType)
+        fragment, memory = (op.dst, op.src) if is_load else (op.src, op.dst)
+        memory_type = memory.type
+        wgrmem_type = fragment.type
+        assert isinstance(memory_type, (GmemTensorType, SmemTensorType))
         assert isinstance(wgrmem_type, WgrmemTensorType)
         assert wgrmem_type.layout == "wgmma_layout_0"
-        assert wgrmem_type.rank == 2 and dst_type.rank == 2
-        assert isinstance(wgrmem_type.dtype, (BF16Type, F16Type)), (
-            f"wgmma store: expected bf16/f16; "
-            f"got {wgrmem_type.dtype}. Use convert first for f32 accumulators."
-        )
-        assert dst_type.dtype == wgrmem_type.dtype, (
-            f"wgmma store: dtype mismatch; "
-            f"destination {dst_type.dtype} vs wgrmem {wgrmem_type.dtype}"
+        assert wgrmem_type.rank == 2 and memory_type.rank == 2
+        assert memory_type.dtype == wgrmem_type.dtype, (
+            f"wgmma move: dtype mismatch; "
+            f"memory {memory_type.dtype} vs wgrmem {wgrmem_type.dtype}"
         )
 
         m_dim, n_dim = wgrmem_type.sizes
-        root = root_buffer(op.src)
+        root = root_buffer(fragment)
         assert root is not None
         root_n = root.type.sizes[1]
-        if isinstance(op.src.definition, TileOp):
-            assert list(dst_type.sizes) == [m_dim, n_dim], (
-                f"wgmma store: destination shape {list(dst_type.sizes)} does "
+        if isinstance(fragment.definition, TileOp):
+            assert list(memory_type.sizes) == [m_dim, n_dim], (
+                f"wgmma move: memory shape {list(memory_type.sizes)} does "
                 f"not match fragment {[m_dim, n_dim]}"
             )
-            pairs = _wgmma_view_pairs(op.src)
+            pairs = _wgmma_view_pairs(fragment)
         else:
             # Keep accepting the legacy producer until PromoteBuffers switches
             # from an attribute-based slice to an explicit WGRMEM view.
             col_start = int(op.attrs.get("wgmma_col_start", 0))
-            dst_m, dst_n = dst_type.sizes
-            assert dst_m == m_dim and 0 <= col_start < n_dim
-            assert col_start + dst_n <= n_dim
+            memory_m, memory_n = memory_type.sizes
+            assert memory_m == m_dim and 0 <= col_start < n_dim
+            assert col_start + memory_n <= n_dim
             pairs = [
                 (pair, row, col - col_start)
-                for pair, row, col in _wgmma_view_pairs(op.src)
-                if col_start <= col < col_start + dst_n
+                for pair, row, col in _wgmma_view_pairs(fragment)
+                if col_start <= col < col_start + memory_n
             ]
         assert m_dim % 64 == 0, (
             f"wgmma store: m must be a multiple of 64; got {m_dim}"
@@ -1567,38 +1596,49 @@ class LowerToPtxTemplate(LoweringPass):
         assert root_n % 16 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 16 in [8, 256]; got {root_n}"
         )
-        dtype_bytes = dst_type.dtype.byte_size
-        row_stride_bytes = dst_type.strides[0] * dtype_bytes
+        dtype_bytes = memory_type.dtype.byte_size
+        row_stride_bytes = memory_type.strides[0] * dtype_bytes
 
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes, dtype_bytes,
         )
-        if isinstance(dst_type, GmemTensorType):
+        if isinstance(memory_type, GmemTensorType):
             template = textwrap.dedent(r"""
                 cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
-                add.u64 ${b64:base}, ${b64:operand.dst.ptr}, ${b64:off64};
+                add.u64 ${b64:base}, ${b64:operand.memory.ptr}, ${b64:off64};
             """)
             address = "${b64:base}"
-            instruction = "st.global.b32"
+            space = "global"
         else:
             template = (
-                "add.u32 ${b32:base}, ${b32:operand.dst.ptr}, "
+                "add.u32 ${b32:base}, ${b32:operand.memory.ptr}, "
                 "${b32:operand.offset.val};\n"
             )
             address = "${b32:base}"
-            instruction = "st.shared.b32"
+            space = "shared"
+        # A pair is one packed BF16/F16 register or two F32 registers.
+        f32 = isinstance(wgrmem_type.dtype, F32Type)
+        instruction = f"{'ld' if is_load else 'st'}.{space}{'.v2' if f32 else ''}.b32"
 
         for pair, di, dj in pairs:
             offset = di * row_stride_bytes + dj * dtype_bytes
+            registers = (
+                f"{{${{f32:operand.fragment.r{2 * pair}}}, "
+                f"${{f32:operand.fragment.r{2 * pair + 1}}}}}"
+                if f32 else f"${{b32:operand.fragment.r{pair}}}"
+            )
+            location = f"[{address}+{offset}]"
             template += (
-                f"{instruction} [{address}+{offset}], "
-                f"${{b32:operand.src.r{pair}}};\n"
+                f"{instruction} {registers}, {location};\n" if is_load
+                else f"{instruction} {location}, {registers};\n"
             )
 
         new_op = PTXTemplateOp.build(
-            operands=[dst_value, src_value, byte_offset],
+            operands=[
+                self.value_map[memory], self.value_map[fragment], byte_offset,
+            ],
             result_types=[], template=template,
-            operand_names=["dst", "src", "offset"], result_names=[],
+            operand_names=["memory", "fragment", "offset"], result_names=[],
             description=str(op),
         )
         new_ops.append(new_op)

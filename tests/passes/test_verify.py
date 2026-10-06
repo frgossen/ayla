@@ -165,6 +165,22 @@ def test_default_verification_checks_tile_rank(indices, result_sizes):
         verify_gpu_dialect(ModuleOp.build(Block(ops=[tile])))
 
 
+@pytest.mark.parametrize("src", [
+    "gmem<1x64xbf16>", "gmem<64x64xbf16 strides=[65, 1]>",
+])
+def test_address_to_wgrmem_move_requires_matching_aligned_shapes(src):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid(%src: {src}) {{
+            %dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+            move(%dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src: {src}) collective=xyz.thread
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match="equal rank-2 shapes"):
+        verify_gpu_dialect(module)
+
+
 def test_async_and_body_collectives_must_match():
     typ = GmemTensorType.build([1], F32Type())
     block_collective = {
