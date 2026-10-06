@@ -44,6 +44,7 @@ from ..gpu_dialect import (
     MoveOp,
     SmemTensorType,
     is_side_effect_free,
+    join_collectives,
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
@@ -152,12 +153,9 @@ class FuseAsync(Pass):
                     group_attrs = op.extra_attrs or None
                     group_collective = op.collective
                 elif kind == "tma_load":
-                    group_collective = {
-                        axis: group_collective[axis].join(
-                            op.collective[axis]
-                        )
-                        for axis in CollectiveAxis
-                    }
+                    group_collective = join_collectives(
+                        group_collective, op.collective,
+                    )
                 in_flight_locks.add(op.lock)
                 group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:
