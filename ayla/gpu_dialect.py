@@ -713,11 +713,10 @@ class ElementwiseOp(GpuOp):
     The first operand is the destination and the rest are sources. Passing the
     same value as the destination and first source computes in place.
 
-    ``inplace`` defaults to true and asks lowering to minimize temporary
-    register live ranges. Set it to false to prefer a wider schedule with more
-    instruction-level parallelism. A source is only overwritten when it is
-    also the destination; the backend remains responsible for register reuse
-    between distinct values.
+    Lowering minimizes temporary register live ranges by default; ``ilp``
+    asks for one wide schedule with more instruction-level parallelism
+    instead. A source is only overwritten when it is also the destination;
+    the backend remains responsible for register reuse between distinct values.
 
     TODO: generalize to several destinations.
     """
@@ -730,19 +729,12 @@ class ElementwiseOp(GpuOp):
         fn: str,
         attrs: dict[str, object] | None = None,
         *,
-        inplace: bool = True,
+        ilp: bool = False,
     ) -> "ElementwiseOp":
-        if type(inplace) is not bool:
-            raise ValueError(
-                f"elementwise inplace must be a bool; got {inplace!r}"
-            )
-        attrs = dict(attrs or {})
-        if not inplace:
-            attrs["inplace"] = False
         return cls(
             operands=[dst, *srcs],
             results=[],
-            attrs={"fn": fn, **attrs},
+            attrs={"fn": fn, **(attrs or {}), **({"ilp": True} if ilp else {})},
         )
 
     @property
@@ -761,9 +753,9 @@ class ElementwiseOp(GpuOp):
         return self.attrs["fn"]  # type: ignore[return-value]
 
     @property
-    def inplace(self) -> bool:
-        """Whether lowering should prefer a minimum-register schedule."""
-        return self.attrs.get("inplace", True)  # type: ignore[return-value]
+    def ilp(self) -> bool:
+        """Whether lowering should prefer one wide schedule over few registers."""
+        return self.attrs.get("ilp", False)  # type: ignore[return-value]
 
     @property
     def extra_attrs(self) -> dict[str, object]:

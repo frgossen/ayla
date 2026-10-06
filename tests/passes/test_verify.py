@@ -297,13 +297,13 @@ def test_elementwise_function_and_arity_are_verified():
     with pytest.raises(ValueError, match="unknown elementwise function"):
         verify_gpu_dialect(unknown)
 
-    invalid_inplace = ModuleOp.build(Block(ops=[
+    invalid_ilp = ModuleOp.build(Block(ops=[
         ElementwiseOp.build(
-            dst, srcs=srcs[:1], fn="sigmoid", attrs={"inplace": 1},
+            dst, srcs=srcs[:1], fn="sigmoid", attrs={"ilp": 1},
         ),
     ]))
-    with pytest.raises(ValueError, match="inplace must be a bool"):
-        verify_gpu_dialect(invalid_inplace)
+    with pytest.raises(ValueError, match="ilp must be a bool"):
+        verify_gpu_dialect(invalid_ilp)
 
 
 @pytest.mark.parametrize("cluster_dim", [(2, 0, 1), (2, 1)])

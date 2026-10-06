@@ -7,6 +7,7 @@ other ops (alloc, load, store, matmul) will be added incrementally.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 import itertools
 import math
 import struct
@@ -164,6 +165,18 @@ def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     )
 
 
+def _elementwise_source_names(op: ElementwiseOp) -> list[str]:
+    return ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
+
+
+def _sigmoid_ptx(dst_dtype: Type) -> Callable[[list[str], list[str]], str]:
+    return (
+        _lower_elementwise_sigmoid_bf16_ptx
+        if isinstance(dst_dtype, BF16Type)
+        else _lower_elementwise_sigmoid_ptx
+    )
+
+
 def _lower_elementwise_in_batches(
     op: ElementwiseOp,
     lower_registers: Callable[
@@ -171,10 +184,9 @@ def _lower_elementwise_in_batches(
     ],
 ) -> str:
     """Lower with either bounded scratch registers or one wide ILP batch."""
-    source_names = ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
     src_regs = [
         _elementwise_operand_regs(op.src(i), name)
-        for i, name in enumerate(source_names)
+        for i, name in enumerate(_elementwise_source_names(op))
     ]
     register_count = len(src_regs[0])
     assert all(len(regs) == register_count for regs in src_regs)
@@ -186,7 +198,7 @@ def _lower_elementwise_in_batches(
     if src_dtype != dst_dtype:
         assert register_count == 2 * len(dst_regs)
         conversion_width = 2
-    batch_size = conversion_width if op.inplace else register_count
+    batch_size = register_count if op.ilp else conversion_width
 
     template = ""
     for start in range(0, register_count, batch_size):
@@ -223,17 +235,8 @@ def _lower_sigmoid_registers(
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
         )
-    lower_sigmoid = (
-        _lower_elementwise_sigmoid_bf16_ptx
-        if isinstance(dst_dtype, BF16Type)
-        else _lower_elementwise_sigmoid_ptx
-    )
     [src] = src_regs
-    return lower_sigmoid(dst_regs, src)
-
-
-def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
-    return _lower_elementwise_in_batches(op, _lower_sigmoid_registers)
+    return _sigmoid_ptx(dst_dtype)(dst_regs, src)
 
 
 def _lower_mul_register_batches(
@@ -250,10 +253,6 @@ def _lower_mul_register_batches(
     return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs)
 
 
-def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
-    return _lower_elementwise_in_batches(op, _lower_mul_register_batches)
-
-
 def _lower_silu_registers(
     op: ElementwiseOp,
     dst_regs: list[str],
@@ -267,29 +266,27 @@ def _lower_silu_registers(
             f"lower_elementwise: silu does not support {src_dtype} input"
         )
     [src_regs] = src_reg_batches
-    lower_sigmoid = (
-        _lower_elementwise_sigmoid_bf16_ptx
-        if isinstance(dst_dtype, BF16Type)
-        else _lower_elementwise_sigmoid_ptx
-    )
     tmp_regs = (
         [f"${{f32:silu_tmp{i}}}" for i in range(len(src_regs))]
         if op.dst is src else dst_regs
     )
-    template = lower_sigmoid(tmp_regs, src_regs)
+    template = _sigmoid_ptx(dst_dtype)(tmp_regs, src_regs)
     template += _lower_mul_registers(dst_regs, src_regs, tmp_regs)
     return template
 
 
-def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
-    return _lower_elementwise_in_batches(op, _lower_silu_registers)
-
-
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
-    "mul": _lower_mul_elementwise_ptx,
-    "sigmoid": _lower_sigmoid_elementwise_ptx,
-    "silu": _lower_silu_elementwise_ptx,
+    "mul": partial(
+        _lower_elementwise_in_batches,
+        lower_registers=_lower_mul_register_batches,
+    ),
+    "sigmoid": partial(
+        _lower_elementwise_in_batches, lower_registers=_lower_sigmoid_registers,
+    ),
+    "silu": partial(
+        _lower_elementwise_in_batches, lower_registers=_lower_silu_registers,
+    ),
 }
 
 
@@ -715,7 +712,7 @@ class LowerToPtxTemplate(LoweringPass):
             )
         template = lower(op)
 
-        source_names = ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
+        source_names = _elementwise_source_names(op)
         assert len(source_names) == op.num_srcs
         new_op = PTXTemplateOp.build(
             operands=[dst_value, *source_values],

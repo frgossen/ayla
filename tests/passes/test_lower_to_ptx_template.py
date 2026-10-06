@@ -560,7 +560,7 @@ def test_lower_elementwise_silu_can_opt_out_of_minimum_register_schedule():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %src: {w} = alloc() attrs={{id: 0}}
             %dst: {b} = alloc() attrs={{id: 1}}
-            elementwise silu(%dst: {b}, %src: {w}) attrs={{inplace: False}}
+            elementwise silu(%dst: {b}, %src: {w}) attrs={{ilp: True}}
           }}
         }}"""))
 
