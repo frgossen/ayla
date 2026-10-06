@@ -382,7 +382,8 @@ class PromoteBuffers(LoweringPass):
         attrs: dict[str, object] = {}
         if matmul_label is not None:
             attrs["label"] = f"{matmul_label}_{operand_name}_{self.target_type}"
-        if self.tma:
+        # TMA cannot fill registers; a register target only stages writeback.
+        if self.tma and self.target_type != "wgrmem":
             attrs["tma"] = True
         if self.nc and allow_nc and not self.tma:
             attrs["nc"] = True
@@ -724,7 +725,7 @@ class PromoteBuffers(LoweringPass):
     def _promote(
         self, op: MatmulOp, epilogue: list[ElementwiseOp],
     ) -> list[Op]:
-        lhs, rhs, dst = op.operands
+        lhs, rhs, dst = op.lhs, op.rhs, op.dst
 
         label = op.attrs.get("label")
         assert label is None or isinstance(label, str)
@@ -741,16 +742,22 @@ class PromoteBuffers(LoweringPass):
                 rhs, "rhs", op.collective, label,
             )
             pre_ops.extend(ops)
-        init = op.init
+        init, init_value = op.init, op.init_value
         if "dst" in self.operand_names:
+            # Registers load a tensor initializer in place of the destination;
+            # the writeback below still targets the destination.
+            fill = init_value if self.target_type == "wgrmem" else None
             ops, [new_dst] = self._build_operand_promotion(
-                dst, "dst", op.collective, label, init=init,
+                dst if fill is None else fill, "dst", op.collective, label,
+                init=init,
             )
             pre_ops.extend(ops)
             # A staged SMEM destination is intermediate IR; its matmul still
             # owns initialization until the destination reaches registers.
             if self.target_type != "smem":
                 init = None
+            if fill is not None:
+                init_value = None
 
         matmul_attrs = op.extra_attrs
         for operand_name in self.operand_names:
@@ -761,6 +768,7 @@ class PromoteBuffers(LoweringPass):
             dst=new_dst,
             collective=op.collective,
             init=init,
+            init_value=init_value,
             attrs=matmul_attrs,
         )
 
