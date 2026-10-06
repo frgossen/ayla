@@ -14,6 +14,7 @@ from ayla import (
     PTXTemplateOp,
     Value,
 )
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
@@ -298,6 +299,21 @@ def test_matmul_program():
         CollectiveAxis.Y: CollectiveLevel.GRID,
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
+
+
+def test_matmul_tensor_initializer_roundtrips():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @addmm(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>, %bias: gmem<64x32xbf16 strides=[0, 1]>) {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>, %bias: gmem<64x32xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))
+
+    assert repr(gpu_dialect.parse(repr(module))) == repr(module)
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.init is None
+    assert matmul.init_value is not None
+    assert list(matmul.init_value.type.strides) == [0, 1]
     assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
     assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)

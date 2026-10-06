@@ -217,6 +217,18 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
         verify_gpu_dialect(module)
 
 
+def test_default_verification_rejects_mismatched_matmul_tensor_init():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>, %init: gmem<1x13xbf16>) {
+            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>, %init: gmem<1x13xbf16>) collective=xyz.grid
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="must match the destination shape"):
+        verify_gpu_dialect(module)
+
+
 def test_default_verification_checks_reduce_shapes():
     def reduce(src_sizes, dst_sizes):
         src = Value(

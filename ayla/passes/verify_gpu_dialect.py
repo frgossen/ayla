@@ -356,6 +356,8 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
+        if op.init is not None and op.init_value is not None:
+            raise ValueError("matmul accepts a scalar or tensor init, not both")
         _verify_collective_attr(op)
         for operand_name in ("lhs", "rhs", "dst"):
             attr_name = f"{operand_name}_tiling_scheme"
@@ -392,6 +394,11 @@ class VerifyGpuDialect(VerificationPass):
                 f"inconsistent matmul shapes: {lhs.sizes}, {rhs.sizes}, "
                 f"{dst.sizes}"
             )
+        init = op.init_value
+        if init is not None and (
+            not isinstance(init.type, MemTensorType) or init.type.sizes != dst.sizes
+        ):
+            raise ValueError("matmul tensor init must match the destination shape")
 
     @verifies(ReduceOp)
     def _verify_reduce(self, op: ReduceOp) -> None:
