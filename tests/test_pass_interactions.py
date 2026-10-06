@@ -31,13 +31,14 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
-from ayla.passes.canonicalize import Canonicalize
+from ayla.passes.canonicalize import Canonicalize, canonicalize
 from ayla.passes.fuse_async import fuse_async
 from ayla.passes.insert_syncs import insert_syncs
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.promote_buffers import promote_buffers
 from ayla.passes.tile_elementwise import tile_elementwise
 from ayla.passes.tile_matmul import tile_matmul
+from ayla.passes.tile_reduce import tile_reduce
 from ayla.passes.unroll_loop import unroll_loop
 from ayla.ptx_codegen import make_ptx_kernel
 from tests.testing_utils import assert_contains_in_order
@@ -104,6 +105,52 @@ def test_promotion_moves_the_epilogue_onto_the_accumulator():
     )
 
     assert repr(module) == PROMOTED_IR
+
+
+def test_reduction_parallel_and_sequential_tiling():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x1024xf32>, %output: gmem<8x1xf32>) {
+            reduce sum(%output: gmem<8x1xf32>, %src: gmem<8x1024xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
+          }
+        }"""))
+
+    module = tile_reduce(
+        module,
+        tile_sizes={0: 1},
+        parallel_iteration_space=(
+            CollectiveLevel.BLOCK, CollectiveAxis.X,
+        ),
+        hero_label_filter="mean",
+    )
+    module = canonicalize(module)
+    module = tile_reduce(
+        module,
+        tile_sizes={1: 128},
+        parallel_iteration_space=None,
+        hero_label_filter="mean",
+        vector_accumulation=True,
+    )
+    module = canonicalize(module)
+    print(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x1024xf32>, %output: gmem<8x1xf32>) grid_dim=[8, None, None] {
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c8: index = index_constant() attrs={value: 8}
+            %0: index = index_mod(%bx: index, %c8: index)
+            %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
+            %2: gmem<1x1xf32> = tile(%output: gmem<8x1xf32>, %0: index, 0)
+            %3: gmem<8x128xf32> = alloc() attrs={id: 0, init: 0.0}
+            %4: gmem<1x128xf32> = tile(%3: gmem<8x128xf32>, %0: index, 0)
+            for (%5: index = 0 to 8) attrs={label: "d1"} {
+              %6: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %5: index)
+              reduce sum(%4: gmem<1x128xf32>, %6: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
+            }
+            reduce sum(%2: gmem<1x1xf32>, %4: gmem<1x128xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
+          }
+        }""")
 
 
 def test_elementwise_tail_is_only_materialized_by_explicit_loop_passes():

@@ -5,6 +5,7 @@ from .cse import CSE
 from .dce import DCE
 from .folding import Folding
 from ..base.pipeline import Pipeline
+from ..gpu_dialect import ModuleOp
 
 
 class Canonicalize(Pipeline):
@@ -20,3 +21,7 @@ class Canonicalize(Pipeline):
         self.add_pass(Folding())
         self.add_pass(CSE())
         self.add_pass(DCE())
+
+
+def canonicalize(module: ModuleOp) -> ModuleOp:
+    return Canonicalize().run(module)

@@ -181,6 +181,29 @@ def test_tile_reduce_rejects_parallel_and_reduction_dimensions_on_block_x():
         )
 
 
+def test_tile_reduce_rejects_parallel_vector_accumulation():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) {
+            reduce sum(%output: gmem<8x1xf32>, %src: gmem<8x64xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
+          }
+        }"""))
+
+    with pytest.raises(
+        AssertionError,
+        match="does not implement parallel vector accumulation",
+    ):
+        tile_reduce(
+            module,
+            tile_sizes={1: 32},
+            parallel_iteration_space=(
+                CollectiveLevel.BLOCK, CollectiveAxis.X,
+            ),
+            hero_label_filter="mean",
+            vector_accumulation=True,
+        )
+
+
 def test_tile_reduce_maps_parallel_dimension_to_block_and_reduction_to_warp():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
