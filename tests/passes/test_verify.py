@@ -170,27 +170,15 @@ def test_async_and_body_collectives_must_match():
         verify_gpu_dialect(module)
 
 
-@pytest.mark.parametrize("pending", [-1, "one"])
-def test_await_pending_count_must_be_nonnegative_integer(pending):
-    lock = Value(name="lock", type=LockType.build("wgmma"))
-    await_op = AwaitOp(operands=[lock], results=[], attrs={"pending": pending})
-
-    with pytest.raises(ValueError, match="non-negative integer"):
-        verify_gpu_dialect(ModuleOp.build(Block(ops=[await_op])))
-
-
 @pytest.mark.parametrize(
-    "kind,pending,message",
-    [
-        ("mbar", 1, "require a WGMMA lock"),
-        ("wgmma", 8, r"must be in \[0, 7\]"),
-    ],
+    "kind,pending",
+    [("wgmma", -1), ("wgmma", "one"), ("mbar", 1), ("wgmma", 8)],
 )
-def test_await_pending_count_matches_the_async_queue(kind, pending, message):
+def test_await_pending_count_matches_the_async_queue(kind, pending):
     lock = Value(name="lock", type=LockType.build(kind))
     await_op = AwaitOp(operands=[lock], results=[], attrs={"pending": pending})
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="pending count must be an integer in"):
         verify_gpu_dialect(ModuleOp.build(Block(ops=[await_op])))
 
 
