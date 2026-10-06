@@ -368,6 +368,40 @@ class TileMatmul(LoweringPass):
                 parallel_ids[level] = ids
                 new_ops.append(ids)
 
+        # A repeated block binding whose grid is smaller than its logical
+        # extent visits the remaining tiles with one grid-stride loop.
+        logical_extents: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        for binding, ub in zip(self.iteration_bindings, ubs, strict=True):
+            if binding is not None:
+                logical_extents[binding] = logical_extents.get(binding, 1) * ub
+        linear_ids = {
+            binding: parallel_ids[binding[0]].results[binding[1]]
+            for binding in logical_extents
+        }
+        waves: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        wave_ops: list[Op] = []
+        grid_stride: ForOp | None = None
+        for binding, logical_extent in logical_extents.items():
+            launch_extent = self._launch_extent(binding)
+            if (
+                self.iteration_bindings.count(binding) == 1
+                or launch_extent is None
+                or launch_extent >= logical_extent
+            ):
+                continue
+            if grid_stride is not None:
+                raise ValueError(
+                    "TileMatmul supports one grid-stride block dimension"
+                )
+            assert binding[0] == CollectiveLevel.BLOCK
+            waves[binding] = -(-logical_extent // launch_extent)
+            grid_stride = ForOp.build(lb=0, ub=waves[binding])
+            stride = IndexConstantOp.build(launch_extent)
+            offset = IndexMulOp.build(grid_stride.iv, stride.result())
+            advanced = IndexAddOp.build(linear_ids[binding], offset.result())
+            wave_ops = [stride, offset, advanced]
+            linear_ids[binding] = advanced.result()
+
         iteration_ops: list[Op] = []
         ivs: list[Value] = []
         divisors: dict[
@@ -380,8 +414,7 @@ class TileMatmul(LoweringPass):
             if binding is None:
                 iv = Value(name=label, type=IndexType())
             else:
-                level, axis = binding
-                linear_id = parallel_ids[level].results[axis]
+                linear_id = linear_ids[binding]
                 if self.iteration_bindings.count(binding) == 1:
                     divisors[binding] = ub
                     ivs.insert(0, linear_id)
@@ -399,37 +432,6 @@ class TileMatmul(LoweringPass):
                 ]
                 iv = mod.result()
             ivs.insert(0, iv)
-
-        grid_stride: tuple[
-            tuple[CollectiveLevel, CollectiveAxis], ForOp, Value
-        ] | None = None
-        for binding, logical_extent in divisors.items():
-            launch_extent = self._launch_extent(binding)
-            if (
-                self.iteration_bindings.count(binding) == 1
-                or launch_extent is None
-                or launch_extent >= logical_extent
-            ):
-                continue
-            if grid_stride is not None:
-                raise ValueError(
-                    "TileMatmul supports one grid-stride block dimension"
-                )
-            level, axis = binding
-            assert level == CollectiveLevel.BLOCK
-            loop = ForOp.build(
-                lb=0,
-                ub=(logical_extent + launch_extent - 1) // launch_extent,
-            )
-            stride = IndexConstantOp.build(launch_extent)
-            offset = IndexMulOp.build(loop.iv, stride.result())
-            block_id = parallel_ids[level].results[axis]
-            advanced = IndexAddOp.build(block_id, offset.result())
-            for user, operand_index in list(block_id.uses):
-                if user in iteration_ops:
-                    user.operands[operand_index] = advanced.result()
-            iteration_ops[:0] = [stride, offset, advanced]
-            grid_stride = (binding, loop, advanced.result())
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
@@ -501,7 +503,7 @@ class TileMatmul(LoweringPass):
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
 
-        parallel_extents = dict(divisors)
+        parallel_extents = dict(logical_extents)
         for i, iv, ub, binding, label in zip(
             reversed(range(len(self.iteration_bindings))),
             reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
@@ -512,23 +514,14 @@ class TileMatmul(LoweringPass):
                 if logical_extent is None:
                     continue
                 launch_extent = self._launch_extent(binding)
-                needs_guard = launch_extent is not None and (
-                    launch_extent > logical_extent
-                    or (
-                        grid_stride is not None
-                        and binding == grid_stride[0]
-                        and logical_extent % launch_extent != 0
-                    )
-                )
-                if needs_guard:
-                    linear_id = (
-                        grid_stride[2]
-                        if grid_stride is not None
-                        and binding == grid_stride[0]
-                        else parallel_ids[binding[0]].results[binding[1]]
-                    )
+                if (
+                    launch_extent is not None
+                    and launch_extent * waves.get(binding, 1) > logical_extent
+                ):
                     limit = IndexConstantOp.build(logical_extent)
-                    condition = IndexLtOp.build(linear_id, limit.result())
+                    condition = IndexLtOp.build(
+                        linear_ids[binding], limit.result(),
+                    )
                     body_ops = [
                         limit,
                         condition,
@@ -548,10 +541,10 @@ class TileMatmul(LoweringPass):
                 tiled_epilogue = []
 
         assert not tiled_epilogue, "TileMatmul: epilogue was never placed"
-        body_ops[:0] = iteration_ops
+        body_ops[:0] = [*wave_ops, *iteration_ops]
         if grid_stride is not None:
-            grid_stride[1].body.ops = body_ops
-            body_ops = [grid_stride[1]]
+            grid_stride.body.ops = body_ops
+            body_ops = [grid_stride]
         new_ops.extend(body_ops)
         return new_ops
 
