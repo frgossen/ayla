@@ -44,6 +44,7 @@ from ayla.gpu_dialect import (
     TmaMoveOp,
     ThreadIdOp,
     TileOp,
+    WgrmemTensorType,
     WrmemTensorType,
     gpu_dialect,
     has_ordering_effect,
@@ -212,6 +213,29 @@ def test_memory_effect_retains_accessed_view_and_exposes_roots():
     read = next(effect for effect in effects if effect.kind == "R")
     assert read.value is view
     assert read.roots == {source}
+
+
+def test_move_writes_distributed_registers_at_thread_scope():
+    source = Value(
+        name="source", type=GmemTensorType.build([64, 64], BF16Type()),
+    )
+    fragment = Value(
+        name="fragment",
+        type=WgrmemTensorType.build(
+            [64, 64], BF16Type(), warps=4, layout="wgmma_layout_0",
+        ),
+    )
+    effects = memory_effects(MoveOp.build(
+        fragment,
+        source,
+        collective={
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        },
+    ))
+
+    assert effects is not None
+    write = next(effect for effect in effects if effect.kind == "W")
+    assert write.scope == CollectiveScope.THREAD
 
 
 def test_reshape_op():
