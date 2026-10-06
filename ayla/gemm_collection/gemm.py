@@ -126,30 +126,23 @@ def schedule_tiled_matmul(
     """Build the post-block-tiling GEMM pipeline."""
     if warpgroup_n_tile is None:
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
-    wg_dim, wg_size = (
-        ("N", warpgroup_n_tile)
+    wg_tiles = (
+        {"M": warpgroup_m_tile, "N": warpgroup_n_tile}
+        if warpgroup_m_tile is not None
+        else {"N": warpgroup_n_tile}
         if output_m_tile == 64 or output_n_tile > 256
-        else ("M", 64)
+        else {"M": 64}
     )
-    wg_dims, wg_sizes = [wg_dim], [wg_size]
-    if warpgroup_m_tile is not None:
-        wg_dims, wg_sizes = ["M", "N"], [
-            warpgroup_m_tile, warpgroup_n_tile,
-        ]
 
     pipeline = Pipeline()
     pipeline.add_pass(TileMatmul(
-        op_dims=wg_dims, tile_sizes=wg_sizes,
-        iteration_bindings=[
-            (CollectiveLevel.WG, CollectiveAxis.X)
-        ] * len(wg_dims),
-        for_loop_labels=[None] * len(wg_dims),
+        op_dims=list(wg_tiles), tile_sizes=list(wg_tiles.values()),
+        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)] * len(wg_tiles),
+        for_loop_labels=[None] * len(wg_tiles),
         op_label_filter=label,
         epilogue_label_filter=epilogue_label_filter,
         allow_partial_tiles=(
-            len(wg_dims) == 1
-            and wg_dims[0] == "M"
-            and output_m_tile % wg_sizes[0] != 0
+            list(wg_tiles) == ["M"] and output_m_tile % wg_tiles["M"] != 0
         ),
     ))
     pipeline.add_pass(PromoteBuffers(
