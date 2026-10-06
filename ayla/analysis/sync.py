@@ -73,42 +73,43 @@ class BarrierScope(enum.IntEnum):
 
     def join(self, other: BarrierScope) -> BarrierScope:
         """The join (least upper bound) on the BarrierScope lattice."""
-        if self == other:
-            return self
-        if self == BarrierScope.THREAD:
-            return other
-        if other == BarrierScope.THREAD:
-            return self
-        if self == BarrierScope.GRID or other == BarrierScope.GRID:
-            return BarrierScope.GRID
-        if self == BarrierScope.CLUSTER or other == BarrierScope.CLUSTER:
-            return BarrierScope.CLUSTER
-        if (
-            self == BarrierScope.CLUSTER_TO_LEADER
-            or other == BarrierScope.CLUSTER_TO_LEADER
-        ):
-            return (
-                BarrierScope.CLUSTER
-                if (
-                    self == BarrierScope.LEADER_TO_CLUSTER
-                    or other == BarrierScope.LEADER_TO_CLUSTER
-                )
-                else BarrierScope.CLUSTER_TO_LEADER
-            )
-        if (
-            self == BarrierScope.LEADER_TO_CLUSTER
-            or other == BarrierScope.LEADER_TO_CLUSTER
-        ):
-            return BarrierScope.CLUSTER
-        if self == BarrierScope.BLOCK or other == BarrierScope.BLOCK:
-            return BarrierScope.BLOCK
-        if {self, other} == {BarrierScope.WARP, BarrierScope.WARPGROUP}:
-            return BarrierScope.WARPGROUP
-        return BarrierScope.BLOCK
+        common_upper_bounds = [
+            scope for scope in BarrierScope
+            if self.leq(scope) and other.leq(scope)
+        ]
+        [least] = [
+            candidate for candidate in common_upper_bounds
+            if all(candidate.leq(scope) for scope in common_upper_bounds)
+        ]
+        return least
 
     def leq(self, other: BarrierScope) -> bool:
         """The partial order (<=) of the BarrierScope lattice."""
-        return self.join(other) == other
+        return self == other or any(
+            upper.leq(other)
+            for upper in _BARRIER_SCOPE_IMMEDIATE_UPPER_BOUNDS[self]
+        )
+
+
+# The docstring's cover edges, from each scope to the scopes directly above it.
+_BARRIER_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
+    BarrierScope.THREAD: (
+        BarrierScope.WARP,
+        BarrierScope.BLOCK_TO_LEADER,
+        BarrierScope.LEADER_TO_BLOCK,
+        BarrierScope.CLUSTER_TO_LEADER,
+        BarrierScope.LEADER_TO_CLUSTER,
+    ),
+    BarrierScope.WARP: (BarrierScope.WARPGROUP,),
+    BarrierScope.WARPGROUP: (BarrierScope.BLOCK,),
+    BarrierScope.BLOCK_TO_LEADER: (BarrierScope.BLOCK,),
+    BarrierScope.LEADER_TO_BLOCK: (BarrierScope.BLOCK,),
+    BarrierScope.BLOCK: (BarrierScope.CLUSTER_TO_LEADER,),
+    BarrierScope.CLUSTER_TO_LEADER: (BarrierScope.CLUSTER,),
+    BarrierScope.LEADER_TO_CLUSTER: (BarrierScope.CLUSTER,),
+    BarrierScope.CLUSTER: (BarrierScope.GRID,),
+    BarrierScope.GRID: (),
+}
 
 
 def _barrier_scope(prior: CollectiveScope, current: CollectiveScope) -> BarrierScope:
@@ -169,16 +170,8 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
     if barrier == BarrierScope.CLUSTER_TO_LEADER:
         # Lowering first executes a local ``bar.sync 0`` in every CTA, then
-        # has each CTA leader arrive at rank 0's cluster mbarrier. The local
-        # gather settles every block-or-narrower effect before the cluster
-        # leader proceeds.
-        return scope in (
-            CollectiveScope.THREAD,
-            CollectiveScope.WARP,
-            CollectiveScope.WARPGROUP,
-            CollectiveScope.BLOCK_LEADER,
-            CollectiveScope.BLOCK,
-        )
+        # has each CTA leader arrive at rank 0's cluster mbarrier.
+        return _barrier_covers(BarrierScope.BLOCK, scope)
     if barrier == BarrierScope.LEADER_TO_CLUSTER:
         # broadcast: the single cluster leader's work, not every block leader
         return scope in (
