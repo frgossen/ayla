@@ -141,6 +141,6 @@ def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():
     templates = find_ops_of_type(module, PTXTemplateOp)
     template = "".join(op.template for op in templates)
     assert template.count("st.shared.b32") == 16
-    assert "${b32:operand.src.r112}" in template
-    assert "${b32:operand.src.r127}" in template
-    assert "${b32:operand.src.r111}" not in template
+    assert "${b32:operand.fragment.r112}" in template
+    assert "${b32:operand.fragment.r127}" in template
+    assert "${b32:operand.fragment.r111}" not in template

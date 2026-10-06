@@ -533,6 +533,23 @@ def test_lower_elementwise_supports_every_wgmma_n_extent(n):
     assert template.count("cvt.rn.bf16x2.f32") == n // 4
 
 
+def test_lower_elementwise_convert_unpacks_bf16_register_pairs():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() {
+            %src: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%dst: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("mov.b32") == 16
+    assert template.count("cvt.f32.bf16") == 32
+
+
 def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -582,6 +599,41 @@ def test_lower_elementwise_mul():
         f"${{f32:operand.lhs.r{reg}}}, ${{f32:operand.rhs.r{reg}}};\n"
         for reg in range(4)
     )
+
+
+def test_move_loads_broadcast_memory_into_wgmma_registers():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+            kernel @k(%bias: gmem<64x64xf16 strides=[0, 1]>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %bias_regs: wgrmem<64x64xf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2}
+            move(%bias_regs: wgrmem<64x64xf16 warps=4 layout="wgmma_layout_0">, %bias: gmem<64x64xf16 strides=[0, 1]>) collective=xyz.thread
+          }
+        }"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = "".join(
+        op.template for op in find_ops_of_type(lowered, PTXTemplateOp)
+    )
+
+    assert template.count("ld.global.b32") == 16
+    assert "ld.global.b16" not in template
+
+
+def test_move_loads_f32_pairs_into_wgmma_registers_as_vectors():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%src: gmem<64x64xf32 strides=[64, 1]>) {
+            %dst: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            move(%dst: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %src: gmem<64x64xf32 strides=[64, 1]>) collective=xyz.thread
+          }
+        }"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = "".join(
+        op.template for op in find_ops_of_type(lowered, PTXTemplateOp)
+    )
+
+    assert template.count("ld.global.v2.b32") == 16
 
 
 def test_lower_elementwise_silu():

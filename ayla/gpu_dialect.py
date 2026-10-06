@@ -2658,6 +2658,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             dst_scope = CollectiveScope.CLUSTER_LEADER
         elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):
             dst_scope = CollectiveScope.BLOCK_LEADER
+        elif isinstance(op.dst.type, WgrmemTensorType):
+            dst_scope = CollectiveScope.THREAD
         else:
             dst_scope = _type_collective_scope(op.dst.type)
         return (
