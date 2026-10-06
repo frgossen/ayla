@@ -141,8 +141,6 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ConstantOp)
     def _verify_constant(self, op: ConstantOp) -> None:
-        if op.operands or len(op.results) != 1:
-            raise ValueError("constant must have no operands and one result")
         result_type = op.result().type
         if not isinstance(result_type, MemTensorType):
             raise ValueError("constant result must be a memory tensor")

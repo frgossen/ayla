@@ -266,29 +266,16 @@ class LowerToPtxTemplate(LoweringPass):
         self, op: ConstantOp,
     ) -> tuple[list[Op], list[object]]:
         result_type = cast(RmemTensorType, op.result().type)
-        dtype = result_type.dtype
-        register_type = "b16" if isinstance(
-            dtype, (F16Type, BF16Type),
-        ) else dtype.name
         value = op.value
         values = (
-            iter(value)
+            value
             if isinstance(value, list)
-            else itertools.repeat(
-                cast(int | float, value),
-                cast(int, result_type.num_elements),
-            )
-        )
-        template = "".join(
-            f"mov.{register_type} "
-            f"${{{register_type}:result.value.r{i}}}, "
-            f"{_ptx_literal(dtype, value)};\n"
-            for i, value in enumerate(values)
+            else itertools.repeat(value, cast(int, result_type.num_elements))
         )
         lowered = PTXTemplateOp.build(
             operands=[],
             result_types=[result_type],
-            template=template,
+            template=_mov_literals_ptx("value", result_type.dtype, values),
             result_names=["value"],
             description=str(op),
         )
@@ -559,14 +546,11 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         result_type = op.result().type
         assert isinstance(result_type, RmemTensorType)
-        n = result_type.num_elements
-        suffix = _ptx_suffix(result_type.dtype)
-
-        template = ""
-        if op.init is not None:
-            literal = _ptx_literal(result_type.dtype, op.init)
-            for i in range(n):
-                template += f"mov.{suffix} ${{{suffix}:result.dst.r{i}}}, {literal};\n"
+        template = "" if op.init is None else _mov_literals_ptx(
+            "dst",
+            result_type.dtype,
+            itertools.repeat(op.init, cast(int, result_type.num_elements)),
+        )
 
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -2280,6 +2264,16 @@ def _ptx_suffix(dtype) -> str:
     """PTX type suffix for a dtype. bf16 uses b16 (no native suffix)."""
     name = dtype.name
     return "b16" if name == "bf16" else name
+
+
+def _mov_literals_ptx(result: str, dtype: Type, values) -> str:
+    """Move literals into a result's registers; 16-bit floats move as bits."""
+    suffix = "b16" if isinstance(dtype, (F16Type, BF16Type)) else dtype.name
+    return "".join(
+        f"mov.{suffix} ${{{suffix}:result.{result}.r{i}}}, "
+        f"{_ptx_literal(dtype, value)};\n"
+        for i, value in enumerate(values)
+    )
 
 
 def _ptx_literal(dtype, value) -> str:
