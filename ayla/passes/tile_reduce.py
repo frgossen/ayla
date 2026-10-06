@@ -1,6 +1,9 @@
 """Tile the parallel and reduction dimensions of reductions."""
 from __future__ import annotations
 
+import math
+from typing import cast
+
 from ..base.ir import (
     Block,
     Op,
@@ -11,6 +14,8 @@ from ..base.ir import (
 )
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
+    AddrMemTensorType,
+    AllocOp,
     BlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
@@ -31,94 +36,147 @@ from ..gpu_dialect import (
 from ._utils import label_matches
 
 
-def _update_launch_dims(
-    hero: ReduceOp,
-    launch_dims: dict[tuple[CollectiveLevel, CollectiveAxis], int],
-) -> dict[tuple[CollectiveLevel, CollectiveAxis], int]:
-    kernel = find_ancestor_of_type(hero, KernelOp)
-    assert kernel is not None
-
-    for (level, axis), launch_dim in launch_dims.items():
-
-        is_block_dim_based = level in (
-            CollectiveLevel.THREAD,
-            CollectiveLevel.WARP,
-            CollectiveLevel.WG,
-        )
-        if is_block_dim_based:
-            base_launch_dims = list(kernel.block_dim)
-        else:
-            base_launch_dims = list(kernel.grid_dim)
-
-        base_launch_dim = launch_dim
-        if level == CollectiveLevel.WARP:
-            assert axis == CollectiveAxis.X
-            base_launch_dim *= 32
-        elif level == CollectiveLevel.WG:
-            assert axis == CollectiveAxis.X
-            base_launch_dim *= 128
-
-        if base_launch_dims[axis] not in (None, base_launch_dim):
-            raise ValueError(
-                f"launch dim conflict: {base_launch_dims[axis]} vs "
-                f"{base_launch_dim}"
-            )
-        base_launch_dims[axis] = base_launch_dim
-
-        if is_block_dim_based:
-            kernel.block_dim = base_launch_dims
-        else:
-            kernel.grid_dim = base_launch_dims
-
-    return launch_dims
-
-
-def _tile_value(
+def _materialize_tile(
     arg: Value,
+    dims: list[int],
     tile_sizes: dict[int, int],
-    tile_indices: dict[int, Value],
+    ivs: dict[int, Value],
 ) -> tuple[list[Op], Value]:
+    if not dims:
+        return [], arg
+
     typ = clone_type(arg.type)
     assert isinstance(typ, MemTensorType)
     indices: list[Value | int] = [0] * typ.rank
     sizes = list(typ.sizes)
-    for dim, tile_size in tile_sizes.items():
-        sizes[dim] = tile_size
-        indices[dim] = tile_indices[dim]
+    for dim in dims:
+        sizes[dim] = tile_sizes[dim]
+        indices[dim] = ivs[dim]
     typ.sizes = sizes
     tile_op = TileOp.build(arg, indices, typ)
     return [tile_op], tile_op.result()
 
 
+def _materialize_partials(
+    value: Value,
+    reduction_dim: int,
+    reduction_bound: int,
+) -> tuple[list[Op], Value]:
+    if isinstance(value.definition, (AllocOp, Block)):
+        assert isinstance(value.type, AddrMemTensorType)
+        sizes = list(value.type.sizes)
+        sizes[reduction_dim] = reduction_bound
+        typ = clone_type(value.type, {
+            "sizes": sizes,
+            "strides": AddrMemTensorType.canonical_strides(sizes),
+        })
+        alloc = AllocOp.build_with_fresh_id(typ, init=0.0)
+        return [alloc], alloc.result()
+
+    tile = value.definition
+    assert isinstance(tile, TileOp), (
+        "TileReduce reduction tiling only supports TileOp destination "
+        "view chains"
+    )
+    ops, replayed_arg = _materialize_partials(
+        tile.arg, reduction_dim, reduction_bound,
+    )
+    tile_type = tile.result().type
+    replayed_type = replayed_arg.type
+    assert isinstance(tile_type, MemTensorType)
+    assert isinstance(replayed_type, MemTensorType)
+    sizes = list(tile_type.sizes)
+    sizes[reduction_dim] = replayed_type.sizes[reduction_dim]
+    typ = clone_type(replayed_type, {"sizes": sizes})
+    replayed = TileOp.build(
+        replayed_arg,
+        list(tile.indices),
+        typ,
+        maybe_partial=tile.maybe_partial,
+    )
+    ops.append(replayed)
+    return ops, replayed.result()
+
+
+def _materialize_iteration_space(
+    dim: int,
+    bounds: dict[int, int],
+    parallel_iteration_space: (
+        tuple[CollectiveLevel, CollectiveAxis] | None
+    ),
+    divisor: int,
+) -> tuple[list[Op], Value, ForOp | None]:
+    if parallel_iteration_space is None:
+        loop = ForOp.build(
+            lb=0,
+            ub=bounds[dim],
+            attrs={"label": f"d{dim}"},
+        )
+        return [loop], loop.iv, loop
+
+    level, axis = parallel_iteration_space
+    id_op_type = {
+        CollectiveLevel.BLOCK: BlockIdsOp,
+        CollectiveLevel.THREAD: ThreadIdsOp,
+        CollectiveLevel.WARP: WarpIdsOp,
+        CollectiveLevel.WG: WarpGroupIdOp,
+    }[level]
+    ids = id_op_type.build()
+    cdivisor = IndexConstantOp.build(divisor)
+    div = IndexDivOp.build(
+        ids.results[axis], cdivisor.result(),
+    )
+    cbound = IndexConstantOp.build(bounds[dim])
+    mod = IndexModOp.build(
+        div.result(), cbound.result(),
+    )
+    return [ids, cdivisor, div, cbound, mod], mod.result(), None
+
+
+def _narrow_collective(
+    collective: dict[CollectiveAxis, CollectiveLevel],
+    parallel_iteration_space: (
+        tuple[CollectiveLevel, CollectiveAxis] | None
+    ),
+) -> dict[CollectiveAxis, CollectiveLevel]:
+    result = dict(collective)
+    if parallel_iteration_space is not None:
+        level, axis = parallel_iteration_space
+        assert level.join(collective[axis]) == collective[axis]
+        result[axis] = level
+    return result
+
+
 class TileReduce(LoweringPass):
     """Tile reduction iteration spaces and selected epilogues.
 
-    ``tile_sizes`` maps each tiled dimension to its tile size, while
-    ``parallel_iteration_spaces`` optionally maps it to hardware.
+    ``tile_sizes`` maps each tiled dimension to its tile size. The
+    ``parallel_iteration_space`` applies to every tiled dimension, or is
+    ``None`` to create sequential iteration spaces.
     Nested tiling is expressed by composing multiple pass invocations.
     A dimension without a parallel iteration space is lowered to a sequential
     loop whose label is derived from the dimension.
     """
 
     tile_sizes: dict[int, int]
-    parallel_iteration_spaces: dict[
-        int, tuple[CollectiveLevel, CollectiveAxis]
-    ]
+    parallel_iteration_space: (
+        tuple[CollectiveLevel, CollectiveAxis] | None
+    )
     hero_label_filter: str | None
     epilogue_label_filter: str | None
 
     def __init__(
         self,
         tile_sizes: dict[int, int],
-        parallel_iteration_spaces: dict[
-            int, tuple[CollectiveLevel, CollectiveAxis]
-        ],
+        parallel_iteration_space: (
+            tuple[CollectiveLevel, CollectiveAxis] | None
+        ),
         hero_label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
     ) -> None:
         super().__init__(
             tile_sizes=dict(tile_sizes),
-            parallel_iteration_spaces=dict(parallel_iteration_spaces),
+            parallel_iteration_space=parallel_iteration_space,
             hero_label_filter=hero_label_filter,
             epilogue_label_filter=epilogue_label_filter,
         )
@@ -140,7 +198,10 @@ class TileReduce(LoweringPass):
         i = 0
         while i < len(ops):
             op = ops[i]
-            if not label_matches(op, self.hero_label_filter):
+            if not (
+                isinstance(op, ReduceOp)
+                and label_matches(op, self.hero_label_filter)
+            ):
                 new_ops.append(op)
                 i += 1
                 continue
@@ -150,134 +211,263 @@ class TileReduce(LoweringPass):
                     break
                 epilogue.append(candidate)
             new_ops.extend(
-                self._rewrite_hero_with_epilogue(op, epilogue)
+                self._rewrite_hero_with_epilogue(
+                    op, epilogue,
+                )
             )
             i += 1 + len(epilogue)
         block.ops = new_ops
 
     def _rewrite_hero_with_epilogue(
-        self, hero: Op, epilogue: list[Op],
+        self, hero: ReduceOp, epilogue: list[Op],
     ) -> list[Op]:
+        self._assert_preconditions(hero, epilogue)
+
+        # Characterize tiled dimensions.
+        src_type = hero.src.type
+        assert isinstance(src_type, MemTensorType)
+        rank = src_type.rank
+        reduction_dim = (
+            rank - 1
+            if rank - 1 in self.tile_sizes
+            else None
+        )
+        parallel_dims = [
+            dim for dim in self.tile_sizes if dim != reduction_dim
+        ]
+        bounds = {
+            dim: cast(int, src_type.sizes[dim]) // tile_size
+            for dim, tile_size in self.tile_sizes.items()
+        }
+
+        # Update launch dimensions.
+        if self.parallel_iteration_space is not None:
+            launch_dim = math.prod(bounds.values())
+            kernel = find_ancestor_of_type(hero, KernelOp)
+            assert kernel is not None
+            level, axis = self.parallel_iteration_space
+            if level == CollectiveLevel.WARP:
+                assert axis == CollectiveAxis.X
+                launch_dim *= 32
+            elif level == CollectiveLevel.WG:
+                assert axis == CollectiveAxis.X
+                launch_dim *= 128
+            if level == CollectiveLevel.BLOCK:
+                launch_dims = list(kernel.grid_dim)
+            else:
+                launch_dims = list(kernel.block_dim)
+            assert launch_dims[axis] in (None, launch_dim), (
+                f"launch dim conflict: {launch_dims[axis]} vs {launch_dim}"
+            )
+            launch_dims[axis] = launch_dim
+            if level == CollectiveLevel.BLOCK:
+                kernel.grid_dim = launch_dims
+            else:
+                kernel.block_dim = launch_dims
+
+        # Create iteration spaces for the parallel dimensions.
+        new_ops: list[Op] = []
+        parallel_body_insertion_point = new_ops
+        ivs: dict[int, Value] = {}
+        divisor = 1
+        for dim in parallel_dims:
+            iteration_ops, iv, inner_loop = _materialize_iteration_space(
+                dim,
+                bounds,
+                self.parallel_iteration_space,
+                divisor,
+            )
+            ivs[dim] = iv
+            parallel_body_insertion_point.extend(iteration_ops)
+            divisor *= bounds[dim]
+            if inner_loop is not None:
+                parallel_body_insertion_point = inner_loop.body.ops
+
+        # Declare partials if needed.
+        partials: Value | None = None
+        if reduction_dim is not None:
+            partials_ops, partials = _materialize_partials(
+                hero.dst, reduction_dim, bounds[reduction_dim],
+            )
+            parallel_body_insertion_point.extend(partials_ops)
+
+        # Create tiles wrt. parallel dimension iteration spaces.
+        src_ops, src = _materialize_tile(
+            hero.src, parallel_dims, self.tile_sizes, ivs,
+        )
+        dst_ops, dst = _materialize_tile(
+            hero.dst, parallel_dims, self.tile_sizes, ivs,
+        )
+        parallel_body_insertion_point.extend([*src_ops, *dst_ops])
+        if partials is not None:
+            partials_ops, partials = _materialize_tile(
+                partials, parallel_dims, self.tile_sizes, ivs,
+            )
+            parallel_body_insertion_point.extend(partials_ops)
+
+        # Create iteration spaces for the reduction dimensions.
+        reduction_body_insertion_point = parallel_body_insertion_point
+        if reduction_dim is not None:
+            iteration_ops, reduction_iv, inner_loop = (
+                _materialize_iteration_space(
+                    reduction_dim,
+                    bounds,
+                    self.parallel_iteration_space,
+                    divisor,
+                )
+            )
+            parallel_body_insertion_point.extend(iteration_ops)
+            if inner_loop is not None:
+                reduction_body_insertion_point = inner_loop.body.ops
+            ivs[reduction_dim] = reduction_iv
+
+        # Create tiles wrt. reduction dimension iteration space.
+        partial_ops: list[Op] = []
+        partial: Value | None = None
+        if reduction_dim is not None:
+            assert partials is not None
+            src_ops, src = _materialize_tile(
+                src,
+                [reduction_dim],
+                self.tile_sizes,
+                ivs,
+            )
+            partial_ops, partial = _materialize_tile(
+                partials,
+                [reduction_dim],
+                {reduction_dim: 1},
+                ivs,
+            )
+
+        # Create the partial reduction, if needed.
+        tiled_collectiveness = _narrow_collective(
+            hero.collective, self.parallel_iteration_space,
+        )
+        if reduction_dim is not None:
+            assert partial is not None
+            partial_attrs = hero.extra_attrs
+            label = partial_attrs.get("label")
+            if isinstance(label, str):
+                partial_attrs["label"] = f"{label}_partial"
+            partial_reduce = ReduceOp.build(
+                partial,
+                src,
+                fn=hero.fn,
+                collective=tiled_collectiveness,
+                attrs=partial_attrs,
+            )
+            reduction_body_insertion_point.extend([
+                *partial_ops,
+                *src_ops,
+                partial_reduce,
+            ])
+
+        # Create final tiled reduction.
+        final_reduction_collectiveness = (
+            tiled_collectiveness if parallel_dims else dict(hero.collective)
+        )
+        final_src = partials if partials is not None else src
+        final_reduce = clone_op(
+            hero,
+            {hero.dst: dst, hero.src: final_src},
+            {"collective": final_reduction_collectiveness},
+        )
+        parallel_body_insertion_point.append(final_reduce)
+
+        # Rewrite the epilogue.
+        parallel_body_insertion_point.extend(
+            clone_op(op, {hero.dst: dst}) for op in epilogue
+        )
+        return new_ops
+
+    def _assert_preconditions(
+        self, hero: Op, epilogue: list[Op],
+    ) -> None:
         assert isinstance(hero, ReduceOp)
+        assert hero.fn == "sum", "TileReduce only supports sum reductions"
         assert all(isinstance(op, ElementwiseOp) for op in epilogue)
         assert all(
             operand is hero.dst
             for op in epilogue
             for operand in op.operands
         )
+
         src_type = hero.src.type
         assert isinstance(src_type, MemTensorType)
         rank = src_type.rank
-        if rank - 1 in self.tile_sizes:
-            raise NotImplementedError(
-                "TileReduce does not yet support tiling the reduction dimension"
-            )
-
-        iteration_space_ops, ivs, innermost_loop = (
-            self._materialize_iteration_space(hero)
+        assert all(0 <= dim < rank for dim in self.tile_sizes), (
+            f"TileReduce dimensions must be in [0, {rank})"
         )
-
-        src_ops, src = _tile_value(
-            hero.src, self.tile_sizes, ivs,
+        reduction_dim = (
+            rank - 1
+            if rank - 1 in self.tile_sizes
+            else None
         )
-        dst_ops, dst = _tile_value(
-            hero.dst, self.tile_sizes, ivs,
-        )
-        tiled_hero = clone_op(hero, {hero.dst: dst, hero.src: src})
-        tiled_epilogue = [
-            clone_op(op, {hero.dst: dst}) for op in epilogue
+        parallel_dims = [
+            dim for dim in self.tile_sizes if dim != reduction_dim
         ]
-        tiled_ops = [*src_ops, *dst_ops, tiled_hero, *tiled_epilogue]
-        if innermost_loop is None:
-            new_ops = [*iteration_space_ops, *tiled_ops]
-        else:
-            innermost_loop.body.ops.extend(tiled_ops)
-            new_ops = iteration_space_ops
-        return new_ops
-
-    def _materialize_iteration_space(
-        self,
-        hero: ReduceOp,
-    ) -> tuple[list[Op], dict[int, Value], ForOp | None]:
-        src_type = hero.src.type
-        assert isinstance(src_type, MemTensorType)
-        bounds: dict[int, int] = {}
-        launch_dims: dict[
-            tuple[CollectiveLevel, CollectiveAxis], int
-        ] = {}
+        assert not parallel_dims or reduction_dim is None, (
+            "TileReduce cannot tile parallel and reduction dimensions in "
+            "one invocation"
+        )
         for dim, tile_size in self.tile_sizes.items():
-            size = src_type.sizes[dim]
-            assert isinstance(size, int)
-            bounds[dim] = size // tile_size
-            space = self.parallel_iteration_spaces.get(dim)
-            if space is not None:
-                launch_dims[space] = (
-                    launch_dims.get(space, 1) * bounds[dim]
-                )
-        launch_dims = _update_launch_dims(hero, launch_dims)
-
-        new_ops: list[Op] = []
-        ivs: dict[int, Value] = {}
-        innermost_loop: ForOp | None = None
-        divisors: dict[
-            tuple[CollectiveLevel, CollectiveAxis], int
-        ] = {}
-        for dim in reversed(self.tile_sizes):
-            space = self.parallel_iteration_spaces.get(dim)
-            if space is None:
-                loop = ForOp.build(
-                    lb=0,
-                    ub=bounds[dim],
-                    attrs={"label": f"d{dim}"},
-                )
-                loop.body.ops.extend(new_ops)
-                new_ops = [loop]
-                if innermost_loop is None:
-                    innermost_loop = loop
-                ivs[dim] = loop.iv
-                continue
-            level, axis = space
-            id_op_type = {
-                CollectiveLevel.BLOCK: BlockIdsOp,
-                CollectiveLevel.THREAD: ThreadIdsOp,
-                CollectiveLevel.WARP: WarpIdsOp,
-                CollectiveLevel.WG: WarpGroupIdOp,
-            }[level]
-            ids = id_op_type.build()
-            divisor = divisors.get(space, 1)
-            divisors[space] = divisor * bounds[dim]
-            cdivisor = IndexConstantOp.build(divisor)
-            div = IndexDivOp.build(
-                ids.results[axis], cdivisor.result(),
+            size = cast(int, src_type.sizes[dim])
+            assert 0 < tile_size <= size, (
+                f"TileReduce requires dimension {dim} tile size to be in "
+                f"[1, {size}]; got {tile_size}"
             )
-            cbound = IndexConstantOp.build(bounds[dim])
-            mod = IndexModOp.build(
-                div.result(), cbound.result(),
+            assert size % tile_size == 0, (
+                f"TileReduce requires dimension {dim} size {size} to be "
+                f"divisible by tile size {tile_size}"
             )
-            new_ops = [
-                ids,
-                cdivisor,
-                div,
-                cbound,
-                mod,
-                *new_ops,
-            ]
-            ivs[dim] = mod.result()
+        if reduction_dim is not None:
+            current = hero.dst
+            while not isinstance(current.definition, (AllocOp, Block)):
+                tile = current.definition
+                assert isinstance(tile, TileOp), (
+                    "TileReduce reduction tiling only supports TileOp "
+                    "destination view chains"
+                )
+                current = tile.arg
 
-        return new_ops, ivs, innermost_loop
+        if self.parallel_iteration_space is None:
+            return
+
+        level, axis = self.parallel_iteration_space
+        # TODO: Make flattened tile-to-CTA mappings cluster-aware and validate
+        # them against the enclosing kernel's cluster_dim.
+        kernel = find_ancestor_of_type(hero, KernelOp)
+        assert kernel is not None
+        assert (
+            level != CollectiveLevel.CLUSTER
+            and all(dim is None for dim in kernel.cluster_dim)
+        ), "TileReduce does not support cluster-aware iteration spaces"
+
+        # TODO: Support mappings across interdependent intra-block levels by
+        # deriving relative IDs and composing their launch constraints.
+        current_level = hero.collective[axis]
+        assert (
+            current_level == CollectiveLevel.GRID
+            and level == CollectiveLevel.BLOCK
+            or current_level == CollectiveLevel.BLOCK
+            and level < CollectiveLevel.BLOCK
+        ), (
+            "TileReduce only supports grid-to-block and "
+            "block-to-intra-block parallel tiling"
+        )
 
 def tile_reduce(
     module: ModuleOp,
     tile_sizes: dict[int, int],
-    parallel_iteration_spaces: dict[
-        int, tuple[CollectiveLevel, CollectiveAxis]
-    ],
+    parallel_iteration_space: (
+        tuple[CollectiveLevel, CollectiveAxis] | None
+    ),
     hero_label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
 ) -> ModuleOp:
     return TileReduce(
         tile_sizes,
-        parallel_iteration_spaces,
+        parallel_iteration_space,
         hero_label_filter,
         epilogue_label_filter,
     ).run(module)

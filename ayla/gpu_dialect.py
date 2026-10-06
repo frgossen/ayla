@@ -272,6 +272,9 @@ class KernelOp(Op):
 
 
 class CollectiveLevel(enum.IntEnum):
+    # TODO: Evaluate whether WARP and WG should remain named levels or be
+    # represented generically as fixed-size thread collectives such as 32t
+    # and 128t.
     THREAD = 0
     WARP = 1
     WG = 2
@@ -279,6 +282,8 @@ class CollectiveLevel(enum.IntEnum):
     CLUSTER = 4
     GRID = 5
 
+    # TODO: Replace uses of join with max; collective levels form a total
+    # order, and max may be easier to read.
     def join(self, other: CollectiveLevel) -> CollectiveLevel:
         return max(self, other)
 
@@ -772,6 +777,7 @@ class AllocOp(Op):
     """Allocate a register- or shared-memory tensor.
 
     Optional `init` attr fills the allocation with a constant value.
+    TODO: Consider replacing `init` with an explicit elementwise fill op.
 
     The `id` attr names the buffer: two allocations are the same one only if
     they carry the same id, which is what lets CSE treat an allocation like any
@@ -2106,6 +2112,8 @@ class ThreadIdsOp(Op):
 class BlockIdsOp(Op):
     """Produce the 3D block index (ctaid.x, ctaid.y, ctaid.z)."""
 
+    # TODO: Make the x/y/z axis an attribute and return one ID instead of
+    # coupling all three axes in one operation.
     @classmethod
     def build(cls) -> "BlockIdsOp":
         idx = IndexType()
