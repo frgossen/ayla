@@ -42,6 +42,7 @@ from ..gpu_dialect import (
     PTXTemplateOp,
     ReinterpretOp,
     ReshapeOp,
+    ReduceOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdsOp,
@@ -49,6 +50,7 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     ToPtrOp,
+    WrmemTensorType,
     WgrmemTensorType,
     physical_layout,
     root_buffer,
@@ -436,6 +438,8 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_alloc_smem(op)
         if isinstance(result_type, RmemTensorType):
             return self._lower_alloc_rmem(op)
+        if isinstance(result_type, WrmemTensorType):
+            return self._lower_alloc_wrmem(op)
         if isinstance(result_type, WgrmemTensorType):
             return self._lower_alloc_wgrmem(op)
         if isinstance(result_type, LockType):
@@ -606,6 +610,127 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], [new_op.result()]
 
+    def _lower_alloc_wrmem(
+        self, op: AllocOp,
+    ) -> tuple[list[Op], list[object]]:
+        result_type = op.result().type
+        assert isinstance(result_type, WrmemTensorType)
+        if not isinstance(result_type.dtype, F32Type):
+            raise NotImplementedError(
+                f"lower_alloc: unsupported wrmem dtype {result_type.dtype}"
+            )
+
+        template = ""
+        if op.init is not None:
+            literal = _ptx_literal(result_type.dtype, op.init)
+            for i in range(result_type.num_elements_per_thread):
+                template += (
+                    f"mov.f32 ${{f32:result.dst.r{i}}}, {literal};\n"
+                )
+
+        new_op = PTXTemplateOp.build(
+            operands=[], result_types=[result_type], template=template,
+            operand_names=[], result_names=["dst"],
+            description=str(op),
+        )
+        return [new_op], [new_op.result()]
+
+    @lowers(ReduceOp)
+    def lower_reduce(
+        self, op: ReduceOp,
+    ) -> tuple[list[Op], list[object]]:
+        if op.fn != "sum":
+            raise NotImplementedError(
+                f"lower_reduce: unsupported function {op.fn!r}"
+            )
+        dst_type = op.dst.type
+        src_type = op.src.type
+        if (
+            isinstance(dst_type, WrmemTensorType)
+            and dst_type.layout == "lane"
+            and isinstance(src_type, SmemTensorType)
+        ):
+            return self._lower_reduce_smem_to_lanes(op)
+        if (
+            isinstance(dst_type, WrmemTensorType)
+            and dst_type.layout == "lane0"
+            and isinstance(src_type, WrmemTensorType)
+            and src_type.layout == "lane"
+        ):
+            return self._lower_reduce_lanes_to_lane0(op)
+        raise NotImplementedError(
+            f"lower_reduce: unsupported; got {dst_type} <- {src_type}"
+        )
+
+    def _lower_reduce_smem_to_lanes(
+        self, op: ReduceOp,
+    ) -> tuple[list[Op], list[object]]:
+        dst = self.value_map[op.dst]
+        src = self.value_map[op.src]
+        assert isinstance(dst, Value) and isinstance(src, Value)
+        dst_type = op.dst.type
+        src_type = op.src.type
+        assert isinstance(dst_type, WrmemTensorType)
+        assert isinstance(src_type, SmemTensorType)
+        if not isinstance(dst_type.dtype, F32Type):
+            raise NotImplementedError(
+                "lower_reduce: smem-to-lanes only supports f32"
+            )
+        if dst_type.sizes != src_type.sizes:
+            raise NotImplementedError(
+                "lower_reduce: smem-to-lanes requires equal shapes"
+            )
+
+        template = textwrap.dedent("""\
+            mov.u32 ${b32:lane}, %laneid;
+            mad.lo.u32 ${b32:addr}, ${b32:lane}, 4, ${b32:operand.src.ptr};
+            ld.shared.f32 ${f32:value}, [${b32:addr}];
+            add.rn.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0}, ${f32:value};
+        """)
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[],
+            description=str(op),
+        )
+        return [lowered], []
+
+    def _lower_reduce_lanes_to_lane0(
+        self, op: ReduceOp,
+    ) -> tuple[list[Op], list[object]]:
+        dst = self.value_map[op.dst]
+        src = self.value_map[op.src]
+        assert isinstance(dst, Value) and isinstance(src, Value)
+        dst_type = op.dst.type
+        src_type = op.src.type
+        assert isinstance(dst_type, WrmemTensorType)
+        assert isinstance(src_type, WrmemTensorType)
+        if not isinstance(dst_type.dtype, F32Type):
+            raise NotImplementedError(
+                "lower_reduce: lane reduction only supports f32"
+            )
+        if (
+            tuple(dst_type.sizes) != (1, 1)
+            or tuple(src_type.sizes) != (1, 32)
+        ):
+            raise NotImplementedError(
+                "lower_reduce: lane reduction requires 1x32 -> 1x1"
+            )
+
+        template = "mov.f32 ${f32:operand.dst.r0}, ${f32:operand.src.r0};\n"
+        for offset in (16, 8, 4, 2, 1):
+            template += (
+                "shfl.sync.down.b32 ${f32:tmp}, "
+                f"${{f32:operand.dst.r0}}, {offset}, 0x1f, 0xffffffff;\n"
+                "add.rn.f32 ${f32:operand.dst.r0}, "
+                "${f32:operand.dst.r0}, ${f32:tmp};\n"
+            )
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[],
+            description=str(op),
+        )
+        return [lowered], []
+
     def _lower_alloc_smem(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
@@ -653,6 +778,12 @@ class LowerToPtxTemplate(LoweringPass):
         source_values = [cast(Value, self.value_map[src]) for src in sources]
         dst_type = op.dst.type
 
+        if (
+            isinstance(dst_type, WrmemTensorType)
+            and all(isinstance(src.type, WrmemTensorType) for src in sources)
+        ):
+            return self._lower_elementwise_wrmem(op)
+
         if not isinstance(dst_type, WgrmemTensorType):
             raise NotImplementedError(
                 f"lower_elementwise: destination must be wgrmem; got {dst_type}"
@@ -683,6 +814,46 @@ class LowerToPtxTemplate(LoweringPass):
             description=str(op),
         )
         return [new_op], []
+
+    def _lower_elementwise_wrmem(
+        self, op: ElementwiseOp,
+    ) -> tuple[list[Op], list[object]]:
+        dst_type = op.dst.type
+        src_type = op.src(0).type
+        assert isinstance(dst_type, WrmemTensorType)
+        assert isinstance(src_type, WrmemTensorType)
+        if (
+            op.fn != "div"
+            or dst_type.layout != "lane0"
+            or src_type.layout != "lane0"
+            or tuple(dst_type.sizes) != (1, 1)
+            or tuple(src_type.sizes) != (1, 1)
+            or not isinstance(dst_type.dtype, F32Type)
+            or src_type.dtype != dst_type.dtype
+        ):
+            raise NotImplementedError(
+                f"lower_elementwise: unsupported wrmem operation {op}"
+            )
+        divisor = op.attrs.get("divisor")
+        if not isinstance(divisor, (int, float)):
+            raise NotImplementedError(
+                "lower_elementwise: wrmem div requires a numeric divisor"
+            )
+
+        dst = self.value_map[op.dst]
+        src = self.value_map[op.src(0)]
+        assert isinstance(dst, Value) and isinstance(src, Value)
+        template = (
+            "div.rn.f32 ${f32:operand.dst.r0}, "
+            "${f32:operand.src.r0}, "
+            f"{_ptx_literal(dst_type.dtype, divisor)};\n"
+        )
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[],
+            description=str(op),
+        )
+        return [lowered], []
 
     @lowers(MatmulOp)
     def lower_matmul(
@@ -1120,6 +1291,12 @@ class LowerToPtxTemplate(LoweringPass):
             return self._lower_move_smem_rmem(op)
         if {type(dst_type), type(src_type)} == {SmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_smem(op)
+        if (
+            isinstance(dst_type, GmemTensorType)
+            and isinstance(src_type, WrmemTensorType)
+            and src_type.layout == "lane0"
+        ):
+            return self._lower_move_wrmem_lane0_to_gmem(op)
         if isinstance(dst_type, WgrmemTensorType) and isinstance(src_type, SmemTensorType) and dst_type.layout == "mma":
             return self._lower_move_smem_to_wgrmem_mma(op)
         if isinstance(dst_type, SmemTensorType) and isinstance(src_type, WgrmemTensorType) and src_type.layout == "mma":
@@ -1134,6 +1311,38 @@ class LowerToPtxTemplate(LoweringPass):
             f"lower_move: unsupported; got "
             f"{type(dst_type).__name__} <- {type(src_type).__name__}"
         )
+
+    def _lower_move_wrmem_lane0_to_gmem(
+        self, op: MoveOp,
+    ) -> tuple[list[Op], list[object]]:
+        dst = self.value_map[op.dst]
+        src = self.value_map[op.src]
+        assert isinstance(dst, Value) and isinstance(src, Value)
+        dst_type = op.dst.type
+        src_type = op.src.type
+        assert isinstance(dst_type, GmemTensorType)
+        assert isinstance(src_type, WrmemTensorType)
+        if (
+            tuple(dst_type.sizes) != (1, 1)
+            or tuple(src_type.sizes) != (1, 1)
+            or not isinstance(dst_type.dtype, F32Type)
+            or src_type.dtype != dst_type.dtype
+        ):
+            raise NotImplementedError(
+                "lower_move: lane0 wrmem store requires matching 1x1 f32 tensors"
+            )
+
+        template = textwrap.dedent("""\
+            mov.u32 ${b32:lane}, %laneid;
+            setp.eq.u32 ${pred:lane0}, ${b32:lane}, 0;
+            @${pred:lane0} st.global.f32 [${b64:operand.dst.ptr}], ${f32:operand.src.r0};
+        """)
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[],
+            description=str(op),
+        )
+        return [lowered], []
 
     @lowers(AwaitOp)
     def lower_await(
@@ -1163,7 +1372,9 @@ class LowerToPtxTemplate(LoweringPass):
         operand_names: list[str] = []
         if scope == "thread":
             return [], []  # per-thread ordering is implicit in program order
-        if scope == "block":
+        if scope == "warp":
+            template = "bar.warp.sync 0xffffffff;\n"
+        elif scope == "block":
             template = "bar.sync 0;\n"
         elif scope == "cluster_to_leader":
             assert op.sync is not None

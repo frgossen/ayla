@@ -292,6 +292,37 @@ def test_preexisting_barrier_updates_dataflow_state():
     assert repr(module).count("barrier()") == 1
 
 
+def test_loop_entry_hazard_is_synchronized_before_loop():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%src: gmem<1x128xf32>) block_dim=[32, 1, 1] {
+            %smem: smem<1x128xf32> = alloc()
+            move(%smem: smem<1x128xf32>, %src: gmem<1x128xf32>)
+            %partial: wrmem<1x32xf32 layout="lane"> = alloc() attrs={init: 0.0}
+            for (%k: index = 0 to 4) {
+              %chunk: smem<1x32xf32 strides=[128, 1]> = tile(%smem: smem<1x128xf32>, 0, %k: index)
+              reduce sum(%partial: wrmem<1x32xf32 layout="lane">, %chunk: smem<1x32xf32 strides=[128, 1]>)
+            }
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%src: gmem<1x128xf32>) block_dim=[32, 1, 1] {
+            %smem: smem<1x128xf32> = alloc()
+            move(%smem: smem<1x128xf32>, %src: gmem<1x128xf32>)
+            %partial: wrmem<1x32xf32 layout="lane"> = alloc() attrs={init: 0.0}
+            barrier() attrs={scope: "block"}
+            for (%k: index = 0 to 4) {
+              %chunk: smem<1x32xf32 strides=[128, 1]> = tile(%smem: smem<1x128xf32>, 0, %k: index)
+              reduce sum(%partial: wrmem<1x32xf32 layout="lane">, %chunk: smem<1x32xf32 strides=[128, 1]>)
+            }
+          }
+        }""")  # noqa: E501
+
+
 def test_war_on_shared_buffer_gets_barrier():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

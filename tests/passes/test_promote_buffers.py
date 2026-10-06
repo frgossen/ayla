@@ -237,6 +237,35 @@ def test_promote_multicast_narrows_grid_collective_to_cluster():
     assert "collective=xyz.cluster attrs={label: \"mm_lhs_smem\", multicast: True" in repr(module)
 
 
+def test_promote_reduction_src_and_dst_to_smem():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<1x6656xf32>, %output: gmem<1x1xf32>) {
+            reduce sum(%output: gmem<1x1xf32>, %src: gmem<1x6656xf32>) attrs={init: 0.0}
+            elementwise div(%output: gmem<1x1xf32>, %output: gmem<1x1xf32>) attrs={divisor: 6656}
+          }
+        }"""))
+
+    module = promote_buffers(
+        module,
+        target_type="smem",
+        operands=["src", "dst"],
+        epilogue_label_filter=".*",
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<1x6656xf32>, %output: gmem<1x1xf32>) {
+            %0: smem<1x6656xf32> = alloc() attrs={id: 0}
+            move(%0: smem<1x6656xf32>, %src: gmem<1x6656xf32>)
+            %1: smem<1x1xf32> = alloc() attrs={id: 1}
+            reduce sum(%1: smem<1x1xf32>, %0: smem<1x6656xf32>) attrs={init: 0.0}
+            elementwise div(%1: smem<1x1xf32>, %1: smem<1x1xf32>) attrs={divisor: 6656}
+            move(%output: gmem<1x1xf32>, %1: smem<1x1xf32>)
+          }
+        }""")
+
+
 def test_promote_can_slice_tma_operand_loads():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

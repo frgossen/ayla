@@ -32,12 +32,19 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
+    WrmemTensorType,
     WgrmemTensorType,
 )
 
 
 _ELEMENTWISE_ARITIES = {
     "convert": 1,
+    # TODO: This is only unary because the divisor is temporarily stored as an
+    # attribute. Make `div` a normal binary elementwise function once the IR
+    # can represent scalar constants as values and broadcast them across tensor
+    # operands. At that point the divisor must become source 1 and this arity
+    # must become 2.
+    "div": 1,
     "mul": 2,
     "sigmoid": 1,
     "silu": 1,
@@ -154,12 +161,16 @@ class VerifyGpuDialect(VerificationPass):
         result_type = op.result().type
         if type(arg_type) is not type(result_type):
             raise ValueError("tile must preserve its operand's memory space")
-        if not isinstance(arg_type, (AddrMemTensorType, WgrmemTensorType)):
+        if not isinstance(
+            arg_type, (AddrMemTensorType, WrmemTensorType, WgrmemTensorType),
+        ):
             raise ValueError(
                 "tile operand and result must be address-backed memory "
-                "tensors or wgrmem"
+                "tensors or register-memory tensors"
             )
-        assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType))
+        assert isinstance(
+            result_type, (AddrMemTensorType, WrmemTensorType, WgrmemTensorType),
+        )
         if not (
             arg_type.rank == result_type.rank == len(op.indices)
         ):
@@ -432,7 +443,6 @@ class VerifyGpuDialect(VerificationPass):
             and arg.num_elements != result.num_elements
         ):
             raise ValueError("reshape must preserve the number of elements")
-
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:
         for block in op.blocks:
