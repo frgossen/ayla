@@ -39,6 +39,7 @@ from ayla.gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     TileOp,
+    WrmemTensorType,
     gpu_dialect,
     has_ordering_effect,
     is_grid_collective,
@@ -444,6 +445,41 @@ def test_index_lt_op():
         IndexLtOp.build(not_index, rhs)
     with pytest.raises(AssertionError, match="expected IndexType rhs"):
         IndexLtOp.build(lhs, not_index)
+
+
+def test_reduce_op_grid_collective():
+    src_type = GmemTensorType.build((8, 6656), F32Type())
+    dst_type = GmemTensorType.build((8, 1), F32Type())
+    src = Value(name="src", type=src_type)
+    dst = Value(name="dst", type=dst_type)
+
+    op = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
+        init=0.0,
+    )
+
+    assert_print_and_roundtrip(
+        op,
+        "reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x6656xf32>) "
+        "collective=xyz.grid attrs={init: 0.0}",
+    )
+    with pytest.raises(ValueError, match="must not also appear in attrs"):
+        gpu_dialect.parse(
+            'reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x6656xf32>) '
+            'attrs={fn: "max"}'
+        )
+
+
+def test_warp_register_memory_type():
+    typ = WrmemTensorType.build((1,), F32Type(), layout="lane0")
+    assert repr(typ) == 'wrmem<1xf32 layout="lane0">'
+    assert_print_and_roundtrip(
+        AllocOp.build(typ, id=0),
+        '%0: wrmem<1xf32 layout="lane0"> = alloc() attrs={id: 0}',
+    )
 
 
 def test_async_op():

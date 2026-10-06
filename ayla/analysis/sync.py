@@ -14,6 +14,7 @@ from ..gpu_dialect import (
     ClusterBlockIdsOp,
     CollectiveScope,
     ElementwiseOp,
+    ForOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
@@ -26,6 +27,7 @@ from ..gpu_dialect import (
     MoveOp,
     PTXTemplateOp,
     PtrAddOp,
+    ReduceOp,
     ReinterpretOp,
     ReshapeOp,
     SelectOp,
@@ -406,6 +408,44 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         super().__init__(SyncState, direction=self.Direction.FORWARD)
         self.targets: BarrierTargetsType = {}
 
+    @staticmethod
+    def _loop_body_targets(
+        op: ForOp, state: SyncState,
+    ) -> BarrierTargetsType:
+        """Analyze one pass through a loop body from ``state``."""
+        analysis = SyncAnalysis()
+        analysis._live_in = {}
+        analysis._live_out = {}
+        analysis._transfer_block(op.body, state)
+        return analysis.targets
+
+    def _loop_entry_barrier_scope(
+        self, op: ForOp, state: SyncState,
+    ) -> BarrierScope:
+        """Return synchronization needed only by effects before ``op``."""
+        without_entry = self._loop_body_targets(op, SyncState.empty())
+        with_entry = self._loop_body_targets(op, state)
+
+        scope = BarrierScope.THREAD
+        for body_op, target in with_entry.items():
+            baseline = without_entry.get(
+                body_op, BarrierTarget(BarrierScope.THREAD),
+            )
+            if not target.scope.leq(baseline.scope):
+                scope = scope.join(target.scope)
+        return scope
+
+    def _transfer_op(self, op: Op, state: SyncState) -> SyncState:
+        if isinstance(op, ForOp):
+            entry_scope = self._loop_entry_barrier_scope(op, state)
+            if (
+                op.trip_count > 1
+                and entry_scope in (BarrierScope.WARP, BarrierScope.BLOCK)
+            ):
+                self.targets[op] = BarrierTarget(entry_scope)
+                state = _after_barrier(state, entry_scope)
+        return super()._transfer_op(op, state)
+
     @transfers(
         BlockIdsOp,
         ClusterBlockIdsOp,
@@ -479,6 +519,6 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             op, state, self.targets, async_lock=op.lock,
         )
 
-    @transfers(ElementwiseOp, MatmulOp, MoveOp, TmaMoveOp)
+    @transfers(ElementwiseOp, MatmulOp, MoveOp, ReduceOp, TmaMoveOp)
     def transfer_memory_effects(self, op: Op, state: SyncState) -> SyncState:
         return _transfer_memory_effects(op, state, self.targets)

@@ -470,6 +470,23 @@ def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
         verify_gpu_dialect(module)
 
 
+def test_tile_strides_are_verified():
+    src = Value(
+        name="src",
+        type=SmemTensorType.build((1, 6656), F32Type()),
+    )
+    thread = Value(name="tx", type=IndexType())
+    result_type = SmemTensorType.build(
+        (1, 52), F32Type(), strides=(6656, 128),
+    )
+    module = ModuleOp.build(Block(ops=[
+        TileOp.build(src, [0, thread], result_type),
+    ]))
+
+    with pytest.raises(ValueError, match="tile result strides.*must match"):
+        verify_gpu_dialect(module)
+
+
 def test_ptx_lowering_verification_rejects_dynamic_shapes():
     with pytest.raises(ValueError, match="unresolved dynamic shape"):
         verify_gpu_dialect(
