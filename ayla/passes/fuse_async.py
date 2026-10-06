@@ -32,6 +32,8 @@ call ``fuse_async(module)``; the single-op + same-kind gating does the rest.
 """
 from __future__ import annotations
 
+from itertools import takewhile
+
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
@@ -116,27 +118,21 @@ class FuseAsync(Pass):
 
         for index, op in enumerate(ops):
             kind = _fusion_kind(op)
-            if kind is not None:
-                # Guaranteed by _fusion_kind; the assertion narrows the type.
-                assert isinstance(op, AsyncOp)
-                if op.lock in awaited_locks:
-                    next_effectful = next(
-                        (
-                            candidate
-                            for candidate in ops[index + 1:]
-                            if not is_side_effect_free(candidate)
-                        ),
-                        None,
-                    )
-                    if not (
-                        isinstance(next_effectful, AwaitOp)
-                        and next_effectful.lock is op.lock
-                    ):
-                        # Scheduling may deliberately move an await away from
-                        # its singleton async. That pair has already been
-                        # processed and cannot join a new fusion run.
-                        kind = None
-
+            # Scheduling may deliberately move an await away from its
+            # singleton async. That pair has already been processed and
+            # cannot join a new fusion run. An await that follows a run of
+            # same-kind launches and their awaits is still adjacent.
+            if isinstance(op, AsyncOp) and op.lock in awaited_locks:
+                run = takewhile(
+                    lambda o: is_side_effect_free(o)
+                    or isinstance(o, AwaitOp)
+                    or _fusion_kind(o) == kind,
+                    ops[index + 1:],
+                )
+                if not any(
+                    isinstance(o, AwaitOp) and o.lock is op.lock for o in run
+                ):
+                    kind = None
             if kind is not None:
                 assert isinstance(op, AsyncOp)
                 if group_kind is not None:

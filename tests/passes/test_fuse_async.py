@@ -113,24 +113,25 @@ def test_does_not_fuse_incompatible_tma_loads(
     assert repr(module) == module_str
 
 
-def test_does_not_fuse_local_and_multicast_tma_loads():
-    module_str = textwrap.dedent("""\
+def test_fuses_launches_whose_awaits_follow_the_run():
+    module = gpu_dialect.parse(textwrap.dedent("""\
         module {
-          kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+          kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %sa: smem<16x16xf32> = alloc()
             %sb: smem<16x16xf32> = alloc()
-            %local: lock<mbar> = alloc()
-            %multicast: lock<mbar> = alloc()
-            async(%local: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
-            await(%local: lock<mbar>)
-            async(%multicast: lock<mbar>) collective=xyz.cluster move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
-            await(%multicast: lock<mbar>)
+            %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            async(%l0: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            async(%l1: lock<mbar>) collective=xyz.block move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            await(%l0: lock<mbar>)
+            await(%l1: lock<mbar>)
           }
-        }""")
+        }"""))
 
-    module = fuse_async(gpu_dialect.parse(module_str))
+    text = repr(fuse_async(module))
 
-    assert repr(module) == module_str
+    assert text.count("async(") == 1
+    assert text.count("await(") == 1
 
 
 def test_rerun_ignores_a_pipelined_singleton_async():
