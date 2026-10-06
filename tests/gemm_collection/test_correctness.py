@@ -1,6 +1,5 @@
 """Correctness tests for all GEMM kernels in the collection."""
 
-import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
 import pytest
 import torch
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 from .parser import Parser
-from .printer import Printer  # noqa: F401
+from .printer import Printer
 
 
 # Observable containers that keep the use-list and parent links
