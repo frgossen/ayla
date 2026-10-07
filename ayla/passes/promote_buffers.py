@@ -52,6 +52,7 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
     WgrmemTensorType,
+    is_column_major,
     is_elementwise,
 )
 from ._utils import label_matches
@@ -331,7 +332,7 @@ class PromoteBuffers(LoweringPass):
         self.operand_names = set(operands)
 
     def _build_smem_type(
-        self, sizes: Sequence[int], dtype: Type,
+        self, sizes: Sequence[int], dtype: Type, column_major: bool = False,
     ) -> SmemTensorType:
         layout = dict(self.physical_layout or {})
         swizzle = layout.pop("swizzle", self.swizzle)
@@ -341,6 +342,7 @@ class PromoteBuffers(LoweringPass):
         )
         return SmemTensorType.build(
             sizes, dtype, swizzle=swizzle, attrs=attrs,
+            strides=[1, sizes[0]] if column_major else None,
         )
 
     def _build_target_type(
@@ -522,8 +524,12 @@ class PromoteBuffers(LoweringPass):
         smem_sizes[-1] = output_cols // self.writeback_slices
         static_smem_sizes = [size for size in smem_sizes if size is not None]
         assert len(static_smem_sizes) == len(smem_sizes)
+        # Stage in the destination's dimension order so the bulk store copies
+        # a dense box; a column-major (transposed) destination is staged
+        # column-major.
         smem_type = self._build_smem_type(
             static_smem_sizes, block_dst.type.dtype,
+            column_major=is_column_major(block_dst.type),
         )
         attrs: dict[str, object] | None = (
             {"reuse_group": f"{matmul_label}_writeback"}
