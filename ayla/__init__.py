@@ -20,6 +20,7 @@ from .jit_compiler import ShapeSpecializingJITCompiler
 from .gemm_heuristics import (
     GemmHeuristicSelection,
     GemmScheduleSeed,
+    apply_gemm_schedule_seed_post_build,
     collapse_gemm_heuristic,
     expand_gemm_heuristic,
     select_gemm_schedules,
@@ -45,6 +46,7 @@ __all__ = [
     "ShapeSpecializingJITCompiler",
     "GemmHeuristicSelection",
     "GemmScheduleSeed",
+    "apply_gemm_schedule_seed_post_build",
     "collapse_gemm_heuristic",
     "expand_gemm_heuristic",
     "select_gemm_schedules",

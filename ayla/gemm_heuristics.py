@@ -19,6 +19,7 @@ class GemmScheduleSeed:
     adaptations: tuple[str, ...]
     source_shape: tuple[int, int, int] | None
     source_percentage_of_torch: float | None
+    post_builder_passes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,24 @@ class GemmHeuristicSelection:
     leaf: str
     decision_path: tuple[str, ...]
     seeds: tuple[GemmScheduleSeed, ...]
+
+
+def apply_gemm_schedule_seed_post_build(
+    module: Any, seed: GemmScheduleSeed,
+) -> Any:
+    """Apply the measured post-builder pass sequence required by ``seed``."""
+    if not seed.post_builder_passes:
+        return module
+    expected = ("schedule_async", "canonicalize")
+    if seed.post_builder_passes != expected:
+        raise ValueError(
+            f"unsupported GEMM post-builder passes: {seed.post_builder_passes}"
+        )
+    # Keep pass imports lazy so selecting a heuristic remains lightweight.
+    from .passes.canonicalize import Canonicalize
+    from .passes.schedule_async import ScheduleAsync
+
+    return Canonicalize().run(ScheduleAsync().run(module))
 
 
 def expand_gemm_heuristic(compact: dict[str, Any]) -> dict[str, Any]:
@@ -370,6 +389,10 @@ def select_gemm_schedules(
             adaptations=adaptations,
             source_shape=(source["m"], source["n"], source["k"]),
             source_percentage_of_torch=seed["source_percentage_of_torch"],
+            post_builder_passes=(
+                ("schedule_async", "canonicalize")
+                if captured.get("reschedule_async") is True else ()
+            ),
         ))
 
     if not any(seed.builder_config is not None for seed in seeds):

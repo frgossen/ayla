@@ -1,6 +1,9 @@
 import pytest
 
-from ayla.gemm_heuristics import select_gemm_schedules
+from ayla.gemm_heuristics import (
+    apply_gemm_schedule_seed_post_build,
+    select_gemm_schedules,
+)
 from ayla.gpu_dialect import CollectiveAxis
 
 
@@ -33,6 +36,31 @@ def test_incremental_winner_preserves_existing_leaf_seeds():
 
     assert "hybrid1152_s3_cy1" in names
     assert "waveconfirm_native" in names
+
+
+def test_rescheduled_seed_exposes_and_executes_post_builder_passes(
+    monkeypatch,
+):
+    selection = select_gemm_schedules(4160, 1024, 3072)
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.captured_config.get("reschedule_async") is True
+    )
+    assert seed.post_builder_passes == ("schedule_async", "canonicalize")
+
+    calls = []
+    monkeypatch.setattr(
+        "ayla.passes.schedule_async.ScheduleAsync.run",
+        lambda self, module: calls.append("schedule_async") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.canonicalize.Canonicalize.run",
+        lambda self, module: calls.append("canonicalize") or module,
+    )
+    module = object()
+
+    assert apply_gemm_schedule_seed_post_build(module, seed) is module
+    assert calls == ["schedule_async", "canonicalize"]
 
 
 def test_addmm_uses_an_independent_operation_group():

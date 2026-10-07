@@ -9,7 +9,11 @@ from typing import Any, cast
 
 import torch
 
-from ayla import GemmScheduleSeed, select_gemm_schedules
+from ayla import (
+    GemmScheduleSeed,
+    apply_gemm_schedule_seed_post_build,
+    select_gemm_schedules,
+)
 from benchmarks.common import (
     assert_against_torch,
     gemm_bench_config,
@@ -33,21 +37,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _ayla_compute(m: int, n: int, k: int, config: dict[str, object]):
+def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
     from ayla.gemm_collection.gemm import (
         auto_matmul_4096_wgmma256_wg_tma_store_module,
     )
     from ayla.ptx_codegen import make_ptx_kernel
     from ayla.ptx_runtime import make_ptx_launcher
 
+    if seed.builder_config is None:
+        raise ValueError("cannot build an unsupported GEMM schedule seed")
     builder = cast(Any, auto_matmul_4096_wgmma256_wg_tma_store_module)
     module = builder(
         m=m,
         n=n,
         k=k,
         dtype="f16",
-        **config,
+        **seed.builder_config,
     )
+    module = apply_gemm_schedule_seed_post_build(module, seed)
     return out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
 
 
@@ -102,7 +109,7 @@ def main() -> int:
             n=args.n,
             k=args.k,
             compute=_ayla_compute(
-                args.m, args.n, args.k, seed.builder_config,
+                args.m, args.n, args.k, seed,
             ),
             dtype=torch.float16,
         )
