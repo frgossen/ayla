@@ -90,10 +90,12 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         "barrier.cluster.arrive.release;",
         "barrier.cluster.wait.acquire;",
         "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
-        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+        "@${pred:cl_t0} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "@${pred:cl_t0} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
+    # No thread-divergent branch: only the arrives are predicated on thread 0.
+    assert "cl_not_t0" not in ptx
 
 
 def test_batches_consecutive_lock_initialization_rendezvous():

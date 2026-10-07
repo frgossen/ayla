@@ -508,6 +508,7 @@ class LowerToPtxTemplate(LoweringPass):
         template = textwrap.dedent(f"""\
             .shared .align 8 .b64 ${{smem:bar}}[1];
             mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:result.dst.parity}}, 0;
             mov.u32 ${{b32:tid_x}}, %tid.x;
             mov.u32 ${{b32:tid_y}}, %tid.y;
             or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
@@ -1146,6 +1147,10 @@ class LowerToPtxTemplate(LoweringPass):
             assert op.sync is not None
             sync = self.value_map[op.sync]
             assert isinstance(sync, Value)
+            # Only thread 0 arrives, but every thread of rank 0 waits on the
+            # parity: a thread-0-only spin loop between WGMMA issues makes
+            # ptxas serialize the WGMMAs (C7520). The rank branch is
+            # CTA-uniform.
             template = textwrap.dedent("""\
                 bar.sync 0;
                 mov.u32 ${b32:cl_tid}, %tid.x;
@@ -1153,20 +1158,21 @@ class LowerToPtxTemplate(LoweringPass):
                 or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidy};
                 mov.u32 ${b32:cl_tidz}, %tid.z;
                 or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidz};
-                setp.ne.u32 ${pred:cl_not_t0}, ${b32:cl_tid}, 0;
-                @${pred:cl_not_t0} bra ${label:cl_done};
+                setp.eq.u32 ${pred:cl_t0}, ${b32:cl_tid}, 0;
                 mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
                 setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;
                 @${pred:rank0} bra ${label:cl_rank0};
                 mov.u32 ${b32:cluster_rank}, 0;
                 mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};
-                mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
+                @${pred:cl_t0} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
                 bra ${label:cl_done};
                 ${label:cl_rank0}:
-                mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];
+                @${pred:cl_t0} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];
+                mov.u32 ${b32:ticks}, 0x989680;
                 ${label:cl_wait}:
-                mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};
+                mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
                 @!${pred:ready} bra ${label:cl_wait};
+                xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
                 ${label:cl_done}:
                 """)
             operands = [sync]
