@@ -22,6 +22,7 @@ from ayla.gpu_dialect import (
     gpu_dialect,
 )
 from ayla.passes.folding import Folding
+from ayla.passes.insert_syncs import insert_syncs
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
@@ -121,10 +122,11 @@ def test_lower_barrier(scope, expected):
 def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
-        mov.u32 ${b32:bl_tid}, %tid.x;
-        setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-        @${pred:bl_w0} bar.sync 1, 128;
-        @!${pred:bl_w0} bar.arrive 1, 128;
+        or.b32 ${b32:bl_warp}, ${b32:operand.warp_x.val}, ${b32:operand.warp_y.val};
+        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:operand.warp_z.val};
+        setp.ne.u32 ${pred:bl_other_warp}, ${b32:bl_warp}, 0;
+        @${pred:bl_other_warp} bar.arrive 1, 128;
+        @!${pred:bl_other_warp} bar.sync 1, 128;
         """)
 
 
@@ -137,6 +139,7 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
           }
         }"""))
 
+    insert_syncs(module)
     lower_to_ptx_template(module)
     ptx = "".join(
         op.attrs["template"]
@@ -153,11 +156,35 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         "bar.sync 0;",
         "barrier.cluster.arrive.release;",
         "barrier.cluster.wait.acquire;",
+        "@${pred:cl_other_warp} bra ${label:cl_done};",
         "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
-        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+        "@${pred:cl_leader} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "@${pred:cl_leader} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
+
+
+def test_batches_consecutive_lock_initialization_rendezvous():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %local0: lock<mbar> = alloc()
+            %buffer: smem<16xf32> = alloc()
+            %local1: lock<mbar> = alloc()
+            %cluster: lock<cluster_mbar> = alloc()
+          }
+        }"""))
+
+    insert_syncs(module)
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.template for op in find_ops_of_type(module, PTXTemplateOp)
+    )
+
+    assert ptx.count("mbarrier.init.shared::cta.b64") == 3
+    assert ptx.count("bar.sync 0;") == 1
+    assert ptx.count("barrier.cluster.arrive.release;") == 1
+    assert ptx.count("barrier.cluster.wait.acquire;") == 1
 
 
 def test_lower_smem_arena_and_reinterpret():
@@ -301,6 +328,7 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
           }
         }"""))
 
+    insert_syncs(module)
     lower_to_ptx_template(module)
 
     ptx = "".join(
@@ -328,6 +356,9 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
         < ptx.index(wait)
     )
     assert ptx.count(multicast) == 1
+    # The issue is predicated on one elected thread, not branched around.
+    assert "@${pred:multicast_issue} cp.async.bulk.tensor" in ptx
+    assert "after_multicast" not in ptx and "after_load" not in ptx
     assert (
         "[${b32:operand.lock.val}], 3, "
         "${b64:operand.cache_policy0.ptr};"

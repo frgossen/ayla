@@ -301,12 +301,25 @@ def schedule_matmul(
             (CollectiveLevel.BLOCK, output_grid_axes[1]),
         ]
     )
-    grid_x = (m_blocks + output_m_tiles_per_cta - 1) // output_m_tiles_per_cta
-    grid_y = (n_blocks + output_n_tiles_per_cta - 1) // output_n_tiles_per_cta
-    if grid_x % cluster_m_ctas or grid_y % cluster_n_ctas:
+    m_grid = (m_blocks + output_m_tiles_per_cta - 1) // output_m_tiles_per_cta
+    n_grid = (n_blocks + output_n_tiles_per_cta - 1) // output_n_tiles_per_cta
+    grid_by_axis = dict(zip(output_grid_axes, (m_grid, n_grid), strict=True))
+    cluster_by_axis = dict(zip(
+        output_grid_axes,
+        (cluster_m_ctas, cluster_n_ctas),
+        strict=True,
+    ))
+    if any(
+        grid_by_axis[axis] % cluster_by_axis[axis]
+        for axis in (CollectiveAxis.X, CollectiveAxis.Y)
+    ):
         raise ValueError("CTA grid must divide evenly by cluster dimensions")
     if cluster_m_ctas > 1 or cluster_n_ctas > 1:
-        kernel.attrs["cluster_dim"] = [cluster_m_ctas, cluster_n_ctas, 1]
+        kernel.attrs["cluster_dim"] = [
+            cluster_by_axis[CollectiveAxis.X],
+            cluster_by_axis[CollectiveAxis.Y],
+            1,
+        ]
     pipeline = Pipeline()
     if group_size == 1:
         pipeline.add_pass(TileMatmul(

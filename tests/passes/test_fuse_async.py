@@ -84,15 +84,9 @@ def test_fuse_tma_loads():
     assert text == expected
 
 
-@pytest.mark.parametrize(
-    ("second_lock_kind", "second_collective"),
-    [
-        ("mbar", "xyz.cluster"),
-        ("bulk", "xyz.block"),
-    ],
-)
+@pytest.mark.parametrize("second_lock_kind", ["bulk"])
 def test_does_not_fuse_incompatible_tma_loads(
-    second_lock_kind, second_collective,
+    second_lock_kind,
 ):
     module_str = textwrap.dedent(f"""\
         module {{
@@ -103,7 +97,7 @@ def test_does_not_fuse_incompatible_tma_loads(
             %l1: lock<{second_lock_kind}> = alloc()
             async(%l0: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={{tma: True}}
             await(%l0: lock<mbar>)
-            async(%l1: lock<{second_lock_kind}>) collective={second_collective} move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective={second_collective} attrs={{tma: True}}
+            async(%l1: lock<{second_lock_kind}>) collective=xyz.block move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.block attrs={{tma: True}}
             await(%l1: lock<{second_lock_kind}>)
           }}
         }}""")
@@ -134,24 +128,36 @@ def test_fuses_launches_whose_awaits_follow_the_run():
     assert text.count("await(") == 1
 
 
-def test_mixed_tma_collectives_keep_nonadjacent_awaits():
-    module_str = textwrap.dedent("""\
+@pytest.mark.parametrize("interleaved", [True, False])
+def test_fuses_local_and_multicast_tma_loads_at_joined_collective(interleaved):
+    local = (
+        "async(%local: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}",
+        "await(%local: lock<mbar>)",
+    )
+    multicast = (
+        "async(%multicast: lock<mbar>) collective=xyz.cluster move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}",
+        "await(%multicast: lock<mbar>)",
+    )
+    body = (
+        [*local, *multicast] if interleaved
+        else [local[0], multicast[0], local[1], multicast[1]]
+    )
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %sa: smem<16x16xf32> = alloc()
             %sb: smem<16x16xf32> = alloc()
-            %l0: lock<mbar> = alloc()
-            %l1: lock<mbar> = alloc()
-            async(%l0: lock<mbar>) collective=xyz.cluster move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
-            async(%l1: lock<mbar>) collective=xyz.block move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
-            await(%l0: lock<mbar>)
-            await(%l1: lock<mbar>)
-          }
-        }""")
+            %local: lock<mbar> = alloc()
+            %multicast: lock<mbar> = alloc()
+        """) + "".join(f"    {line}\n" for line in body) + "  }\n}")
 
-    module = fuse_async(gpu_dialect.parse_module(module_str))
+    text = repr(fuse_async(module))
 
-    assert repr(module) == module_str
+    assert text.count("async(") == 1
+    assert text.count("await(") == 1
+    assert "async(%local: lock<mbar>) collective=xyz.cluster {" in text
+    assert "collective=xyz.block attrs={tma: True}" in text
+    assert "collective=xyz.cluster attrs={multicast: True, tma: True}" in text
 
 
 def test_rerun_ignores_a_pipelined_singleton_async():

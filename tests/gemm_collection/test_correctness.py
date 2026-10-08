@@ -399,6 +399,22 @@ def test_cluster_multicast_gemm_matches_torch(
 
 
 @requires_cuda
+def test_cluster_dimensions_follow_swapped_output_grid_axes():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=256,
+        n=512,
+        k=64,
+        output_grid_axes=(CollectiveAxis.Y, CollectiveAxis.X),
+        cluster_n_ctas=2,
+        operand_move_attrs={"lhs": {"multicast": True}},
+    )
+    kernel = make_ptx_kernel(module)
+
+    assert kernel.grid_dim == (2, 2, 1)
+    assert kernel.cluster_dim == (2, 1, 1)
+
+
+@requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128
     module = auto_matmul_4096_wgmma256_wg_tma_store_module(

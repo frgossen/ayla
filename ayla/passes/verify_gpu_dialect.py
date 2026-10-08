@@ -37,6 +37,7 @@ from ..gpu_dialect import (
     TmaMoveOp,
     WgrmemTensorType,
     is_column_major,
+    join_collectives,
     physical_layout,
     root_buffer,
 )
@@ -325,39 +326,20 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
         _verify_collective_attr(op)
+        joined_collective = {
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        }
         for inner in op.body.ops:
             collective = inner.attrs.get("collective")
-            if collective is not None and collective != op.collective:
-                raise ValueError(
-                    "async collective must match the collective of every "
-                    f"contained operation; got {op.collective} and "
-                    f"{collective}"
-                )
-        multicast_modes = [
-            inner.multicast
-            for user in op.lock.users()
-            if isinstance(user, AsyncOp)
-            for inner in user.body.ops
-            if (
-                isinstance(inner, TmaMoveOp)
-                or (
-                    isinstance(inner, MoveOp)
-                    and inner.attrs.get("tma") is True
-                )
-            )
-        ]
-        if multicast_modes and any(
-            mode != multicast_modes[0] for mode in multicast_modes[1:]
-        ):
+            if collective is None:
+                continue
+            assert isinstance(collective, dict)
+            joined_collective = join_collectives(joined_collective, collective)
+        if joined_collective != op.collective:
             raise ValueError(
-                "TMA operations sharing a lock must use the same multicast mode"
-            )
-        if (
-            op.is_tma_multicast
-            and set(op.collective.values()) != {CollectiveLevel.CLUSTER}
-        ):
-            raise ValueError(
-                "TMA multicast async must be exactly cluster-collective"
+                "async collective must match the join of its contained "
+                f"operations; got {op.collective}, expected "
+                f"{joined_collective}"
             )
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)

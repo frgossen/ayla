@@ -309,6 +309,14 @@ class CollectiveAxis(enum.IntEnum):
     Z = 2
 
 
+def join_collectives(
+    lhs: dict[CollectiveAxis, CollectiveLevel],
+    rhs: dict[CollectiveAxis, CollectiveLevel],
+) -> dict[CollectiveAxis, CollectiveLevel]:
+    """The per-axis join of two collectives."""
+    return {axis: lhs[axis].join(rhs[axis]) for axis in CollectiveAxis}
+
+
 def is_grid_collective(
     collective: dict[CollectiveAxis, CollectiveLevel],
     axes: tuple[CollectiveAxis, ...] = tuple(CollectiveAxis),
@@ -2809,6 +2817,14 @@ def has_ordering_effect(op: Op) -> bool:
         has_ordering_effect(nested)
         for block in op.blocks
         for nested in block.ops
+    )
+
+
+def lock_has_tma_multicast(lock: Value) -> bool:
+    """Whether this specific lock coordinates a multicast TMA async group."""
+    return any(
+        isinstance(user, AsyncOp) and user.is_tma_multicast
+        for user in lock.users()
     )
 
 
