@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -41,6 +42,8 @@ SUPPORTED_DTYPES = frozenset({"float16", "bfloat16"})
 MIN_GEMM_TILE = 64
 SPLIT_K_REDUCTION_PRESSURE_THRESHOLD = 32
 MIN_OUTPUT_TILES_WITHOUT_SPLIT_K = 128
+NEAR_FULL_OUTPUT_TILES_WITHOUT_SPLIT_K = 256
+NEAR_FULL_REDUCTION_PRESSURE_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -100,13 +103,13 @@ class Validation:
 
 @dataclass(frozen=True, kw_only=True)
 class ScheduleConfig:
-    """Every configurable knob on the static GEMM builder.
+    """Search policy for one static GEMM schedule.
 
     Cache attributes are flattened here so CSV output remains useful.  They
     are expanded back into ``operand_move_attrs`` by :meth:`builder_kwargs`.
-    Multicast, two-dimensional workgroup geometry, and exact CTA assignment are
-    recorded explicitly so the raw results and generated heuristic document
-    preserve every builder knob used by the search.
+    Cluster geometry, flattened CTA traversal, and historical fast-axis fields
+    are benchmark policy rather than GEMM-builder APIs; ``_make_ayla_config``
+    composes those from kernel dimensions and generic tiling passes.
     """
 
     name: str
@@ -123,18 +126,35 @@ class ScheduleConfig:
     lhs_l2_cache_hint: str
     rhs_l2_cache_hint: str
     dst_l2_cache_hint: str
+    wgmma_group_size: int | None = None
+    output_n_tiles_per_cta: int = 1
     lhs_l2_promotion: str | None = None
+    rhs_l2_promotion: str | None = None
     ptx_optimization_level: int | None = None
     multicast: bool = False
     unsafe_reuse_smem: bool = False
     warpgroup_m_tile: int | None = None
+    # Historical-result compatibility only. The library uses its established
+    # repeated-binding order and new searches must not vary this field.
     warpgroup_fast_axis: str = "n"
     cluster_m_ctas: int = 1
     cluster_n_ctas: int = 1
     output_cta_count: int | None = None
     output_tile_fast_axis: str = "n"
+    swap_output_grid_axes: bool = False
     unroll_output_tiles: bool = True
     rhs_tma_load_slices: int | None = None
+    wgmma_pending_groups: int = 0
+    wgmma_epilogue_pipeline: bool = False
+    cyclic_operand_pipeline: bool = False
+    # Benchmark policy: rerun the existing async scheduler after all optional
+    # WGMMA transforms. This is selected per measured configuration rather
+    # than imposed by the GEMM builder because the final issue order is
+    # performance-sensitive.
+    reschedule_async: bool = False
+    # Compute C^T = B A^T and write C through stmatrix.trans. Every tile,
+    # warpgroup, and lhs/rhs field then describes the swapped (N, M) problem.
+    transpose_output: bool = False
 
     def builder_kwargs(self) -> dict[str, object]:
         if self.multicast and (self.cluster_m_ctas > 1) == (self.cluster_n_ctas > 1):
@@ -147,36 +167,39 @@ class ScheduleConfig:
         rhs: dict[str, object] = {"l2_cache_hint": self.rhs_l2_cache_hint}
         if self.lhs_l2_promotion is not None:
             lhs["l2_promotion"] = self.lhs_l2_promotion
+        if self.rhs_l2_promotion is not None:
+            rhs["l2_promotion"] = self.rhs_l2_promotion
         if self.cluster_n_ctas > 1:
             lhs["multicast"] = True
         if self.cluster_m_ctas > 1:
             rhs["multicast"] = True
         return {
-            "output_tiles_per_cta": self.output_tiles_per_cta,
-            "output_cta_count": self.output_cta_count,
-            "unroll_output_tiles": self.unroll_output_tiles,
-            "output_tile_fast_axis": self.output_tile_fast_axis,
+            "output_m_tiles_per_cta": self.output_tiles_per_cta,
+            "output_n_tiles_per_cta": self.output_n_tiles_per_cta,
+            "output_grid_axes": (
+                ("Y", "X") if self.swap_output_grid_axes else ("X", "Y")
+            ),
             "output_m_tile": self.output_m_tile,
             "output_n_tile": self.output_n_tile,
             "warpgroup_m_tile": self.warpgroup_m_tile,
             "warpgroup_n_tile": self.warpgroup_n_tile,
-            "warpgroup_fast_axis": self.warpgroup_fast_axis,
-            "cluster_m_ctas": self.cluster_m_ctas,
-            "cluster_n_ctas": self.cluster_n_ctas,
             "operand_stages": self.operand_stages,
             "operand_k_tile": self.operand_k_tile,
-            "rhs_tma_load_slices": self.rhs_tma_load_slices,
+            "wgmma_group_size": self.wgmma_group_size,
+            "wgmma_pending_groups": self.wgmma_pending_groups,
+            "wgmma_epilogue_pipeline": self.wgmma_epilogue_pipeline,
+            "cyclic_operand_pipeline": self.cyclic_operand_pipeline,
             "output_slices": self.output_slices,
             "output_store_buffers": self.output_store_buffers,
             "output_tma_inner_size": self.output_tma_inner_size,
             "output_store": self.output_store,
-            "unsafe_reuse_smem": self.unsafe_reuse_smem,
             "operand_move_attrs": {
                 "lhs": lhs,
                 "rhs": rhs,
                 "dst": {"l2_cache_hint": self.dst_l2_cache_hint},
             },
             "ptx_optimization_level": self.ptx_optimization_level,
+            "transpose_output": self.transpose_output,
         }
 
 
@@ -269,10 +292,15 @@ def source_layout(shape: Shape) -> str:
 def validate_shape(shape: Shape) -> Validation:
     """Classify one shape before any module construction or GPU allocation."""
     reasons: list[tuple[str, str]] = []
-    if shape.batch is not None or shape.op == "bmm":
-        reasons.append(("batching", "batched GEMM is not implemented"))
-    elif shape.op != "mm":
+    if shape.op not in ("mm", "addmm", "bmm"):
         reasons.append(("op", f"{shape.op} semantics are not implemented"))
+    if shape.op == "bmm" and (shape.batch is None or shape.batch <= 1):
+        reasons.append((
+            "batch",
+            "canonical BMM evaluation requires a batch dimension greater than 1",
+        ))
+    elif shape.op != "bmm" and shape.batch is not None:
+        reasons.append(("batching", "unexpected batch dimension"))
 
     if shape.dtype not in SUPPORTED_DTYPES:
         reasons.append((
@@ -288,6 +316,8 @@ def validate_shape(shape: Shape) -> Validation:
             (shape.m + MIN_GEMM_TILE - 1) // MIN_GEMM_TILE
             * ((shape.n + MIN_GEMM_TILE - 1) // MIN_GEMM_TILE)
         )
+        if shape.op == "bmm" and shape.batch is not None:
+            output_tiles *= shape.batch
         reduction_tiles = (
             shape.k + MIN_GEMM_TILE - 1
         ) // MIN_GEMM_TILE
@@ -299,8 +329,17 @@ def validate_shape(shape: Shape) -> Validation:
             output_tiles < MIN_OUTPUT_TILES_WITHOUT_SPLIT_K
             and reduction_tiles >= output_tiles
         )
-        needs_split_k = high_reduction_pressure or underfilled_deep_reduction
-        if shape.op == "mm" and needs_split_k:
+        near_full_deep_reduction = (
+            output_tiles < NEAR_FULL_OUTPUT_TILES_WITHOUT_SPLIT_K
+            and reduction_tiles
+            >= NEAR_FULL_REDUCTION_PRESSURE_THRESHOLD * output_tiles
+        )
+        needs_split_k = (
+            high_reduction_pressure
+            or underfilled_deep_reduction
+            or near_full_deep_reduction
+        )
+        if shape.op in ("mm", "addmm", "bmm") and needs_split_k:
             reasons.append((
                 "split_k",
                 "temporarily skipped: reduction pressure is "
@@ -308,7 +347,11 @@ def validate_shape(shape: Shape) -> Validation:
                 f"across {output_tiles} output tiles; an "
                 "efficient kernel requires split-K/Stream-K",
             ))
-    if shape.op == "mm" and positive_dimensions and shape.m < MIN_GEMM_TILE:
+    if (
+        shape.op in ("mm", "addmm", "bmm")
+        and positive_dimensions
+        and shape.m < MIN_GEMM_TILE
+    ):
         reasons.append((
             "small_m",
             f"M={shape.m} is below the current WGMMA M tile ({MIN_GEMM_TILE})",
@@ -319,6 +362,26 @@ def validate_shape(shape: Shape) -> Validation:
         or shape.args[1].shape != (shape.k, shape.n)
     ):
         reasons.append(("shape", "operand shapes do not agree with M, N, and K"))
+    if shape.op == "addmm" and (
+        len(shape.args) != 3
+        or shape.args[0].shape != (shape.n,)
+        or shape.args[1].shape != (shape.m, shape.k)
+        or shape.args[2].shape != (shape.k, shape.n)
+    ):
+        reasons.append((
+            "shape",
+            "addmm requires a vector-N bias and operands agreeing with M/N/K",
+        ))
+    if shape.op == "bmm" and (
+        shape.batch is None
+        or len(shape.args) != 2
+        or shape.args[0].shape != (shape.batch, shape.m, shape.k)
+        or shape.args[1].shape != (shape.batch, shape.k, shape.n)
+    ):
+        reasons.append((
+            "shape",
+            "bmm operands must have shapes [B,M,K] and [B,K,N]",
+        ))
     alignment = []
     if shape.k % 64:
         alignment.append(
@@ -351,26 +414,47 @@ def benchmark_shapes(validations: Iterable[Validation]) -> list[Shape]:
     ``BT`` because those are the physical operands accepted by Ayla.
     """
     accepted = [item.shape for item in validations if item.supported]
-    counts: Counter[tuple[int, int, int, str]] = Counter()
-    suites: defaultdict[tuple[int, int, int, str], set[str]] = defaultdict(set)
-    records: Counter[tuple[int, int, int, str]] = Counter()
+    counts: Counter[tuple[str, int | None, int, int, int, str]] = Counter()
+    suites: defaultdict[
+        tuple[str, int | None, int, int, int, str], set[str]
+    ] = defaultdict(set)
+    records: Counter[
+        tuple[str, int | None, int, int, int, str]
+    ] = Counter()
     for shape in accepted:
-        key = (shape.m, shape.n, shape.k, shape.dtype)
+        key = (
+            shape.op, shape.batch, shape.m, shape.n, shape.k, shape.dtype,
+        )
         counts[key] += shape.count
         suites[key].update(shape.suites)
         records[key] += shape.source_records
 
     result = []
-    for (m, n, k, dtype), count in counts.items():
-        result.append(Shape(
-            op="mm", batch=None, m=m, n=n, k=k,
-            args=(
+    for (op, batch, m, n, k, dtype), count in counts.items():
+        matrix_args = (
+            (
+                TensorSpec(
+                    shape=(batch, m, k), stride=(m * k, k, 1), dtype=dtype,
+                ),
+                TensorSpec(
+                    shape=(batch, n, k), stride=(n * k, k, 1), dtype=dtype,
+                ),
+            )
+            if op == "bmm" and batch is not None
+            else (
                 TensorSpec(shape=(m, k), stride=(k, 1), dtype=dtype),
                 TensorSpec(shape=(k, n), stride=(1, k), dtype=dtype),
-            ),
+            )
+        )
+        result.append(Shape(
+            op=op, batch=batch, m=m, n=n, k=k,
+            args=(
+                (TensorSpec(shape=(n,), stride=(1,), dtype=dtype),)
+                if op == "addmm" else ()
+            ) + matrix_args,
             count=count,
-            suites=tuple(sorted(suites[m, n, k, dtype])),
-            source_records=records[m, n, k, dtype],
+            suites=tuple(sorted(suites[op, batch, m, n, k, dtype])),
+            source_records=records[op, batch, m, n, k, dtype],
         ))
     result.sort(key=lambda shape: (-shape.count, shape.shape_id))
     return result
@@ -395,6 +479,34 @@ def validation_row(validation: Validation) -> dict[str, object]:
         "suites": list(shape.suites),
         "source_records": shape.source_records,
     }
+
+
+def timing_protocol(rows: Iterable[dict[str, Any]], source: object) -> str:
+    """The one timing protocol behind measured rows.
+
+    Rows written before the protocol was recorded are ``"legacy"``: timed hot,
+    or after a flush that L2-pinned operands survive.
+    """
+    protocols = {
+        str(row.get("timing_protocol", "legacy"))
+        for row in rows if row.get("latency_ms") is not None
+    }
+    if len(protocols) > 1:
+        raise ValueError(f"{source}: mixes timing protocols {sorted(protocols)}")
+    return protocols.pop() if protocols else "unmeasured"
+
+
+def require_same_timing(*sources: tuple[object, Iterable[dict[str, Any]]]) -> None:
+    """Raise unless every measured row in every source shares one protocol."""
+    found = {
+        name: timing_protocol(rows, name) for name, rows in sources
+    }
+    measured = set(found.values()) - {"unmeasured"}
+    if len(measured) > 1:
+        raise ValueError(
+            "results timed under different protocols are not comparable: "
+            + ", ".join(f"{name}={value}" for name, value in found.items())
+        )
 
 
 def write_json(rows: list[dict[str, object]], output: Path) -> None:
@@ -471,9 +583,11 @@ def _config(
     name: str,
     *,
     output_tiles_per_cta: int = 1,
+    output_n_tiles_per_cta: int = 1,
     output_cta_count: int | None = None,
     unroll_output_tiles: bool = True,
     output_tile_fast_axis: str = "n",
+    swap_output_grid_axes: bool = False,
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_m_tile: int | None = None,
@@ -484,7 +598,12 @@ def _config(
     multicast: bool = False,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
+    wgmma_group_size: int | None = None,
     rhs_tma_load_slices: int | None = None,
+    wgmma_pending_groups: int = 0,
+    wgmma_epilogue_pipeline: bool = False,
+    cyclic_operand_pipeline: bool = False,
+    reschedule_async: bool = False,
     output_slices: int = 1,
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
@@ -494,14 +613,17 @@ def _config(
     rhs_l2_cache_hint: str = "evict_first",
     dst_l2_cache_hint: str = "evict_first",
     lhs_l2_promotion: str | None = None,
+    rhs_l2_promotion: str | None = None,
     ptx_optimization_level: int | None = None,
 ) -> ScheduleConfig:
     return ScheduleConfig(
         name=name,
         output_tiles_per_cta=output_tiles_per_cta,
+        output_n_tiles_per_cta=output_n_tiles_per_cta,
         output_cta_count=output_cta_count,
         unroll_output_tiles=unroll_output_tiles,
         output_tile_fast_axis=output_tile_fast_axis,
+        swap_output_grid_axes=swap_output_grid_axes,
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
         warpgroup_m_tile=warpgroup_m_tile,
@@ -513,7 +635,12 @@ def _config(
         cluster_n_ctas=cluster_n_ctas,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
+        wgmma_group_size=wgmma_group_size,
         rhs_tma_load_slices=rhs_tma_load_slices,
+        wgmma_pending_groups=wgmma_pending_groups,
+        wgmma_epilogue_pipeline=wgmma_epilogue_pipeline,
+        cyclic_operand_pipeline=cyclic_operand_pipeline,
+        reschedule_async=reschedule_async,
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,
@@ -523,6 +650,7 @@ def _config(
         rhs_l2_cache_hint=rhs_l2_cache_hint,
         dst_l2_cache_hint=dst_l2_cache_hint,
         lhs_l2_promotion=lhs_l2_promotion,
+        rhs_l2_promotion=rhs_l2_promotion,
         ptx_optimization_level=ptx_optimization_level,
         multicast=multicast,
     )
@@ -579,17 +707,13 @@ def seed_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
             warpgroup_n_tile=128, operand_stages=4,
             cluster_n_ctas=4, multicast=True,
         )
-        wg2d_nfast = _config(
-            "seed_huge_m_wg2d_m128_n256_wn128_nfast",
+        wg2d = _config(
+            "seed_huge_m_wg2d_m128_n256_wn128",
             output_m_tile=128, output_n_tile=256,
             warpgroup_m_tile=64, warpgroup_n_tile=128,
-            warpgroup_fast_axis="n", operand_stages=3,
+            operand_stages=3,
         )
-        return multicast_n4, replace(
-            wg2d_nfast,
-            name="seed_huge_m_wg2d_m128_n256_wn128_mfast",
-            warpgroup_fast_axis="m",
-        ), wg2d_nfast
+        return multicast_n4, wg2d
 
     if (
         shape.m >= 8192
@@ -597,21 +721,16 @@ def seed_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
         and shape.k <= 2048
         and shape.m % 128 == 0
     ):
-        wg2d_nfast = _config(
-            "seed_tall_narrow_wg2d_m128_n256_wn128_nfast",
+        wg2d = _config(
+            "seed_tall_narrow_wg2d_m128_n256_wn128",
             output_m_tile=128, output_n_tile=256,
             warpgroup_m_tile=64, warpgroup_n_tile=128,
-            warpgroup_fast_axis="n", operand_stages=3,
+            operand_stages=3,
         )
-        return wg2d_nfast, replace(
-            wg2d_nfast,
-            name="seed_tall_narrow_wg2d_m128_n256_wn128_mfast",
-            warpgroup_fast_axis="m",
-        ), replace(
-            wg2d_nfast,
-            name="seed_tall_narrow_wg2d_m128_n256_wn64_mfast",
+        return wg2d, replace(
+            wg2d,
+            name="seed_tall_narrow_wg2d_m128_n256_wn64",
             warpgroup_n_tile=64,
-            warpgroup_fast_axis="m",
         )
 
     if (
@@ -724,6 +843,87 @@ def seed_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
         ))
     else:
         configs.append(scalar_k2)
+    return tuple(configs)
+
+
+def bmm_tuning_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
+    """Compact BMM search over native GEMM scheduling controls.
+
+    Batch already supplies independent CTA work, so this search concentrates
+    on one-output-tile CTAs, writeback width, K staging, and the operand with
+    reuse along the larger per-batch output dimension.  These are ordinary
+    :class:`ScheduleConfig` values; BMM does not require a scheduling pass.
+    """
+    if shape.op != "bmm":
+        return ()
+
+    if shape.n <= 48:
+        n_tiles = (48,)
+    elif shape.n <= 64:
+        n_tiles = (48, shape.n)
+    elif shape.n <= 192:
+        n_tiles = tuple(sorted({64, min(shape.n, 96), min(shape.n, 128)}))
+    else:
+        n_tiles = (64, 128, min(shape.n, 256))
+
+    configs: list[ScheduleConfig] = []
+    seen: set[tuple[object, ...]] = set()
+
+    def add(config: ScheduleConfig) -> None:
+        estimated_smem = (
+            2
+            * (config.output_m_tile + config.output_n_tile)
+            * config.operand_k_tile
+            * config.operand_stages
+            + 2 * config.output_m_tile * config.output_n_tile
+        )
+        key = tuple(
+            value for field, value in asdict(config).items()
+            if field != "name"
+        )
+        if estimated_smem <= 225 * 1024 and key not in seen:
+            seen.add(key)
+            configs.append(config)
+
+    for m_tile in (64, 128):
+        if m_tile > shape.m and m_tile != 64:
+            continue
+        for n_tile in n_tiles:
+            for k_tile, stages_options in ((64, (2, 4)), (128, (3, 6))):
+                if shape.k % k_tile:
+                    continue
+                for stages in stages_options:
+                    stem = f"bmm_m{m_tile}_n{n_tile}_k{k_tile}_s{stages}"
+                    base = _config(
+                        stem,
+                        output_m_tile=m_tile,
+                        output_n_tile=n_tile,
+                        warpgroup_n_tile=n_tile,
+                        operand_k_tile=k_tile,
+                        operand_stages=stages,
+                        output_tma_inner_size=(
+                            128
+                            if shape.n % 64 == 0
+                            and n_tile >= 128 and n_tile % 128 == 0
+                            else None
+                        ),
+                        output_store=(
+                            "stmatrix" if shape.n % 64 == 0 else "scalar"
+                        ),
+                    )
+                    add(base)
+                    for operand in ("lhs", "rhs"):
+                        add(replace(
+                            base,
+                            name=f"{stem}_{operand}_keep",
+                            **{f"{operand}_l2_cache_hint": "evict_last"},
+                        ))
+                    if shape.k // k_tile > stages:
+                        add(replace(
+                            base,
+                            name=f"{stem}_cyclic",
+                            cyclic_operand_pipeline=True,
+                        ))
     return tuple(configs)
 
 
@@ -1159,20 +1359,208 @@ def cublas_inspired_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
     return tuple(configs)
 
 
-def resource_tuning_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
-    """Sweep output tile shape, pipeline depth, and proven SMEM reuse cases."""
-    configs = [
-        _config(
-            f"reuse_m64_n{n_tile}_k64_s{stages}",
-            output_m_tile=64, output_n_tile=n_tile,
-            warpgroup_n_tile=n_tile, operand_stages=stages,
-            output_tma_inner_size=None,
-            unsafe_reuse_smem=True,
+def tail_end_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
+    """Target the remaining low-ratio regimes using existing schedule knobs.
+
+    These are benchmark policies, not new compiler features.  The deep-K
+    family tests the 64x64/80/96, 8--13-stage geometries visible in saved
+    cuBLAS NCU reports, including safe WGMMA overlap and one-dimensional
+    compute-WG splits.  The tall family tests the largest geometry that fits
+    without operand/output SMEM overlay.  The wide family fills the gap around
+    the measured N=152 winner.  Unsafe reuse, cluster width eight, and 2-D
+    clusters are intentionally absent.
+    """
+    configs: list[ScheduleConfig] = []
+
+    def fits(config: ScheduleConfig) -> bool:
+        estimated_smem = (
+            2
+            * (config.output_m_tile + config.output_n_tile)
+            * config.operand_k_tile
+            * config.operand_stages
+            + 2
+            * config.output_m_tile
+            * config.output_n_tile
+            * config.output_store_buffers
         )
-        for n_tile in (64, 80, 96)
-        for stages in (2, 3, 4, 5, 6)
-        if shape.n >= n_tile
-    ]
+        return estimated_smem <= 225 * 1024
+
+    if shape.m <= 2048 and shape.k >= 2048:
+        deep_specs = (
+            (64, range(9, 14)),
+            (80, range(8, 12)),
+            (96, range(8, 11)),
+        )
+        for n_tile, stages_options in deep_specs:
+            if shape.n < n_tile:
+                continue
+            group_counts = tuple(
+                groups for groups in (1, 2, 3, 4)
+                if n_tile % groups == 0
+                and n_tile // groups >= 16
+                and (n_tile // groups) % 8 == 0
+            )
+            for stages in stages_options:
+                for groups in group_counts:
+                    wg_n = n_tile // groups
+                    base = _config(
+                        f"taildeep_m64_n{n_tile}_wg{groups}_s{stages}",
+                        output_m_tile=64,
+                        output_n_tile=n_tile,
+                        warpgroup_n_tile=wg_n,
+                        operand_k_tile=64,
+                        operand_stages=stages,
+                        output_store=("stmatrix" if groups == 1 else "scalar"),
+                        output_tma_inner_size=(
+                            64 if groups == 1 and n_tile == 64 else None
+                        ),
+                    )
+                    if not fits(base):
+                        continue
+                    configs.extend((
+                        base,
+                        replace(
+                            base,
+                            name=f"taildeep_pending1_{base.name}",
+                            wgmma_pending_groups=1,
+                        ),
+                        replace(
+                            base,
+                            name=f"taildeep_cyclic_{base.name}",
+                            cyclic_operand_pipeline=True,
+                        ),
+                    ))
+
+                if (n_tile, stages) not in ((64, 13), (96, 10)):
+                    continue
+                m_tiles = (shape.m + 63) // 64
+                n_tiles = (shape.n + n_tile - 1) // n_tile
+                for axis, extent in (("m", m_tiles), ("n", n_tiles)):
+                    for cluster in (2, 4):
+                        if extent % cluster:
+                            continue
+                        clustered = _config(
+                            f"taildeep_cluster_{axis}{cluster}_m64_n{n_tile}_"
+                            f"s{stages}",
+                            output_m_tile=64,
+                            output_n_tile=n_tile,
+                            warpgroup_n_tile=n_tile,
+                            operand_k_tile=64,
+                            operand_stages=stages,
+                            cluster_m_ctas=(cluster if axis == "m" else 1),
+                            cluster_n_ctas=(cluster if axis == "n" else 1),
+                            multicast=True,
+                            output_tma_inner_size=(
+                                64 if n_tile == 64 else None
+                            ),
+                        )
+                        if fits(clustered):
+                            configs.append(clustered)
+
+    if shape.m >= 8192 and shape.k <= 1024:
+        tall_specs = (
+            (192, 128, (2, 3, 4)),
+            (192, 160, (2, 3)),
+            (192, 192, (2, 3)),
+            (256, 128, (2, 3)),
+            (256, 160, (2,)),
+            (256, 192, (2,)),
+        )
+        for m_tile, n_tile, stages_options in tall_specs:
+            if shape.n < n_tile:
+                continue
+            m_tiles = (shape.m + m_tile - 1) // m_tile
+            n_tiles = (shape.n + n_tile - 1) // n_tile
+            for stages in stages_options:
+                ordinary = _config(
+                    f"tailtall_m{m_tile}_n{n_tile}_s{stages}",
+                    output_m_tile=m_tile,
+                    output_n_tile=n_tile,
+                    warpgroup_n_tile=n_tile,
+                    operand_k_tile=64,
+                    operand_stages=stages,
+                    output_slices=2,
+                    output_tma_inner_size=(128 if n_tile == 128 else None),
+                )
+                if not fits(ordinary):
+                    continue
+                configs.append(ordinary)
+                for cta_count in (128, 132):
+                    for fast_axis in ("m", "n"):
+                        configs.append(replace(
+                            ordinary,
+                            name=(
+                                f"tailtall_c{cta_count}_{fast_axis}_"
+                                f"m{m_tile}_n{n_tile}_s{stages}"
+                            ),
+                            output_cta_count=cta_count,
+                            output_tile_fast_axis=fast_axis,
+                            unroll_output_tiles=False,
+                        ))
+
+                configs.append(replace(
+                    ordinary,
+                    name=f"tailtall_wgm64_m{m_tile}_n{n_tile}_s{stages}",
+                    warpgroup_m_tile=64,
+                ))
+                for axis, extent in (("m", m_tiles), ("n", n_tiles)):
+                    if extent % 2:
+                        continue
+                    configs.append(replace(
+                        ordinary,
+                        name=(
+                            f"tailtall_cluster_{axis}2_m{m_tile}_n{n_tile}_"
+                            f"s{stages}"
+                        ),
+                        cluster_m_ctas=(2 if axis == "m" else 1),
+                        cluster_n_ctas=(2 if axis == "n" else 1),
+                        multicast=True,
+                    ))
+
+    if shape.m <= 1024 and shape.n >= 8192 and shape.k <= 2048:
+        for m_tile in (64, 128, 192, 256):
+            if shape.m < m_tile:
+                continue
+            for n_tile in (128, 160, 192, 208, 256, 320, 384):
+                if shape.n < n_tile:
+                    continue
+                for stages in (2, 3, 4):
+                    base = _config(
+                        f"tailwide_m{m_tile}_n{n_tile}_s{stages}",
+                        output_m_tile=m_tile,
+                        output_n_tile=n_tile,
+                        warpgroup_n_tile=(n_tile if n_tile <= 256 else 128),
+                        operand_k_tile=64,
+                        operand_stages=stages,
+                        output_slices=(2 if n_tile % 16 == 0 else 1),
+                        output_tma_inner_size=(
+                            128 if n_tile % 64 == 0 else None
+                        ),
+                    )
+                    if fits(base) and n_tile % base.warpgroup_n_tile == 0:
+                        configs.extend((
+                            base,
+                            replace(
+                                base,
+                                name=f"tailwide_cyclic_{base.name}",
+                                cyclic_operand_pipeline=True,
+                            ),
+                        ))
+
+    unique: dict[tuple[object, ...], ScheduleConfig] = {}
+    for config in configs:
+        values = tuple(
+            getattr(config, field.name)
+            for field in fields(ScheduleConfig)
+            if field.name != "name"
+        )
+        unique.setdefault(values, config)
+    return tuple(unique.values())
+
+
+def resource_tuning_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
+    """Sweep output tile shape and pipeline depth within the SMEM budget."""
+    configs: list[ScheduleConfig] = []
     tile_specs = [
         (128, 152, stages) for stages in (2, 3, 4)
     ]
@@ -1242,7 +1630,11 @@ def coarse_tile_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
 
 
 def two_dimensional_wg_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
-    """A bounded ablation of the existing linearized workgroup-tiling design."""
+    """A bounded probe of the existing linearized workgroup-tiling design.
+
+    TileMatmul's established repeated-binding order is used. The discarded
+    warpgroup fast-axis knob produced duplicate IR and no selected benefit.
+    """
     specs: list[tuple[int, int, int, int, int, int]] = [
         (128, 128, 64, 64, 64, 3),
         (128, 128, 64, 64, 64, 4),
@@ -1255,19 +1647,17 @@ def two_dimensional_wg_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
     return tuple(
         _config(
             f"wg2d_m{m_tile}_n{n_tile}_wm{wg_m}_wn{wg_n}_"
-            f"k{k_tile}_s{stages}_{fast}fast",
+            f"k{k_tile}_s{stages}",
             output_m_tile=m_tile,
             output_n_tile=n_tile,
             warpgroup_m_tile=wg_m,
             warpgroup_n_tile=wg_n,
-            warpgroup_fast_axis=fast,
             operand_k_tile=k_tile,
             operand_stages=stages,
             output_slices=1,
             output_tma_inner_size=(128 if n_tile in (128, 256) else None),
         )
         for m_tile, n_tile, wg_m, wg_n, k_tile, stages in specs
-        for fast in ("m", "n")
         if shape.m % m_tile == 0 and shape.n % n_tile == 0
     )
 
@@ -1301,6 +1691,616 @@ def multicast_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
                     multicast=True,
                 ))
     return tuple(configs)
+
+
+def multicast_ablation_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
+    """Paired local/cluster schedules for a bounded multicast sweep.
+
+    Unlike :func:`multicast_configs`, this includes an otherwise-identical
+    non-clustered control for every tile/mainloop geometry.  The broader tile
+    set deliberately covers balanced, tall, wide, deep-K, and partial-edge
+    workloads without turning the experiment into a full combinatorial search.
+    """
+    specs = (
+        # m, n, k, stages
+        (64, 64, 128, 3),
+        (64, 96, 64, 5),
+        (64, 128, 64, 4),
+        (128, 64, 64, 4),
+        (128, 128, 64, 2),
+        (128, 128, 64, 3),
+        (128, 128, 64, 4),
+        (128, 256, 64, 3),
+    )
+    configs: list[ScheduleConfig] = []
+    aspect = (
+        "tall" if shape.m >= 4 * shape.n
+        else "wide" if shape.n >= 4 * shape.m
+        else "balanced"
+    )
+    for m_tile, n_tile, k_tile, stages in specs:
+        if (
+            shape.m < m_tile
+            or shape.n < n_tile
+            or shape.k % k_tile
+            or shape.k // k_tile < stages
+        ):
+            continue
+        estimated_smem = (
+            2 * (m_tile + n_tile) * k_tile * stages
+            + 2 * m_tile * n_tile
+        )
+        if estimated_smem > 225 * 1024:
+            continue
+        if aspect == "tall" and m_tile < n_tile:
+            continue
+        if aspect == "wide" and n_tile < m_tile:
+            continue
+        m_ctas = math.ceil(shape.m / m_tile)
+        n_ctas = math.ceil(shape.n / n_tile)
+        clustered: list[ScheduleConfig] = []
+        for axis, extent in (("m", m_ctas), ("n", n_ctas)):
+            dominant_axis = (
+                (aspect == "tall" and axis == "m")
+                or (aspect == "wide" and axis == "n")
+            )
+            cluster_sizes = (
+                (2, 4)
+                if dominant_axis
+                or (
+                    aspect == "balanced"
+                    and (m_tile, n_tile, k_tile, stages)
+                    == (128, 128, 64, 3)
+                )
+                else (2,)
+            )
+            for cluster in cluster_sizes:
+                if extent % cluster:
+                    continue
+                clustered.append(_config(
+                    f"mc_ablate_{axis}{cluster}_m{m_tile}_n{n_tile}_"
+                    f"k{k_tile}_s{stages}",
+                    output_m_tile=m_tile,
+                    output_n_tile=n_tile,
+                    warpgroup_n_tile=n_tile,
+                    operand_k_tile=k_tile,
+                    operand_stages=stages,
+                    output_slices=(2 if m_tile >= 192 else 1),
+                    output_tma_inner_size=(
+                        128 if n_tile in (64, 128, 256) else None
+                    ),
+                    cluster_m_ctas=(cluster if axis == "m" else 1),
+                    cluster_n_ctas=(cluster if axis == "n" else 1),
+                    multicast=True,
+                ))
+        if not clustered:
+            continue
+        configs.append(_config(
+            f"mc_ablate_local_m{m_tile}_n{n_tile}_k{k_tile}_s{stages}",
+            output_m_tile=m_tile,
+            output_n_tile=n_tile,
+            warpgroup_n_tile=n_tile,
+            operand_k_tile=k_tile,
+            operand_stages=stages,
+            output_slices=(2 if m_tile >= 192 else 1),
+            output_tma_inner_size=(
+                128 if n_tile in (64, 128, 256) else None
+            ),
+        ))
+        configs.extend(clustered)
+    return tuple(configs)
+
+
+def multicast_resweep_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Broad paired cluster sweep after the multicast synchronization fix.
+
+    Keep this as benchmark policy: every tile/mainloop point has an identical
+    local control, while the clustered variants vary only the cluster axis and
+    size. Deep reductions remain useful acceptance and search cases once the
+    multicast refill wait is off the compute path.
+    """
+    if max(shape.m, shape.n) < 512:
+        return ()
+
+    if shape.m >= 4 * shape.n:
+        tile_specs = (
+            (128, 64), (128, 96), (128, 128),
+            (192, 96), (192, 128),
+            (256, 96), (256, 128),
+        )
+    elif shape.n >= 4 * shape.m:
+        tile_specs = (
+            (64, 128), (128, 128),
+            (64, 192), (128, 192),
+            (64, 256), (128, 256),
+        )
+    else:
+        tile_specs = (
+            (64, 64), (64, 128), (128, 64), (128, 128),
+            (128, 192), (192, 128), (192, 192),
+            (128, 256), (256, 128),
+        )
+
+    def fits(config: ScheduleConfig) -> bool:
+        return (
+            shape.m >= config.output_m_tile
+            and shape.n >= config.output_n_tile
+            and shape.k % config.operand_k_tile == 0
+            and (
+                2
+                * (config.output_m_tile + config.output_n_tile)
+                * config.operand_k_tile
+                * config.operand_stages
+                + 2 * config.output_m_tile * config.output_n_tile
+                <= 225 * 1024
+            )
+        )
+
+    def variants(local: ScheduleConfig) -> list[ScheduleConfig]:
+        if not fits(local):
+            return []
+        result = [local]
+        m_tiles = math.ceil(shape.m / local.output_m_tile)
+        n_tiles = math.ceil(shape.n / local.output_n_tile)
+        if local.output_cta_count is None:
+            extents = (
+                ("m", math.ceil(m_tiles / local.output_tiles_per_cta)),
+                ("n", math.ceil(n_tiles / local.output_n_tiles_per_cta)),
+            )
+        else:
+            # A flattened launch has one physical grid axis. Adjacent CTAs
+            # vary only the logical fast axis, so only that operand reuse is
+            # a valid multicast cluster.
+            fast_extent = m_tiles if local.output_tile_fast_axis == "m" else n_tiles
+            extents = ((local.output_tile_fast_axis, fast_extent),)
+        for axis, extent in extents:
+            for cluster in (2, 4, 8):
+                if extent % cluster or (
+                    local.output_cta_count is not None
+                    and local.output_cta_count % cluster
+                ):
+                    continue
+                result.append(replace(
+                    local,
+                    name=(
+                        f"mc_resweep_{axis}{cluster}_"
+                        f"{local.name.removeprefix('mc_resweep_local_')}"
+                    ),
+                    cluster_m_ctas=(cluster if axis == "m" else 1),
+                    cluster_n_ctas=(cluster if axis == "n" else 1),
+                    multicast=True,
+                ))
+        return result
+
+    configs: list[ScheduleConfig] = []
+    incumbent = replace(
+        base,
+        name=f"mc_resweep_local_incumbent_{base.name}",
+        cluster_m_ctas=1,
+        cluster_n_ctas=1,
+        multicast=False,
+        unsafe_reuse_smem=False,
+    )
+    configs.extend(variants(incumbent))
+
+    for m_tile, n_tile in tile_specs:
+        k_stage_options = (
+            ((64, (2, 3, 4, 6, 8)), (128, (2, 3, 4)))
+            if shape.k > 2048
+            else ((64, (2, 3, 4)), (128, (2, 3)))
+        )
+        for k_tile, stages_options in k_stage_options:
+            for stages in stages_options:
+                local = _config(
+                    f"mc_resweep_local_m{m_tile}_n{n_tile}_"
+                    f"k{k_tile}_s{stages}",
+                    output_m_tile=m_tile,
+                    output_n_tile=n_tile,
+                    warpgroup_n_tile=n_tile,
+                    operand_k_tile=k_tile,
+                    operand_stages=stages,
+                    output_slices=(2 if m_tile >= 192 else 1),
+                    output_tma_inner_size=(
+                        128 if n_tile in (64, 128, 256) else None
+                    ),
+                    lhs_l2_cache_hint="evict_last",
+                    rhs_l2_cache_hint="evict_last",
+                    dst_l2_cache_hint="evict_first",
+                )
+                configs.extend(variants(local))
+
+    unique: dict[tuple[object, ...], ScheduleConfig] = {}
+    for config in configs:
+        key = tuple(
+            getattr(config, field.name)
+            for field in fields(ScheduleConfig)
+            if field.name != "name"
+        )
+        unique.setdefault(key, config)
+    return tuple(unique.values())
+
+
+def multicast_winner_transfer_configs(
+    shape: Shape,
+) -> tuple[ScheduleConfig, ...]:
+    """Transfer confirmed cluster-2 schedule families with local controls.
+
+    The source configurations won on tall, wide, and square MM shapes.  Keep
+    this experiment paired: each cluster candidate differs from an emitted
+    local schedule only by its cluster axis/size and multicast bit.
+    """
+    large_output_axis = max(shape.m, shape.n) >= 8192
+    substantial_square = (
+        min(shape.m, shape.n) >= 512
+        and max(shape.m, shape.n) <= 2 * min(shape.m, shape.n)
+    )
+    if (
+        shape.k > 2048
+        or shape.k % 64
+        or not (large_output_axis or substantial_square)
+        or shape.m < 64
+        or shape.n < 64
+    ):
+        return ()
+
+    # m tile, n tile, stages, LHS hint, swapped grid, M tiles/CTA.
+    families = (
+        (64, 64, 2, "evict_last", True, 1),
+        (128, 64, 2, "evict_last", True, 1),
+        (128, 64, 3, "evict_last", True, 1),
+        (128, 64, 2, "evict_last", False, 4),
+        (128, 128, 2, "evict_first", False, 1),
+        (128, 128, 2, "evict_last", True, 1),
+        (128, 128, 3, "evict_last", True, 1),
+    )
+    configs: list[ScheduleConfig] = []
+    for m_tile, n_tile, stages, lhs_hint, swap, m_group in families:
+        if (
+            shape.m < m_tile
+            or shape.n < n_tile
+            or shape.n % 128
+        ):
+            continue
+        suffix = (
+            f"m{m_tile}_n{n_tile}_k64_s{stages}_"
+            f"l{'f' if lhs_hint == 'evict_first' else 'l'}_"
+            f"swap{int(swap)}_mg{m_group}"
+        )
+        local = _config(
+            f"mc_transfer_local_{suffix}",
+            output_m_tile=m_tile,
+            output_n_tile=n_tile,
+            warpgroup_n_tile=n_tile,
+            operand_k_tile=64,
+            operand_stages=stages,
+            output_tiles_per_cta=m_group,
+            output_tma_inner_size=128,
+            lhs_l2_cache_hint=lhs_hint,
+            rhs_l2_cache_hint="evict_last",
+            dst_l2_cache_hint="evict_first",
+            swap_output_grid_axes=swap,
+        )
+        configs.append(local)
+        extents = (
+            ("m", shape.m, m_tile * m_group),
+            ("n", shape.n, n_tile),
+        )
+        for axis, problem_extent, clustered_tile_extent in extents:
+            for cluster in (2, 4, 8):
+                if problem_extent % (clustered_tile_extent * cluster):
+                    continue
+                configs.append(replace(
+                    local,
+                    name=f"mc_transfer_{axis}{cluster}_{suffix}",
+                    cluster_m_ctas=(cluster if axis == "m" else 1),
+                    cluster_n_ctas=(cluster if axis == "n" else 1),
+                    multicast=True,
+                ))
+    return tuple(configs)
+
+
+def multicast_incumbent_neighborhood_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Co-tune clusters with incumbent and broad local scheduling controls.
+
+    This is benchmark search policy, not a new scheduler abstraction.  Every
+    clustered schedule is emitted with an otherwise-identical local control.
+    """
+    large_output_axis = max(shape.m, shape.n) >= 8192
+    substantial_square = (
+        min(shape.m, shape.n) >= 512
+        and max(shape.m, shape.n) <= 2 * min(shape.m, shape.n)
+    )
+    # Deep-K shapes are explicit multicast acceptance cases.  Keep them in
+    # the incumbent neighborhood now that refill waits run off the compute
+    # path; the old exclusion only reflected the broken handoff protocol.
+    if not (large_output_axis or substantial_square):
+        return ()
+
+    def key(config: ScheduleConfig) -> tuple[object, ...]:
+        return tuple(
+            getattr(config, field.name)
+            for field in fields(ScheduleConfig)
+            if field.name != "name"
+        )
+
+    def fits(config: ScheduleConfig) -> bool:
+        if (
+            shape.m < config.output_m_tile
+            or shape.n < config.output_n_tile
+            or shape.k % config.operand_k_tile
+            or config.output_n_tile % config.output_slices
+            or (config.output_n_tile // config.output_slices) % 8
+            or (
+                config.output_tma_inner_size is not None
+                and config.output_n_tile // config.output_slices < 64
+            )
+            or (
+                config.output_tiles_per_cta > 1
+                and config.output_n_tiles_per_cta > 1
+            )
+        ):
+            return False
+        logical_tiles = (
+            math.ceil(shape.m / config.output_m_tile)
+            * math.ceil(shape.n / config.output_n_tile)
+        )
+        if (
+            config.output_cta_count is not None
+            and logical_tiles < config.output_cta_count
+        ):
+            return False
+        smem = (
+            2
+            * (config.output_m_tile + config.output_n_tile)
+            * config.operand_k_tile
+            * config.operand_stages
+            + 2
+            * config.output_m_tile
+            * config.output_n_tile
+            * config.output_store_buffers
+        )
+        return config.unsafe_reuse_smem or smem <= 225 * 1024
+
+    local_by_key: dict[tuple[object, ...], ScheduleConfig] = {}
+
+    def add_local(config: ScheduleConfig) -> None:
+        local = replace(
+            config,
+            cluster_m_ctas=1,
+            cluster_n_ctas=1,
+            multicast=False,
+            unsafe_reuse_smem=False,
+        )
+        if fits(local):
+            local_by_key.setdefault(key(local), local)
+
+    base_local = replace(
+        base,
+        cluster_m_ctas=1,
+        cluster_n_ctas=1,
+        multicast=False,
+        unsafe_reuse_smem=False,
+    )
+    add_local(base_local)
+    cache_policies = (
+        ("evict_first", "evict_first", "evict_first"),
+        ("evict_last", "evict_last", "evict_first"),
+        ("evict_first", "evict_last", "evict_first"),
+        ("evict_last", "evict_first", "evict_first"),
+    )
+    for lhs_hint, rhs_hint, dst_hint in cache_policies:
+        add_local(replace(
+            base_local,
+            lhs_l2_cache_hint=lhs_hint,
+            rhs_l2_cache_hint=rhs_hint,
+            dst_l2_cache_hint=dst_hint,
+        ))
+    for stages in range(
+        max(2, base_local.operand_stages - 1),
+        min(8, base_local.operand_stages + 1) + 1,
+    ):
+        add_local(replace(base_local, operand_stages=stages))
+    if base_local.warpgroup_m_tile is None:
+        for slices in (1, 2, 4, 8):
+            for buffers in (1, slices):
+                add_local(replace(
+                    base_local,
+                    output_slices=slices,
+                    output_store_buffers=buffers,
+                ))
+    if base_local.output_cta_count is not None:
+        add_local(replace(
+            base_local,
+            output_tile_fast_axis=(
+                "m" if base_local.output_tile_fast_axis == "n" else "n"
+            ),
+        ))
+
+    if base_local.output_cta_count is None:
+        add_local(replace(
+            base_local,
+            swap_output_grid_axes=not base_local.swap_output_grid_axes,
+        ))
+
+    aspect = (
+        "tall" if shape.m >= 4 * shape.n
+        else "wide" if shape.n >= 4 * shape.m
+        else "balanced"
+    )
+    anchor_tiles = (
+        {(128, 64), (128, 128), (192, 128), (256, 128)}
+        if aspect == "tall"
+        else {(64, 128), (128, 128), (128, 192), (128, 256)}
+        if aspect == "wide"
+        else {
+            (64, 64), (64, 128), (128, 64), (128, 128),
+            (192, 192), (128, 256), (256, 128),
+        }
+    )
+    anchors = [
+        config
+        for config in multicast_resweep_configs(shape, base_local)
+        if (
+            not config.multicast
+            and "incumbent" not in config.name
+            and (config.output_m_tile, config.output_n_tile) in anchor_tiles
+            and (
+                (
+                    config.operand_k_tile == 64
+                    and config.operand_stages in (
+                        (2, 3, 6, 8) if shape.k > 2048 else (2, 3)
+                    )
+                )
+                or (
+                    config.operand_k_tile == 128
+                    and config.operand_stages == 2
+                    and shape.k >= 512
+                )
+            )
+        )
+    ]
+    for anchor in anchors:
+        for lhs_hint, rhs_hint, dst_hint in cache_policies:
+            cached = replace(
+                anchor,
+                lhs_l2_cache_hint=lhs_hint,
+                rhs_l2_cache_hint=rhs_hint,
+                dst_l2_cache_hint=dst_hint,
+            )
+            add_local(cached)
+            cold_policy = (
+                lhs_hint == "evict_last"
+                and rhs_hint == "evict_last"
+                and dst_hint == "evict_first"
+            )
+            if cold_policy:
+                add_local(replace(
+                    cached,
+                    swap_output_grid_axes=not cached.swap_output_grid_axes,
+                ))
+            canonical_anchor = (
+                cached.operand_k_tile == 64
+                and cached.operand_stages == 2
+                and (
+                    cached.output_m_tile,
+                    cached.output_n_tile,
+                ) in ((64, 128), (128, 64), (128, 128))
+            )
+            if not canonical_anchor or not cold_policy:
+                continue
+
+            group_axes = (
+                ("m",) if aspect == "tall"
+                else ("n",) if aspect == "wide"
+                else ("m", "n")
+            )
+            for axis in group_axes:
+                for group in (2, 4):
+                    grouped = replace(
+                        cached,
+                        output_tiles_per_cta=(group if axis == "m" else 1),
+                        output_n_tiles_per_cta=(
+                            group if axis == "n" else 1
+                        ),
+                    )
+                    add_local(grouped)
+                    add_local(replace(
+                        grouped,
+                        swap_output_grid_axes=(
+                            not grouped.swap_output_grid_axes
+                        ),
+                    ))
+
+            logical_tiles = (
+                math.ceil(shape.m / cached.output_m_tile)
+                * math.ceil(shape.n / cached.output_n_tile)
+            )
+            for cta_count in (128, 132):
+                if cta_count >= logical_tiles:
+                    continue
+                for fast_axis in ("m", "n"):
+                    add_local(replace(
+                        cached,
+                        output_tiles_per_cta=1,
+                        output_n_tiles_per_cta=1,
+                        output_cta_count=cta_count,
+                        output_tile_fast_axis=fast_axis,
+                        unroll_output_tiles=False,
+                    ))
+
+            for slices in (2, 4):
+                if (
+                    cached.output_n_tile % slices
+                    or (cached.output_n_tile // slices) % 8
+                ):
+                    continue
+                for buffers in (1, slices):
+                    sliced = replace(
+                        cached,
+                        output_slices=slices,
+                        output_store_buffers=buffers,
+                    )
+                    add_local(sliced)
+                    add_local(replace(
+                        sliced,
+                        swap_output_grid_axes=(
+                            not sliced.swap_output_grid_axes
+                        ),
+                    ))
+
+    results: dict[tuple[object, ...], ScheduleConfig] = {}
+    for local in local_by_key.values():
+        digest = hashlib.sha1(repr(key(local)).encode()).hexdigest()[:10]
+        named_local = replace(local, name=f"mc_nb_local_{digest}")
+        results.setdefault(key(named_local), named_local)
+
+        m_tiles = math.ceil(shape.m / local.output_m_tile)
+        n_tiles = math.ceil(shape.n / local.output_n_tile)
+        if local.output_cta_count is None:
+            extents = (
+                ("m", math.ceil(m_tiles / local.output_tiles_per_cta)),
+                ("n", math.ceil(n_tiles / local.output_n_tiles_per_cta)),
+            )
+        else:
+            fast_extent = (
+                m_tiles if local.output_tile_fast_axis == "m" else n_tiles
+            )
+            extents = ((local.output_tile_fast_axis, fast_extent),)
+        for axis, extent in extents:
+            full_cluster_sizes = (
+                (
+                    local.output_m_tile == base_local.output_m_tile
+                    and local.output_n_tile == base_local.output_n_tile
+                )
+                or (
+                    local.output_m_tile == 128
+                    and local.output_n_tile == 128
+                    and local.operand_k_tile == 64
+                    and local.operand_stages == 2
+                )
+            )
+            cluster_sizes = (2, 4, 8) if full_cluster_sizes else (2,)
+            for cluster in cluster_sizes:
+                if extent % cluster or (
+                    local.output_cta_count is not None
+                    and local.output_cta_count % cluster
+                ):
+                    continue
+                clustered = replace(
+                    local,
+                    name=f"mc_nb_{axis}{cluster}_{digest}",
+                    cluster_m_ctas=(cluster if axis == "m" else 1),
+                    cluster_n_ctas=(cluster if axis == "n" else 1),
+                    multicast=True,
+                )
+                results.setdefault(key(clustered), clustered)
+    return tuple(results.values())
 
 
 def pipeline_tile_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
@@ -1446,13 +2446,12 @@ def gap_tuning_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
     if shape.m % 128 == 0 and shape.n % 256 == 0:
         configs.extend(
             _config(
-                f"gap_wg2d_m128_n256_wn128_k64_s{stages}_{fast}fast",
+                f"gap_wg2d_m128_n256_wn128_k64_s{stages}",
                 output_m_tile=128, output_n_tile=256,
                 warpgroup_m_tile=64, warpgroup_n_tile=128,
-                warpgroup_fast_axis=fast, operand_stages=stages,
+                operand_stages=stages,
             )
             for stages in (2, 4)
-            for fast in ("m", "n")
         )
 
     for m_tile, n_tile, stages in (
@@ -1702,6 +2701,199 @@ def static_loop_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
     return tuple(configs)
 
 
+def small_cta_writeback_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
+    """All-compute one-WG schedules with fine-grained TMA writeback.
+
+    These schedules trade CTA-wide data reuse for 2--4 resident 128-thread
+    CTAs.  Sixteen- or thirty-two-column output slices keep each TMA store
+    small, while the extra resident CTAs hide the necessarily serialized
+    single-buffer writeback without assigning a warpgroup to producer work.
+    """
+    if shape.k % 64:
+        return ()
+
+    configs: list[ScheduleConfig] = []
+    for m_tile in (64, 128, 192):
+        if shape.m < m_tile:
+            continue
+        for n_tile in (64, 96, 128, 160, 192, 256):
+            if shape.n < n_tile or shape.n % n_tile:
+                continue
+            for slice_width in (16, 32):
+                if n_tile % slice_width:
+                    continue
+                slices = n_tile // slice_width
+                for stages in (2, 3):
+                    # Include the output arena and one KiB of launch/runtime
+                    # overhead when estimating Hopper residency.
+                    smem_bytes = (
+                        (m_tile + n_tile) * 64 * 2 * stages
+                        + m_tile * slice_width * 2
+                        + 1024
+                    )
+                    accumulator_regs = m_tile * n_tile // 128
+                    allocated_regs = (
+                        (accumulator_regs + 32 + 7) // 8 * 8
+                    )
+                    resident = min(
+                        4,
+                        232_448 // smem_bytes,
+                        65_536 // (allocated_regs * 128),
+                    )
+                    if resident < 2:
+                        continue
+                    ctas = 132 * resident
+                    logical_tiles = (
+                        math.ceil(shape.m / m_tile)
+                        * math.ceil(shape.n / n_tile)
+                    )
+                    if logical_tiles < ctas:
+                        continue
+                    configs.append(_config(
+                        f"smallcta_m{m_tile}_n{n_tile}_s{stages}_"
+                        f"split{slices}_r{resident}",
+                        output_cta_count=ctas,
+                        unroll_output_tiles=False,
+                        output_m_tile=m_tile,
+                        output_n_tile=n_tile,
+                        warpgroup_m_tile=m_tile,
+                        warpgroup_n_tile=n_tile,
+                        operand_stages=stages,
+                        operand_k_tile=64,
+                        cyclic_operand_pipeline=True,
+                        output_slices=slices,
+                        output_store_buffers=1,
+                        output_tma_inner_size=None,
+                        lhs_l2_cache_hint="evict_last",
+                        rhs_l2_cache_hint="evict_last",
+                        dst_l2_cache_hint="evict_last",
+                        lhs_l2_promotion="256B",
+                        ptx_optimization_level=2,
+                    ))
+    return tuple(configs)
+
+
+def small_cta_writeback_refinement_configs(
+    shape: Shape,
+) -> tuple[ScheduleConfig, ...]:
+    """Refine the confirmed M128/N128/split-8 one-WG geometry."""
+    if shape.m < 128 or shape.n < 128 or shape.n % 128 or shape.k % 64:
+        return ()
+
+    def base(name: str, **changes: object) -> ScheduleConfig:
+        config = _config(
+            name,
+            output_cta_count=396,
+            unroll_output_tiles=False,
+            output_m_tile=128,
+            output_n_tile=128,
+            warpgroup_m_tile=128,
+            warpgroup_n_tile=128,
+            operand_stages=2,
+            operand_k_tile=64,
+            cyclic_operand_pipeline=True,
+            output_slices=8,
+            output_store_buffers=1,
+            output_tma_inner_size=None,
+            lhs_l2_cache_hint="evict_last",
+            rhs_l2_cache_hint="evict_last",
+            dst_l2_cache_hint="evict_last",
+            lhs_l2_promotion="256B",
+            ptx_optimization_level=2,
+        )
+        return replace(config, **changes)
+
+    configs = [base("smallcta_ref_base")]
+    for ctas in (308, 330, 352, 364, 384):
+        configs.append(base(
+            f"smallcta_ref_cta{ctas}", output_cta_count=ctas,
+        ))
+    configs.extend([
+        base("smallcta_ref_mfast", output_tile_fast_axis="m"),
+        base("smallcta_ref_cta364_mfast", output_cta_count=364,
+             output_tile_fast_axis="m"),
+        base("smallcta_ref_unroll", unroll_output_tiles=True),
+        base("smallcta_ref_cta364_unroll", output_cta_count=364,
+             unroll_output_tiles=True),
+        base("smallcta_ref_noncyclic", cyclic_operand_pipeline=False),
+        base("smallcta_ref_k128s1", operand_k_tile=128, operand_stages=1,
+             cyclic_operand_pipeline=False),
+        base("smallcta_ref_group4", wgmma_group_size=4),
+        base("smallcta_ref_lhs_first", lhs_l2_cache_hint="evict_first"),
+        base("smallcta_ref_rhs_first", rhs_l2_cache_hint="evict_first"),
+        base("smallcta_ref_dst_first", dst_l2_cache_hint="evict_first"),
+        base("smallcta_ref_all_first", lhs_l2_cache_hint="evict_first",
+             rhs_l2_cache_hint="evict_first",
+             dst_l2_cache_hint="evict_first"),
+        base("smallcta_ref_no_lhs_promote", lhs_l2_promotion=None),
+        base("smallcta_ref_lhs_promote64", lhs_l2_promotion="64B"),
+        base("smallcta_ref_lhs_promote128", lhs_l2_promotion="128B"),
+        base("smallcta_ref_rhs_promote128", rhs_l2_promotion="128B"),
+        base("smallcta_ref_rhs_promote256", rhs_l2_promotion="256B"),
+    ])
+    for level in (None, 0, 1, 3):
+        suffix = "none" if level is None else str(level)
+        configs.append(base(
+            f"smallcta_ref_opt{suffix}", ptx_optimization_level=level,
+        ))
+    return tuple(configs)
+
+
+def small_cta_writeback_transfer_configs(
+    shape: Shape,
+) -> tuple[ScheduleConfig, ...]:
+    """Transfer the refined one-WG writeback family across tail shapes."""
+    if (
+        shape.m < 192 or shape.n < 128
+        or shape.k % 64
+    ):
+        return ()
+
+    configs: list[ScheduleConfig] = []
+
+    def add(m_tile: int, ctas: int, name: str) -> None:
+        logical_tiles = (
+            math.ceil(shape.m / m_tile) * math.ceil(shape.n / 128)
+        )
+        if logical_tiles < ctas:
+            return
+        configs.append(_config(
+            name,
+            output_cta_count=ctas,
+            unroll_output_tiles=False,
+            output_m_tile=m_tile,
+            output_n_tile=128,
+            warpgroup_m_tile=m_tile,
+            warpgroup_n_tile=128,
+            operand_stages=2,
+            operand_k_tile=64,
+            cyclic_operand_pipeline=True,
+            output_slices=8,
+            output_store_buffers=1,
+            output_tma_inner_size=None,
+            lhs_l2_cache_hint="evict_last",
+            rhs_l2_cache_hint="evict_last",
+            dst_l2_cache_hint="evict_last",
+            lhs_l2_promotion="256B",
+            ptx_optimization_level=2,
+        ))
+
+    add(64, 528, "smallcta_xfer_m64_r4")
+    add(128, 396, "smallcta_xfer_m128_r3")
+    add(192, 264, "smallcta_xfer_m192_r2")
+
+    logical_tiles = math.ceil(shape.m / 128) * math.ceil(shape.n / 128)
+    exact_counts = [
+        count for count in range(300, 397)
+        if logical_tiles % count == 0
+    ]
+    if exact_counts:
+        exact = max(exact_counts)
+        if exact != 396:
+            add(128, exact, f"smallcta_xfer_m128_exact{exact}")
+    return tuple(configs)
+
+
 def local_refinement_configs(
     shape: Shape,
     base: ScheduleConfig,
@@ -1761,13 +2953,6 @@ def local_refinement_configs(
                     base, output_slices=slices, output_store_buffers=slices,
                 ),
             ])
-    if base.warpgroup_m_tile is not None:
-        candidates.append(replace(
-            base,
-            warpgroup_fast_axis=(
-                "m" if base.warpgroup_fast_axis == "n" else "n"
-            ),
-        ))
     if base.output_cta_count is not None:
         candidates.append(replace(
             base,
@@ -1813,13 +2998,6 @@ def local_refinement_configs(
         replace(base, ptx_optimization_level=level)
         for level in (1, 2, 3)
     )
-    if (
-        base.output_m_tile == 64
-        and base.output_n_tile <= 96
-        and base.output_cta_count is None
-        and not base.multicast
-    ):
-        candidates.append(replace(base, unsafe_reuse_smem=True))
     if base.output_n_tile % 64 == 0:
         candidates.append(replace(
             base,
@@ -1897,31 +3075,9 @@ def rhs_tma_slicing_configs(
     shape: Shape,
     base: ScheduleConfig,
 ) -> tuple[ScheduleConfig, ...]:
-    """Vary RHS TMA transaction granularity around a measured winner.
-
-    A slice count divides the leading N extent of the promoted RHS tile into
-    independent TMA loads.  This changes transaction and barrier geometry
-    without changing the math tile, making it a useful low-risk refinement of
-    configurations that are already good.
-    """
-    del shape  # Reserved for future shape-dependent pruning.
-    effective_base = (
-        base.output_n_tile // base.warpgroup_n_tile
-        if base.rhs_tma_load_slices is None and base.output_n_tile == 384
-        else (base.rhs_tma_load_slices or 1)
-    )
-    counts = (
-        count for count in (1, 2, 3, 4, 6, 8)
-        if base.output_n_tile % count == 0 and count != effective_base
-    )
-    return tuple(
-        replace(
-            base,
-            name=f"rhsload{count}_{base.name}",
-            rhs_tma_load_slices=count,
-        )
-        for count in counts
-    )
+    """Retired: no winners and unresolved narrow two-slice correctness."""
+    del shape, base
+    return ()
 
 
 def workgroup_parallelism_configs(
@@ -1946,6 +3102,9 @@ def workgroup_parallelism_configs(
                 base,
                 name=f"wgparallel_n{groups}_{base.name}",
                 warpgroup_n_tile=wg_n,
+                output_slices=groups,
+                output_store_buffers=1,
+                output_tma_inner_size=None,
             ))
     else:
         wg_n_options = {base.output_n_tile, base.warpgroup_n_tile}
@@ -1958,18 +3117,21 @@ def workgroup_parallelism_configs(
             )
             if total_groups > 8:
                 continue
-            for fast_axis in ("m", "n"):
-                candidates.append(replace(
-                    base,
-                    name=(
-                        f"wgparallel_m{base.output_m_tile // 64}_"
-                        f"n{base.output_n_tile // wg_n}_{fast_axis}_"
-                        f"{base.name}"
-                    ),
-                    warpgroup_m_tile=64,
-                    warpgroup_n_tile=wg_n,
-                    warpgroup_fast_axis=fast_axis,
-                ))
+            candidates.append(replace(
+                base,
+                name=(
+                    f"wgparallel_m{base.output_m_tile // 64}_"
+                    f"n{base.output_n_tile // wg_n}_{base.name}"
+                ),
+                warpgroup_m_tile=64,
+                warpgroup_n_tile=wg_n,
+                output_slices=base.output_n_tile // wg_n,
+                output_store_buffers=1,
+                output_tma_inner_size=(
+                    base.output_tma_inner_size
+                    if base.output_n_tile == wg_n else None
+                ),
+            ))
     return tuple(candidates)
 
 
@@ -1977,21 +3139,478 @@ def smem_reuse_configs(
     shape: Shape,
     base: ScheduleConfig,
 ) -> tuple[ScheduleConfig, ...]:
-    """Reuse the operand arena for one-tile winners after their final read."""
-    del shape
+    """Retired: zero final winners and unresolved lifetime-safety failures."""
+    del shape, base
+    return ()
+
+
+def wgmma_pipeline_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Pipeline commit groups around a measured winner.
+
+    Keep fewer groups pending than there are operand buffers, so a stage is
+    never refilled while a pending WGMMA group can still read it.  Unsafe SMEM
+    overlay is deliberately disabled: pipelined configurations must be valid
+    standalone heuristic candidates.
+    """
+    if base.cyclic_operand_pipeline:
+        return ()
+    if shape.k < 2 * base.operand_k_tile:
+        return ()
+    configs = []
+    for stages in range(2, 9):
+        if shape.k // base.operand_k_tile < stages:
+            continue
+        estimated_smem = (
+            2
+            * (base.output_m_tile + base.output_n_tile)
+            * base.operand_k_tile
+            * stages
+            + 2
+            * base.output_m_tile
+            * base.output_n_tile
+            * base.output_store_buffers
+        )
+        if estimated_smem > 225 * 1024:
+            continue
+        configs.append(replace(
+            base,
+            name=f"wgpipe1_s{stages}_{base.name}",
+            operand_stages=stages,
+            wgmma_pending_groups=1,
+            unsafe_reuse_smem=False,
+        ))
+    return tuple(configs)
+
+
+def continuous_wgmma_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Keep one safe WGMMA group pending across K-loop backedges."""
+    configs = []
+    for stages in range(2, 9):
+        if shape.k // base.operand_k_tile < stages:
+            continue
+        estimated_smem = (
+            2
+            * (base.output_m_tile + base.output_n_tile)
+            * base.operand_k_tile
+            * stages
+            + 2
+            * base.output_m_tile
+            * base.output_n_tile
+            * base.output_store_buffers
+        )
+        if estimated_smem > 225 * 1024:
+            continue
+        configs.append(replace(
+            base,
+            name=f"continuous_wg_s{stages}_{base.name}",
+            operand_stages=stages,
+            wgmma_pending_groups=0,
+            cyclic_operand_pipeline=True,
+            unsafe_reuse_smem=False,
+        ))
+    return tuple(configs)
+
+
+def wgmma_group_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Split K128's eight WGMMA instructions into two commit groups."""
+    if base.operand_k_tile != 128:
+        return ()
+    configs = []
+    for stages in range(2, 9):
+        if shape.k // base.operand_k_tile < stages:
+            continue
+        estimated_smem = (
+            2
+            * (base.output_m_tile + base.output_n_tile)
+            * base.operand_k_tile
+            * stages
+            + 2
+            * base.output_m_tile
+            * base.output_n_tile
+            * base.output_store_buffers
+        )
+        if estimated_smem > 225 * 1024:
+            continue
+        configs.append(replace(
+            base,
+            name=f"wg_group4_s{stages}_{base.name}",
+            operand_stages=stages,
+            wgmma_group_size=4,
+            wgmma_pending_groups=1,
+            cyclic_operand_pipeline=False,
+            unsafe_reuse_smem=False,
+        ))
+    return tuple(configs)
+
+
+def wgmma_epilogue_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Pipeline only a refill-free straight-line WGMMA epilogue."""
     if (
-        base.unsafe_reuse_smem
-        or base.output_tiles_per_cta != 1
-        or base.output_cta_count is not None
-        or base.multicast
-        or base.output_store != "stmatrix"
+        base.cyclic_operand_pipeline
+        or base.wgmma_pending_groups
+        or shape.k < 2 * base.operand_k_tile
     ):
         return ()
     return (replace(
         base,
-        name=f"smemreuse_{base.name}",
-        unsafe_reuse_smem=True,
+        name=f"wgmma_epilogue_{base.name}",
+        wgmma_epilogue_pipeline=True,
+        unsafe_reuse_smem=False,
     ),)
+
+
+def grid_swap_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Swap ordinary M/N block axes to reverse operand cache locality."""
+    del shape
+    if (
+        base.output_cta_count is not None
+        or base.output_tiles_per_cta != 1
+        or base.multicast
+    ):
+        return ()
+    return (replace(
+        base,
+        name=f"grid_swap_{base.name}",
+        swap_output_grid_axes=not base.swap_output_grid_axes,
+    ),)
+
+
+def grid_swap_refinement_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Refine geometry only for measured swapped-grid winners."""
+    if not base.swap_output_grid_axes:
+        return ()
+    return local_refinement_configs(shape, base)
+
+
+def grid_swap_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure both ordinary block-axis orders against one Torch baseline."""
+    del shape
+    if base.output_cta_count is not None or base.multicast:
+        return ()
+    unswapped = replace(
+        base,
+        name=f"grid_ablation_mfast_{base.name}",
+        swap_output_grid_axes=False,
+    )
+    swapped = replace(
+        base,
+        name=f"grid_ablation_nfast_{base.name}",
+        swap_output_grid_axes=True,
+    )
+    return (unswapped, swapped)
+
+
+def exact_axis_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure both exact-grid traversal orders against one Torch baseline."""
+    del shape
+    if base.output_cta_count is None:
+        return ()
+    m_fast = replace(
+        base,
+        name=f"exact_axis_mfast_{base.name}",
+        output_tile_fast_axis="m",
+    )
+    n_fast = replace(
+        base,
+        name=f"exact_axis_nfast_{base.name}",
+        output_tile_fast_axis="n",
+    )
+    return (m_fast, n_fast)
+
+
+def lhs_promotion_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure every supported LHS TMA L2 promotion against one baseline."""
+    del shape
+    return tuple(
+        replace(
+            base,
+            name=f"lhs_promote_{promotion or 'none'}_{base.name}",
+            lhs_l2_promotion=promotion,
+        )
+        for promotion in (None, "64B", "128B", "256B")
+    )
+
+
+def rhs_promotion_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure every supported RHS TMA L2 promotion against one baseline."""
+    del shape
+    return tuple(
+        replace(
+            base,
+            name=f"rhs_promote_{promotion or 'none'}_{base.name}",
+            rhs_l2_promotion=promotion,
+        )
+        for promotion in (None, "64B", "128B", "256B")
+    )
+
+
+def cache_hint_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure all operand/store L2 eviction combinations together."""
+    del shape
+    return tuple(
+        replace(
+            base,
+            name=(
+                f"cache_l{lhs.removeprefix('evict_')}"
+                f"r{rhs.removeprefix('evict_')}"
+                f"d{dst.removeprefix('evict_')}_{base.name}"
+            ),
+            lhs_l2_cache_hint=lhs,
+            rhs_l2_cache_hint=rhs,
+            dst_l2_cache_hint=dst,
+        )
+        for lhs in ("evict_first", "evict_last")
+        for rhs in ("evict_first", "evict_last")
+        for dst in ("evict_first", "evict_last")
+    )
+
+
+def stage_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Remeasure nearby operand-pipeline depths against one baseline."""
+    configs = []
+    for stages in range(max(2, base.operand_stages - 2), min(8, base.operand_stages + 2) + 1):
+        if shape.k // base.operand_k_tile < stages:
+            continue
+        operand_buffers = stages
+        estimated_smem = (
+            2
+            * (base.output_m_tile + base.output_n_tile)
+            * base.operand_k_tile
+            * operand_buffers
+            + 2
+            * base.output_m_tile
+            * base.output_n_tile
+            * base.output_store_buffers
+        )
+        if estimated_smem > 225 * 1024:
+            continue
+        configs.append(replace(
+            base,
+            name=f"stage_ablation_s{stages}_{base.name}",
+            operand_stages=stages,
+            unsafe_reuse_smem=False,
+        ))
+    return tuple(configs)
+
+
+def ptx_optimization_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure every supported PTX optimization level together."""
+    del shape
+    return tuple(
+        replace(
+            base,
+            name=f"ptx_o{level or 0}_{base.name}",
+            ptx_optimization_level=level,
+        )
+        for level in (None, 1, 2, 3)
+    )
+
+
+def output_layout_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Compare linear and block-major shared layouts for TMA stores."""
+    del shape
+    if (
+        base.output_store == "scalar"
+        or base.output_slices != 1
+        or base.output_n_tile % 64
+    ):
+        return (replace(base, name=f"output_layout_fixed_{base.name}"),)
+    return (
+        replace(
+            base,
+            name=f"output_linear_{base.name}",
+            output_tma_inner_size=None,
+        ),
+        replace(
+            base,
+            name=f"output_block64_{base.name}",
+            output_tma_inner_size=128,
+        ),
+    )
+
+
+def output_slicing_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Compare safe TMA writeback slicing and buffering choices."""
+    del shape
+    base_config = replace(
+        base,
+        name=(
+            f"output_slice_s{base.output_slices}"
+            f"_b{base.output_store_buffers}_{base.name}"
+        ),
+    )
+    if base.output_store == "scalar" or base.warpgroup_m_tile is not None:
+        return (base_config,)
+    configs = [base_config]
+    for slices in (1, 2, 4):
+        if base.output_n_tile % slices or base.output_n_tile // slices % 8:
+            continue
+        if (
+            base.output_tma_inner_size is not None
+            and base.output_n_tile // slices % 64
+        ):
+            continue
+        estimated_smem = (
+            2
+            * (base.output_m_tile + base.output_n_tile)
+            * base.operand_k_tile
+            * base.operand_stages
+            + 2
+            * base.output_m_tile
+            * base.output_n_tile
+        )
+        if estimated_smem > 225 * 1024:
+            continue
+        configs.append(replace(
+            base,
+            name=f"output_slice_s{slices}_b1_{base.name}",
+            output_slices=slices,
+            output_store_buffers=1,
+            unsafe_reuse_smem=False,
+        ))
+    return tuple(dict.fromkeys(configs))
+
+
+def continuous_toggle_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Compare continuous and ordinary scheduling at fixed geometry."""
+    if (
+        base.multicast
+        or shape.k // base.operand_k_tile < base.operand_stages
+        or base.operand_stages < 2
+    ):
+        return ()
+    return (
+        replace(
+            base,
+            name=f"continuous_off_{base.name}",
+            cyclic_operand_pipeline=False,
+            wgmma_pending_groups=0,
+        ),
+        replace(
+            base,
+            name=f"continuous_on_{base.name}",
+            cyclic_operand_pipeline=True,
+            wgmma_pending_groups=0,
+        ),
+    )
+
+
+def wgmma_feature_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Disable selected WGMMA pipelining, or probe cyclic depth one."""
+    if (
+        shape.k // base.operand_k_tile < base.operand_stages
+        or base.operand_stages < 2
+    ):
+        return ()
+    disabled = replace(
+        base,
+        name=f"wgmma_feature_off_{base.name}",
+        cyclic_operand_pipeline=False,
+        wgmma_pending_groups=0,
+        wgmma_epilogue_pipeline=False,
+    )
+    selected = (
+        base.cyclic_operand_pipeline
+        or base.wgmma_pending_groups > 0
+        or base.wgmma_epilogue_pipeline
+    )
+    enabled = replace(
+        base if selected else disabled,
+        name=(
+            f"wgmma_feature_selected_{base.name}"
+            if selected else f"wgmma_feature_probe_{base.name}"
+        ),
+        cyclic_operand_pipeline=(
+            base.cyclic_operand_pipeline if selected else True
+        ),
+    )
+    return disabled, enabled
+
+
+def output_store_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Compare scalar and STMatrix/TMA output writeback paths."""
+    del shape
+    current = replace(base, name=f"output_store_{base.output_store}_{base.name}")
+    if base.output_slices != 1:
+        return (current,)
+    if base.output_store == "stmatrix":
+        alternative = replace(
+            base,
+            name=f"output_store_scalar_{base.name}",
+            output_store="scalar",
+            output_tma_inner_size=None,
+        )
+    else:
+        alternative = replace(
+            base,
+            name=f"output_store_stmatrix_{base.name}",
+            output_store="stmatrix",
+            output_tma_inner_size=None,
+        )
+    return (current, alternative)
+
+
+def local_ablation_configs(
+    shape: Shape,
+    base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Measure a local neighborhood together with its exact paired base."""
+    paired_base = replace(base, name=f"paired_local_base_{base.name}")
+    return (paired_base, *local_refinement_configs(shape, base))
 
 
 def cluster_tuning_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
@@ -2043,6 +3662,183 @@ def cluster_tuning_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
             output_tma_inner_size=(128 if n_tile in (64, 128) else None),
         ))
     return tuple(configs)
+
+
+def output_n_grouping_ablation_configs(
+    shape: Shape, base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Pair native N-tile grouping with ordinary/cyclic K scheduling."""
+    if (
+        base.output_cta_count is not None
+        or base.output_tiles_per_cta != 1
+        or base.output_n_tiles_per_cta != 1
+        or math.ceil(shape.n / base.output_n_tile) < 2
+    ):
+        return ()
+
+    configs = [replace(base, name="ngroup_base")]
+    for cyclic in (False, True):
+        if cyclic and shape.k // base.operand_k_tile < base.operand_stages:
+            continue
+        configs.append(replace(
+            base,
+            name=f"ngroup_g2_cy{int(cyclic)}",
+            output_n_tiles_per_cta=2,
+            cyclic_operand_pipeline=cyclic,
+        ))
+    return tuple(configs)
+
+
+def documented_gap_ablation_configs(
+    shape: Shape, base: ScheduleConfig,
+) -> tuple[ScheduleConfig, ...]:
+    """Turn on winner features that the historical search never generalized.
+
+    This is deliberately benchmark-only policy.  Each candidate changes one
+    documented gap around the incumbent wherever possible, making the result
+    attributable while covering values that the older generators omitted
+    entirely (M grouping 5/6, N grouping 4/6, and stage 9).
+    """
+    candidates: list[ScheduleConfig] = []
+
+    if not base.reschedule_async:
+        candidates.append(replace(
+            base, name=f"gap_reschedule_{base.name}",
+            reschedule_async=True,
+        ))
+    candidates.extend(wgmma_epilogue_configs(shape, base))
+    candidates.extend(workgroup_parallelism_configs(shape, base))
+    candidates.extend(wgmma_group_configs(shape, base))
+
+    if (
+        base.output_cta_count is None
+        and not base.multicast
+        and base.output_n_tiles_per_cta == 1
+    ):
+        m_tiles = math.ceil(shape.m / base.output_m_tile)
+        for group in (4, 5, 6):
+            if group <= m_tiles and group != base.output_tiles_per_cta:
+                candidates.append(replace(
+                    base,
+                    name=f"gap_mgroup{group}_{base.name}",
+                    output_tiles_per_cta=group,
+                ))
+    if (
+        base.output_cta_count is None
+        and not base.multicast
+        and base.output_tiles_per_cta == 1
+    ):
+        n_tiles = math.ceil(shape.n / base.output_n_tile)
+        for group in (2, 4, 6):
+            if group <= n_tiles and group != base.output_n_tiles_per_cta:
+                candidates.append(replace(
+                    base,
+                    name=f"gap_ngroup{group}_{base.name}",
+                    output_n_tiles_per_cta=group,
+                ))
+
+    if base.output_cta_count is not None:
+        for axis in ("m", "n"):
+            if axis != base.output_tile_fast_axis:
+                candidates.append(replace(
+                    base,
+                    name=f"gap_exact_{axis}fast_{base.name}",
+                    output_tile_fast_axis=axis,
+                ))
+
+    if (
+        base.output_store != "scalar"
+        and base.warpgroup_m_tile is None
+        and base.output_n_tile % 3 == 0
+        and (base.output_n_tile // 3) % 8 == 0
+        and base.output_n_tile // 3 >= 64
+    ):
+        candidates.append(replace(
+            base,
+            name=f"gap_slices3_{base.name}",
+            output_slices=3,
+            output_store_buffers=1,
+            output_tma_inner_size=None,
+            unsafe_reuse_smem=False,
+        ))
+
+    for stages in (7, 8, 9):
+        if (
+            stages != base.operand_stages
+            and shape.k // base.operand_k_tile >= stages
+        ):
+            candidates.append(replace(
+                base,
+                name=f"gap_stage{stages}_{base.name}",
+                operand_stages=stages,
+                unsafe_reuse_smem=False,
+            ))
+
+    if base.warpgroup_m_tile is None:
+        for m_tile in (192, 256):
+            if m_tile <= shape.m and m_tile != base.output_m_tile:
+                candidates.append(replace(
+                    base,
+                    name=f"gap_mtile{m_tile}_{base.name}",
+                    output_m_tile=m_tile,
+                ))
+
+    if base.operand_k_tile != 128 and shape.k % 128 == 0:
+        for stages in (2, 3, 4):
+            if shape.k // 128 >= stages:
+                candidates.append(replace(
+                    base,
+                    name=f"gap_k128_s{stages}_{base.name}",
+                    operand_k_tile=128,
+                    operand_stages=stages,
+                    unsafe_reuse_smem=False,
+                ))
+
+    unique: dict[tuple[object, ...], ScheduleConfig] = {}
+    for candidate in candidates:
+        if (
+            candidate.output_m_tile % (
+                candidate.warpgroup_m_tile or candidate.output_m_tile
+            )
+            or candidate.output_n_tile % candidate.warpgroup_n_tile
+            or candidate.output_n_tile % candidate.output_slices
+            or (candidate.output_n_tile // candidate.output_slices) % 8
+        ):
+            continue
+        estimated_smem = (
+            2
+            * (candidate.output_m_tile + candidate.output_n_tile)
+            * candidate.operand_k_tile
+            * candidate.operand_stages
+            + 2
+            * candidate.output_m_tile
+            * candidate.output_n_tile
+            * candidate.output_store_buffers
+        )
+        if not candidate.unsafe_reuse_smem and estimated_smem > 225 * 1024:
+            continue
+        key = tuple(
+            getattr(candidate, field.name)
+            for field in fields(ScheduleConfig)
+            if field.name != "name"
+        )
+        unique.setdefault(key, candidate)
+    return tuple(unique.values())
+
+
+def continuous_cluster_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
+    """Combine safe continuous WGMMA overlap with multicast geometries."""
+    return tuple(
+        replace(
+            config,
+            name=f"continuous_{config.name}",
+            wgmma_pending_groups=0,
+            cyclic_operand_pipeline=True,
+            unsafe_reuse_smem=False,
+        )
+        for config in cluster_tuning_configs(shape)
+        if shape.k // config.operand_k_tile >= config.operand_stages
+    )
 
 
 def architecture_gap_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
@@ -2148,8 +3944,11 @@ def architecture_gap_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
             m_ctas = (shape.m + m_tile - 1) // m_tile
             n_ctas = (shape.n + n_tile - 1) // n_tile
             for stages in (2, 3, 4):
-                operand_smem = 2 * (m_tile + n_tile) * 64 * stages
-                if operand_smem > 225 * 1024:
+                estimated_smem = (
+                    2 * (m_tile + n_tile) * 64 * stages
+                    + 2 * m_tile * n_tile
+                )
+                if estimated_smem > 225 * 1024:
                     continue
                 for axis, extent in (("none", 1), ("m", m_ctas), ("n", n_ctas)):
                     if axis != "none" and extent % 2:
@@ -2163,9 +3962,26 @@ def architecture_gap_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
                         cluster_n_ctas=(2 if axis == "n" else 1),
                         multicast=axis != "none",
                         output_tma_inner_size=(128 if n_tile == 128 else None),
-                        unsafe_reuse_smem=True,
                     ))
     return tuple(configs)
+
+
+def continuous_architecture_gap_configs(
+    shape: Shape,
+) -> tuple[ScheduleConfig, ...]:
+    """Apply continuous overlap to non-multicast deep/parallel geometries."""
+    return tuple(
+        replace(
+            config,
+            name=f"continuous_{config.name}",
+            wgmma_pending_groups=0,
+            cyclic_operand_pipeline=True,
+            unsafe_reuse_smem=False,
+        )
+        for config in architecture_gap_configs(shape)
+        if not config.multicast
+        and shape.k // config.operand_k_tile >= config.operand_stages
+    )
 
 
 def narrow_wg2d_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
@@ -2187,16 +4003,14 @@ def narrow_wg2d_configs(shape: Shape) -> tuple[ScheduleConfig, ...]:
                 )
                 if estimated_smem > 220 * 1024:
                     continue
-                for fast in ("m", "n"):
-                    configs.append(_config(
-                        f"wg2dn_m{m_tile}_n{n_tile}_wm64_"
-                        f"k{k_tile}_s{stages}_{fast}fast",
-                        output_m_tile=m_tile, output_n_tile=n_tile,
-                        warpgroup_m_tile=64, warpgroup_n_tile=n_tile,
-                        warpgroup_fast_axis=fast,
-                        operand_k_tile=k_tile, operand_stages=stages,
-                        output_tma_inner_size=(
-                            64 if n_tile == 64 else None
-                        ),
-                    ))
+                configs.append(_config(
+                    f"wg2dn_m{m_tile}_n{n_tile}_wm64_"
+                    f"k{k_tile}_s{stages}",
+                    output_m_tile=m_tile, output_n_tile=n_tile,
+                    warpgroup_m_tile=64, warpgroup_n_tile=n_tile,
+                    operand_k_tile=k_tile, operand_stages=stages,
+                    output_tma_inner_size=(
+                        64 if n_tile == 64 else None
+                    ),
+                ))
     return tuple(configs)

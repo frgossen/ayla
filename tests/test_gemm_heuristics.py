@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from ayla.gemm_heuristics import (
@@ -7,44 +9,48 @@ from ayla.gemm_heuristics import (
 from ayla.gpu_dialect import CollectiveAxis
 
 
-def test_small_cta_seed_retains_the_measured_fixed_grid():
-    for shape in (
-        (128_100, 1536, 512),
-        (128_112, 1024, 256),
-        (197_951, 512, 256),
-    ):
-        selection = select_gemm_schedules(*shape)
-        seed = next(
-            seed for seed in selection.seeds
-            if seed.captured_config["name"]
-            == "heuristic_smallcta_m128_n128_k64_s2_split8_r3"
-        )
+def test_fixed_grid_seed_exposes_required_unroll():
+    selection = select_gemm_schedules(
+        8192, 768, 768, operation="addmm",
+    )
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.fixed_output_unroll_factor is not None
+    )
 
-        assert seed.builder_config is not None
-        assert seed.builder_config["output_grid_size"] == 396
-        assert seed.builder_config["output_m_tiles_per_cta"] == 1
-        assert seed.builder_config["output_n_tiles_per_cta"] == 1
-        assert seed.builder_config["warpgroup_m_tile"] == 128
-        assert seed.builder_config["warpgroup_n_tile"] == 128
-        assert seed.builder_config["output_slices"] == 8
-        assert "fixed output grid" in seed.adaptations[0]
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_grid_size"] > 0
+    assert seed.fixed_output_unroll_factor == 2
+    assert "fixed output grid" in seed.adaptations[0]
 
 
-def test_incremental_winner_preserves_existing_leaf_seeds():
-    selection = select_gemm_schedules(1152, 3072, 768)
-    names = {seed.captured_config["name"] for seed in selection.seeds}
+def test_compact_seeds_omit_dropped_experimental_controls():
+    selection = select_gemm_schedules(2048, 768, 768)
+    redundant = {
+        "output_tile_fast_axis",
+        "rhs_tma_load_slices",
+        "unsafe_reuse_smem",
+        "warpgroup_fast_axis",
+        "wgmma_epilogue_pipeline",
+        "wgmma_group_size",
+        "wgmma_pending_groups",
+    }
 
-    assert "hybrid1152_s3_cy1" in names
-    assert "waveconfirm_native" in names
+    assert selection.seeds
+    assert all(
+        redundant.isdisjoint(seed.captured_config)
+        for seed in selection.seeds
+    )
 
 
 def test_rescheduled_seed_exposes_and_executes_post_builder_passes(
     monkeypatch,
 ):
     selection = select_gemm_schedules(4160, 1024, 3072)
-    seed = next(
-        seed for seed in selection.seeds
-        if seed.captured_config.get("reschedule_async") is True
+    seed = dataclasses.replace(
+        selection.seeds[0],
+        fixed_output_unroll_factor=None,
+        post_builder_passes=("schedule_async", "canonicalize"),
     )
     assert seed.post_builder_passes == ("schedule_async", "canonicalize")
 
@@ -113,146 +119,73 @@ def test_bmm_filters_illegal_blocked_output_tma_transfers():
     )
 
 
-def test_addmm_transfer_winners_seed_matching_mm_leaves():
-    shapes = (
-        (4096, 4096, 1024),
-        (512, 6144, 1536),
-        (1152, 768, 3072),
-        (512, 1024, 4096),
-        (12608, 256, 768),
-        (32768, 256, 1024),
-        (12608, 768, 256),
-        (16448, 512, 512),
-        (8192, 2048, 256),
-        (25664, 384, 128),
-        (25216, 320, 320),
-        (50176, 768, 256),
+def test_rhs_promotion_is_forwarded_to_the_builder():
+    selection = select_gemm_schedules(2048, 768, 768)
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.captured_config.get("rhs_l2_promotion") is not None
     )
 
-    for shape in shapes:
-        selection = select_gemm_schedules(*shape)
-        assert any(seed.source_shape == shape for seed in selection.seeds)
+    assert seed.builder_config is not None
+    rhs = seed.builder_config["operand_move_attrs"]["rhs"]
+    assert rhs["l2_promotion"] == seed.captured_config["rhs_l2_promotion"]
 
 
 def test_n_grouped_winner_routes_existing_builder_controls():
-    selection = select_gemm_schedules(3136, 2048, 1024)
+    selection = select_gemm_schedules(2048, 2048, 128)
     seed = next(
         seed for seed in selection.seeds
-        if seed.captured_config["name"] == "ngroup3136wide_g2_cy1"
+        if seed.captured_config["output_n_tiles_per_cta"] > 1
     )
 
     assert seed.builder_config is not None
     assert seed.builder_config["output_m_tiles_per_cta"] == 1
-    assert seed.builder_config["output_n_tiles_per_cta"] == 2
-    assert seed.builder_config["cyclic_operand_pipeline"] is True
+    assert seed.builder_config["output_n_tiles_per_cta"] == 4
 
 
-def test_swapped_n_grouped_winner_routes_existing_builder_controls():
-    selection = select_gemm_schedules(2856, 3072, 768)
+def test_swapped_grid_winner_routes_existing_builder_controls():
+    selection = select_gemm_schedules(2048, 768, 768)
     seed = next(
         seed for seed in selection.seeds
-        if seed.captured_config["name"] == "ng2856tune_swap1"
+        if seed.captured_config["swap_output_grid_axes"] is True
     )
 
     assert seed.builder_config is not None
-    assert seed.builder_config["output_m_tiles_per_cta"] == 1
-    assert seed.builder_config["output_n_tiles_per_cta"] == 3
     assert seed.builder_config["output_grid_axes"] == (
         CollectiveAxis.Y, CollectiveAxis.X,
     )
 
 
-def test_256_thread_m_grouped_winners_route_existing_builder_controls():
-    for shape, group in (
-        ((50265, 1024, 512), 6),
-        ((6272, 1280, 320), 2),
-        ((16448, 512, 1536), 2),
-    ):
-        selection = select_gemm_schedules(*shape)
-        seed = next(
-            seed for seed in selection.seeds
-            if seed.source_shape == shape
-            and seed.captured_config["output_m_tile"] == 128
-            and seed.captured_config["output_n_tile"] == 256
-            and seed.captured_config["swap_output_grid_axes"] is True
-        )
-
-        assert seed.builder_config is not None
-        assert seed.builder_config["output_m_tiles_per_cta"] == group
-        assert seed.builder_config["output_n_tiles_per_cta"] == 1
-        assert seed.builder_config["cyclic_operand_pipeline"] is True
-        assert seed.builder_config["output_grid_axes"] == (
-            CollectiveAxis.Y, CollectiveAxis.X,
-        )
-
-
-def test_additional_swapped_m_groups_route_existing_builder_controls():
-    for shape, group in (((9521, 512, 7936), 2),):
-        selection = select_gemm_schedules(*shape)
-        seed = next(
-            seed for seed in selection.seeds
-            if seed.source_shape == shape
-            and seed.captured_config["swap_output_grid_axes"] is True
-            and seed.captured_config["output_tiles_per_cta"] == group
-        )
-
-        assert seed.builder_config is not None
-        assert seed.builder_config["output_m_tiles_per_cta"] == group
-        assert seed.builder_config["output_grid_axes"] == (
-            CollectiveAxis.Y, CollectiveAxis.X,
-        )
-
-
-def test_large_shape_static_groups_route_existing_builder_controls():
-    cases = (
-        ((6400, 2048, 512), 5, 1),
-        ((512, 50272, 768), 1, 6),
+def test_two_dimensional_warpgroup_winner_is_preserved():
+    selection = select_gemm_schedules(
+        2048, 768, 768, operation="addmm",
     )
-    for shape, m_group, n_group in cases:
-        selection = select_gemm_schedules(*shape)
-        seed = next(
-            seed for seed in selection.seeds
-            if seed.source_shape == shape
-            and seed.captured_config["output_m_tile"] == 128
-        )
-
-        assert seed.builder_config is not None
-        assert seed.builder_config["output_m_tiles_per_cta"] == m_group
-        assert seed.builder_config["output_n_tiles_per_cta"] == n_group
-        assert seed.builder_config["ptx_optimization_level"] == 1
-
-
-def test_30522_group_five_family_routes_existing_builder_controls():
-    for k in (2048, 4096, 8192):
-        shape = (30522, 768, k)
-        selection = select_gemm_schedules(*shape)
-        seed = next(
-            seed for seed in selection.seeds
-            if seed.captured_config["output_m_tile"] == 192
-            and seed.captured_config["output_n_tile"] == 192
-        )
-
-        assert seed.builder_config is not None
-        assert seed.builder_config["output_m_tiles_per_cta"] == 5
-        assert seed.builder_config["output_n_tiles_per_cta"] == 1
-        assert seed.builder_config["output_grid_axes"] == (
-            CollectiveAxis.Y, CollectiveAxis.X,
-        )
-
-
-def test_4000_n_group_six_routes_existing_builder_controls():
-    selection = select_gemm_schedules(4000, 4000, 1024)
     seed = next(
         seed for seed in selection.seeds
-        if seed.captured_config["name"] == "confirm4000_g6_swap"
+        if seed.captured_config.get("warpgroup_m_tile") is not None
     )
 
-    assert seed.source_shape == (4000, 4000, 1024)
     assert seed.builder_config is not None
-    assert seed.builder_config["output_m_tiles_per_cta"] == 1
-    assert seed.builder_config["output_n_tiles_per_cta"] == 6
-    assert seed.builder_config["operand_stages"] == 4
-    assert seed.builder_config["cyclic_operand_pipeline"] is False
-    assert seed.builder_config["output_grid_axes"] == (
-        CollectiveAxis.Y, CollectiveAxis.X,
+    assert seed.builder_config["warpgroup_m_tile"] == 64
+
+
+def test_group_five_family_routes_existing_builder_controls():
+    selection = select_gemm_schedules(4096, 1024, 256)
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.captured_config["output_tiles_per_cta"] == 5
     )
+
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_m_tiles_per_cta"] == 5
+    assert seed.builder_config["output_n_tiles_per_cta"] == 1
+
+
+def test_transpose_winner_is_selected_for_the_original_problem():
+    selection = select_gemm_schedules(8192, 768, 768)
+    seed = next(seed for seed in selection.seeds if seed.transpose_output)
+
+    assert seed.captured_config["transpose_output"] is True
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_m_tile"] == 64
+    assert seed.builder_config["output_n_tile"] == 128

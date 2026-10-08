@@ -50,6 +50,16 @@ def _config_key(row: dict[str, Any]) -> str:
     return json.dumps(row["configuration"], sort_keys=True, separators=(",", ":"))
 
 
+def _paired_percentage(
+    baseline: dict[str, Any], candidate: dict[str, Any],
+) -> float:
+    value = candidate.get("torch_pct")
+    return (
+        float(value) if value is not None
+        else float(baseline["latency_ms"]) / float(candidate["latency_ms"]) * 100
+    )
+
+
 def _format_knobs(config: dict[str, Any]) -> str:
     return ", ".join(f"{key}={config.get(key)!r}" for key in DISPLAY_KNOBS)
 
@@ -65,7 +75,13 @@ def improvement_rows(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
     for row in rows:
         if row.get("implementation") != "ayla":
             continue
-        if row.get("status") == "ok" and row.get("latency_ms") is not None:
+        if (
+            row.get("status") == "ok"
+            and row.get("latency_ms") is not None
+            and not bool(
+                row.get("configuration", {}).get("unsafe_reuse_smem")
+            )
+        ):
             ayla_by_shape[str(row["shape_id"])].append(row)
         else:
             failures_by_regime[str(row["regime"])] += 1
@@ -84,7 +100,7 @@ def improvement_rows(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
             candidates = ayla_by_shape.get(shape_id, [])
             if not candidates:
                 continue
-            best = min(candidates, key=lambda row: float(row["latency_ms"]))
+            best = max(candidates, key=lambda row: _paired_percentage(baseline, row))
             paired.append((baseline, best))
             winning_configs[str(best["configuration"]["name"])] += int(
                 baseline["frequency"]
@@ -93,8 +109,10 @@ def improvement_rows(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
         calls = sum(int(row["frequency"]) for row in baselines)
         covered_calls = sum(int(base["frequency"]) for base, _ in paired)
         torch_ms = sum(
-            float(base["latency_ms"]) * int(base["frequency"])
-            for base, _ in paired
+            float(best["latency_ms"])
+            * _paired_percentage(base, best) / 100
+            * int(base["frequency"])
+            for base, best in paired
         )
         ayla_ms = sum(
             float(best["latency_ms"]) * int(base["frequency"])
@@ -107,8 +125,7 @@ def improvement_rows(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
         )
         speedup = torch_ms / ayla_ms if ayla_ms else None
         shape_percentages = [
-            float(base["latency_ms"]) / float(best["latency_ms"]) * 100
-            for base, best in paired
+            _paired_percentage(base, best) for base, best in paired
         ]
         winning_shapes = sum(value > 100 for value in shape_percentages)
         return {
@@ -179,6 +196,9 @@ def shape_improvement_rows(
             row.get("implementation") == "ayla"
             and row.get("status") == "ok"
             and row.get("latency_ms") is not None
+            and not bool(
+                row.get("configuration", {}).get("unsafe_reuse_smem")
+            )
         ):
             ayla_by_shape[str(row["shape_id"])].append(row)
 
@@ -187,12 +207,14 @@ def shape_improvement_rows(
         candidates = ayla_by_shape.get(shape_id, [])
         if not candidates:
             continue
-        best = min(candidates, key=lambda row: float(row["latency_ms"]))
-        torch_latency = float(baseline["latency_ms"])
+        best = max(candidates, key=lambda row: _paired_percentage(baseline, row))
         ayla_latency = float(best["latency_ms"])
-        percentage = torch_latency / ayla_latency * 100
+        percentage = _paired_percentage(baseline, best)
+        torch_latency = ayla_latency * percentage / 100
         result.append({
             "shape_id": shape_id,
+            "op": str(baseline.get("op", "mm")),
+            "batch": baseline.get("batch"),
             "m": int(baseline["m"]),
             "n": int(baseline["n"]),
             "k": int(baseline["k"]),
@@ -202,7 +224,7 @@ def shape_improvement_rows(
             "regime": str(baseline["regime"]),
             "torch_latency_ms": torch_latency,
             "ayla_latency_ms": ayla_latency,
-            "torch_tflops": float(baseline["tflops"]),
+            "torch_tflops": float(best["tflops"]) / (percentage / 100),
             "ayla_tflops": float(best["tflops"]),
             "percentage_of_torch": percentage,
             "speedup": percentage / 100,
@@ -224,7 +246,12 @@ def seed_recommendations(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
     """Return the three most reliable measured configurations per regime."""
     by_regime: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if row.get("implementation") == "ayla":
+        if (
+            row.get("implementation") == "ayla"
+            and not bool(
+                row.get("configuration", {}).get("unsafe_reuse_smem")
+            )
+        ):
             by_regime[str(row["regime"])].append(row)
 
     recommendations = []

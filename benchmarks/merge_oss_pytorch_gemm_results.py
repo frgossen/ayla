@@ -13,6 +13,7 @@ from benchmarks.oss_gemm_corpus import (
     RAW_JSON,
     benchmark_shapes,
     load_shapes,
+    require_same_timing,
     validate_shapes,
     write_json,
     write_rows_csv,
@@ -41,10 +42,12 @@ def main() -> int:
         shape.shape_id
         for shape in benchmark_shapes(validate_shapes(load_shapes()))
     }
-    for path in args.inputs:
-        rows = json.loads(path.read_text())
+    inputs = [(path, json.loads(path.read_text())) for path in args.inputs]
+    for path, rows in inputs:
         if not isinstance(rows, list):
             raise ValueError(f"{path}: expected a JSON list")
+    require_same_timing(*inputs)
+    for path, rows in inputs:
         for row in rows:
             if str(row.get("shape_id", "")) not in supported:
                 continue

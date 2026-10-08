@@ -40,6 +40,7 @@ DEFAULT_OUTPUT = Path(__file__).with_name("oss_gemm_minimal_heuristics.json")
 @dataclass(frozen=True)
 class Point:
     shape_id: str
+    op: str
     m: int
     n: int
     k: int
@@ -47,10 +48,12 @@ class Point:
     frequency: int
     percentage: float
     config: ScheduleConfig
+    batch: int = 1
 
 
 Feature = tuple[str, Callable[[Point], float]]
 FEATURES: tuple[Feature, ...] = (
+    ("batch", lambda point: float(point.batch)),
     ("m", lambda point: float(point.m)),
     ("n", lambda point: float(point.n)),
     ("k", lambda point: float(point.k)),
@@ -58,7 +61,9 @@ FEATURES: tuple[Feature, ...] = (
     (
         "output_tiles_64",
         lambda point: float(
-            ((point.m + 63) // 64) * ((point.n + 63) // 64)
+            point.batch
+            * ((point.m + 63) // 64)
+            * ((point.n + 63) // 64)
         ),
     ),
     ("reduction_tiles_64", lambda point: float((point.k + 63) // 64)),
@@ -80,17 +85,33 @@ _LEGACY_CONFIG_DEFAULTS: dict[str, object] = {
     "dst_l2_cache_hint": "evict_first",
 }
 
+# Historical result rows retain experimental controls that the simplified
+# library deliberately does not expose.  They must neither split mapper
+# families nor leak back into the production heuristic.
+_REDUNDANT_CONFIG_FIELDS = {
+    "output_tile_fast_axis",
+    "rhs_tma_load_slices",
+    "unsafe_reuse_smem",
+    "warpgroup_fast_axis",
+    "wgmma_epilogue_pipeline",
+    "wgmma_group_size",
+    "wgmma_pending_groups",
+}
+
+
+def _production_config(config: ScheduleConfig) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in dataclasses.asdict(config).items()
+        if key not in _REDUNDANT_CONFIG_FIELDS
+    }
+
 
 def _config_from_mapping(mapping: dict[str, Any]) -> ScheduleConfig:
     values: dict[str, object] = {}
     for field in dataclasses.fields(ScheduleConfig):
-        value = mapping.get(field.name, dataclasses.MISSING)
-        if value is not dataclasses.MISSING and (
-            value is not None
-            or field.default is None
-            or field.name in {"warpgroup_m_tile", "output_cta_count"}
-        ):
-            values[field.name] = value
+        if field.name in mapping:
+            values[field.name] = mapping[field.name]
         elif field.default is not dataclasses.MISSING:
             values[field.name] = field.default
         elif field.name == "warpgroup_n_tile":
@@ -107,7 +128,9 @@ def _family(config: ScheduleConfig) -> tuple[object, ...]:
     return tuple(
         (field.name, getattr(config, field.name))
         for field in dataclasses.fields(ScheduleConfig)
-        if field.name not in {"name", "output_cta_count"}
+        if field.name not in {
+            "name", "output_cta_count", *_REDUNDANT_CONFIG_FIELDS,
+        }
     ) + (("uses_exact_ctas", config.output_cta_count is not None),)
 
 
@@ -115,8 +138,8 @@ def _alignment(k: int) -> str:
     return "k128" if k % 128 == 0 else "k64"
 
 
-def _group_key(dtype: str, k: int) -> str:
-    return f"{dtype}/{_alignment(k)}"
+def _group_key(op: str, dtype: str, k: int) -> str:
+    return f"{op}/{dtype}/{_alignment(k)}"
 
 
 def _load_points(path: Path) -> list[Point]:
@@ -130,6 +153,8 @@ def _load_points(path: Path) -> list[Point]:
             raise ValueError(f"{row.get('shape_id')}: missing configuration")
         points.append(Point(
             shape_id=str(row["shape_id"]),
+            op=str(row.get("op", "mm")),
+            batch=int(row.get("batch") or 1),
             m=int(row["m"]), n=int(row["n"]), k=int(row["k"]),
             dtype=str(row["dtype"]), frequency=int(row["frequency"]),
             percentage=float(row["percentage_of_torch"]),
@@ -168,9 +193,10 @@ def _best_split(
     return best
 
 
-def _feature_vector(point: Point) -> tuple[float, float, float, float]:
+def _feature_vector(point: Point) -> tuple[float, float, float, float, float]:
     return (
-        math.log2(point.m), math.log2(point.n), math.log2(point.k),
+        math.log2(point.batch), math.log2(point.m), math.log2(point.n),
+        math.log2(point.k),
         math.log2(point.m / point.n),
     )
 
@@ -189,9 +215,48 @@ def _leaf(
 ) -> dict[str, object]:
     families = Counter(_family(point.config) for point in points)
     seeds = []
-    for rank, (family, support) in enumerate(
-        families.most_common(seeds_per_leaf), 1,
-    ):
+    selected_families = []
+    required = [
+        lambda config: config.transpose_output,
+        lambda config: config.rhs_l2_promotion is not None,
+        lambda config: (
+            config.output_tiles_per_cta == 5
+            or config.output_n_tiles_per_cta == 5
+        ),
+        lambda config: config.warpgroup_m_tile is not None,
+    ]
+    uncovered = {
+        index for index, predicate in enumerate(required)
+        if any(predicate(point.config) for point in points)
+    }
+    family_config = {
+        _family(point.config): point.config for point in points
+    }
+    while uncovered and len(selected_families) < seeds_per_leaf:
+        family, support = max(
+            families.items(),
+            key=lambda item: (
+                sum(
+                    required[index](family_config[item[0]])
+                    for index in uncovered
+                ),
+                item[1],
+            ),
+        )
+        covered = {
+            index for index in uncovered
+            if required[index](family_config[family])
+        }
+        if not covered:
+            break
+        selected_families.append((family, support))
+        uncovered -= covered
+    for candidate in families.most_common():
+        if len(selected_families) >= seeds_per_leaf:
+            break
+        if candidate[0] not in {family for family, _ in selected_families}:
+            selected_families.append(candidate)
+    for rank, (family, support) in enumerate(selected_families, 1):
         members = [point for point in points if _family(point.config) == family]
         exemplar = min(
             members,
@@ -199,13 +264,14 @@ def _leaf(
                 _distance(candidate, other) for other in members
             ),
         )
-        config = dataclasses.asdict(exemplar.config)
+        config = _production_config(exemplar.config)
         config["name"] = f"heuristic_{leaf_id}_seed{rank}"
         seeds.append({
             "rank": rank,
             "family_support": support,
             "source_shape_id": exemplar.shape_id,
             "source_shape": {
+                "batch": exemplar.batch,
                 "m": exemplar.m, "n": exemplar.n, "k": exemplar.k,
             },
             "source_percentage_of_torch": exemplar.percentage,
@@ -299,7 +365,9 @@ def build_mapper(
 ) -> dict[str, object]:
     groups: dict[str, list[Point]] = {}
     for point in points:
-        groups.setdefault(_group_key(point.dtype, point.k), []).append(point)
+        groups.setdefault(
+            _group_key(point.op, point.dtype, point.k), [],
+        ).append(point)
     budgets = _allocate_leaf_budgets(groups, max_leaves)
     trees = {
         key: _build_tree(
@@ -312,7 +380,7 @@ def build_mapper(
         for key, group in sorted(groups.items())
     }
     leaves = [leaf for tree in trees.values() for leaf in _walk_leaves(tree)]
-    fallback = dataclasses.asdict(dataclasses.replace(
+    fallback = _production_config(dataclasses.replace(
         fallback_config(), output_m_tile=64,
     ))
     fallback["name"] = "heuristic_coverage_fallback"
@@ -338,7 +406,10 @@ def build_mapper(
         "groups": trees,
     }
     queries = [
-        query_mapper(mapper, point.m, point.n, point.k, point.dtype)
+        query_mapper(
+            mapper, point.m, point.n, point.k, point.dtype, point.op,
+            point.batch,
+        )
         for point in points
     ]
     covered = sum(bool(query["seeds"]) for query in queries)
@@ -354,24 +425,36 @@ def build_mapper(
     return mapper
 
 
-def _query_features(m: int, n: int, k: int) -> dict[str, float]:
+def _query_features(
+    m: int, n: int, k: int, batch: int = 1,
+) -> dict[str, float]:
     return {
+        "batch": float(batch),
         "m": float(m), "n": float(n), "k": float(k),
         "aspect_m_over_n": m / n,
-        "output_tiles_64": float(((m + 63) // 64) * ((n + 63) // 64)),
+        "output_tiles_64": float(
+            batch * ((m + 63) // 64) * ((n + 63) // 64)
+        ),
         "reduction_tiles_64": float((k + 63) // 64),
     }
 
 
 def _adapt_query_config(
-    config: dict[str, Any], m: int, n: int, k: int,
+    config: dict[str, Any], m: int, n: int, k: int, *,
+    allow_partial: bool = False,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     changes = []
     m_tile = int(config["output_m_tile"])
     n_tile = int(config["output_n_tile"])
     k_tile = int(config["operand_k_tile"])
-    if m < m_tile or n < n_tile or k % k_tile:
+    if (not allow_partial and (m < m_tile or n < n_tile)) or k % k_tile:
         return None, ["tile does not fit or K tile does not divide K"]
+    if (
+        config.get("output_store") != "scalar"
+        and config.get("output_tma_inner_size") is not None
+        and (n % 64 or n_tile % 64)
+    ):
+        return None, ["blocked output TMA requires 64-column divisibility"]
     m_tiles = (m + m_tile - 1) // m_tile
     n_tiles = (n + n_tile - 1) // n_tile
     if (
@@ -399,11 +482,12 @@ def _adapt_query_config(
 
 def query_mapper(
     mapper: dict[str, Any], m: int, n: int, k: int, dtype: str,
+    op: str = "mm", batch: int = 1,
 ) -> dict[str, object]:
-    group = _group_key(dtype, k)
+    group = _group_key(op, dtype, k)
     if group not in mapper["groups"]:
         raise ValueError(f"no heuristic group for {group}")
-    features = _query_features(m, n, k)
+    features = _query_features(m, n, k, batch)
     node = mapper["groups"][group]
     path = []
     while node["kind"] == "split":
@@ -424,6 +508,7 @@ def query_mapper(
     for seed in node["seeds"]:
         config, changes = _adapt_query_config(
             dict(seed["configuration"]), m, n, k,
+            allow_partial=op == "bmm",
         )
         if config is None:
             continue
@@ -445,6 +530,7 @@ def query_mapper(
         for seed in mapper.get("fallback_seeds", []):
             config, changes = _adapt_query_config(
                 dict(seed["configuration"]), m, n, k,
+                allow_partial=op == "bmm",
             )
             if config is None:
                 continue
@@ -461,7 +547,10 @@ def query_mapper(
         math.inf if seed["distance"] is None else float(seed["distance"])
     ))
     return {
-        "shape": {"m": m, "n": n, "k": k, "dtype": dtype},
+        "shape": {
+            "op": op, "batch": batch,
+            "m": m, "n": n, "k": k, "dtype": dtype,
+        },
         "group": group,
         "decision_path": path,
         "leaf": {
@@ -486,6 +575,8 @@ def main() -> int:
         help="print the decision trace and seeds for one shape",
     )
     parser.add_argument("--dtype", default="float16")
+    parser.add_argument("--op", choices=("mm", "addmm", "bmm"), default="mm")
+    parser.add_argument("--batch", type=int, default=1)
     args = parser.parse_args()
 
     if args.max_leaves < 1 or args.min_leaf_shapes < 1:
@@ -513,7 +604,7 @@ def main() -> int:
     else:
         mapper = build_mapper(_load_points(args.input))
     print(json.dumps(
-        query_mapper(mapper, *args.query, args.dtype),
+        query_mapper(mapper, *args.query, args.dtype, args.op, args.batch),
         indent=2, sort_keys=True,
     ))
     return 0

@@ -15,6 +15,8 @@ import json
 import math
 import multiprocessing as mp
 import re
+import statistics
+import textwrap
 import time
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -22,13 +24,23 @@ from typing import Any
 
 import torch
 
+import benchmarks.common as benchmark_common
+
 from benchmarks.common import (
     GemmBenchConfig,
+    addmm_bench_config,
+    assert_addmm_against_torch,
     assert_against_torch,
+    assert_bmm_against_torch,
+    bmm_bench_config,
     gemm_bench_config,
+    out_parameter_addmm_op,
+    out_parameter_bmm_op,
     out_parameter_op,
     print_results,
     run,
+    torch_addmm_nt,
+    torch_bmm_nt,
     torch_mm_nt,
 )
 from benchmarks.oss_gemm_corpus import (
@@ -40,33 +52,65 @@ from benchmarks.oss_gemm_corpus import (
     ScheduleConfig,
     Shape,
     architecture_gap_configs,
+    continuous_architecture_gap_configs,
     benchmark_shapes,
+    bmm_tuning_configs,
     cublas_inspired_configs,
+    cache_hint_ablation_configs,
     cluster_tuning_configs,
+    continuous_wgmma_configs,
+    continuous_cluster_configs,
+    continuous_toggle_ablation_configs,
     coarse_tile_configs,
+    documented_gap_ablation_configs,
     exploration_configs,
     exact_cta_configs,
+    exact_axis_ablation_configs,
     exact_cta_refinement_configs,
     fallback_config,
     gap_tuning_configs,
+    grid_swap_configs,
+    grid_swap_ablation_configs,
+    grid_swap_refinement_configs,
     load_shapes,
     local_refinement_configs,
+    local_ablation_configs,
+    lhs_promotion_ablation_configs,
+    multicast_ablation_configs,
     multicast_configs,
+    multicast_incumbent_neighborhood_configs,
+    multicast_resweep_configs,
+    multicast_winner_transfer_configs,
     narrow_tile_configs,
     narrow_wg2d_configs,
+    output_layout_ablation_configs,
+    output_n_grouping_ablation_configs,
+    output_slicing_ablation_configs,
+    output_store_ablation_configs,
     pipeline_tile_configs,
+    ptx_optimization_ablation_configs,
     regime,
     regime_name,
     refinement_configs,
     resource_tuning_configs,
     rhs_tma_slicing_configs,
+    rhs_promotion_ablation_configs,
     smem_reuse_configs,
+    small_cta_writeback_configs,
+    small_cta_writeback_refinement_configs,
+    small_cta_writeback_transfer_configs,
+    stage_ablation_configs,
     seed_configs,
     static_loop_configs,
+    tail_end_configs,
     targeted_tuning_configs,
     tile_refinement_configs,
     two_dimensional_wg_configs,
     workgroup_parallelism_configs,
+    wgmma_pipeline_configs,
+    wgmma_group_configs,
+    wgmma_epilogue_configs,
+    wgmma_feature_ablation_configs,
     validate_shapes,
     validation_row,
     write_json,
@@ -83,7 +127,36 @@ IR_DTYPES = {
     "bfloat16": "bf16",
 }
 
+
+def _shapes_with_current_best(shapes, current_best):
+    """Keep only shapes represented by an explicit ranking configuration."""
+    return [shape for shape in shapes if current_best(shape) is not None]
+
+
+def _baseline_config(shape: Shape) -> GemmBenchConfig:
+    if shape.op == "bmm":
+        assert shape.batch is not None
+        return bmm_bench_config(
+            name="Torch",
+            batch=shape.batch,
+            m=shape.m,
+            n=shape.n,
+            k=shape.k,
+            compute=torch_bmm_nt,
+            dtype=TORCH_DTYPES[shape.dtype],
+        )
+    builder = addmm_bench_config if shape.op == "addmm" else gemm_bench_config
+    compute = torch_addmm_nt if shape.op == "addmm" else torch_mm_nt
+    return builder(
+        name="Torch", m=shape.m, n=shape.n, k=shape.k,
+        compute=compute, dtype=TORCH_DTYPES[shape.dtype],
+    )
+
+
 _DEFAULT_CONFIG_TIMEOUT_S = 120.0
+# How this run times configurations, recorded on every row it writes. Rows
+# measured under different protocols are not comparable.
+_TIMING_PROTOCOL = "inference-v2"
 
 
 def _shape_fields(shape: Shape) -> dict[str, object]:
@@ -117,7 +190,7 @@ def _result_row(
     search_scope: str = "full_corpus_seed",
 ) -> dict[str, object]:
     config_values = (
-        {"name": "torch.mm"}
+        {"name": f"torch.{shape.op}"}
         if config is None else dataclasses.asdict(config)
     )
     return {
@@ -132,6 +205,7 @@ def _result_row(
         "correctness_relative_rms": relative_rms_error,
         "status": "error" if error is not None else "ok",
         "error": error,
+        "timing_protocol": _TIMING_PROTOCOL,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
@@ -145,29 +219,238 @@ def _make_ayla_config(
     # path. Importing this submodule compiles the collection as a side effect.
     from ayla.gemm_collection.gemm import (
         auto_matmul_4096_wgmma256_wg_tma_store_module,
+        schedule_matmul,
     )
+    from ayla.base.ir import find_ancestor_of_type, find_ops_of_type
+    from ayla.gpu_dialect import (
+        CollectiveAxis,
+        ForOp,
+        gpu_dialect,
+    )
+    from ayla.passes.canonicalize import Canonicalize
+    from ayla.passes.licm import LICM
+    from ayla.passes.schedule_async import ScheduleAsync
+    from ayla.passes.unroll_loop import UnrollLoop
     from ayla.ptx_codegen import make_ptx_kernel
     from ayla.ptx_runtime import make_ptx_launcher
 
-    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
-        m=shape.m,
-        n=shape.n,
-        k=shape.k,
-        dtype=IR_DTYPES[shape.dtype],
-        **schedule.builder_kwargs(),
+    if schedule.unsafe_reuse_smem:
+        raise ValueError("unsafe SMEM reuse is excluded from this search")
+    if schedule.rhs_tma_load_slices not in (None, 1):
+        raise ValueError(
+            "RHS TMA slicing remains experimental and is not a seedable knob"
+        )
+
+    kwargs = schedule.builder_kwargs()
+    transpose_output = bool(kwargs.pop("transpose_output"))
+    # Historical searches recorded these experimental controls, but the
+    # simplified queued-pipeline implementation deliberately has no separate
+    # WGMMA feature knobs.  Keep accepting old result rows while compiling
+    # their effective schedule through the public GEMM API.
+    kwargs.pop("wgmma_group_size")
+    kwargs.pop("wgmma_pending_groups")
+    kwargs.pop("wgmma_epilogue_pipeline")
+    if transpose_output and shape.op == "addmm":
+        raise ValueError("transposed output is not implemented for addmm")
+    axes = kwargs.pop("output_grid_axes")
+    assert isinstance(axes, tuple)
+    kwargs["output_grid_axes"] = tuple(
+        CollectiveAxis[axis] for axis in axes
     )
-    compute = out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
-    bench = gemm_bench_config(
-        name=f"Ayla {schedule.name}",
-        m=shape.m, n=shape.n, k=shape.k,
-        compute=compute, dtype=TORCH_DTYPES[shape.dtype],
+    dtype = IR_DTYPES[shape.dtype]
+
+    ptx_attrs = (
+        ""
+        if schedule.ptx_optimization_level is None
+        else " attrs={ptx_optimization_level: "
+        f"{schedule.ptx_optimization_level}}}"
     )
-    max_abs, relative_rms = assert_against_torch(
-        bench,
-        seed=int(shape.shape_id[-8:], 16),
-        max_abs_error=4,
-        max_relative_rms_error=2e-3,
-    )
+
+    def addmm_module():
+        return gpu_dialect.parse(textwrap.dedent(f"""\
+            module {{
+              kernel @addmm(%bias: gmem<{shape.m}x{shape.n}x{dtype} strides=[0, 1]>, %a: gmem<{shape.m}x{shape.k}x{dtype}>, %b: gmem<{shape.n}x{shape.k}x{dtype}>, %c: gmem<{shape.m}x{shape.n}x{dtype}>){ptx_attrs} {{
+                matmul(%a: gmem<{shape.m}x{shape.k}x{dtype}>, %b: gmem<{shape.n}x{shape.k}x{dtype}>, %c: gmem<{shape.m}x{shape.n}x{dtype}>, %bias: gmem<{shape.m}x{shape.n}x{dtype} strides=[0, 1]>) collective=xyz.grid attrs={{label: "mm"}}
+              }}
+            }}"""))
+
+    def bmm_module():
+        assert shape.batch is not None
+        batch = shape.batch
+        if transpose_output:
+            m, n, k = shape.m, shape.n, shape.k
+            c3 = f"gmem<1x{n}x{m}x{dtype} strides=[{m * n}, 1, {n}]>"
+            c2 = f"gmem<{n}x{m}x{dtype} strides=[1, {n}]>"
+            return gpu_dialect.parse(textwrap.dedent(f"""\
+                module {{
+                  kernel @bmm(%a: gmem<{batch}x{m}x{k}x{dtype}>, %bt: gmem<{batch}x{n}x{k}x{dtype}>, %c: gmem<{batch}x{n}x{m}x{dtype} strides=[{m * n}, 1, {n}]>) grid_dim=[None, None, {batch}]{ptx_attrs} {{
+                    %bx: index, %by: index, %bz: index = block_ids()
+                    %a3: gmem<1x{m}x{k}x{dtype}> = tile(%a: gmem<{batch}x{m}x{k}x{dtype}>, %bz: index, 0, 0)
+                    %a2: gmem<{m}x{k}x{dtype}> = reshape(%a3: gmem<1x{m}x{k}x{dtype}>)
+                    %bt3: gmem<1x{n}x{k}x{dtype}> = tile(%bt: gmem<{batch}x{n}x{k}x{dtype}>, %bz: index, 0, 0)
+                    %bt2: gmem<{n}x{k}x{dtype}> = reshape(%bt3: gmem<1x{n}x{k}x{dtype}>)
+                    %c3: {c3} = tile(%c: gmem<{batch}x{n}x{m}x{dtype} strides=[{m * n}, 1, {n}]>, %bz: index, 0, 0)
+                    %c2: {c2} = reshape(%c3: {c3})
+                    matmul(%bt2: gmem<{n}x{k}x{dtype}>, %a2: gmem<{m}x{k}x{dtype}>, %c2: {c2}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+                  }}
+                }}"""))
+        return gpu_dialect.parse(textwrap.dedent(f"""\
+            module {{
+              kernel @bmm(%a: gmem<{batch}x{shape.m}x{shape.k}x{dtype}>, %bt: gmem<{batch}x{shape.n}x{shape.k}x{dtype}>, %c: gmem<{batch}x{shape.m}x{shape.n}x{dtype}>) grid_dim=[None, None, {batch}]{ptx_attrs} {{
+                %bx: index, %by: index, %bz: index = block_ids()
+                %a3: gmem<1x{shape.m}x{shape.k}x{dtype}> = tile(%a: gmem<{batch}x{shape.m}x{shape.k}x{dtype}>, %bz: index, 0, 0)
+                %a2: gmem<{shape.m}x{shape.k}x{dtype}> = reshape(%a3: gmem<1x{shape.m}x{shape.k}x{dtype}>)
+                %bt3: gmem<1x{shape.n}x{shape.k}x{dtype}> = tile(%bt: gmem<{batch}x{shape.n}x{shape.k}x{dtype}>, %bz: index, 0, 0)
+                %bt2: gmem<{shape.n}x{shape.k}x{dtype}> = reshape(%bt3: gmem<1x{shape.n}x{shape.k}x{dtype}>)
+                %c3: gmem<1x{shape.m}x{shape.n}x{dtype}> = tile(%c: gmem<{batch}x{shape.m}x{shape.n}x{dtype}>, %bz: index, 0, 0)
+                %c2: gmem<{shape.m}x{shape.n}x{dtype}> = reshape(%c3: gmem<1x{shape.m}x{shape.n}x{dtype}>)
+                matmul(%a2: gmem<{shape.m}x{shape.k}x{dtype}>, %bt2: gmem<{shape.n}x{shape.k}x{dtype}>, %c2: gmem<{shape.m}x{shape.n}x{dtype}>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+              }}
+            }}"""))
+
+    def mm_module():
+        a_type = f"gmem<{shape.m}x{shape.k}x{dtype}>"
+        b_type = f"gmem<{shape.n}x{shape.k}x{dtype}>"
+        if transpose_output:
+            c_type = (
+                f"gmem<{shape.n}x{shape.m}x{dtype} strides=[1, {shape.n}]>"
+            )
+            operands = f"%b: {b_type}, %a: {a_type}, %c: {c_type}"
+        else:
+            c_type = f"gmem<{shape.m}x{shape.n}x{dtype}>"
+            operands = f"%a: {a_type}, %b: {b_type}, %c: {c_type}"
+        return gpu_dialect.parse(textwrap.dedent(f"""\
+            module {{
+              kernel @mm(%a: {a_type}, %b: {b_type}, %c: {c_type}) attrs={{ptx_optimization_level: {schedule.ptx_optimization_level}}} {{
+                matmul({operands}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+              }}
+            }}"""))
+
+    if (
+        shape.op in ("addmm", "bmm")
+        or transpose_output
+        or schedule.output_cta_count is not None
+    ):
+        if shape.op == "bmm" and schedule.output_cta_count is not None:
+            raise ValueError(
+                "fixed output grids are not part of the initial BMM search"
+            )
+        schedule_kwargs = dict(kwargs)
+        schedule_kwargs.pop("ptx_optimization_level", None)
+        if schedule.output_cta_count is not None:
+            schedule_kwargs["output_grid_size"] = schedule.output_cta_count
+        module = schedule_matmul(
+            (
+                addmm_module()
+                if shape.op == "addmm"
+                else bmm_module()
+                if shape.op == "bmm"
+                else mm_module()
+            ),
+            **schedule_kwargs,
+        )
+        if schedule.output_cta_count is not None and schedule.unroll_output_tiles:
+            module = LICM().run(module)
+            module = LICM().run(module)
+            outer_loops = [
+                loop for loop in find_ops_of_type(module, ForOp)
+                if find_ancestor_of_type(loop, ForOp) is None
+            ]
+            if len(outer_loops) != 1:
+                raise ValueError(
+                    "fixed output-grid unrolling requires one outer tile loop"
+                )
+            output_loop = outer_loops[0]
+            output_loop.attrs["label"] = "outmn"
+            module = UnrollLoop(
+                unroll_factor=output_loop.trip_count,
+                label_filter="outmn",
+            ).run(module)
+            module = Canonicalize().run(module)
+    else:
+        module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=shape.m,
+            n=shape.n,
+            k=shape.k,
+            dtype=dtype,
+            **kwargs,
+        )
+
+    [kernel] = module.body.ops
+    if schedule.cluster_m_ctas > 1 or schedule.cluster_n_ctas > 1:
+        if schedule.output_cta_count is not None:
+            cluster_axis = (
+                "m" if schedule.cluster_m_ctas > 1 else "n"
+            )
+            kernel.attrs["fixed_grid_fast_axis"] = (
+                schedule.output_tile_fast_axis
+            )
+            kernel.attrs["cluster_tile_axis"] = cluster_axis
+            cluster = max(schedule.cluster_m_ctas, schedule.cluster_n_ctas)
+            kernel.attrs["cluster_dim"] = [cluster, 1, 1]
+        elif schedule.swap_output_grid_axes:
+            kernel.attrs["cluster_dim"] = [
+                schedule.cluster_n_ctas, schedule.cluster_m_ctas, 1,
+            ]
+        else:
+            kernel.attrs["cluster_dim"] = [
+                schedule.cluster_m_ctas, schedule.cluster_n_ctas, 1,
+            ]
+        if schedule.multicast:
+            if kernel.num_warp_groups is None:
+                raise ValueError(
+                    "multicast producer warp requires resolved compute "
+                    "warpgroups"
+                )
+            compute_threads = kernel.num_warp_groups * 128
+            kernel.attrs["multicast_producer_warp_threads"] = compute_threads
+            kernel.block_dim = (compute_threads + 32, 1, 1)
+    if schedule.reschedule_async:
+        module = ScheduleAsync().run(module)
+        module = Canonicalize().run(module)
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    if shape.op == "bmm":
+        assert shape.batch is not None
+        bench = bmm_bench_config(
+            name=f"Ayla {schedule.name}",
+            batch=shape.batch,
+            m=shape.m,
+            n=shape.n,
+            k=shape.k,
+            compute=out_parameter_bmm_op(launcher),
+            dtype=TORCH_DTYPES[shape.dtype],
+        )
+        max_abs, relative_rms = assert_bmm_against_torch(
+            bench,
+            batch=shape.batch,
+            m=shape.m,
+            seed=int(shape.shape_id[-8:], 16),
+            max_abs_error=4,
+            max_relative_rms_error=2e-3,
+        )
+    else:
+        compute = (
+            out_parameter_addmm_op(launcher)
+            if shape.op == "addmm" else out_parameter_op(launcher)
+        )
+        bench_builder = (
+            addmm_bench_config if shape.op == "addmm" else gemm_bench_config
+        )
+        bench = bench_builder(
+            name=f"Ayla {schedule.name}",
+            m=shape.m, n=shape.n, k=shape.k,
+            compute=compute, dtype=TORCH_DTYPES[shape.dtype],
+        )
+        checker = (
+            assert_addmm_against_torch
+            if shape.op == "addmm" else assert_against_torch
+        )
+        max_abs, relative_rms = checker(
+            bench,
+            seed=int(shape.shape_id[-8:], 16),
+            max_abs_error=4,
+            max_relative_rms_error=2e-3,
+        )
     return bench, max_abs, relative_rms
 
 
@@ -175,41 +458,36 @@ def _isolated_benchmark_worker(
     shape: Shape,
     schedules: tuple[ScheduleConfig, ...],
     include_baseline: bool,
+    timing: dict[str, Any],
     sender: Connection,
 ) -> None:
     """Build and time configs in a process the parent can safely terminate."""
     try:
-        if include_baseline:
-            sender.send(("started_baseline", None))
-            baseline = gemm_bench_config(
-                name="Torch", m=shape.m, n=shape.n, k=shape.k,
-                compute=torch_mm_nt, dtype=TORCH_DTYPES[shape.dtype],
-            )
-            result = run([baseline])[0]
-            sender.send(("baseline", {
-                "latency_ms": result.median_ms,
-                "tflops": result.tflops,
-            }))
-            del baseline
-            torch.cuda.empty_cache()
-
         for schedule in schedules:
             sender.send(("started", schedule.name))
             try:
                 bench, max_abs, relative_rms = _make_ayla_config(shape, schedule)
-                result = run([bench])[0]
+                baseline = _baseline_config(shape)
+                torch_result, result = run([baseline, bench], **timing)
             except Exception as error:
                 sender.send(("error", schedule.name, (
                     type(error).__name__, str(error),
                 )))
             else:
+                if include_baseline:
+                    sender.send(("baseline", {
+                        "latency_ms": torch_result.median_ms,
+                        "tflops": torch_result.tflops,
+                    }))
+                    include_baseline = False
                 sender.send(("result", schedule.name, {
                     "latency_ms": result.median_ms,
                     "tflops": result.tflops,
+                    "torch_pct": result.torch_mm_pct,
                     "max_abs": max_abs,
                     "relative_rms": relative_rms,
                 }))
-                del bench
+                del baseline, bench
             torch.cuda.empty_cache()
         sender.send(("done", None))
     except BaseException as error:
@@ -235,7 +513,11 @@ def _benchmark_isolated(
     shape: Shape,
     schedules: list[ScheduleConfig],
     timeout_s: float,
-) -> tuple[dict[str, float], list[tuple[ScheduleConfig, dict[str, float] | None, str | None]]]:
+    timing: dict[str, Any],
+) -> tuple[
+    dict[str, float] | None,
+    list[tuple[ScheduleConfig, dict[str, float] | None, str | None]],
+]:
     """Benchmark schedules with a restartable per-configuration watchdog."""
     context = mp.get_context("spawn")
     baseline: dict[str, float] | None = None
@@ -249,7 +531,9 @@ def _benchmark_isolated(
         remaining = tuple(schedules[position:])
         process = context.Process(
             target=_isolated_benchmark_worker,
-            args=(shape, remaining, baseline is None, sender),
+            args=(
+                shape, remaining, baseline is None, timing, sender,
+            ),
         )
         process.start()
         sender.close()
@@ -287,9 +571,7 @@ def _benchmark_isolated(
                     break
 
                 kind = message[0]
-                if kind == "started_baseline":
-                    deadline = time.monotonic() + timeout_s
-                elif kind == "baseline":
+                if kind == "baseline":
                     baseline = message[1]
                     deadline = time.monotonic() + timeout_s
                 elif kind == "started":
@@ -339,8 +621,6 @@ def _benchmark_isolated(
         if not restart:
             break
 
-    if baseline is None:
-        raise RuntimeError("benchmark worker returned no Torch baseline")
     return baseline, measurements
 
 
@@ -380,6 +660,40 @@ def _schedule_key(schedule: ScheduleConfig) -> tuple[object, ...]:
         for field in dataclasses.fields(ScheduleConfig)
         if field.name != "name"
     )
+
+
+def _load_explicit_candidates(
+    path: Path,
+) -> dict[str, tuple[ScheduleConfig, ...]]:
+    """Load exact shape/config pairs from an analysis candidate manifest."""
+    value = json.loads(path.read_text())
+    entries = value.get("transfers") if isinstance(value, dict) else value
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"{path}: expected a list or an object with a 'transfers' list"
+        )
+    by_shape: dict[str, dict[tuple[object, ...], ScheduleConfig]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: candidate {index} is not an object")
+        shape_id = entry.get("target", entry.get("shape_id"))
+        config = entry.get("configuration", entry.get("config"))
+        if not isinstance(shape_id, str) or not isinstance(config, dict):
+            raise ValueError(
+                f"{path}: candidate {index} needs target/shape_id and "
+                "configuration/config"
+            )
+        schedule = _schedule_from_row({"configuration": config})
+        key = _schedule_key(schedule)
+        digest = hashlib.sha1(repr(key).encode()).hexdigest()[:10]
+        schedule = dataclasses.replace(
+            schedule, name=f"documented_{index:04d}_{digest}",
+        )
+        by_shape.setdefault(shape_id, {}).setdefault(key, schedule)
+    return {
+        shape_id: tuple(configs.values())
+        for shape_id, configs in by_shape.items()
+    }
 
 
 def _adapt_transfer_schedule(
@@ -486,9 +800,16 @@ def transfer_configs(
         baseline = torch_by_shape.get(shape_id)
         if baseline is None or str(baseline.get("dtype")) != shape.dtype:
             continue
-        best = min(candidates, key=lambda row: float(row["latency_ms"]))
+        def candidate_pct(row: dict[str, Any]) -> float:
+            value = row.get("torch_pct")
+            return (
+                float(value) if value is not None
+                else float(baseline["latency_ms"]) / float(row["latency_ms"]) * 100
+            )
+
+        best = max(candidates, key=candidate_pct)
         m, n, k = (int(best[field]) for field in ("m", "n", "k"))
-        pct = float(baseline["latency_ms"]) / float(best["latency_ms"]) * 100
+        pct = candidate_pct(best)
         distance = (
             abs(math.log2(m / shape.m))
             + abs(math.log2(n / shape.n))
@@ -532,6 +853,10 @@ def main() -> int:
     parser.add_argument("--output-json", type=Path, default=RAW_JSON)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
+        "--workload", choices=("mm", "addmm", "bmm", "all"), default="mm",
+        help="benchmark mm, addmm, bmm, or all accepted workload identities",
+    )
+    parser.add_argument(
         "--shape-filter", help="regular expression matched against shape_id",
     )
     parser.add_argument(
@@ -550,6 +875,30 @@ def main() -> int:
     parser.add_argument(
         "--no-resume", action="store_true",
         help="replace existing raw output instead of skipping completed shapes",
+    )
+    parser.add_argument(
+        "--pair-each-config", action="store_true",
+        help="time every candidate in its own interleaved Torch/Ayla pair",
+    )
+    parser.add_argument(
+        "--max-timing-rounds", type=int, default=200,
+        help="cap rotated CUDA-event samples per benchmark configuration",
+    )
+    parser.add_argument(
+        "--timing", choices=("inference", "cold", "warm"), default="inference",
+        help=(
+            "inference: time each GEMM as a model layer (hot activations, "
+            "cold per-layer weights, a consumer of its output); cold: one "
+            "launch after resetting L2 (needs --cold-cache-mib); warm: "
+            "back-to-back launches on the same inputs"
+        ),
+    )
+    parser.add_argument(
+        "--cold-cache-mib", type=int, default=0,
+        help=(
+            "MiB of L2 pollution before each sample; inference timing uses at "
+            "least twice the L2 size"
+        ),
     )
     parser.add_argument(
         "--explore-knobs", action="store_true",
@@ -577,7 +926,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--resource-tune-only", action="store_true",
-        help="sweep tile shapes and pipeline depth with SMEM reuse",
+        help="sweep safe tile shapes and pipeline depth within the SMEM budget",
     )
     parser.add_argument(
         "--coarse-tile-only", action="store_true",
@@ -592,6 +941,22 @@ def main() -> int:
         help="sweep cluster-2/4 operand multicast",
     )
     parser.add_argument(
+        "--multicast-ablation-only", action="store_true",
+        help="pair diverse cluster-2/4 multicast schedules with exact local controls",
+    )
+    parser.add_argument(
+        "--multicast-resweep-only", action="store_true",
+        help="pair incumbent/diverse tiles with cluster-2/4/8 multicast",
+    )
+    parser.add_argument(
+        "--multicast-transfer-only", action="store_true",
+        help="transfer confirmed small-K local and multicast winners",
+    )
+    parser.add_argument(
+        "--multicast-neighborhood-only", action="store_true",
+        help="co-tune clusters with each incumbent scheduling neighborhood",
+    )
+    parser.add_argument(
         "--pipeline-tile-only", action="store_true",
         help="refine winning tile widths with K64/K128 pipeline depths",
     )
@@ -602,6 +967,10 @@ def main() -> int:
     parser.add_argument(
         "--narrow-tile-only", action="store_true",
         help="refine N=48/56/72 tiles across M tiles and K pipelines",
+    )
+    parser.add_argument(
+        "--bmm-tune-only", action="store_true",
+        help="search compact batch-aware geometry, staging, and cache choices",
     )
     parser.add_argument(
         "--exact-cta-only", action="store_true",
@@ -632,8 +1001,24 @@ def main() -> int:
         help="sweep compact near-one-wave static grid-stride schedules",
     )
     parser.add_argument(
+        "--small-cta-writeback-only", action="store_true",
+        help="sweep resident one-WG CTAs with fine-grained TMA writeback",
+    )
+    parser.add_argument(
+        "--small-cta-writeback-refine-only", action="store_true",
+        help="refine the M128/N128/split-8 one-WG schedule",
+    )
+    parser.add_argument(
+        "--small-cta-writeback-transfer-only", action="store_true",
+        help="transfer refined one-WG writeback schedules across tail shapes",
+    )
+    parser.add_argument(
         "--architecture-gap-only", action="store_true",
         help="sweep deep pipelines, 64x80 tiles, and wide clustered tiles",
+    )
+    parser.add_argument(
+        "--tail-end-only", action="store_true",
+        help="target the remaining deep-K, extreme-tall, and extreme-wide tail",
     )
     parser.add_argument(
         "--recheck-best-only", action="store_true",
@@ -652,6 +1037,107 @@ def main() -> int:
         help="reuse operand/output shared memory around eligible winners",
     )
     parser.add_argument(
+        "--wgmma-pipeline-only", action="store_true",
+        help="pipeline WGMMA commit groups around each current winner",
+    )
+    parser.add_argument(
+        "--continuous-wgmma-only", action="store_true",
+        help="pipeline one WGMMA group safely across K-loop backedges",
+    )
+    parser.add_argument(
+        "--wgmma-group-only", action="store_true",
+        help="split K128 into four-instruction WGMMA commit groups",
+    )
+    parser.add_argument(
+        "--wgmma-epilogue-only", action="store_true",
+        help="pipeline only refill-free straight-line WGMMA epilogues",
+    )
+    parser.add_argument(
+        "--continuous-cluster-only", action="store_true",
+        help="combine continuous WGMMA overlap with multicast clusters",
+    )
+    parser.add_argument(
+        "--continuous-architecture-only", action="store_true",
+        help="combine continuous overlap with deep/parallel geometries",
+    )
+    parser.add_argument(
+        "--grid-swap-only", action="store_true",
+        help="swap ordinary M/N block axes around each current winner",
+    )
+    parser.add_argument(
+        "--grid-swap-refine-only", action="store_true",
+        help="refine tile geometry only around swapped-grid winners",
+    )
+    parser.add_argument(
+        "--grid-swap-ablation-only", action="store_true",
+        help="time both ordinary block-axis orders against one baseline",
+    )
+    parser.add_argument(
+        "--exact-axis-ablation-only", action="store_true",
+        help="time both exact-grid traversal orders against one baseline",
+    )
+    parser.add_argument(
+        "--lhs-promotion-ablation-only", action="store_true",
+        help="time all LHS TMA L2 promotion sizes against one baseline",
+    )
+    parser.add_argument(
+        "--rhs-promotion-ablation-only", action="store_true",
+        help="time all RHS TMA L2 promotion sizes against one baseline",
+    )
+    parser.add_argument(
+        "--cache-hint-ablation-only", action="store_true",
+        help="time all L2 eviction-hint combinations against one baseline",
+    )
+    parser.add_argument(
+        "--stage-ablation-only", action="store_true",
+        help="time nearby operand-pipeline depths against one baseline",
+    )
+    parser.add_argument(
+        "--ptx-optimization-ablation-only", action="store_true",
+        help="time PTX optimization levels 0 through 3 against one baseline",
+    )
+    parser.add_argument(
+        "--output-layout-ablation-only", action="store_true",
+        help="time linear and block-major TMA output layouts together",
+    )
+    parser.add_argument(
+        "--output-slicing-ablation-only", action="store_true",
+        help="time safe TMA writeback slice and buffer counts together",
+    )
+    parser.add_argument(
+        "--output-n-grouping-ablation-only", action="store_true",
+        help="time native N-tile grouping with ordinary/cyclic K scheduling",
+    )
+    parser.add_argument(
+        "--continuous-toggle-ablation-only", action="store_true",
+        help="time continuous and ordinary K scheduling at fixed geometry",
+    )
+    parser.add_argument(
+        "--wgmma-feature-ablation-only", action="store_true",
+        help="time selected WGMMA pipelining against the same schedule off",
+    )
+    parser.add_argument(
+        "--output-store-ablation-only", action="store_true",
+        help="time scalar and STMatrix/TMA output writeback together",
+    )
+    parser.add_argument(
+        "--local-ablation-only", action="store_true",
+        help="time local refinements together with the exact current base",
+    )
+    parser.add_argument(
+        "--documented-gap-ablation-only", action="store_true",
+        help="turn on historically winning but unsearched incumbent features",
+    )
+    parser.add_argument(
+        "--candidate-json", type=Path,
+        help="time exact target/config pairs from an analysis JSON manifest",
+    )
+    parser.add_argument(
+        "--maximum-current-pct", type=float,
+        help="keep shapes whose current --ranking-json winner is at or below "
+        "this percent of Torch",
+    )
+    parser.add_argument(
         "--worst-shapes", type=int,
         help="select this many shapes with the greatest frequency-weighted "
         "Ayla latency deficit in --ranking-json",
@@ -664,8 +1150,14 @@ def main() -> int:
         "--closest-below-torch", type=int,
         help="select this many shapes nearest to, but still below, Torch",
     )
+    parser.add_argument(
+        "--lowest-pct-shapes", type=int,
+        help="select this many shapes with the lowest current percent of Torch",
+    )
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--config-num-shards", type=int, default=1)
+    parser.add_argument("--config-shard-index", type=int, default=0)
     args = parser.parse_args()
 
     validations = validate_shapes(load_shapes(args.corpus))
@@ -675,6 +1167,8 @@ def main() -> int:
         write_json(validation_rows, args.validation_json)
     supported_signatures = [item.shape for item in validations if item.supported]
     supported = benchmark_shapes(validations)
+    if args.workload != "all":
+        supported = [shape for shape in supported if shape.op == args.workload]
     supported_shape_ids = {shape.shape_id for shape in supported}
     print(
         f"validation: {len(supported_signatures)}/{len(validations)} pooled "
@@ -693,15 +1187,47 @@ def main() -> int:
     ranking_rows: list[dict[str, Any]] = []
     torch_by_shape: dict[str, dict[str, Any]] = {}
     ayla_by_shape: dict[str, list[dict[str, Any]]] = {}
+    ayla_by_problem: dict[
+        tuple[int, int, int, str], list[dict[str, Any]]
+    ] = {}
     if (
         args.worst_shapes is not None
         or args.closest_below_torch is not None
+        or args.lowest_pct_shapes is not None
+        or args.multicast_resweep_only
+        or args.multicast_transfer_only
+        or args.multicast_neighborhood_only
         or args.local_refine_only
         or args.transfer_only
         or args.recheck_best_only
         or args.rhs_tma_slice_only
         or args.workgroup_parallel_only
         or args.smem_reuse_only
+        or args.wgmma_pipeline_only
+        or args.continuous_wgmma_only
+        or args.wgmma_group_only
+        or args.wgmma_epilogue_only
+        or args.continuous_cluster_only
+        or args.continuous_architecture_only
+        or args.grid_swap_only
+        or args.grid_swap_refine_only
+        or args.grid_swap_ablation_only
+        or args.exact_axis_ablation_only
+        or args.lhs_promotion_ablation_only
+        or args.rhs_promotion_ablation_only
+        or args.cache_hint_ablation_only
+        or args.stage_ablation_only
+        or args.ptx_optimization_ablation_only
+        or args.output_layout_ablation_only
+        or args.output_slicing_ablation_only
+        or args.output_n_grouping_ablation_only
+        or args.continuous_toggle_ablation_only
+        or args.wgmma_feature_ablation_only
+        or args.output_store_ablation_only
+        or args.local_ablation_only
+        or args.documented_gap_ablation_only
+        or args.candidate_json is not None
+        or args.maximum_current_pct is not None
     ):
         ranking_rows = _read_existing(args.ranking_json)
         torch_by_shape = {
@@ -715,14 +1241,71 @@ def main() -> int:
                 row.get("implementation") == "ayla"
                 and row.get("status") == "ok"
                 and row.get("latency_ms") is not None
+                and not bool(
+                    row.get("configuration", {}).get("unsafe_reuse_smem")
+                )
             ):
                 ayla_by_shape.setdefault(str(row["shape_id"]), []).append(row)
+                problem = tuple(
+                    int(row[field]) for field in ("m", "n", "k")
+                ) + (str(row["dtype"]),)
+                ayla_by_problem.setdefault(problem, []).append(row)
 
     def current_best(shape: Shape) -> dict[str, Any] | None:
         candidates = ayla_by_shape.get(shape.shape_id, [])
-        return min(
-            candidates, key=lambda row: float(row["latency_ms"]),
+        if not candidates and shape.op == "addmm":
+            candidates = ayla_by_problem.get(
+                (shape.m, shape.n, shape.k, shape.dtype), [],
+            )
+        baseline = torch_by_shape.get(shape.shape_id)
+
+        def candidate_pct(row: dict[str, Any]) -> float:
+            value = row.get("torch_pct")
+            if value is not None:
+                return float(value)
+            if baseline is None:
+                return float("-inf")
+            return (
+                float(baseline["latency_ms"]) / float(row["latency_ms"]) * 100
+            )
+
+        return max(
+            candidates, key=candidate_pct,
         ) if candidates else None
+
+    explicit_candidates = (
+        _load_explicit_candidates(args.candidate_json)
+        if args.candidate_json is not None else {}
+    )
+    if args.candidate_json is not None:
+        supported = [
+            shape for shape in supported
+            if shape.shape_id in explicit_candidates
+        ]
+
+    if args.maximum_current_pct is not None:
+        def within_current_pct(shape: Shape) -> bool:
+            best = current_best(shape)
+            baseline = torch_by_shape.get(shape.shape_id)
+            if best is None:
+                return False
+            value = best.get("torch_pct")
+            if value is not None:
+                return float(value) <= args.maximum_current_pct
+            return (
+                baseline is not None
+                and float(baseline["latency_ms"])
+                / float(best["latency_ms"]) * 100
+                <= args.maximum_current_pct
+            )
+        supported = [shape for shape in supported if within_current_pct(shape)]
+
+    if args.recheck_best_only:
+        ranked_count = len(supported)
+        supported = _shapes_with_current_best(supported, current_best)
+        print(
+            f"recheck ranking coverage: {len(supported)}/{ranked_count} shapes"
+        )
 
     if args.worst_shapes is not None:
         if args.worst_shapes < 1:
@@ -761,16 +1344,74 @@ def main() -> int:
         supported = [shape for shape in supported if current_pct(shape) < 100]
         supported.sort(key=current_pct, reverse=True)
         supported = supported[:args.closest_below_torch]
+    if args.lowest_pct_shapes is not None:
+        if args.lowest_pct_shapes < 1:
+            parser.error("--lowest-pct-shapes must be positive")
+        if args.worst_shapes is not None or args.closest_below_torch is not None:
+            parser.error(
+                "--lowest-pct-shapes, --closest-below-torch, and "
+                "--worst-shapes are mutually exclusive"
+            )
+
+        def lowest_current_pct(shape: Shape) -> float:
+            best = current_best(shape)
+            if best is None:
+                return float("-inf")
+            value = best.get("torch_pct")
+            if value is not None:
+                return float(value)
+            baseline = torch_by_shape.get(shape.shape_id)
+            if baseline is None:
+                return float("-inf")
+            return (
+                float(baseline["latency_ms"])
+                / float(best["latency_ms"])
+                * 100
+            )
+
+        supported.sort(key=lowest_current_pct)
+        supported = supported[:args.lowest_pct_shapes]
     if args.max_shapes is not None:
         if args.max_shapes < 1:
             parser.error("--max-shapes must be positive")
         supported = supported[:args.max_shapes]
     if args.config_timeout_seconds < 0:
         parser.error("--config-timeout-seconds must be nonnegative")
+    if args.max_timing_rounds < 3:
+        parser.error("--max-timing-rounds must be at least three")
+    if args.cold_cache_mib < 0:
+        parser.error("--cold-cache-mib must be nonnegative")
+    if args.timing == "cold" and not args.cold_cache_mib:
+        parser.error("--timing cold requires --cold-cache-mib")
+    if args.timing == "warm" and args.cold_cache_mib:
+        parser.error("--timing warm does not flush; drop --cold-cache-mib")
+    timing = {
+        "cold_cache_bytes": args.cold_cache_mib * 1024 * 1024,
+        "inference": args.timing == "inference",
+    }
+    global _TIMING_PROTOCOL
+    _TIMING_PROTOCOL = (
+        f"cold{args.cold_cache_mib}"
+        if args.timing == "cold"
+        else "inference-v2"
+        if args.timing == "inference"
+        else args.timing
+    )
+    benchmark_common._MAX_ROUNDS = args.max_timing_rounds
+    # The isolated worker always times each candidate as an interleaved
+    # [Torch, Ayla] pair, so pairing and the per-configuration watchdog are
+    # compatible. ``--pair-each-config`` only selects the equivalent
+    # in-process path when isolation is disabled.
     if args.num_shards < 1:
         parser.error("--num-shards must be positive")
     if not 0 <= args.shard_index < args.num_shards:
         parser.error("--shard-index must be in [0, --num-shards)")
+    if args.config_num_shards < 1:
+        parser.error("--config-num-shards must be positive")
+    if not 0 <= args.config_shard_index < args.config_num_shards:
+        parser.error(
+            "--config-shard-index must be in [0, --config-num-shards)"
+        )
 
     representatives: dict[str, str] = {}
     for shape in supported:
@@ -789,6 +1430,16 @@ def main() -> int:
         row for row in rows
         if str(row.get("shape_id", "")) in supported_shape_ids
     ]
+    # Rows from before the field existed were timed hot or after a plain flush
+    # that L2-pinned operands survive; neither is comparable to a new row.
+    stale = {
+        str(row.get("timing_protocol", "legacy")) for row in rows
+    } - {_TIMING_PROTOCOL}
+    if stale:
+        parser.error(
+            f"{args.output_json} holds rows timed as {sorted(stale)}, not "
+            f"{_TIMING_PROTOCOL!r}; write to a new output or pass --no-resume"
+        )
     config_pattern = re.compile(args.config_filter) if args.config_filter else None
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -798,9 +1449,14 @@ def main() -> int:
             args.tune_only, args.cublas_inspired_only,
             args.resource_tune_only, args.coarse_tile_only, args.wg2d_only,
             args.multicast_only,
+            args.multicast_ablation_only,
+            args.multicast_resweep_only,
+            args.multicast_transfer_only,
+            args.multicast_neighborhood_only,
             args.pipeline_tile_only,
             args.gap_tune_only,
             args.narrow_tile_only,
+            args.bmm_tune_only,
             args.exact_cta_only,
             args.exact_cta_refine_only,
             args.local_refine_only,
@@ -808,16 +1464,46 @@ def main() -> int:
             args.narrow_wg2d_only,
             args.transfer_only,
             args.static_loop_only,
+            args.small_cta_writeback_only,
+            args.small_cta_writeback_refine_only,
+            args.small_cta_writeback_transfer_only,
             args.architecture_gap_only,
+            args.tail_end_only,
             args.recheck_best_only,
             args.rhs_tma_slice_only,
             args.workgroup_parallel_only,
             args.smem_reuse_only,
+            args.wgmma_pipeline_only,
+            args.continuous_wgmma_only,
+            args.wgmma_group_only,
+            args.wgmma_epilogue_only,
+            args.continuous_cluster_only,
+            args.continuous_architecture_only,
+            args.grid_swap_only,
+            args.grid_swap_refine_only,
+            args.grid_swap_ablation_only,
+            args.exact_axis_ablation_only,
+            args.lhs_promotion_ablation_only,
+            args.rhs_promotion_ablation_only,
+            args.cache_hint_ablation_only,
+            args.stage_ablation_only,
+            args.ptx_optimization_ablation_only,
+            args.output_layout_ablation_only,
+            args.output_slicing_ablation_only,
+            args.output_n_grouping_ablation_only,
+            args.continuous_toggle_ablation_only,
+            args.wgmma_feature_ablation_only,
+            args.output_store_ablation_only,
+            args.local_ablation_only,
+            args.documented_gap_ablation_only,
+            args.candidate_json is not None,
         ))
         if exclusive > 1:
             parser.error("fallback/refinement modes are mutually exclusive")
         schedules = (
-            [fallback_config()] if args.fallback_only
+            list(explicit_candidates.get(shape.shape_id, ()))
+            if args.candidate_json is not None
+            else [fallback_config()] if args.fallback_only
             else list(refinement_configs(shape)) if args.refine_only
             else list(tile_refinement_configs()) if args.tile_refine_only
             else list(targeted_tuning_configs(shape)) if args.tune_only
@@ -831,12 +1517,26 @@ def main() -> int:
             if args.wg2d_only
             else list(multicast_configs(shape))
             if args.multicast_only
+            else list(multicast_ablation_configs(shape))
+            if args.multicast_ablation_only
+            else list(multicast_resweep_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.multicast_resweep_only and (best := current_best(shape)) is not None
+            else list(multicast_winner_transfer_configs(shape))
+            if args.multicast_transfer_only
+            else list(multicast_incumbent_neighborhood_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.multicast_neighborhood_only and (best := current_best(shape)) is not None
             else list(pipeline_tile_configs(shape))
             if args.pipeline_tile_only
             else list(gap_tuning_configs(shape))
             if args.gap_tune_only
             else list(narrow_tile_configs(shape))
             if args.narrow_tile_only
+            else list(bmm_tuning_configs(shape))
+            if args.bmm_tune_only
             else list(exact_cta_configs(shape))
             if args.exact_cta_only
             else list(exact_cta_refinement_configs(shape))
@@ -851,8 +1551,16 @@ def main() -> int:
             if args.transfer_only
             else list(static_loop_configs(shape))
             if args.static_loop_only
+            else list(small_cta_writeback_configs(shape))
+            if args.small_cta_writeback_only
+            else list(small_cta_writeback_refinement_configs(shape))
+            if args.small_cta_writeback_refine_only
+            else list(small_cta_writeback_transfer_configs(shape))
+            if args.small_cta_writeback_transfer_only
             else list(architecture_gap_configs(shape))
             if args.architecture_gap_only
+            else list(tail_end_configs(shape))
+            if args.tail_end_only
             else [_schedule_from_row(best)]
             if args.recheck_best_only and (best := current_best(shape)) is not None
             else list(rhs_tma_slicing_configs(shape, _schedule_from_row(best)))
@@ -863,6 +1571,90 @@ def main() -> int:
             if args.workgroup_parallel_only and (best := current_best(shape)) is not None
             else list(smem_reuse_configs(shape, _schedule_from_row(best)))
             if args.smem_reuse_only and (best := current_best(shape)) is not None
+            else list(wgmma_pipeline_configs(shape, _schedule_from_row(best)))
+            if args.wgmma_pipeline_only and (best := current_best(shape)) is not None
+            else list(continuous_wgmma_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.continuous_wgmma_only and (best := current_best(shape)) is not None
+            else list(wgmma_group_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.wgmma_group_only and (best := current_best(shape)) is not None
+            else list(wgmma_epilogue_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.wgmma_epilogue_only and (best := current_best(shape)) is not None
+            else list(continuous_cluster_configs(shape))
+            if args.continuous_cluster_only
+            else list(continuous_architecture_gap_configs(shape))
+            if args.continuous_architecture_only
+            else list(grid_swap_configs(shape, _schedule_from_row(best)))
+            if args.grid_swap_only and (best := current_best(shape)) is not None
+            else list(grid_swap_refinement_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.grid_swap_refine_only and (best := current_best(shape)) is not None
+            else list(grid_swap_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.grid_swap_ablation_only and (best := current_best(shape)) is not None
+            else list(exact_axis_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.exact_axis_ablation_only and (best := current_best(shape)) is not None
+            else list(lhs_promotion_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.lhs_promotion_ablation_only and (best := current_best(shape)) is not None
+            else list(rhs_promotion_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.rhs_promotion_ablation_only and (best := current_best(shape)) is not None
+            else list(cache_hint_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.cache_hint_ablation_only and (best := current_best(shape)) is not None
+            else list(stage_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.stage_ablation_only and (best := current_best(shape)) is not None
+            else list(ptx_optimization_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.ptx_optimization_ablation_only and (best := current_best(shape)) is not None
+            else list(output_layout_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.output_layout_ablation_only and (best := current_best(shape)) is not None
+            else list(output_slicing_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.output_slicing_ablation_only and (best := current_best(shape)) is not None
+            else list(output_n_grouping_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.output_n_grouping_ablation_only and (best := current_best(shape)) is not None
+            else list(continuous_toggle_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.continuous_toggle_ablation_only and (best := current_best(shape)) is not None
+            else list(wgmma_feature_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.wgmma_feature_ablation_only and (best := current_best(shape)) is not None
+            else list(output_store_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.output_store_ablation_only and (best := current_best(shape)) is not None
+            else list(local_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.local_ablation_only and (best := current_best(shape)) is not None
+            else list(documented_gap_ablation_configs(
+                shape, _schedule_from_row(best),
+            ))
+            if args.documented_gap_ablation_only and (best := current_best(shape)) is not None
             else [
                 config for config in seed_configs(shape)
                 if config_pattern is None or config_pattern.search(config.name)
@@ -872,7 +1664,35 @@ def main() -> int:
             schedules = [
                 config for config in schedules if config_pattern.search(config.name)
             ]
-        if ranking_rows and not args.recheck_best_only:
+        schedules = [
+            config for config in schedules
+            if int.from_bytes(
+                hashlib.sha256(config.name.encode()).digest()[:8], "big",
+            ) % args.config_num_shards == args.config_shard_index
+        ]
+        if (
+            ranking_rows
+            and args.candidate_json is None
+            and not args.recheck_best_only
+            and not args.multicast_ablation_only
+            and not args.multicast_resweep_only
+            and not args.multicast_neighborhood_only
+            and not args.grid_swap_ablation_only
+            and not args.exact_axis_ablation_only
+            and not args.lhs_promotion_ablation_only
+            and not args.rhs_promotion_ablation_only
+            and not args.cache_hint_ablation_only
+            and not args.stage_ablation_only
+            and not args.ptx_optimization_ablation_only
+            and not args.output_layout_ablation_only
+            and not args.output_slicing_ablation_only
+            and not args.output_n_grouping_ablation_only
+            and not args.continuous_toggle_ablation_only
+            and not args.wgmma_feature_ablation_only
+            and not args.output_store_ablation_only
+            and not args.local_ablation_only
+            and not args.documented_gap_ablation_only
+        ):
             measured_keys = {
                 _schedule_key(_schedule_from_row(row))
                 for row in ayla_by_shape.get(shape.shape_id, [])
@@ -897,7 +1717,7 @@ def main() -> int:
         if not schedules:
             print(f"[shape {index}/{len(supported)}] no matching seed configs")
             continue
-        expected = {(shape.shape_id, "torch.mm")} | {
+        expected = {(shape.shape_id, f"torch.{shape.op}")} | {
             (shape.shape_id, schedule.name) for schedule in schedules
         }
         if expected <= {_row_key(row) for row in rows}:
@@ -926,15 +1746,16 @@ def main() -> int:
 
         if args.config_timeout_seconds > 0:
             baseline_result, measurements = _benchmark_isolated(
-                shape, schedules, args.config_timeout_seconds,
+                shape, schedules, args.config_timeout_seconds, timing,
             )
-            rows.append(_result_row(
-                shape, "torch", None,
-                latency_ms=baseline_result["latency_ms"],
-                tflops=baseline_result["tflops"],
-                torch_pct=100.0,
-                search_scope="torch_baseline",
-            ))
+            if baseline_result is not None:
+                rows.append(_result_row(
+                    shape, "torch", None,
+                    latency_ms=baseline_result["latency_ms"],
+                    tflops=baseline_result["tflops"],
+                    torch_pct=100.0,
+                    search_scope="torch_baseline",
+                ))
             for schedule, measurement, error in measurements:
                 if measurement is None:
                     rows.append(_result_row(
@@ -947,10 +1768,7 @@ def main() -> int:
                     shape, "ayla", schedule,
                     latency_ms=measurement["latency_ms"],
                     tflops=measurement["tflops"],
-                    torch_pct=(
-                        baseline_result["latency_ms"]
-                        / measurement["latency_ms"] * 100
-                    ),
+                    torch_pct=measurement.get("torch_pct"),
                     max_abs_error=measurement["max_abs"],
                     relative_rms_error=measurement["relative_rms"],
                     search_scope=scope(schedule),
@@ -975,12 +1793,41 @@ def main() -> int:
                     scope(schedule),
                 ))
 
-        baseline = gemm_bench_config(
-            name="Torch", m=shape.m, n=shape.n, k=shape.k,
-            compute=torch_mm_nt, dtype=TORCH_DTYPES[shape.dtype],
-        )
+        baseline = _baseline_config(shape)
+        if args.pair_each_config:
+            torch_results = []
+            for bench, (
+                schedule, max_abs, relative_rms, search_scope,
+            ) in zip(ayla_configs, built, strict=True):
+                torch_result, ayla_result = run([baseline, bench], **timing)
+                torch_results.append(torch_result)
+                rows.append(_result_row(
+                    shape, "ayla", schedule,
+                    latency_ms=ayla_result.median_ms,
+                    tflops=ayla_result.tflops,
+                    torch_pct=ayla_result.torch_mm_pct,
+                    max_abs_error=max_abs,
+                    relative_rms_error=relative_rms,
+                    search_scope=search_scope,
+                ))
+            if torch_results:
+                torch_latency = statistics.median(
+                    result.median_ms for result in torch_results
+                )
+                rows.append(_result_row(
+                    shape, "torch", None,
+                    latency_ms=torch_latency,
+                    tflops=(
+                        2 * shape.m * shape.n * shape.k
+                        / (torch_latency / 1e3) / 1e12
+                    ),
+                    torch_pct=100.0,
+                    search_scope="torch_baseline",
+                ))
+            _write_raw(rows, args.output_json, args.output_csv)
+            continue
         configs = [baseline, *ayla_configs]
-        results = run(configs)
+        results = run(configs, **timing)
         print_results(results)
         torch_result, *ayla_results = results
         rows.append(_result_row(
