@@ -1,7 +1,16 @@
 """Tests for the LICM (loop-invariant code motion) pass."""
 import textwrap
 
-from ayla.gpu_dialect import gpu_dialect
+from ayla.base.ir import find_ops_of_type
+from ayla.gpu_dialect import (
+    AllocOp,
+    IfOp,
+    KernelOp,
+    LockType,
+    RmemTensorType,
+    SmemTensorType,
+    gpu_dialect,
+)
 from ayla.passes.licm import licm
 
 
@@ -53,3 +62,67 @@ def test_hoist_alloc_without_init():
           }
         }""")
     assert text == expected
+
+
+def test_do_not_hoist_alloc_out_of_top_level_if():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %zero: index = index_constant() attrs={value: 0}
+            %one: index = index_constant() attrs={value: 1}
+            %condition: pred = index_lt(%zero: index, %one: index)
+            if(%condition: pred) {
+              %s: smem<64x64xbf16> = alloc() attrs={id: 0}
+              %r: rmem<64x64xbf16> = alloc() attrs={id: 1, init: 0.0}
+              move(%s: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
+            }
+          }
+        }"""))
+
+    module = licm(module)
+
+    [guard] = find_ops_of_type(module, IfOp)
+    smem, rmem = find_ops_of_type(module, AllocOp)
+    assert smem.parent_block is guard.body
+    assert rmem.parent_block is guard.body
+
+
+def test_hoist_uninitialized_smem_through_loop_guard():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %zero: index = index_constant() attrs={value: 0}
+            %one: index = index_constant() attrs={value: 1}
+            %condition: pred = index_lt(%zero: index, %one: index)
+            for (%k: index = 0 to 2) {
+              if(%condition: pred) {
+                %s: smem<64x64xbf16> = alloc() attrs={id: 0}
+                %r: rmem<64x64xbf16> = alloc() attrs={id: 1, init: 0.0}
+                %lock: lock<mbar> = alloc() attrs={id: 2}
+                move(%s: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
+              }
+            }
+          }
+        }"""))
+
+    # One pass crosses the guard; the second crosses the enclosing loop.
+    module = licm(licm(module))
+
+    [guard] = find_ops_of_type(module, IfOp)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    smem = next(
+        alloc for alloc in find_ops_of_type(module, AllocOp)
+        if isinstance(alloc.result().type, SmemTensorType)
+    )
+    rmem = next(
+        alloc for alloc in find_ops_of_type(module, AllocOp)
+        if isinstance(alloc.result().type, RmemTensorType)
+    )
+    lock = next(
+        alloc for alloc in find_ops_of_type(module, AllocOp)
+        if isinstance(alloc.result().type, LockType)
+    )
+    assert smem.parent_block is kernel.body
+    assert rmem.parent_block is guard.body
+    assert lock.parent_block is guard.body
