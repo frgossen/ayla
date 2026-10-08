@@ -4,6 +4,7 @@ import textwrap
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     AllocOp,
+    MoveOp,
     TmaMoveOp,
     gpu_dialect,
 )
@@ -73,6 +74,43 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
     ]
     assert "src_tiling_scheme" not in writeback.attrs
     assert writeback.attrs["dst_tiling_scheme"] == 7
+
+
+def test_wgrmem_2d_grid_gathers_for_one_block_tma_store():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<104x16xbf16>, %c: gmem<128x208xbf16>) grid_dim=[1, 1, 1] block_dim=[512, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c2: index = index_constant() attrs={value: 2}
+            %row: index = index_div(%wgx: index, %c2: index)
+            %col: index = index_mod(%wgx: index, %c2: index)
+            %rows: gmem<64x208xbf16 strides=[208, 1]> = tile(%c: gmem<128x208xbf16>, %row: index, 0)
+            %tile: gmem<64x104xbf16 strides=[208, 1]> = tile(%rows: gmem<64x208xbf16 strides=[208, 1]>, 0, %col: index)
+            matmul(%a: smem<64x16xbf16>, %b: smem<104x16xbf16>, %tile: gmem<64x104xbf16 strides=[208, 1]>) collective=[x.wg, y.block, z.thread] attrs={init: 0.0, label: "mm"}
+          }
+        }"""))  # noqa: E501
+
+    promote_buffers(
+        module,
+        target_type="wgrmem",
+        target_dtype="f32",
+        operands=["dst"],
+        layout="wgmma_layout_0",
+        warps=4,
+        tma=True,
+        writeback_slices=1,
+        label_filter="mm",
+    )
+
+    allocations = find_ops_of_type(module, AllocOp)
+    assert any(op.result().type.sizes == [128, 208] for op in allocations)
+    moves = find_ops_of_type(module, MoveOp)
+    [gather] = [move for move in moves if not move.attrs.get("tma")]
+    [store] = [move for move in moves if move.attrs.get("tma")]
+    assert gather.dst.type.sizes == [64, 104]
+    assert "writer_wg" not in gather.attrs
+    assert store.dst.type.sizes == [128, 208]
+    assert store.src.type.sizes == [128, 208]
 
 
 def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
