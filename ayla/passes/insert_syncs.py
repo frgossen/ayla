@@ -15,6 +15,7 @@ from ..gpu_dialect import (
     KernelOp,
     LockType,
     ModuleOp,
+    effective_operands,
     lock_has_tma_multicast,
 )
 
@@ -37,11 +38,16 @@ def _insert_barriers(
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
-    # Publication still owed by the lock initializations just above.
+    # Locks initialized above whose publication is still owed, and its scope.
+    # Publish once something uses one of them, or a barrier is due anyway.
+    pending_locks: set[Value] = set()
     pending_init = BarrierScope.THREAD
     for op in block.ops:
         target = targets.get(op)
-        if pending_init != BarrierScope.THREAD and not isinstance(op, AllocOp):
+        if pending_locks and (
+            (target is not None and target.scope != BarrierScope.THREAD)
+            or not pending_locks.isdisjoint(effective_operands(op))
+        ):
             new_ops.extend(_publication_barriers(pending_init))
             if (
                 target is not None
@@ -49,6 +55,7 @@ def _insert_barriers(
                 and op not in (barrier_syncs or {})
             ):
                 target = None  # The publication already orders this hazard.
+            pending_locks.clear()
             pending_init = BarrierScope.THREAD
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
@@ -77,7 +84,9 @@ def _insert_barriers(
                 attrs=attrs,
             ))
         new_ops.append(op)
-        pending_init = pending_init.join(_lock_init_barrier(op))
+        if (init := _lock_init_barrier(op)) != BarrierScope.THREAD:
+            pending_locks.add(op.result())
+            pending_init = pending_init.join(init)
         for inner in op.blocks:
             _insert_barriers(inner, targets, num_threads, barrier_syncs)
     new_ops.extend(_publication_barriers(pending_init))
