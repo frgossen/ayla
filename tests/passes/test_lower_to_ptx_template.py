@@ -56,10 +56,11 @@ def test_lower_barrier(scope, expected):
 def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
-        mov.u32 ${b32:bl_tid}, %tid.x;
-        setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-        @${pred:bl_w0} bar.sync 1, 128;
-        @!${pred:bl_w0} bar.arrive 1, 128;
+        or.b32 ${b32:bl_warp}, ${b32:operand.warp_x.val}, ${b32:operand.warp_y.val};
+        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:operand.warp_z.val};
+        setp.ne.u32 ${pred:bl_other_warp}, ${b32:bl_warp}, 0;
+        @${pred:bl_other_warp} bar.arrive 1, 128;
+        @!${pred:bl_other_warp} bar.sync 1, 128;
         """)
 
 
@@ -89,10 +90,11 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         "bar.sync 0;",
         "barrier.cluster.arrive.release;",
         "barrier.cluster.wait.acquire;",
+        "@${pred:cl_other_warp} bra ${label:cl_done};",
         "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
-        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+        "@${pred:cl_t0} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "@${pred:cl_t0} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
 
 

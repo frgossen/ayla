@@ -49,6 +49,7 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     ToPtrOp,
+    WarpIdsOp,
     WgrmemTensorType,
     physical_layout,
     lock_has_tma_multicast,
@@ -257,6 +258,7 @@ class LowerToPtxTemplate(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
+        self.warp_ids: WarpIdsOp | None = None
 
     @lowers(KernelOp)
     def lower_kernel(
@@ -285,8 +287,28 @@ class LowerToPtxTemplate(LoweringPass):
             )
             op.body.ops.insert(0, policy_op)
             self.cache_policy_values = dict(zip(cache_hints, policy_op.results))
+        # The leader's warp (warp 0) waits at gather barriers and issues TMA.
+        # Compute the warp index once, rather than at every use.
+        self.warp_ids = WarpIdsOp.build()
+        op.body.ops.insert(0, self.warp_ids)
         self.lower_block(op.body)
         return [op], []
+
+    def _leader_warp(self, prefix: str) -> tuple[list[Value], list[str], str]:
+        """Operands and PTX setting ``${pred:<prefix>_other_warp}`` outside warp 0.
+
+        Warp 0 holds the leader, thread 0. The kernel's warp index is broadcast
+        from each warp's first thread, so ptxas proves this predicate
+        warp-uniform.
+        """
+        assert self.warp_ids is not None, "lower_kernel creates warp_ids"
+        return list(self.warp_ids.results), ["warp_x", "warp_y", "warp_z"], (
+            f"or.b32 ${{b32:{prefix}_warp}}, ${{b32:operand.warp_x.val}}, "
+            "${b32:operand.warp_y.val};\n"
+            f"or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, "
+            "${b32:operand.warp_z.val};\n"
+            f"setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, 0;\n"
+        )
 
     def _tma_instruction(
         self,
@@ -508,6 +530,7 @@ class LowerToPtxTemplate(LoweringPass):
         template = textwrap.dedent(f"""\
             .shared .align 8 .b64 ${{smem:bar}}[1];
             mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:result.dst.parity}}, 0;
             mov.u32 ${{b32:tid_x}}, %tid.x;
             mov.u32 ${{b32:tid_y}}, %tid.y;
             or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
@@ -1146,46 +1169,52 @@ class LowerToPtxTemplate(LoweringPass):
             assert op.sync is not None
             sync = self.value_map[op.sync]
             assert isinstance(sync, Value)
-            template = textwrap.dedent("""\
-                bar.sync 0;
+            # After the local sync, only the leader's warp (warp 0) goes on:
+            # thread 0 arrives at rank 0's cluster mbarrier, and in rank 0 the
+            # warp waits on its parity as one, staying converged for the
+            # leader's next warp-wide instructions. The other warps continue.
+            # Special registers are read before branching, so ptxas keeps
+            # them out of loops.
+            warp_operands, warp_names, leader_warp = self._leader_warp("cl")
+            template = "bar.sync 0;\n" + leader_warp + textwrap.dedent("""\
                 mov.u32 ${b32:cl_tid}, %tid.x;
-                mov.u32 ${b32:cl_tidy}, %tid.y;
-                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidy};
-                mov.u32 ${b32:cl_tidz}, %tid.z;
-                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidz};
-                setp.ne.u32 ${pred:cl_not_t0}, ${b32:cl_tid}, 0;
-                @${pred:cl_not_t0} bra ${label:cl_done};
+                setp.eq.u32 ${pred:cl_t0}, ${b32:cl_tid}, 0;
                 mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
                 setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;
+                @${pred:cl_other_warp} bra ${label:cl_done};
                 @${pred:rank0} bra ${label:cl_rank0};
                 mov.u32 ${b32:cluster_rank}, 0;
                 mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};
-                mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
+                @${pred:cl_t0} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
                 bra ${label:cl_done};
                 ${label:cl_rank0}:
-                mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];
+                @${pred:cl_t0} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];
+                mov.u32 ${b32:ticks}, 0x989680;
                 ${label:cl_wait}:
-                mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};
+                mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
                 @!${pred:ready} bra ${label:cl_wait};
+                xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
                 ${label:cl_done}:
                 """)
-            operands = [sync]
-            operand_names = ["sync"]
+            operands = [sync, *warp_operands]
+            operand_names = ["sync", *warp_names]
         elif scope in ("leader_to_cluster", "cluster"):
             template = textwrap.dedent("""\
                 barrier.cluster.arrive.release;
                 barrier.cluster.wait.acquire;
                 """)
         elif scope == "block_leader":
-            # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
-            # insert_syncs (unique among concurrently-live block-leader barriers).
+            # Warp 0, which holds the leader t0, waits; the other warps arrive
+            # and continue, on the named barrier id chosen by insert_syncs
+            # (unique among concurrently-live block-leader barriers). Warps
+            # are told apart by their warp-uniform index, and arrive first so
+            # an arrival never waits behind a skipped bar.sync.
             bar_id = op.attrs.get("id", 1)
             num_threads = op.attrs["num_threads"]
-            template = textwrap.dedent(f"""\
-                mov.u32 ${{b32:bl_tid}}, %tid.x;
-                setp.lt.u32 ${{pred:bl_w0}}, ${{b32:bl_tid}}, 32;
-                @${{pred:bl_w0}} bar.sync {bar_id}, {num_threads};
-                @!${{pred:bl_w0}} bar.arrive {bar_id}, {num_threads};
+            operands, operand_names, leader_warp = self._leader_warp("bl")
+            template = leader_warp + textwrap.dedent(f"""\
+                @${{pred:bl_other_warp}} bar.arrive {bar_id}, {num_threads};
+                @!${{pred:bl_other_warp}} bar.sync {bar_id}, {num_threads};
                 """)
         elif scope == "grid":
             assert op.sync is not None
