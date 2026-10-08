@@ -84,6 +84,17 @@ def _verify_collective_attr(op: Op) -> None:
         )
 
 
+def _non_unit_layout(
+    typ: AddrMemTensorType,
+) -> list[tuple[int | None, int | None]]:
+    """The (size, stride) pairs of non-singleton dimensions."""
+    return [
+        (size, stride)
+        for size, stride in zip(typ.sizes, typ.strides, strict=True)
+        if size != 1
+    ]
+
+
 def _verify_transposed_fragment_store(op: MoveOp) -> None:
     """A WGMMA fragment reaches column-major smem only through STMatrix.trans."""
     src = op.src.type
@@ -460,12 +471,17 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError("reshape must preserve the memory space")
         if arg.dtype != result.dtype:
             raise ValueError("reshape must preserve the element type")
-        # TODO: Accept non-canonical strides when the reshape preserves the
-        # underlying linear element order.
+        # TODO: Accept other non-canonical strides when the reshape preserves
+        # the underlying linear element order.
         if isinstance(arg, AddrMemTensorType):
             assert isinstance(result, AddrMemTensorType)
-            if not arg.is_canonical_strides or not result.is_canonical_strides:
-                raise ValueError("reshape operands must have canonical strides")
+            if not (
+                arg.is_canonical_strides and result.is_canonical_strides
+            ) and _non_unit_layout(arg) != _non_unit_layout(result):
+                raise ValueError(
+                    "reshape operands must have canonical strides or differ "
+                    "only by singleton dimensions"
+                )
         if (
             arg.num_elements is not None
             and result.num_elements is not None

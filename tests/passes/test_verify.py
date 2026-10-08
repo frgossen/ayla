@@ -270,6 +270,25 @@ def test_default_verification_checks_reshape():
     ]))
     assert verify_gpu_dialect(register_reshape) is register_reshape
 
+    strided_singleton_source = Value(
+        name="strided_singleton_source",
+        type=GmemTensorType.build(
+            [1, 384, 196], F32Type(), strides=[75264, 1, 384],
+        ),
+    )
+    strided_singleton_reshape = ModuleOp.build(Block(ops=[
+        ReshapeOp.build(
+            strided_singleton_source,
+            GmemTensorType.build(
+                [384, 196], F32Type(), strides=[1, 384],
+            ),
+        ),
+    ]))
+    assert (
+        verify_gpu_dialect(strided_singleton_reshape)
+        is strided_singleton_reshape
+    )
+
     wrong_size = ModuleOp.build(Block(ops=[
         ReshapeOp.build(
             source, GmemTensorType.build([5, 4], F32Type()),
