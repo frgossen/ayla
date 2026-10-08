@@ -248,6 +248,7 @@ class PromoteBuffers(LoweringPass):
     tma : bool
         Use TMA for the move. A WGRMEM destination is written back through a
         block-wide SMEM staging buffer because TMA cannot read registers.
+        A selected WGRMEM-to-GMEM move is staged the same way.
     nc : bool
         Non-coherent cache hint for scalar gmem→rmem loads.
     physical_layout : dict or None
@@ -684,6 +685,18 @@ class PromoteBuffers(LoweringPass):
                 new_ops.append(op)
                 i += 1
                 continue
+            if isinstance(op, MoveOp):
+                label = op.attrs.get("label")
+                assert label is None or isinstance(label, str)
+                writeback_ops, _ = self._build_operand_writeback(
+                    op.dst, op.src, "dst", op.collective, label,
+                    writeback_tiling_scheme=cast(
+                        int | None, op.attrs.get("dst_tiling_scheme")
+                    ),
+                )
+                new_ops.extend(writeback_ops)
+                i += 1
+                continue
             epilogue = self._epilogue(ops, i)
             assert isinstance(op, MatmulOp)
             new_ops.extend(self._promote(op, epilogue))
@@ -691,7 +704,25 @@ class PromoteBuffers(LoweringPass):
         block.ops = new_ops
 
     def _promotes(self, op: Op) -> bool:
-        return isinstance(op, MatmulOp) and label_matches(op, self.label_filter)
+        if not label_matches(op, self.label_filter):
+            return False
+        return isinstance(op, MatmulOp) or self._is_register_writeback(op)
+
+    def _is_register_writeback(self, op: Op) -> bool:
+        """Whether ``op`` is the writeback half of a destination promotion.
+
+        A schedule that builds its own register accumulators -- such as two
+        matmuls feeding one epilogue -- writes the result back itself. That
+        move still needs staging through SMEM when the store is a TMA.
+        """
+        return (
+            isinstance(op, MoveOp)
+            and "dst" in self.operand_names
+            and self.tma
+            and self.target_type == "wgrmem"
+            and isinstance(op.src.type, WgrmemTensorType)
+            and isinstance(op.dst.type, GmemTensorType)
+        )
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[ElementwiseOp]:
         """The ops directly behind ``ops[hero]`` that promote with it.
