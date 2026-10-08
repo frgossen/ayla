@@ -266,7 +266,7 @@ class TileMatmul(LoweringPass):
         return found
 
     def _iteration_bounds(self, hero: MatmulOp) -> list[int]:
-        lhs, rhs, _ = hero.operands
+        lhs, rhs = hero.lhs, hero.rhs
         assert isinstance(lhs.type, MemTensorType)
         assert isinstance(rhs.type, MemTensorType)
         sizes_by_dim = {
@@ -348,7 +348,8 @@ class TileMatmul(LoweringPass):
         epilogue: list[Op],
         ubs: list[int],
     ) -> list[Op]:
-        lhs, rhs, dst = hero.operands
+        lhs, rhs, dst = hero.lhs, hero.rhs, hero.dst
+        init_value = hero.init_value
         tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
@@ -465,6 +466,14 @@ class TileMatmul(LoweringPass):
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
+        if init_value is not None:  # A tensor initializer is tiled like dst.
+            ops, init_value = _build_tile_op(
+                init_value, ["M", "N"],
+                op_dims=self.op_dims,
+                tile_idxs=ivs,
+                tile_sizes=self.tile_sizes,
+            )
+            dst_ops += ops
         # The destination is cut by M and N, never by K, so its tile stands
         # outside the loops over K -- the same place the epilogue stands, and
         # where it has to be for an epilogue there to name it. Only that far:
@@ -492,6 +501,7 @@ class TileMatmul(LoweringPass):
                 collective=hero.collective,
                 attrs=attrs,
                 init=hero.init,
+                init_value=init_value,
             ),
         )
 

@@ -29,6 +29,8 @@ from ..gpu_dialect import (
     MoveOp,
     ReduceOp,
     ReshapeOp,
+    RmemTensorType,
+    ConstantOp,
     SmemTensorType,
     TileOp,
     TmaDescType,
@@ -180,6 +182,44 @@ class VerifyGpuDialect(VerificationPass):
         if type(op.step) is not int or op.step <= 0:
             raise ValueError(
                 f"for step must be a positive integer, got {op.step!r}"
+            )
+
+    @verifies(ConstantOp)
+    def _verify_constant(self, op: ConstantOp) -> None:
+        result_type = op.result().type
+        if not isinstance(result_type, MemTensorType):
+            raise ValueError("constant result must be a memory tensor")
+        if not isinstance(
+            result_type.dtype, (F16Type, BF16Type, F32Type, F64Type),
+        ):
+            raise ValueError("constant result must have a floating-point dtype")
+        value = op.attrs.get("value")
+        if type(value) in (int, float):
+            return
+        if not isinstance(value, list) or any(
+            type(element) not in (int, float) for element in value
+        ):
+            raise ValueError(
+                "constant value must be an int, float, or flat numerical list"
+            )
+        if result_type.num_elements != len(value):
+            raise ValueError(
+                f"constant has {len(value)} values for tensor shape "
+                f"{result_type.sizes}"
+            )
+
+    @verifies(ConstantOp, stage=VerificationStage.PTX_LOWERING)
+    def _verify_lowerable_constant(self, op: ConstantOp) -> None:
+        result_type = op.result().type
+        if not isinstance(result_type, RmemTensorType):
+            raise ValueError(
+                "PTX lowering supports constant materialization only in rmem; "
+                f"got {result_type}"
+            )
+        if result_type.num_elements is None:
+            raise ValueError(
+                f"PTX lowering requires a statically shaped constant; "
+                f"got {result_type}"
             )
 
     @verifies(TileOp)
@@ -343,6 +383,22 @@ class VerifyGpuDialect(VerificationPass):
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
         _verify_transposed_fragment_store(op)
+        dst_type, src_type = op.dst.type, op.src.type
+        if (
+            isinstance(dst_type, WgrmemTensorType)
+            and isinstance(src_type, AddrMemTensorType)
+            and (
+                dst_type.rank != 2
+                or dst_type.sizes != src_type.sizes
+                or dst_type.dtype != src_type.dtype
+                or src_type.strides[0] % 2 != 0
+                or src_type.strides[1] != 1
+            )
+        ):
+            raise ValueError(
+                "address-to-WGRMEM move requires equal rank-2 shapes and dtypes "
+                "with element pairs contiguous and aligned in memory"
+            )
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
@@ -376,6 +432,8 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
+        if op.init is not None and op.init_value is not None:
+            raise ValueError("matmul accepts a scalar or tensor init, not both")
         _verify_collective_attr(op)
         for operand_name in ("lhs", "rhs", "dst"):
             attr_name = f"{operand_name}_tiling_scheme"
@@ -412,6 +470,11 @@ class VerifyGpuDialect(VerificationPass):
                 f"inconsistent matmul shapes: {lhs.sizes}, {rhs.sizes}, "
                 f"{dst.sizes}"
             )
+        init = op.init_value
+        if init is not None and (
+            not isinstance(init.type, MemTensorType) or init.type.sizes != dst.sizes
+        ):
+            raise ValueError("matmul tensor init must match the destination shape")
 
     @verifies(ReduceOp)
     def _verify_reduce(self, op: ReduceOp) -> None:

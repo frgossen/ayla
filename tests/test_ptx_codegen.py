@@ -16,13 +16,35 @@ from ayla import (
 from ayla.gpu_dialect import (
     BlockIdsOp,
     ClusterBlockIdsOp,
+    ConstantOp,
     F32Type,
     IfOp,
     IndexConstantOp,
     IndexLtOp,
+    RmemTensorType,
     ThreadIdsOp,
     gpu_dialect,
 )
+
+
+def test_codegen_rank_zero_constant():
+    constant = ConstantOp.build(
+        1e-5, RmemTensorType.build([], F32Type()),
+    )
+    consume = PTXTemplateOp.build(
+        operands=[constant.result()],
+        result_types=[],
+        template="mov.f32 ${f32:sink}, ${f32:operand[0].r0};\n",
+    )
+    module = ModuleOp.build(Block(ops=[KernelOp.build(
+        "constant", Block(ops=[constant, consume]),
+        grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+    )]))
+
+    ptx = make_ptx_kernel(module).ptx
+
+    assert "mov.f32 %f0, 0f3727C5AC;" in ptx
+    assert "mov.f32 %f1, %f0;" in ptx
 
 
 def test_codegen_cwise_add():

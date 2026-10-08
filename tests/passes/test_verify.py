@@ -9,6 +9,7 @@ from ayla.gpu_dialect import (
     BarrierOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
     F32Type,
     ForOp,
@@ -49,6 +50,27 @@ def test_default_verification_allows_dynamic_shapes():
     module = _dynamic_matmul_module()
 
     assert verify_gpu_dialect(module) is module
+
+
+def test_constant_value_count_must_match_its_shape():
+    constant = ConstantOp.build(
+        [1.0, 2.0], RmemTensorType.build([2, 2], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[constant]))
+
+    with pytest.raises(ValueError, match="2 values for tensor shape"):
+        verify_gpu_dialect(module)
+
+
+def test_ptx_lowering_requires_rmem_constants():
+    constant = ConstantOp.build(
+        1.0, GmemTensorType.build([], F32Type()),
+    )
+    module = ModuleOp.build(Block(ops=[constant]))
+
+    assert verify_gpu_dialect(module) is module
+    with pytest.raises(ValueError, match="only in rmem"):
+        verify_gpu_dialect(module, VerificationStage.PTX_LOWERING)
 
 
 @pytest.mark.parametrize("step", [0, -1])
@@ -146,6 +168,22 @@ def test_default_verification_checks_tile_rank(indices, result_sizes):
         verify_gpu_dialect(ModuleOp.build(Block(ops=[tile])))
 
 
+@pytest.mark.parametrize("src", [
+    "gmem<1x64xbf16>", "gmem<64x64xbf16 strides=[65, 1]>",
+])
+def test_address_to_wgrmem_move_requires_matching_aligned_shapes(src):
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @invalid(%src: {src}) {{
+            %dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+            move(%dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src: {src}) collective=xyz.thread
+          }}
+        }}"""))
+
+    with pytest.raises(ValueError, match="equal rank-2 shapes"):
+        verify_gpu_dialect(module)
+
+
 def test_async_and_body_collectives_must_match():
     typ = GmemTensorType.build([1], F32Type())
     block_collective = {
@@ -191,6 +229,18 @@ def test_default_verification_rejects_inconsistent_matmul_shapes():
         }"""))
 
     with pytest.raises(ValueError, match="inconsistent matmul shapes"):
+        verify_gpu_dialect(module)
+
+
+def test_default_verification_rejects_mismatched_matmul_tensor_init():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>, %init: gmem<1x13xbf16>) {
+            matmul(%a: gmem<7x11xbf16>, %b: gmem<13x11xbf16>, %c: gmem<7x13xbf16>, %init: gmem<1x13xbf16>) collective=xyz.grid
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="must match the destination shape"):
         verify_gpu_dialect(module)
 
 

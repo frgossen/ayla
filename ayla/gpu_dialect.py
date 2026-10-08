@@ -379,6 +379,7 @@ class MatmulOp(GpuOp):
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
         init: float | int | None = None,
+        init_value: Value | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if "collective" in a:
@@ -387,7 +388,11 @@ class MatmulOp(GpuOp):
         if init is not None:
             a["init"] = init
         return cls(
-            operands=[lhs, rhs, dst], results=[], attrs=a,
+            operands=[
+                lhs, rhs, dst,
+                *([init_value] if init_value is not None else []),
+            ],
+            results=[], attrs=a,
         )
 
     @property
@@ -405,6 +410,11 @@ class MatmulOp(GpuOp):
     @property
     def init(self) -> float | int | None:
         return self.attrs.get("init")  # type: ignore[return-value]
+
+    @property
+    def init_value(self) -> Value | None:
+        """Tensor used to initialize the accumulator, if present."""
+        return self.operands[3] if len(self.operands) == 4 else None
 
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
@@ -449,15 +459,19 @@ class MatmulOp(GpuOp):
         for _ in range(2):
             p.read_literal(",")
             operands.append(Value.parse(p))
+        if p.can_read_literal(","):
+            p.read_literal(",")
+            operands.append(Value.parse(p))
         p.read_literal(")")
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
         init = attrs.pop("init", None)
         return cls.build(
-            *operands,
+            *operands[:3],
             collective=collective,
             attrs=attrs,
             init=init,  # type: ignore[arg-type]
+            init_value=operands[3] if len(operands) == 4 else None,
         )
 
 
@@ -2124,6 +2138,33 @@ class F64Type(Type):
     byte_size = 8
 
 
+@gpu_dialect.register_op("constant")
+class ConstantOp(GpuOp):
+    """Produce an immutable floating-point tensor constant.
+
+    A scalar payload is a splat; a list payload is flat row-major data. A
+    rank-0 tensor is the canonical scalar data value. Unlike
+    ``IndexConstantOp``, this operation represents numerical program data
+    rather than an index used for addressing or control flow.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        value: int | float | list[int | float],
+        result_type: MemTensorType,
+    ) -> "ConstantOp":
+        return cls(
+            operands=[],
+            results=[Value(name=None, type=result_type)],
+            attrs={"value": value},
+        )
+
+    @property
+    def value(self) -> object:
+        return self.attrs["value"]
+
+
 @gpu_dialect.register_op("thread_ids")
 class ThreadIdsOp(GpuOp):
     """Produce the 3D thread index (tid.x, tid.y, tid.z)."""
@@ -2631,6 +2672,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             dst_scope = CollectiveScope.CLUSTER_LEADER
         elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):
             dst_scope = CollectiveScope.BLOCK_LEADER
+        elif isinstance(op.dst.type, WgrmemTensorType):
+            dst_scope = CollectiveScope.THREAD
         else:
             dst_scope = _type_collective_scope(op.dst.type)
         return (
@@ -2671,6 +2714,9 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
+        init_effects = [] if op.init_value is None else _memory_effect(
+            "R", op.init_value, _type_collective_scope(op.init_value.type),
+        )
         return (
             _memory_effect(
                 "R", op.lhs, _type_collective_scope(op.lhs.type),
@@ -2680,6 +2726,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
                 "R", op.rhs, _type_collective_scope(op.rhs.type),
                 cast(int | None, op.attrs.get("rhs_tiling_scheme")),
             )
+            + init_effects
             + _memory_effect(
                 "R", op.dst, CollectiveScope.THREAD,
                 cast(int | None, op.attrs.get("dst_tiling_scheme")),
@@ -2786,6 +2833,7 @@ def is_side_effect_free(op: Op) -> bool:
         IndexMulOp,
         LaneIdOp,
         PtrAddOp,
+        ConstantOp,
         SelectOp,
         ReinterpretOp,
         ReshapeOp,

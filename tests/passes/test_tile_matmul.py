@@ -52,6 +52,33 @@ def test_tiles_gmem_matmul_along_m_and_k():
     assert text == expected
 
 
+def test_tiles_tensor_initializer_with_the_output():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @addmm(%a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>, %bias: gmem<128x64xbf16 strides=[0, 1]>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>, %bias: gmem<128x64xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))
+
+    tile_matmul(
+        module,
+        op_dims=["M", "N"],
+        tile_sizes=[64, 32],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
+        for_loop_labels=[None, None],
+        op_label_filter="mm",
+    )
+
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.init_value is not None
+    assert isinstance(matmul.init_value.definition, TileOp)
+    assert list(matmul.init_value.type.sizes) == [64, 32]
+    assert list(matmul.init_value.type.strides) == [0, 1]
+
+
 def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {

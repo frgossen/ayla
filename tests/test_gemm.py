@@ -4,11 +4,13 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import (
+    schedule_matmul,
     schedule_register_matmul,
     schedule_tiled_matmul,
 )
 from ayla.gpu_dialect import AsyncOp, AwaitOp, ModuleOp, MoveOp, gpu_dialect
 from ayla.passes.tile_matmul import TileMatmul
+from ayla.ptx_codegen import make_ptx_kernel
 
 
 def test_tiled_schedule_maps_two_output_dimensions_to_warp_groups():
@@ -25,6 +27,28 @@ def test_tiled_schedule_maps_two_output_dimensions_to_warp_groups():
     assert isinstance(warpgroup_tiling, TileMatmul)
     assert warpgroup_tiling.op_dims == ["M", "N"]
     assert warpgroup_tiling.tile_sizes == [64, 80]
+
+
+def test_schedule_matmul_initializes_accumulator_from_broadcast_memory():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @addmm(%bias: gmem<128x64xbf16 strides=[0, 1]>, %a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>, %bias: gmem<128x64xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))
+
+    module = schedule_matmul(
+        module,
+        output_n_tile=64,
+        warpgroup_n_tile=64,
+        operand_stages=1,
+        output_tma_inner_size=64,
+    )
+    ptx = make_ptx_kernel(module).ptx
+
+    assert ptx.count("ld.global.b32") == 16
+    assert "add.f32" not in ptx
+    assert ptx.index("ld.global.b32") < ptx.index("wgmma.mma_async")
 
 
 def test_register_matmul_schedules_side_by_side_gemms():
