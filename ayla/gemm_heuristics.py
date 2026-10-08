@@ -20,6 +20,8 @@ class GemmScheduleSeed:
     source_shape: tuple[int, int, int] | None
     source_percentage_of_torch: float | None
     post_builder_passes: tuple[str, ...] = ()
+    transpose_output: bool = False
+    fixed_output_unroll_factor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,29 @@ def apply_gemm_schedule_seed_post_build(
     module: Any, seed: GemmScheduleSeed,
 ) -> Any:
     """Apply the measured post-builder pass sequence required by ``seed``."""
+    if seed.fixed_output_unroll_factor is not None:
+        from .base.ir import find_ancestor_of_type, find_ops_of_type
+        from .gpu_dialect import ForOp
+        from .passes.canonicalize import Canonicalize
+        from .passes.licm import LICM
+        from .passes.unroll_loop import UnrollLoop
+
+        module = LICM().run(module)
+        module = LICM().run(module)
+        outer_loops = [
+            loop for loop in find_ops_of_type(module, ForOp)
+            if find_ancestor_of_type(loop, ForOp) is None
+        ]
+        if len(outer_loops) != 1:
+            raise ValueError(
+                "fixed output-grid unrolling requires one outer tile loop"
+            )
+        outer_loops[0].attrs["label"] = "heuristic_output_grid"
+        module = UnrollLoop(
+            unroll_factor=seed.fixed_output_unroll_factor,
+            label_filter="heuristic_output_grid",
+        ).run(module)
+        module = Canonicalize().run(module)
     if not seed.post_builder_passes:
         return module
     expected = ("schedule_async", "canonicalize")
@@ -232,10 +257,10 @@ def _output_groups(
 
 
 def _adapt_config(
-    captured: dict[str, object], m: int, n: int,
+    captured: dict[str, object], m: int, n: int, k: int,
 ) -> tuple[dict[str, object] | None, tuple[str, ...]]:
     """Translate a captured search config to the current builder vocabulary."""
-    if captured.get("unsafe_reuse_smem") is True:
+    if captured.get("unsafe_reuse_smem", False) is True:
         return None, ("unsafe shared-memory lifetime reuse is not supported",)
     if "output_m_tiles_per_cta" in captured:
         return dict(captured), ()
@@ -243,7 +268,20 @@ def _adapt_config(
     if preferred_ctas is None:
         m_group, n_group, ctas = _output_groups(captured, m, n)
     else:
-        m_group, n_group, ctas = 1, 1, _as_int(preferred_ctas)
+        m_group, n_group = 1, 1
+        m_tiles = math.ceil(m / _as_int(captured["output_m_tile"]))
+        n_tiles = math.ceil(n / _as_int(captured["output_n_tile"]))
+        logical_tiles = m_tiles * n_tiles
+        divisors = [
+            count for count in range(64, 265)
+            if logical_tiles % count == 0
+            and logical_tiles // count <= 8
+            and not (k > 2048 and logical_tiles // count > 2)
+        ]
+        ctas = (
+            min(divisors, key=lambda count: abs(count - _as_int(preferred_ctas)))
+            if divisors else _as_int(preferred_ctas)
+        )
     adaptations = []
     if preferred_ctas is not None:
         adaptations.append(
@@ -258,13 +296,15 @@ def _adapt_config(
         )
 
     lhs = {"l2_cache_hint": captured["lhs_l2_cache_hint"]}
-    if captured["lhs_l2_promotion"] is not None:
+    if captured.get("lhs_l2_promotion") is not None:
         lhs["l2_promotion"] = captured["lhs_l2_promotion"]
     rhs = {"l2_cache_hint": captured["rhs_l2_cache_hint"]}
-    if captured["multicast"] is True:
-        if _as_int(captured["cluster_n_ctas"]) > 1:
+    if captured.get("rhs_l2_promotion") is not None:
+        rhs["l2_promotion"] = captured["rhs_l2_promotion"]
+    if captured.get("multicast", False) is True:
+        if _as_int(captured.get("cluster_n_ctas", 1)) > 1:
             lhs["multicast"] = True
-        if _as_int(captured["cluster_m_ctas"]) > 1:
+        if _as_int(captured.get("cluster_m_ctas", 1)) > 1:
             rhs["multicast"] = True
     builder: dict[str, object] = {
         "output_m_tiles_per_cta": m_group,
@@ -299,7 +339,7 @@ def _adapt_config(
         "cluster_m_ctas", "cluster_n_ctas",
     )
     for key in optional:
-        value = captured[key]
+        value = captured.get(key)
         if value not in (None, 1, "n"):
             builder[key] = value
     return builder, tuple(adaptations)
@@ -373,15 +413,32 @@ def select_gemm_schedules(
     seeds = []
     for seed in node["seeds"]:
         captured = dict(seed["configuration"])
-        builder, adaptations = _adapt_config(captured, m, n)
+        transpose_output = bool(captured.get("transpose_output", False))
+        builder_m, builder_n = (n, m) if transpose_output else (m, n)
+        builder, adaptations = _adapt_config(
+            captured, builder_m, builder_n, k,
+        )
         if builder is not None and not _legal(
             builder,
-            m,
-            n,
+            builder_m,
+            builder_n,
             k,
             allow_partial_output_tiles=operation == "bmm",
         ):
             continue
+        unroll_factor = None
+        if (
+            builder is not None
+            and builder.get("output_grid_size") is not None
+            and captured.get("unroll_output_tiles", False) is True
+        ):
+            logical_tiles = (
+                math.ceil(builder_m / _as_int(builder["output_m_tile"]))
+                * math.ceil(builder_n / _as_int(builder["output_n_tile"]))
+            )
+            unroll_factor = math.ceil(
+                logical_tiles / _as_int(builder["output_grid_size"]),
+            )
         source = seed["source"]
         seeds.append(GemmScheduleSeed(
             captured_config=captured,
@@ -393,11 +450,13 @@ def select_gemm_schedules(
                 ("schedule_async", "canonicalize")
                 if captured.get("reschedule_async") is True else ()
             ),
+            transpose_output=transpose_output,
+            fixed_output_unroll_factor=unroll_factor,
         ))
 
     if not any(seed.builder_config is not None for seed in seeds):
         captured = dict(mapper["fallback"])
-        builder, adaptations = _adapt_config(captured, m, n)
+        builder, adaptations = _adapt_config(captured, m, n, k)
         if builder is not None and _legal(
             builder,
             m,
@@ -407,5 +466,8 @@ def select_gemm_schedules(
         ):
             seeds.append(GemmScheduleSeed(
                 captured, builder, adaptations, None, None,
+                transpose_output=bool(
+                    captured.get("transpose_output", False)
+                ),
             ))
     return GemmHeuristicSelection(node["leaf"], tuple(path), tuple(seeds))

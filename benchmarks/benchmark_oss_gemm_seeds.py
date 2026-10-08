@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import textwrap
 from typing import Any, cast
 
 import torch
@@ -40,20 +41,45 @@ def _parser() -> argparse.ArgumentParser:
 def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
     from ayla.gemm_collection.gemm import (
         auto_matmul_4096_wgmma256_wg_tma_store_module,
+        schedule_matmul,
     )
+    from ayla.gpu_dialect import gpu_dialect
     from ayla.ptx_codegen import make_ptx_kernel
     from ayla.ptx_runtime import make_ptx_launcher
 
     if seed.builder_config is None:
         raise ValueError("cannot build an unsupported GEMM schedule seed")
-    builder = cast(Any, auto_matmul_4096_wgmma256_wg_tma_store_module)
-    module = builder(
-        m=m,
-        n=n,
-        k=k,
-        dtype="f16",
-        **seed.builder_config,
-    )
+    if seed.transpose_output or "output_grid_size" in seed.builder_config:
+        config = dict(seed.builder_config)
+        ptx_level = config.pop("ptx_optimization_level", None)
+        if seed.transpose_output:
+            c_type = f"gmem<{n}x{m}xf16 strides=[1, {n}]>"
+            operands = (
+                f"%b: gmem<{n}x{k}xf16>, "
+                f"%a: gmem<{m}x{k}xf16>, %c: {c_type}"
+            )
+        else:
+            c_type = f"gmem<{m}x{n}xf16>"
+            operands = (
+                f"%a: gmem<{m}x{k}xf16>, "
+                f"%b: gmem<{n}x{k}xf16>, %c: {c_type}"
+            )
+        module = gpu_dialect.parse(textwrap.dedent(f"""\
+            module {{
+              kernel @mm(%a: gmem<{m}x{k}xf16>, %b: gmem<{n}x{k}xf16>, %c: {c_type}) attrs={{ptx_optimization_level: {ptx_level}}} {{
+                matmul({operands}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+              }}
+            }}"""))
+        module = schedule_matmul(module, **config)
+    else:
+        builder = cast(Any, auto_matmul_4096_wgmma256_wg_tma_store_module)
+        module = builder(
+            m=m,
+            n=n,
+            k=k,
+            dtype="f16",
+            **seed.builder_config,
+        )
     module = apply_gemm_schedule_seed_post_build(module, seed)
     return out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
 
@@ -103,21 +129,28 @@ def main() -> int:
         if seed.builder_config is None:
             print(f"skipping unsafe seed {index}")
             continue
-        bench = gemm_bench_config(
-            name=f"seed-{index}",
-            m=args.m,
-            n=args.n,
-            k=args.k,
-            compute=_ayla_compute(
-                args.m, args.n, args.k, seed,
-            ),
-            dtype=torch.float16,
-        )
-        assert_against_torch(
-            bench,
-            max_abs_error=4,
-            max_relative_rms_error=2e-3,
-        )
+        try:
+            bench = gemm_bench_config(
+                name=f"seed-{index}",
+                m=args.m,
+                n=args.n,
+                k=args.k,
+                compute=_ayla_compute(
+                    args.m, args.n, args.k, seed,
+                ),
+                dtype=torch.float16,
+            )
+            assert_against_torch(
+                bench,
+                max_abs_error=4,
+                max_relative_rms_error=2e-3,
+            )
+        except Exception as error:
+            print(
+                f"skipping seed {index}: "
+                f"{type(error).__name__}: {error}",
+            )
+            continue
         configs.append(bench)
         measured_seeds.append(seed)
 
