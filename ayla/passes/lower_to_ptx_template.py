@@ -50,6 +50,7 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WgrmemTensorType,
+    is_column_major,
     physical_layout,
     root_buffer,
 )
@@ -358,6 +359,9 @@ class LowerToPtxTemplate(LoweringPass):
             physical_layout(view_root_type)
             if isinstance(view_root_type, SmemTensorType) else None
         )
+        # Blocks split the contiguous dimension; the other one is the row.
+        inner_dim = 0 if is_column_major(view_root_type) else 1
+        outer_rows = view_root_type.sizes[1 - inner_dim]
 
         # Accumulate byte offset for each dimension.
         zero = IndexConstantOp.build(0)
@@ -365,23 +369,27 @@ class LowerToPtxTemplate(LoweringPass):
         byte_offset = zero.result()
 
         for dim, idx in enumerate(op.indices):
-            if layout is not None and layout[1] == "block_major" and dim == 1:
+            if (
+                layout is not None
+                and layout[1] == "block_major"
+                and dim == inner_dim
+            ):
                 block_width, _ = layout
-                if result_sizes[1] % block_width:
+                if result_sizes[dim] % block_width:
                     parent_type = op.arg.type
                     assert isinstance(parent_type, AddrMemTensorType)
-                    parent_width = parent_type.sizes[1]
+                    parent_width = parent_type.sizes[dim]
                     assert isinstance(parent_width, int)
                     assert parent_width % block_width == 0
                     assert isinstance(idx, int), (
                         "block-major sub-block tiles require a static index"
                     )
                     block, inner = divmod(
-                        idx * result_sizes[1], block_width,
+                        idx * result_sizes[dim], block_width,
                     )
                     byte_delta = (
                         block
-                        * cast(int, view_root_type.sizes[0])
+                        * cast(int, outer_rows)
                         * block_width
                         + inner
                     ) * dtype_bytes
@@ -408,10 +416,7 @@ class LowerToPtxTemplate(LoweringPass):
             if layout is not None and layout[1] == "block_major":
                 block_width, _ = layout
                 assert view_root_type.rank == 2
-                if dim == 0:
-                    stride = block_width
-                elif dim == 1:
-                    stride = view_root_type.sizes[0]
+                stride = outer_rows if dim == inner_dim else block_width
 
             assert stride is not None
             stride_bytes = stride * dtype_bytes
@@ -1713,6 +1718,7 @@ class LowerToPtxTemplate(LoweringPass):
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = cast(tuple[int, ...], root_type.sizes)
+        transposed = is_column_major(root_type)
         # TODO: Model writer ownership as a warpgroup-uniform IR condition so
         # loop peeling/unrolling can specialize each slice and lower the whole
         # gather to one branch instead of predicating every stmatrix.
@@ -1726,40 +1732,60 @@ class LowerToPtxTemplate(LoweringPass):
                 shr.u32 ${{b32:st_wg}}, ${{b32:st_full_tid}}, 7;
                 setp.eq.u32 ${{pred:st_writer}}, ${{b32:st_wg}}, {writer_wg};
             """)
+        # Lane l addresses row l % 8 of matrix l / 8. Untransposed, the x4
+        # matrices sit side by side along the fragment row. Transposed, they
+        # are the 2x2 matrices of a 16x16 fragment block, and a stored row is
+        # a fragment column: lane l writes physical row
+        # (l & 7) + 8 * (l >> 4) at column 16 * warp + 8 * ((l >> 3) & 1).
+        lane_coordinates = textwrap.dedent("""\
+            shr.u32 ${b32:st_hi}, ${b32:st_lane}, 4;
+            mad.lo.u32 ${b32:st_row}, ${b32:st_hi}, 8, ${b32:st_row};
+            shr.u32 ${b32:st_col}, ${b32:st_lane}, 3;
+            and.b32 ${b32:st_col}, ${b32:st_col}, 1;
+            shl.b32 ${b32:st_col}, ${b32:st_col}, 3;
+            mad.lo.u32 ${b32:st_col}, ${b32:st_warp}, 16, ${b32:st_col};
+        """) if transposed else textwrap.dedent("""\
+            mad.lo.u32 ${b32:st_row}, ${b32:st_warp}, 16, ${b32:st_row};
+            shr.u32 ${b32:st_col}, ${b32:st_lane}, 3;
+            shl.b32 ${b32:st_col}, ${b32:st_col}, 3;
+        """)
         template = writer_setup + textwrap.dedent("""\
             mov.u32 ${b32:st_lane}, %laneid;
             mov.u32 ${b32:st_tid}, %tid.x;
             and.b32 ${b32:st_tid}, ${b32:st_tid}, 127;
             shr.u32 ${b32:st_warp}, ${b32:st_tid}, 5;
             and.b32 ${b32:st_row}, ${b32:st_lane}, 7;
-            mad.lo.u32 ${b32:st_row}, ${b32:st_warp}, 16, ${b32:st_row};
-            shr.u32 ${b32:st_col}, ${b32:st_lane}, 3;
-            shl.b32 ${b32:st_col}, ${b32:st_col}, 3;
+        """) + lane_coordinates + textwrap.dedent("""\
             mad.lo.u32 ${b32:st_off}, ${b32:st_row}, 64, ${b32:st_col};
             shl.b32 ${b32:st_off}, ${b32:st_off}, 1;
         """)
         groups: list[tuple[list[int], int]] = []
-        for i in range(0, len(register_starts), 2):
-            first0 = register_starts[i]
-            first1 = register_starts[i + 1]
-            di, dj = _wgmma_pair_static_offset(first0, n_dim)
-            next_di, next_dj = _wgmma_pair_static_offset(
-                first1, n_dim,
+        if transposed:
+            groups = _stmatrix_transposed_groups(
+                register_starts, n_dim, col_start, root_sizes[1],
             )
-            assert next_di == di and next_dj == dj + 16
-            offset0 = _stmatrix_store_static_offset(
-                first0, n_dim, col_start, root_sizes[0],
-            )
-            offset1 = _stmatrix_store_static_offset(
-                first0 + 1, n_dim, col_start, root_sizes[0],
-            )
-            groups.extend([
-                ([first0, first0 + 2, first1, first1 + 2], offset0),
-                (
-                    [first0 + 1, first0 + 3, first1 + 1, first1 + 3],
-                    offset1,
-                ),
-            ])
+        else:
+            for i in range(0, len(register_starts), 2):
+                first0 = register_starts[i]
+                first1 = register_starts[i + 1]
+                di, dj = _wgmma_pair_static_offset(first0, n_dim)
+                next_di, next_dj = _wgmma_pair_static_offset(
+                    first1, n_dim,
+                )
+                assert next_di == di and next_dj == dj + 16
+                offset0 = _stmatrix_store_static_offset(
+                    first0, n_dim, col_start, root_sizes[0],
+                )
+                offset1 = _stmatrix_store_static_offset(
+                    first0 + 1, n_dim, col_start, root_sizes[0],
+                )
+                groups.extend([
+                    ([first0, first0 + 2, first1, first1 + 2], offset0),
+                    (
+                        [first0 + 1, first0 + 3, first1 + 1, first1 + 3],
+                        offset1,
+                    ),
+                ])
         for registers, physical_offset in groups:
             regs = ", ".join(
                 f"${{b32:operand.src.r{i}}}" for i in registers
@@ -1773,8 +1799,9 @@ class LowerToPtxTemplate(LoweringPass):
                 add.u32 ${{b32:st_addr}}, ${{b32:operand.dst.ptr}},
                     ${{b32:st_addr_off}};
             """)
+            shape = f"x{len(registers)}" + (".trans" if transposed else "")
             template += (
-                f"{predicate}stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
+                f"{predicate}stmatrix.sync.aligned.m8n8.{shape}.shared::cta.b16 "
                 f"[${{b32:st_addr}}], {{{regs}}};\n"
             )
         lowered = PTXTemplateOp.build(
@@ -2264,15 +2291,39 @@ def _view_f32_register_indices(value: Value) -> list[int]:
     ]
 
 
+def _stmatrix_transposed_groups(
+    register_starts: list[int], n_dim: int, col_start: int, dst_rows: int,
+) -> list[tuple[list[int], int]]:
+    """Registers and static offsets of each transposed STMatrix.
+
+    A group is the four pairs of one 16x16 fragment block, or the two pairs
+    of a trailing 8-column block (an x2).
+    """
+    pairs_per_m_tile = n_dim // 4
+    groups: list[tuple[list[int], int]] = []
+    for first in register_starts:
+        count = min(4, pairs_per_m_tile - first % pairs_per_m_tile)
+        offset = _stmatrix_store_static_offset(
+            first, n_dim, col_start, dst_rows, transposed=True,
+        )
+        groups.append((list(range(first, first + count)), offset))
+    return groups
+
+
 def _stmatrix_store_static_offset(
-    pair_index: int, n_dim: int, col_start: int, dst_m: int,
+    pair_index: int, n_dim: int, col_start: int, dst_rows: int,
+    transposed: bool = False,
 ) -> int:
-    """Byte offset for a pair in the selected 64-column blocked layout."""
+    """Byte offset for a pair in the selected 64-column blocked layout.
+
+    A transposed destination stores fragment columns as physical rows.
+    """
     di, dj = _wgmma_pair_static_offset(pair_index, n_dim)
-    relative_col = dj - col_start
-    assert relative_col >= 0 and relative_col % 32 == 0
-    block_offset = relative_col // 64 * dst_m * 64
-    return (block_offset + di * 64 + relative_col % 64) * 2
+    row, col = di, dj - col_start
+    if transposed:
+        row, col = col, row
+    assert row >= 0 and col >= 0 and col % 8 == 0
+    return (col // 64 * dst_rows * 64 + row * 64 + col % 64) * 2
 
 
 def _tma_coordinates(
@@ -2308,6 +2359,11 @@ def _tma_coordinates(
 def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_type = op.dst.type
     src_type = op.src.type
+    dst_root = root_buffer(op.dst)
+    if dst_root is not None and is_column_major(dst_root.type):
+        # The verifier admits only STMatrix-compatible transposed stores.
+        # Each start names a 16-column group of up to four pairs.
+        return [pair for pair, _, _ in _stmatrix_pairs(op) if pair % 4 == 0]
     layout = (
         physical_layout(dst_type)
         if isinstance(dst_type, SmemTensorType) else None
@@ -2343,19 +2399,12 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     assert isinstance(src_root_type, WgrmemTensorType)
     root_n = cast(int, src_root_type.sizes[1])
     is_view = isinstance(op.src.definition, TileOp)
-    if is_view:
-        row_start, col_start = _static_view_origin(op.src)
-        pairs = _wgmma_view_pairs(op.src)
-    else:
-        row_start = 0
-        col_start = op.attrs.get("wgmma_col_start", 0)
-        assert isinstance(col_start, int)
-        dst_n = cast(int, dst_type.sizes[1])
-        pairs = [
-            (pair, row, col - col_start)
-            for pair, row, col in _wgmma_view_pairs(op.src)
-            if col_start <= col < col_start + dst_n
-        ]
+    row_start, col_start = (
+        _static_view_origin(op.src) if is_view
+        else (0, op.attrs.get("wgmma_col_start", 0))
+    )
+    assert isinstance(col_start, int)
+    pairs = _stmatrix_pairs(op)
     dst_m, dst_n = cast(tuple[int, int], dst_type.sizes)
     if (
         dst_m != m_dim
@@ -2375,6 +2424,20 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         return None
     register_starts = [pair for pair, _, _ in pairs if pair % 4 == 0]
     return register_starts if len(register_starts) % 2 == 0 else None
+
+
+def _stmatrix_pairs(op: MoveOp) -> list[tuple[int, int, int]]:
+    """The WGMMA pairs a fragment store writes, relative to its destination."""
+    if isinstance(op.src.definition, TileOp):
+        return _wgmma_view_pairs(op.src)
+    col_start = op.attrs.get("wgmma_col_start", 0)
+    assert isinstance(col_start, int)
+    dst_n = cast(int, cast(MemTensorType, op.dst.type).sizes[1])
+    return [
+        (pair, row, col - col_start)
+        for pair, row, col in _wgmma_view_pairs(op.src)
+        if col_start <= col < col_start + dst_n
+    ]
 
 
 def _ptx_suffix(dtype) -> str:

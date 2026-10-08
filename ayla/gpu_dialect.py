@@ -1855,6 +1855,16 @@ class TmaDescType(Type):
         )
 
 
+def is_column_major(tensor_type: Type) -> bool:
+    """Whether a rank-2 address tensor is contiguous along its first dimension."""
+    return (
+        isinstance(tensor_type, AddrMemTensorType)
+        and tensor_type.rank == 2
+        and tensor_type.strides[0] == 1
+        and tensor_type.strides[1] != 1
+    )
+
+
 def physical_layout(
     tensor_type: SmemTensorType | TmaDescType,
 ) -> tuple[int, str] | None:

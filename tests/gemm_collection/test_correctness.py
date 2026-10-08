@@ -1,5 +1,7 @@
 """Correctness tests for all GEMM kernels in the collection."""
 
+import textwrap
+
 import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
 import pytest
 import torch
@@ -7,6 +9,7 @@ import torch
 from ayla.base.ir import find_ancestor_of_type, find_ops_of_type
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    schedule_matmul,
 )
 from ayla.gemm_collection.dynamic_m import (
     _dynamic_m_schedule_heuristic,
@@ -19,9 +22,11 @@ from ayla.gpu_dialect import (
     CollectiveAxis,
     ElementwiseOp,
     ForOp,
+    ModuleOp,
     TileOp,
     TmaDescType,
     WgrmemTensorType,
+    gpu_dialect,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -675,3 +680,71 @@ def test_every_registered_kernel_is_covered():
         and getattr(ayla, name).default._schema.returns
     }
     assert registered <= covered, f"not exercised: {sorted(registered - covered)}"
+
+
+def _transposed_output_matmul(m, n, k, **schedule):
+    """Schedule C = A B^T as C^T = B A^T through C's column-major view."""
+    a, b = f"gmem<{m}x{k}xf16>", f"gmem<{n}x{k}xf16>"
+    c = f"gmem<{n}x{m}xf16 strides=[1, {n}]>"
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: {a}, %b: {b}, %c: {c}) {{
+            matmul(%b: {b}, %a: {a}, %c: {c}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+          }}
+        }}"""))
+    assert isinstance(module, ModuleOp)
+    return schedule_matmul(module, **schedule)
+
+
+def test_transposed_output_stores_fragments_with_stmatrix_trans():
+    kernel = make_ptx_kernel(_transposed_output_matmul(
+        200, 256, 128, output_m_tile=128, output_n_tile=104,
+    ))
+
+    assert "stmatrix.sync.aligned.m8n8.x4.trans" in kernel.ptx
+    assert "stmatrix.sync.aligned.m8n8.x2.trans" in kernel.ptx
+    output_desc = next(
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx == 2
+    )
+    # The store describes the row-major C behind the column-major view.
+    assert list(output_desc.gmem_type.sizes) == [200, 256]
+    assert list(output_desc.tile_sizes) == [104, 128]
+
+
+def test_transposed_output_needs_a_blocked_staging_layout():
+    with pytest.raises(ValueError, match="transposed WGMMA fragment store"):
+        make_ptx_kernel(_transposed_output_matmul(
+            128, 128, 64, output_m_tile=128, output_n_tile=128,
+            output_tma_inner_size=None,
+        ))
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("m", "n", "k", "schedule"),
+    [
+        (196, 384, 384, {"output_m_tile": 128, "output_n_tile": 200}),
+        (130, 512, 512, {
+            "output_m_tile": 64, "output_n_tile": 64,
+            "warpgroup_n_tile": 64, "operand_stages": 4,
+        }),
+        (700, 768, 256, {"output_m_tile": 192, "output_n_tile": 176,
+                         "operand_stages": 2}),
+        (300, 512, 128, {"output_m_tile": 128, "output_n_tile": 128,
+                         "output_slices": 2, "output_store_buffers": 2}),
+    ],
+)
+def test_transposed_output_matches_torch(m, n, k, schedule):
+    launcher = make_ptx_launcher(make_ptx_kernel(
+        _transposed_output_matmul(m, n, k, **schedule),
+    ))
+    torch.manual_seed(11)
+    lhs = torch.randn((m, k), dtype=torch.float16, device="cuda")
+    rhs = torch.randn((n, k), dtype=torch.float16, device="cuda")
+    actual = torch.full((m, n), float("nan"), dtype=torch.float16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T), rtol=2e-3, atol=0.25)
