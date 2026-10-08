@@ -113,6 +113,61 @@ def test_does_not_fuse_incompatible_tma_loads(
     assert repr(module) == module_str
 
 
+def test_fuses_launches_whose_awaits_follow_the_run():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %sa: smem<16x16xf32> = alloc()
+            %sb: smem<16x16xf32> = alloc()
+            %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            async(%l0: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            async(%l1: lock<mbar>) collective=xyz.block move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            await(%l0: lock<mbar>)
+            await(%l1: lock<mbar>)
+          }
+        }"""))
+
+    text = repr(fuse_async(module))
+
+    assert text.count("async(") == 1
+    assert text.count("await(") == 1
+
+
+def test_rerun_ignores_a_pipelined_singleton_async():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %sa: smem<16x16xf32> = alloc()
+            %sb: smem<16x16xf32> = alloc()
+            %pipelined: lock<mbar> = alloc()
+            %fresh: lock<mbar> = alloc()
+            await(%pipelined: lock<mbar>)
+            async(%pipelined: lock<mbar>) collective=xyz.block move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            async(%fresh: lock<mbar>) collective=xyz.block move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            await(%fresh: lock<mbar>)
+          }
+        }""")
+
+    module = fuse_async(gpu_dialect.parse(module_str))
+
+    assert repr(module) == module_str
+
+
+def test_still_rejects_truly_unawaited_fusible_async():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %s: smem<16x16xf32> = alloc()
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) collective=xyz.block move(%s: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+          }
+        }"""))
+
+    with pytest.raises(AssertionError, match="no adjacent await"):
+        fuse_async(module)
+
+
 def test_fuse_different_accumulators():
     """Matmuls writing to different accumulators can fuse."""
     module_str = textwrap.dedent("""\

@@ -9,6 +9,7 @@ from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    AwaitOp,
     BF16Type,
     BarrierOp,
     ClusterBlockIdsOp,
@@ -286,6 +287,18 @@ class VerifyGpuDialect(VerificationPass):
         if lock_type.kind == "cluster_mbar":
             raise ValueError(
                 "cluster_mbar is a barrier resource, not an async lock"
+            )
+
+    @verifies(AwaitOp)
+    def _verify_await(self, op: AwaitOp) -> None:
+        lock_type = op.lock.type
+        assert isinstance(lock_type, LockType)
+        pending = op.attrs.get("pending", 0)
+        limit = 7 if lock_type.supports_partial_await else 0
+        if type(pending) is not int or not 0 <= pending <= limit:
+            raise ValueError(
+                f"await pending count must be an integer in [0, {limit}] for "
+                f"a {lock_type.kind} lock; got {pending!r}"
             )
 
     @verifies(MoveOp)

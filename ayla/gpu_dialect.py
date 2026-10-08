@@ -1108,6 +1108,11 @@ class LockType(Type):
         assert kind is None or isinstance(kind, str)
         return kind
 
+    @property
+    def supports_partial_await(self) -> bool:
+        """Whether an await may leave newer hardware groups pending."""
+        return self.kind == "wgmma"
+
     def print(self, p: Printer) -> None:
         p.write("lock<")
         p.write(self.kind if self.kind is not None else "?")
@@ -1131,7 +1136,11 @@ class LockType(Type):
 
 @gpu_dialect.register_op("await")
 class AwaitOp(GpuOp):
-    """Wait for all async work registered on a lock."""
+    """Wait for async work registered on a lock.
+
+    By default this drains the lock.  Queue-backed locks may use the generic
+    ``pending`` attribute to retain that many newer hardware groups.
+    """
 
     @classmethod
     def build(cls, lock: Value, attrs: dict[str, object] | None = None) -> "AwaitOp":

@@ -30,6 +30,7 @@ def schedule_register_matmul(
     label: str,
     operand_stages: int,
     operand_k_tile: int = 64,
+    cyclic_operand_pipeline: bool = False,
     rhs_tma_load_slices: int = 1,
     unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
@@ -90,9 +91,11 @@ def schedule_register_matmul(
     pipeline.add_pass(FuseAsync())
     pipeline.add_pass(LICM())
     pipeline.add_pass(Canonicalize())
+    # A cyclic pipeline leaves the last stage's loads to the queued wgmma ring.
+    stages = "|".join(map(str, range(operand_stages - cyclic_operand_pipeline)))
     pipeline.add_pass(PipelineLoop(
         label_filter_loop=k_label,
-        label_filter_op=rf"{label}_(lhs|rhs)_smem_iter\d+_async",
+        label_filter_op=rf"{label}_(lhs|rhs)_smem_iter(?:{stages})_async",
         pipelining_offset=1,
     ))
     pipeline.add_pass(UnrollLoop(
@@ -103,6 +106,12 @@ def schedule_register_matmul(
     for _ in range(2):
         pipeline.add_pass(LICM())
         pipeline.add_pass(Canonicalize())
+    if cyclic_operand_pipeline:
+        pipeline.add_pass(PipelineLoop(
+            label_filter_loop=k_label,
+            label_filter_op=rf"{label}_iter\d+_async_iter0",
+            pipelining_offset=1,
+        ))
     return pipeline
 
 
@@ -114,6 +123,7 @@ def schedule_tiled_matmul(
     operand_stages: int,
     operand_k_tile: int = 64,
     warpgroup_m_tile: int | None = None,
+    cyclic_operand_pipeline: bool = False,
     warpgroup_n_tile: int | None = None,
     output_slices: int = 1,
     output_store_buffers: int = 1,
@@ -167,6 +177,7 @@ def schedule_tiled_matmul(
         label=label,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
+        cyclic_operand_pipeline=cyclic_operand_pipeline,
         # Preserve the existing three 128-row RHS loads for the tuned N=384
         # schedule; other supported schedules use one RHS load.
         rhs_tma_load_slices=(
@@ -196,6 +207,7 @@ def schedule_matmul(
     warpgroup_n_tile: int | None = None,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
+    cyclic_operand_pipeline: bool = False,
     output_slices: int = 1,
     output_store_buffers: int = 1,
     # Split each 256-column output row into two 128-element TMA dimensions.
@@ -246,6 +258,10 @@ def schedule_matmul(
         )
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
+    if cyclic_operand_pipeline and operand_stages < 2:
+        raise ValueError(
+            "cyclic_operand_pipeline requires at least two operand stages"
+        )
     if warpgroup_n_tile is None:
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     if output_n_tile % warpgroup_n_tile:
@@ -314,6 +330,7 @@ def schedule_matmul(
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
         warpgroup_m_tile=warpgroup_m_tile,
+        cyclic_operand_pipeline=cyclic_operand_pipeline,
         warpgroup_n_tile=warpgroup_n_tile,
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
@@ -347,6 +364,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     warpgroup_n_tile: int | None = None,
     operand_stages: int = 3,
     operand_k_tile: int = 64,
+    cyclic_operand_pipeline: bool = False,
     output_slices: int = 1,
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
@@ -378,6 +396,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_{dtype}"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
+    if cyclic_operand_pipeline:
+        name += "_kring"
     if output_m_tile != 128:
         name += f"_m{output_m_tile}"
     if output_n_tile != 256:
@@ -421,6 +441,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         warpgroup_n_tile=resolved_warpgroup_n_tile,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
+        cyclic_operand_pipeline=cyclic_operand_pipeline,
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,

@@ -17,10 +17,10 @@ single ``await``. The kind is decided by the op *inside* the async (see
   fused (no fused-store codegen, and unvalidated).
 
 Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
-the run. An already-fused (multi-op) async returns ``None`` and is left
-untouched, so the pass is idempotent. Side-effect-free ops between members (lock
-allocs, tile views) are transparent — emitted before the merged block — and the
-per-member awaits are dropped.
+the run. An already-fused (multi-op) async, or a singleton whose await has been
+moved away by scheduling, is left untouched, so the pass is idempotent.
+Side-effect-free ops between members (lock allocs, tile views) are transparent
+— emitted before the merged block — and the per-member awaits are dropped.
 
 **Placement matters** (caller's responsibility): fuse TMA loads *before*
 pipelining, while each stage's loads and awaits are still adjacent. After
@@ -31,6 +31,8 @@ after pipelining + kk-unroll, where they become consecutive. Both points just
 call ``fuse_async(module)``; the single-op + same-kind gating does the rest.
 """
 from __future__ import annotations
+
+from itertools import takewhile
 
 from ..gpu_dialect import (
     AsyncOp,
@@ -69,6 +71,11 @@ class FuseAsync(Pass):
 
     def run_block(self, block: Block) -> None:
         super().run_block(block)
+
+        ops = block.ops
+        awaited_locks = {
+            op.lock for op in ops if isinstance(op, AwaitOp)
+        }
 
         new_ops: list[Op] = []
         group_inner: list[Op] = []
@@ -109,8 +116,23 @@ class FuseAsync(Pass):
             group_collective = None
             in_flight_locks = set()
 
-        for op in block.ops:
+        for index, op in enumerate(ops):
             kind = _fusion_kind(op)
+            # Scheduling may deliberately move an await away from its
+            # singleton async. That pair has already been processed and
+            # cannot join a new fusion run. An await that follows a run of
+            # same-kind launches and their awaits is still adjacent.
+            if isinstance(op, AsyncOp) and op.lock in awaited_locks:
+                run = takewhile(
+                    lambda o: is_side_effect_free(o)
+                    or isinstance(o, AwaitOp)
+                    or _fusion_kind(o) == kind,
+                    ops[index + 1:],
+                )
+                if not any(
+                    isinstance(o, AwaitOp) and o.lock is op.lock for o in run
+                ):
+                    kind = None
             if kind is not None:
                 assert isinstance(op, AsyncOp)
                 if group_kind is not None:
