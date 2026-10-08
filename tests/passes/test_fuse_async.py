@@ -134,6 +134,26 @@ def test_fuses_launches_whose_awaits_follow_the_run():
     assert text.count("await(") == 1
 
 
+def test_mixed_tma_collectives_keep_nonadjacent_awaits():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %sa: smem<16x16xf32> = alloc()
+            %sb: smem<16x16xf32> = alloc()
+            %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            async(%l0: lock<mbar>) collective=xyz.cluster move(%sa: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
+            async(%l1: lock<mbar>) collective=xyz.block move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.block attrs={tma: True}
+            await(%l0: lock<mbar>)
+            await(%l1: lock<mbar>)
+          }
+        }""")
+
+    module = fuse_async(gpu_dialect.parse_module(module_str))
+
+    assert repr(module) == module_str
+
+
 def test_rerun_ignores_a_pipelined_singleton_async():
     module_str = textwrap.dedent("""\
         module {

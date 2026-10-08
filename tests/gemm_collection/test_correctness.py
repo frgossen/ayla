@@ -351,6 +351,47 @@ def test_cyclic_wgmma_pipeline_matches_torch():
     assert torch.equal(actual, torch.mm(lhs, rhs.T))
 
 
+@pytest.mark.parametrize(
+    ("m", "n", "cluster_m_ctas", "cluster_n_ctas", "multicast_operand"),
+    [
+        (256, 256, 2, 1, "rhs"),
+        (128, 512, 1, 2, "lhs"),
+    ],
+)
+@requires_cuda
+def test_cluster_multicast_gemm_matches_torch(
+    m: int,
+    n: int,
+    cluster_m_ctas: int,
+    cluster_n_ctas: int,
+    multicast_operand: str,
+):
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=128,
+        output_m_tile=128,
+        output_n_tile=256,
+        warpgroup_n_tile=128,
+        cluster_m_ctas=cluster_m_ctas,
+        cluster_n_ctas=cluster_n_ctas,
+        operand_move_attrs={multicast_operand: {"multicast": True}},
+    )
+    kernel = make_ptx_kernel(module)
+    launcher = make_ptx_launcher(kernel)
+    torch.manual_seed(19)
+    lhs = torch.randn((m, 128), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, 128), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert kernel.cluster_dim == (cluster_m_ctas, cluster_n_ctas, 1)
+    assert ".multicast::cluster" in kernel.ptx
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+
+
 @requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128

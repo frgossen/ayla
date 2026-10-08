@@ -76,6 +76,17 @@ class FuseAsync(Pass):
         awaited_locks = {
             op.lock for op in ops if isinstance(op, AwaitOp)
         }
+        # A multicast operand and a CTA-local operand intentionally use
+        # different collectives. Their launches can be adjacent while both
+        # awaits follow the launches, so neither singleton can be finalized at
+        # the collective boundary. Preserve both original async/await pairs.
+        tma_collectives = {
+            tuple(op.collective.items())
+            for op in ops
+            if _fusion_kind(op) == "tma_load"
+            and isinstance(op, AsyncOp)
+        }
+        fuse_tma_loads = len(tma_collectives) <= 1
 
         new_ops: list[Op] = []
         group_inner: list[Op] = []
@@ -118,6 +129,8 @@ class FuseAsync(Pass):
 
         for index, op in enumerate(ops):
             kind = _fusion_kind(op)
+            if kind == "tma_load" and not fuse_tma_loads:
+                kind = None
             # Scheduling may deliberately move an await away from its
             # singleton async. That pair has already been processed and
             # cannot join a new fusion run. An await that follows a run of
