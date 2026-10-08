@@ -310,6 +310,23 @@ class LowerToPtxTemplate(LoweringPass):
             f"setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, 0;\n"
         )
 
+    def _leader_thread(
+        self, prefix: str, before_branch: str = "",
+    ) -> tuple[list[Value], list[str], str]:
+        """Operands and PTX that let one elected thread of warp 0 do leader work.
+
+        Every other warp branches to ``${label:<prefix>_done}``, without
+        diverging inside a warp, and ``elect.sync`` sets
+        ``${pred:<prefix>_leader}`` on one thread of warp 0, so ptxas can keep
+        the work's operands in uniform registers. ``before_branch`` runs in
+        every warp, so ptxas can keep its special-register reads out of loops.
+        """
+        operands, names, leader_warp = self._leader_warp(prefix)
+        return operands, names, leader_warp + before_branch + (
+            f"@${{pred:{prefix}_other_warp}} bra ${{label:{prefix}_done}};\n"
+            f"elect.sync _|${{pred:{prefix}_leader}}, 0xffffffff;\n"
+        )
+
     def _tma_instruction(
         self,
         op: TmaMoveOp,
@@ -1170,25 +1187,25 @@ class LowerToPtxTemplate(LoweringPass):
             sync = self.value_map[op.sync]
             assert isinstance(sync, Value)
             # After the local sync, only the leader's warp (warp 0) goes on:
-            # thread 0 arrives at rank 0's cluster mbarrier, and in rank 0 the
-            # warp waits on its parity as one, staying converged for the
-            # leader's next warp-wide instructions. The other warps continue.
-            # Special registers are read before branching, so ptxas keeps
-            # them out of loops.
-            warp_operands, warp_names, leader_warp = self._leader_warp("cl")
-            template = "bar.sync 0;\n" + leader_warp + textwrap.dedent("""\
-                mov.u32 ${b32:cl_tid}, %tid.x;
-                setp.eq.u32 ${pred:cl_t0}, ${b32:cl_tid}, 0;
-                mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
-                setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;
-                @${pred:cl_other_warp} bra ${label:cl_done};
+            # one elected thread arrives at rank 0's cluster mbarrier, and in
+            # rank 0 the warp waits on its parity as one, staying converged
+            # for the leader's next warp-wide instructions. The other warps
+            # continue.
+            warp_operands, warp_names, leader_thread = self._leader_thread(
+                "cl",
+                before_branch=(
+                    "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
+                    "setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;\n"
+                ),
+            )
+            template = "bar.sync 0;\n" + leader_thread + textwrap.dedent("""\
                 @${pred:rank0} bra ${label:cl_rank0};
                 mov.u32 ${b32:cluster_rank}, 0;
                 mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};
-                @${pred:cl_t0} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
+                @${pred:cl_leader} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
                 bra ${label:cl_done};
                 ${label:cl_rank0}:
-                @${pred:cl_t0} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];
+                @${pred:cl_leader} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];
                 mov.u32 ${b32:ticks}, 0x989680;
                 ${label:cl_wait}:
                 mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
@@ -1918,9 +1935,10 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         """Lower smem → gmem TMA bulk store (block-collective).
 
-        Thread 0 issues cp.async.bulk.tensor.2d and commits the group.
-        The barrier inserted before the async orders all threads' shared-memory
-        writes before thread 0 starts the store.
+        One elected thread of warp 0 issues cp.async.bulk.tensor.2d and commits
+        the group; every thread's bulk await waits on its own groups, so it
+        covers whichever thread committed. The barrier inserted before the async
+        orders all threads' shared-memory writes before the store starts.
         """
         dst_value = cast(Value, self.value_map[op.dst])
         src_value = cast(Value, self.value_map[op.src])
@@ -1928,14 +1946,17 @@ class LowerToPtxTemplate(LoweringPass):
         desc_type = dst_value.type
         assert isinstance(desc_type, TmaDescType)
 
-        operands = [dst_value, src_value] + idx_values
-        operand_names = ["dst", "src"] + [f"idx{i}" for i in range(len(idx_values))]
+        leader_operands, leader_names, leader_thread = self._leader_thread("st")
+        operands = [dst_value, src_value, *idx_values, *leader_operands]
+        operand_names = [
+            "dst", "src", *[f"idx{i}" for i in range(len(idx_values))],
+            *leader_names,
+        ]
         coordinate_lines, coordinates = _tma_coordinates(
             desc_type, [f"idx{i}" for i in range(len(idx_values))], "store",
         )
         tensor_rank = len(coordinates)
         indices = ", ".join(coordinates)
-        coordinate_code = "\n".join(coordinate_lines)
         tma_instruction = self._tma_instruction(
             op,
             f"cp.async.bulk.tensor.{tensor_rank}d.global.shared::cta.bulk_group",
@@ -1946,24 +1967,17 @@ class LowerToPtxTemplate(LoweringPass):
             "cache_policy",
         )
 
-        # TODO: The logic to test for thread 0 could be expressed in index compute to cse etc.
-        # The RAW (all threads finish writing the smem tile before t0 stores it) is
-        # handled by insert_syncs, which emits a barrier before this async.
-
-        template = textwrap.dedent(f"""\
-            mov.u32 ${{b32:st_tid}}, %tid.x;
-            mov.u32 ${{b32:st_tidy}}, %tid.y;
-            or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidy}};
-            mov.u32 ${{b32:st_tidz}}, %tid.z;
-            or.b32 ${{b32:st_tid}}, ${{b32:st_tid}}, ${{b32:st_tidz}};
-            setp.ne.s32 ${{pred:st_not_t0}}, ${{b32:st_tid}}, 0;
-            @${{pred:st_not_t0}} bra ${{label:st_done}};
-            fence.proxy.async.shared::cta;
-            {coordinate_code}
-            {tma_instruction}
-            cp.async.bulk.commit_group;
-            ${{label:st_done}}:
-        """)
+        # The RAW (all threads finish writing the smem tile before the leader
+        # stores it) is handled by insert_syncs, which emits a barrier before
+        # this async.
+        lines = [
+            "fence.proxy.async.shared::cta;",
+            *coordinate_lines,
+            f"@${{pred:st_leader}} {tma_instruction}",
+            "@${pred:st_leader} cp.async.bulk.commit_group;",
+            "${label:st_done}:",
+        ]
+        template = leader_thread + "\n".join(lines) + "\n"
 
         new_op = PTXTemplateOp.build(
             operands=operands,
@@ -1985,7 +1999,7 @@ class LowerToPtxTemplate(LoweringPass):
         single mbarrier.arrive.expect_tx covers their summed byte count — so a
         fused lhs+rhs pair (or any run of loads) needs one mbarrier and one
         arrive instead of one per load (fastcu's single-``full``-barrier idea).
-        Thread 0 issues; the await op emits the wait.
+        One elected thread of warp 0 issues; the await op emits the wait.
         """
         lock_type = lock_value.type
         assert isinstance(lock_type, LockType)
@@ -1994,8 +2008,15 @@ class LowerToPtxTemplate(LoweringPass):
             f"{lock_type.kind!r}"
         )
 
-        operands: list[Value] = [lock_value]
-        operand_names: list[str] = ["lock"]
+        leader_operands, leader_names, leader_thread = self._leader_thread(
+            "ld",
+            before_branch=(
+                "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
+                "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;\n"
+            ),
+        )
+        operands: list[Value] = [lock_value, *leader_operands]
+        operand_names: list[str] = ["lock", *leader_names]
         multicast_mask: int | None = None
         if op.is_tma_multicast:
             kernel = find_ancestor_of_type(op, KernelOp)
@@ -2042,33 +2063,20 @@ class LowerToPtxTemplate(LoweringPass):
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
                 f"[${{b32:operand.lock.val}}]"
             )
-            if tma.multicast is not True:
-                load_lines.append(self._tma_instruction(
-                    tma,
-                    opcode,
-                    arguments,
-                    operands,
-                    operand_names,
-                    f"cache_policy{i}",
-                ))
-            else:
+            issue = "ld_leader"
+            if tma.multicast is True:
                 assert multicast_mask is not None
-                load_lines.extend([
-                    "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;",
-                    "setp.ne.u32 ${pred:not_cluster_leader}, "
-                    "${b32:cluster_rank}, 0;",
-                    f"@${{pred:not_cluster_leader}} bra "
-                    f"${{label:after_multicast_{i}}};",
-                    self._tma_instruction(
-                        tma,
-                        f"{opcode}.multicast::cluster",
-                        f"{arguments}, {multicast_mask}",
-                        operands,
-                        operand_names,
-                        f"cache_policy{i}",
-                    ),
-                    f"${{label:after_multicast_{i}}}:",
-                ])
+                opcode = f"{opcode}.multicast::cluster"
+                arguments = f"{arguments}, {multicast_mask}"
+                issue = "multicast_issue"
+            load_lines.append(f"@${{pred:{issue}}} " + self._tma_instruction(
+                tma,
+                opcode,
+                arguments,
+                operands,
+                operand_names,
+                f"cache_policy{i}",
+            ))
 
         # Plain-string lines (literal ${...} placeholders); only load_lines and
         # the byte count are interpolated, so we avoid f-string/dedent brace and
@@ -2077,19 +2085,15 @@ class LowerToPtxTemplate(LoweringPass):
         # The buffer-reuse WAR (t0's reload vs prior readers of the smem tile) is
         # handled by insert_syncs, which emits a barrier before this async.
         lines = [
-            "mov.u32 ${b32:tid_x}, %tid.x;",
-            "mov.u32 ${b32:tid_y}, %tid.y;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};",
-            "mov.u32 ${b32:tid_z}, %tid.z;",
-            "or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};",
-            "setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;",
-            "@${pred:not_t0} bra ${label:after_load};",
+            "and.pred ${pred:multicast_issue}, ${pred:ld_leader}, "
+            "${pred:cluster_leader};",
             *load_lines,
+            "@${pred:ld_leader} "
             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
             f"[${{b32:operand.lock.val}}], {total_bytes};",
-            "${label:after_load}:",
+            "${label:ld_done}:",
         ]
-        template = "\n".join(lines) + "\n"
+        template = leader_thread + "\n".join(lines) + "\n"
 
         new_op = PTXTemplateOp.build(
             operands=operands,

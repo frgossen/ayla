@@ -92,8 +92,8 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         "barrier.cluster.wait.acquire;",
         "@${pred:cl_other_warp} bra ${label:cl_done};",
         "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "@${pred:cl_t0} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "@${pred:cl_t0} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
+        "@${pred:cl_leader} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
+        "@${pred:cl_leader} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
         "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
 
@@ -290,6 +290,9 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
         < ptx.index(wait)
     )
     assert ptx.count(multicast) == 1
+    # The issue is predicated on one elected thread, not branched around.
+    assert "@${pred:multicast_issue} cp.async.bulk.tensor" in ptx
+    assert "after_multicast" not in ptx and "after_load" not in ptx
     assert (
         "[${b32:operand.lock.val}], 3, "
         "${b64:operand.cache_policy0.ptr};"
