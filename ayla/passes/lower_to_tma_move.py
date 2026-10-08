@@ -25,6 +25,7 @@ from ..gpu_dialect import (
     IndexMulOp,
     ModuleOp,
     MoveOp,
+    ReshapeOp,
     SmemTensorType,
     TileOp,
     TmaDescType,
@@ -72,14 +73,20 @@ class LowerToTmaMove(LoweringPass):
         gmem_operand = move.src if is_load else move.dst
         smem_operand = move.dst if is_load else move.src
 
-        index_ops, root, indices = _build_tile_chain_indices(gmem_operand)
         smem = cast(Value, self.value_map[smem_operand])
+
+        assert isinstance(smem.type, SmemTensorType), (
+            f"lower_to_tma_move: plain operand must be smem; got {smem.type}"
+        )
+        tile_shape = list(smem.type.sizes)
+        assert all(isinstance(size, int) for size in tile_shape)
+        transpose = is_column_major(gmem_operand.type)
+        index_ops, root, indices, tile_shape = _build_tile_chain_indices(
+            gmem_operand, cast(list[int], tile_shape),
+        )
 
         assert isinstance(root.type, GmemTensorType), (
             f"lower_to_tma_move: tiled operand must be gmem; got {root.type}"
-        )
-        assert isinstance(smem.type, SmemTensorType), (
-            f"lower_to_tma_move: plain operand must be smem; got {smem.type}"
         )
 
         entry_block = root.definition
@@ -89,31 +96,33 @@ class LowerToTmaMove(LoweringPass):
         desc_attrs: dict[str, object] = {}
         if layout is not None:
             desc_attrs["physical_layout"] = layout
-        tile_shape = list(smem.type.sizes)
-        assert all(isinstance(size, int) for size in tile_shape)
         gmem_type = root.type
-        if is_column_major(gmem_type):
+        if transpose:
             # A transposed view of a row-major tensor: describe the tensor
             # itself, so the box and coordinates use its dimension order.
+            # Rank-N batch views transpose only their two matrix dimensions.
             if not is_column_major(smem.type):
                 raise ValueError(
                     "lower_to_tma_move: a column-major gmem view needs a "
                     f"column-major smem tile; got {smem.type}"
                 )
-            gmem_type = GmemTensorType.build(
-                list(reversed(gmem_type.sizes)), gmem_type.dtype,
-            )
-            if list(gmem_type.strides) != list(reversed(root.type.strides)):
+            sizes = list(gmem_type.sizes)
+            strides = list(gmem_type.strides)
+            for values in (sizes, indices, tile_shape):
+                values[-2], values[-1] = values[-1], values[-2]
+            gmem_type = GmemTensorType.build(sizes, gmem_type.dtype)
+            expected_strides = [
+                strides[i] for i in [*range(len(strides) - 2), -1, -2]
+            ]
+            if list(gmem_type.strides) != expected_strides:
                 raise ValueError(
                     "lower_to_tma_move: column-major view must be a dense "
                     f"transpose; got {root.type}"
                 )
-            indices.reverse()
-            tile_shape.reverse()
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=gmem_type,
-            tile_shape=cast(list[int], tile_shape),
+            tile_shape=tile_shape,
             swizzle=smem.type.swizzle,
             l2_promotion=cast(str | None, move.attrs.get("l2_promotion")),
             attrs=desc_attrs or None,
@@ -157,33 +166,61 @@ class LowerToTmaMove(LoweringPass):
         return index_ops, tma_op
 
 
-def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value]]:
-    """Walk up nested tile ops to find the root tensor and per-dim indices.
+def _build_tile_chain_indices(
+    value: Value, tile_shape: list[int],
+) -> tuple[list[Op], Value, list[Value], list[int]]:
+    """Walk up tiled/singleton-reshaped views to the root tensor.
 
-    Returns (new_ops, root, indices) where new_ops are the index
-    arithmetic ops, root is the base tensor, and indices are the
-    accumulated per-dim element offsets.
+    TMA descriptors describe the root tensor, so coordinates and the copied
+    box must use the root rank. A reshape that only adds or removes singleton
+    dimensions preserves every non-singleton coordinate and rectangular tile.
     """
-    tiles: list[TileOp] = []
-    v = value
-    while isinstance(v.definition, TileOp):
-        tiles.append(v.definition)
-        v = v.definition.arg
-    root = v
-
-    root_type = root.type
-    assert isinstance(root_type, GmemTensorType)
-    ndims = root_type.rank
     zero = IndexConstantOp.build(0)
     new_ops: list[Op] = [zero]
-    indices = [zero.result()] * ndims
+    value_type = value.type
+    assert isinstance(value_type, GmemTensorType)
+    indices = [zero.result()] * value_type.rank
+    v = value
 
-    for tile_op in reversed(tiles):
-        result_type = tile_op.result().type
+    while isinstance(v.definition, (TileOp, ReshapeOp)):
+        definition = v.definition
+        if isinstance(definition, ReshapeOp):
+            result_type = definition.result().type
+            arg_type = definition.arg.type
+            assert isinstance(result_type, GmemTensorType)
+            assert isinstance(arg_type, GmemTensorType)
+            result_sizes = list(result_type.sizes)
+            arg_sizes = list(arg_type.sizes)
+            assert all(isinstance(size, int) for size in result_sizes)
+            assert all(isinstance(size, int) for size in arg_sizes)
+            result_nonunit = [
+                i for i, size in enumerate(result_sizes) if size != 1
+            ]
+            arg_nonunit = [i for i, size in enumerate(arg_sizes) if size != 1]
+            if [result_sizes[i] for i in result_nonunit] != [
+                arg_sizes[i] for i in arg_nonunit
+            ]:
+                raise ValueError(
+                    "lower_to_tma_move: reshape must only add or remove "
+                    "singleton dimensions"
+                )
+            mapped_indices = [zero.result()] * len(arg_sizes)
+            mapped_shape = [1] * len(arg_sizes)
+            for result_dim, arg_dim in zip(
+                result_nonunit, arg_nonunit, strict=True,
+            ):
+                mapped_indices[arg_dim] = indices[result_dim]
+                mapped_shape[arg_dim] = tile_shape[result_dim]
+            indices = mapped_indices
+            tile_shape = mapped_shape
+            v = definition.arg
+            continue
+
+        result_type = definition.result().type
         assert isinstance(result_type, GmemTensorType)
         result_sizes = list(result_type.sizes)
         assert all(isinstance(size, int) for size in result_sizes)
-        for dim, idx in enumerate(tile_op.indices):
+        for dim, idx in enumerate(definition.indices):
             if isinstance(idx, int):
                 const_op = IndexConstantOp.build(idx)
                 new_ops.append(const_op)
@@ -198,8 +235,9 @@ def _build_tile_chain_indices(value: Value) -> tuple[list[Op], Value, list[Value
             add_op = IndexAddOp.build(indices[dim], mul_op.result())
             new_ops.append(add_op)
             indices[dim] = add_op.result()
+        v = definition.arg
 
-    return new_ops, root, indices
+    return new_ops, v, indices, tile_shape
 
 
 def lower_to_tma_move(module: ModuleOp) -> ModuleOp:
