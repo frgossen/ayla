@@ -251,6 +251,28 @@ _ELEMENTWISE_LOWERERS = {
 }
 
 
+def _leader_warp(prefix: str) -> str:
+    """PTX setting ``${pred:<prefix>_other_warp}`` outside warp 0.
+
+    Warp 0 holds the leader, thread 0. Each warp index is broadcast from the
+    warp's first thread (CUTLASS's canonical_warp_idx_sync), so ptxas proves
+    this predicate warp-uniform. It folds each broadcast of a special register
+    away and merges the repeated reads, but keeps one of a combined value.
+    """
+    return textwrap.dedent(f"""\
+        mov.u32 ${{b32:{prefix}_warp}}, %tid.x;
+        shr.u32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, 5;
+        shfl.sync.idx.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, 0, 31, 0xffffffff;
+        mov.u32 ${{b32:{prefix}_warp_yz}}, %tid.y;
+        shfl.sync.idx.b32 ${{b32:{prefix}_warp_yz}}, ${{b32:{prefix}_warp_yz}}, 0, 31, 0xffffffff;
+        or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp_yz}};
+        mov.u32 ${{b32:{prefix}_warp_yz}}, %tid.z;
+        shfl.sync.idx.b32 ${{b32:{prefix}_warp_yz}}, ${{b32:{prefix}_warp_yz}}, 0, 31, 0xffffffff;
+        or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp_yz}};
+        setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, 0;
+    """)
+
+
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -1177,15 +1199,16 @@ class LowerToPtxTemplate(LoweringPass):
                 barrier.cluster.wait.acquire;
                 """)
         elif scope == "block_leader":
-            # Warp 0 (t0) waits, others arrive, on the named barrier id chosen by
-            # insert_syncs (unique among concurrently-live block-leader barriers).
+            # Warp 0, which holds the leader t0, waits; the other warps arrive
+            # and continue, on the named barrier id chosen by insert_syncs
+            # (unique among concurrently-live block-leader barriers). Warps
+            # are told apart by their warp-uniform index, and arrive first so
+            # an arrival never waits behind a skipped bar.sync.
             bar_id = op.attrs.get("id", 1)
             num_threads = op.attrs["num_threads"]
-            template = textwrap.dedent(f"""\
-                mov.u32 ${{b32:bl_tid}}, %tid.x;
-                setp.lt.u32 ${{pred:bl_w0}}, ${{b32:bl_tid}}, 32;
-                @${{pred:bl_w0}} bar.sync {bar_id}, {num_threads};
-                @!${{pred:bl_w0}} bar.arrive {bar_id}, {num_threads};
+            template = _leader_warp("bl") + textwrap.dedent(f"""\
+                @${{pred:bl_other_warp}} bar.arrive {bar_id}, {num_threads};
+                @!${{pred:bl_other_warp}} bar.sync {bar_id}, {num_threads};
                 """)
         elif scope == "grid":
             assert op.sync is not None
