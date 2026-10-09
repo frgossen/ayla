@@ -18,7 +18,7 @@ from ..gpu_dialect import (
     MemoryEffect,
     MemTensorType,
     ModuleOp,
-    ThreadIdsOp,
+    ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
     is_elementwise,
@@ -38,7 +38,7 @@ from ._utils import label_matches
 
 _PARALLEL_ID_OPS = {
     CollectiveLevel.BLOCK: BlockIdOp,
-    CollectiveLevel.THREAD: ThreadIdsOp,
+    CollectiveLevel.THREAD: ThreadIdOp,
     CollectiveLevel.WG: WarpGroupIdOp,
 }
 
@@ -351,12 +351,15 @@ class TileMatmul(LoweringPass):
             if binding is None or binding in parallel_ids:
                 continue
             level, axis = binding
-            if level == CollectiveLevel.BLOCK:
-                ids = BlockIdOp.build(axis)
+            if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
+                op_type = {
+                    CollectiveLevel.BLOCK: BlockIdOp,
+                    CollectiveLevel.THREAD: ThreadIdOp,
+                }[level]
+                ids = op_type.build(axis)
                 parallel_ids[binding] = ids.value
             else:
                 op_type = {
-                    CollectiveLevel.THREAD: ThreadIdsOp,
                     CollectiveLevel.WG: WarpGroupIdOp,
                 }[level]
                 ids = op_type.build()

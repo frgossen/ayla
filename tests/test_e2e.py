@@ -44,8 +44,8 @@ def test_cwise_add_from_ir():
         module {{
           kernel @cwise_add(%lhs: gmem<1024xf32>, %rhs: gmem<1024xf32>, %dst: gmem<1024xf32>) grid_dim=[4, 1, 1] block_dim=[256, 1, 1] {{
             %gx: index = block_id() attrs={{axis: "x"}}
-            %bx: index, %by: index, %bz: index = thread_ids()
-            ptx_template(%lhs: gmem<1024xf32>, %rhs: gmem<1024xf32>, %dst: gmem<1024xf32>, %gx: index, %bx: index, %by: index, %bz: index) attrs={{template: {template_str}}}
+            %bx: index = thread_id() attrs={{axis: "x"}}
+            ptx_template(%lhs: gmem<1024xf32>, %rhs: gmem<1024xf32>, %dst: gmem<1024xf32>, %gx: index, %bx: index) attrs={{template: {template_str}}}
           }}
         }}""")  # noqa: E501
 
@@ -133,8 +133,9 @@ def test_matmul_16_from_ir():
     module_str = textwrap.dedent(f"""\
         module {{
           kernel @matmul_16(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>, %c: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[16, 16, 1] {{
-            %bx: index, %by: index, %bz: index = thread_ids()
-            ptx_template(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>, %c: gmem<16x16xf32>, %bx: index, %by: index, %bz: index) attrs={{template: {template_str}}}
+            %bx: index = thread_id() attrs={{axis: "x"}}
+            %by: index = thread_id() attrs={{axis: "y"}}
+            ptx_template(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>, %c: gmem<16x16xf32>, %bx: index, %by: index) attrs={{template: {template_str}}}
           }}
         }}""")  # noqa: E501
 
@@ -163,7 +164,8 @@ def test_naive_matmul_4096_from_ir():
           kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
             %cx: index = block_id() attrs={axis: "x"}
             %cy: index = block_id() attrs={axis: "y"}
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tx: index = thread_id() attrs={axis: "x"}
+            %ty: index = thread_id() attrs={axis: "y"}
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<64x4096xf32> = tile(%b: gmem<4096x4096xf32>, %cy: index, 0)
             %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)
@@ -207,7 +209,8 @@ def test_tma():
           kernel @tma(%a: gmem<4096x4096xf32>) grid_dim=[32, 64, 1] block_dim=[128, 1, 1] {
             %cx: index = block_id() attrs={axis: "x"}
             %cy: index = block_id() attrs={axis: "y"}
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tx: index = thread_id() attrs={axis: "x"}
+            %ty: index = thread_id() attrs={axis: "y"}
             %a_block: gmem<128x64xf32 strides=[4096, 1]> = tile(%a: gmem<4096x4096xf32>, %cx: index, %cy: index)
             %a_thread: gmem<64x32xf32 strides=[4096, 1]> = tile(%a_block: gmem<128x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
             %a_smem: smem<64x32xf32 swizzle="128B"> = alloc() attrs={id: 0}
@@ -239,7 +242,6 @@ def test_tma_lowered():
           kernel @tma_load(%a: gmem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %gx: index = block_id() attrs={axis: "x"}
             %gy: index = block_id() attrs={axis: "y"}
-            %tx: index, %ty: index, %tz: index = thread_ids()
             %a_smem: smem<64x64xf32> = alloc() attrs={id: 0}
             %lock: lock<mbar> = alloc() attrs={id: 1}
             async(%lock: lock<mbar>) tma_move(%a_smem: smem<64x64xf32>, %a_desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %gx: index, %gy: index)

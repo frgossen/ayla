@@ -28,7 +28,7 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     ReduceOp,
-    ThreadIdsOp,
+    ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
 )
@@ -114,20 +114,23 @@ def _materialize_iteration_space(
         return [loop], loop.iv, loop
 
     level, axis = parallel_iteration_space
-    if level == CollectiveLevel.BLOCK:
-        ids = BlockIdOp.build(axis)
+    if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
+        id_op_type = {
+            CollectiveLevel.BLOCK: BlockIdOp,
+            CollectiveLevel.THREAD: ThreadIdOp,
+        }[level]
+        ids = id_op_type.build(axis)
         id_ops: list[Op] = [ids]
         parallel_id = ids.value
     elif level == CollectiveLevel.WARP:
         assert axis == CollectiveAxis.X
-        ids = ThreadIdsOp.build()
+        ids = ThreadIdOp.build(CollectiveAxis.X)
         warp_size = IndexConstantOp.build(32)
-        warp_id = IndexDivOp.build(ids.x, warp_size.result())
+        warp_id = IndexDivOp.build(ids.value, warp_size.result())
         id_ops = [ids, warp_size, warp_id]
         parallel_id = warp_id.result()
     else:
         id_op_type = {
-            CollectiveLevel.THREAD: ThreadIdsOp,
             CollectiveLevel.WG: WarpGroupIdOp,
         }[level]
         ids = id_op_type.build()

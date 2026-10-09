@@ -2151,29 +2151,28 @@ class ConstantOp(GpuOp):
         }
 
 
-@gpu_dialect.register_op("thread_ids")
-class ThreadIdsOp(GpuOp):
-    """Produce the 3D thread index (tid.x, tid.y, tid.z)."""
+@gpu_dialect.register_op("thread_id")
+class ThreadIdOp(GpuOp):
+    """Produce one axis of the thread index."""
 
     @classmethod
-    def build(cls) -> "ThreadIdsOp":
-        idx = IndexType()
+    def build(cls, axis: CollectiveAxis) -> "ThreadIdOp":
+        axis_name = axis.name.lower()
         return cls(
             operands=[],
-            results=[Value(name=name, type=idx) for name in ["tx", "ty", "tz"]],
+            results=[Value(name=f"t{axis_name}", type=IndexType())],
+            attrs={"axis": axis_name},
         )
 
     @property
-    def x(self) -> Value:
+    def axis(self) -> CollectiveAxis:
+        axis = self.attrs["axis"]
+        assert isinstance(axis, str)
+        return CollectiveAxis[axis.upper()]
+
+    @property
+    def value(self) -> Value:
         return self.results[0]
-
-    @property
-    def y(self) -> Value:
-        return self.results[1]
-
-    @property
-    def z(self) -> Value:
-        return self.results[2]
 
 
 @gpu_dialect.register_op("block_id")
@@ -2779,7 +2778,7 @@ def is_side_effect_free(op: Op) -> bool:
         SelectOp,
         ReinterpretOp,
         ReshapeOp,
-        ThreadIdsOp,
+        ThreadIdOp,
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,

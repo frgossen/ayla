@@ -31,7 +31,7 @@ from .gpu_dialect import (
     PTXTemplateOp,
     RmemTensorType,
     SmemTensorType,
-    ThreadIdsOp,
+    ThreadIdOp,
     TmaDescType,
     ToPtrOp,
     WarpGroupIdOp,
@@ -331,8 +331,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_if(p, op)
     elif isinstance(op, PTXTemplateOp):
         _emit_ptx_template(p, op)
-    elif isinstance(op, ThreadIdsOp):
-        _emit_thread_ids(p, op)
+    elif isinstance(op, ThreadIdOp):
+        _emit_thread_id(p, op)
     elif isinstance(op, BlockIdOp):
         _emit_block_id(p, op)
     elif isinstance(op, ClusterBlockIdsOp):
@@ -507,14 +507,11 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
     p.write_newline_once()
 
 
-def _emit_thread_ids(p: PtxPrinter, op: ThreadIdsOp) -> None:
-    rx = p.unique_ptx_names_for_value(op.x)
-    ry = p.unique_ptx_names_for_value(op.y)
-    rz = p.unique_ptx_names_for_value(op.z)
+def _emit_thread_id(p: PtxPrinter, op: ThreadIdOp) -> None:
+    result = p.unique_ptx_names_for_value(op.value)
+    axis = op.axis.name.lower()
     p.write_newline_once()
-    p.write_line(f"mov.u32 {rx}, %tid.x;")
-    p.write_line(f"mov.u32 {ry}, %tid.y;")
-    p.write_line(f"mov.u32 {rz}, %tid.z;")
+    p.write_line(f"mov.u32 {result}, %tid.{axis};")
     p.write_newline_once()
 
 
@@ -526,8 +523,8 @@ def _emit_block_id(p: PtxPrinter, op: BlockIdOp) -> None:
     p.write_newline_once()
 
 
-# TODO: Make the thread and cluster block ID ops take an axis attribute and
-# return one value instead of always materializing x, y, z.
+# TODO: Make the cluster block ID op take an axis attribute and return one
+# value instead of always materializing x, y, z.
 def _emit_cluster_block_ids(p: PtxPrinter, op: ClusterBlockIdsOp) -> None:
     rx = p.unique_ptx_names_for_value(op.x)
     ry = p.unique_ptx_names_for_value(op.y)

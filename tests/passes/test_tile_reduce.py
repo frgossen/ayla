@@ -218,7 +218,7 @@ def test_tile_reduce_maps_parallel_dimension_to_block_and_reduction_to_warp():
             %3: gmem<4x1xf32> = tile(%output: gmem<8x1xf32>, %1: index, 0)
             %4: gmem<8x2xf32> = alloc() attrs={id: 0, init: 0.0}
             %5: gmem<4x2xf32> = tile(%4: gmem<8x2xf32>, %1: index, 0)
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tx: index = thread_id() attrs={axis: "x"}
             %c32: index = index_constant() attrs={value: 32}
             %6: index = index_div(%tx: index, %c32: index)
             %c1_1: index = index_constant() attrs={value: 1}
@@ -273,7 +273,7 @@ def test_tile_reduce_composes_block_and_warp_tiling():
             %0: index = index_mod(%bx: index, %c2: index)
             %1: gmem<32x64xf32> = tile(%src: gmem<64x64xf32>, %0: index, 0)
             %2: gmem<32x1xf32> = tile(%output: gmem<64x1xf32>, %0: index, 0)
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tx: index = thread_id() attrs={axis: "x"}
             %c32: index = index_constant() attrs={value: 32}
             %3: index = index_div(%tx: index, %c32: index)
             %4: index = index_mod(%3: index, %c2: index)
@@ -750,7 +750,7 @@ def test_tile_reduce_assigns_one_mean_row_per_warp():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x6656xf32>, %output: gmem<8x1xf32>) block_dim=[256, None, None] {
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tx: index = thread_id() attrs={axis: "x"}
             %c32: index = index_constant() attrs={value: 32}
             %0: index = index_div(%tx: index, %c32: index)
             %c8: index = index_constant() attrs={value: 8}
