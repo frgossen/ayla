@@ -2256,31 +2256,6 @@ class WarpGroupIdOp(GpuOp):
         return self.results[2]
 
 
-@gpu_dialect.register_op("warp_ids")
-class WarpIdsOp(GpuOp):
-    """Produce the 3D warp index within the block."""
-
-    @classmethod
-    def build(cls) -> "WarpIdsOp":
-        idx = IndexType()
-        return cls(
-            operands=[],
-            results=[Value(name=name, type=idx) for name in ["wx", "wy", "wz"]],
-        )
-
-    @property
-    def x(self) -> Value:
-        return self.results[0]
-
-    @property
-    def y(self) -> Value:
-        return self.results[1]
-
-    @property
-    def z(self) -> Value:
-        return self.results[2]
-
-
 @gpu_dialect.register_op("index_constant")
 class IndexConstantOp(GpuOp):
     """Produce a constant index value."""
@@ -2810,7 +2785,6 @@ def is_side_effect_free(op: Op) -> bool:
         ThreadIdsOp,
         TileOp,
         ToPtrOp,
-        WarpIdsOp,
         WarpGroupIdOp,
     ))
 
