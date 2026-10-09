@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Collapse measured OSS GEMM winners into a small, traceable seed mapper.
+"""Build a lossless measured OSS GEMM winner mapper with a compact fallback.
 
-The generated JSON is deliberately an exploration seed policy, not a claim
-that one configuration is optimal for every point in a leaf.  A shallow tree
-isolates nearby workload regimes and each leaf keeps two or three measured
-exemplars.  Querying the mapper reports the complete decision path and adapts
-shape-dependent exact CTA counts to a valid divisor of the requested grid.
+Every measured shape is dispatched to its exact winning configuration.  A
+shallow tree of nearby exemplars is retained only for shapes outside the
+measured corpus.  Querying the mapper reports whether exact dispatch or the
+fallback tree was used.
 
 Examples::
 
@@ -104,6 +103,37 @@ def _production_config(config: ScheduleConfig) -> dict[str, object]:
         key: value
         for key, value in dataclasses.asdict(config).items()
         if key not in _REDUNDANT_CONFIG_FIELDS
+    }
+
+
+def _exact_entry(point: Point) -> dict[str, object]:
+    config = _production_config(point.config)
+    # Names are diagnostic only.  A common name lets the compact serializer
+    # deduplicate genuinely identical winning configurations.
+    config["name"] = "heuristic_exact_winner"
+    return {
+        "shape": {
+            "operation": point.op,
+            "dtype": point.dtype,
+            "batch": point.batch,
+            "m": point.m,
+            "n": point.n,
+            "k": point.k,
+        },
+        "seed": {
+            "rank": 1,
+            "family_support": 1,
+            "source_shape_id": point.shape_id,
+            "source_shape": {
+                "batch": point.batch,
+                "m": point.m,
+                "n": point.n,
+                "k": point.k,
+            },
+            "source_percentage_of_torch": point.percentage,
+            "source_configuration_name": point.config.name,
+            "configuration": config,
+        },
     }
 
 
@@ -363,6 +393,18 @@ def build_mapper(
     min_leaf_shapes: int = 6,
     seeds_per_leaf: int = 3,
 ) -> dict[str, object]:
+    exact = [_exact_entry(point) for point in points]
+    exact_keys = {
+        (
+            point.op, point.dtype, point.batch,
+            point.m, point.n, point.k,
+        )
+        for point in points
+    }
+    if len(exact_keys) != len(points):
+        raise ValueError(
+            "measured winners do not have unique dispatch dimensions"
+        )
     groups: dict[str, list[Point]] = {}
     for point in points:
         groups.setdefault(
@@ -385,8 +427,8 @@ def build_mapper(
     ))
     fallback["name"] = "heuristic_coverage_fallback"
     mapper: dict[str, Any] = {
-        "version": 1,
-        "purpose": "initial search seeds, not final production dispatch",
+        "version": 2,
+        "purpose": "exact production winners with fallback seeds for unseen shapes",
         "source_shape_count": len(points),
         "layout": "canonical_nt",
         "features": [name for name, _ in FEATURES],
@@ -394,6 +436,8 @@ def build_mapper(
         "actual_leaves": len(leaves),
         "seeds_per_leaf": seeds_per_leaf,
         "stored_seed_count": 1 + sum(len(leaf["seeds"]) for leaf in leaves),
+        "exact_winner_count": len(exact),
+        "exact": exact,
         "fallback_seeds": [{
             "rank": 1,
             "family_support": 0,
@@ -420,8 +464,21 @@ def build_mapper(
         }
         for point, query in zip(points, queries, strict=True)
     )
+    exact_recalled = sum(
+        {
+            key: value for key, value in query["seeds"][0]["configuration"].items()
+            if key != "name"
+        } == {
+            key: value for key, value in _production_config(point.config).items()
+            if key != "name"
+        }
+        for point, query in zip(points, queries, strict=True)
+    )
     mapper["training_legal_seed_coverage_pct"] = 100 * covered / len(points)
     mapper["training_winner_family_recall_pct"] = 100 * recalled / len(points)
+    mapper["training_winner_config_recall_pct"] = (
+        100 * exact_recalled / len(points)
+    )
     return mapper
 
 
@@ -442,6 +499,7 @@ def _query_features(
 def _adapt_query_config(
     config: dict[str, Any], m: int, n: int, k: int, *,
     allow_partial: bool = False,
+    preserve_output_grid: bool = False,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     changes = []
     m_tile = int(config["output_m_tile"])
@@ -463,7 +521,7 @@ def _adapt_query_config(
     ):
         return None, ["cluster shape does not divide the output grid"]
     preferred = config.get("output_cta_count")
-    if preferred is not None:
+    if preferred is not None and not preserve_output_grid:
         logical_tiles = m_tiles * n_tiles
         divisors = [
             count for count in range(64, 265)
@@ -484,9 +542,39 @@ def query_mapper(
     mapper: dict[str, Any], m: int, n: int, k: int, dtype: str,
     op: str = "mm", batch: int = 1,
 ) -> dict[str, object]:
+    exact = next((
+        entry for entry in mapper.get("exact", [])
+        if entry["shape"] == {
+            "operation": op, "dtype": dtype, "batch": batch,
+            "m": m, "n": n, "k": k,
+        }
+    ), None)
     group = _group_key(op, dtype, k)
     if group not in mapper["groups"]:
         raise ValueError(f"no heuristic group for {group}")
+    if exact is not None:
+        seed = exact["seed"]
+        return {
+            "shape": {
+                "op": op, "batch": batch,
+                "m": m, "n": n, "k": k, "dtype": dtype,
+            },
+            "group": group,
+            "decision_path": [],
+            "leaf": {
+                "id": f"exact:{op}:{batch}:{m}:{n}:{k}",
+                "training_shapes": 1,
+                "ranges": {"m": [m, m], "n": [n, n], "k": [k, k]},
+            },
+            "fallback_used": False,
+            "exact_match": True,
+            "seeds": [{
+                **seed,
+                "distance": 0.0,
+                "adaptations": [],
+                "configuration": dict(seed["configuration"]),
+            }],
+        }
     features = _query_features(m, n, k, batch)
     node = mapper["groups"][group]
     path = []
@@ -559,6 +647,7 @@ def query_mapper(
             "ranges": node["ranges"],
         },
         "fallback_used": fallback_used,
+        "exact_match": False,
         "seeds": seeds,
     }
 
@@ -594,8 +683,10 @@ def main() -> int:
         mapper["source_artifact"] = str(args.input.resolve())
         write_json(mapper, args.output)
         print(
-            f"wrote {mapper['actual_leaves']} leaves and "
-            f"{mapper['stored_seed_count']} seeds to {args.output.resolve()}"
+            f"wrote {mapper['exact_winner_count']} exact winners, "
+            f"{mapper['actual_leaves']} fallback leaves, and "
+            f"{mapper['stored_seed_count']} fallback seeds to "
+            f"{args.output.resolve()}"
         )
         return 0
 

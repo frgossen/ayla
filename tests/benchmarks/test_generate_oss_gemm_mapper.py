@@ -37,11 +37,14 @@ def test_mapper_is_small_and_query_explains_decisions():
         _points(), max_leaves=3, min_leaf_shapes=2, seeds_per_leaf=2,
     )
 
-    result = query_mapper(mapper, 512, 1024, 512, "float16")
+    result = query_mapper(mapper, 640, 1024, 512, "float16")
 
     assert mapper["actual_leaves"] <= 3
     assert mapper["stored_seed_count"] <= 7
     assert mapper["training_legal_seed_coverage_pct"] == 100.0
+    assert mapper["training_winner_config_recall_pct"] == 100.0
+    assert len(mapper["exact"]) == len(_points())
+    assert result["exact_match"] is False
     assert result["decision_path"]
     assert result["seeds"]
     assert result["seeds"][0]["source_shape_id"].startswith("shape-")
@@ -66,6 +69,41 @@ def test_query_adapts_exact_cta_count_to_grid_divisor():
     assert adapted is not None
     assert adapted["output_cta_count"] == 128
     assert changes == ["output_cta_count 132 -> 128"]
+
+
+def test_every_training_shape_returns_its_exact_winner():
+    points = _points()
+    points[0] = dataclasses.replace(
+        points[0],
+        config=dataclasses.replace(points[0].config, output_cta_count=131),
+    )
+    mapper = build_mapper(
+        points, max_leaves=3, min_leaf_shapes=2, seeds_per_leaf=2,
+    )
+
+    for point in points:
+        result = query_mapper(
+            mapper, point.m, point.n, point.k, point.dtype,
+            point.op, point.batch,
+        )
+        assert result["exact_match"] is True
+        assert len(result["seeds"]) == 1
+        actual = result["seeds"][0]["configuration"]
+        expected = dataclasses.asdict(point.config)
+        for field in (
+            "output_tile_fast_axis", "rhs_tma_load_slices",
+            "unsafe_reuse_smem", "warpgroup_fast_axis",
+            "wgmma_epilogue_pipeline", "wgmma_group_size",
+            "wgmma_pending_groups",
+        ):
+            expected.pop(field)
+        expected["name"] = "heuristic_exact_winner"
+        assert actual == expected
+
+    assert query_mapper(
+        mapper, points[0].m, points[0].n, points[0].k,
+        points[0].dtype,
+    )["seeds"][0]["configuration"]["output_cta_count"] == 131
 
 
 def test_config_loader_preserves_explicit_optional_nulls():
@@ -121,7 +159,7 @@ def test_mapper_preserves_a_transpose_winner_in_its_leaf():
     mapper = build_mapper(
         points, max_leaves=1, min_leaf_shapes=2, seeds_per_leaf=2,
     )
-    result = query_mapper(mapper, 512, 1024, 512, "float16")
+    result = query_mapper(mapper, 640, 1024, 512, "float16")
 
     assert any(
         seed["configuration"].get("transpose_output") is True
@@ -141,7 +179,7 @@ def test_mapper_preserves_an_rhs_promotion_winner_in_its_leaf():
     mapper = build_mapper(
         points, max_leaves=1, min_leaf_shapes=2, seeds_per_leaf=2,
     )
-    result = query_mapper(mapper, 512, 1024, 512, "float16")
+    result = query_mapper(mapper, 640, 1024, 512, "float16")
 
     assert any(
         seed["configuration"].get("rhs_l2_promotion") == "256B"

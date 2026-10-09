@@ -349,24 +349,29 @@ def _make_ayla_config(
             ),
             **schedule_kwargs,
         )
-        if schedule.output_cta_count is not None and schedule.unroll_output_tiles:
+        if (
+            schedule.output_cta_count is not None
+            and schedule.unroll_output_tiles
+        ):
             module = LICM().run(module)
             module = LICM().run(module)
             outer_loops = [
                 loop for loop in find_ops_of_type(module, ForOp)
                 if find_ancestor_of_type(loop, ForOp) is None
             ]
-            if len(outer_loops) != 1:
+            if len(outer_loops) > 1:
                 raise ValueError(
-                    "fixed output-grid unrolling requires one outer tile loop"
+                    "fixed output-grid unrolling requires at most one outer "
+                    "tile loop"
                 )
-            output_loop = outer_loops[0]
-            output_loop.attrs["label"] = "outmn"
-            module = UnrollLoop(
-                unroll_factor=output_loop.trip_count,
-                label_filter="outmn",
-            ).run(module)
-            module = Canonicalize().run(module)
+            if outer_loops:
+                output_loop = outer_loops[0]
+                output_loop.attrs["label"] = "outmn"
+                module = UnrollLoop(
+                    unroll_factor=output_loop.trip_count,
+                    label_filter="outmn",
+                ).run(module)
+                module = Canonicalize().run(module)
     else:
         module = auto_matmul_4096_wgmma256_wg_tma_store_module(
             m=shape.m,
