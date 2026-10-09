@@ -14,6 +14,7 @@ from ayla import (
     PTXTemplateOp,
     Value,
 )
+from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
@@ -42,6 +43,7 @@ from ayla.gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     TileOp,
+    WgrmemTensorType,
     gpu_dialect,
     has_ordering_effect,
     is_grid_collective,
@@ -211,6 +213,29 @@ def test_memory_effect_retains_accessed_view_and_exposes_roots():
     assert read.roots == {source}
 
 
+def test_move_writes_distributed_registers_at_thread_scope():
+    source = Value(
+        name="source", type=GmemTensorType.build([64, 64], BF16Type()),
+    )
+    fragment = Value(
+        name="fragment",
+        type=WgrmemTensorType.build(
+            [64, 64], BF16Type(), warps=4, layout="wgmma_layout_0",
+        ),
+    )
+    effects = memory_effects(MoveOp.build(
+        fragment,
+        source,
+        collective={
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        },
+    ))
+
+    assert effects is not None
+    write = next(effect for effect in effects if effect.kind == "W")
+    assert write.scope == CollectiveScope.THREAD
+
+
 def test_reshape_op():
     source = Value(
         name="source",
@@ -295,6 +320,21 @@ def test_matmul_program():
         CollectiveAxis.Y: CollectiveLevel.GRID,
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
+
+
+def test_matmul_tensor_initializer_roundtrips():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @addmm(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>, %bias: gmem<64x32xbf16 strides=[0, 1]>) {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>, %bias: gmem<64x32xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))
+
+    assert repr(gpu_dialect.parse(repr(module))) == repr(module)
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.init is None
+    assert matmul.init_value is not None
+    assert list(matmul.init_value.type.strides) == [0, 1]
     assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
     assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)

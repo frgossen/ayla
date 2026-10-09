@@ -131,6 +131,10 @@ class LowerToAsync(LoweringPass):
             collective=op.collective,
             attrs=op.extra_attrs,
             init=op.init,
+            init_value=(
+                cast(Value, self.value_map[op.init_value])
+                if op.init_value is not None else None
+            ),
         )
         return self._wrap(matmul, "wgmma", op.extra_attrs)
 

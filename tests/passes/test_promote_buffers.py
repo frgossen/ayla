@@ -4,7 +4,12 @@ import textwrap
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     AllocOp,
+    ElementwiseOp,
+    F32Type,
+    MatmulOp,
+    MoveOp,
     TmaMoveOp,
+    WgrmemTensorType,
     gpu_dialect,
 )
 from ayla.passes.lower_to_async import lower_to_async
@@ -34,6 +39,40 @@ def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
     assert "move(%3: smem<64x256xbf16>, %1: wgrmem<64x256xbf16" in text
     assert "move(%c: gmem<128x256xbf16>" in text
     assert 'attrs={label: "mm_dst_tma", tma: True}' in text
+
+
+def test_tensor_initializer_converts_into_promoted_accumulator():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @addmm(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: gmem<64x64xbf16>, %bias: gmem<64x64xbf16 strides=[0, 1]>) {
+            matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: gmem<64x64xbf16>, %bias: gmem<64x64xbf16 strides=[0, 1]>) collective=[xy.block, z.thread] attrs={label: "mm"}
+          }
+        }"""))
+
+    promote_buffers(
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, label_filter="mm",
+    )
+
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert isinstance(matmul.dst.type, WgrmemTensorType)
+    assert isinstance(matmul.dst.type.dtype, F32Type)
+    assert matmul.init is None
+    assert matmul.init_value is None
+    assert matmul.dst.definition.init is None
+    [init_convert] = [
+        op for op in find_ops_of_type(module, ElementwiseOp)
+        if op.fn == "convert" and op.dst is matmul.dst
+    ]
+    init_fragment = init_convert.src(0)
+    assert isinstance(init_fragment.type, WgrmemTensorType)
+    [init_move] = [
+        op for op in find_ops_of_type(module, MoveOp)
+        if op.dst is init_fragment
+    ]
+    assert list(init_move.src.type.strides) == [0, 1]
+    body = module.body.ops[0].body.ops
+    assert body.index(init_move) < body.index(init_convert) < body.index(matmul)
 
 
 def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
