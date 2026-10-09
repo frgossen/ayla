@@ -396,15 +396,6 @@ def _make_ayla_config(
             kernel.attrs["cluster_dim"] = [
                 schedule.cluster_m_ctas, schedule.cluster_n_ctas, 1,
             ]
-        if schedule.multicast:
-            if kernel.num_warp_groups is None:
-                raise ValueError(
-                    "multicast producer warp requires resolved compute "
-                    "warpgroups"
-                )
-            compute_threads = kernel.num_warp_groups * 128
-            kernel.attrs["multicast_producer_warp_threads"] = compute_threads
-            kernel.block_dim = (compute_threads + 32, 1, 1)
     if schedule.reschedule_async:
         module = ScheduleAsync().run(module)
         module = Canonicalize().run(module)
