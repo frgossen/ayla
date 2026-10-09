@@ -34,7 +34,6 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WarpGroupIdOp,
-    WarpIdsOp,
     memory_effects,
 )
 from .dataflow import DataflowAnalysis, DataflowState, transfers
@@ -124,7 +123,6 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,
-        WarpIdsOp,
     )
     def transfer_no_memory_effect(
         self, op: Op, state: BufferLivenessState,

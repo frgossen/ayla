@@ -30,7 +30,6 @@ from ..gpu_dialect import (
     ReduceOp,
     ThreadIdsOp,
     TileOp,
-    WarpIdsOp,
     WarpGroupIdOp,
 )
 from ._utils import label_matches
@@ -115,22 +114,31 @@ def _materialize_iteration_space(
         return [loop], loop.iv, loop
 
     level, axis = parallel_iteration_space
-    id_op_type = {
-        CollectiveLevel.BLOCK: BlockIdsOp,
-        CollectiveLevel.THREAD: ThreadIdsOp,
-        CollectiveLevel.WARP: WarpIdsOp,
-        CollectiveLevel.WG: WarpGroupIdOp,
-    }[level]
-    ids = id_op_type.build()
+    if level == CollectiveLevel.WARP:
+        assert axis == CollectiveAxis.X
+        ids = ThreadIdsOp.build()
+        warp_size = IndexConstantOp.build(32)
+        warp_id = IndexDivOp.build(ids.x, warp_size.result())
+        id_ops: list[Op] = [ids, warp_size, warp_id]
+        parallel_id = warp_id.result()
+    else:
+        id_op_type = {
+            CollectiveLevel.BLOCK: BlockIdsOp,
+            CollectiveLevel.THREAD: ThreadIdsOp,
+            CollectiveLevel.WG: WarpGroupIdOp,
+        }[level]
+        ids = id_op_type.build()
+        id_ops = [ids]
+        parallel_id = ids.results[axis]
     cdivisor = IndexConstantOp.build(divisor)
     div = IndexDivOp.build(
-        ids.results[axis], cdivisor.result(),
+        parallel_id, cdivisor.result(),
     )
     cbound = IndexConstantOp.build(bounds[dim])
     mod = IndexModOp.build(
         div.result(), cbound.result(),
     )
-    return [ids, cdivisor, div, cbound, mod], mod.result(), None
+    return [*id_ops, cdivisor, div, cbound, mod], mod.result(), None
 
 
 def _narrow_collective(
