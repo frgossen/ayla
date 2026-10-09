@@ -168,6 +168,19 @@ def test_block_barrier_does_not_cover_a_cluster_leader_effect():
     )
 
 
+def test_cluster_to_leader_join_retains_its_local_gather():
+    # A fused local and multicast load needs both gathers; the cluster
+    # gather includes the local one, but not a block barrier.
+    assert (
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK_TO_LEADER)
+        == BarrierScope.CLUSTER_TO_LEADER
+    )
+    assert (
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK)
+        == BarrierScope.CLUSTER
+    )
+
+
 def test_cluster_leader_barrier_coverage_is_directional():
     assert not _barrier_covers(
         BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.CLUSTER_LEADER,
