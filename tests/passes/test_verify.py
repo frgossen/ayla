@@ -439,6 +439,63 @@ def test_tma_multicast_accepts_clustered_load():
     assert verify_gpu_dialect(module) is module
 
 
+def _linearized_multicast_kernel(shared_operand: str) -> str:
+    # Four output tiles on a 2x2 grid, linearized N-fast onto four CTAs:
+    # m = bx / 2, n = bx % 2. A cluster of two adjacent CTAs shares m.
+    index = {"lhs": "%m", "rhs": "%n"}[shared_operand]
+    return textwrap.dedent(f"""\
+        module {{
+          kernel @linear(%src: gmem<32x16xf32>) grid_dim=[4, 1, 1] cluster_dim=[2, 1, 1] {{
+            %bx: index, %by: index, %bz: index = block_ids()
+            %c2: index = index_constant() attrs={{value: 2}}
+            %m: index = index_div(%bx: index, %c2: index)
+            %n: index = index_mod(%bx: index, %c2: index)
+            %tile: gmem<16x16xf32> = tile(%src: gmem<32x16xf32>, {index}: index, 0)
+            %dst: smem<16x16xf32> = alloc() attrs={{id: 0}}
+            move(%dst: smem<16x16xf32>, %tile: gmem<16x16xf32>) collective=xyz.cluster attrs={{multicast: True, tma: True}}
+          }}
+        }}""")
+
+
+def test_tma_multicast_accepts_tile_shared_by_the_cluster():
+    module = gpu_dialect.parse(_linearized_multicast_kernel("lhs"))
+
+    assert verify_gpu_dialect(module) is module
+
+
+def test_tma_multicast_rejects_tile_that_differs_within_a_cluster():
+    module = gpu_dialect.parse(_linearized_multicast_kernel("rhs"))
+
+    with pytest.raises(ValueError, match="different tiles within a cluster"):
+        verify_gpu_dialect(module)
+
+
+def test_tma_multicast_checks_every_wave_of_a_fixed_grid():
+    # Two CTAs stride over four N-fast tiles. A cluster of both CTAs shares
+    # the M row in every wave, but never the N column.
+    def kernel(index: str) -> str:
+        return textwrap.dedent(f"""\
+            module {{
+              kernel @waves(%src: gmem<32x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {{
+                %bx: index, %by: index, %bz: index = block_ids()
+                %c2: index = index_constant() attrs={{value: 2}}
+                %dst: smem<16x16xf32> = alloc() attrs={{id: 0}}
+                for (%w: index = 0 to 2) attrs={{label: "waves"}} {{
+                  %wave: index = index_mul(%w: index, %c2: index)
+                  %t: index = index_add(%bx: index, %wave: index)
+                  %m: index = index_div(%t: index, %c2: index)
+                  %n: index = index_mod(%t: index, %c2: index)
+                  %tile: gmem<16x16xf32> = tile(%src: gmem<32x16xf32>, {index}: index, 0)
+                  move(%dst: smem<16x16xf32>, %tile: gmem<16x16xf32>) collective=xyz.cluster attrs={{multicast: True, tma: True}}
+                }}
+              }}
+            }}""")
+
+    assert verify_gpu_dialect(gpu_dialect.parse(kernel("%m")))
+    with pytest.raises(ValueError, match="different tiles within a cluster"):
+        verify_gpu_dialect(gpu_dialect.parse(kernel("%n")))
+
+
 def test_tma_multicast_rejects_grid_collective():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
