@@ -44,6 +44,7 @@ from ayla.gpu_dialect import (
     TmaMoveOp,
     ThreadIdOp,
     TileOp,
+    WrmemTensorType,
     gpu_dialect,
     has_ordering_effect,
     is_grid_collective,
@@ -539,6 +540,15 @@ def test_index_lt_op():
         IndexLtOp.build(not_index, rhs)
     with pytest.raises(AssertionError, match="expected IndexType rhs"):
         IndexLtOp.build(lhs, not_index)
+
+
+def test_warp_register_memory_type():
+    typ = WrmemTensorType.build((1,), F32Type())
+    assert repr(typ) == 'wrmem<1xf32 layout="default">'
+    assert_print_and_roundtrip(
+        AllocOp.build(typ, id=0),
+        '%0: wrmem<1xf32 layout="default"> = alloc() attrs={id: 0}',
+    )
 
 
 def test_async_op():

@@ -1400,7 +1400,7 @@ class MemTensorType(Type):
 
     Subclasses split along the addressing model:
       - AddrMemTensorType: byte-addressable linear memory (gmem, smem).
-      - RegMemTensorType: SIMT-distributed registers (rmem, wgrmem).
+      - RegMemTensorType: SIMT-distributed registers (rmem, wrmem, wgrmem).
 
     All subclasses encode as `<NAME><N x M x ... x DTYPE [extra] attrs={...}>`,
     differing only in the `[extra]` clauses they print/parse (strides for
@@ -1566,7 +1566,8 @@ class AddrMemTensorType(MemTensorType):
 class RegMemTensorType(MemTensorType):
     """Register-resident tensor: SIMT-distributed registers, no byte
     addressing. Storage is a fixed set of named registers per thread
-    (rmem) or per warp (wgrmem); no pointer arithmetic, no aliasing.
+    (rmem), warp (wrmem), or warp group (wgrmem); no pointer arithmetic,
+    no aliasing.
     """
 
 
@@ -1880,6 +1881,65 @@ class RmemTensorType(RegMemTensorType):
     Each thread independently holds the full tile in its own registers.
     There is no inter-lane sharing, so no layout policy is needed.
     """
+
+
+@gpu_dialect.register_type("wrmem")
+class WrmemTensorType(RegMemTensorType):
+    """Register-memory tensor collectively owned by one warp.
+
+    Each lane holds the registers assigned to it by the producing operation;
+    the logical value is the union of the 32 lane fragments.
+    ``default`` is a placeholder layout whose mapping is not yet specified.
+    """
+
+    # TODO: Move warp-level MMA support from WgrmemTensorType to WrmemTensorType,
+    # including the mma layout, bf16/f16 register mapping, matmul and elementwise
+    # lowering, and memory effects.
+    # TODO: Define the supported layout mappings and validate layout names.
+
+    @classmethod
+    def build(  # type: ignore[override]
+        cls,
+        sizes: list[int],
+        dtype: Type,
+        layout: str = "default",
+        attrs: dict[str, object] | None = None,
+    ):
+        return cls(attrs={
+            "sizes": list(sizes),
+            "dtype": dtype,
+            "layout": layout,
+            **(attrs or {}),
+        })
+
+    @property
+    def layout(self) -> str:
+        return self.attrs["layout"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write(self.name)
+        p.write("<")
+        p.write_shape(self.sizes, self.dtype)
+        p.write(f' layout="{self.layout}"')
+        p.write_extra_attrs(
+            self.attrs, skip_keys=("sizes", "dtype", "layout"),
+        )
+        p.write(">")
+
+    @classmethod
+    def parse(cls, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.TYPE_ID:
+            raise ValueError(
+                f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal("<")
+        sizes, dtype = p.read_shape_with_dtype()
+        p.read_literal("layout")
+        p.read_literal("=")
+        layout = p.read_str_attr()
+        attrs = p.read_extra_attrs()
+        p.read_literal(">")
+        return cls.build(sizes, dtype, layout, attrs=attrs)
 
 
 @gpu_dialect.register_type("wgrmem")
@@ -2626,6 +2686,8 @@ _COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
 def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, RmemTensorType):
         return CollectiveScope.THREAD
+    if isinstance(t, WrmemTensorType):
+        return CollectiveScope.WARP
     if isinstance(t, WgrmemTensorType):
         return CollectiveScope.WARPGROUP
     if isinstance(t, SmemTensorType):
@@ -2776,7 +2838,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             CollectiveScope.THREAD
             if isinstance(
                 op.dst.type,
-                (RmemTensorType, WgrmemTensorType),
+                (RmemTensorType, WrmemTensorType, WgrmemTensorType),
             )
             else _type_collective_scope(op.dst.type)
         )
