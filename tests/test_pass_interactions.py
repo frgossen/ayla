@@ -271,8 +271,8 @@ def test_local_and_multicast_tma_loads_share_completion():
     assert_contains_in_order(
         ptx,
         "fence.mbarrier_init.release.cluster;",
-        "barrier.cluster.arrive.release;",
-        "barrier.cluster.wait.acquire;",
+        "barrier.cluster.arrive.relaxed.aligned;",
+        "barrier.cluster.wait.aligned;",
     )
     assert (
         ptx.index(local)

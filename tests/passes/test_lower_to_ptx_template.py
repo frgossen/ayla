@@ -95,8 +95,8 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         ptx,
         "fence.mbarrier_init.release.cluster;",
         "bar.sync 0;",
-        "barrier.cluster.arrive.release;",
-        "barrier.cluster.wait.acquire;",
+        "barrier.cluster.arrive.relaxed.aligned;",
+        "barrier.cluster.wait.aligned;",
         "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
         "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
         "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
@@ -123,8 +123,8 @@ def test_batches_consecutive_lock_initialization_rendezvous():
 
     assert ptx.count("mbarrier.init.shared::cta.b64") == 3
     assert ptx.count("bar.sync 0;") == 1
-    assert ptx.count("barrier.cluster.arrive.release;") == 1
-    assert ptx.count("barrier.cluster.wait.acquire;") == 1
+    assert ptx.count("barrier.cluster.arrive.relaxed.aligned;") == 1
+    assert ptx.count("barrier.cluster.wait.aligned;") == 1
 
 
 def test_lower_smem_arena_and_reinterpret():
@@ -285,11 +285,11 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
         ptx,
         "fence.mbarrier_init.release.cluster;",
         "bar.sync 0;",
-        "barrier.cluster.arrive.release;",
-        "barrier.cluster.wait.acquire;",
+        "barrier.cluster.arrive.relaxed.aligned;",
+        "barrier.cluster.wait.aligned;",
     )
     assert (
-        ptx.index("barrier.cluster.wait.acquire;")
+        ptx.index("barrier.cluster.wait.aligned;")
         < ptx.index(leader)
         < ptx.index(multicast)
         < ptx.index(arrive)

@@ -463,6 +463,8 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             scope = BarrierScope[op.scope.upper()]
         except KeyError as error:
             raise ValueError(f"unknown barrier scope {op.scope!r}") from error
+        if op.attrs.get("publication"):
+            return state  # Orders only lock initialization.
         return _after_barrier(state, scope)
 
     @transfers(AwaitOp)

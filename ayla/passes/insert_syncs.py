@@ -49,9 +49,12 @@ def _insert_barriers(
             or not pending_locks.isdisjoint(effective_operands(op))
         ):
             new_ops.extend(_publication_barriers(pending_init))
+            # The CTA barrier of a publication orders memory as well. Its
+            # cluster rendezvous orders only the initialization.
             if (
                 target is not None
                 and target.scope.leq(pending_init)
+                and target.scope.leq(BarrierScope.BLOCK)
                 and op not in (barrier_syncs or {})
             ):
                 target = None  # The publication already orders this hazard.
@@ -132,7 +135,16 @@ def _publication_barriers(scope: BarrierScope) -> list[Op]:
         BarrierScope.BLOCK: [BarrierScope.BLOCK],
         BarrierScope.CLUSTER: [BarrierScope.BLOCK, BarrierScope.CLUSTER],
     }[scope]
-    return [BarrierOp.build(_BARRIER_OP_SCOPE[s]) for s in scopes]
+    # Each initializing thread already releases its initialization to the
+    # cluster with fence.mbarrier_init, so the rendezvous is a publication:
+    # it orders no other memory and lowers without a fence.
+    return [
+        BarrierOp.build(
+            _BARRIER_OP_SCOPE[s],
+            attrs={"publication": True} if s == BarrierScope.CLUSTER else None,
+        )
+        for s in scopes
+    ]
 
 
 def _hoist_lock_allocations(kernel: KernelOp) -> None:

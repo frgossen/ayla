@@ -1208,6 +1208,13 @@ class LowerToPtxTemplate(LoweringPass):
                 """)
             operands = [sync]
             operand_names = ["sync"]
+        elif scope == "cluster" and op.attrs.get("publication"):
+            # Every initializing thread released its initialization with
+            # fence.mbarrier_init, so the arrival needs no fence of its own.
+            template = textwrap.dedent("""\
+                barrier.cluster.arrive.relaxed.aligned;
+                barrier.cluster.wait.aligned;
+                """)
         elif scope in ("leader_to_cluster", "cluster"):
             template = textwrap.dedent("""\
                 barrier.cluster.arrive.release;

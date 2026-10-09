@@ -84,6 +84,22 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
         }""")  # noqa: E501
 
 
+def test_publication_does_not_stand_in_for_a_cluster_hazard_barrier():
+    # The publication's cluster rendezvous orders only initialization, so a
+    # cluster hazard at the first use keeps its own release/acquire barrier.
+    lock = AllocOp.build_with_fresh_id(LockType.build(kind="cluster_mbar"))
+    use = Op(operands=[lock.result()], results=[])
+    block = Block(ops=[lock, use])
+
+    _insert_barriers(block, {use: BarrierTarget(BarrierScope.CLUSTER)}, 128)
+
+    scopes = [
+        (op.scope, op.attrs.get("publication", False))
+        for op in block.ops if isinstance(op, BarrierOp)
+    ]
+    assert scopes == [("block", False), ("cluster", True), ("cluster", False)]
+
+
 def test_block_leader_barrier_requires_whole_warps():
     op = Op(operands=[], results=[])
     block = Block(ops=[op])
@@ -308,7 +324,7 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     text = repr(module)
     # One cluster rendezvous publishes both locks' initialization. Reuse only
     # needs the separate one-way handoff to the next multicast issuer.
-    assert text.count('barrier() attrs={scope: "cluster"}') == 1
+    assert text.count('barrier() attrs={publication: True, scope: "cluster"}') == 1
     barriers = [
         op for op in find_ops_of_type(module, BarrierOp)
         if op.scope == "cluster_to_leader"
@@ -342,13 +358,13 @@ def test_interleaved_lock_allocations_share_one_publication():
     insert_syncs(module)
 
     text = repr(module)
-    assert text.count('barrier() attrs={scope: "cluster"}') == 1
+    assert text.count('barrier() attrs={publication: True, scope: "cluster"}') == 1
     assert text.count('barrier() attrs={scope: "block"}') == 1
     assert_contains_in_order(
         text,
         "%l0: lock<mbar> = alloc() attrs={id: 1}",
         "%l1: lock<mbar> = alloc() attrs={id: 3}",
-        'barrier() attrs={scope: "cluster"}',
+        'barrier() attrs={publication: True, scope: "cluster"}',
     )
     assert text.index("async(%l0") < text.index("async(%l1")
 
