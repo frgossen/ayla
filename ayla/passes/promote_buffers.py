@@ -27,7 +27,7 @@ from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
-    BlockIdsOp,
+    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
@@ -88,7 +88,7 @@ def _collective_level(value: Value) -> str:
     if isinstance(defn, Block):
         return "block"
 
-    if isinstance(defn, BlockIdsOp):
+    if isinstance(defn, BlockIdOp):
         return "block"
     if isinstance(defn, WarpGroupIdOp):
         return "wg"

@@ -10,7 +10,7 @@ from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
     BarrierOp,
-    BlockIdsOp,
+    BlockIdOp,
     ClusterBlockIdsOp,
     CollectiveScope,
     ElementwiseOp,
@@ -407,7 +407,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         self.targets: BarrierTargetsType = {}
 
     @transfers(
-        BlockIdsOp,
+        BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,

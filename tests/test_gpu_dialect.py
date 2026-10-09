@@ -20,6 +20,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BarrierOp,
     BF16Type,
+    BlockIdOp,
     ClusterBlockIdsOp,
     CollectiveScope,
     ConstantOp,
@@ -424,6 +425,17 @@ def test_cluster_block_ids_round_trip():
     )
 
 
+def test_block_id_round_trip():
+    block_id = BlockIdOp.build(CollectiveAxis.Y)
+
+    assert block_id.axis == CollectiveAxis.Y
+    assert block_id.results == [block_id.value]
+    assert_print_and_roundtrip(
+        block_id,
+        '%by: index = block_id() attrs={axis: "y"}',
+    )
+
+
 def test_cluster_collective_scope_is_between_block_and_grid():
     assert (
         CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER)
@@ -756,7 +768,8 @@ def test_naive_matmul_4096_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id() attrs={axis: "x"}
+            %cy: index = block_id() attrs={axis: "y"}
             %tx: index, %ty: index, %tz: index = thread_ids()
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<4096x64xf32 strides=[4096, 1]> = tile(%b: gmem<4096x4096xf32>, 0, %cy: index)

@@ -140,7 +140,7 @@ def test_tile_reduce_combines_parallel_and_reduction_dimensions():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) grid_dim=[2, None, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id() attrs={axis: "x"}
             %c1: index = index_constant() attrs={value: 1}
             %0: index = index_div(%bx: index, %c1: index)
             %c2: index = index_constant() attrs={value: 2}
@@ -209,7 +209,7 @@ def test_tile_reduce_maps_parallel_dimension_to_block_and_reduction_to_warp():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) grid_dim=[2, None, None] block_dim=[64, None, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id() attrs={axis: "x"}
             %c1: index = index_constant() attrs={value: 1}
             %0: index = index_div(%bx: index, %c1: index)
             %c2: index = index_constant() attrs={value: 2}
@@ -268,7 +268,7 @@ def test_tile_reduce_composes_block_and_warp_tiling():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<64x64xf32>, %output: gmem<64x1xf32>) grid_dim=[2, None, None] block_dim=[64, None, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id() attrs={axis: "x"}
             %c2: index = index_constant() attrs={value: 2}
             %0: index = index_mod(%bx: index, %c2: index)
             %1: gmem<32x64xf32> = tile(%src: gmem<64x64xf32>, %0: index, 0)
@@ -626,7 +626,7 @@ def test_tile_reduce_maps_one_dimension_to_block_y():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<256x128x6656xf32>, %output: gmem<256x128x1xf32>) grid_dim=[None, 2, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %by: index = block_id() attrs={axis: "y"}
             %c2: index = index_constant() attrs={value: 2}
             %0: index = index_mod(%by: index, %c2: index)
             %1: gmem<128x128x6656xf32> = tile(%src: gmem<256x128x6656xf32>, %0: index, 0, 0)
@@ -667,7 +667,7 @@ def test_tile_reduce_combines_parallel_and_sequential_dimensions():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<256x128x6656xf32>, %output: gmem<256x128x1xf32>) grid_dim=[None, 2, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %by: index = block_id() attrs={axis: "y"}
             %c2: index = index_constant() attrs={value: 2}
             %0: index = index_mod(%by: index, %c2: index)
             %1: gmem<128x128x6656xf32> = tile(%src: gmem<256x128x6656xf32>, %0: index, 0, 0)
@@ -705,7 +705,7 @@ def test_tile_reduce_maps_two_dimensions_to_one_parallel_iteration_space():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<256x128x6656xf32>, %output: gmem<256x128x1xf32>) grid_dim=[4, None, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id() attrs={axis: "x"}
             %c2: index = index_constant() attrs={value: 2}
             %0: index = index_mod(%bx: index, %c2: index)
             %1: index = index_div(%bx: index, %c2: index)

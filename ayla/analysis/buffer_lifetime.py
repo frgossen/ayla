@@ -10,7 +10,7 @@ from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
     BarrierOp,
-    BlockIdsOp,
+    BlockIdOp,
     ClusterBlockIdsOp,
     ElementwiseOp,
     IndexAddOp,
@@ -106,7 +106,7 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
 
     @transfers(
         BarrierOp,
-        BlockIdsOp,
+        BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,

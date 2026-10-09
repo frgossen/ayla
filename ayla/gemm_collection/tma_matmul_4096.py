@@ -16,7 +16,8 @@ def tma_matmul_4096_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @tma_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id() attrs={axis: "x"}
+            %cy: index = block_id() attrs={axis: "y"}
             %tx: index, %ty: index, %tz: index = thread_ids()
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<64x4096xf32> = tile(%b: gmem<4096x4096xf32>, %cy: index, 0)
