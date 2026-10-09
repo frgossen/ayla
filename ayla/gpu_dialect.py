@@ -713,6 +713,11 @@ class ElementwiseOp(GpuOp):
     The first operand is the destination and the rest are sources. Passing the
     same value as the destination and first source computes in place.
 
+    Lowering minimizes temporary register live ranges by default; ``ilp``
+    asks for one wide schedule with more instruction-level parallelism
+    instead. A source is only overwritten when it is also the destination;
+    the backend remains responsible for register reuse between distinct values.
+
     TODO: generalize to several destinations.
     """
 
@@ -723,11 +728,13 @@ class ElementwiseOp(GpuOp):
         srcs: list[Value],
         fn: str,
         attrs: dict[str, object] | None = None,
+        *,
+        ilp: bool = False,
     ) -> "ElementwiseOp":
         return cls(
             operands=[dst, *srcs],
             results=[],
-            attrs={"fn": fn, **(attrs or {})},
+            attrs={"fn": fn, **(attrs or {}), **({"ilp": True} if ilp else {})},
         )
 
     @property
@@ -744,6 +751,11 @@ class ElementwiseOp(GpuOp):
     @property
     def fn(self) -> str:
         return self.attrs["fn"]  # type: ignore[return-value]
+
+    @property
+    def ilp(self) -> bool:
+        """Whether lowering should prefer one wide schedule over few registers."""
+        return self.attrs.get("ilp", False)  # type: ignore[return-value]
 
     @property
     def extra_attrs(self) -> dict[str, object]:

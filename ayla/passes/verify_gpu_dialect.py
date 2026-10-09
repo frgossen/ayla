@@ -407,6 +407,8 @@ class VerifyGpuDialect(VerificationPass):
                 f"elementwise {op.fn} expects {expected} sources, "
                 f"got {op.num_srcs}"
             )
+        if type(op.ilp) is not bool:
+            raise ValueError(f"elementwise ilp must be a bool; got {op.ilp!r}")
 
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:

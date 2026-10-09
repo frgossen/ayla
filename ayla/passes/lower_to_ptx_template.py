@@ -6,6 +6,8 @@ other ops (alloc, load, store, matmul) will be added incrementally.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 import itertools
 import math
 import struct
@@ -163,52 +165,99 @@ def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     )
 
 
-def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
+def _elementwise_source_names(op: ElementwiseOp) -> list[str]:
+    return ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
+
+
+def _sigmoid_ptx(dst_dtype: Type) -> Callable[[list[str], list[str]], str]:
+    return (
+        _lower_elementwise_sigmoid_bf16_ptx
+        if isinstance(dst_dtype, BF16Type)
+        else _lower_elementwise_sigmoid_ptx
+    )
+
+
+def _lower_elementwise_in_batches(
+    op: ElementwiseOp,
+    lower_registers: Callable[
+        [ElementwiseOp, list[str], list[list[str]]], str
+    ],
+) -> str:
+    """Lower with either bounded scratch registers or one wide ILP batch."""
+    src_regs = [
+        _elementwise_operand_regs(op.src(i), name)
+        for i, name in enumerate(_elementwise_source_names(op))
+    ]
+    register_count = len(src_regs[0])
+    assert all(len(regs) == register_count for regs in src_regs)
+
+    src_dtype = cast(MemTensorType, op.src(0).type).dtype
+    dst_dtype = cast(MemTensorType, op.dst.type).dtype
+    dst_regs = _elementwise_operand_regs(op.dst, "dst")
+    conversion_width = 1
+    if src_dtype != dst_dtype:
+        assert register_count == 2 * len(dst_regs)
+        conversion_width = 2
+    batch_size = register_count if op.ilp else conversion_width
+
+    template = ""
+    for start in range(0, register_count, batch_size):
+        end = start + batch_size
+        batch_src_regs = [regs[start:end] for regs in src_regs]
+        if src_dtype == dst_dtype:
+            result_regs = dst_regs[start:end]
+        else:
+            result_regs = [
+                f"${{f32:{op.fn}_result{i}}}"
+                for i in range(batch_size)
+            ]
+        template += lower_registers(op, result_regs, batch_src_regs)
+        if src_dtype != dst_dtype:
+            # TODO: Have PromoteBuffers emit an explicit convert after the F32
+            # epilogue; only promotion knows the register accumulator exists.
+            template += _lower_dtype_conversion_ptx(
+                dst_regs[start // conversion_width:end // conversion_width],
+                result_regs,
+                src_dtype,
+                dst_dtype,
+            )
+    return template
+
+
+def _lower_sigmoid_registers(
+    op: ElementwiseOp,
+    dst_regs: list[str],
+    src_regs: list[list[str]],
+) -> str:
     src_dtype = cast(MemTensorType, op.src(0).type).dtype
     dst_dtype = cast(MemTensorType, op.dst.type).dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
         )
-
-    src_regs = _elementwise_operand_regs(op.src(0), "src")
-    if src_dtype == dst_dtype:
-        result_regs = _elementwise_operand_regs(op.dst, "dst")
-    else:
-        result_regs = [
-            f"${{f32:sigmoid_tmp{reg}}}" for reg in range(len(src_regs))
-        ]
-
-    if isinstance(dst_dtype, BF16Type):
-        template = _lower_elementwise_sigmoid_bf16_ptx(
-            result_regs, src_regs,
-        )
-    else:
-        template = _lower_elementwise_sigmoid_ptx(result_regs, src_regs)
-    if src_dtype != dst_dtype:
-        template += _lower_dtype_conversion_ptx(
-            _elementwise_operand_regs(op.dst, "dst"),
-            result_regs,
-            src_dtype,
-            dst_dtype,
-        )
-    return template
+    [src] = src_regs
+    return _sigmoid_ptx(dst_dtype)(dst_regs, src)
 
 
-def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
+def _lower_mul_register_batches(
+    op: ElementwiseOp,
+    dst_regs: list[str],
+    src_regs: list[list[str]],
+) -> str:
     if not all(
         isinstance(cast(MemTensorType, value.type).dtype, F32Type)
         for value in op.operands
     ):
         raise NotImplementedError("lower_elementwise: mul supports only f32")
-    return _lower_mul_registers(
-        _elementwise_operand_regs(op.dst, "dst"),
-        _elementwise_operand_regs(op.src(0), "lhs"),
-        _elementwise_operand_regs(op.src(1), "rhs"),
-    )
+    lhs_regs, rhs_regs = src_regs
+    return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs)
 
 
-def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
+def _lower_silu_registers(
+    op: ElementwiseOp,
+    dst_regs: list[str],
+    src_reg_batches: list[list[str]],
+) -> str:
     src = op.src(0)
     src_dtype = cast(MemTensorType, src.type).dtype
     dst_dtype = cast(MemTensorType, op.dst.type).dtype
@@ -216,37 +265,28 @@ def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
         raise NotImplementedError(
             f"lower_elementwise: silu does not support {src_dtype} input"
         )
-
-    src_regs = _elementwise_operand_regs(src, "src")
-    if src_dtype == dst_dtype:
-        result_regs = _elementwise_operand_regs(op.dst, "dst")
-    else:
-        result_regs = [
-            f"${{f32:silu_result{reg}}}" for reg in range(len(src_regs))
-        ]
-    tmp_regs = [f"${{f32:silu_tmp{reg}}}" for reg in range(len(src_regs))]
-    if isinstance(dst_dtype, BF16Type):
-        template = _lower_elementwise_sigmoid_bf16_ptx(tmp_regs, src_regs)
-    else:
-        template = _lower_elementwise_sigmoid_ptx(tmp_regs, src_regs)
-    template += _lower_mul_registers(result_regs, src_regs, tmp_regs)
-    # TODO: Have PromoteBuffers emit an explicit convert after the F32
-    # epilogue; only promotion knows the register accumulator exists.
-    if src_dtype != dst_dtype:
-        template += _lower_dtype_conversion_ptx(
-            _elementwise_operand_regs(op.dst, "dst"),
-            result_regs,
-            src_dtype,
-            dst_dtype,
-        )
+    [src_regs] = src_reg_batches
+    tmp_regs = (
+        [f"${{f32:silu_tmp{i}}}" for i in range(len(src_regs))]
+        if op.dst is src else dst_regs
+    )
+    template = _sigmoid_ptx(dst_dtype)(tmp_regs, src_regs)
+    template += _lower_mul_registers(dst_regs, src_regs, tmp_regs)
     return template
 
 
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
-    "mul": _lower_mul_elementwise_ptx,
-    "sigmoid": _lower_sigmoid_elementwise_ptx,
-    "silu": _lower_silu_elementwise_ptx,
+    "mul": partial(
+        _lower_elementwise_in_batches,
+        lower_registers=_lower_mul_register_batches,
+    ),
+    "sigmoid": partial(
+        _lower_elementwise_in_batches, lower_registers=_lower_sigmoid_registers,
+    ),
+    "silu": partial(
+        _lower_elementwise_in_batches, lower_registers=_lower_silu_registers,
+    ),
 }
 
 
@@ -672,7 +712,7 @@ class LowerToPtxTemplate(LoweringPass):
             )
         template = lower(op)
 
-        source_names = ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
+        source_names = _elementwise_source_names(op)
         assert len(source_names) == op.num_srcs
         new_op = PTXTemplateOp.build(
             operands=[dst_value, *source_values],

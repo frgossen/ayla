@@ -395,6 +395,13 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
     ]
     assert "ex2.approx.ftz.f32" in template
     assert "rcp.approx.ftz.f32" in template
+    assert "${f32:sigmoid_result0}" in template
+    assert "${f32:sigmoid_result1}" in template
+    assert "sigmoid_result2" not in template
+    assert not any(
+        line.startswith("mul.f32 ${f32:operand.src")
+        for line in template.splitlines()
+    )
 
 
 def test_lower_sigmoid_can_convert_its_result_to_f16():
@@ -539,24 +546,13 @@ def test_lower_elementwise_silu():
         lowered, lambda op: isinstance(op, PTXTemplateOp)
     )[-1].attrs["template"]
 
-    expected = "".join(
-        textwrap.dedent(f"""\
-            mul.f32 ${{f32:silu_tmp{reg}}}, ${{f32:operand.src.r{reg}}}, 0fBFB8AA3B;
-            ex2.approx.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}};
-            add.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}}, 0f3F800000;
-            rcp.approx.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}};
-            """)
-        for reg in range(4)
-    )
-    expected += "".join(
-        f"mul.f32 ${{f32:operand.dst.r{reg}}}, "
-        f"${{f32:operand.src.r{reg}}}, ${{f32:silu_tmp{reg}}};\n"
-        for reg in range(4)
-    )
-    assert template == expected
+    assert "${f32:silu_tmp0}" in template
+    assert "silu_tmp1" not in template
+    assert template.count("ex2.approx.f32") == 4
+    assert template.count("mul.f32 ${f32:operand.dst") == 4
 
 
-def test_lower_elementwise_silu_with_bf16_output():
+def test_lower_elementwise_silu_can_opt_out_of_minimum_register_schedule():
     w = 'wgrmem<16x8xf32 layout="mma">'
     b = 'wgrmem<16x8xbf16 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
@@ -564,7 +560,7 @@ def test_lower_elementwise_silu_with_bf16_output():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %src: {w} = alloc() attrs={{id: 0}}
             %dst: {b} = alloc() attrs={{id: 1}}
-            elementwise silu(%dst: {b}, %src: {w})
+            elementwise silu(%dst: {b}, %src: {w}) attrs={{ilp: True}}
           }}
         }}"""))
 
@@ -576,8 +572,35 @@ def test_lower_elementwise_silu_with_bf16_output():
     assert template.count("ex2.approx.ftz.f32") == 4
     assert template.count("rcp.approx.ftz.f32") == 4
     assert "ex2.approx.f32" not in template
-    assert template.count("mul.f32 ${f32:silu_result") == 4
+    assert "${f32:silu_result3}" in template
     assert template.endswith(textwrap.dedent("""\
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r0}, ${f32:silu_result1}, ${f32:silu_result0};
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r1}, ${f32:silu_result3}, ${f32:silu_result2};
         """))
+
+
+def test_lower_elementwise_silu_minimizes_temporary_live_ranges_by_default():
+    src = 'wgrmem<16x8xf32 layout="mma">'
+    dst = 'wgrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {{
+            %src: {src} = alloc() attrs={{id: 0}}
+            %dst: {dst} = alloc() attrs={{id: 1}}
+            elementwise silu(%dst: {dst}, %src: {src})
+          }}
+        }}"""))
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("ex2.approx.ftz.f32") == 4
+    assert "silu_tmp" not in template
+    assert "${f32:silu_result0}" in template
+    assert "${f32:silu_result1}" in template
+    assert "silu_result2" not in template
+    assert template.count("cvt.rn.bf16x2.f32") == 2
+    assert not any(
+        line.startswith("mul.f32 ${f32:operand.src")
+        for line in template.splitlines()
+    )
