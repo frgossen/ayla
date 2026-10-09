@@ -10,8 +10,8 @@ def pranjalssh_4096_pipelined_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @pranjalssh_4096_pipelined(%a: gmem<4096x4096xbf16>, %bt: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 32, 1] block_dim=[128, 1, 1] {
-            %bx: index = block_id() attrs={axis: "x"}
-            %by: index = block_id() attrs={axis: "y"}
+            %bx: index = block_id.x
+            %by: index = block_id.y
             %smem_a0: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             %smem_b0: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             %smem_a1: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 2}

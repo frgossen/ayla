@@ -170,10 +170,10 @@ def test_codegen_naive_matmul_4096():
     module_str = textwrap.dedent("""\
         module {
           kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
-            %cx: index = block_id() attrs={axis: "x"}
-            %cy: index = block_id() attrs={axis: "y"}
-            %tx: index = thread_id() attrs={axis: "x"}
-            %ty: index = thread_id() attrs={axis: "y"}
+            %cx: index = block_id.x
+            %cy: index = block_id.y
+            %tx: index = thread_id.x
+            %ty: index = thread_id.y
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<64x4096xf32> = tile(%b: gmem<4096x4096xf32>, %cy: index, 0)
             %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)
@@ -313,10 +313,10 @@ def test_codegen_tma_load():
     module_str = textwrap.dedent("""\
         module {
           kernel @tma(%a: gmem<4096x4096xf32>) grid_dim=[32, 64, 1] block_dim=[128, 1, 1] {
-            %cx: index = block_id() attrs={axis: "x"}
-            %cy: index = block_id() attrs={axis: "y"}
-            %tx: index = thread_id() attrs={axis: "x"}
-            %ty: index = thread_id() attrs={axis: "y"}
+            %cx: index = block_id.x
+            %cy: index = block_id.y
+            %tx: index = thread_id.x
+            %ty: index = thread_id.y
             %a_block: gmem<128x64xf32 strides=[4096, 1]> = tile(%a: gmem<4096x4096xf32>, %cx: index, %cy: index)
             %a_thread: gmem<64x32xf32 strides=[4096, 1]> = tile(%a_block: gmem<128x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
             %a_smem: smem<64x32xf32 swizzle="128B"> = alloc() attrs={id: 0}

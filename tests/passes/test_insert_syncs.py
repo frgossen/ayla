@@ -366,8 +366,8 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             %9: smem<256x64xbf16 swizzle="128B"> = alloc() attrs={id: 9}
             %10: lock<mbar> = alloc() attrs={id: 10}
             %11: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 11}
-            %bx: index = block_id() attrs={axis: "x"}
-            %by: index = block_id() attrs={axis: "y"}
+            %bx: index = block_id.x
+            %by: index = block_id.y
             %12: gmem<256x4096xbf16> = tile(%b: gmem<4096x4096xbf16>, %by: index, 0)
             %13: gmem<256x64xbf16 strides=[4096, 1]> = tile(%12: gmem<256x4096xbf16>, 0, %c3: index)
             %14: gmem<256x64xbf16 strides=[4096, 1]> = tile(%12: gmem<256x4096xbf16>, 0, %c2: index)

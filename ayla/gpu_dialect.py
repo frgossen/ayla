@@ -2156,12 +2156,19 @@ class ThreadIdOp(GpuOp):
     """Produce one axis of the thread index."""
 
     @classmethod
-    def build(cls, axis: CollectiveAxis) -> "ThreadIdOp":
+    def build(
+        cls,
+        axis: CollectiveAxis,
+        attrs: dict[str, object] | None = None,
+    ) -> "ThreadIdOp":
+        attrs = dict(attrs or {})
+        if "axis" in attrs:
+            raise ValueError("pass axis as an explicit argument")
         axis_name = axis.name.lower()
         return cls(
             operands=[],
             results=[Value(name=f"t{axis_name}", type=IndexType())],
-            attrs={"axis": axis_name},
+            attrs={"axis": axis_name, **attrs},
         )
 
     @property
@@ -2173,6 +2180,41 @@ class ThreadIdOp(GpuOp):
     @property
     def value(self) -> Value:
         return self.results[0]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "axis"
+        }
+
+    def print(self, p: Printer) -> None:
+        self.value.print(p)
+        p.write(f" = {self.op_id}.{self.axis.name.lower()}")
+        p.write_extra_attrs(self.attrs, skip_keys=("axis",))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ThreadIdOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal(".")
+        axis_name = p.read_identifier()
+        try:
+            axis = CollectiveAxis[axis_name.upper()]
+        except KeyError as error:
+            raise ValueError(f"invalid thread ID axis {axis_name!r}") from error
+        attrs = p.read_extra_attrs()
+        if "axis" in attrs:
+            raise ValueError("thread ID axis must not also appear in attrs")
+        return cls(
+            operands=[],
+            results=results,
+            attrs={"axis": axis.name.lower(), **attrs},
+        )
 
 
 @gpu_dialect.register_op("block_id")
@@ -2180,12 +2222,19 @@ class BlockIdOp(GpuOp):
     """Produce one axis of the block index."""
 
     @classmethod
-    def build(cls, axis: CollectiveAxis) -> "BlockIdOp":
+    def build(
+        cls,
+        axis: CollectiveAxis,
+        attrs: dict[str, object] | None = None,
+    ) -> "BlockIdOp":
+        attrs = dict(attrs or {})
+        if "axis" in attrs:
+            raise ValueError("pass axis as an explicit argument")
         axis_name = axis.name.lower()
         return cls(
             operands=[],
             results=[Value(name=f"b{axis_name}", type=IndexType())],
-            attrs={"axis": axis_name},
+            attrs={"axis": axis_name, **attrs},
         )
 
     @property
@@ -2197,6 +2246,41 @@ class BlockIdOp(GpuOp):
     @property
     def value(self) -> Value:
         return self.results[0]
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "axis"
+        }
+
+    def print(self, p: Printer) -> None:
+        self.value.print(p)
+        p.write(f" = {self.op_id}.{self.axis.name.lower()}")
+        p.write_extra_attrs(self.attrs, skip_keys=("axis",))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "BlockIdOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal(".")
+        axis_name = p.read_identifier()
+        try:
+            axis = CollectiveAxis[axis_name.upper()]
+        except KeyError as error:
+            raise ValueError(f"invalid block ID axis {axis_name!r}") from error
+        attrs = p.read_extra_attrs()
+        if "axis" in attrs:
+            raise ValueError("block ID axis must not also appear in attrs")
+        return cls(
+            operands=[],
+            results=results,
+            attrs={"axis": axis.name.lower(), **attrs},
+        )
 
 
 @gpu_dialect.register_op("cluster_block_ids")
