@@ -2176,31 +2176,28 @@ class ThreadIdsOp(GpuOp):
         return self.results[2]
 
 
-@gpu_dialect.register_op("block_ids")
-class BlockIdsOp(GpuOp):
-    """Produce the 3D block index (ctaid.x, ctaid.y, ctaid.z)."""
+@gpu_dialect.register_op("block_id")
+class BlockIdOp(GpuOp):
+    """Produce one axis of the block index."""
 
-    # TODO: Make the x/y/z axis an attribute and return one ID instead of
-    # coupling all three axes in one operation.
     @classmethod
-    def build(cls) -> "BlockIdsOp":
-        idx = IndexType()
+    def build(cls, axis: CollectiveAxis) -> "BlockIdOp":
+        axis_name = axis.name.lower()
         return cls(
             operands=[],
-            results=[Value(name=name, type=idx) for name in ["bx", "by", "bz"]],
+            results=[Value(name=f"b{axis_name}", type=IndexType())],
+            attrs={"axis": axis_name},
         )
 
     @property
-    def x(self) -> Value:
+    def axis(self) -> CollectiveAxis:
+        axis = self.attrs["axis"]
+        assert isinstance(axis, str)
+        return CollectiveAxis[axis.upper()]
+
+    @property
+    def value(self) -> Value:
         return self.results[0]
-
-    @property
-    def y(self) -> Value:
-        return self.results[1]
-
-    @property
-    def z(self) -> Value:
-        return self.results[2]
 
 
 @gpu_dialect.register_op("cluster_block_ids")
@@ -2769,7 +2766,7 @@ def is_side_effect_free(op: Op) -> bool:
         # moves freely nor stands in for another.
         return op.init is None
     return isinstance(op, (
-        BlockIdsOp,
+        BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,

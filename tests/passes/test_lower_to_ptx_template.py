@@ -261,7 +261,8 @@ def test_lower_tma_load_with_l2_cache_hint():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @load(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %x: index, %y: index, %z: index = block_ids()
+            %x: index = block_id() attrs={axis: "x"}
+            %y: index = block_id() attrs={axis: "y"}
             %smem: smem<64x64xf32> = alloc()
             %lock: lock<mbar> = alloc()
             async(%lock: lock<mbar>) tma_move(%smem: smem<64x64xf32>, %desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %x: index, %y: index) attrs={l2_cache_hint: "evict_last"}
@@ -325,7 +326,8 @@ def test_lower_tma_store_with_l2_cache_hint():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @store(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %x: index, %y: index, %z: index = block_ids()
+            %x: index = block_id() attrs={axis: "x"}
+            %y: index = block_id() attrs={axis: "y"}
             %smem: smem<64x64xf32> = alloc()
             %lock: lock<bulk> = alloc()
             async(%lock: lock<bulk>) tma_move(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %smem: smem<64x64xf32>, %x: index, %y: index) attrs={l2_cache_hint: "evict_first"}
@@ -346,7 +348,8 @@ def test_lower_move_gmem_to_smem():
         """\
         module {
           kernel @load_tile(%a: gmem<4096x4096xbf16>) grid_dim=[64, 64, 1] block_dim=[128, 1, 1] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id() attrs={axis: "x"}
+            %by: index = block_id() attrs={axis: "y"}
             %a_tile: gmem<64x16xbf16 strides=[4096, 1]> = tile(%a: gmem<4096x4096xbf16>, %by: index, %bx: index)
             %smem_a: smem<64x16xbf16> = alloc() attrs={id: 0}
             move(%smem_a: smem<64x16xbf16>, %a_tile: gmem<64x16xbf16 strides=[4096, 1]>) collective=xyz.block

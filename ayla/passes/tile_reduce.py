@@ -16,7 +16,7 @@ from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
-    BlockIdsOp,
+    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
@@ -114,16 +114,19 @@ def _materialize_iteration_space(
         return [loop], loop.iv, loop
 
     level, axis = parallel_iteration_space
-    if level == CollectiveLevel.WARP:
+    if level == CollectiveLevel.BLOCK:
+        ids = BlockIdOp.build(axis)
+        id_ops: list[Op] = [ids]
+        parallel_id = ids.value
+    elif level == CollectiveLevel.WARP:
         assert axis == CollectiveAxis.X
         ids = ThreadIdsOp.build()
         warp_size = IndexConstantOp.build(32)
         warp_id = IndexDivOp.build(ids.x, warp_size.result())
-        id_ops: list[Op] = [ids, warp_size, warp_id]
+        id_ops = [ids, warp_size, warp_id]
         parallel_id = warp_id.result()
     else:
         id_op_type = {
-            CollectiveLevel.BLOCK: BlockIdsOp,
             CollectiveLevel.THREAD: ThreadIdsOp,
             CollectiveLevel.WG: WarpGroupIdOp,
         }[level]

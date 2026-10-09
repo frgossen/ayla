@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 from ..gpu_dialect import (
-    BlockIdsOp,
+    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ForOp,
@@ -37,7 +37,7 @@ from ._utils import label_matches
 
 
 _PARALLEL_ID_OPS = {
-    CollectiveLevel.BLOCK: BlockIdsOp,
+    CollectiveLevel.BLOCK: BlockIdOp,
     CollectiveLevel.THREAD: ThreadIdsOp,
     CollectiveLevel.WG: WarpGroupIdOp,
 }
@@ -345,20 +345,26 @@ class TileMatmul(LoweringPass):
 
         new_ops: list[Op] = []
         parallel_ids: dict[
-            CollectiveLevel, BlockIdsOp | ThreadIdsOp | WarpGroupIdOp
+            tuple[CollectiveLevel, CollectiveAxis], Value
         ] = {}
-        for level, op_type in (
-            (CollectiveLevel.BLOCK, BlockIdsOp),
-            (CollectiveLevel.THREAD, ThreadIdsOp),
-            (CollectiveLevel.WG, WarpGroupIdOp),
-        ):
-            if any(
-                binding is not None and binding[0] == level
-                for binding in self.iteration_bindings
-            ):
+        for binding in self.iteration_bindings:
+            if binding is None or binding in parallel_ids:
+                continue
+            level, axis = binding
+            if level == CollectiveLevel.BLOCK:
+                ids = BlockIdOp.build(axis)
+                parallel_ids[binding] = ids.value
+            else:
+                op_type = {
+                    CollectiveLevel.THREAD: ThreadIdsOp,
+                    CollectiveLevel.WG: WarpGroupIdOp,
+                }[level]
                 ids = op_type.build()
-                parallel_ids[level] = ids
-                new_ops.append(ids)
+                for result_axis in CollectiveAxis:
+                    parallel_ids[(level, result_axis)] = (
+                        ids.results[result_axis]
+                    )
+            new_ops.append(ids)
 
         ivs: list[Value] = []
         iteration_ops: list[Op] = []
@@ -372,8 +378,7 @@ class TileMatmul(LoweringPass):
             if binding is None:
                 iv = Value(name=label, type=IndexType())
             else:
-                level, axis = binding
-                linear_id = parallel_ids[level].results[axis]
+                linear_id = parallel_ids[binding]
                 if self.iteration_bindings.count(binding) == 1:
                     divisors[binding] = ub
                     ivs.insert(0, linear_id)
@@ -475,8 +480,7 @@ class TileMatmul(LoweringPass):
                     continue
                 launch_extent = self._launch_extent(binding)
                 if launch_extent is not None and launch_extent > logical_extent:
-                    level, axis = binding
-                    linear_id = parallel_ids[level].results[axis]
+                    linear_id = parallel_ids[binding]
                     limit = IndexConstantOp.build(logical_extent)
                     condition = IndexLtOp.build(linear_id, limit.result())
                     body_ops = [

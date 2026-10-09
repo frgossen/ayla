@@ -10,7 +10,8 @@ def pranjalssh_4096_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @pranjalssh_4096(%a: gmem<4096x4096xbf16>, %bt: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 32, 1] block_dim=[128, 1, 1] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id() attrs={axis: "x"}
+            %by: index = block_id() attrs={axis: "y"}
             %smem_a: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             %smem_b: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
             %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2, init: 0.0}
