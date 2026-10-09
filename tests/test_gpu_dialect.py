@@ -448,11 +448,11 @@ def test_index_lt_op():
 
 
 def test_warp_register_memory_type():
-    typ = WrmemTensorType.build((1,), F32Type(), layout="lane0")
-    assert repr(typ) == 'wrmem<1xf32 layout="lane0">'
+    typ = WrmemTensorType.build((1,), F32Type())
+    assert repr(typ) == 'wrmem<1xf32 layout="default">'
     assert_print_and_roundtrip(
         AllocOp.build(typ, id=0),
-        '%0: wrmem<1xf32 layout="lane0"> = alloc() attrs={id: 0}',
+        '%0: wrmem<1xf32 layout="default"> = alloc() attrs={id: 0}',
     )
 
 

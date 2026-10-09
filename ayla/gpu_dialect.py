@@ -1855,14 +1855,20 @@ class WrmemTensorType(RegMemTensorType):
 
     Each lane holds the registers assigned to it by the producing operation;
     the logical value is the union of the 32 lane fragments.
+    ``default`` is a placeholder layout whose mapping is not yet specified.
     """
+
+    # TODO: Move warp-level MMA support from WgrmemTensorType to WrmemTensorType,
+    # including the mma layout, bf16/f16 register mapping, matmul and elementwise
+    # lowering, and memory effects.
+    # TODO: Define the supported layout mappings and validate layout names.
 
     @classmethod
     def build(  # type: ignore[override]
         cls,
         sizes: list[int],
         dtype: Type,
-        layout: str,
+        layout: str = "default",
         attrs: dict[str, object] | None = None,
     ):
         return cls(attrs={
