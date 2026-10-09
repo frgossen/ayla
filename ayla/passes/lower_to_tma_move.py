@@ -15,14 +15,20 @@ block, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
 """
 from __future__ import annotations
 
+import math
 from typing import cast
 
 from ..gpu_dialect import (
     AsyncOp,
+    BF16Type,
+    F16Type,
+    F32Type,
+    F64Type,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
     IndexMulOp,
+    KernelOp,
     ModuleOp,
     MoveOp,
     ReshapeOp,
@@ -33,8 +39,12 @@ from ..gpu_dialect import (
     is_column_major,
     is_side_effect_free,
 )
-from ..base.ir import Block, Op, Value
+from ..base.ir import Block, Op, Value, clone_type, find_ancestor_of_type
 from ..base.lowering_pass import LoweringPass, lowers
+
+# A swizzled TMA box must start on a whole swizzle atom: eight rows of the
+# swizzle width.
+_SWIZZLE_ATOM_BYTES = {"128B": 1024, "64B": 512, "32B": 256}
 
 
 class LowerToTmaMove(LoweringPass):
@@ -45,8 +55,28 @@ class LowerToTmaMove(LoweringPass):
     ) -> tuple[list[Op], list[object]] | None:
         if not op.attrs.get("tma"):
             return None
-        index_ops, tma_op = self._materialize(op)
-        return index_ops + [tma_op], []
+        slices = _multicast_slices(op, cast(Value, self.value_map[op.dst]))
+        if slices == 1:
+            index_ops, tma_op = self._materialize(op)
+            return index_ops + [tma_op], []
+        # Each cluster CTA can issue one row slice of a multicast tile, so
+        # one TMA unit does not carry the whole tile for the cluster.
+        smem = cast(Value, self.value_map[op.dst])
+        smem_type = cast(SmemTensorType, smem.type)
+        rows, columns = cast(tuple[int, int], tuple(smem_type.sizes))
+        slice_type = SmemTensorType.build(
+            (rows // slices, columns),
+            smem_type.dtype,
+            swizzle=smem_type.swizzle,
+        )
+        new_ops: list[Op] = []
+        for index in range(slices):
+            view = TileOp.build(smem, [index, 0], slice_type)
+            index_ops, tma_op = self._materialize(
+                op, smem=view.result(), row_offset=index * (rows // slices),
+            )
+            new_ops += [view, *index_ops, tma_op]
+        return new_ops, []
 
     @lowers(AsyncOp)
     def lower_async(
@@ -67,13 +97,35 @@ class LowerToTmaMove(LoweringPass):
         body.ops = [o for o in body.ops if not is_side_effect_free(o)]
         return hoisted + [op], list(op.results)
 
-    def _materialize(self, move: MoveOp) -> tuple[list[Op], TmaMoveOp]:
-        """Build the descriptor + index ops and a sync ``tma_move`` for ``move``."""
+    def _materialize(
+        self,
+        move: MoveOp,
+        smem: Value | None = None,
+        row_offset: int = 0,
+    ) -> tuple[list[Op], TmaMoveOp]:
+        """Build the descriptor + index ops and a sync ``tma_move`` for ``move``.
+
+        ``smem`` and ``row_offset`` select a row slice of a load's tile.
+        """
         is_load = isinstance(move.dst.type, SmemTensorType)
         gmem_operand = move.src if is_load else move.dst
         smem_operand = move.dst if is_load else move.src
 
-        smem = cast(Value, self.value_map[smem_operand])
+        if smem is not None:
+            # Use the existing tile-chain walker for slice coordinates, so a
+            # singleton batch reshape still maps the row to its root axis.
+            assert isinstance(gmem_operand.type, GmemTensorType)
+            assert isinstance(smem.type, SmemTensorType)
+            rows = cast(int, smem.type.sizes[0])
+            assert row_offset % rows == 0
+            view_type = clone_type(gmem_operand.type)
+            assert isinstance(view_type, GmemTensorType)
+            view_type.sizes = list(smem.type.sizes)
+            gmem_operand = TileOp.build(
+                gmem_operand, [row_offset // rows, 0], view_type,
+            ).result()
+        else:
+            smem = cast(Value, self.value_map[smem_operand])
 
         assert isinstance(smem.type, SmemTensorType), (
             f"lower_to_tma_move: plain operand must be smem; got {smem.type}"
@@ -164,6 +216,38 @@ class LowerToTmaMove(LoweringPass):
                 multicast=move.multicast,
             )
         return index_ops, tma_op
+
+
+def _multicast_slices(move: MoveOp, smem: Value) -> int:
+    """How many row slices the cluster's CTAs issue a multicast load in.
+
+    A slice must cover whole swizzle atoms, and the tile must be a plain
+    row-major 2-D buffer; otherwise one CTA issues the whole tile.
+    """
+    if move.multicast is not True:
+        return 1
+    kernel = find_ancestor_of_type(move, KernelOp)
+    assert kernel is not None
+    cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+    smem_type = smem.type
+    if (
+        cluster_size < 2
+        or not isinstance(smem_type, SmemTensorType)
+        or smem_type.rank != 2
+        or "physical_layout" in smem_type.attrs
+        or not smem_type.is_canonical_strides
+    ):
+        return 1
+    rows, columns = smem_type.sizes
+    assert isinstance(rows, int) and isinstance(columns, int)
+    dtype_bytes = cast(
+        BF16Type | F16Type | F32Type | F64Type, smem_type.dtype,
+    ).byte_size
+    atom = _SWIZZLE_ATOM_BYTES.get(cast(str, smem_type.swizzle), 0)
+    slice_rows, remainder = divmod(rows, cluster_size)
+    if remainder or not atom or slice_rows * columns * dtype_bytes % atom:
+        return 1
+    return cluster_size
 
 
 def _build_tile_chain_indices(
