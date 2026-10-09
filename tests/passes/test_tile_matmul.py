@@ -15,7 +15,8 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
-from ayla.passes.tile_matmul import TileMatmul, tile_matmul
+from ayla.passes.canonicalize import Canonicalize
+from ayla.passes.tile_matmul import tile_matmul
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -270,19 +271,39 @@ def test_parallel_tiling_guards_multiple_dimensions():
     )
 
 
-def test_parallel_tiling_rejects_two_dims_on_one_hardware_axis():
-    binding = (CollectiveLevel.BLOCK, CollectiveAxis.X)
+def test_two_dimensional_warp_group_tiling_linearizes_coordinates():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<160x64xbf16>, %c: gmem<128x160xf32>) {
+            matmul(%a: gmem<128x64xbf16>, %b: gmem<160x64xbf16>, %c: gmem<128x160xf32>) collective=xyz.grid
+          }
+        }"""))  # noqa: E501
+    binding = (CollectiveLevel.WG, CollectiveAxis.X)
 
-    with pytest.raises(
-        ValueError,
-        match="one hardware dimension cannot tile multiple matmul dimensions",
-    ):
-        TileMatmul(
-            op_dims=["M", "N"],
-            tile_sizes=[64, 64],
-            iteration_bindings=[binding, binding],
-            for_loop_labels=[None, None],
-        )
+    module = tile_matmul(
+        module,
+        op_dims=["M", "N"],
+        tile_sizes=[64, 80],
+        iteration_bindings=[binding, binding],
+        for_loop_labels=[None, None],
+    )
+    module = Canonicalize().run(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<160x64xbf16>, %c: gmem<128x160xf32>) block_dim=[512, 1, 1] num_warp_groups=4 {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c2: index = index_constant() attrs={value: 2}
+            %0: index = index_div(%wgx: index, %c2: index)
+            %1: index = index_mod(%0: index, %c2: index)
+            %2: index = index_mod(%wgx: index, %c2: index)
+            %3: gmem<64x64xbf16> = tile(%a: gmem<128x64xbf16>, %1: index, 0)
+            %4: gmem<80x64xbf16> = tile(%b: gmem<160x64xbf16>, %2: index, 0)
+            %5: gmem<64x160xf32> = tile(%c: gmem<128x160xf32>, %1: index, 0)
+            %6: gmem<64x80xf32 strides=[160, 1]> = tile(%5: gmem<64x160xf32>, 0, %2: index)
+            matmul(%3: gmem<64x64xbf16>, %4: gmem<80x64xbf16>, %6: gmem<64x80xf32 strides=[160, 1]>) collective=[x.wg, yz.grid] attrs={dst_tiling_scheme: 0}
+          }
+        }""")  # noqa: E501
 
 
 def test_block_x_tiling_rejects_a_smaller_fixed_grid():
