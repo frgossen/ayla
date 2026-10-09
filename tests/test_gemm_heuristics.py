@@ -4,6 +4,8 @@ import pytest
 
 from ayla.gemm_heuristics import (
     apply_gemm_schedule_seed_post_build,
+    collapse_gemm_heuristic,
+    expand_gemm_heuristic,
     select_gemm_schedules,
 )
 from ayla.gpu_dialect import CollectiveAxis
@@ -22,6 +24,50 @@ def test_fixed_grid_seed_exposes_required_unroll():
     assert seed.builder_config["output_grid_size"] > 0
     assert seed.fixed_output_unroll_factor == 2
     assert "fixed output grid" in seed.adaptations[0]
+
+
+def test_single_iteration_fixed_grid_requires_no_unroll_passes():
+    module = object()
+    seed = dataclasses.replace(
+        select_gemm_schedules(8192, 768, 768, operation="addmm").seeds[0],
+        fixed_output_unroll_factor=1,
+        post_builder_passes=(),
+    )
+
+    assert apply_gemm_schedule_seed_post_build(module, seed) is module
+
+
+def test_compact_round_trip_preserves_exact_dispatch():
+    expanded = {
+        "version": 2,
+        "workload": "gemm",
+        "source_shape_count": 1,
+        "layout": "canonical_nt",
+        "features": ["m"],
+        "source_fields": ["m", "n", "k"],
+        "fallback": {"name": "fallback"},
+        "exact": [{
+            "operation": "mm", "dtype": "float16", "batch": 1,
+            "m": 128, "n": 256, "k": 512,
+            "seed": {
+                "configuration": {"name": "winner", "operand_stages": 4},
+                "source": {"m": 128, "n": 256, "k": 512},
+                "source_percentage_of_torch": 110.0,
+            },
+        }],
+        "groups": {"mm/float16/k128": {
+            "leaf": "fallback-leaf",
+            "seeds": [{
+                "configuration": {"name": "fallback"},
+                "source": {"m": 64, "n": 64, "k": 128},
+                "source_percentage_of_torch": 100.0,
+            }],
+        }},
+    }
+
+    assert expand_gemm_heuristic(
+        collapse_gemm_heuristic(expanded),
+    ) == expanded
 
 
 def test_compact_seeds_omit_dropped_experimental_controls():
@@ -75,7 +121,7 @@ def test_addmm_uses_an_independent_operation_group():
         128, 4096, 4096, operation="addmm",
     )
 
-    assert addmm.leaf.startswith("addmm_")
+    assert addmm.leaf.startswith("exact:addmm:")
     assert mm.leaf != addmm.leaf
 
 
@@ -120,7 +166,9 @@ def test_bmm_filters_illegal_blocked_output_tma_transfers():
 
 
 def test_rhs_promotion_is_forwarded_to_the_builder():
-    selection = select_gemm_schedules(2048, 768, 768)
+    selection = select_gemm_schedules(
+        512, 512, 64, operation="bmm", batch=72,
+    )
     seed = next(
         seed for seed in selection.seeds
         if seed.captured_config.get("rhs_l2_promotion") is not None
@@ -132,7 +180,7 @@ def test_rhs_promotion_is_forwarded_to_the_builder():
 
 
 def test_n_grouped_winner_routes_existing_builder_controls():
-    selection = select_gemm_schedules(2048, 2048, 128)
+    selection = select_gemm_schedules(4096, 4096, 64)
     seed = next(
         seed for seed in selection.seeds
         if seed.captured_config["output_n_tiles_per_cta"] > 1
@@ -144,7 +192,9 @@ def test_n_grouped_winner_routes_existing_builder_controls():
 
 
 def test_swapped_grid_winner_routes_existing_builder_controls():
-    selection = select_gemm_schedules(2048, 768, 768)
+    selection = select_gemm_schedules(
+        100480, 128, 128, operation="addmm",
+    )
     seed = next(
         seed for seed in selection.seeds
         if seed.captured_config["swap_output_grid_axes"] is True
@@ -158,7 +208,7 @@ def test_swapped_grid_winner_routes_existing_builder_controls():
 
 def test_two_dimensional_warpgroup_winner_is_preserved():
     selection = select_gemm_schedules(
-        2048, 768, 768, operation="addmm",
+        4096, 2304, 768, operation="addmm",
     )
     seed = next(
         seed for seed in selection.seeds
@@ -170,7 +220,7 @@ def test_two_dimensional_warpgroup_winner_is_preserved():
 
 
 def test_group_five_family_routes_existing_builder_controls():
-    selection = select_gemm_schedules(4096, 1024, 256)
+    selection = select_gemm_schedules(30522, 768, 2048)
     seed = next(
         seed for seed in selection.seeds
         if seed.captured_config["output_tiles_per_cta"] == 5
@@ -182,10 +232,12 @@ def test_group_five_family_routes_existing_builder_controls():
 
 
 def test_transpose_winner_is_selected_for_the_original_problem():
-    selection = select_gemm_schedules(8192, 768, 768)
+    selection = select_gemm_schedules(
+        196, 384, 768, operation="bmm", batch=64,
+    )
     seed = next(seed for seed in selection.seeds if seed.transpose_output)
 
     assert seed.captured_config["transpose_output"] is True
     assert seed.builder_config is not None
-    assert seed.builder_config["output_m_tile"] == 64
-    assert seed.builder_config["output_n_tile"] == 128
+    assert seed.builder_config["output_m_tile"] == 192
+    assert seed.builder_config["output_n_tile"] == 200

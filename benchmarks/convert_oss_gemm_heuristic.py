@@ -126,6 +126,19 @@ def _from_mapper(mapper: dict) -> dict:
         "features": mapper["features"],
         "source_fields": ["m", "n", "k"],
         "fallback": mapper["fallback_seeds"][0]["configuration"],
+        "exact": [
+            {
+                **entry["shape"],
+                "seed": {
+                    "configuration": entry["seed"]["configuration"],
+                    "source": entry["seed"]["source_shape"],
+                    "source_percentage_of_torch": (
+                        entry["seed"]["source_percentage_of_torch"]
+                    ),
+                },
+            }
+            for entry in mapper.get("exact", [])
+        ],
         "groups": {
             name: node(tree) for name, tree in mapper["groups"].items()
         },
