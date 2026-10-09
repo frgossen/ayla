@@ -2032,6 +2032,7 @@ class LowerToPtxTemplate(LoweringPass):
         operands: list[Value] = [lock_value]
         operand_names: list[str] = ["lock"]
         multicast_mask: int | None = None
+        cluster_size = 1
         if op.is_tma_multicast:
             kernel = find_ancestor_of_type(op, KernelOp)
             assert kernel is not None
@@ -2040,6 +2041,8 @@ class LowerToPtxTemplate(LoweringPass):
             multicast_mask = (1 << cluster_size) - 1
         total_bytes = 0
         load_lines: list[str] = []
+        multicast_count = sum(tma.multicast is True for tma in tmas)
+        multicasts = 0
         for i, tma in enumerate(tmas):
             dst_value = cast(Value, self.value_map[tma.dst])
             desc_value = cast(Value, self.value_map[tma.src])
@@ -2083,6 +2086,17 @@ class LowerToPtxTemplate(LoweringPass):
                 opcode = f"{opcode}.multicast::cluster"
                 arguments = f"{arguments}, {multicast_mask}"
                 issue = "multicast_issue"
+                if multicast_count > 1:
+                    # Cluster CTAs share a group's multicast slices: rank r
+                    # issues every slice j with j % cluster_size == r.
+                    issue = f"multicast_issue{i}"
+                    load_lines += [
+                        f"setp.eq.u32 ${{pred:issuer{i}}}, "
+                        f"${{b32:cluster_rank}}, {multicasts % cluster_size};",
+                        f"and.pred ${{pred:{issue}}}, ${{pred:ld_leader}}, "
+                        f"${{pred:issuer{i}}};",
+                    ]
+                multicasts += 1
             load_lines.append(f"@${{pred:{issue}}} " + self._tma_instruction(
                 tma,
                 opcode,
