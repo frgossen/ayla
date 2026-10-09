@@ -41,7 +41,6 @@ from ..gpu_dialect import (
     IndexModOp,
     IndexMulOp,
     KernelOp,
-    LaneIdOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
@@ -93,7 +92,7 @@ def _collective_level(value: Value) -> str:
         return "block"
     if isinstance(defn, WarpGroupIdOp):
         return "wg"
-    if isinstance(defn, (ThreadIdsOp, LaneIdOp)):
+    if isinstance(defn, ThreadIdsOp):
         return "thread"
     if isinstance(defn, IndexConstantOp):
         return "block"

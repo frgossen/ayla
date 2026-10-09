@@ -2466,15 +2466,6 @@ class SelectOp(GpuOp):
         return self.operands[1:]
 
 
-@gpu_dialect.register_op("lane_id")
-class LaneIdOp(GpuOp):
-    """Produce the lane index within the warp (0..31)."""
-
-    @classmethod
-    def build(cls) -> "LaneIdOp":
-        return cls(operands=[], results=[Value(name=None, type=IndexType())])
-
-
 def root_buffers(value: Value) -> set[Value]:
     """Return every physical buffer that may underlie ``value``."""
     definition = value.definition
@@ -2811,7 +2802,6 @@ def is_side_effect_free(op: Op) -> bool:
         IndexLtOp,
         IndexModOp,
         IndexMulOp,
-        LaneIdOp,
         PtrAddOp,
         ConstantOp,
         SelectOp,

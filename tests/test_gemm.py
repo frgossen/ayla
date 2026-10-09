@@ -4,7 +4,7 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import schedule_register_matmul
-from ayla.gpu_dialect import AsyncOp, ModuleOp, MoveOp, gpu_dialect
+from ayla.gpu_dialect import AsyncOp, MoveOp, gpu_dialect
 
 
 def test_register_matmul_schedules_side_by_side_gemms():
@@ -18,8 +18,6 @@ def test_register_matmul_schedules_side_by_side_gemms():
             elementwise mul(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "product"}
           }
         }"""))  # noqa: E501
-    assert isinstance(module, ModuleOp)
-
     for label in ("gate", "up"):
         schedule_register_matmul(
             label=label,
