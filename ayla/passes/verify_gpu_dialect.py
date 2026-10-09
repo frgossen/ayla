@@ -28,7 +28,6 @@ from ..gpu_dialect import (
     MoveOp,
     ReduceOp,
     ReshapeOp,
-    RmemTensorType,
     ConstantOp,
     SmemTensorType,
     TileOp,
@@ -168,20 +167,6 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 f"constant has {len(value)} values for tensor shape "
                 f"{result_type.sizes}"
-            )
-
-    @verifies(ConstantOp, stage=VerificationStage.PTX_LOWERING)
-    def _verify_lowerable_constant(self, op: ConstantOp) -> None:
-        result_type = op.result().type
-        if not isinstance(result_type, RmemTensorType):
-            raise ValueError(
-                "PTX lowering supports constant materialization only in rmem; "
-                f"got {result_type}"
-            )
-        if result_type.num_elements is None:
-            raise ValueError(
-                f"PTX lowering requires a statically shaped constant; "
-                f"got {result_type}"
             )
 
     @verifies(TileOp)

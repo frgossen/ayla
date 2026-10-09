@@ -310,7 +310,11 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_constant(
         self, op: ConstantOp,
     ) -> tuple[list[Op], list[object]]:
-        result_type = cast(RmemTensorType, op.result().type)
+        result_type = op.result().type
+        if not isinstance(result_type, RmemTensorType):
+            raise NotImplementedError(
+                f"lower_constant: unsupported result type {result_type}"
+            )
         value = op.value
         values = (
             value

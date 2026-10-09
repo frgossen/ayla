@@ -2140,8 +2140,8 @@ class ConstantOp(Op):
         )
 
     @property
-    def value(self) -> object:
-        return self.attrs["value"]
+    def value(self) -> int | float | list[int | float]:
+        return cast(int | float | list[int | float], self.attrs["value"])
 
 
 @gpu_dialect.register_op("thread_ids")

@@ -11,6 +11,7 @@ from ayla.gpu_dialect import (
     F16Type,
     F32Type,
     F64Type,
+    GmemTensorType,
     IndexConstantOp,
     ModuleOp,
     PtrAddOp,
@@ -62,6 +63,14 @@ def test_lower_dense_constant():
         "mov.f32 ${f32:result.value.r0}, 0f3F800000;\n"
         "mov.f32 ${f32:result.value.r1}, 0f40000000;\n"
     )
+
+
+def test_lower_constant_rejects_non_rmem():
+    constant = ConstantOp.build(1.0, GmemTensorType.build([], F32Type()))
+    module = ModuleOp.build(Block(ops=[constant]))
+
+    with pytest.raises(NotImplementedError, match="lower_constant"):
+        lower_to_ptx_template(module)
 
 
 def _lower_barrier(scope: str) -> str:
