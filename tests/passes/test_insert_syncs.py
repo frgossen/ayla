@@ -182,15 +182,21 @@ def test_cluster_leader_barrier_coverage_is_directional():
     assert not _barrier_covers(
         BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
     )
-    assert _barrier_covers(
+    assert not _barrier_covers(
         BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.BLOCK,
     )
 
 
 def test_cluster_to_leader_join_retains_its_local_gather():
     assert (
-        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK)
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK_TO_LEADER)
         == BarrierScope.CLUSTER_TO_LEADER
+    )
+    # The release gathers at the leaders only, so a block hazard at the same
+    # op needs a full cluster barrier.
+    assert (
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK)
+        == BarrierScope.CLUSTER
     )
 
 
@@ -310,11 +316,16 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
         op for op in find_ops_of_type(module, BarrierOp)
         if op.scope == "cluster_to_leader"
     ]
-    assert len(barriers) == 1
+    # The release is split: every warp arrives after its read, and the
+    # leader waits before the next multicast write.
+    assert [op.attrs["phase"] for op in barriers] == ["arrive", "wait"]
     sync = barriers[0].sync
-    assert sync is not None
+    assert sync is not None and barriers[1].sync is sync
     assert isinstance(sync.type, LockType)
     assert sync.type.kind == "cluster_mbar"
+    ops = module.body.ops[0].body.ops
+    read = next(op for op in ops if type(op).__name__ == "MoveOp")
+    assert ops.index(barriers[0]) == ops.index(read) + 1
 
 
 def test_preexisting_barrier_updates_dataflow_state():

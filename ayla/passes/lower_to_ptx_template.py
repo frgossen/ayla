@@ -285,6 +285,36 @@ _ELEMENTWISE_LOWERERS = {
 }
 
 
+def _leader_warp(prefix: str) -> str:
+    """PTX setting ``${pred:<prefix>_other_warp}`` outside warp 0.
+
+    Warp 0 holds the leader, thread 0. Each warp index is broadcast from the
+    warp's first thread (CUTLASS's canonical_warp_idx_sync), so ptxas proves
+    this predicate warp-uniform. It folds each broadcast of a special register
+    away and merges the repeated reads, but keeps one of a combined value.
+    """
+    return textwrap.dedent(f"""\
+        mov.u32 ${{b32:{prefix}_warp}}, %tid.x;
+        shr.u32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, 5;
+        shfl.sync.idx.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, 0, 31, 0xffffffff;
+        mov.u32 ${{b32:{prefix}_warp_yz}}, %tid.y;
+        shfl.sync.idx.b32 ${{b32:{prefix}_warp_yz}}, ${{b32:{prefix}_warp_yz}}, 0, 31, 0xffffffff;
+        or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp_yz}};
+        mov.u32 ${{b32:{prefix}_warp_yz}}, %tid.z;
+        shfl.sync.idx.b32 ${{b32:{prefix}_warp_yz}}, ${{b32:{prefix}_warp_yz}}, 0, 31, 0xffffffff;
+        or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp_yz}};
+        setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, 0;
+    """)
+
+
+def _split_release(lock: Value) -> bool:
+    """Whether a cluster mbarrier releases stages with split arrive/wait."""
+    return any(
+        isinstance(user, BarrierOp) and "phase" in user.attrs
+        for user in lock.users()
+    )
+
+
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -600,6 +630,32 @@ class LowerToPtxTemplate(LoweringPass):
         kernel = find_ancestor_of_type(op, KernelOp)
         assert kernel is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+        if _split_release(op.result()):
+            # Every CTA's leader waits for one arrival per warp of the
+            # cluster: any CTA may write the released stage.
+            assert kernel.num_threads is not None
+            arrivals = kernel.num_threads // 32 * cluster_size
+            template = textwrap.dedent(f"""\
+                .shared .align 8 .b64 ${{smem:bar}}[1];
+                mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+                mov.u32 ${{b32:result.dst.parity}}, 0;
+                mov.u32 ${{b32:tid_x}}, %tid.x;
+                mov.u32 ${{b32:tid_y}}, %tid.y;
+                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+                mov.u32 ${{b32:tid_z}}, %tid.z;
+                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+                setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+                @${{pred:not_t0}} bra ${{label:after_init}};
+                mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrivals};
+                fence.mbarrier_init.release.cluster;
+                ${{label:after_init}}:
+            """)
+            new_op = PTXTemplateOp.build(
+                operands=[], result_types=[lock_type], template=template,
+                operand_names=[], result_names=["dst"],
+                description=str(op),
+            )
+            return [new_op], [new_op.result()]
         # InsertSyncs represents publication explicitly with BarrierOps.
         template = textwrap.dedent(f"""\
             .shared .align 8 .b64 ${{smem:bar}}[1];
@@ -1237,6 +1293,42 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
+        elif scope == "cluster_to_leader" and op.attrs.get("phase") == "arrive":
+            # Each warp arrives once at every cluster CTA's mbarrier and
+            # continues.
+            assert op.sync is not None
+            kernel = find_ancestor_of_type(op, KernelOp)
+            assert kernel is not None
+            cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+            template = (
+                "bar.warp.sync 0xffffffff;\n"
+                "elect.sync _|${pred:release}, 0xffffffff;\n"
+                + "".join(
+                    textwrap.dedent(f"""\
+                        mov.u32 ${{b32:rank}}, {rank};
+                        mapa.shared::cluster.u32 ${{b32:remote}}, ${{b32:operand.sync.val}}, ${{b32:rank}};
+                        @${{pred:release}} mbarrier.arrive.shared::cluster.b64 _, [${{b32:remote}}];
+                        """)
+                    for rank in range(cluster_size)
+                )
+            )
+            operands = [cast(Value, self.value_map[op.sync])]
+            operand_names = ["sync"]
+        elif scope == "cluster_to_leader" and op.attrs.get("phase") == "wait":
+            # Only the leader's warp, which issues the next write, waits for
+            # every warp of the cluster.
+            assert op.sync is not None
+            template = _leader_warp("cl") + textwrap.dedent("""\
+                @${pred:cl_other_warp} bra ${label:cl_done};
+                mov.u32 ${b32:ticks}, 0x989680;
+                ${label:cl_wait}:
+                mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
+                @!${pred:ready} bra ${label:cl_wait};
+                xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
+                ${label:cl_done}:
+                """)
+            operands = [cast(Value, self.value_map[op.sync])]
+            operand_names = ["sync"]
         elif scope == "cluster_to_leader":
             assert op.sync is not None
             sync = self.value_map[op.sync]

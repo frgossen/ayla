@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from ..analysis.sync import (
     BarrierScope,
     BarrierTargetsType,
@@ -43,6 +45,8 @@ def _insert_barriers(
     # Publish once something uses one of them, or a barrier is due anyway.
     pending_locks: set[Value] = set()
     pending_init = BarrierScope.THREAD
+    # Arrivals may move up, but never above a publication of their lock.
+    published = 0
     for op in block.ops:
         target = targets.get(op)
         if pending_locks and (
@@ -50,6 +54,7 @@ def _insert_barriers(
             or not pending_locks.isdisjoint(effective_operands(op))
         ):
             new_ops.extend(_publication_barriers(pending_init))
+            published = len(new_ops)
             if (
                 target is not None
                 and target.scope.leq(pending_init)
@@ -79,6 +84,20 @@ def _insert_barriers(
             sync = (
                 barrier_syncs.get(op) if barrier_syncs is not None else None
             )
+            if target.scope == BarrierScope.CLUSTER_TO_LEADER:
+                assert sync is not None
+                # Split the release: every warp arrives as soon as the
+                # accesses it orders are complete, and only the leader waits,
+                # just before the op.
+                arrival = BarrierOp.build(
+                    scope="cluster_to_leader", sync=sync,
+                    attrs={**attrs, "phase": "arrive"},
+                )
+                new_ops.insert(
+                    _arrival_index(new_ops, target.release_after, published),
+                    arrival,
+                )
+                attrs = {**attrs, "phase": "wait"}
             new_ops.append(BarrierOp.build(
                 scope=_BARRIER_OP_SCOPE[target.scope],
                 sync=sync,
@@ -92,6 +111,24 @@ def _insert_barriers(
             _insert_barriers(inner, targets, num_threads, barrier_syncs)
     new_ops.extend(_publication_barriers(pending_init))
     block.ops = new_ops
+
+
+def _arrival_index(
+    new_ops: list[Op], release_after: frozenset[Op | None], published: int,
+) -> int:
+    """Where a release may arrive: after the last access it orders completes.
+
+    That access must be earlier in this block, so the arrival and its wait
+    run once each per execution of the block; otherwise the arrival stays
+    beside its wait.
+    """
+    positions = [
+        next((i for i, op in enumerate(new_ops) if op is after), None)
+        for after in release_after
+    ]
+    if not positions or None in positions:
+        return len(new_ops)
+    return max(published, max(cast(list[int], positions)) + 1)
 
 
 def _materialize_cluster_mbars(
