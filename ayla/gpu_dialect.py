@@ -2118,7 +2118,7 @@ class F64Type(Type):
 
 
 @gpu_dialect.register_op("constant")
-class ConstantOp(Op):
+class ConstantOp(GpuOp):
     """Produce an immutable floating-point tensor constant.
 
     A scalar payload is a splat; a list payload is flat row-major data. A
@@ -2142,6 +2142,13 @@ class ConstantOp(Op):
     @property
     def value(self) -> int | float | list[int | float]:
         return cast(int | float | list[int | float], self.attrs["value"])
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "value"
+        }
 
 
 @gpu_dialect.register_op("thread_ids")

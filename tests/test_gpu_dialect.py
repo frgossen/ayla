@@ -121,6 +121,7 @@ def test_constant_represents_address_backed_memory_spaces(
         (PTXTemplateOp, {"template": "ret;", "description": "test"}),
         (ForOp, {"lb": 0, "ub": 1, "step": 1}),
         (IndexConstantOp, {"value": 0}),
+        (ConstantOp, {"value": 1.0}),
     ],
 )
 def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
