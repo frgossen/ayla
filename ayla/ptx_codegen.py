@@ -23,7 +23,6 @@ from .gpu_dialect import (
     IndexMulOp,
     IndexType,
     KernelOp,
-    LaneIdOp,
     LockType,
     ModuleOp,
     PredicateType,
@@ -352,8 +351,6 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_index_mod(p, op)
     elif isinstance(op, WarpGroupIdOp):
         _emit_warp_group_id(p, op)
-    elif isinstance(op, LaneIdOp):
-        _emit_lane_id(p, op)
     elif isinstance(op, ToPtrOp):
         _emit_to_ptr(p, op)
     elif isinstance(op, PtrAddOp):
@@ -644,11 +641,6 @@ def _emit_index_mod(p: PtxPrinter, op: IndexModOp) -> None:
     else:
         rhs = p.unique_ptx_names_for_value(op.rhs)
         _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs};", op)
-
-
-def _emit_lane_id(p: PtxPrinter, op: LaneIdOp) -> None:
-    dst = p.unique_ptx_names_for_value(op.result())
-    _write_with_comment(p, f"mov.u32 {dst}, %laneid;", op)
 
 
 def _emit_to_ptr(p: PtxPrinter, op: ToPtrOp) -> None:
