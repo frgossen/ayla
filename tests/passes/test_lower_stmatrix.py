@@ -105,7 +105,7 @@ def test_n8_fragment_uses_scalar_store_fallback():
     template = "".join(op.template for op in templates)
     assert "stmatrix.sync" not in template
     assert template.count("st.shared.b32") == 10
-    assert "${b32:operand.src.r9}" in template
+    assert "${b32:operand.fragment.r9}" in template
 
 
 def test_n8_fragment_scalar_store_supports_global_memory():
@@ -122,7 +122,7 @@ def test_n8_fragment_scalar_store_supports_global_memory():
     )
     template = "".join(op.template for op in templates)
     assert template.count("st.global.b32") == 10
-    assert "${b32:operand.src.r9}" in template
+    assert "${b32:operand.fragment.r9}" in template
 
 
 def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():

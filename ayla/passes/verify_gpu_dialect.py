@@ -317,22 +317,6 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
-        dst_type, src_type = op.dst.type, op.src.type
-        if (
-            isinstance(dst_type, WgrmemTensorType)
-            and isinstance(src_type, AddrMemTensorType)
-            and (
-                dst_type.rank != 2
-                or dst_type.sizes != src_type.sizes
-                or dst_type.dtype != src_type.dtype
-                or src_type.strides[0] % 2 != 0
-                or src_type.strides[1] != 1
-            )
-        ):
-            raise ValueError(
-                "address-to-WGRMEM move requires equal rank-2 shapes and dtypes "
-                "with element pairs contiguous and aligned in memory"
-            )
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:

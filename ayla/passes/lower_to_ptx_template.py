@@ -1744,7 +1744,12 @@ class LowerToPtxTemplate(LoweringPass):
         dtype_bytes = cast(
             BF16Type | F16Type | F32Type | F64Type, memory_type.dtype,
         ).byte_size
-        row_stride_bytes = cast(int, memory_type.strides[0]) * dtype_bytes
+        row_stride = cast(int, memory_type.strides[0])
+        assert row_stride % 2 == 0 and memory_type.strides[1] == 1, (
+            f"wgmma move: element pairs must be contiguous and aligned in "
+            f"memory; got strides {list(memory_type.strides)}"
+        )
+        row_stride_bytes = row_stride * dtype_bytes
 
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes, dtype_bytes,
@@ -1782,7 +1787,9 @@ class LowerToPtxTemplate(LoweringPass):
 
         new_op = PTXTemplateOp.build(
             operands=[
-                self.value_map[memory], self.value_map[fragment], byte_offset,
+                cast(Value, self.value_map[memory]),
+                cast(Value, self.value_map[fragment]),
+                byte_offset,
             ],
             result_types=[], template=template,
             operand_names=["memory", "fragment", "offset"], result_names=[],
