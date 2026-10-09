@@ -14,8 +14,8 @@ def test_dce_removes_unused_index_ops():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4096x4096xf32>) {
-            %cx: index = block_id() attrs={axis: "x"}
-            %cy: index = block_id() attrs={axis: "y"}
+            %cx: index = block_id.x
+            %cy: index = block_id.y
             %c64: index = index_constant() attrs={value: 64}
             %cx_offset: index = index_mul(%cx: index, %c64: index)
             %dead: index = index_constant() attrs={value: 999}
@@ -32,7 +32,7 @@ def test_dce_removes_unused_index_ops():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4096x4096xf32>) {
-            %cx: index = block_id() attrs={axis: "x"}
+            %cx: index = block_id.x
             %c64: index = index_constant() attrs={value: 64}
             %cx_offset: index = index_mul(%cx: index, %c64: index)
             %val: rmem<1xf32> = alloc() attrs={id: 0}

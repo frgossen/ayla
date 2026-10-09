@@ -298,8 +298,8 @@ def test_promote_smem_with_warp_group_dependent_lhs():
     module_str = textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096_wgmma256_wg(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
-            %bx: index = block_id() attrs={axis: "x"}
-            %by: index = block_id() attrs={axis: "y"}
+            %bx: index = block_id.x
+            %by: index = block_id.y
             %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)
             %1: gmem<256x4096xbf16> = tile(%b: gmem<4096x4096xbf16>, %by: index, 0)
             %2: gmem<128x256xbf16 strides=[4096, 1]> = tile(%c: gmem<4096x4096xbf16>, %bx: index, %by: index)
@@ -338,8 +338,8 @@ def test_promote_smem_with_warp_group_dependent_lhs():
     expected = textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096_wgmma256_wg(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
-            %bx: index = block_id() attrs={axis: "x"}
-            %by: index = block_id() attrs={axis: "y"}
+            %bx: index = block_id.x
+            %by: index = block_id.y
             %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)
             %1: gmem<256x4096xbf16> = tile(%b: gmem<4096x4096xbf16>, %by: index, 0)
             %2: gmem<128x256xbf16 strides=[4096, 1]> = tile(%c: gmem<4096x4096xbf16>, %bx: index, %by: index)
