@@ -288,6 +288,19 @@ def _leader_thread(prefix: str, before_branch: str = "") -> str:
     )
 
 
+# The leader's warp, which issues the next write, waits for every warp of
+# the cluster to release the stage; the other warps go on.
+_RELEASE_WAIT = _leader_warp("cl") + textwrap.dedent("""\
+    @${pred:cl_other_warp} bra ${label:cl_done};
+    mov.u32 ${b32:ticks}, 0x989680;
+    ${label:cl_wait}:
+    mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
+    @!${pred:ready} bra ${label:cl_wait};
+    xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
+    ${label:cl_done}:
+    """)
+
+
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -541,10 +554,15 @@ class LowerToPtxTemplate(LoweringPass):
         kernel = find_ancestor_of_type(op, KernelOp)
         assert kernel is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
-        # InsertSyncs represents publication explicitly with BarrierOps.
+        # Every CTA's leader waits for one arrival per warp of the
+        # cluster: any CTA may write the released stage. InsertSyncs
+        # represents publication explicitly with BarrierOps.
+        assert kernel.num_threads is not None
+        arrivals = kernel.num_threads // 32 * cluster_size
         template = textwrap.dedent(f"""\
             .shared .align 8 .b64 ${{smem:bar}}[1];
             mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+            mov.u32 ${{b32:result.dst.parity}}, 0;
             mov.u32 ${{b32:tid_x}}, %tid.x;
             mov.u32 ${{b32:tid_y}}, %tid.y;
             or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
@@ -552,10 +570,7 @@ class LowerToPtxTemplate(LoweringPass):
             or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
             setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
             @${{pred:not_t0}} bra ${{label:after_init}};
-            mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
-            setp.ne.u32 ${{pred:not_rank0}}, ${{b32:cluster_rank}}, 0;
-            @${{pred:not_rank0}} bra ${{label:after_init}};
-            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {cluster_size};
+            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrivals};
             fence.mbarrier_init.release.cluster;
             ${{label:after_init}}:
         """)
@@ -1167,6 +1182,28 @@ class LowerToPtxTemplate(LoweringPass):
             f"lower_await: unsupported lock kind {kind!r}"
         )
 
+    def _release_arrival(self, op: BarrierOp) -> str:
+        """PTX in which each warp arrives once at every cluster CTA's mbarrier.
+
+        Any CTA may write the released stage, so every CTA's leader waits
+        for every warp of the cluster.
+        """
+        kernel = find_ancestor_of_type(op, KernelOp)
+        assert kernel is not None
+        cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+        return (
+            "bar.warp.sync 0xffffffff;\n"
+            "elect.sync _|${pred:release}, 0xffffffff;\n"
+            + "".join(
+                textwrap.dedent(f"""\
+                    mov.u32 ${{b32:rank}}, {rank};
+                    mapa.shared::cluster.u32 ${{b32:remote}}, ${{b32:operand.sync.val}}, ${{b32:rank}};
+                    @${{pred:release}} mbarrier.arrive.shared::cluster.b64 _, [${{b32:remote}}];
+                    """)
+                for rank in range(cluster_size)
+            )
+        )
+
     @lowers(BarrierOp)
     def lower_barrier(
         self, op: BarrierOp,
@@ -1180,33 +1217,15 @@ class LowerToPtxTemplate(LoweringPass):
         if scope == "block":
             template = "bar.sync 0;\n"
         elif scope == "cluster_to_leader":
+            # A release split by InsertSyncs lowers its halves separately;
+            # one without a phase arrives and then waits.
             assert op.sync is not None
-            sync = self.value_map[op.sync]
-            assert isinstance(sync, Value)
-            template = textwrap.dedent("""\
-                bar.sync 0;
-                mov.u32 ${b32:cl_tid}, %tid.x;
-                mov.u32 ${b32:cl_tidy}, %tid.y;
-                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidy};
-                mov.u32 ${b32:cl_tidz}, %tid.z;
-                or.b32 ${b32:cl_tid}, ${b32:cl_tid}, ${b32:cl_tidz};
-                setp.ne.u32 ${pred:cl_not_t0}, ${b32:cl_tid}, 0;
-                @${pred:cl_not_t0} bra ${label:cl_done};
-                mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
-                setp.eq.u32 ${pred:rank0}, ${b32:cluster_rank}, 0;
-                @${pred:rank0} bra ${label:cl_rank0};
-                mov.u32 ${b32:cluster_rank}, 0;
-                mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};
-                mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];
-                bra ${label:cl_done};
-                ${label:cl_rank0}:
-                mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];
-                ${label:cl_wait}:
-                mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};
-                @!${pred:ready} bra ${label:cl_wait};
-                ${label:cl_done}:
-                """)
-            operands = [sync]
+            phase = op.attrs.get("phase")
+            template = (
+                (self._release_arrival(op) if phase != "wait" else "")
+                + (_RELEASE_WAIT if phase != "arrive" else "")
+            )
+            operands = [cast(Value, self.value_map[op.sync])]
             operand_names = ["sync"]
         elif scope == "cluster" and op.attrs.get("publication"):
             # Every initializing thread released its initialization with

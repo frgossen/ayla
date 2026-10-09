@@ -87,21 +87,26 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
     )
     assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
+    # One arrival per warp of each of the two CTAs.
     assert (
-        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 2;"
+        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 8;"
         in ptx
     )
+    # Without a phase, the release arrives at both CTAs and then waits.
     assert_contains_in_order(
         ptx,
         "fence.mbarrier_init.release.cluster;",
         "bar.sync 0;",
         "barrier.cluster.arrive.relaxed.aligned;",
         "barrier.cluster.wait.aligned;",
-        "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
-        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+        "elect.sync _|${pred:release}, 0xffffffff;",
+        "mapa.shared::cluster.u32 ${b32:remote}, ${b32:operand.sync.val}, ${b32:rank};",
+        "@${pred:release} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote}];",
+        "@${pred:release} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote}];",
+        "@${pred:cl_other_warp} bra ${label:cl_done};",
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
+    assert "bar.sync 0;" not in ptx.split("barrier.cluster.wait.aligned;")[1]
 
 
 def test_batches_consecutive_lock_initialization_rendezvous():

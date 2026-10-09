@@ -201,6 +201,11 @@ class ConcurrentMemoryEffect:
     scope: CollectiveScope
     tiling_scheme: int | None
     pending_await: Value | None
+    # The async lock whose await completes the access (``None`` for a
+    # synchronous access), and the op after which the access is complete,
+    # once known.
+    lock: Value | None = None
+    completed_after: "Op | None" = None
 
 
 @dataclasses.dataclass
@@ -264,6 +269,10 @@ class BarrierTarget:
     the named-barrier ``named_id`` to lower to (``None`` otherwise)."""
     scope: BarrierScope
     named_id: int | None = None
+    # For a cluster-to-leader barrier: where each access it orders is
+    # complete (``None`` where that is unknown). Its arrival may move up to
+    # the last of them; only its wait must stay before the op.
+    release_after: frozenset["Op | None"] = frozenset()
 
 
 # The analysis result: each effect-bearing op mapped to the barrier before it.
@@ -315,6 +324,7 @@ def _transfer_memory_effects(
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
+    release_after: set[Op | None] = set()
     for current in effects:
         for root in current.roots:
             for prior in live.concurrent_memory_effects.get(root, ()):
@@ -326,9 +336,10 @@ def _transfer_memory_effects(
                     continue
                 # A hazard needs a write (RAR is safe).
                 if prior.kind == "W" or current.kind == "W":
-                    barrier_scope = barrier_scope.join(
-                        _barrier_scope(prior.scope, current.scope)
-                    )
+                    scope = _barrier_scope(prior.scope, current.scope)
+                    barrier_scope = barrier_scope.join(scope)
+                    if scope == BarrierScope.CLUSTER_TO_LEADER:
+                        release_after.add(prior.completed_after)
     # A block-leader barrier is named. Its id remains in use until either a
     # full-block sync, or (for an mbar async) the await where everyone waits for
     # t0. Reuse any id whose prior lifetime has ended.
@@ -385,7 +396,15 @@ def _transfer_memory_effects(
             ).add(named_id)
         else:
             live.named_barrier_ids.add(named_id)
-    targets[op] = BarrierTarget(barrier_scope, named_id)
+    if barrier_scope == BarrierScope.CLUSTER_TO_LEADER:
+        recorded = targets.get(op)
+        if recorded is not None:
+            release_after |= recorded.release_after
+    else:
+        release_after = set()
+    targets[op] = BarrierTarget(
+        barrier_scope, named_id, frozenset(release_after),
+    )
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
     live = _after_barrier(live, barrier_scope)
@@ -408,6 +427,8 @@ def _transfer_memory_effects(
         effect = ConcurrentMemoryEffect(
             memory_effect.kind, memory_effect.scope,
             memory_effect.tiling_scheme, pending,
+            lock=async_lock,
+            completed_after=None if async_lock is not None else op,
         )
         for root in memory_effect.roots:
             live.concurrent_memory_effects.setdefault(root, set()).add(effect)
@@ -472,9 +493,14 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         # Clear every effect pending on this lock -- only the ones this await
         # fully orders were made pending on it. Effects it only partially orders
         # were never pending and stay live for a barrier.
+        # An access this await only partially orders stays live, but is now
+        # complete: a release may follow this await.
         for buffer, effects in state.concurrent_memory_effects.items():
             state.concurrent_memory_effects[buffer] = {
-                effect for effect in effects
+                dataclasses.replace(effect, completed_after=op)
+                if effect.lock == op.lock and effect.completed_after is None
+                else effect
+                for effect in effects
                 if effect.pending_await != op.lock
             }
         # An mbar await also completes a block-leader handoff: all threads wait

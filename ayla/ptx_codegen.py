@@ -200,8 +200,8 @@ def map_type_to_registers(type):
             )
         if type.kind == "cluster_mbar":
             return TypeRegisterMapping(
-                member_register_types=PtxType.B32,
-                member_names="val",
+                member_register_types=(PtxType.B32, PtxType.B32),
+                member_names=("val", "parity"),
             )
         return TypeRegisterMapping(
             member_register_types=(),
