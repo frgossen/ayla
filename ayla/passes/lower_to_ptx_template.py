@@ -23,6 +23,7 @@ from ..gpu_dialect import (
     AwaitOp,
     BarrierOp,
     BF16Type,
+    CollectiveAxis,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -47,7 +48,7 @@ from ..gpu_dialect import (
     RmemTensorType,
     ConstantOp,
     SmemTensorType,
-    ThreadIdsOp,
+    ThreadIdOp,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -2172,9 +2173,9 @@ def _build_wgmma_layout_0_dynamic_offset(
     """
     ops: list[Op] = []
 
-    tid_op = ThreadIdsOp.build()
+    tid_op = ThreadIdOp.build(CollectiveAxis.X)
     ops.append(tid_op)
-    tid_x = tid_op.x
+    tid_x = tid_op.value
 
     c128 = IndexConstantOp.build(128)
     ops.append(c128)

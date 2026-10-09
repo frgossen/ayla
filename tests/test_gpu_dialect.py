@@ -42,6 +42,7 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    ThreadIdOp,
     TileOp,
     gpu_dialect,
     has_ordering_effect,
@@ -436,6 +437,17 @@ def test_block_id_round_trip():
     )
 
 
+def test_thread_id_round_trip():
+    thread_id = ThreadIdOp.build(CollectiveAxis.Z)
+
+    assert thread_id.axis == CollectiveAxis.Z
+    assert thread_id.results == [thread_id.value]
+    assert_print_and_roundtrip(
+        thread_id,
+        '%tz: index = thread_id() attrs={axis: "z"}',
+    )
+
+
 def test_cluster_collective_scope_is_between_block_and_grid():
     assert (
         CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER)
@@ -770,7 +782,8 @@ def test_naive_matmul_4096_module():
           kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
             %cx: index = block_id() attrs={axis: "x"}
             %cy: index = block_id() attrs={axis: "y"}
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %tx: index = thread_id() attrs={axis: "x"}
+            %ty: index = thread_id() attrs={axis: "y"}
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<4096x64xf32 strides=[4096, 1]> = tile(%b: gmem<4096x4096xf32>, 0, %cy: index)
             %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)
