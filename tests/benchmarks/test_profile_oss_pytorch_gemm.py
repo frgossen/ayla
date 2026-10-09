@@ -6,6 +6,39 @@ from benchmarks import benchmark_oss_pytorch_gemm_shapes, profile_oss_pytorch_ge
 from benchmarks.oss_gemm_corpus import seed_configs
 
 
+def test_single_wave_fixed_grid_does_not_unroll_the_reduction_loop():
+    shape = SimpleNamespace(m=1024, n=4096)
+    schedule = SimpleNamespace(
+        output_cta_count=128,
+        output_m_tile=128,
+        output_n_tile=256,
+        transpose_output=False,
+        unroll_output_tiles=True,
+    )
+
+    assert (
+        benchmark_oss_pytorch_gemm_shapes._fixed_output_unroll_factor(
+            shape, schedule,
+        )
+        is None
+    )
+
+
+def test_two_wave_fixed_grid_unrolls_only_the_output_loop():
+    shape = SimpleNamespace(m=8192, n=768)
+    schedule = SimpleNamespace(
+        output_cta_count=129,
+        output_m_tile=192,
+        output_n_tile=128,
+        transpose_output=False,
+        unroll_output_tiles=True,
+    )
+
+    assert benchmark_oss_pytorch_gemm_shapes._fixed_output_unroll_factor(
+        shape, schedule,
+    ) == 2
+
+
 def test_profiler_reuses_benchmark_builder_without_dropping_fixed_grid(
     monkeypatch,
 ):

@@ -153,6 +153,27 @@ def _baseline_config(shape: Shape) -> GemmBenchConfig:
     )
 
 
+def _fixed_output_unroll_factor(
+    shape: Shape, schedule: ScheduleConfig,
+) -> int | None:
+    """Return output-wave unrolling, never reduction-loop unrolling."""
+    if (
+        schedule.output_cta_count is None
+        or not schedule.unroll_output_tiles
+    ):
+        return None
+    m, n = (
+        (shape.n, shape.m) if schedule.transpose_output
+        else (shape.m, shape.n)
+    )
+    logical_tiles = (
+        math.ceil(m / schedule.output_m_tile)
+        * math.ceil(n / schedule.output_n_tile)
+    )
+    waves = math.ceil(logical_tiles / schedule.output_cta_count)
+    return waves if waves > 1 else None
+
+
 _DEFAULT_CONFIG_TIMEOUT_S = 120.0
 # How this run times configurations, recorded on every row it writes. Rows
 # measured under different protocols are not comparable.
@@ -349,29 +370,26 @@ def _make_ayla_config(
             ),
             **schedule_kwargs,
         )
-        if (
-            schedule.output_cta_count is not None
-            and schedule.unroll_output_tiles
-        ):
+        output_unroll_factor = _fixed_output_unroll_factor(shape, schedule)
+        if output_unroll_factor is not None:
             module = LICM().run(module)
             module = LICM().run(module)
             outer_loops = [
                 loop for loop in find_ops_of_type(module, ForOp)
                 if find_ancestor_of_type(loop, ForOp) is None
             ]
-            if len(outer_loops) > 1:
+            if len(outer_loops) != 1:
                 raise ValueError(
-                    "fixed output-grid unrolling requires at most one outer "
+                    "fixed output-grid unrolling requires exactly one outer "
                     "tile loop"
                 )
-            if outer_loops:
-                output_loop = outer_loops[0]
-                output_loop.attrs["label"] = "outmn"
-                module = UnrollLoop(
-                    unroll_factor=output_loop.trip_count,
-                    label_filter="outmn",
-                ).run(module)
-                module = Canonicalize().run(module)
+            output_loop = outer_loops[0]
+            output_loop.attrs["label"] = "outmn"
+            module = UnrollLoop(
+                unroll_factor=output_unroll_factor,
+                label_filter="outmn",
+            ).run(module)
+            module = Canonicalize().run(module)
     else:
         module = auto_matmul_4096_wgmma256_wg_tma_store_module(
             m=shape.m,
