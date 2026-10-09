@@ -639,6 +639,19 @@ def test_move_loads_f32_pairs_into_wgmma_registers_as_vectors():
     assert template.count("ld.global.v2.b32") == 16
 
 
+def test_move_rejects_unaligned_wgmma_register_pairs():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%src: gmem<64x64xbf16 strides=[65, 1]>) {
+            %dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            move(%dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src: gmem<64x64xbf16 strides=[65, 1]>) collective=xyz.thread
+          }
+        }"""))
+
+    with pytest.raises(AssertionError, match="contiguous and aligned"):
+        lower_to_ptx_template(module)
+
+
 def test_lower_elementwise_silu():
     w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
