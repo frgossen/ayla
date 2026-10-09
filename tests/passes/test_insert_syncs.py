@@ -320,6 +320,39 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     assert sync.type.kind == "cluster_mbar"
 
 
+def test_interleaved_lock_allocations_share_one_publication():
+    # Rescheduling async starts places each lock allocation just before its
+    # first use. Initialization is still published once, before the first.
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<32x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %c16: index = index_constant() attrs={value: 16}
+            %s0: smem<16x16xf32> = alloc() attrs={id: 0}
+            %l0: lock<mbar> = alloc() attrs={id: 1}
+            async(%l0: lock<mbar>) collective=xyz.cluster tma_move(%s0: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<32x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            %s1: smem<16x16xf32> = alloc() attrs={id: 2}
+            %l1: lock<mbar> = alloc() attrs={id: 3}
+            async(%l1: lock<mbar>) collective=xyz.cluster tma_move(%s1: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<32x16xf32> tile=16x16>, %c16: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            await(%l0: lock<mbar>)
+            await(%l1: lock<mbar>)
+          }
+        }"""))
+
+    insert_syncs(module)
+
+    text = repr(module)
+    assert text.count('barrier() attrs={scope: "cluster"}') == 1
+    assert text.count('barrier() attrs={scope: "block"}') == 1
+    assert_contains_in_order(
+        text,
+        "%l0: lock<mbar> = alloc() attrs={id: 1}",
+        "%l1: lock<mbar> = alloc() attrs={id: 3}",
+        'barrier() attrs={scope: "cluster"}',
+    )
+    assert text.index("async(%l0") < text.index("async(%l1")
+
+
 def test_preexisting_barrier_updates_dataflow_state():
     source = """\
         module {
@@ -609,13 +642,13 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
         text,
         textwrap.dedent("""\
             barrier() attrs={id: 1, num_threads: 256, scope: "block_leader"}
-            async(%10: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
+            async(%3: lock<mbar>) attrs={label: "mm_lhs_smem_iter0_async"} {
             barrier() attrs={id: 2, num_threads: 256, scope: "block_leader"}
-            async(%7: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
+            async(%2: lock<mbar>) attrs={label: "mm_lhs_smem_iter1_async"} {
             barrier() attrs={id: 3, num_threads: 256, scope: "block_leader"}
-            async(%4: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
+            async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter2_async"} {
             barrier() attrs={id: 4, num_threads: 256, scope: "block_leader"}
-            async(%1: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
+            async(%0: lock<mbar>) attrs={label: "mm_lhs_smem_iter3_async"} {"""),
     )
 
 

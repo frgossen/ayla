@@ -135,13 +135,29 @@ def _publication_barriers(scope: BarrierScope) -> list[Op]:
     return [BarrierOp.build(_BARRIER_OP_SCOPE[s]) for s in scopes]
 
 
+def _hoist_lock_allocations(kernel: KernelOp) -> None:
+    """Move the kernel's top-level published lock allocations to its entry.
+
+    A lock allocation has no operands, so it may run before any op. Grouping
+    the allocations lets one publication barrier cover every initialization,
+    however an earlier scheduler interleaved them with their first uses.
+    """
+    locks = [
+        op for op in kernel.body.ops
+        if _lock_init_barrier(op) != BarrierScope.THREAD
+    ]
+    rest = [op for op in kernel.body.ops if op not in set(locks)]
+    kernel.body.ops = locks + rest
+
+
 class InsertSyncs(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
-        analysis = SyncAnalysis()
-        analysis.analyze(module)
         kernel = find_op(module, lambda op: isinstance(op, KernelOp))
         assert isinstance(kernel, KernelOp)
+        _hoist_lock_allocations(kernel)
+        analysis = SyncAnalysis()
+        analysis.analyze(module)
         barrier_syncs = _materialize_cluster_mbars(kernel, analysis.targets)
         # Transform: insert the barriers with the kernel-wide participant count.
         _insert_barriers(
