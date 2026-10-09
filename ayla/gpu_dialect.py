@@ -385,6 +385,8 @@ class MatmulOp(GpuOp):
         if "collective" in a:
             raise ValueError("pass collective as an explicit argument")
         a["collective"] = dict(collective)
+        # TODO: Make the initializer always a value: merge ``init`` into
+        # ``init_value`` and express scalar initializers as constants.
         if init is not None:
             a["init"] = init
         return cls(
