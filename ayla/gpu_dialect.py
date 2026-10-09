@@ -2117,6 +2117,40 @@ class F64Type(Type):
     byte_size = 8
 
 
+@gpu_dialect.register_op("constant")
+class ConstantOp(GpuOp):
+    """Produce an immutable floating-point tensor constant.
+
+    A scalar payload is a splat; a list payload is flat row-major data. A
+    rank-0 tensor is the canonical scalar data value. Unlike
+    ``IndexConstantOp``, this operation represents numerical program data
+    rather than an index used for addressing or control flow.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        value: int | float | list[int | float],
+        result_type: MemTensorType,
+    ) -> "ConstantOp":
+        return cls(
+            operands=[],
+            results=[Value(name=None, type=result_type)],
+            attrs={"value": value},
+        )
+
+    @property
+    def value(self) -> int | float | list[int | float]:
+        return cast(int | float | list[int | float], self.attrs["value"])
+
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "value"
+        }
+
+
 @gpu_dialect.register_op("thread_ids")
 class ThreadIdsOp(GpuOp):
     """Produce the 3D thread index (tid.x, tid.y, tid.z)."""
@@ -2779,6 +2813,7 @@ def is_side_effect_free(op: Op) -> bool:
         IndexMulOp,
         LaneIdOp,
         PtrAddOp,
+        ConstantOp,
         SelectOp,
         ReinterpretOp,
         ReshapeOp,

@@ -106,7 +106,8 @@ class Printer:
         """Write `NxMx...` or `NxMx...xDTYPE` if dtype is given."""
         self.write("x".join("?" if s is None else str(s) for s in sizes))
         if dtype is not None:
-            self.write("x")
+            if sizes:
+                self.write("x")
             dtype.print(self)
 
     def write_list_attr(self, v: list, brackets: bool = True) -> None:

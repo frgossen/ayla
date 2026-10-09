@@ -28,6 +28,7 @@ from ..gpu_dialect import (
     MoveOp,
     ReduceOp,
     ReshapeOp,
+    ConstantOp,
     SmemTensorType,
     TileOp,
     TmaDescType,
@@ -142,6 +143,30 @@ class VerifyGpuDialect(VerificationPass):
         if type(op.step) is not int or op.step <= 0:
             raise ValueError(
                 f"for step must be a positive integer, got {op.step!r}"
+            )
+
+    @verifies(ConstantOp)
+    def _verify_constant(self, op: ConstantOp) -> None:
+        result_type = op.result().type
+        if not isinstance(result_type, MemTensorType):
+            raise ValueError("constant result must be a memory tensor")
+        if not isinstance(
+            result_type.dtype, (F16Type, BF16Type, F32Type, F64Type),
+        ):
+            raise ValueError("constant result must have a floating-point dtype")
+        value = op.attrs.get("value")
+        if type(value) in (int, float):
+            return
+        if not isinstance(value, list) or any(
+            type(element) not in (int, float) for element in value
+        ):
+            raise ValueError(
+                "constant value must be an int, float, or flat numerical list"
+            )
+        if result_type.num_elements != len(value):
+            raise ValueError(
+                f"constant has {len(value)} values for tensor shape "
+                f"{result_type.sizes}"
             )
 
     @verifies(TileOp)

@@ -45,6 +45,7 @@ from ..gpu_dialect import (
     ReinterpretOp,
     ReshapeOp,
     RmemTensorType,
+    ConstantOp,
     SmemTensorType,
     ThreadIdsOp,
     TileOp,
@@ -304,6 +305,30 @@ class LowerToPtxTemplate(LoweringPass):
     def __init__(self) -> None:
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
+
+    @lowers(ConstantOp)
+    def lower_constant(
+        self, op: ConstantOp,
+    ) -> tuple[list[Op], list[object]]:
+        result_type = op.result().type
+        if not isinstance(result_type, RmemTensorType):
+            raise NotImplementedError(
+                f"lower_constant: unsupported result type {result_type}"
+            )
+        value = op.value
+        values = (
+            value
+            if isinstance(value, list)
+            else itertools.repeat(value, cast(int, result_type.num_elements))
+        )
+        lowered = PTXTemplateOp.build(
+            operands=[],
+            result_types=[result_type],
+            template=_mov_literals_ptx("value", result_type.dtype, values),
+            result_names=["value"],
+            description=str(op),
+        )
+        return [lowered], [lowered.result()]
 
     @lowers(KernelOp)
     def lower_kernel(
@@ -597,15 +622,11 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         result_type = op.result().type
         assert isinstance(result_type, RmemTensorType)
-        n = result_type.num_elements
-        assert n is not None
-        suffix = _ptx_suffix(result_type.dtype)
-
-        template = ""
-        if op.init is not None:
-            literal = _ptx_literal(result_type.dtype, op.init)
-            for i in range(n):
-                template += f"mov.{suffix} ${{{suffix}:result.dst.r{i}}}, {literal};\n"
+        template = "" if op.init is None else _mov_literals_ptx(
+            "dst",
+            result_type.dtype,
+            itertools.repeat(op.init, cast(int, result_type.num_elements)),
+        )
 
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -2424,6 +2445,16 @@ def _ptx_suffix(dtype) -> str:
     return "b16" if name == "bf16" else name
 
 
+def _mov_literals_ptx(result: str, dtype: Type, values) -> str:
+    """Move literals into a result's registers; 16-bit floats move as bits."""
+    suffix = "b16" if isinstance(dtype, (F16Type, BF16Type)) else dtype.name
+    return "".join(
+        f"mov.{suffix} ${{{suffix}:result.{result}.r{i}}}, "
+        f"{_ptx_literal(dtype, value)};\n"
+        for i, value in enumerate(values)
+    )
+
+
 def _ptx_literal(dtype, value) -> str:
     name = dtype.name
     if name == "f32":
@@ -2433,6 +2464,8 @@ def _ptx_literal(dtype, value) -> str:
     if name == "bf16":
         bits = struct.unpack(">I", struct.pack(">f", float(value)))[0] >> 16
         return f"0x{bits:04X}"
+    if name == "f16":
+        return "0x" + struct.pack(">e", float(value)).hex().upper()
     raise NotImplementedError(f"_ptx_literal: dtype {name}")
 
 
