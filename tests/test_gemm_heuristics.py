@@ -3,8 +3,10 @@ import dataclasses
 import pytest
 
 from ayla.gemm_heuristics import (
+    _adapt_config,
     apply_gemm_schedule_seed_post_build,
     collapse_gemm_heuristic,
+    default_reverse_output_rows,
     expand_gemm_heuristic,
     select_gemm_schedules,
 )
@@ -341,3 +343,76 @@ def test_transpose_winner_is_selected_for_the_original_problem():
     assert seed.builder_config is not None
     assert seed.builder_config["output_m_tile"] == 192
     assert seed.builder_config["output_n_tile"] == 200
+
+
+def test_default_output_row_order_reverses_only_large_non_batched_outputs():
+    assert default_reverse_output_rows(12608, 3072)
+    assert not default_reverse_output_rows(8192, 768)
+    assert not default_reverse_output_rows(
+        512, 512, operation="bmm", batch=256,
+    )
+
+
+def test_unmeasured_large_output_reverses_output_rows():
+    selection = select_gemm_schedules(20000, 3072, 768)
+
+    seeds = [seed for seed in selection.seeds if seed.builder_config is not None]
+    assert seeds
+    for seed in seeds:
+        rows = "N" if seed.transpose_output else "M"
+        assert rows in seed.builder_config["output_reversed_dims"]
+        assert "output rows visited last-to-first" in seed.adaptations
+
+
+def test_caller_can_forbid_reversed_output_rows():
+    selection = select_gemm_schedules(
+        20000, 3072, 768, reverse_output_rows=False,
+    )
+
+    for seed in selection.seeds:
+        assert seed.builder_config is not None
+        assert "output_reversed_dims" not in seed.builder_config
+
+
+def test_exact_winner_keeps_its_measured_output_row_order():
+    [seed] = select_gemm_schedules(12608, 3072, 768).seeds
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_reversed_dims"] == ("M",)
+    assert "output rows visited last-to-first" not in seed.adaptations
+
+    [forced] = select_gemm_schedules(
+        12608, 3072, 768, reverse_output_rows=False,
+    ).seeds
+    assert forced.builder_config is not None
+    assert "output_reversed_dims" not in forced.builder_config
+    assert "output rows visited first-to-last" in forced.adaptations
+
+
+def test_addmm_exact_winner_keeps_its_measured_output_row_order():
+    [seed] = select_gemm_schedules(
+        100352, 512, 64, operation="addmm",
+    ).seeds
+
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_reversed_dims"] == ("M",)
+
+
+def test_bmm_exact_winner_remains_forward_order():
+    [seed] = select_gemm_schedules(
+        196, 640, 128, operation="bmm", batch=128,
+    ).seeds
+
+    assert seed.builder_config is not None
+    assert "output_reversed_dims" not in seed.builder_config
+
+
+def test_measured_output_tile_reverse_is_routed_to_the_builder():
+    selection = select_gemm_schedules(12608, 3072, 768)
+    captured = {
+        **selection.seeds[0].captured_config, "output_tile_reverse": "m",
+    }
+    builder, _ = _adapt_config(
+        captured, 12608, 3072, 768, preserve_output_grid=True,
+    )
+    assert builder is not None
+    assert builder["output_reversed_dims"] == ("M",)

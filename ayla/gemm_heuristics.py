@@ -13,6 +13,20 @@ from typing import Any
 from .gpu_dialect import CollectiveAxis
 
 
+_REVERSE_OUTPUT_MIN_BYTES = 64 * 2**20
+
+
+def default_reverse_output_rows(
+    m: int, n: int, *, operation: str = "mm", batch: int = 1,
+    element_bytes: int = 2,
+) -> bool:
+    """Whether to write an unmeasured output's rows last-to-first."""
+    return (
+        operation != "bmm"
+        and m * n * batch * element_bytes >= _REVERSE_OUTPUT_MIN_BYTES
+    )
+
+
 @dataclass(frozen=True)
 class GemmScheduleSeed:
     captured_config: dict[str, object]
@@ -417,6 +431,8 @@ def _adapt_config(
         builder["output_grid_axes"] = (
             CollectiveAxis.Y, CollectiveAxis.X,
         )
+    if reverse := str(captured.get("output_tile_reverse") or ""):
+        builder["output_reversed_dims"] = tuple(reverse.upper())
     optional = (
         "warpgroup_m_tile", "warpgroup_fast_axis", "rhs_tma_load_slices",
         "cluster_m_ctas", "cluster_n_ctas",
@@ -426,6 +442,33 @@ def _adapt_config(
         if value not in (None, 1, "n"):
             builder[key] = value
     return builder, tuple(adaptations)
+
+
+def _with_output_row_order(
+    builder: dict[str, object],
+    adaptations: tuple[str, ...],
+    *,
+    reverse: bool | None,
+    transpose_output: bool,
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """Apply a caller/default row-order choice over the captured order."""
+    if reverse is None:
+        return builder, adaptations
+    rows = "N" if transpose_output else "M"
+    current = tuple(builder.get("output_reversed_dims", ()))
+    dims = tuple(dim for dim in current if dim != rows)
+    if reverse:
+        dims += (rows,)
+    if dims == current:
+        return builder, adaptations
+    builder = {
+        key: value for key, value in builder.items()
+        if key != "output_reversed_dims"
+    }
+    if dims:
+        builder["output_reversed_dims"] = dims
+    order = "last-to-first" if reverse else "first-to-last"
+    return builder, (*adaptations, f"output rows visited {order}")
 
 
 def _legal(
@@ -463,8 +506,14 @@ def select_gemm_schedules(
     batch: int = 1,
     dtype: str = "float16",
     layout: str = "canonical_nt",
+    reverse_output_rows: bool | None = None,
 ) -> GemmHeuristicSelection:
-    """Return nearby captured configurations and current-library adaptations."""
+    """Return nearby captured configurations and current-library adaptations.
+
+    ``reverse_output_rows`` forces or forbids visiting output rows
+    last-to-first. ``None`` keeps an exact measured choice and applies the
+    size-based default only to unmeasured shapes.
+    """
     if min(m, n, k) <= 0:
         raise ValueError("GEMM dimensions must be positive")
     if batch <= 0:
@@ -517,6 +566,19 @@ def select_gemm_schedules(
             captured, builder_m, builder_n, k,
             preserve_output_grid=exact is not None,
         )
+        if builder is not None:
+            builder, adaptations = _with_output_row_order(
+                builder,
+                adaptations,
+                reverse=(
+                    reverse_output_rows
+                    if reverse_output_rows is not None or exact is not None
+                    else default_reverse_output_rows(
+                        m, n, operation=operation, batch=batch,
+                    )
+                ),
+                transpose_output=transpose_output,
+            )
         if exact is None and builder is not None and not _legal(
             builder,
             builder_m,
@@ -559,6 +621,18 @@ def select_gemm_schedules(
     if not any(seed.builder_config is not None for seed in seeds):
         captured = dict(mapper["fallback"])
         builder, adaptations = _adapt_config(captured, m, n, k)
+        if builder is not None:
+            builder, adaptations = _with_output_row_order(
+                builder,
+                adaptations,
+                reverse=(
+                    reverse_output_rows if reverse_output_rows is not None
+                    else default_reverse_output_rows(
+                        m, n, operation=operation, batch=batch,
+                    )
+                ),
+                transpose_output=bool(captured.get("transpose_output", False)),
+            )
         if builder is not None and _legal(
             builder,
             m,
