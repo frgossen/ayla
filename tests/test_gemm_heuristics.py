@@ -37,6 +37,106 @@ def test_single_iteration_fixed_grid_requires_no_unroll_passes():
     assert apply_gemm_schedule_seed_post_build(module, seed) is module
 
 
+def test_fixed_grid_unroll_is_rescheduled_after_unrolling(monkeypatch):
+    seed = dataclasses.replace(
+        select_gemm_schedules(8192, 768, 768, operation="addmm").seeds[0],
+        fixed_output_unroll_factor=2,
+        post_builder_passes=(),
+    )
+    calls = []
+    loop = type("Loop", (), {"attrs": {}})()
+    monkeypatch.setattr(
+        "ayla.passes.licm.LICM.run",
+        lambda self, module: calls.append("licm") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ops_of_type",
+        lambda module, op_type: [loop],
+    )
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ancestor_of_type",
+        lambda loop, op_type: None,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.unroll_loop.UnrollLoop.run",
+        lambda self, module: calls.append("unroll") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.schedule_async.ScheduleAsync.run",
+        lambda self, module: calls.append("schedule_async") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.canonicalize.Canonicalize.run",
+        lambda self, module: calls.append("canonicalize") or module,
+    )
+    module = object()
+
+    assert apply_gemm_schedule_seed_post_build(module, seed) is module
+    assert calls == [
+        "licm",
+        "licm",
+        "unroll",
+        "canonicalize",
+        "schedule_async",
+        "canonicalize",
+    ]
+
+
+def test_rolled_wave_pipeline_is_composed_for_selected_mm(monkeypatch):
+    from ayla.passes.pipeline_loop import PipelineLoop
+
+    seed = select_gemm_schedules(4096, 16384, 1024).seeds[0]
+    assert seed.pipeline_output_waves is True
+    assert seed.fixed_output_unroll_factor is None
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_grid_fast_axis"] == "n"
+
+    class FakeAsync:
+        def __init__(self):
+            self.attrs = {"label": "mm_lhs_smem_iter0_async"}
+
+    class FakeAwait:
+        pass
+
+    class FakeFor:
+        def __init__(self):
+            self.attrs = {}
+            self.body = type("Body", (), {"ops": [FakeAsync(), FakeAwait()]})()
+
+    loop = FakeFor()
+    calls = []
+    monkeypatch.setattr("ayla.gpu_dialect.AsyncOp", FakeAsync)
+    monkeypatch.setattr("ayla.gpu_dialect.AwaitOp", FakeAwait)
+    monkeypatch.setattr("ayla.gpu_dialect.ForOp", FakeFor)
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ops_of_type", lambda module, op_type: [loop],
+    )
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ancestor_of_type", lambda loop, op_type: None,
+    )
+    monkeypatch.setattr(
+        PipelineLoop,
+        "run",
+        lambda self, module: calls.append("pipeline_loop") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.schedule_async.ScheduleAsync.run",
+        lambda self, module: calls.append("schedule_async") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.canonicalize.Canonicalize.run",
+        lambda self, module: calls.append("canonicalize") or module,
+    )
+
+    module = object()
+    assert apply_gemm_schedule_seed_post_build(module, seed) is module
+    assert calls == ["pipeline_loop", "schedule_async", "canonicalize"]
+    assert loop.attrs["label"] == "heuristic_output_grid"
+    assert loop.body.ops[0].attrs["label"] == (
+        "heuristic_wave_prologue_async"
+    )
+
+
 def test_compact_round_trip_preserves_exact_dispatch():
     expanded = {
         "version": 2,
@@ -73,7 +173,6 @@ def test_compact_round_trip_preserves_exact_dispatch():
 def test_compact_seeds_omit_dropped_experimental_controls():
     selection = select_gemm_schedules(2048, 768, 768)
     redundant = {
-        "output_tile_fast_axis",
         "rhs_tma_load_slices",
         "unsafe_reuse_smem",
         "warpgroup_fast_axis",
