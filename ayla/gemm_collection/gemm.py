@@ -181,6 +181,7 @@ def schedule_matmul(
     *,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
+    output_reversed_dims: tuple[str, ...] = (),
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -226,6 +227,8 @@ def schedule_matmul(
         )
     if output_m_tiles_per_cta > 1 and output_n_tiles_per_cta > 1:
         raise ValueError("output tiles may be grouped along only one axis")
+    if not set(output_reversed_dims) <= {"M", "N"}:
+        raise ValueError("output_reversed_dims must name M and/or N")
     if min(m, n, k) <= 0:
         raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (64, 128, 192, 256):
@@ -273,6 +276,7 @@ def schedule_matmul(
                 m % output_m_tile != 0
                 or n % output_n_tile != 0
             ),
+            reversed_dims=list(output_reversed_dims),
         ))
     else:
         grid = (blocks + group_size - 1) // group_size
@@ -292,6 +296,7 @@ def schedule_matmul(
                 or n % output_n_tile != 0
                 or blocks % group_size != 0
             ),
+            reversed_dims=list(output_reversed_dims),
         ))
     pipeline.add_pass(schedule_tiled_matmul(
         label="mm",
@@ -322,6 +327,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     k: int | None = None,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
+    output_reversed_dims: tuple[str, ...] = (),
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_n_tile: int | None = None,
@@ -374,6 +380,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
+    if output_reversed_dims:
+        name += "_rev" + "".join(output_reversed_dims).lower()
 
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
@@ -386,6 +394,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         module,
         output_m_tiles_per_cta=output_m_tiles_per_cta,
         output_n_tiles_per_cta=output_n_tiles_per_cta,
+        output_reversed_dims=output_reversed_dims,
         output_m_tile=output_m_tile,
         output_n_tile=output_n_tile,
         warpgroup_n_tile=resolved_warpgroup_n_tile,
