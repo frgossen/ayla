@@ -13,12 +13,13 @@ from ayla.gpu_dialect import (
     IndexConstantOp,
     IndexLtOp,
     IndexMulOp,
+    IndexModOp,
     MatmulOp,
     TileOp,
     gpu_dialect,
 )
 from ayla.passes.canonicalize import Canonicalize
-from ayla.passes.tile_matmul import tile_matmul
+from ayla.passes.tile_matmul import TileMatmul, tile_matmul
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -458,3 +459,68 @@ def test_tiling_schemes_are_refined_across_two_matmuls():
         {"dst_tiling_scheme": 1},
         {"dst_tiling_scheme": 3},
     ]
+
+
+def test_reversed_dim_mirrors_the_parallel_tile_index():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<256x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<256x128xf32>) block_dim=[128, 1, 1] {
+            matmul(%a: gmem<256x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<256x128xf32>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))  # noqa: E501
+    tile_matmul(
+        module,
+        op_dims=["M", "N"], tile_sizes=[64, 64],
+        iteration_bindings=[
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+        ],
+        for_loop_labels=[None, None],
+        op_label_filter="mm",
+        reversed_dims=["M"],
+    )
+
+    [kernel] = module.body.ops
+    assert kernel.grid_dim[:2] == (4, 2)
+    mods = find_ops_of_type(module, IndexModOp)
+    assert len(mods) == 1
+    constants = {
+        op.value for op in find_ops_of_type(module, IndexConstantOp)
+    }
+    assert {1, 3, 4} <= constants
+
+
+def test_reversed_dim_mirrors_a_sequential_tile_loop():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xf32>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xf32>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))  # noqa: E501
+    tile_matmul(
+        module,
+        op_dims=["M", "M"], tile_sizes=[2048, 128],
+        iteration_bindings=[
+            None,
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+        ],
+        for_loop_labels=["outm", None],
+        op_label_filter="mm",
+        reversed_dims=["M"],
+    )
+
+    [loop] = find_ops_of_type(module, ForOp)
+    assert loop.trip_count == 2
+    first = loop.body.ops[0]
+    assert isinstance(first, IndexConstantOp) and first.value == 1
+    assert "tile(%a: gmem<4096x16xbf16>, %outm: index, 0)" not in repr(module)
+
+
+def test_reversed_dim_must_be_tiled():
+    with pytest.raises(ValueError, match="not tiled"):
+        TileMatmul(
+            op_dims=["M"], tile_sizes=[64],
+            iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+            for_loop_labels=[None],
+            reversed_dims=["N"],
+        )

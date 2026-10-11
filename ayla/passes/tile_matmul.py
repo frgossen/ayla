@@ -130,6 +130,9 @@ class TileMatmul(LoweringPass):
     rounding the logical tile count up. Addressing remains full-tile; callers
     must use memory operations with defined out-of-bounds behavior, such as
     TMA.
+
+    ``reversed_dims`` names tiled dimensions visited last-to-first. Hardware
+    workers keep their launch order but take the mirrored logical tile.
     """
 
     op_dims: list[str]
@@ -141,6 +144,7 @@ class TileMatmul(LoweringPass):
     op_label_filter: str | None
     epilogue_label_filter: str | None
     allow_partial_tiles: bool
+    reversed_dims: list[str]
 
     def __init__(
         self,
@@ -153,6 +157,7 @@ class TileMatmul(LoweringPass):
         op_label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
         allow_partial_tiles: bool = False,
+        reversed_dims: list[str] | None = None,
     ) -> None:
         super().__init__(
             op_dims=list(op_dims),
@@ -162,7 +167,13 @@ class TileMatmul(LoweringPass):
             op_label_filter=op_label_filter,
             epilogue_label_filter=epilogue_label_filter,
             allow_partial_tiles=allow_partial_tiles,
+            reversed_dims=list(reversed_dims or []),
         )
+        unknown = set(self.reversed_dims) - set(op_dims)
+        if unknown:
+            raise ValueError(
+                f"TileMatmul: reversed dims {sorted(unknown)} are not tiled"
+            )
         assert (
             len(op_dims)
             == len(tile_sizes)
@@ -408,17 +419,26 @@ class TileMatmul(LoweringPass):
         divisors: dict[
             tuple[CollectiveLevel, CollectiveAxis], int
         ] = {}
-        for ub, binding, label in reversed(list(zip(
-            ubs, self.iteration_bindings, self.for_loop_labels,
-            strict=True,
+        loop_ivs: dict[int, Value] = {}
+        loop_prefix: dict[int, list[Op]] = {}
+        for i, ub, binding, label in reversed(list(zip(
+            range(len(ubs)), ubs, self.iteration_bindings,
+            self.for_loop_labels, strict=True,
         ))):
             if binding is None:
                 iv = Value(name=label, type=IndexType())
+                loop_ivs[i] = iv
+                if self.op_dims[i] in self.reversed_dims:
+                    loop_prefix[i], iv = _reversed_index(iv, ub)
             else:
                 linear_id = linear_ids[binding]
                 if self.iteration_bindings.count(binding) == 1:
                     divisors[binding] = ub
-                    ivs.insert(0, linear_id)
+                    iv = linear_id
+                    if self.op_dims[i] in self.reversed_dims:
+                        ops, iv = _reversed_index(iv, ub)
+                        iteration_ops.extend(ops)
+                    ivs.insert(0, iv)
                     continue
                 divisor = divisors.get(binding, 1)
                 divisors[binding] = divisor * ub
@@ -432,6 +452,9 @@ class TileMatmul(LoweringPass):
                     cdivisor, div, cbound, mod, *iteration_ops,
                 ]
                 iv = mod.result()
+                if self.op_dims[i] in self.reversed_dims:
+                    ops, iv = _reversed_index(iv, ub)
+                    iteration_ops.extend(ops)
             ivs.insert(0, iv)
 
         # The outermost loop over a dim the epilogue does not have. It belongs
@@ -538,7 +561,10 @@ class TileMatmul(LoweringPass):
                         IfOp.build(condition.result(), Block(ops=body_ops)),
                     ]
                 continue
-            body = Block(arguments=[iv], ops=body_ops)
+            body = Block(
+                arguments=[loop_ivs[i]],
+                ops=[*loop_prefix.get(i, []), *body_ops],
+            )
             attrs: dict[str, object] | None = (
                 {"label": label} if label is not None else None
             )
@@ -611,6 +637,17 @@ def _resolve_launch_dim_constraints(
     return result
 
 
+def _reversed_index(index: Value, extent: int) -> tuple[list[Op], Value]:
+    """Build ``extent - 1 - index`` with non-negative index operations."""
+    one = IndexConstantOp.build(1)
+    shifted = IndexAddOp.build(index, one.result())
+    last = IndexConstantOp.build(extent - 1)
+    scaled = IndexMulOp.build(shifted.result(), last.result())
+    bound = IndexConstantOp.build(extent)
+    mirrored = IndexModOp.build(scaled.result(), bound.result())
+    return [one, shifted, last, scaled, bound, mirrored], mirrored.result()
+
+
 def _build_tile_op(
     arg: Value,
     dim_names: list[str],
@@ -676,9 +713,11 @@ def tile_matmul(
     op_label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
     allow_partial_tiles: bool = False,
+    reversed_dims: list[str] | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
         op_dims, tile_sizes, iteration_bindings, for_loop_labels,
         op_label_filter, epilogue_label_filter, allow_partial_tiles,
+        reversed_dims,
     ).run(module)
