@@ -31,7 +31,7 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.fuse_async import fuse_async
 from ayla.passes.insert_syncs import insert_syncs
 from ayla.passes.lower_to_async import lower_to_async

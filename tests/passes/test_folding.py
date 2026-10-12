@@ -3,7 +3,7 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import TileOp, gpu_dialect
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
 

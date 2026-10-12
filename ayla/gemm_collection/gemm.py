@@ -13,7 +13,7 @@ from ..gpu_dialect import (
     ModuleOp,
     gpu_dialect,
 )
-from ..passes.canonicalize import Canonicalize
+from ..pipelines.canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
 from ..passes.licm import LICM
 from ..passes.lower_to_async import LowerToAsync
