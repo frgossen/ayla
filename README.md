@@ -29,6 +29,7 @@ pixi run bench-oss-seed -- 8192 768 768 --csv results.csv  # optional output
 python -m benchmarks.convert_oss_gemm_heuristic expand ayla/oss_gemm_heuristic.json /tmp/heuristic.json
 python -m benchmarks.convert_oss_gemm_heuristic collapse /tmp/heuristic.json ayla/oss_gemm_heuristic.json
 python -m benchmarks.convert_oss_gemm_heuristic update ayla/oss_gemm_heuristic.json /tmp/updated.json run-*.json
+python -m benchmarks.convert_oss_gemm_heuristic merge-mapper ayla/oss_gemm_heuristic.json /tmp/updated.json bmm-mapper.json
 ```
 
 The converter provides lossless editing and merges any number of result files.
@@ -38,6 +39,8 @@ tensor values or source strides.
 Library callers can select the independent fused-addmm schedule groups with
 `select_gemm_schedules(m, n, k, operation="addmm")`; omitting `operation`
 preserves the existing `mm` routing.
+Canonical batched workloads use
+`select_gemm_schedules(m, n, k, operation="bmm", batch=batch)`.
 
 ### Using pixi
 
