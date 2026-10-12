@@ -2424,6 +2424,73 @@ class WarpGroupIdOp(GpuOp):
         return self.results[2]
 
 
+# The ID op of each hardware-mapped collective level, and how many threads one
+# of its IDs spans along x. Block IDs count the grid; the others count threads
+# of a block, where warps and warp groups are numbered along x only.
+HW_LEVEL_IDS: dict[
+    CollectiveLevel,
+    tuple[type[BlockIdOp | WarpGroupIdOp | ThreadIdOp], int],
+] = {
+    CollectiveLevel.BLOCK: (BlockIdOp, 1),
+    CollectiveLevel.WG: (WarpGroupIdOp, 128),
+    CollectiveLevel.WARP: (ThreadIdOp, 32),
+    CollectiveLevel.THREAD: (ThreadIdOp, 1),
+}
+
+
+def build_hardware_id(level: CollectiveLevel, axis: CollectiveAxis) -> tuple[list[Op], Value]:
+    """Materialize one axis of a hardware ID using the shared level metadata."""
+    op_type, threads = HW_LEVEL_IDS[level]
+    if op_type in (BlockIdOp, ThreadIdOp):
+        ids = op_type.build(axis)
+        value = ids.value
+    else:
+        ids = op_type.build()
+        value = ids.results[axis]
+    ops: list[Op] = [ids]
+    if level == CollectiveLevel.WARP:
+        assert axis == CollectiveAxis.X
+        divisor = IndexConstantOp.build(threads)
+        divided = IndexDivOp.build(value, divisor.result())
+        ops.extend([divisor, divided])
+        value = divided.result()
+    return ops, value
+
+
+def launch_extent(
+    kernel: KernelOp, level: CollectiveLevel, axis: CollectiveAxis,
+) -> int | None:
+    """How many ``level`` IDs ``kernel`` launches along ``axis``, if known."""
+    _, threads = HW_LEVEL_IDS[level]
+    if level == CollectiveLevel.BLOCK:
+        return kernel.grid_dim[axis]
+    extent = kernel.block_dim[axis]
+    if threads == 1 or extent is None:
+        return extent
+    return -(-extent // threads) if axis == CollectiveAxis.X else None
+
+
+def require_launch_extent(
+    kernel: KernelOp, level: CollectiveLevel, axis: CollectiveAxis, count: int,
+) -> None:
+    """Make ``kernel`` launch ``count`` ``level`` IDs along ``axis``."""
+    _, threads = HW_LEVEL_IDS[level]
+    assert threads == 1 or axis == CollectiveAxis.X, (
+        "warps and warp groups are numbered along x"
+    )
+    is_grid = level == CollectiveLevel.BLOCK
+    dims = list(kernel.grid_dim if is_grid else kernel.block_dim)
+    if dims[axis] not in (None, count * threads):
+        raise ValueError(
+            f"launch dim conflict: {dims[axis]} vs {count * threads}"
+        )
+    dims[axis] = count * threads
+    if is_grid:
+        kernel.grid_dim = dims
+    else:
+        kernel.block_dim = dims
+
+
 @gpu_dialect.register_op("index_constant")
 class IndexConstantOp(GpuOp):
     """Produce a constant index value."""

@@ -14,9 +14,9 @@ from ..base.ir import (
 )
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
+    build_hardware_id,
     AddrMemTensorType,
     AllocOp,
-    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
@@ -28,9 +28,8 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     ReduceOp,
-    ThreadIdOp,
     TileOp,
-    WarpGroupIdOp,
+    require_launch_extent,
 )
 from ._utils import label_matches
 
@@ -115,28 +114,7 @@ def _materialize_iteration_space(
         return [loop], loop.iv, loop
 
     level, axis = parallel_iteration_space
-    if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
-        id_op_type = {
-            CollectiveLevel.BLOCK: BlockIdOp,
-            CollectiveLevel.THREAD: ThreadIdOp,
-        }[level]
-        ids = id_op_type.build(axis)
-        id_ops: list[Op] = [ids]
-        parallel_id = ids.value
-    elif level == CollectiveLevel.WARP:
-        assert axis == CollectiveAxis.X
-        ids = ThreadIdOp.build(CollectiveAxis.X)
-        warp_size = IndexConstantOp.build(32)
-        warp_id = IndexDivOp.build(ids.value, warp_size.result())
-        id_ops = [ids, warp_size, warp_id]
-        parallel_id = warp_id.result()
-    else:
-        id_op_type = {
-            CollectiveLevel.WG: WarpGroupIdOp,
-        }[level]
-        ids = id_op_type.build()
-        id_ops = [ids]
-        parallel_id = ids.results[axis]
+    id_ops, parallel_id = build_hardware_id(level, axis)
     cdivisor = IndexConstantOp.build(divisor)
     div = IndexDivOp.build(
         parallel_id, cdivisor.result(),
@@ -257,28 +235,12 @@ class TileReduce(LoweringPass):
 
         # Update launch dimensions.
         if self.parallel_iteration_space is not None:
-            launch_dim = math.prod(bounds.values())
             kernel = find_ancestor_of_type(hero, KernelOp)
             assert kernel is not None
-            level, axis = self.parallel_iteration_space
-            if level == CollectiveLevel.WARP:
-                assert axis == CollectiveAxis.X
-                launch_dim *= 32
-            elif level == CollectiveLevel.WG:
-                assert axis == CollectiveAxis.X
-                launch_dim *= 128
-            if level == CollectiveLevel.BLOCK:
-                launch_dims = list(kernel.grid_dim)
-            else:
-                launch_dims = list(kernel.block_dim)
-            assert launch_dims[axis] in (None, launch_dim), (
-                f"launch dim conflict: {launch_dims[axis]} vs {launch_dim}"
+            require_launch_extent(
+                kernel, *self.parallel_iteration_space,
+                math.prod(bounds.values()),
             )
-            launch_dims[axis] = launch_dim
-            if level == CollectiveLevel.BLOCK:
-                kernel.grid_dim = launch_dims
-            else:
-                kernel.block_dim = launch_dims
 
         # Create iteration spaces for the parallel dimensions.
         new_ops: list[Op] = []

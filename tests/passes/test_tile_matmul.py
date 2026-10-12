@@ -16,7 +16,7 @@ from ayla.gpu_dialect import (
     gpu_dialect,
 )
 from ayla.passes.canonicalize import Canonicalize
-from ayla.passes.tile_matmul import tile_matmul
+from ayla.passes.tile_matmul import TileMatmul, tile_matmul
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -428,3 +428,13 @@ def test_tiling_schemes_are_refined_across_two_matmuls():
         {"dst_tiling_scheme": 1},
         {"dst_tiling_scheme": 3},
     ]
+
+
+@pytest.mark.parametrize("level", [CollectiveLevel.WARP, CollectiveLevel.CLUSTER])
+def test_rejects_hardware_levels_without_matmul_tiling(level):
+    with pytest.raises(ValueError, match="unsupported iteration binding"):
+        TileMatmul(
+            op_dims=["M"], tile_sizes=[64],
+            iteration_bindings=[(level, CollectiveAxis.X)],
+            for_loop_labels=[None],
+        )

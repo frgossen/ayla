@@ -22,6 +22,7 @@ from ayla.gpu_dialect import (
     ReshapeOp,
     RmemTensorType,
     SmemTensorType,
+    ThreadIdOp,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -601,4 +602,11 @@ def test_verification_rejects_unknown_grid_barrier_target():
     module = _grid_barrier_module((1, 1, 1), target="sm_101a")
 
     with pytest.raises(ValueError, match="no residency limit.*sm_101a"):
+        verify_gpu_dialect(module)
+
+
+def test_hardware_ids_require_an_enclosing_kernel():
+    module = ModuleOp.build(Block(ops=[ThreadIdOp.build(CollectiveAxis.X)]))
+
+    with pytest.raises(ValueError, match="requires an enclosing kernel"):
         verify_gpu_dialect(module)
