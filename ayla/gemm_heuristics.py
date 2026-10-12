@@ -162,6 +162,19 @@ def _as_int(value: object) -> int:
 def _output_groups(
     config: dict[str, object], m: int, n: int,
 ) -> tuple[int, int, int]:
+    if "output_n_tiles_per_cta" in config:
+        m_group = _as_int(config.get("output_m_tiles_per_cta", 1))
+        n_group = _as_int(config["output_n_tiles_per_cta"])
+        ctas = (
+            math.ceil(
+                math.ceil(m / _as_int(config["output_m_tile"])) / m_group,
+            )
+            * math.ceil(
+                math.ceil(n / _as_int(config["output_n_tile"])) / n_group,
+            )
+        )
+        return m_group, n_group, ctas
+
     tiles = _as_int(config["output_tiles_per_cta"])
     fast_axis = str(config["output_tile_fast_axis"])
     preferred = config["output_cta_count"]
@@ -232,6 +245,9 @@ def _adapt_config(
         "warpgroup_n_tile": captured["warpgroup_n_tile"],
         "operand_stages": captured["operand_stages"],
         "operand_k_tile": captured["operand_k_tile"],
+        "cyclic_operand_pipeline": captured.get(
+            "cyclic_operand_pipeline", False,
+        ),
         "output_slices": captured["output_slices"],
         "output_store_buffers": captured["output_store_buffers"],
         "output_tma_inner_size": captured["output_tma_inner_size"],

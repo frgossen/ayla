@@ -30,3 +30,16 @@ def test_incremental_winner_preserves_existing_leaf_seeds():
 
     assert "hybrid1152_s3_cy1" in names
     assert "waveconfirm_native" in names
+
+
+def test_n_grouped_winner_routes_existing_builder_controls():
+    selection = select_gemm_schedules(3136, 2048, 1024)
+    seed = next(
+        seed for seed in selection.seeds
+        if seed.captured_config["name"] == "ngroup3136wide_g2_cy1"
+    )
+
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_m_tiles_per_cta"] == 1
+    assert seed.builder_config["output_n_tiles_per_cta"] == 2
+    assert seed.builder_config["cyclic_operand_pipeline"] is True
