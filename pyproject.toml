@@ -21,6 +21,9 @@ dev = ["pyright", "pytest", "ruff"]
 include = ["ayla*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+ayla = ["oss_gemm_heuristic.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -88,3 +91,4 @@ test = "pytest"
 lint = "ruff check"
 typecheck = "pyright"
 bench = "python -m benchmarks.bench_gemm_collection"
+bench-oss-seed = "python -m benchmarks.benchmark_oss_gemm_seeds"
