@@ -31,7 +31,14 @@ def _without_names(value):
 
 
 def _update(expanded: dict, paths: list[Path]) -> dict:
-    touched: dict[int, dict] = {}
+    def family(seed: dict) -> str:
+        return json.dumps(
+            _without_names(seed["configuration"]),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    touched: dict[int, tuple[dict, set[str]]] = {}
     for path in paths:
         rows = json.loads(path.read_text())
         if not isinstance(rows, list):
@@ -51,30 +58,31 @@ def _update(expanded: dict, paths: list[Path]) -> dict:
             if not isinstance(source, dict) or not isinstance(score, (int, float)):
                 raise ValueError(f"{path}: result lacks heuristic source or score")
             leaf = _leaf(expanded["groups"][group], features)
-            leaf["seeds"].append({
+            new_seed = {
                 "configuration": config,
                 "source": source,
                 "source_percentage_of_torch": score,
-            })
-            touched[id(leaf)] = leaf
+            }
+            leaf["seeds"].append(new_seed)
+            _, updated_families = touched.setdefault(
+                id(leaf), (leaf, set()),
+            )
+            updated_families.add(family(new_seed))
 
-    for leaf in touched.values():
+    for leaf, updated_families in touched.values():
         best = {}
         for seed in leaf["seeds"]:
-            family = json.dumps(
-                _without_names(seed["configuration"]),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            incumbent = best.get(family)
+            key = family(seed)
+            incumbent = best.get(key)
             if incumbent is None or seed["source_percentage_of_torch"] > (
                 incumbent["source_percentage_of_torch"]
             ):
-                best[family] = seed
+                best[key] = seed
         leaf["seeds"] = sorted(
             best.values(),
             key=lambda seed: (
                 seed["configuration"].get("unsafe_reuse_smem") is True,
+                family(seed) not in updated_families,
                 -seed["source_percentage_of_torch"],
             ),
         )[:3]
