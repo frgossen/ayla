@@ -76,3 +76,47 @@ def test_dce_keeps_async_and_await_with_work():
     dce(module)
 
     assert repr(module) == expected
+
+
+def test_dce_removes_empty_async_group_across_blocks():
+    # The async sits in a loop body, its await after the loop.
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test() {
+            %lock: lock<mbar> = alloc()
+            for (%i: index = 0 to 4 step 1) {
+              async(%lock: lock<mbar>) collective=xyz.block {
+              }
+            }
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    dce(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test() {
+            for (%i: index = 0 to 4) {
+            }
+          }
+        }""")
+
+
+def test_dce_keeps_empty_async_sharing_a_lock_with_work():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%src: gmem<1xf32>, %dst: smem<1xf32>) {
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) collective=xyz.block {
+            }
+            async(%lock: lock<mbar>) collective=xyz.block move(%dst: smem<1xf32>, %src: gmem<1xf32>) collective=xyz.block attrs={tma: True}
+            await(%lock: lock<mbar>)
+          }
+        }""")
+    module = gpu_dialect.parse_module(module_str)
+    expected = repr(module)
+
+    dce(module)
+
+    assert repr(module) == expected

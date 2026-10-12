@@ -6,7 +6,7 @@ groups and their awaits.
 from __future__ import annotations
 
 from ..gpu_dialect import AsyncOp, AwaitOp, ModuleOp, is_side_effect_free
-from ..base.ir import Block, Op, find_ops_of_type
+from ..base.ir import Block, Op
 from ..base.pipeline import Pass
 
 
@@ -19,22 +19,25 @@ def _collect_uses(block: Block, used: set[int]) -> None:
             _collect_uses(inner, used)
 
 
+def _in_empty_async_group(op: Op) -> bool:
+    """Whether ``op`` is an async without work, or an await on only those.
+
+    One makes no sense without the other, so a lock's asyncs and awaits go
+    together. Deciding from the lock alone gives every member the same answer,
+    whichever block it sits in.
+    """
+    if not isinstance(op, (AsyncOp, AwaitOp)):
+        return False
+    return all(
+        isinstance(user, AwaitOp)
+        or isinstance(user, AsyncOp) and not user.body.ops
+        for user in op.lock.users()
+    )
+
+
 class DCE(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
-        empty_groups: set[Op] = set()
-        for op in find_ops_of_type(module, AsyncOp):
-            users = op.lock.users()
-            if not op.body.ops and all(
-                isinstance(user, AwaitOp)
-                or isinstance(user, AsyncOp) and not user.body.ops
-                for user in users
-            ):
-                empty_groups.update(users)
-        for op in empty_groups:
-            assert op.parent_block is not None
-            op.parent_block.ops.remove(op)
-
         for block in module.blocks:
             self.run_block(block)
         return module
@@ -52,7 +55,7 @@ class DCE(Pass):
         used: set[int] = set()
         kept: list[Op] = []
         for op in reversed(block.ops):
-            if is_side_effect_free(op) and not any(
+            if _in_empty_async_group(op) or is_side_effect_free(op) and not any(
                 id(r) in used for r in op.results
             ):
                 continue
