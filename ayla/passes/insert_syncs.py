@@ -15,7 +15,6 @@ from ..gpu_dialect import (
     KernelOp,
     LockType,
     ModuleOp,
-    lock_has_tma_multicast,
 )
 
 
@@ -37,19 +36,8 @@ def _insert_barriers(
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
-    # Publication still owed by the lock initializations just above.
-    pending_init = BarrierScope.THREAD
     for op in block.ops:
         target = targets.get(op)
-        if pending_init != BarrierScope.THREAD and not isinstance(op, AllocOp):
-            new_ops.extend(_publication_barriers(pending_init))
-            if (
-                target is not None
-                and target.scope.leq(pending_init)
-                and op not in (barrier_syncs or {})
-            ):
-                target = None  # The publication already orders this hazard.
-            pending_init = BarrierScope.THREAD
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
                 raise NotImplementedError(
@@ -77,10 +65,8 @@ def _insert_barriers(
                 attrs=attrs,
             ))
         new_ops.append(op)
-        pending_init = pending_init.join(_lock_init_barrier(op))
         for inner in op.blocks:
             _insert_barriers(inner, targets, num_threads, barrier_syncs)
-    new_ops.extend(_publication_barriers(pending_init))
     block.ops = new_ops
 
 
@@ -104,26 +90,6 @@ def _materialize_cluster_mbars(
         barrier_syncs[op] = alloc.result()
     kernel.body.ops[0:0] = allocs
     return barrier_syncs
-
-
-def _lock_init_barrier(op: Op) -> BarrierScope:
-    """Publication barrier required by an implicitly initialized lock."""
-    lock = op.result() if isinstance(op, AllocOp) else None
-    if lock is None or not isinstance(lock.type, LockType):
-        return BarrierScope.THREAD
-    if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
-        return BarrierScope.CLUSTER
-    return BarrierScope.BLOCK if lock.type.kind == "mbar" else BarrierScope.THREAD
-
-
-def _publication_barriers(scope: BarrierScope) -> list[Op]:
-    """A CTA barrier, followed by a cluster rendezvous for cluster scope."""
-    scopes = {
-        BarrierScope.THREAD: [],
-        BarrierScope.BLOCK: [BarrierScope.BLOCK],
-        BarrierScope.CLUSTER: [BarrierScope.BLOCK, BarrierScope.CLUSTER],
-    }[scope]
-    return [BarrierOp.build(_BARRIER_OP_SCOPE[s]) for s in scopes]
 
 
 class InsertSyncs(Pass):
