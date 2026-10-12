@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Ayla's fused Muse SwiGLU MLP against ``torch.compile``."""
+"""Benchmark shape-routed Ayla Muse SwiGLU against ``torch.compile``."""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +26,7 @@ from ayla.gpu_dialect import (
     WrmemTensorType,
 )
 from ayla.gemm_collection.gemm import (
+    auto_matmul_4096_wgmma256_wg_tma_store_module,
     schedule_register_matmul,
     schedule_tiled_matmul,
 )
@@ -50,15 +51,69 @@ from benchmarks.common import (
 _HIDDEN = 6_656
 _INTERMEDIATE = 19_968
 _PACKED_INTERMEDIATE = 2 * _INTERMEDIATE
-_M_VALUES = (32, 64)
+_M_VALUES = (1, 4, 32, 64, 512, 2048)
 _OUTPUT = (
     Path(__file__).resolve().parents[1]
     / ".benchmarks/bf16_muse_swiglu.csv"
 )
 
+_LARGE_M_VALUES = (512, 2048)
 _OUTPUT_M_TILE = 64
 _OUTPUT_N_TILE = 192
 _RESIDENT_BLOCKS = 104
+
+
+def _retained_cache_policy(
+    *, keep_lhs: bool,
+) -> dict[str, dict[str, object]]:
+    if keep_lhs:
+        return {
+            "lhs": {
+                "l2_cache_hint": "evict_last",
+                "l2_promotion": "256B",
+            },
+            "rhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        }
+    return {
+        "lhs": {"l2_promotion": "256B"},
+        "rhs": {"l2_promotion": "256B"},
+        "dst": {"l2_cache_hint": "evict_first"},
+    }
+
+
+# Retained winners from the historical Muse cold-cache sweep. These are
+# benchmark choices, not general-purpose dynamic-M heuristics.
+_LARGE_M_CONFIGS: dict[tuple[int, str], dict[str, object]] = {
+    (512, "projection"): {
+        "output_m_tile": 128,
+        "output_n_tile": 208,
+        "operand_k_tile": 64,
+        "operand_stages": 4,
+        "output_tma_inner_size": None,
+        "operand_move_attrs": _retained_cache_policy(keep_lhs=True),
+        "ptx_optimization_level": 3,
+    },
+    (512, "down"): {
+        "output_m_tile": 128,
+        "output_n_tile": 208,
+        "operand_k_tile": 64,
+        "operand_stages": 4,
+        "output_tma_inner_size": None,
+        "operand_move_attrs": _retained_cache_policy(keep_lhs=False),
+        "ptx_optimization_level": 3,
+    },
+    (2048, "down"): {
+        "output_m_tile": 192,
+        "output_n_tile": 192,
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_slices": 3,
+        "output_tma_inner_size": 64,
+        "operand_move_attrs": _retained_cache_policy(keep_lhs=False),
+        "ptx_optimization_level": 2,
+    },
+}
 
 
 def _tile(
@@ -278,7 +333,7 @@ def _schedule_down_projection(
 # Muse MLP matcher and lowering exist.
 def _small_muse_swiglu_module(*, m: int) -> ModuleOp:
     """Build the benchmark-only one-wave fused Muse MLP."""
-    if m not in _M_VALUES:
+    if m not in (1, 4, 32, 64):
         raise ValueError(f"unsupported small M={m}")
     down_operand_stages = 5 if m <= 32 else 6
 
@@ -345,10 +400,91 @@ def _torch_swiglu(
     return hidden @ down_weight.T
 
 
+def _torch_projection_swiglu(
+    lhs: torch.Tensor,
+    packed_weight: torch.Tensor,
+) -> torch.Tensor:
+    projection = lhs @ packed_weight.T
+    gate = projection[:, :_INTERMEDIATE]
+    up = projection[:, _INTERMEDIATE:]
+    return torch.nn.functional.silu(gate) * up
+
+
+def _swiglu_from_projection(projection: torch.Tensor) -> torch.Tensor:
+    gate = projection[:, :_INTERMEDIATE]
+    up = projection[:, _INTERMEDIATE:]
+    return torch.nn.functional.silu(gate) * up
+
+
+def _gemm(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    config: dict[str, object],
+):
+    launcher = make_ptx_launcher(make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=m, n=n, k=k, **config,
+        ),
+    ))
+    output = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+
+    def run(lhs: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        launcher(lhs, weight, output)
+        return output
+
+    return run
+
+
+def _large_m_ayla_swiglu(m: int):
+    down = _gemm(
+        m=m,
+        n=_HIDDEN,
+        k=_INTERMEDIATE,
+        config=_LARGE_M_CONFIGS[(m, "down")],
+    )
+    if m == 2048:
+        # At M=2048 the archived Ayla projection is not profitable with the
+        # current, simplified GEMM builder. Preserve the normal backend
+        # fallback and replace only the down projection, which still wins.
+        projection_swiglu = torch.compile(
+            _torch_projection_swiglu,
+            fullgraph=True,
+            dynamic=False,
+        )
+        route = "torch_projection+ayla_m192n192_down"
+    else:
+        projection = _gemm(
+            m=m,
+            n=_PACKED_INTERMEDIATE,
+            k=_HIDDEN,
+            config=_LARGE_M_CONFIGS[(m, "projection")],
+        )
+        activation = torch.compile(
+            _swiglu_from_projection,
+            fullgraph=True,
+            dynamic=False,
+        )
+
+        def projection_swiglu(lhs, packed_weight):
+            return activation(projection(lhs, packed_weight))
+
+        route = "ayla_m128n208_projection+ayla_m128n208_down"
+
+    def run(lhs, packed_weight, down_weight):
+        return down(projection_swiglu(lhs, packed_weight), down_weight)
+
+    return run, route
+
+
 def build_ayla_swiglu(m: int):
     """Build the benchmark route selected for a supported Muse M shape."""
     if m not in _M_VALUES:
         raise ValueError(f"unsupported M={m}; expected one of {_M_VALUES}")
+    if m in _LARGE_M_VALUES:
+        return _large_m_ayla_swiglu(m)
+
     hidden = torch.empty(
         (m, _INTERMEDIATE), device="cuda", dtype=torch.bfloat16,
     )
