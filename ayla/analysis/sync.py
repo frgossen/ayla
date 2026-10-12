@@ -328,17 +328,14 @@ def _transfer_memory_effects(
             for barrier_id in ids
         }
         used_ids = live.named_barrier_ids | pending_await_ids
-        if recorded is not None and recorded.named_id is not None:
+        # A loop backedge can carry another barrier's id over this site after
+        # it was chosen; the site then takes a new one.
+        if (
+            recorded is not None
+            and recorded.named_id is not None
+            and recorded.named_id not in used_ids
+        ):
             named_id = recorded.named_id
-            # TODO: Insert or upgrade to a full-block sync when a loop backedge
-            # keeps this named barrier live, instead of rejecting the program.
-            assert named_id not in used_ids, (
-                f"named barrier {named_id} remains in use across a loop "
-                f"backedge before {op}; named barriers are only released by a "
-                "full-block sync or their mbar await, so add a full-block sync "
-                "before the backedge; "
-                f"pending awaits={live.named_barrier_ids_pending_await}"
-            )
         if named_id is None:
             # A barrier can first become necessary on a later loop-fixpoint
             # iteration. Do not let it steal an id already assigned to another

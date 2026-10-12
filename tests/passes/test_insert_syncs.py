@@ -671,3 +671,56 @@ def test_full_block_sync_releases_all_named_barrier_ids():
         'barrier() attrs={scope: "block"}',
         'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',
     ]
+
+
+def test_named_barrier_ids_account_for_loop_carried_handoffs():
+    # Each refill's barrier stays in use until its stage's mbar await. The
+    # stage-1 refill at the end of the body is still pending when the next
+    # iteration refills stage 2, so those two may not share an id, even though
+    # the stage-2 barrier is released before the stage-1 barrier is reached.
+    acc = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+
+    def load(stage: int) -> str:
+        return (
+            f"async(%l{stage}: lock<mbar>) move(%s{stage}: smem<64x64xbf16>, "
+            f"%g: gmem<64x64xbf16>) attrs={{tma: True}}"
+        )
+
+    def compute(stage: int) -> str:
+        return (
+            f"await(%l{stage}: lock<mbar>)\n"
+            f"matmul(%s{stage}: smem<64x64xbf16>, %s{stage}: smem<64x64xbf16>, "
+            f"%acc: {acc}) collective=[xy.block, z.thread]"
+        )
+
+    body = "\n".join([
+        compute(0), load(2), compute(1), load(0), compute(2), load(1),
+    ])
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @test(%g: gmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %s0: smem<64x64xbf16> = alloc()
+            %s1: smem<64x64xbf16> = alloc()
+            %s2: smem<64x64xbf16> = alloc()
+            %acc: {acc} = alloc() attrs={{init: 0.0}}
+            %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            %l2: lock<mbar> = alloc()
+        """) + textwrap.indent(
+        "\n".join([
+            load(2), compute(2), load(0), load(1),
+            "for (%k: index = 0 to 4) {",
+            textwrap.indent(body, "  "),
+            "}",
+        ]),
+        " " * 4,
+    ) + "\n  }\n}")  # noqa: E501
+
+    insert_syncs(module)
+
+    ids = [
+        barrier.attrs["id"]
+        for barrier in find_ops_of_type(module, BarrierOp)
+    ]
+    assert len(set(ids)) == 3
+
