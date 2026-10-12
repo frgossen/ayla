@@ -1,10 +1,7 @@
 """Routing a matmul and its epilogue through ayla under torch.compile."""
-from textwrap import dedent
-
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 from tests.testing_utils import requires_cuda
@@ -12,7 +9,7 @@ from tests.testing_utils import requires_cuda
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
-def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():
+def test_glimmer_attention_subgraph_lowers_executable_matmuls():
     def glimmer_attention_subgraph(
         attention_output,
         gate_input,
@@ -41,32 +38,28 @@ def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():
         return projected_attention
 
     num_tokens = 8
-    inputs = (
-        torch.empty(num_tokens, 32, 128, device="cuda", dtype=torch.bfloat16),
-        torch.empty(num_tokens, 6656, device="cuda", dtype=torch.bfloat16),
-        torch.empty(4096, 6656, device="cuda", dtype=torch.bfloat16),
-        torch.empty(6656, 4096, device="cuda", dtype=torch.bfloat16),
+    inputs = tuple(
+        (torch.randn(shape, device="cuda") * 0.02).to(torch.bfloat16)
+        for shape in (
+            (num_tokens, 32, 128),
+            (num_tokens, 6656),
+            (4096, 6656),
+            (6656, 4096),
+        )
     )
-    with pytest.raises(
-        InductorError,
-        match="Muse Glimmer attention subgraph lowering is not implemented",
-    ) as exc_info:
-        with inductor_config.patch(force_disable_caches=True), torch.no_grad():
-            torch.compile(
-                glimmer_attention_subgraph, dynamic=False,
-            )(*inputs)
+    expected = glimmer_attention_subgraph(*inputs)
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        actual, (code,) = run_and_get_code(
+            torch.compile(glimmer_attention_subgraph, dynamic=False), *inputs,
+        )
 
-    assert dedent("""\
-        module {
-          kernel @gated_attention_output_projection(%attention_output: gmem<8x32x128xbf16>, %gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>) {
-            %0: gmem<8x4096xbf16> = reshape(%attention_output: gmem<8x32x128xbf16>)
-            %1: gmem<8x4096xbf16> = alloc() attrs={id: 0}
-            matmul(%gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %1: gmem<8x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "gate_projection"}
-            elementwise sigmoid(%1: gmem<8x4096xbf16>, %1: gmem<8x4096xbf16>) attrs={label: "gate_activation"}
-            elementwise mul(%1: gmem<8x4096xbf16>, %1: gmem<8x4096xbf16>, %0: gmem<8x4096xbf16>) attrs={label: "gated_attention"}
-            matmul(%1: gmem<8x4096xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>) collective=xyz.grid attrs={init: 0.0, label: "output_projection"}
-          }
-        }""") in str(exc_info.value.inner_exception)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    calls = [line for line in code.splitlines() if "torch.ops.ayla" in line]
+    assert len(calls) == 2
+    assert "dynamic_m_matmul_n4096_k6656_out" in calls[0]
+    assert "dynamic_m_matmul_n6656_k4096_out" in calls[1]
+    assert "# ayla nodes: mm" in code
+    assert "# ayla nodes: mm_1" in code
 
 
 @requires_cuda

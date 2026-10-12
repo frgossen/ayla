@@ -94,6 +94,24 @@ def make_dynamic_m_matmul(
     namespace: str = DEFAULT_NAMESPACE,
 ):
     """Create an exact-shape cached ``op(lhs, rhs) -> out`` GEMM."""
+    compiler = _make_dynamic_m_matmul_compiler(n, k, name=name)
+
+    operands = [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    return torch_custom_call.make_torch_custom_call(
+        compiler,
+        operands,
+        namespace=namespace,
+        infer_result_shapes=lambda lhs, _rhs: [(lhs.shape[0], n)],
+    )
+
+
+def _make_dynamic_m_matmul_compiler(
+    n: int,
+    k: int,
+    *,
+    name: str | None = None,
+) -> ShapeSpecializingJITCompiler:
+    """Create the cached compiler shared by functional and out calls."""
     module = dynamic_m_matmul_template(n, k, name=name)
 
     def compile_specialization(module: ModuleOp):
@@ -110,11 +128,22 @@ def make_dynamic_m_matmul(
         kernel = make_ptx_kernel(scheduled)
         return ptx_runtime.make_ptx_launcher(kernel)
 
-    compiler = ShapeSpecializingJITCompiler(module, compile_specialization)
-    operands = [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+    return ShapeSpecializingJITCompiler(module, compile_specialization)
+
+
+def make_dynamic_m_matmul_out(
+    n: int,
+    k: int,
+    *,
+    name: str | None = None,
+    namespace: str = DEFAULT_NAMESPACE,
+):
+    """Create an exact-shape cached ``op(lhs, rhs, out)`` GEMM."""
+    op_name = name or f"dynamic_m_matmul_n{n}_k{k}_out"
+    compiler = _make_dynamic_m_matmul_compiler(n, k, name=op_name)
     return torch_custom_call.make_torch_custom_call(
         compiler,
-        operands,
+        [OperandKind.R, OperandKind.R, OperandKind.RW],
         namespace=namespace,
-        infer_result_shapes=lambda lhs, _rhs: [(lhs.shape[0], n)],
+        name=op_name,
     )
