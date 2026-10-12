@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Set
 from typing import cast
 
 from ..base.ir import (
@@ -164,51 +165,48 @@ def _narrow_collective(
     return result
 
 
+def refine_operand_tiling_schemes(
+    existing_schemes: list[int | None],
+    operand_varying_dims: dict[int, Set[int]],
+    bounds: dict[int, int],
+    *,
+    allow_initialize: bool,
+) -> list[int | None]:
+    """Keep operand schemes only while their tiles remain disjoint."""
+    partitioned_dims = {dim for dim, bound in bounds.items() if bound > 1}
+    schemes = list(existing_schemes)
+    for operand_index, dims in operand_varying_dims.items():
+        if not partitioned_dims <= dims:
+            schemes[operand_index] = None
+        elif schemes[operand_index] is None and allow_initialize:
+            schemes[operand_index] = MemoryEffect.fresh_tiling_scheme_id()
+    return schemes
+
+
 def _refine_tiling_schemes(
     hero: ReduceOp,
     bounds: dict[int, int],
-) -> dict[int, int]:
+) -> list[int | None]:
     """Retain each operand's ID while its tiled accesses stay disjoint."""
     src_type = hero.src.type
     assert isinstance(src_type, MemTensorType)
-    operand_dims = {
+    operand_varying_dims: dict[int, Set[int]] = {
         1: frozenset(range(src_type.rank)),
         0: frozenset(range(src_type.rank - 1)),
     }
-    partitioned_dims = {
-        dim for dim, bound in bounds.items() if bound > 1
-    }
-    disjoint_operands = [
-        operand_index
-        for operand_index, dims in operand_dims.items()
-        if partitioned_dims <= dims
-    ]
-
-    existing = {
-        operand_index: scheme_id
-        for operand_index, scheme_id in enumerate(cast(
-            list[int | None], hero.attrs.get("operand_tiling_scheme", []),
-        ))
-        if scheme_id is not None
-    }
-    if existing:
-        return {
-            operand_index: scheme_id
-            for operand_index, scheme_id in existing.items()
-            if operand_index in disjoint_operands
-        }
-
-    can_initialize = (
+    operand_tiling_scheme = cast(
+        list[int | None], hero.attrs.get("operand_tiling_scheme", [None, None]),
+    )
+    allow_initialize = (
         is_grid_collective(hero.collective)
         and find_ancestor_of_type(hero, ForOp) is None
     )
-    if not can_initialize:
-        return {}
-
-    return {
-        operand_index: MemoryEffect.fresh_tiling_scheme_id()
-        for operand_index in disjoint_operands
-    }
+    return refine_operand_tiling_schemes(
+        operand_tiling_scheme,
+        operand_varying_dims,
+        bounds,
+        allow_initialize=allow_initialize,
+    )
 
 
 class TileReduce(LoweringPass):
@@ -427,8 +425,14 @@ class TileReduce(LoweringPass):
             assert partial is not None
             partial_attrs = hero.extra_attrs
             partial_attrs.pop("operand_tiling_scheme", None)
-            if 1 in tiling_schemes:
-                partial_attrs["operand_tiling_scheme"] = [None, tiling_schemes[1]]
+            partial_tiling_schemes = [None, tiling_schemes[1]]
+            if (
+                not self.vector_accumulation
+                and find_ancestor_of_type(hero, ForOp) is None
+            ):
+                partial_tiling_schemes[0] = MemoryEffect.fresh_tiling_scheme_id()
+            if any(scheme is not None for scheme in partial_tiling_schemes):
+                partial_attrs["operand_tiling_scheme"] = partial_tiling_schemes
             label = partial_attrs.get("label")
             if isinstance(label, str):
                 partial_attrs["label"] = f"{label}_partial"
@@ -456,18 +460,11 @@ class TileReduce(LoweringPass):
             {"collective": final_reduction_collectiveness},
         )
         final_reduce.attrs.pop("operand_tiling_scheme", None)
-        final_operand_indices = (
-            (0,) if reduction_dim is not None else (0, 1)
-        )
-        final_tiling_schemes = {
-            operand_index: tiling_schemes[operand_index]
-            for operand_index in final_operand_indices
-            if operand_index in tiling_schemes
-        }
-        if final_tiling_schemes:
-            final_reduce.attrs["operand_tiling_scheme"] = [
-                final_tiling_schemes.get(i) for i in range(2)
-            ]
+        final_tiling_schemes = list(tiling_schemes)
+        if reduction_dim is not None:
+            final_tiling_schemes[1] = None
+        if any(scheme is not None for scheme in final_tiling_schemes):
+            final_reduce.attrs["operand_tiling_scheme"] = final_tiling_schemes
         parallel_body_insertion_point.append(final_reduce)
 
         # Rewrite the epilogue.
