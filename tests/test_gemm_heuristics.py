@@ -206,17 +206,18 @@ def test_swapped_grid_winner_routes_existing_builder_controls():
     )
 
 
-def test_two_dimensional_warpgroup_winner_is_preserved():
+def test_fixed_grid_addmm_winner_is_preserved():
     selection = select_gemm_schedules(
         4096, 2304, 768, operation="addmm",
     )
     seed = next(
         seed for seed in selection.seeds
-        if seed.captured_config.get("warpgroup_m_tile") is not None
+        if seed.captured_config.get("output_cta_count") == 132
     )
 
     assert seed.builder_config is not None
-    assert seed.builder_config["warpgroup_m_tile"] == 64
+    assert seed.builder_config["output_grid_size"] == 132
+    assert seed.builder_config.get("warpgroup_m_tile") is None
 
 
 def test_group_five_family_routes_existing_builder_controls():
