@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from functools import cache
 from importlib.resources import files
@@ -22,6 +23,7 @@ class GemmScheduleSeed:
     post_builder_passes: tuple[str, ...] = ()
     transpose_output: bool = False
     fixed_output_unroll_factor: int | None = None
+    pipeline_output_waves: bool = False
 
 
 @dataclass(frozen=True)
@@ -35,10 +37,46 @@ def apply_gemm_schedule_seed_post_build(
     module: Any, seed: GemmScheduleSeed,
 ) -> Any:
     """Apply the measured post-builder pass sequence required by ``seed``."""
-    if (
+    if seed.pipeline_output_waves:
+        if (
+            seed.fixed_output_unroll_factor is not None
+            or seed.builder_config is None
+            or seed.builder_config.get("output_grid_size") is None
+        ):
+            raise ValueError("wave pipelining requires a rolled fixed grid")
+        from .base.ir import find_ancestor_of_type, find_ops_of_type
+        from .gpu_dialect import AsyncOp, AwaitOp, ForOp
+        from .passes.canonicalize import Canonicalize
+        from .passes.pipeline_loop import PipelineLoop
+        from .passes.schedule_async import ScheduleAsync
+
+        outer_loops = [
+            loop for loop in find_ops_of_type(module, ForOp)
+            if find_ancestor_of_type(loop, ForOp) is None
+        ]
+        if len(outer_loops) != 1:
+            raise ValueError("wave pipelining requires one outer tile loop")
+        outer_loops[0].attrs["label"] = "heuristic_output_grid"
+        for body_op in outer_loops[0].body.ops:
+            if isinstance(body_op, AwaitOp):
+                break
+            if isinstance(body_op, AsyncOp) and re.fullmatch(
+                r"mm_(lhs|rhs)_smem_iter\d+_async",
+                str(body_op.attrs.get("label", "")),
+            ):
+                body_op.attrs["label"] = "heuristic_wave_prologue_async"
+        module = PipelineLoop(
+            label_filter_loop="heuristic_output_grid",
+            label_filter_op=r"heuristic_wave_prologue_async",
+            pipelining_offset=1,
+        ).run(module)
+        module = ScheduleAsync().run(module)
+        module = Canonicalize().run(module)
+    output_was_unrolled = (
         seed.fixed_output_unroll_factor is not None
         and seed.fixed_output_unroll_factor > 1
-    ):
+    )
+    if output_was_unrolled:
         from .base.ir import find_ancestor_of_type, find_ops_of_type
         from .gpu_dialect import ForOp
         from .passes.canonicalize import Canonicalize
@@ -61,13 +99,13 @@ def apply_gemm_schedule_seed_post_build(
             label_filter="heuristic_output_grid",
         ).run(module)
         module = Canonicalize().run(module)
-    if not seed.post_builder_passes:
-        return module
     expected = ("schedule_async", "canonicalize")
-    if seed.post_builder_passes != expected:
+    if seed.post_builder_passes and seed.post_builder_passes != expected:
         raise ValueError(
             f"unsupported GEMM post-builder passes: {seed.post_builder_passes}"
         )
+    if not output_was_unrolled and not seed.post_builder_passes:
+        return module
     # Keep pass imports lazy so selecting a heuristic remains lightweight.
     from .passes.canonicalize import Canonicalize
     from .passes.schedule_async import ScheduleAsync
@@ -372,6 +410,9 @@ def _adapt_config(
     }
     if preferred_ctas is not None:
         builder["output_grid_size"] = ctas
+        builder["output_grid_fast_axis"] = captured.get(
+            "output_tile_fast_axis", "n",
+        )
     if captured.get("swap_output_grid_axes") is True:
         builder["output_grid_axes"] = (
             CollectiveAxis.Y, CollectiveAxis.X,
@@ -510,6 +551,9 @@ def select_gemm_schedules(
             ),
             transpose_output=transpose_output,
             fixed_output_unroll_factor=unroll_factor,
+            pipeline_output_waves=bool(
+                captured.get("pipeline_output_waves", False)
+            ),
         ))
 
     if not any(seed.builder_config is not None for seed in seeds):
