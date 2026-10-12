@@ -5,6 +5,7 @@ import pytest
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     AsyncOp,
+    AwaitOp,
     BarrierOp,
     CollectiveAxis,
     CollectiveLevel,
@@ -178,6 +179,18 @@ def test_async_and_body_collectives_must_match():
 
     with pytest.raises(ValueError, match="async collective must match"):
         verify_gpu_dialect(module)
+
+
+@pytest.mark.parametrize(
+    "kind,pending",
+    [("wgmma", -1), ("wgmma", "one"), ("mbar", 1), ("wgmma", 8)],
+)
+def test_await_pending_count_matches_the_async_queue(kind, pending):
+    lock = Value(name="lock", type=LockType.build(kind))
+    await_op = AwaitOp(operands=[lock], results=[], attrs={"pending": pending})
+
+    with pytest.raises(ValueError, match="pending count must be an integer in"):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[await_op])))
 
 
 def test_default_verification_rejects_inconsistent_matmul_shapes():

@@ -212,6 +212,44 @@ def test_configurable_tma_gemm_supports_fp16():
     assert ".f32.bf16.bf16" not in kernel.ptx
 
 
+def test_cyclic_wgmma_pipeline_reaches_ptx():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=128,
+            n=256,
+            k=1024,
+            operand_stages=4,
+            cyclic_operand_pipeline=True,
+            output_slices=2,
+        )
+    )
+
+    assert "wgmma.wait_group.sync.aligned 1;" in kernel.ptx
+
+
+@requires_cuda
+def test_cyclic_wgmma_pipeline_matches_torch():
+    m, n, k = 128, 256, 1024
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        operand_stages=4,
+        cyclic_operand_pipeline=True,
+        output_slices=2,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(17)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))
+
+
 @requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128

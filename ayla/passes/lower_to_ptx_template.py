@@ -1381,9 +1381,8 @@ class LowerToPtxTemplate(LoweringPass):
         # the smem operands have retired. The buffer-reuse WAR (thread-0's TMA
         # reload vs those reads) is handled by insert_syncs, which emits a barrier
         # before the reload — so no barrier is needed here.
-        template = textwrap.dedent(r"""
-            wgmma.wait_group.sync.aligned 0;
-        """)
+        pending = cast(int, op.attrs.get("pending", 0))
+        template = f"wgmma.wait_group.sync.aligned {pending};\n"
         new_op = PTXTemplateOp.build(
             operands=[],
             result_types=[],
