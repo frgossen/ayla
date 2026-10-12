@@ -19,6 +19,7 @@ from ayla.gpu_dialect import (
 )
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.tile_matmul import tile_matmul
+from ayla.passes.unroll_loop import UnrollLoop
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -379,6 +380,35 @@ def test_smaller_block_grid_still_conflicts_without_linearization():
             for_loop_labels=[None],
             op_label_filter="mm",
         )
+
+
+def test_grid_stride_loop_reuses_dimension_label_for_unrolling():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))  # noqa: E501
+    binding = (CollectiveLevel.BLOCK, CollectiveAxis.X)
+
+    tile_matmul(
+        module,
+        op_dims=["M", "N"], tile_sizes=[64, 64],
+        iteration_bindings=[binding, binding],
+        for_loop_labels=["outmn", None],
+        op_label_filter="mm",
+    )
+
+    [loop] = find_ops_of_type(module, ForOp)
+    assert loop.attrs["label"] == "outmn"
+    module = UnrollLoop(
+        unroll_factor=loop.trip_count,
+        label_filter="outmn",
+    ).run(module)
+    module = Canonicalize().run(module)
+
+    assert not find_ops_of_type(module, ForOp)
+    assert len(find_ops_of_type(module, MatmulOp)) == 4
 
 
 def test_block_x_tiling_sets_an_unconstrained_grid():

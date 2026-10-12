@@ -110,8 +110,9 @@ class TileMatmul(LoweringPass):
         be larger than the logical tile count; excess workers are guarded. A
         smaller block grid visits the remaining logical tiles with a
         grid-stride loop.
-      - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
-        ``None`` for an iteration mapped to a hardware dimension.
+      - ``for_loop_labels[i]``: the label for a generated ``for`` loop. For
+        dimensions sharing an underprovisioned hardware binding, the first
+        dimension's label names the resulting grid-stride loop.
 
     Nesting order is outer→inner along the list.
 
@@ -175,10 +176,6 @@ class TileMatmul(LoweringPass):
             f"{len(tile_sizes)}, {len(iteration_bindings)}, "
             f"{len(for_loop_labels)}"
         )
-        assert all(
-            binding is None or label is None
-            for binding, label in zip(iteration_bindings, for_loop_labels)
-        ), "TileMatmul: only sequential iterations may have loop labels"
         parallel_bindings = [
             binding for binding in iteration_bindings if binding is not None
         ]
@@ -405,7 +402,12 @@ class TileMatmul(LoweringPass):
                 )
             assert binding[0] == CollectiveLevel.BLOCK
             waves[binding] = -(-logical_extent // launch_extent)
-            grid_stride = ForOp.build(lb=0, ub=waves[binding])
+            # The first dimension sharing the binding names the loop.
+            label = self.for_loop_labels[self.iteration_bindings.index(binding)]
+            grid_stride = ForOp.build(
+                lb=0, ub=waves[binding],
+                attrs={"label": label} if label is not None else None,
+            )
             stride = IndexConstantOp.build(launch_extent)
             offset = IndexMulOp.build(grid_stride.iv, stride.result())
             advanced = IndexAddOp.build(linear_ids[binding], offset.result())
