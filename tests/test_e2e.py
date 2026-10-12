@@ -2,6 +2,7 @@
 import json
 import textwrap
 
+import pytest
 import torch
 
 from ayla.base.pipeline import Pipeline
@@ -14,6 +15,25 @@ from ayla.passes.unroll_loop import UnrollLoop
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
+
+
+@requires_cuda
+@pytest.mark.parametrize("m", [32, 64])
+def test_muse_swiglu_benchmark_route_matches_torch(m: int):
+    """Exercise the full benchmark route until torch.compile owns it."""
+    from benchmarks.benchmark_bf16_muse_swiglu import (
+        _check,
+        _inputs,
+        _torch_swiglu,
+        build_ayla_swiglu,
+    )
+
+    inputs = _inputs(m)
+    expected = _torch_swiglu(*inputs)
+    ayla_swiglu, _ = build_ayla_swiglu(m)
+    actual = ayla_swiglu(*inputs)
+    torch.cuda.synchronize()
+    _check("Ayla benchmark route", actual, expected)
 
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(
