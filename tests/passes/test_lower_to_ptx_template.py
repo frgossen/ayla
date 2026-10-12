@@ -357,6 +357,9 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
         < ptx.index(wait)
     )
     assert ptx.count(multicast) == 1
+    # The issue is predicated on one elected thread, not branched around.
+    assert "@${pred:multicast_issue} cp.async.bulk.tensor" in ptx
+    assert "after_multicast" not in ptx and "after_load" not in ptx
     assert (
         "[${b32:operand.lock.val}], 3, "
         "${b64:operand.cache_policy0.ptr};"
