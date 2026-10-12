@@ -17,10 +17,10 @@ single ``await``. The kind is decided by the op *inside* the async (see
   fused (no fused-store codegen, and unvalidated).
 
 Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
-the run. An already-fused (multi-op) async returns ``None`` and is left
-untouched, so the pass is idempotent. Side-effect-free ops between members (lock
-allocs, tile views) are transparent — emitted before the merged block — and the
-per-member awaits are dropped.
+the run. An already-fused (multi-op) async, or a singleton whose await has been
+moved away by scheduling, is left untouched, so the pass is idempotent.
+Side-effect-free ops between members (lock allocs, tile views) are transparent
+— emitted before the merged block — and the per-member awaits are dropped.
 
 **Placement matters** (caller's responsibility): fuse TMA loads *before*
 pipelining, while each stage's loads and awaits are still adjacent. After
@@ -70,6 +70,22 @@ class FuseAsync(Pass):
     def run_block(self, block: Block) -> None:
         super().run_block(block)
 
+        ops = block.ops
+        awaited_locks = {
+            op.lock for op in ops if isinstance(op, AwaitOp)
+        }
+
+        def has_adjacent_await(index: int, lock: Value) -> bool:
+            """Whether the next effectful op is this async's await."""
+            for candidate in ops[index + 1:]:
+                if is_side_effect_free(candidate):
+                    continue
+                return (
+                    isinstance(candidate, AwaitOp)
+                    and candidate.lock is lock
+                )
+            return False
+
         new_ops: list[Op] = []
         group_inner: list[Op] = []
         group_lock: Value | None = None
@@ -109,8 +125,18 @@ class FuseAsync(Pass):
             group_collective = None
             in_flight_locks = set()
 
-        for op in block.ops:
+        for index, op in enumerate(ops):
             kind = _fusion_kind(op)
+            if (
+                kind is not None
+                and isinstance(op, AsyncOp)
+                and op.lock in awaited_locks
+                and not has_adjacent_await(index, op.lock)
+            ):
+                # Scheduling may deliberately move an await away from its
+                # singleton async. That pair has already been processed and
+                # cannot safely participate in a new fusion run.
+                kind = None
             if kind is not None:
                 assert isinstance(op, AsyncOp)
                 if group_kind is not None:

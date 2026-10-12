@@ -4,7 +4,7 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import schedule_matmul, schedule_register_matmul
-from ayla.gpu_dialect import AsyncOp, MoveOp, gpu_dialect
+from ayla.gpu_dialect import AsyncOp, AwaitOp, ModuleOp, MoveOp, gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
 
 
@@ -104,3 +104,36 @@ def test_register_matmul_keeps_multicast_and_local_loads_separate():
     assert len(load_groups) == 2
     assert [group.is_tma_multicast for group in load_groups] == [True, False]
     assert load_groups[0].collective != load_groups[1].collective
+
+
+def test_second_hero_ignores_an_already_pipelined_singleton():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @second_hero(%prior: gmem<64x16xbf16>, %lhs: gmem<64x16xbf16>, %rhs: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %prior_smem: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %prior_lock: lock<mbar> = alloc() attrs={id: 1}
+            await(%prior_lock: lock<mbar>)
+            async(%prior_lock: lock<mbar>) collective=xyz.block attrs={label: "prior_async"} move(%prior_smem: smem<64x16xbf16 swizzle="128B">, %prior: gmem<64x16xbf16>) collective=xyz.block attrs={label: "prior", tma: True}
+            %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2, init: 0.0}
+            matmul(%lhs: gmem<64x16xbf16>, %rhs: gmem<64x16xbf16>, %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "second"}
+          }
+        }"""))
+
+    schedule_register_matmul(
+        label="second", operand_stages=1, operand_k_tile=16,
+    ).run(module)
+
+    asyncs = find_ops_of_type(module, AsyncOp)
+    [prior] = [op for op in asyncs if op.attrs.get("label") == "prior_async"]
+    assert len(prior.body.ops) == 1
+    [prior_await] = [
+        op for op in find_ops_of_type(module, AwaitOp)
+        if op.lock is prior.lock
+    ]
+    kernel = module.body.ops[0]
+    assert kernel.body.ops.index(prior_await) < kernel.body.ops.index(prior)
+    assert any(
+        len(op.body.ops) == 2
+        and op.attrs.get("label") == "second_lhs_smem_async"
+        for op in asyncs
+    )
