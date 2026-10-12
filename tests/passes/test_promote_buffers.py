@@ -437,3 +437,39 @@ def test_epilogue_runs_on_the_promoted_accumulator():
             move(%c: gmem<64x256xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_wgrmem"}
           }
         }""")  # noqa: E501
+
+
+def test_standalone_register_writeback_is_staged_for_tma():
+    # Two accumulators feed one epilogue, so the schedule writes the result
+    # back itself; promotion still stages that move through SMEM.
+    wgrmem = 'wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @dual(%a: smem<64x16xbf16>, %b0: smem<256x16xbf16>, %b1: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {{
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
+            %gate: {wgrmem} = alloc() attrs={{init: 0.0}}
+            %up: {wgrmem} = alloc() attrs={{init: 0.0}}
+            matmul(%a: smem<64x16xbf16>, %b0: smem<256x16xbf16>, %gate: {wgrmem}) collective=[x.wg, y.block, z.thread] attrs={{label: "gate"}}
+            matmul(%a: smem<64x16xbf16>, %b1: smem<256x16xbf16>, %up: {wgrmem}) collective=[x.wg, y.block, z.thread] attrs={{label: "up"}}
+            elementwise mul(%up: {wgrmem}, %up: {wgrmem}, %gate: {wgrmem})
+            move(%c_wg: gmem<64x256xbf16 strides=[256, 1]>, %up: {wgrmem}) collective=[x.wg, y.block, z.thread] attrs={{label: "out"}}
+          }}
+        }}"""))
+    promote_buffers(
+        module, target_type="wgrmem", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, tma=True,
+        move_attrs={"dst": {"l2_cache_hint": "evict_last"}},
+        label_filter="out",
+    )
+    text = repr(module)
+    assert text.count("matmul(") == 2
+    assert 'elementwise convert(' in text
+    assert "smem<128x256xbf16> = alloc()" in text
+    assert "smem<64x256xbf16> = tile(" in text
+    assert 'attrs={label: "out_dst_smem"}' in text
+    assert "move(%c: gmem<128x256xbf16>" in text
+    assert (
+        'attrs={l2_cache_hint: "evict_last", label: "out_dst_tma", tma: True}'
+        in text
+    )
