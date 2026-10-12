@@ -3,8 +3,7 @@ import torch
 from torch.fx import Graph, Node
 
 from ayla.base.ir import find_ops_of_type
-from ayla.fx_compiler import fx_region_to_module
-from ayla.fx_pipeline import FxRegionMatch
+from ayla.fx_compiler import FxRegionMatch, fx_region_to_module
 from ayla.gpu_dialect import (
     ElementwiseOp,
     KernelOp,
