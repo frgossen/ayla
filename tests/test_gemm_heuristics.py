@@ -22,3 +22,11 @@ def test_small_cta_seed_retains_the_measured_fixed_grid():
         assert seed.builder_config["warpgroup_n_tile"] == 128
         assert seed.builder_config["output_slices"] == 8
         assert "fixed output grid" in seed.adaptations[0]
+
+
+def test_incremental_winner_preserves_existing_leaf_seeds():
+    selection = select_gemm_schedules(1152, 3072, 768)
+    names = {seed.captured_config["name"] for seed in selection.seeds}
+
+    assert "hybrid1152_s3_cy1" in names
+    assert "waveconfirm_native" in names

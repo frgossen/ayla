@@ -30,7 +30,12 @@ def _without_names(value):
     return value
 
 
-def _update(expanded: dict, paths: list[Path]) -> dict:
+def _update(
+    expanded: dict,
+    paths: list[Path],
+    *,
+    max_seeds_per_leaf: int = 3,
+) -> dict:
     def family(seed: dict) -> str:
         return json.dumps(
             _without_names(seed["configuration"]),
@@ -85,7 +90,7 @@ def _update(expanded: dict, paths: list[Path]) -> dict:
                 family(seed) not in updated_families,
                 -seed["source_percentage_of_torch"],
             ),
-        )[:3]
+        )[:max_seeds_per_leaf]
     return expanded
 
 
@@ -135,7 +140,10 @@ def main() -> int:
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("results", type=Path, nargs="*")
+    parser.add_argument("--max-seeds-per-leaf", type=int, default=3)
     args = parser.parse_args()
+    if args.max_seeds_per_leaf < 1:
+        parser.error("--max-seeds-per-leaf must be positive")
 
     source = json.loads(args.input.read_text())
     if args.mode == "expand":
@@ -148,7 +156,11 @@ def main() -> int:
         if not args.results:
             parser.error("update requires at least one result file")
         result = collapse_gemm_heuristic(
-            _update(expand_gemm_heuristic(source), args.results),
+            _update(
+                expand_gemm_heuristic(source),
+                args.results,
+                max_seeds_per_leaf=args.max_seeds_per_leaf,
+            ),
         )
         text = json.dumps(result, separators=(",", ":")) + "\n"
     else:
