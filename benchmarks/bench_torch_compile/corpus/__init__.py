@@ -10,9 +10,8 @@ from benchmarks.common import BenchConfig
 from . import gemm_sigmoid, muse_glimmer_block
 
 
-def build_configs() -> list[BenchConfig]:
-    """Every config in the corpus."""
-    return [
-        *gemm_sigmoid.build_configs(),
-        *muse_glimmer_block.build_configs(),
-    ]
+def build_configs(*, muse_num_tokens: int | None = None) -> list[BenchConfig]:
+    """The supported GEMM cases, or one captured block at its input shape."""
+    if muse_num_tokens is not None:
+        return [muse_glimmer_block.build_config(muse_num_tokens)]
+    return gemm_sigmoid.build_configs()

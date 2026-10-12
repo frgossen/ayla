@@ -138,11 +138,25 @@ def _block_body(arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1, arg7_1, 
     return (cat_1, view_12, cat, view_10, convert_element_type_21, add_8)
 
 
-_DECODE_M = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-_PREFILL_M = (512, 2048, 4096, 8192)
+def build_config(num_tokens: int) -> BenchConfig:
+    """Build the captured block for one concrete input shape."""
+    def compare_outputs(actual, expected) -> None:
+        # Output 3 is storage allocated with aten.empty for a cache update
+        # outside this captured block, so its contents are intentionally
+        # undefined here.
+        for index, (got, want) in enumerate(zip(actual, expected, strict=True)):
+            if index == 3:
+                continue
+            difference = got.float() - want.float()
+            relative_rms = (
+                difference.square().mean().sqrt()
+                / want.float().square().mean().sqrt()
+            )
+            if not torch.isfinite(relative_rms) or relative_rms > 5e-3:
+                raise AssertionError(
+                    f"output {index}: relative RMS error {float(relative_rms)}"
+                )
 
-
-def _build_config(num_tokens: int, phase: str) -> BenchConfig:
     def make_inputs() -> list[torch.Tensor | int]:
         torch.manual_seed(0)
         return [
@@ -170,15 +184,8 @@ def _build_config(num_tokens: int, phase: str) -> BenchConfig:
         ]
 
     return BenchConfig(
-        name=f"muse_glimmer_block {phase} M={num_tokens} bf16",
+        name=f"muse_glimmer_block M={num_tokens} bf16",
         make_inputs=make_inputs,
         compute=_block_body,
+        compare_outputs=compare_outputs,
     )
-
-
-def build_configs() -> list[BenchConfig]:
-    """What this module contributes to the corpus."""
-    return [
-        *(_build_config(m, "decode") for m in _DECODE_M),
-        *(_build_config(m, "prefill") for m in _PREFILL_M),
-    ]
