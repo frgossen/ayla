@@ -61,20 +61,25 @@ def test_swapped_n_grouped_winner_routes_existing_builder_controls():
     )
 
 
-def test_swapped_m_grouped_winners_route_existing_builder_controls():
+def test_256_thread_m_grouped_winners_route_existing_builder_controls():
     for shape, group in (
-        ((6272, 1280, 320), 3),
+        ((50265, 1024, 512), 6),
+        ((6272, 1280, 320), 2),
         ((16448, 512, 1536), 2),
     ):
         selection = select_gemm_schedules(*shape)
         seed = next(
             seed for seed in selection.seeds
-            if seed.captured_config["name"] == "exactstatic_swap1"
+            if seed.source_shape == shape
+            and seed.captured_config["output_m_tile"] == 128
+            and seed.captured_config["output_n_tile"] == 256
+            and seed.captured_config["swap_output_grid_axes"] is True
         )
 
         assert seed.builder_config is not None
         assert seed.builder_config["output_m_tiles_per_cta"] == group
         assert seed.builder_config["output_n_tiles_per_cta"] == 1
+        assert seed.builder_config["cyclic_operand_pipeline"] is True
         assert seed.builder_config["output_grid_axes"] == (
             CollectiveAxis.Y, CollectiveAxis.X,
         )
