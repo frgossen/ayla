@@ -309,19 +309,15 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(AwaitOp)
     def _verify_await(self, op: AwaitOp) -> None:
-        if len(op.operands) != 1 or not isinstance(
-            op.operands[0].type, LockType,
-        ):
-            raise ValueError("await expects exactly one lock operand")
-        pending = op.attrs.get("pending", 0)
-        if type(pending) is not int or pending < 0:
-            raise ValueError("await pending count must be a non-negative integer")
-        lock_type = op.operands[0].type
+        lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
-        if pending and not lock_type.supports_partial_await:
-            raise ValueError("pending async groups require a WGMMA lock")
-        if pending > 7:
-            raise ValueError("WGMMA pending async count must be in [0, 7]")
+        pending = op.attrs.get("pending", 0)
+        limit = 7 if lock_type.supports_partial_await else 0
+        if type(pending) is not int or not 0 <= pending <= limit:
+            raise ValueError(
+                f"await pending count must be an integer in [0, {limit}] for "
+                f"a {lock_type.kind} lock; got {pending!r}"
+            )
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:

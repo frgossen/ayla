@@ -25,7 +25,7 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
 )
-from ..base.ir import Op, Value
+from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 

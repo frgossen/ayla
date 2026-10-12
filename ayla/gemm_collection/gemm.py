@@ -91,19 +91,11 @@ def schedule_register_matmul(
     pipeline.add_pass(FuseAsync())
     pipeline.add_pass(LICM())
     pipeline.add_pass(Canonicalize())
-    if cyclic_operand_pipeline:
-        pipelined_stages = "|".join(
-            str(stage)
-            for stage in range(operand_stages - 1)
-        )
-        load_filter = (
-            rf"{label}_(lhs|rhs)_smem_iter(?:{pipelined_stages})_async"
-        )
-    else:
-        load_filter = rf"{label}_(lhs|rhs)_smem_iter\d+_async"
+    # A cyclic pipeline leaves the last stage's loads to the queued wgmma ring.
+    stages = "|".join(map(str, range(operand_stages - cyclic_operand_pipeline)))
     pipeline.add_pass(PipelineLoop(
         label_filter_loop=k_label,
-        label_filter_op=load_filter,
+        label_filter_op=rf"{label}_(lhs|rhs)_smem_iter(?:{stages})_async",
         pipelining_offset=1,
     ))
     pipeline.add_pass(UnrollLoop(

@@ -73,8 +73,9 @@ class PipelineLoop(LoweringPass):
         around to the last stage from the prior loop iteration.  A full wait
         after the loop drains the final outstanding issue.
         """
-        waits: list[AwaitOp] = []
-        for issue in selected:
+        replacements: dict[Op, Op] = {}
+        previous_issues = [selected[-1], *selected[:-1]]
+        for previous, issue in zip(previous_issues, selected, strict=True):
             matching = [
                 user for user in issue.lock.users()
                 if isinstance(user, AwaitOp) and user.parent_block is op.body
@@ -84,15 +85,10 @@ class PipelineLoop(LoweringPass):
                     "Pipeline: queued async issue must have exactly one "
                     "await in the same loop body"
                 )
-            waits.append(matching[0])
-
-        replacements = {
-            wait: AwaitOp.build(
-                selected[index - 1].lock,
-                attrs={**wait.attrs, "pending": 1},
+            [wait] = matching
+            replacements[wait] = AwaitOp.build(
+                previous.lock, attrs={**wait.attrs, "pending": 1},
             )
-            for index, wait in enumerate(waits)
-        }
         op.body.ops = [
             replacements.get(body_op, body_op) for body_op in op.body.ops
         ]
@@ -319,19 +315,16 @@ class PipelineLoop(LoweringPass):
             if isinstance(body_op, AsyncOp)
             and label_matches(body_op, self.label_filter_op)
         ]
-        if selected_async:
-            if not all(
-                isinstance(issue.lock.type, LockType)
-                and issue.lock.type.supports_partial_await
-                for issue in selected_async
-            ):
-                selected_async = []
-            elif self.pipelining_offset != 1:
+        if selected_async and all(
+            isinstance(issue.lock.type, LockType)
+            and issue.lock.type.supports_partial_await
+            for issue in selected_async
+        ):
+            if self.pipelining_offset != 1:
                 raise ValueError(
                     "Pipeline: queued async completion requires offset one"
                 )
-            else:
-                return self._pipeline_queued_async(op, selected_async)
+            return self._pipeline_queued_async(op, selected_async)
 
         labeled_set, shared_set = self._compute_labeled_and_shared(body_ops)
         labeled = [o for o in body_ops if o in labeled_set]
@@ -389,8 +382,4 @@ def pipeline_loop(
     pipelining_offset: int,
 ) -> ModuleOp:
     """Convenience entry point."""
-    return PipelineLoop(
-        label_filter_loop,
-        label_filter_op,
-        pipelining_offset,
-    ).run(module)
+    return PipelineLoop(label_filter_loop, label_filter_op, pipelining_offset).run(module)
