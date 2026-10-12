@@ -259,7 +259,7 @@ def test_codegen_naive_matmul_4096():
           cvt.u64.u32 %rd17, %r15;
           add.u64 %rd16, %rd10, %rd17;  // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + %r2 * 32768 + %r3 * 8
 
-          // PTX template `%c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}`
+          // PTX template `%c_thread_rmem: rmem<2x2xf32> = alloc() attrs={init: 0.0}`
           mov.f32 %f0, 0f00000000;
           mov.f32 %f1, 0f00000000;
           mov.f32 %f2, 0f00000000;
@@ -276,13 +276,13 @@ def test_codegen_naive_matmul_4096():
           cvt.u64.u32 %rd21, %r18;
           add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r3 * 32768 + %r16 * 4
 
-          // PTX template `%a_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 1}`
+          // PTX template `%a_k_rmem: rmem<2x1xf32> = alloc() attrs={}`
 
           // PTX template `move(%a_k_rmem: rmem<2x1xf32>, %a_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc:...`
           ld.global.nc.f32 %f4, [%rd18+0];
           ld.global.nc.f32 %f5, [%rd18+16384];
 
-          // PTX template `%b_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 2}`
+          // PTX template `%b_k_rmem: rmem<2x1xf32> = alloc() attrs={}`
 
           // PTX template `move(%b_k_rmem: rmem<2x1xf32>, %b_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc:...`
           ld.global.nc.f32 %f6, [%rd20+0];
