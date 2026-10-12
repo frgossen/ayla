@@ -86,10 +86,7 @@ def test_256_thread_m_grouped_winners_route_existing_builder_controls():
 
 
 def test_additional_swapped_m_groups_route_existing_builder_controls():
-    for shape, group in (
-        ((30522, 768, 2048), 6),
-        ((9521, 512, 7936), 2),
-    ):
+    for shape, group in (((9521, 512, 7936), 2),):
         selection = select_gemm_schedules(*shape)
         seed = next(
             seed for seed in selection.seeds
@@ -122,3 +119,21 @@ def test_large_shape_static_groups_route_existing_builder_controls():
         assert seed.builder_config["output_m_tiles_per_cta"] == m_group
         assert seed.builder_config["output_n_tiles_per_cta"] == n_group
         assert seed.builder_config["ptx_optimization_level"] == 1
+
+
+def test_30522_group_five_family_routes_existing_builder_controls():
+    for k in (2048, 4096, 8192):
+        shape = (30522, 768, k)
+        selection = select_gemm_schedules(*shape)
+        seed = next(
+            seed for seed in selection.seeds
+            if seed.captured_config["output_m_tile"] == 192
+            and seed.captured_config["output_n_tile"] == 192
+        )
+
+        assert seed.builder_config is not None
+        assert seed.builder_config["output_m_tiles_per_cta"] == 5
+        assert seed.builder_config["output_n_tiles_per_cta"] == 1
+        assert seed.builder_config["output_grid_axes"] == (
+            CollectiveAxis.Y, CollectiveAxis.X,
+        )
