@@ -159,6 +159,96 @@ def test_tile_reduce_combines_parallel_and_reduction_dimensions():
         }""")  # noqa: E501
 
 
+def test_tile_reduce_vector_accumulation_into_block_tiled_wrmem():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x1024xf32>) grid_dim=[8, None, None] {
+            %bx: index = block_id.x
+            %c8: index = index_constant() attrs={value: 8}
+            %0: index = index_mod(%bx: index, %c8: index)
+            %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
+            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
+            reduce sum(%2: wrmem<1x1xf32 layout="blocked">, %1: gmem<1x1024xf32>) collective=[x.block, yz.grid] attrs={label: "mean"}
+          }
+        }"""))
+
+    module = tile_reduce(
+        module,
+        tile_sizes={1: 128},
+        parallel_iteration_space=None,
+        hero_label_filter="mean",
+        vector_accumulation=True,
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x1024xf32>) grid_dim=[8, None, None] {
+            %bx: index = block_id.x
+            %c8: index = index_constant() attrs={value: 8}
+            %0: index = index_mod(%bx: index, %c8: index)
+            %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
+            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
+            %3: wrmem<1x128xf32 layout="blocked"> = alloc() attrs={id: 0, init: 0.0}
+            for (%4: index = 0 to 8) attrs={label: "d1"} {
+              %5: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %4: index)
+              reduce sum(%3: wrmem<1x128xf32 layout="blocked">, %5: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
+            }
+            reduce sum(%2: wrmem<1x1xf32 layout="blocked">, %3: wrmem<1x128xf32 layout="blocked">) collective=[x.block, yz.grid] attrs={label: "mean"}
+          }
+        }""")  # noqa: E501
+
+
+def test_tile_reduce_across_block_dimensions():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x1024xf32>, %output: gmem<8x1xf32>) {
+            reduce sum(%output: gmem<8x1xf32>, %src: gmem<8x1024xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
+          }
+        }"""))
+
+    module = tile_reduce(
+        module,
+        tile_sizes={0: 1},
+        parallel_iteration_space=(
+            CollectiveLevel.BLOCK, CollectiveAxis.X,
+        ),
+        hero_label_filter="mean",
+    )
+    module = Canonicalize().run(module)
+
+    # TODO: Keep buffer promotion separate from tiling. Resolve gmem
+    # allocations later through buffer promotion, buffer reuse, or extra
+    # scratch gmem kernel arguments that effectively implement gmem allocation.
+    module = tile_reduce(
+        module,
+        tile_sizes={1: 128},
+        parallel_iteration_space=(
+            CollectiveLevel.BLOCK, CollectiveAxis.Y,
+        ),
+        hero_label_filter="mean",
+    )
+    module = Canonicalize().run(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x1024xf32>, %output: gmem<8x1xf32>) grid_dim=[8, 8, None] {
+            %bx: index = block_id.x
+            %c8: index = index_constant() attrs={value: 8}
+            %0: index = index_mod(%bx: index, %c8: index)
+            %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
+            %2: gmem<1x1xf32> = tile(%output: gmem<8x1xf32>, %0: index, 0)
+            %3: gmem<8x8xf32> = alloc() attrs={id: 0, init: 0.0}
+            %4: gmem<1x8xf32> = tile(%3: gmem<8x8xf32>, %0: index, 0)
+            %by: index = block_id.y
+            %5: index = index_mod(%by: index, %c8: index)
+            %6: gmem<1x1xf32 strides=[8, 1]> = tile(%4: gmem<1x8xf32>, 0, %5: index)
+            %7: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %5: index)
+            reduce sum(%6: gmem<1x1xf32 strides=[8, 1]>, %7: gmem<1x128xf32 strides=[1024, 1]>) collective=[xy.block, z.grid] attrs={label: "mean_partial"}
+            reduce sum(%2: gmem<1x1xf32>, %4: gmem<1x8xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
+          }
+        }""")  # noqa: E501
+
+
 def test_tile_reduce_rejects_parallel_and_reduction_dimensions_on_block_x():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
@@ -178,6 +268,29 @@ def test_tile_reduce_rejects_parallel_and_reduction_dimensions_on_block_x():
                 CollectiveLevel.BLOCK, CollectiveAxis.X,
             ),
             hero_label_filter="mean",
+        )
+
+
+def test_tile_reduce_rejects_parallel_vector_accumulation():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) {
+            reduce sum(%output: gmem<8x1xf32>, %src: gmem<8x64xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
+          }
+        }"""))
+
+    with pytest.raises(
+        AssertionError,
+        match="does not implement parallel vector accumulation",
+    ):
+        tile_reduce(
+            module,
+            tile_sizes={1: 32},
+            parallel_iteration_space=(
+                CollectiveLevel.BLOCK, CollectiveAxis.X,
+            ),
+            hero_label_filter="mean",
+            vector_accumulation=True,
         )
 
 
