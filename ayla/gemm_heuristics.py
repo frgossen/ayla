@@ -301,6 +301,7 @@ def select_gemm_schedules(
     n: int,
     k: int,
     *,
+    operation: str = "mm",
     dtype: str = "float16",
     layout: str = "canonical_nt",
 ) -> GemmHeuristicSelection:
@@ -310,7 +311,11 @@ def select_gemm_schedules(
     mapper = _mapper()
     if layout != mapper["layout"]:
         raise ValueError(f"no GEMM heuristic for layout {layout}")
-    group = f"{dtype}/{'k128' if k % 128 == 0 else 'k64'}"
+    if operation not in {"mm", "addmm"}:
+        raise ValueError(f"no GEMM heuristic for operation {operation}")
+    group = (
+        f"{operation}/{dtype}/{'k128' if k % 128 == 0 else 'k64'}"
+    )
     try:
         node = mapper["groups"][group]
     except KeyError as error:

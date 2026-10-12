@@ -35,6 +35,10 @@ The converter provides lossless editing and merges any number of result files.
 The benchmark generates contiguous `A`/`BT` inputs; it does not replay captured
 tensor values or source strides.
 
+Library callers can select the independent fused-addmm schedule groups with
+`select_gemm_schedules(m, n, k, operation="addmm")`; omitting `operation`
+preserves the existing `mm` routing.
+
 ### Using pixi
 
 If you don't already have pixi installed, get it with curl:
