@@ -23,6 +23,7 @@ from ayla.gpu_dialect import (
     gpu_dialect,
 )
 from ayla.passes.folding import Folding
+from ayla.passes.insert_syncs import insert_syncs
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
 from tests.testing_utils import assert_contains_in_order
@@ -124,6 +125,7 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
           }
         }"""))
 
+    insert_syncs(module)
     lower_to_ptx_template(module)
     ptx = "".join(
         op.attrs["template"]
@@ -145,6 +147,29 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
         "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
     )
+
+
+def test_batches_consecutive_lock_initialization_rendezvous():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %local0: lock<mbar> = alloc()
+            %buffer: smem<16xf32> = alloc()
+            %local1: lock<mbar> = alloc()
+            %cluster: lock<cluster_mbar> = alloc()
+          }
+        }"""))
+
+    insert_syncs(module)
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.template for op in find_ops_of_type(module, PTXTemplateOp)
+    )
+
+    assert ptx.count("mbarrier.init.shared::cta.b64") == 3
+    assert ptx.count("bar.sync 0;") == 1
+    assert ptx.count("barrier.cluster.arrive.release;") == 1
+    assert ptx.count("barrier.cluster.wait.acquire;") == 1
 
 
 def test_lower_smem_arena_and_reinterpret():
@@ -289,6 +314,7 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
           }
         }"""))
 
+    insert_syncs(module)
     lower_to_ptx_template(module)
 
     ptx = "".join(

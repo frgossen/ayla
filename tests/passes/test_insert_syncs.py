@@ -246,6 +246,24 @@ def test_cluster_mbar_materialization_depends_on_barrier_scope():
     assert kernel.body.ops[0].result() is sync
 
 
+def test_batches_lock_initialization_publication():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %local0: lock<mbar> = alloc()
+            %buffer: smem<16xf32> = alloc()
+            %local1: lock<mbar> = alloc()
+            %cluster: lock<cluster_mbar> = alloc()
+          }
+        }"""))
+
+    insert_syncs(module)
+
+    assert [
+        barrier.scope for barrier in find_ops_of_type(module, BarrierOp)
+    ] == ["block", "cluster"]
+
+
 def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -265,9 +283,9 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     insert_syncs(module)
 
     text = repr(module)
-    # The parent multicast lowering synchronizes mbarrier initialization. This
-    # pass only needs the one-way reuse handoff to the next multicast issuer.
-    assert 'barrier() attrs={scope: "cluster"}' not in text
+    # Initialization publication is a full cluster rendezvous. Reuse only
+    # needs the separate one-way handoff to the next multicast issuer.
+    assert text.count('barrier() attrs={scope: "cluster"}') == 2
     barriers = [
         op for op in find_ops_of_type(module, BarrierOp)
         if op.scope == "cluster_to_leader"
@@ -344,6 +362,7 @@ def test_war_on_shared_buffer_gets_barrier():
               %ak: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %k: index)
               %bk: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc() attrs={id: 2}
+              barrier() attrs={scope: "block"}
               barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem<128x64xbf16 swizzle="128B">, %ak: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -562,7 +581,9 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
     # order. It's block_leader, not block, because the TMA write is issued by a
     # single leader thread.
     text = repr(module)
-    assert text.count("barrier()") == 4
+    # Constants split these into four static allocation runs.
+    assert text.count('barrier() attrs={scope: "block"}') == 4
+    assert text.count('scope: "block_leader"') == 4
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
