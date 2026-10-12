@@ -34,6 +34,9 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
+    is_column_major,
+    physical_layout,
+    root_buffer,
 )
 
 
@@ -71,6 +74,29 @@ def _verify_collective_attr(op: Op) -> None:
     ):
         raise ValueError(
             f"{op.op_id} collective attribute must list x, y, and z"
+        )
+
+
+def _verify_transposed_fragment_store(op: MoveOp) -> None:
+    """A WGMMA fragment reaches column-major smem only through STMatrix.trans."""
+    src = op.src.type
+    if not (
+        isinstance(src, WgrmemTensorType) and src.layout == "wgmma_layout_0"
+    ):
+        return
+    dst_root = root_buffer(op.dst)
+    if dst_root is None or not is_column_major(dst_root.type):
+        return
+    dst = dst_root.type
+    if not (
+        isinstance(dst, SmemTensorType)
+        and isinstance(src.dtype, (BF16Type, F16Type))
+        and dst.swizzle == "128B"
+        and physical_layout(dst) == (64, "block_major")
+    ):
+        raise ValueError(
+            "a transposed WGMMA fragment store needs a 16-bit fragment and a "
+            f"128B-swizzled, 64-wide block-major smem destination; got {dst}"
         )
 
 
@@ -310,6 +336,7 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
+        _verify_transposed_fragment_store(op)
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
