@@ -53,6 +53,10 @@ class FxRegionMatch:
     inputs: tuple[Node, ...]
 
 
+# TODO: Derive discovery support from the Ayla importer once primitive math
+# operations have complete import and lowering support. Today add, div, exp,
+# and neg are included only so discovery can traverse the hardcoded
+# decomposed-SiLU pattern; they are not independently importable.
 _SUPPORTED_FX_TARGETS = {
     torch.ops.aten.add.Tensor,
     torch.ops.aten.div.Tensor,
@@ -402,19 +406,32 @@ def make_fx_to_ayla_rewrite(
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> None:
     """Build a rewrite that compiles matched FX regions through Ayla."""
+    if len(signature) != len(signature_mapping):
+        raise ValueError("signature and signature mapping must have equal length")
+    if signature_mapping[-1:] != [OperandKind.RESULT] or (
+        signature_mapping.count(OperandKind.RESULT) != 1
+    ):
+        raise ValueError("FX regions require exactly one final result")
+    if not all(isinstance(typ, GmemTensorType) for typ in signature):
+        raise ValueError("FX region signatures require gmem tensors")
+    expected_types = [
+        typ for typ in signature if isinstance(typ, GmemTensorType)
+    ]
     compiler = JITCompiler(
         name=name,
         signature=signature,
         compile_fn=compile_region,
     )
-    checked_match = make_fx_region_matcher(
-        signature=signature,
-        signature_mapping=signature_mapping,
-        accept=accept,
-    )
 
     def region(torch_match: Match) -> FxRegionMatch | None:
-        return checked_match(torch_match.output_node())
+        candidate = discover_supported_fx_region(torch_match.output_node())
+        if candidate is None or not _matches_signature(
+            candidate, expected_types,
+        ):
+            return None
+        if accept is not None and not accept(candidate):
+            return None
+        return candidate
 
     def resolve_inputs(torch_match: Match) -> tuple[Node, ...]:
         candidate = region(torch_match)
@@ -442,51 +459,19 @@ def make_fx_to_ayla_rewrite(
     )
 
 
-def make_fx_region_matcher(
-    *,
-    signature: list[Type],
-    signature_mapping: list[OperandKind],
-    accept: Callable[[FxRegionMatch], bool] | None = None,
-) -> Callable[[Node], FxRegionMatch | None]:
-    """Discover regions and restrict them to one custom-op signature."""
-
-    def checked_match(node: Node) -> FxRegionMatch | None:
-        candidate = discover_supported_fx_region(node)
-        if candidate is None or not _matches_signature(
-            candidate, signature, signature_mapping,
-        ):
-            return None
-        if accept is not None and not accept(candidate):
-            return None
-        return candidate
-
-    return checked_match
-
-
 def _matches_signature(
     match: FxRegionMatch,
-    signature: list[Type],
-    signature_mapping: list[OperandKind],
+    signature: list[GmemTensorType],
 ) -> bool:
-    if len(signature) != len(signature_mapping):
-        raise ValueError("signature and signature mapping must have equal length")
-    if signature_mapping.count(OperandKind.RESULT) != 1:
-        raise ValueError("FX regions currently require exactly one result")
-    nodes = iter(match.inputs)
-    actual: list[Node] = []
-    for kind in signature_mapping:
-        if kind == OperandKind.RESULT:
-            actual.append(match.output)
-            continue
-        node = next(nodes, None)
-        if node is None:
-            return False
-        actual.append(node)
-    if next(nodes, None) is not None:
+    actual = (*match.inputs, match.output)
+    if len(actual) != len(signature):
         return False
 
     for node, expected in zip(actual, signature, strict=True):
-        if not isinstance(expected, GmemTensorType):
+        tensor = node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type not in (
+            "cuda", "meta",
+        ):
             return False
         found = _node_type(node)
         if found.dtype != expected.dtype or found.rank != expected.rank:
