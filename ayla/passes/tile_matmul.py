@@ -639,6 +639,11 @@ def _resolve_launch_dim_constraints(
 
 def _reversed_index(index: Value, extent: int) -> tuple[list[Op], Value]:
     """Build ``extent - 1 - index`` with non-negative index operations."""
+    # TODO: Move this to the shared pass utilities and let TileReduce reverse
+    # its parallel dimensions, so a consumer can start where an unchangeable
+    # producer finished. Reversing a reduction dimension would change the
+    # floating-point summation order, and reversing both a producer and its
+    # consumer cancels the L2 benefit.
     one = IndexConstantOp.build(1)
     shifted = IndexAddOp.build(index, one.result())
     last = IndexConstantOp.build(extent - 1)
