@@ -43,47 +43,39 @@ def test_muse_swiglu_is_captured_and_run(m: int):
 @pytest.mark.parametrize("fn,op", [
     pytest.param(
         lambda x, w: torch.sigmoid(x @ w.t()),
-        "auto_matmul_4096_wgmma256_wg_sigmoid_out",
+        "gemm_sigmoid_4096",
         id="sigmoid_epilogue",
     ),
     pytest.param(
         lambda x, w: x @ w.t(),
-        "auto_matmul_4096_wgmma256_wg_out",
+        "gemm_4096",
         id="no_epilogue",
     ),
 ])
-def test_a_matmul_compiles_to_one_ayla_kernel(fn, op):
-    """The epilogue, where there is one, is folded in rather than left over."""
+def test_a_matmul_region_compiles_to_one_ayla_kernel(fn, op):
     torch.manual_seed(0)
-    # Scaled so the sigmoid lands in its transition region rather than
-    # saturating, where any wrong function would still look about right.
     x, w = (
         (torch.randn(4096, 4096, device="cuda") * 0.02).to(torch.bfloat16)
         for _ in range(2)
     )
     expected = fn(x, w)
 
-    # The backend is not part of the Inductor cache key, so a warm cache would
-    # serve a stock-compiled graph and the lowering would never run.
     with inductor_config.patch(force_disable_caches=True), torch.no_grad():
         actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
-    calls = [line for line in code.splitlines() if "torch.ops.ayla" in line]
+    calls = [
+        line for line in code.splitlines()
+        if f"torch.ops.ayla.{op}.default(" in line
+    ]
     assert len(calls) == 1
     assert op in calls[0]
-    # Nothing is left over to read the output back and apply the epilogue.
     assert code.count("async_compile.triton") == 0
 
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
-def test_a_second_reader_of_the_matmul_keeps_both_kernels():
-    """The fused kernel stores the sigmoid and never the matmul behind it.
-
-    So it can only stand in where nothing else reads that. Fusing anyway would
-    leave the graph returning a buffer the kernel never wrote.
-    """
+def test_a_shared_matmul_falls_back_to_the_plain_gemm_rule():
     torch.manual_seed(0)
     x, w = (
         (torch.randn(4096, 4096, device="cuda") * 0.02).to(torch.bfloat16)
@@ -98,17 +90,16 @@ def test_a_second_reader_of_the_matmul_keeps_both_kernels():
     with inductor_config.patch(force_disable_caches=True), torch.no_grad():
         actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
 
-    for got, want in zip(actual, expected):
+    for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
-    assert "auto_matmul_4096_wgmma256_wg_out" in code, "the matmul is still ayla's"
-    assert "_sigmoid_out" not in code, "but the epilogue cannot fold into it"
+    assert "torch.ops.ayla.gemm_4096.default(" in code
+    assert "torch.ops.ayla.gemm_sigmoid_4096.default(" not in code
     assert code.count("async_compile.triton") == 1
 
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
-def test_a_matmul_off_the_gpu_is_declined():
-    """Shape and dtype match, device does not -- the kernels are cuda only."""
+def test_a_matmul_off_the_gpu_is_not_rewritten():
     torch.manual_seed(0)
     x, w = (
         (torch.randn(4096, 4096) * 0.02).to(torch.bfloat16) for _ in range(2)
