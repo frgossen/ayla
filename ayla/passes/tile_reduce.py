@@ -25,12 +25,14 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     KernelOp,
+    MemoryEffect,
     MemTensorType,
     ModuleOp,
     ReduceOp,
     ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
+    is_grid_collective,
 )
 from ._utils import label_matches
 
@@ -162,6 +164,52 @@ def _narrow_collective(
     return result
 
 
+def _refine_tiling_schemes(
+    hero: ReduceOp,
+    bounds: dict[int, int],
+) -> dict[int, int]:
+    """Retain each operand's ID while its tiled accesses stay disjoint."""
+    src_type = hero.src.type
+    assert isinstance(src_type, MemTensorType)
+    operand_dims = {
+        1: frozenset(range(src_type.rank)),
+        0: frozenset(range(src_type.rank - 1)),
+    }
+    partitioned_dims = {
+        dim for dim, bound in bounds.items() if bound > 1
+    }
+    disjoint_operands = [
+        operand_index
+        for operand_index, dims in operand_dims.items()
+        if partitioned_dims <= dims
+    ]
+
+    existing = {
+        operand_index: scheme_id
+        for operand_index, scheme_id in cast(
+            dict[int, int], hero.attrs.get("tiling_scheme", {}),
+        ).items()
+    }
+    if existing:
+        return {
+            operand_index: scheme_id
+            for operand_index, scheme_id in existing.items()
+            if operand_index in disjoint_operands
+        }
+
+    can_initialize = (
+        is_grid_collective(hero.collective)
+        and find_ancestor_of_type(hero, ForOp) is None
+    )
+    if not can_initialize:
+        return {}
+
+    return {
+        operand_index: MemoryEffect.fresh_tiling_scheme_id()
+        for operand_index in disjoint_operands
+    }
+
+
 class TileReduce(LoweringPass):
     """Tile reduction iteration spaces and selected epilogues.
 
@@ -259,6 +307,7 @@ class TileReduce(LoweringPass):
             dim: cast(int, src_type.sizes[dim]) // tile_size
             for dim, tile_size in self.tile_sizes.items()
         }
+        tiling_schemes = _refine_tiling_schemes(hero, bounds)
 
         # Update launch dimensions.
         if self.parallel_iteration_space is not None:
@@ -376,6 +425,11 @@ class TileReduce(LoweringPass):
         if reduction_dim is not None:
             assert partial is not None
             partial_attrs = hero.extra_attrs
+            partial_attrs.pop("tiling_scheme", None)
+            if 1 in tiling_schemes:
+                partial_attrs["tiling_scheme"] = {
+                    1: tiling_schemes[1],
+                }
             label = partial_attrs.get("label")
             if isinstance(label, str):
                 partial_attrs["label"] = f"{label}_partial"
@@ -402,6 +456,17 @@ class TileReduce(LoweringPass):
             {hero.dst: dst, hero.src: final_src},
             {"collective": final_reduction_collectiveness},
         )
+        final_reduce.attrs.pop("tiling_scheme", None)
+        final_operand_indices = (
+            (0,) if reduction_dim is not None else (0, 1)
+        )
+        final_tiling_schemes = {
+            operand_index: tiling_schemes[operand_index]
+            for operand_index in final_operand_indices
+            if operand_index in tiling_schemes
+        }
+        if final_tiling_schemes:
+            final_reduce.attrs["tiling_scheme"] = final_tiling_schemes
         parallel_body_insertion_point.append(final_reduce)
 
         # Rewrite the epilogue.

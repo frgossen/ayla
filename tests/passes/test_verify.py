@@ -272,6 +272,39 @@ def test_default_verification_rejects_unknown_reduction_function():
         verify_gpu_dialect(ModuleOp.build(Block(ops=[op])))
 
 
+@pytest.mark.parametrize(
+    ("schemes", "match"),
+    [
+        ([], "operand-indexed map"),
+        ({-1: 0}, "operand index"),
+        ({2: 0}, "operand index"),
+        ({"1": 0}, "operand index"),
+        ({1: -1}, "non-negative integers"),
+        ({1: 1.5}, "non-negative integers"),
+        ({1: True}, "non-negative integers"),
+    ],
+)
+def test_default_verification_checks_reduce_tiling_schemes(schemes, match):
+    src = Value(
+        name="src", type=GmemTensorType.build([8, 32], F32Type()),
+    )
+    dst = Value(
+        name="dst", type=GmemTensorType.build([8, 1], F32Type()),
+    )
+    op = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={
+            axis: CollectiveLevel.GRID for axis in CollectiveAxis
+        },
+        attrs={"tiling_scheme": schemes},
+    )
+
+    with pytest.raises(ValueError, match=match):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[op])))
+
+
 def test_default_verification_checks_reshape():
     source = Value(
         name="source",
@@ -513,6 +546,23 @@ def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
         }}"""))
 
     with pytest.raises(ValueError, match="same multicast mode"):
+        verify_gpu_dialect(module)
+
+
+def test_tile_strides_are_verified():
+    src = Value(
+        name="src",
+        type=SmemTensorType.build((1, 6656), F32Type()),
+    )
+    thread = Value(name="tx", type=IndexType())
+    result_type = SmemTensorType.build(
+        (1, 52), F32Type(), strides=(6656, 128),
+    )
+    module = ModuleOp.build(Block(ops=[
+        TileOp.build(src, [0, thread], result_type),
+    ]))
+
+    with pytest.raises(ValueError, match="tile result strides.*must match"):
         verify_gpu_dialect(module)
 
 

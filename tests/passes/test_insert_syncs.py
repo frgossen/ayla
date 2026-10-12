@@ -56,10 +56,10 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
             %value: rmem<64x64xbf16> = alloc()
             %lock: lock<bulk> = alloc()
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
-            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback0", tiling_scheme: {0: 0}}
             await(%lock: lock<bulk>)
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
-            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback1", tiling_scheme: {0: 0}}
           }
         }"""))  # noqa: E501
     insert_syncs(module)
@@ -73,12 +73,12 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
             %lock: lock<bulk> = alloc()
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
             barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
-            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback0"}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback0", tiling_scheme: {0: 0}}
             await(%lock: lock<bulk>)
             barrier() attrs={scope: "block"}
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
             barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
-            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback1", tiling_scheme: {0: 0}}
           }
         }""")  # noqa: E501
 
@@ -290,6 +290,37 @@ def test_preexisting_barrier_updates_dataflow_state():
     ))
     insert_syncs(module)
     assert repr(module).count("barrier()") == 1
+
+
+def test_loop_entry_hazard_is_synchronized_before_loop():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%src: gmem<1x128xf32>) block_dim=[32, 1, 1] {
+            %smem: smem<1x128xf32> = alloc()
+            move(%smem: smem<1x128xf32>, %src: gmem<1x128xf32>)
+            %partial: wrmem<1x32xf32 layout="lane"> = alloc() attrs={init: 0.0}
+            for (%k: index = 0 to 4) {
+              %chunk: smem<1x32xf32 strides=[128, 1]> = tile(%smem: smem<1x128xf32>, 0, %k: index)
+              reduce sum(%partial: wrmem<1x32xf32 layout="lane">, %chunk: smem<1x32xf32 strides=[128, 1]>)
+            }
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%src: gmem<1x128xf32>) block_dim=[32, 1, 1] {
+            %smem: smem<1x128xf32> = alloc()
+            move(%smem: smem<1x128xf32>, %src: gmem<1x128xf32>)
+            %partial: wrmem<1x32xf32 layout="lane"> = alloc() attrs={init: 0.0}
+            barrier() attrs={scope: "block"}
+            for (%k: index = 0 to 4) {
+              %chunk: smem<1x32xf32 strides=[128, 1]> = tile(%smem: smem<1x128xf32>, 0, %k: index)
+              reduce sum(%partial: wrmem<1x32xf32 layout="lane">, %chunk: smem<1x32xf32 strides=[128, 1]>)
+            }
+          }
+        }""")  # noqa: E501
 
 
 def test_war_on_shared_buffer_gets_barrier():

@@ -10,6 +10,27 @@ from torch._inductor.utils import run_and_get_code
 from tests.testing_utils import requires_cuda
 
 
+@pytest.mark.skip(
+    reason="new reduction tiling does not yet set its block launch dimension",
+)
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
+def test_glimmer_mean_runs_with_ayla():
+    def mean(src):
+        return torch.ops.aten.mean.dim(src, [-1], True)
+
+    torch.manual_seed(0)
+    src = torch.randn(8, 6656, device="cuda", dtype=torch.float32)
+    expected = mean(src)
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        actual, (code,) = run_and_get_code(
+            torch.compile(mean, dynamic=False), src,
+        )
+
+    torch.testing.assert_close(actual, expected)
+    assert "torch.ops.ayla.glimmer_mean_8x6656" in code
+
+
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
 def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():

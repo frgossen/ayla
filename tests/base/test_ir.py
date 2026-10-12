@@ -43,6 +43,7 @@ def test_with_attrs_and_blocks():
             "s": "hello",
             "lst": [1, "x", [2, 3]],
             "d": {"k": [True, None]},
+            "indexed": {1: 8, 0: 7},
         },
         blocks=[
             Block(name="a"),
@@ -53,7 +54,7 @@ def test_with_attrs_and_blocks():
     )
     expected = textwrap.dedent(
         """\
-        generic() attrs={b: True, d: {k: [True, None]}, f: 3.5, i: 42, lst: [1, "x", [2, 3]], s: "hello"} {
+        generic() attrs={b: True, d: {k: [True, None]}, f: 3.5, i: 42, indexed: {0: 7, 1: 8}, lst: [1, "x", [2, 3]], s: "hello"} {
         ^a:
         }
         {

@@ -192,6 +192,35 @@ def test_barrier_has_an_ordering_effect_and_unknown_memory_effects():
     assert has_ordering_effect(nested)
 
 
+def test_reduce_reports_operand_tiling_schemes():
+    src = Value(
+        name="src", type=GmemTensorType.build((8, 32), F32Type()),
+    )
+    dst = Value(
+        name="dst", type=GmemTensorType.build((8, 1), F32Type()),
+    )
+    reduce = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={
+            axis: CollectiveLevel.GRID for axis in CollectiveAxis
+        },
+        attrs={"tiling_scheme": {0: 7, 1: 8}},
+    )
+
+    effects = memory_effects(reduce)
+    assert effects is not None
+    assert {
+        (effect.kind, effect.value.name, effect.tiling_scheme)
+        for effect in effects
+    } == {
+        ("R", "dst", 7),
+        ("W", "dst", 7),
+        ("R", "src", 8),
+    }
+
+
 def test_memory_effect_retains_accessed_view_and_exposes_roots():
     source = Value(
         name="source",
@@ -586,6 +615,32 @@ def test_index_lt_op():
         IndexLtOp.build(lhs, not_index)
 
 
+def test_reduce_op_grid_collective():
+    src_type = GmemTensorType.build((8, 6656), F32Type())
+    dst_type = GmemTensorType.build((8, 1), F32Type())
+    src = Value(name="src", type=src_type)
+    dst = Value(name="dst", type=dst_type)
+
+    op = ReduceOp.build(
+        dst,
+        src,
+        fn="sum",
+        collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
+        init=0.0,
+    )
+
+    assert_print_and_roundtrip(
+        op,
+        "reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x6656xf32>) "
+        "collective=xyz.grid attrs={init: 0.0}",
+    )
+    with pytest.raises(ValueError, match="must not also appear in attrs"):
+        gpu_dialect.parse(
+            'reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x6656xf32>) '
+            'attrs={fn: "max"}'
+        )
+
+
 def test_warp_register_memory_type():
     typ = WrmemTensorType.build((1,), F32Type())
     assert repr(typ) == 'wrmem<1xf32 layout="default">'
@@ -721,7 +776,7 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         collective={
             axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
         },
-        attrs={"dst_tiling_scheme": 7, "src_tiling_scheme": 8},
+        attrs={"tiling_scheme": {0: 7, 1: 8}},
     ))
 
     assert effects is not None

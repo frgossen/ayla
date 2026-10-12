@@ -33,6 +33,7 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
+    WrmemTensorType,
     WgrmemTensorType,
 )
 
@@ -72,6 +73,23 @@ def _verify_collective_attr(op: Op) -> None:
         raise ValueError(
             f"{op.op_id} collective attribute must list x, y, and z"
         )
+
+
+def _verify_tiling_scheme_attr(op: Op, num_operands: int) -> None:
+    schemes = op.attrs.get("tiling_scheme")
+    if schemes is None:
+        return
+    if not isinstance(schemes, dict):
+        raise ValueError("tiling_scheme must be an operand-indexed map")
+    for operand_index, scheme_id in schemes.items():
+        if type(operand_index) is not int or not 0 <= operand_index < num_operands:
+            raise ValueError(
+                f"tiling_scheme operand index must be in [0, {num_operands})"
+            )
+        if type(scheme_id) is not int or scheme_id < 0:
+            raise ValueError(
+                "tiling_scheme IDs must be non-negative integers"
+            )
 
 
 def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
@@ -172,12 +190,16 @@ class VerifyGpuDialect(VerificationPass):
         result_type = op.result().type
         if type(arg_type) is not type(result_type):
             raise ValueError("tile must preserve its operand's memory space")
-        if not isinstance(arg_type, (AddrMemTensorType, WgrmemTensorType)):
+        if not isinstance(
+            arg_type, (AddrMemTensorType, WrmemTensorType, WgrmemTensorType),
+        ):
             raise ValueError(
                 "tile operand and result must be address-backed memory "
-                "tensors or wgrmem"
+                "tensors or register-memory tensors"
             )
-        assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType))
+        assert isinstance(
+            result_type, (AddrMemTensorType, WrmemTensorType, WgrmemTensorType),
+        )
         if not (
             arg_type.rank == result_type.rank == len(op.indices)
         ):
@@ -309,6 +331,7 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
+        _verify_tiling_scheme_attr(op, 2)
         _verify_tma_multicast(op)
 
     @verifies(TmaMoveOp)
@@ -339,6 +362,7 @@ class VerifyGpuDialect(VerificationPass):
                 f"{descriptor_type.gmem_type.rank}"
             )
         _verify_collective_attr(op)
+        _verify_tiling_scheme_attr(op, 2)
         _verify_tma_multicast(op)
 
     @verifies(MatmulOp)
@@ -346,15 +370,7 @@ class VerifyGpuDialect(VerificationPass):
         if op.init is not None and op.init_value is not None:
             raise ValueError("matmul accepts a scalar or tensor init, not both")
         _verify_collective_attr(op)
-        for operand_name in ("lhs", "rhs", "dst"):
-            attr_name = f"{operand_name}_tiling_scheme"
-            scheme_id = op.attrs.get(attr_name)
-            if scheme_id is not None and (
-                type(scheme_id) is not int or scheme_id < 0
-            ):
-                raise ValueError(
-                    f"matmul {attr_name} must be a non-negative integer"
-                )
+        _verify_tiling_scheme_attr(op, 3)
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if (
@@ -392,6 +408,7 @@ class VerifyGpuDialect(VerificationPass):
         if op.fn not in ReduceOp.NEUTRAL_ELEMENTS:
             raise ValueError(f"unknown reduction function {op.fn!r}")
         _verify_collective_attr(op)
+        _verify_tiling_scheme_attr(op, 2)
         dst, src = op.dst.type, op.src.type
         if not isinstance(dst, MemTensorType) or not isinstance(
             src, MemTensorType,
@@ -461,7 +478,6 @@ class VerifyGpuDialect(VerificationPass):
             and arg.num_elements != result.num_elements
         ):
             raise ValueError("reshape must preserve the number of elements")
-
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:
         for block in op.blocks:
