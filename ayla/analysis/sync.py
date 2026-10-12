@@ -52,12 +52,14 @@ class BarrierScope(enum.IntEnum):
 
         GRID -> CLUSTER
         CLUSTER -> {BLOCK, CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
+        CLUSTER_TO_LEADER -> BLOCK_TO_LEADER
         BLOCK -> {WARPGROUP, BLOCK_TO_LEADER, LEADER_TO_BLOCK}
         WARPGROUP -> WARP
-        {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK,
-         CLUSTER_TO_LEADER, LEADER_TO_CLUSTER} -> THREAD
+        {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK, LEADER_TO_CLUSTER} -> THREAD
 
-    The four directional scopes are pairwise independent.
+    A cluster-to-leader barrier gathers every CTA's threads at the leaders,
+    so it includes a block-to-leader gather. The other directional scopes
+    are pairwise independent.
     """
     THREAD = 0
     WARP = 1
@@ -82,6 +84,10 @@ class BarrierScope(enum.IntEnum):
             return BarrierScope.GRID
         if self == BarrierScope.CLUSTER or other == BarrierScope.CLUSTER:
             return BarrierScope.CLUSTER
+        if {self, other} == {
+            BarrierScope.CLUSTER_TO_LEADER, BarrierScope.BLOCK_TO_LEADER,
+        }:
+            return BarrierScope.CLUSTER_TO_LEADER
         if self in (
             BarrierScope.CLUSTER_TO_LEADER,
             BarrierScope.LEADER_TO_CLUSTER,
