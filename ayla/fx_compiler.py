@@ -42,6 +42,13 @@ _ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
     torch.ops.aten.sigmoid.default: ("sigmoid", 1),
 }
 
+# Matmul FX targets mapped to the argument positions of their accumulator
+# initializer (``None`` for zero), LHS, and transposed-weight RHS.
+_MATMUL_OPS: dict[object, tuple[int | None, int, int]] = {
+    torch.ops.aten.mm.default: (None, 0, 1),
+    torch.ops.aten.addmm.default: (0, 1, 2),
+}
+
 
 @dataclass(frozen=True)
 class FxRegionMatch:
@@ -53,8 +60,8 @@ class FxRegionMatch:
 
 # Discovery traverses exactly what ``fx_region_to_module`` can import.
 _SUPPORTED_FX_TARGETS = {
-    torch.ops.aten.mm.default,
     torch.ops.aten.permute.default,
+    *_MATMUL_OPS,
     *_ELEMENTWISE_OPS,
 }
 
@@ -105,11 +112,14 @@ def discover_supported_fx_region(
     return FxRegionMatch(output=output, inputs=tuple(boundaries))
 
 
-def _node_type(node: Node) -> GmemTensorType:
+def _node_tensor(node: Node) -> torch.Tensor:
     tensor = node.meta.get("val")
     if not isinstance(tensor, torch.Tensor):
         raise ValueError(f"{node.name}: missing tensor metadata")
+    return tensor
 
+
+def _tensor_type(tensor: torch.Tensor) -> GmemTensorType:
     def static(value: object) -> int | None:
         return value if isinstance(value, int) else None
 
@@ -118,6 +128,10 @@ def _node_type(node: Node) -> GmemTensorType:
         from_torch_dtype(tensor.dtype),
         strides=[static(stride) for stride in tensor.stride()],
     )
+
+
+def _node_type(node: Node) -> GmemTensorType:
+    return _tensor_type(_node_tensor(node))
 
 
 def _region_nodes(match: FxRegionMatch) -> list[Node]:
@@ -187,13 +201,15 @@ def fx_region_to_module(
 ) -> ModuleOp:
     """Import one single-output FX region into unscheduled Ayla GPU IR.
 
-    The importer covers what GEMM regions need: a matmul whose RHS is a
-    transposed weight, followed by elementwise epilogues from
-    ``_ELEMENTWISE_OPS``. Unsupported operations fail explicitly.
+    The importer covers what GEMM regions need: a matmul from
+    ``_MATMUL_OPS`` whose RHS is a transposed weight, followed by elementwise
+    epilogues from ``_ELEMENTWISE_OPS``. Unsupported operations fail
+    explicitly.
     """
     if match.output in match.inputs:
         raise ValueError("FX region output cannot also be an input")
     nodes = _region_nodes(match)
+    region = set(nodes)
     values = {
         node: Value(node.name, _node_type(node)) for node in match.inputs
     }
@@ -210,9 +226,8 @@ def fx_region_to_module(
         transpose_source = _transpose_source(node)
         if transpose_source is not None:
             if not all(
-                user.target is torch.ops.aten.mm.default
-                and len(user.args) == 2
-                and user.args[1] is node
+                user.target in _MATMUL_OPS
+                and user.args[_MATMUL_OPS[user.target][2]] is node
                 for user in node.users
             ):
                 raise ValueError(
@@ -221,9 +236,13 @@ def fx_region_to_module(
             values[node] = values[transpose_source]
             continue
 
-        if node.target is torch.ops.aten.mm.default:
-            lhs_node = _node_argument(node.args[0], owner=node)
-            rhs_node = _node_argument(node.args[1], owner=node)
+        matmul = _MATMUL_OPS.get(node.target)
+        if matmul is not None:
+            init_index, lhs_index, rhs_index = matmul
+            if any(node.kwargs.get(scale, 1) != 1 for scale in ("alpha", "beta")):
+                raise ValueError(f"{node.name}: scaled matmuls are unsupported")
+            lhs_node = _node_argument(node.args[lhs_index], owner=node)
+            rhs_node = _node_argument(node.args[rhs_index], owner=node)
             rhs_source = _transpose_source(rhs_node)
             if rhs_source is None:
                 raise ValueError(
@@ -232,8 +251,24 @@ def fx_region_to_module(
             dst = _allocate(node, match.output, output_value, ops)
             label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
             matmul_index += 1
-            zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
-            ops.append(zero)
+            if init_index is None:
+                zero = ConstantOp.build(
+                    0.0, RmemTensorType.build([], F32Type()),
+                )
+                ops.append(zero)
+                init = zero.result()
+            else:
+                bias = _node_argument(node.args[init_index], owner=node)
+                region_users = set(bias.users) & region
+                if bias not in match.inputs or region_users != {node}:
+                    raise ValueError(
+                        f"{node.name}: matmul bias must be a region input"
+                    )
+                # Torch broadcasts the bias to the output; Ayla reads the same
+                # memory through the zero strides of that broadcast view.
+                init = values[bias] = Value(bias.name, _tensor_type(
+                    _node_tensor(bias).expand(_node_tensor(node).shape),
+                ))
             ops.append(MatmulOp.build(
                 values[lhs_node],
                 values[rhs_source],
@@ -241,7 +276,7 @@ def fx_region_to_module(
                 collective={
                     axis: CollectiveLevel.GRID for axis in CollectiveAxis
                 },
-                init=zero.result(),
+                init=init,
                 attrs={"label": label},
             ))
             values[node] = dst
