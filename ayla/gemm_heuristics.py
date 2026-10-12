@@ -165,7 +165,10 @@ def _output_groups(
     config: dict[str, object], m: int, n: int,
 ) -> tuple[int, int, int]:
     if "output_n_tiles_per_cta" in config:
-        m_group = _as_int(config.get("output_m_tiles_per_cta", 1))
+        m_group = _as_int(config.get(
+            "output_m_tiles_per_cta",
+            config.get("output_tiles_per_cta", 1),
+        ))
         n_group = _as_int(config["output_n_tiles_per_cta"])
         ctas = (
             math.ceil(
