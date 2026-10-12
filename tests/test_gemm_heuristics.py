@@ -43,6 +43,27 @@ def test_addmm_uses_an_independent_operation_group():
     assert mm.leaf != addmm.leaf
 
 
+def test_addmm_transfer_winners_seed_matching_mm_leaves():
+    shapes = (
+        (4096, 4096, 1024),
+        (512, 6144, 1536),
+        (1152, 768, 3072),
+        (512, 1024, 4096),
+        (12608, 256, 768),
+        (32768, 256, 1024),
+        (12608, 768, 256),
+        (16448, 512, 512),
+        (8192, 2048, 256),
+        (25664, 384, 128),
+        (25216, 320, 320),
+        (50176, 768, 256),
+    )
+
+    for shape in shapes:
+        selection = select_gemm_schedules(*shape)
+        assert any(seed.source_shape == shape for seed in selection.seeds)
+
+
 def test_n_grouped_winner_routes_existing_builder_controls():
     selection = select_gemm_schedules(3136, 2048, 1024)
     seed = next(
