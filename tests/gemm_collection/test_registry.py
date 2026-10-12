@@ -26,3 +26,9 @@ def test_register_rejects_a_builder_that_takes_arguments():
         @register_gemm
         def variant_module(output_m_tiles_per_cta: int = 1):
             raise AssertionError("builder should not run")
+
+
+def test_register_defers_building_the_kernel():
+    @register_gemm
+    def lazy_registry_test_module():
+        raise AssertionError("builder should not run")
