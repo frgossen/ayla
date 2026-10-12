@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import torch
 
-from ayla.gemm_collection.muse_swiglu import MUSE_SWIGLU_M_VALUES
+from ayla.gemm_collection.muse_swiglu import (
+    MUSE_SWIGLU_HIDDEN,
+    MUSE_SWIGLU_INTERMEDIATE,
+    MUSE_SWIGLU_M_VALUES,
+    MUSE_SWIGLU_PACKED_INTERMEDIATE,
+)
 from benchmarks.common import BenchConfig
-
-_HIDDEN = 6_656
-_INTERMEDIATE = 19_968
-_PACKED_INTERMEDIATE = 2 * _INTERMEDIATE
 
 
 def muse_swiglu(
@@ -21,8 +22,8 @@ def muse_swiglu(
     # projection as one matmul followed by two slices; preserve that structure
     # so this corpus exercises the graph pattern we intend to replace.
     projection = lhs @ packed_weight.T
-    gate = projection[:, :_INTERMEDIATE]
-    up = projection[:, _INTERMEDIATE:]
+    gate = projection[:, :MUSE_SWIGLU_INTERMEDIATE]
+    up = projection[:, MUSE_SWIGLU_INTERMEDIATE:]
     return (torch.nn.functional.silu(gate) * up) @ down_weight.T
 
 
@@ -37,15 +38,17 @@ def build_config(m: int) -> BenchConfig:
         torch.manual_seed(20260921 + m)
         return [
             torch.randn(
-                (m, _HIDDEN), device="cuda", dtype=torch.bfloat16,
+                (m, MUSE_SWIGLU_HIDDEN),
+                device="cuda",
+                dtype=torch.bfloat16,
             ),
             torch.randn(
-                (_PACKED_INTERMEDIATE, _HIDDEN),
+                (MUSE_SWIGLU_PACKED_INTERMEDIATE, MUSE_SWIGLU_HIDDEN),
                 device="cuda",
                 dtype=torch.bfloat16,
             ) * .01,
             torch.randn(
-                (_HIDDEN, _INTERMEDIATE),
+                (MUSE_SWIGLU_HIDDEN, MUSE_SWIGLU_INTERMEDIATE),
                 device="cuda",
                 dtype=torch.bfloat16,
             ) * .01,
