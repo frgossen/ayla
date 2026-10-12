@@ -4,10 +4,9 @@ from __future__ import annotations
 from typing import cast
 
 import torch
+from torch._inductor.pattern_matcher import PatternMatcherPass
 
-from ..fx_compiler import FxRoutePlan, make_fx_to_ayla_rewrite
-from ..fx_pipeline import FxRegionMatch
-from ..fx_schedules import compile_swiglu
+from ..fx_compiler import FxRegionMatch, make_fx_to_ayla_rewrite
 from ..gpu_dialect import (
     BF16Type,
     GmemTensorType,
@@ -15,10 +14,12 @@ from ..gpu_dialect import (
     ModuleOp,
     Type,
 )
+from ..jit_compiler import LauncherPlan
 from ..ptx_codegen import make_ptx_kernel
 from ..ptx_runtime import make_ptx_launcher
 from ..torch_custom_call import OperandKind
 from .gemm import auto_matmul_4096_wgmma256_wg_tma_store_module
+from .swiglu import compile_swiglu, is_swiglu_region
 
 
 MUSE_SWIGLU_HIDDEN = 6_656
@@ -26,12 +27,12 @@ MUSE_SWIGLU_INTERMEDIATE = 19_968
 MUSE_SWIGLU_PACKED_INTERMEDIATE = 2 * MUSE_SWIGLU_INTERMEDIATE
 MUSE_SWIGLU_M_VALUES = (1, 4, 32, 64, 512, 2048)
 
-_KEEP_LHS = {
+_KEEP_LHS: dict[str, dict[str, object]] = {
     "lhs": {"l2_cache_hint": "evict_last", "l2_promotion": "256B"},
     "rhs": {"l2_cache_hint": "evict_first"},
     "dst": {"l2_cache_hint": "evict_first"},
 }
-_STREAM_INPUTS = {
+_STREAM_INPUTS: dict[str, dict[str, object]] = {
     "lhs": {"l2_promotion": "256B"},
     "rhs": {"l2_promotion": "256B"},
     "dst": {"l2_cache_hint": "evict_first"},
@@ -48,22 +49,7 @@ _MUSE_SWIGLU_SIGNATURE: list[Type] = [
     ),
     GmemTensorType.build([None, MUSE_SWIGLU_HIDDEN], BF16Type()),
 ]
-_MUSE_SWIGLU_OPERANDS = [
-    OperandKind.R,
-    OperandKind.R,
-    OperandKind.R,
-    OperandKind.RESULT,
-]
-
-
-def _muse_m(match: FxRegionMatch) -> int:
-    lhs = match.inputs[0].meta.get("val")
-    if not isinstance(lhs, torch.Tensor):
-        raise ValueError("Muse SwiGLU match has no lhs tensor metadata")
-    return int(lhs.shape[0])
-
-
-def _compile_large_m(m: int) -> FxRoutePlan:
+def _compile_large_m(m: int) -> LauncherPlan:
     # These are the winners retained from the Muse cold-cache sweep, not
     # general-purpose FX compiler heuristics.
     if m == 512:
@@ -153,7 +139,7 @@ def _compile_large_m(m: int) -> FxRoutePlan:
     return build_route
 
 
-def _compile_muse_swiglu(module: ModuleOp) -> FxRoutePlan:
+def _compile_muse_swiglu(module: ModuleOp) -> LauncherPlan:
     [kernel] = module.body.ops
     if not isinstance(kernel, KernelOp):
         raise ValueError("Muse SwiGLU requires one kernel")
@@ -166,13 +152,30 @@ def _compile_muse_swiglu(module: ModuleOp) -> FxRoutePlan:
     return _compile_large_m(m)
 
 
-MUSE_SWIGLU_RULE = make_fx_to_ayla_rewrite(
-    name="muse_swiglu",
-    signature=_MUSE_SWIGLU_SIGNATURE,
-    signature_mapping=_MUSE_SWIGLU_OPERANDS,
-    compile_region=_compile_muse_swiglu,
-    accept=lambda match: _muse_m(match) in MUSE_SWIGLU_M_VALUES,
-    infer_result_shapes=lambda lhs, _packed, _down: [
-        (lhs.shape[0], MUSE_SWIGLU_HIDDEN),
-    ],
-)
+def _accept_muse_swiglu(match: FxRegionMatch) -> bool:
+    lhs = cast(torch.Tensor, match.inputs[0].meta["val"])
+    return (
+        int(lhs.shape[0]) in MUSE_SWIGLU_M_VALUES
+        and is_swiglu_region(match)
+    )
+
+
+def register_muse_swiglu(patterns: PatternMatcherPass) -> None:
+    """Register the Muse SwiGLU FX-to-Ayla rewrite."""
+    make_fx_to_ayla_rewrite(
+        patterns,
+        root=torch.ops.aten.mm.default,
+        name="muse_swiglu",
+        signature=_MUSE_SWIGLU_SIGNATURE,
+        signature_mapping=[
+            OperandKind.R,
+            OperandKind.R,
+            OperandKind.R,
+            OperandKind.RESULT,
+        ],
+        compile_region=_compile_muse_swiglu,
+        accept=_accept_muse_swiglu,
+        infer_result_shapes=lambda lhs, _packed, _down: [
+            (lhs.shape[0], MUSE_SWIGLU_HIDDEN),
+        ],
+    )
