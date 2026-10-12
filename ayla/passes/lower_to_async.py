@@ -4,7 +4,9 @@ Wraps the ops that run asynchronously on the hardware — a TMA bulk transfer
 (``move`` with ``tma=True`` or a lowered ``tma_move``) and a wgmma matmul
 (smem×smem→wgrmem with 4 warps) — in an ``async`` block carrying the lock,
 followed by an ``await``. The lock kind is ``mbar`` for a TMA load, ``bulk``
-for a TMA store, ``wgmma`` for a matmul.
+for a TMA store, ``wgmma`` for a matmul. wgmma groups complete in issue order,
+so a matmul gets no await here: insert_syncs awaits only the groups that the
+work after it needs, leaving newer ones in flight.
 
 Other moves/matmuls stay synchronous. Already-``async`` ops pass through, so
 running the pass twice is idempotent. Later passes reorder/batch the awaits to
@@ -56,6 +58,8 @@ class LowerToAsync(LoweringPass):
             body=Block(ops=[inner]),
             attrs={"label": f"{label}_async"} if label is not None else None,
         )
+        if kind == "wgmma":
+            return [lock, async_op], []
         await_op = AwaitOp.build(
             lock.result(),
             attrs={"label": f"{label}_await"} if label is not None else None,

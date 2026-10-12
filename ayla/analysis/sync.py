@@ -190,11 +190,16 @@ class ConcurrentMemoryEffect:
     pending_await: Value | None
 
 
+# ``wgmma.wait_group`` leaves at most seven newer groups in flight.
+_MAX_WGMMA_PENDING = 7
+
+
 @dataclasses.dataclass
 class SyncState(DataflowState):
     """The forward analysis state: outstanding concurrent memory effects keyed by
-    root buffer, named-barrier ids in use until a full-block sync, and ids in use
-    until an await on a particular lock."""
+    root buffer, named-barrier ids in use until a full-block sync, ids in use
+    until an await on a particular lock, and for each wgmma lock in flight the
+    fewest groups committed after its newest one."""
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
@@ -202,6 +207,7 @@ class SyncState(DataflowState):
     named_barrier_ids_pending_await: dict[Value, set[int]] = (
         dataclasses.field(default_factory=dict)
     )
+    newer_wgmma_groups: dict[Value, int] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> SyncState:
@@ -218,11 +224,16 @@ class SyncState(DataflowState):
             self.named_barrier_ids_pending_await,
             other.named_barrier_ids_pending_await,
         )
+        # A lock idle on one path keeps the other path's count.
+        g, h = self.newer_wgmma_groups, other.newer_wgmma_groups
         return SyncState(
             {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
             self.named_barrier_ids | other.named_barrier_ids,
             {lock: p.get(lock, set()) | q.get(lock, set())
              for lock in p.keys() | q.keys()},
+            {lock: min(g.get(lock, _MAX_WGMMA_PENDING),
+                       h.get(lock, _MAX_WGMMA_PENDING))
+             for lock in g.keys() | h.keys()},
         )
 
 
@@ -248,9 +259,14 @@ def _after_barrier(
 @dataclasses.dataclass(frozen=True)
 class BarrierTarget:
     """The barrier before an op: its ``scope`` and, for a block-leader barrier,
-    the named-barrier ``named_id`` to lower to (``None`` otherwise)."""
+    the named-barrier ``named_id`` to lower to (``None`` otherwise). Before the
+    barrier, the op may first await the ``wgmma_await`` lock, leaving the
+    ``wgmma_pending`` newest wgmma groups in flight: such an await, like any
+    with a ``pending`` attribute, waits for all but that many newest groups."""
     scope: BarrierScope
     named_id: int | None = None
+    wgmma_await: Value | None = None
+    wgmma_pending: int = 0
 
 
 # The analysis result: each effect-bearing op mapped to the barrier before it.
@@ -287,6 +303,28 @@ def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
     )
 
 
+def _complete_wgmma(live: SyncState, pending: int) -> None:
+    """Wait for all but the ``pending`` newest wgmma groups.
+
+    All wgmma locks share one in-order queue, so this completes every lock
+    with at least ``pending`` groups committed after it on every path. Their
+    effects within a warpgroup are then done, while wider ones become live for
+    a barrier to order.
+    """
+    groups = live.newer_wgmma_groups
+    retired = {lock for lock, newer in groups.items() if newer >= pending}
+    for lock in retired:
+        del groups[lock]
+    for buffer, effects in live.concurrent_memory_effects.items():
+        live.concurrent_memory_effects[buffer] = {
+            dataclasses.replace(effect, pending_await=None)
+            if effect.pending_await in retired else effect
+            for effect in effects
+            if effect.pending_await not in retired
+            or not effect.scope.leq(CollectiveScope.WARPGROUP)
+        }
+
+
 def _transfer_memory_effects(
     op: Op,
     live: SyncState,
@@ -299,23 +337,53 @@ def _transfer_memory_effects(
         raise NotImplementedError(
             f"unmodelled effect-bearing op: {type(op).__name__}"
         )
-    # The barrier this op needs, as the join over its hazards. Each hazard
-    # resolves per-pair (:func:`_barrier_scope`).
-    barrier_scope: BarrierScope = BarrierScope.THREAD
-    for current in effects:
-        for root in current.roots:
-            for prior in live.concurrent_memory_effects.get(root, ()):
-                # Matching scheme IDs prove the runtime accesses pairwise disjoint.
-                if (
-                    current.tiling_scheme is not None
-                    and current.tiling_scheme == prior.tiling_scheme
-                ):
-                    continue
-                # A hazard needs a write (RAR is safe).
-                if prior.kind == "W" or current.kind == "W":
+    assert async_lock is None or isinstance(async_lock.type, LockType)
+    wgmma_issue = (
+        async_lock is not None
+        and cast(LockType, async_lock.type).kind == "wgmma"
+    )
+
+    def hazards() -> tuple[BarrierScope, set[Value]]:
+        """The barrier this op needs, as the join over its hazards (each
+        resolves per-pair, :func:`_barrier_scope`), and the wgmma locks still
+        in flight whose work it needs."""
+        barrier_scope = BarrierScope.THREAD
+        wgmma_waits: set[Value] = set()
+        for current in effects:
+            for root in current.roots:
+                for prior in live.concurrent_memory_effects.get(root, ()):
+                    # Matching scheme IDs prove the runtime accesses pairwise
+                    # disjoint.
+                    if (
+                        current.tiling_scheme is not None
+                        and current.tiling_scheme == prior.tiling_scheme
+                    ):
+                        continue
+                    # A hazard needs a write (RAR is safe).
+                    if prior.kind != "W" and current.kind != "W":
+                        continue
+                    # A later wgmma group runs after one in flight; any other
+                    # access waits for it.
+                    if prior.pending_await in live.newer_wgmma_groups:
+                        if not wgmma_issue:
+                            wgmma_waits.add(prior.pending_await)
+                        continue
                     barrier_scope = barrier_scope.join(
                         _barrier_scope(prior.scope, current.scope)
                     )
+        return barrier_scope, wgmma_waits
+
+    barrier_scope, wgmma_waits = hazards()
+    # Wait for the newest group it needs, which completes the older ones.
+    wgmma_await = min(
+        wgmma_waits, key=lambda lock: live.newer_wgmma_groups[lock],
+        default=None,
+    )
+    wgmma_pending = 0
+    if wgmma_await is not None:
+        wgmma_pending = live.newer_wgmma_groups[wgmma_await]
+        _complete_wgmma(live, wgmma_pending)
+        barrier_scope, _ = hazards()
     # A block-leader barrier is named. Its id remains in use until either a
     # full-block sync, or (for an mbar async) the await where everyone waits for
     # t0. Reuse any id whose prior lifetime has ended.
@@ -359,7 +427,6 @@ def _transfer_memory_effects(
             named_id = min(available_ids)
         # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
         # an mbar await is an all-thread rendezvous that ends this handoff.
-        assert async_lock is None or isinstance(async_lock.type, LockType)
         if (
             async_lock is not None
             and cast(LockType, async_lock.type).kind == "mbar"
@@ -369,21 +436,24 @@ def _transfer_memory_effects(
             ).add(named_id)
         else:
             live.named_barrier_ids.add(named_id)
-    targets[op] = BarrierTarget(barrier_scope, named_id)
+    targets[op] = BarrierTarget(
+        barrier_scope, named_id, wgmma_await, wgmma_pending,
+    )
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
     live = _after_barrier(live, barrier_scope)
     # An async op's effects that its await fully orders wait pending on the lock
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for
-    # a later barrier to order.
+    # a later barrier to order. A wgmma group's effects all stay pending until
+    # it completes, since nothing orders against work still in flight.
     async_scope = (
         _async_completion_scope(op) if isinstance(op, AsyncOp) else None
     )
     for memory_effect in effects:
         pending = (
             async_lock
-            if (
+            if wgmma_issue or (
                 async_scope is not None
                 and memory_effect.scope.leq(async_scope)
             )
@@ -451,6 +521,9 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(AwaitOp)
     def transfer_await(self, op: AwaitOp, state: SyncState) -> SyncState:
+        assert isinstance(op.lock.type, LockType)
+        if op.lock.type.kind == "wgmma":
+            _complete_wgmma(state, cast(int, op.attrs.get("pending", 0)))
         # Clear every effect pending on this lock -- only the ones this await
         # fully orders were made pending on it. Effects it only partially orders
         # were never pending and stay live for a barrier.
@@ -472,6 +545,12 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(AsyncOp)
     def transfer_async(self, op: AsyncOp, state: SyncState) -> SyncState:
+        assert isinstance(op.lock.type, LockType)
+        if op.lock.type.kind == "wgmma":
+            groups = state.newer_wgmma_groups
+            for lock, newer in groups.items():
+                groups[lock] = min(newer + 1, _MAX_WGMMA_PENDING)
+            groups[op.lock] = 0
         return _transfer_memory_effects(
             op, state, self.targets, async_lock=op.lock,
         )

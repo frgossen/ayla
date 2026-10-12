@@ -212,6 +212,64 @@ def test_configurable_tma_gemm_supports_fp16():
     assert ".f32.bf16.bf16" not in kernel.ptx
 
 
+@pytest.mark.parametrize("operand_stages", [2, 3, 4])
+def test_cyclic_wgmma_pipeline_keeps_one_group_in_flight(operand_stages):
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=128,
+        n=256,
+        k=1024,
+        operand_stages=operand_stages,
+        cyclic_operand_pipeline=True,
+    ))
+    waits = {
+        line.strip()
+        for line in kernel.ptx.splitlines()
+        if "wgmma.wait_group" in line
+    }
+
+    # Each refill waits for the group that read its stage, while the group
+    # issued after it keeps running; the final drain waits for everything.
+    assert waits == {
+        "wgmma.wait_group.sync.aligned 0;",
+        "wgmma.wait_group.sync.aligned 1;",
+    }
+
+
+@requires_cuda
+@pytest.mark.parametrize("config", [
+    dict(m=128, n=256, k=320, operand_stages=2),
+    dict(m=128, n=256, k=1024, operand_stages=3),
+    dict(m=128, n=256, k=1024, operand_stages=4, output_slices=2),
+    # Four output tiles per CTA chain the K loops through their tails.
+    dict(
+        m=512, n=256, k=1024, operand_stages=3, output_m_tiles_per_cta=4,
+        output_slices=2, output_store_buffers=2,
+    ),
+])
+def test_cyclic_wgmma_pipeline_matches_the_ordinary_pipeline(config):
+    m, n, k = config["m"], config["n"], config["k"]
+    torch.manual_seed(17)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    outputs = []
+    for cyclic in (False, True):
+        launcher = make_ptx_launcher(make_ptx_kernel(
+            auto_matmul_4096_wgmma256_wg_tma_store_module(
+                **config, cyclic_operand_pipeline=cyclic,
+            )
+        ))
+        output = torch.empty((m, n), dtype=BF16, device="cuda")
+        launcher(lhs, rhs, output)
+        outputs.append(output)
+    torch.cuda.synchronize()
+
+    # Same-accumulator WGMMAs accumulate in issue order either way.
+    assert torch.equal(outputs[1], outputs[0])
+    torch.testing.assert_close(
+        outputs[1].float(), (lhs.float() @ rhs.float().T), rtol=2e-2, atol=2e-1,
+    )
+
+
 @requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128

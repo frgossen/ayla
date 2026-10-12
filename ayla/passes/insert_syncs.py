@@ -9,7 +9,14 @@ from ..analysis.sync import (
 )
 from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
-from ..gpu_dialect import AllocOp, BarrierOp, KernelOp, LockType, ModuleOp
+from ..gpu_dialect import (
+    AllocOp,
+    AwaitOp,
+    BarrierOp,
+    KernelOp,
+    LockType,
+    ModuleOp,
+)
 
 
 # BarrierScope -> the BarrierOp ``scope`` attr.
@@ -28,10 +35,18 @@ def _insert_barriers(
     num_threads: int | None,
     barrier_syncs: dict[Op, Value] | None = None,
 ) -> None:
-    """Insert a ``barrier`` before every op the analysis assigned one."""
+    """Insert the wgmma ``await`` and ``barrier`` the analysis assigned an op."""
     new_ops: list[Op] = []
     for op in block.ops:
         target = targets.get(op)
+        if target is not None and target.wgmma_await is not None:
+            new_ops.append(AwaitOp.build(
+                target.wgmma_await,
+                attrs=(
+                    {"pending": target.wgmma_pending}
+                    if target.wgmma_pending else None
+                ),
+            ))
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
                 raise NotImplementedError(
@@ -94,6 +109,19 @@ class InsertSyncs(Pass):
         kernel = find_op(module, lambda op: isinstance(op, KernelOp))
         assert isinstance(kernel, KernelOp)
         barrier_syncs = _materialize_cluster_mbars(kernel, analysis.targets)
+        # An inserted await can precede a lock allocated in a loop it awaits
+        # across. Lock allocs take no operands, so define those at the entry.
+        allocs: list[Op] = []
+        for target in analysis.targets.values():
+            lock = target.wgmma_await
+            alloc = lock.definition if lock is not None else None
+            if not isinstance(alloc, AllocOp):
+                continue
+            block = alloc.parent_block
+            if block is not None and block is not kernel.body:
+                block.ops.remove(alloc)
+                allocs.append(alloc)
+        kernel.body.ops[0:0] = allocs
         # Transform: insert the barriers with the kernel-wide participant count.
         _insert_barriers(
             module.body, analysis.targets, kernel.num_threads, barrier_syncs,

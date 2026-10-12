@@ -14,9 +14,13 @@ the ops that define its operands.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
+    ForOp,
+    LockType,
     TmaMoveOp,
     effective_operands,
     has_ordering_effect,
@@ -44,6 +48,14 @@ def _is_async_move(op: Op) -> bool:
 
 def _is_await(op: Op) -> bool:
     return isinstance(op, AwaitOp)
+
+
+def _is_wgmma_issue(op: Op) -> bool:
+    return (
+        isinstance(op, AsyncOp)
+        and isinstance(op.lock.type, LockType)
+        and op.lock.type.kind == "wgmma"
+    )
 
 
 def _can_swap(upper: Op, lower: Op) -> bool:
@@ -115,6 +127,7 @@ def _bubble(
     targets: list[Op],
     *,
     step: int,
+    may_hoist: Callable[[list[Op], int], bool] = lambda ops, j: True,
 ) -> None:
     """Bubble each target through its neighbours as far as `_can_swap` allows.
 
@@ -124,27 +137,46 @@ def _bubble(
     swapped above its producer, since that swap would require
     ``_can_swap(producer, consumer)``, which the SSA check rejects. Valid SSA
     input therefore stays valid, and producers settle before the consumers
-    stacked on them.
+    stacked on them. ``may_hoist(ops, j)`` can further refuse moving ``ops[j]``
+    above ``ops[j - 1]``.
     """
     assert step in (-1, 1), f"step must be -1 or +1; got {step}"
     for op in targets:
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
             lo, hi = sorted((j, j + step))
-            if not _can_swap(ops[lo], ops[hi]):
+            if not _can_swap(ops[lo], ops[hi]) or (
+                step == -1 and not may_hoist(ops, j)
+            ):
                 break
             ops[j], ops[j + step] = ops[j + step], ops[j]
             j += step
 
 
-def _hoist_async_moves(ops: list[Op]) -> None:
+def _hoist_async_moves(
+    ops: list[Op], wgmma_pending_groups: int, in_loop: bool,
+) -> None:
     # Targets: the async moves (matmuls are tracked as lock peers but never
     # moved) plus the side-effect-free dependency cone feeding each. Then hoist
     # each up.
     targets = _side_effect_free_operand_closure(
         [op for op in ops if _is_async_move(op)], ops
     )
-    _bubble(ops, targets, step=-1)
+
+    def may_hoist(ops: list[Op], j: int) -> bool:
+        """Whether a move above a wgmma issue still leaves the groups it
+        conflicts with ``wgmma_pending_groups`` newer groups to wait for."""
+        if not (_is_async_move(ops[j]) and _is_wgmma_issue(ops[j - 1])):
+            return True
+        issues = 0
+        for upper in reversed(ops[:j - 1]):
+            if not _can_swap(upper, ops[j]):
+                return issues >= wgmma_pending_groups
+            issues += _is_wgmma_issue(upper)
+        # A loop body may conflict with the previous iteration's groups.
+        return issues >= wgmma_pending_groups or not in_loop
+
+    _bubble(ops, targets, step=-1, may_hoist=may_hoist)
 
 
 def _sink_awaits(ops: list[Op]) -> None:
@@ -154,9 +186,25 @@ def _sink_awaits(ops: list[Op]) -> None:
 
 
 class ScheduleAsync(Pass):
+    """Hoist async moves and sink awaits.
+
+    insert_syncs awaits wgmma groups right before the first op that needs
+    them. A move hoisted directly below the group it conflicts with makes
+    that a full wait; ``wgmma_pending_groups`` keeps it below that many newer
+    wgmma issues instead, so the wait leaves them in flight.
+    """
+
+    wgmma_pending_groups: int
+
+    def __init__(self, wgmma_pending_groups: int = 0) -> None:
+        super().__init__(wgmma_pending_groups=wgmma_pending_groups)
 
     def run_block(self, block: Block) -> None:
-        _hoist_async_moves(block.ops)
+        _hoist_async_moves(
+            block.ops,
+            self.wgmma_pending_groups,
+            isinstance(block.parent_op, ForOp),
+        )
         _sink_awaits(block.ops)
         super().run_block(block)
 

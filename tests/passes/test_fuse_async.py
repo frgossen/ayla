@@ -9,16 +9,15 @@ from ayla.passes.fuse_async import fuse_async
 
 def test_fuse_same_accumulator():
     """Matmuls writing to the same accumulator fuse — wgmma guarantees
-    ordering within a commit group."""
+    ordering within a commit group. Like its members, the group gets no await;
+    insert_syncs adds one where its work is needed."""
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %l0: lock<wgmma> = alloc() attrs={id: 0}
             async(%l0: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            await(%l0: lock<wgmma>)
             %l1: lock<wgmma> = alloc() attrs={id: 1}
             async(%l1: lock<wgmma>) matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            await(%l1: lock<wgmma>)
           }
         }""")
 
@@ -35,7 +34,6 @@ def test_fuse_same_accumulator():
               matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
             }
-            await(%l0: lock<wgmma>)
           }
         }""")
     assert text == expected

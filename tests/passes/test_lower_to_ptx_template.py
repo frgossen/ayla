@@ -105,6 +105,21 @@ def test_lower_barrier(scope, expected):
     assert _lower_barrier(scope) == expected
 
 
+def test_wgmma_await_keeps_pending_groups_in_flight():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k() {
+            %l: lock<wgmma> = alloc() attrs={id: 0}
+            await(%l: lock<wgmma>) attrs={pending: 1}
+          }
+        }"""))
+
+    lowered = lower_to_ptx_template(module)
+    [wait] = find_ops_of_type(lowered, PTXTemplateOp)
+
+    assert wait.attrs["template"] == "wgmma.wait_group.sync.aligned 1;\n"
+
+
 def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\

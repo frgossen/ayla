@@ -100,8 +100,8 @@ def test_sync_matmul_stays_as_matmul():
     assert text == module_str
 
 
-def test_wgmma_matmul_to_async_await():
-    """wgmma-eligible matmul becomes async { matmul } + await with a lock."""
+def test_wgmma_matmul_to_async():
+    """wgmma-eligible matmul becomes async { matmul }; insert_syncs awaits it."""
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
@@ -118,7 +118,6 @@ def test_wgmma_matmul_to_async_await():
           kernel @test(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %0: lock<wgmma> = alloc() attrs={id: 0}
             async(%0: lock<wgmma>) collective=[xy.block, z.thread] matmul(%a: smem<128x16xbf16 swizzle="128B">, %b: smem<128x16xbf16 swizzle="128B">, %c: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            await(%0: lock<wgmma>)
           }
         }""")
     assert text == expected

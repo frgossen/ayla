@@ -20,7 +20,8 @@ Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
 the run. An already-fused (multi-op) async returns ``None`` and is left
 untouched, so the pass is idempotent. Side-effect-free ops between members (lock
 allocs, tile views) are transparent — emitted before the merged block — and the
-per-member awaits are dropped.
+per-member awaits are dropped. Members without an await in the block, such as
+wgmma matmuls, fuse into a group without one.
 
 **Placement matters** (caller's responsibility): fuse TMA loads *before*
 pipelining, while each stage's loads and awaits are still adjacent. After
@@ -70,6 +71,7 @@ class FuseAsync(Pass):
     def run_block(self, block: Block) -> None:
         super().run_block(block)
 
+        awaited = {op.lock for op in block.ops if isinstance(op, AwaitOp)}
         new_ops: list[Op] = []
         group_inner: list[Op] = []
         group_lock: Value | None = None
@@ -79,10 +81,12 @@ class FuseAsync(Pass):
         # Member locks still awaiting their (to-be-dropped) await. Each fused
         # async adds its lock; its await removes it. Must be empty at finalize.
         in_flight_locks: set[Value] = set()
+        # Whether any member is awaited, so the group needs an await too.
+        group_awaited = False
 
         def finalize() -> None:
             nonlocal group_inner, group_lock, group_kind, group_attrs, group_collective
-            nonlocal in_flight_locks
+            nonlocal in_flight_locks, group_awaited
             if group_collective is not None:
                 assert group_lock is not None
                 # Every member's await must have been dropped (its lock removed)
@@ -101,13 +105,15 @@ class FuseAsync(Pass):
                     body=Block(ops=group_inner),
                     attrs=group_attrs,
                 ))
-                new_ops.append(AwaitOp.build(group_lock))
+                if group_awaited:
+                    new_ops.append(AwaitOp.build(group_lock))
             group_inner = []
             group_lock = None
             group_kind = None
             group_attrs = None
             group_collective = None
             in_flight_locks = set()
+            group_awaited = False
 
         for op in block.ops:
             kind = _fusion_kind(op)
@@ -126,7 +132,9 @@ class FuseAsync(Pass):
                     group_kind = kind
                     group_attrs = op.extra_attrs or None
                     group_collective = op.collective
-                in_flight_locks.add(op.lock)
+                if op.lock in awaited:
+                    in_flight_locks.add(op.lock)
+                    group_awaited = True
                 group_inner.extend(op.body.ops)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:
                 in_flight_locks.discard(op.lock)  # member's await; group covers it

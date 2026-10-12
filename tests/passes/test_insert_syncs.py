@@ -18,6 +18,7 @@ from ayla.gpu_dialect import (
     CollectiveScope,
     KernelOp,
     LockType,
+    ModuleOp,
     TmaMoveOp,
     gpu_dialect,
 )
@@ -724,3 +725,124 @@ def test_named_barrier_ids_account_for_loop_carried_handoffs():
     ]
     assert len(set(ids)) == 3
 
+
+_ACC = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+
+
+def _issue(lock: str, acc: str = "%c0") -> str:
+    return (
+        f"async(%{lock}: lock<wgmma>) matmul(%a: smem<64x16xbf16>, "
+        f"%a: smem<64x16xbf16>, {acc}: {_ACC})"
+    )
+
+
+def _wgmma_module(*body: str) -> ModuleOp:
+    return gpu_dialect.parse_module(textwrap.dedent(f"""\
+        module {{
+          kernel @k(%a: smem<64x16xbf16>, %c0: {_ACC}, %c1: {_ACC}) {{
+            %l0: lock<wgmma> = alloc()
+            %l1: lock<wgmma> = alloc()
+        """) + textwrap.indent("\n".join(body), " " * 4) + "\n  }\n}")
+
+
+def _awaits(module: ModuleOp) -> list[str]:
+    insert_syncs(module)
+    return [
+        line.strip() for line in repr(module).splitlines()
+        if line.strip().startswith("await(")
+    ]
+
+
+def _exp(acc: str) -> str:
+    return f"elementwise exp({acc}: {_ACC}, {acc}: {_ACC})"
+
+
+def test_wgmma_await_of_the_newest_group_drains_the_queue():
+    module = _wgmma_module(_issue("l0"), _exp("%c0"), _issue("l1"))
+
+    assert _awaits(module) == ["await(%l0: lock<wgmma>)"]
+
+
+def test_partial_wgmma_await_completes_only_older_groups():
+    module = _wgmma_module(
+        _issue("l0"), _issue("l1", "%c1"),
+        "await(%l0: lock<wgmma>) attrs={pending: 1}",
+        _exp("%c0"), _exp("%c1"),
+    )
+
+    # %c0 is complete; %c1's group was the one left in flight.
+    assert _awaits(module) == [
+        "await(%l0: lock<wgmma>) attrs={pending: 1}",
+        "await(%l1: lock<wgmma>)",
+    ]
+
+
+def test_full_wgmma_await_completes_every_older_group():
+    module = _wgmma_module(
+        _issue("l0"), _issue("l1", "%c1"), "await(%l1: lock<wgmma>)",
+        _exp("%c0"),
+    )
+
+    assert _awaits(module) == ["await(%l1: lock<wgmma>)"]
+
+
+def test_wgmma_await_is_inserted_where_its_work_is_needed():
+    module = _wgmma_module(_issue("l0"), _issue("l1", "%c1"), _exp("%c0"))
+
+    # Only %l0's group is needed; the newer %l1 group stays in flight.
+    assert _awaits(module) == ["await(%l0: lock<wgmma>) attrs={pending: 1}"]
+
+
+def test_cyclic_wgmma_refills_wait_for_one_group():
+    def load(stage: int) -> str:
+        return (
+            f"async(%load{stage}: lock<mbar>) move(%s{stage}: smem<64x16xbf16>, "
+            f"%a{stage}: gmem<64x16xbf16>) attrs={{tma: True}}"
+        )
+
+    def mma(stage: int) -> str:
+        return (
+            f"async(%mma{stage}: lock<wgmma>) matmul(%s{stage}: smem<64x16xbf16>, "
+            f"%s{stage}: smem<64x16xbf16>, %acc: {_ACC}) collective=[xy.block, z.thread]"
+        )
+
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
+        module {{
+          kernel @k(%a0: gmem<64x16xbf16>, %a1: gmem<64x16xbf16>, %acc: {_ACC}) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %s0: smem<64x16xbf16> = alloc()
+            %s1: smem<64x16xbf16> = alloc()
+            %load0: lock<mbar> = alloc()
+            %load1: lock<mbar> = alloc()
+            %mma0: lock<wgmma> = alloc()
+            %mma1: lock<wgmma> = alloc()
+            {load(0)}
+            for (%k: index = 0 to 4) {{
+              await(%load0: lock<mbar>)
+              {mma(0)}
+              {load(1)}
+              await(%load1: lock<mbar>)
+              {mma(1)}
+              {load(0)}
+            }}
+            elementwise exp(%acc: {_ACC}, %acc: {_ACC})
+          }}
+        }}"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    # Each refill waits for the group that read its stage, from this or the
+    # previous iteration, while the group issued since keeps running.
+    lines = [
+        line.strip() for line in repr(module).splitlines()
+        if line.strip().startswith(("await(%mma", "barrier", "async(%load"))
+    ]
+    assert lines == [
+        "async(%load0: lock<mbar>) move(%s0: smem<64x16xbf16>, %a0: gmem<64x16xbf16>) attrs={tma: True}",
+        "await(%mma1: lock<wgmma>) attrs={pending: 1}",
+        'barrier() attrs={id: 2, num_threads: 128, scope: "block_leader"}',
+        "async(%load1: lock<mbar>) move(%s1: smem<64x16xbf16>, %a1: gmem<64x16xbf16>) attrs={tma: True}",
+        "await(%mma0: lock<wgmma>) attrs={pending: 1}",
+        'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',
+        "async(%load0: lock<mbar>) move(%s0: smem<64x16xbf16>, %a0: gmem<64x16xbf16>) attrs={tma: True}",
+        "await(%mma1: lock<wgmma>)",
+    ]  # noqa: E501

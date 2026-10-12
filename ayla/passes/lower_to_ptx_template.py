@@ -1377,13 +1377,12 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_await_wgmma(
         self, op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
-        # wait_group drains the commit group so the warpgroup's wgmma reads of
-        # the smem operands have retired. The buffer-reuse WAR (thread-0's TMA
-        # reload vs those reads) is handled by insert_syncs, which emits a barrier
-        # before the reload — so no barrier is needed here.
-        template = textwrap.dedent(r"""
-            wgmma.wait_group.sync.aligned 0;
-        """)
+        # wait_group retires the lock's commit groups so the warpgroup's wgmma
+        # reads of the smem operands have completed; insert_syncs records how
+        # many newer groups may stay in flight. The buffer-reuse WAR (thread-0's
+        # TMA reload vs those reads) is handled by insert_syncs, which emits a
+        # barrier before the reload — so no barrier is needed here.
+        template = f"wgmma.wait_group.sync.aligned {op.attrs.get('pending', 0)};\n"
         new_op = PTXTemplateOp.build(
             operands=[],
             result_types=[],
