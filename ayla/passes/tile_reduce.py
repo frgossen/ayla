@@ -60,6 +60,7 @@ def _materialize_partials(
     value: Value,
     reduction_dim: int,
     reduction_bound: int,
+    neutral_element: float | int,
 ) -> tuple[list[Op], Value]:
     if isinstance(value.definition, (AllocOp, Block)):
         assert isinstance(value.type, AddrMemTensorType)
@@ -69,7 +70,7 @@ def _materialize_partials(
             "sizes": sizes,
             "strides": AddrMemTensorType.canonical_strides(sizes),
         })
-        alloc = AllocOp.build_with_fresh_id(typ, init=0.0)
+        alloc = AllocOp.build_with_fresh_id(typ, init=neutral_element)
         return [alloc], alloc.result()
 
     tile = value.definition
@@ -78,7 +79,7 @@ def _materialize_partials(
         "view chains"
     )
     ops, replayed_arg = _materialize_partials(
-        tile.arg, reduction_dim, reduction_bound,
+        tile.arg, reduction_dim, reduction_bound, neutral_element,
     )
     tile_type = tile.result().type
     replayed_type = replayed_arg.type
@@ -300,8 +301,13 @@ class TileReduce(LoweringPass):
         # Declare partials if needed.
         partials: Value | None = None
         if reduction_dim is not None:
+            neutral_element = ReduceOp.NEUTRAL_ELEMENTS[hero.fn]
+            assert neutral_element is not None
             partials_ops, partials = _materialize_partials(
-                hero.dst, reduction_dim, bounds[reduction_dim],
+                hero.dst,
+                reduction_dim,
+                bounds[reduction_dim],
+                neutral_element,
             )
             parallel_body_insertion_point.extend(partials_ops)
 
@@ -398,7 +404,10 @@ class TileReduce(LoweringPass):
         self, hero: Op, epilogue: list[Op],
     ) -> None:
         assert isinstance(hero, ReduceOp)
-        assert hero.fn == "sum", "TileReduce only supports sum reductions"
+        assert (
+            hero.fn in ReduceOp.NEUTRAL_ELEMENTS
+            and ReduceOp.NEUTRAL_ELEMENTS[hero.fn] is not None
+        ), "TileReduce requires a reduction with a neutral element"
         assert all(isinstance(op, ElementwiseOp) for op in epilogue)
         assert all(
             operand is hero.dst

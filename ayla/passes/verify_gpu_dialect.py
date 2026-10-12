@@ -37,13 +37,6 @@ from ..gpu_dialect import (
 )
 
 
-_ELEMENTWISE_ARITIES = {
-    "convert": 1,
-    "mul": 2,
-    "sigmoid": 1,
-    "silu": 1,
-}
-
 # The target is the device description currently available to compilation.
 # Grid-barrier schedules conservatively assume one CTA per SM.
 _RESIDENT_GRID_CTAS_BY_TARGET = {
@@ -396,6 +389,8 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ReduceOp)
     def _verify_reduce(self, op: ReduceOp) -> None:
+        if op.fn not in ReduceOp.NEUTRAL_ELEMENTS:
+            raise ValueError(f"unknown reduction function {op.fn!r}")
         _verify_collective_attr(op)
         dst, src = op.dst.type, op.src.type
         if not isinstance(dst, MemTensorType) or not isinstance(
@@ -431,7 +426,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ElementwiseOp)
     def _verify_elementwise(self, op: ElementwiseOp) -> None:
-        expected = _ELEMENTWISE_ARITIES.get(op.fn)
+        expected = ElementwiseOp.ARITIES.get(op.fn)
         if expected is None:
             raise ValueError(f"unknown elementwise function {op.fn!r}")
         if op.num_srcs != expected:

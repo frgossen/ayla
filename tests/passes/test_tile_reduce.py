@@ -561,7 +561,7 @@ def test_tile_reduce_replays_tiled_destination_for_reduction_tiling():
         }""")  # noqa: E501
 
 
-def test_tile_reduce_rejects_non_sum_reduction():
+def test_tile_reduce_uses_reduction_neutral_element_for_partials():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @maximum(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) {
@@ -569,16 +569,17 @@ def test_tile_reduce_rejects_non_sum_reduction():
           }
         }"""))
 
-    with pytest.raises(
-        AssertionError,
-        match="only supports sum reductions",
-    ):
-        tile_reduce(
-            module,
-            tile_sizes={1: 32},
-            parallel_iteration_space=None,
-            hero_label_filter="maximum",
-        )
+    module = tile_reduce(
+        module,
+        tile_sizes={1: 32},
+        parallel_iteration_space=None,
+        hero_label_filter="maximum",
+    )
+
+    text = repr(module)
+    assert "alloc() attrs={id: 0, init: -inf}" in text
+    assert text.count("reduce max(") == 2
+    assert repr(gpu_dialect.parse_module(text)) == text
 
 
 def test_tile_reduce_rejects_multiple_parallel_and_reduction_dimensions_on_block_x():
