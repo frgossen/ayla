@@ -363,7 +363,6 @@ def test_war_on_shared_buffer_gets_barrier():
               %bk: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc() attrs={id: 2}
               barrier() attrs={scope: "block"}
-              barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem<128x64xbf16 swizzle="128B">, %ak: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem<128x64xbf16 swizzle="128B">, %bk: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -608,6 +607,8 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             %sd: smem<64x64xbf16> = alloc()
             %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
             %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            %l2: lock<mbar> = alloc()
             async(%l0: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
@@ -616,14 +617,12 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             }
             await(%l0: lock<mbar>)
             matmul(%sa: smem<64x64xbf16>, %sb: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            %l1: lock<mbar> = alloc()
             async(%l1: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
             }
             await(%l1: lock<mbar>)
             matmul(%sc: smem<64x64xbf16>, %sd: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            %l2: lock<mbar> = alloc()
             async(%l2: lock<mbar>) {
               move(%sc: smem<64x64xbf16>, %c: gmem<64x64xbf16>) attrs={tma: True}
               move(%sd: smem<64x64xbf16>, %d: gmem<64x64xbf16>) attrs={tma: True}

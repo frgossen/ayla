@@ -55,6 +55,7 @@ from ..gpu_dialect import (
     ToPtrOp,
     WgrmemTensorType,
     physical_layout,
+    lock_has_tma_multicast,
     root_buffer,
 )
 
@@ -321,14 +322,6 @@ _ELEMENTWISE_LOWERERS = {
         _lower_elementwise_in_batches, lower_registers=_lower_silu_registers,
     ),
 }
-
-
-def _lock_has_tma_multicast(lock: Value) -> bool:
-    """Whether this specific lock coordinates a multicast TMA async group."""
-    return any(
-        isinstance(user, AsyncOp) and user.is_tma_multicast
-        for user in lock.users()
-    )
 
 
 class LowerToPtxTemplate(LoweringPass):
@@ -1339,7 +1332,7 @@ class LowerToPtxTemplate(LoweringPass):
         # Materializing the optional hint in a virtual register lets ptxas
         # select the compact fused wait; an immediate or test_wait expands
         # into substantially more phase-check, sleep, or yield instructions.
-        multicast_async = _lock_has_tma_multicast(op.lock)
+        multicast_async = lock_has_tma_multicast(op.lock)
         acquire_scope = "cluster" if multicast_async else "cta"
         template = textwrap.dedent(fr"""
             mov.u32 ${{b32:ticks}}, 0x989680;

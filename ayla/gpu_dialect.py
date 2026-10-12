@@ -2942,6 +2942,14 @@ def has_ordering_effect(op: Op) -> bool:
     )
 
 
+def lock_has_tma_multicast(lock: Value) -> bool:
+    """Whether this specific lock coordinates a multicast TMA async group."""
+    return any(
+        isinstance(user, AsyncOp) and user.is_tma_multicast
+        for user in lock.users()
+    )
+
+
 def is_side_effect_free(op: Op) -> bool:
     """Safe to move, and interchangeable with an identical op.
 

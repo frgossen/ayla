@@ -11,11 +11,11 @@ from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
-    AsyncOp,
     BarrierOp,
     KernelOp,
     LockType,
     ModuleOp,
+    lock_has_tma_multicast,
 )
 
 
@@ -37,16 +37,19 @@ def _insert_barriers(
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
-    pending_init: set[BarrierScope] = set()
+    # Publication still owed by the lock initializations just above.
+    pending_init = BarrierScope.THREAD
     for op in block.ops:
-        if pending_init and not isinstance(op, AllocOp):
-            new_ops.extend(
-                BarrierOp.build(_BARRIER_OP_SCOPE[scope])
-                for scope in (BarrierScope.BLOCK, BarrierScope.CLUSTER)
-                if scope in pending_init
-            )
-            pending_init.clear()
         target = targets.get(op)
+        if pending_init != BarrierScope.THREAD and not isinstance(op, AllocOp):
+            new_ops.extend(_publication_barriers(pending_init))
+            if (
+                target is not None
+                and target.scope.leq(pending_init)
+                and op not in (barrier_syncs or {})
+            ):
+                target = None  # The publication already orders this hazard.
+            pending_init = BarrierScope.THREAD
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
                 raise NotImplementedError(
@@ -74,14 +77,10 @@ def _insert_barriers(
                 attrs=attrs,
             ))
         new_ops.append(op)
-        pending_init.update(_lock_init_barriers(op))
+        pending_init = pending_init.join(_lock_init_barrier(op))
         for inner in op.blocks:
             _insert_barriers(inner, targets, num_threads, barrier_syncs)
-    new_ops.extend(
-        BarrierOp.build(_BARRIER_OP_SCOPE[scope])
-        for scope in (BarrierScope.BLOCK, BarrierScope.CLUSTER)
-        if scope in pending_init
-    )
+    new_ops.extend(_publication_barriers(pending_init))
     block.ops = new_ops
 
 
@@ -107,26 +106,24 @@ def _materialize_cluster_mbars(
     return barrier_syncs
 
 
-def _lock_init_barriers(op: Op) -> tuple[BarrierScope, ...]:
-    """Publication barriers required by an implicitly initialized lock."""
-    if not isinstance(op, AllocOp):
-        return ()
-    lock_type = op.result().type
-    if not isinstance(lock_type, LockType):
-        return ()
-    if lock_type.kind == "cluster_mbar":
-        return (BarrierScope.BLOCK, BarrierScope.CLUSTER)
-    if lock_type.kind != "mbar":
-        return ()
-    multicast = any(
-        isinstance(user, AsyncOp) and user.is_tma_multicast
-        for user in op.result().users()
-    )
-    return (
-        (BarrierScope.BLOCK, BarrierScope.CLUSTER)
-        if multicast
-        else (BarrierScope.BLOCK,)
-    )
+def _lock_init_barrier(op: Op) -> BarrierScope:
+    """Publication barrier required by an implicitly initialized lock."""
+    lock = op.result() if isinstance(op, AllocOp) else None
+    if lock is None or not isinstance(lock.type, LockType):
+        return BarrierScope.THREAD
+    if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
+        return BarrierScope.CLUSTER
+    return BarrierScope.BLOCK if lock.type.kind == "mbar" else BarrierScope.THREAD
+
+
+def _publication_barriers(scope: BarrierScope) -> list[Op]:
+    """A CTA barrier, followed by a cluster rendezvous for cluster scope."""
+    scopes = {
+        BarrierScope.THREAD: [],
+        BarrierScope.BLOCK: [BarrierScope.BLOCK],
+        BarrierScope.CLUSTER: [BarrierScope.BLOCK, BarrierScope.CLUSTER],
+    }[scope]
+    return [BarrierOp.build(_BARRIER_OP_SCOPE[s]) for s in scopes]
 
 
 class InsertSyncs(Pass):
