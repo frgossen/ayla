@@ -25,9 +25,7 @@ class DCE(Pass):
         empty_groups: set[Op] = set()
         for op in find_ops_of_type(module, AsyncOp):
             users = op.lock.users()
-            if not op.body.ops and any(
-                isinstance(user, AwaitOp) for user in users
-            ) and all(
+            if not op.body.ops and all(
                 isinstance(user, AwaitOp)
                 or isinstance(user, AsyncOp) and not user.body.ops
                 for user in users
