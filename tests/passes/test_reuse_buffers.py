@@ -168,3 +168,24 @@ def test_does_not_reuse_async_locks():
     reuse_buffers(module)
 
     assert repr(module) == module_str
+
+
+def test_reuses_mean_output_for_the_sum():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x6656xf32>, %output: gmem<8x1xf32>) {
+            %sum: gmem<8x1xf32> = alloc() attrs={id: 0}
+            reduce sum(%sum: gmem<8x1xf32>, %src: gmem<8x6656xf32>) attrs={init: 0.0}
+            elementwise div(%output: gmem<8x1xf32>, %sum: gmem<8x1xf32>) attrs={divisor: 6656}
+          }
+        }"""))
+
+    reuse_buffers(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<8x6656xf32>, %output: gmem<8x1xf32>) {
+            reduce sum(%output: gmem<8x1xf32>, %src: gmem<8x6656xf32>) attrs={init: 0.0}
+            elementwise div(%output: gmem<8x1xf32>, %output: gmem<8x1xf32>) attrs={divisor: 6656}
+          }
+        }""")

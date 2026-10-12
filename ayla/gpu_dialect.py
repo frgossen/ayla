@@ -1944,6 +1944,20 @@ class WrmemTensorType(RegMemTensorType):
     def layout(self) -> str:
         return self.attrs["layout"]  # type: ignore[return-value]
 
+    @property
+    def num_elements_per_thread(self) -> int:
+        num_elements = self.num_elements
+        assert num_elements is not None
+        if self.layout == "lane":
+            if num_elements % 32:
+                raise NotImplementedError(
+                    "wrmem lane layout requires a multiple of 32 elements"
+                )
+            return num_elements // 32
+        if self.layout == "lane0":
+            return num_elements
+        raise NotImplementedError(f"unsupported wrmem layout {self.layout!r}")
+
     def print(self, p: Printer) -> None:
         p.write(self.name)
         p.write("<")
@@ -2756,6 +2770,13 @@ def _memory_effect(
     return [MemoryEffect(kind, value, scope, tiling_scheme)]
 
 
+def operand_tiling_scheme(op: Op, operand_index: int) -> int | None:
+    schemes = cast(
+        list[int | None] | None, op.attrs.get("operand_tiling_scheme"),
+    )
+    return None if schemes is None else schemes[operand_index]
+
+
 def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
     if not isinstance(value.type, TmaDescType):
         return value
@@ -2801,11 +2822,11 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return (
             _memory_effect(
                 "W", op.dst, dst_scope,
-                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+                operand_tiling_scheme(op, 0),
             )
             + _memory_effect(
                 "R", op.src, src_scope,
-                cast(int | None, op.attrs.get("src_tiling_scheme")),
+                operand_tiling_scheme(op, 1),
             )
         )
     if isinstance(op, TmaMoveOp):
@@ -2827,11 +2848,11 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return (
             _memory_effect(
                 "W", _resolve_tma_descriptor(op, op.dst), dst_scope,
-                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+                operand_tiling_scheme(op, 0),
             )
             + _memory_effect(
                 "R", _resolve_tma_descriptor(op, op.src), src_scope,
-                cast(int | None, op.attrs.get("src_tiling_scheme")),
+                operand_tiling_scheme(op, 1),
             )
         )
     if isinstance(op, MatmulOp):
@@ -2842,20 +2863,20 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return (
             _memory_effect(
                 "R", op.lhs, _type_collective_scope(op.lhs.type),
-                cast(int | None, op.attrs.get("lhs_tiling_scheme")),
+                operand_tiling_scheme(op, 0),
             )
             + _memory_effect(
                 "R", op.rhs, _type_collective_scope(op.rhs.type),
-                cast(int | None, op.attrs.get("rhs_tiling_scheme")),
+                operand_tiling_scheme(op, 1),
             )
             + init_effects
             + _memory_effect(
                 "R", op.dst, CollectiveScope.THREAD,
-                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+                operand_tiling_scheme(op, 2),
             )
             + _memory_effect(
                 "W", op.dst, CollectiveScope.THREAD,
-                cast(int | None, op.attrs.get("dst_tiling_scheme")),
+                operand_tiling_scheme(op, 2),
             )
         )
     if isinstance(op, ElementwiseOp):
@@ -2877,13 +2898,20 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             else _type_collective_scope(op.dst.type)
         )
         effects = (
-            [] if op.init is not None else _memory_effect("R", op.dst, dst_scope)
+            [] if op.init is not None else _memory_effect(
+                "R", op.dst, dst_scope,
+                operand_tiling_scheme(op, 0),
+            )
         )
         return (
             effects
-            + _memory_effect("W", op.dst, dst_scope)
+            + _memory_effect(
+                "W", op.dst, dst_scope,
+                operand_tiling_scheme(op, 0),
+            )
             + _memory_effect(
                 "R", op.src, _type_collective_scope(op.src.type),
+                operand_tiling_scheme(op, 1),
             )
         )
     if isinstance(op, AwaitOp):

@@ -81,7 +81,7 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
-            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, init: 0.0, label: "mm", lhs_tiling_scheme: 6}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={init: 0.0, label: "mm", operand_tiling_scheme: [6, None, 7]}
           }
         }"""))
     promote_buffers(
@@ -94,13 +94,13 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
             %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
-            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", lhs_tiling_scheme: 6}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", operand_tiling_scheme: [6, None, None]}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             elementwise convert(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
             %2: smem<128x256xbf16> = alloc() attrs={id: 2}
             %3: smem<64x256xbf16> = tile(%2: smem<128x256xbf16>, %wgx: index, 0)
             move(%3: smem<64x256xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_smem"}
-            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, label: "mm_dst_tma", tma: True}
+            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_tma", operand_tiling_scheme: [7, None], tma: True}
           }
         }""")  # noqa: E501
 
@@ -110,8 +110,7 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
         op for op in find_ops_of_type(module, TmaMoveOp)
         if op.attrs.get("label") == "mm_dst_tma"
     ]
-    assert "src_tiling_scheme" not in writeback.attrs
-    assert writeback.attrs["dst_tiling_scheme"] == 7
+    assert writeback.attrs["operand_tiling_scheme"] == [7, None]
 
 
 def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
@@ -274,6 +273,35 @@ def test_promote_multicast_narrows_grid_collective_to_cluster():
     )
 
     assert "collective=xyz.cluster attrs={label: \"mm_lhs_smem\", multicast: True" in repr(module)
+
+
+def test_promote_reduction_src_and_dst_to_smem():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<1x6656xf32>, %output: gmem<1x1xf32>) {
+            reduce sum(%output: gmem<1x1xf32>, %src: gmem<1x6656xf32>) attrs={init: 0.0}
+            elementwise div(%output: gmem<1x1xf32>, %output: gmem<1x1xf32>) attrs={divisor: 6656}
+          }
+        }"""))
+
+    module = promote_buffers(
+        module,
+        target_type="smem",
+        operands=["src", "dst"],
+        epilogue_label_filter=".*",
+    )
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @mean(%src: gmem<1x6656xf32>, %output: gmem<1x1xf32>) {
+            %0: smem<1x6656xf32> = alloc() attrs={id: 0}
+            move(%0: smem<1x6656xf32>, %src: gmem<1x6656xf32>)
+            %1: smem<1x1xf32> = alloc() attrs={id: 1}
+            reduce sum(%1: smem<1x1xf32>, %0: smem<1x6656xf32>) attrs={init: 0.0}
+            elementwise div(%1: smem<1x1xf32>, %1: smem<1x1xf32>) attrs={divisor: 6656}
+            move(%output: gmem<1x1xf32>, %1: smem<1x1xf32>)
+          }
+        }""")
 
 
 def test_promote_can_slice_tma_operand_loads():

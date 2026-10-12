@@ -6,10 +6,83 @@ from collections.abc import Callable
 import torch
 
 from .base.ir import clone_op
-from .gpu_dialect import GmemTensorType, KernelOp, MatmulOp, ModuleOp
+from .base.pipeline import Pipeline
+from .gpu_dialect import (
+    CollectiveAxis,
+    CollectiveLevel,
+    GmemTensorType,
+    KernelOp,
+    MatmulOp,
+    ModuleOp,
+)
+from .passes.promote_buffers import PromoteBuffers
+from .passes.reuse_buffers import ReuseBuffers
 from .passes.specialize_shapes import specialize_shapes
-from .ptx_runtime import PtxLauncher
+from .passes.tile_reduce import (
+    TileReduce,
+)
+from .passes.verify_gpu_dialect import VerifyGpuDialect
+from .ptx_codegen import PtxLoweringPipeline, make_ptx_kernel_from_lowered
+from .ptx_runtime import PtxLauncher, make_ptx_launcher
 from .torch_custom_call import to_torch_dtype
+
+
+class JITCompiler:
+    """Lazily compile one module and cache its launcher."""
+
+    def __init__(self, module: ModuleOp) -> None:
+        self._module = module
+        self._launcher: PtxLauncher | None = None
+
+    def _compile_and_make_ptx_launcher(self) -> PtxLauncher:
+        module = clone_op(self._module, {})
+        assert isinstance(module, ModuleOp)
+        pipeline = Pipeline()
+        pipeline.add_pass(ReuseBuffers())
+        pipeline.add_pass(TileReduce(
+            tile_sizes={0: 1},
+            parallel_iteration_space=(
+                CollectiveLevel.BLOCK, CollectiveAxis.X,
+            ),
+            hero_label_filter="mean",
+            epilogue_label_filter="mean_epilogue",
+        ))
+        pipeline.add_pass(PromoteBuffers(
+            target_type="smem",
+            operands=["src"],
+        ))
+        pipeline.add_pass(PromoteBuffers(
+            target_type="wrmem",
+            operands=["dst"],
+            layout="lane0",
+            epilogue_label_filter="mean_epilogue",
+        ))
+        pipeline.add_pass(TileReduce(
+            tile_sizes={1: 32},
+            parallel_iteration_space=None,
+            hero_label_filter="mean",
+            epilogue_label_filter="mean_epilogue",
+        ))
+        pipeline.add_pass(PtxLoweringPipeline())
+        pipeline.add_instrumentation_pass(VerifyGpuDialect())
+        module = pipeline.run(module)
+        return make_ptx_launcher(make_ptx_kernel_from_lowered(module))
+
+    def _get_launcher(self) -> PtxLauncher:
+        if self._launcher is None:
+            self._launcher = self._compile_and_make_ptx_launcher()
+        return self._launcher
+
+    @property
+    def name(self) -> str:
+        return self._get_launcher().name
+
+    @property
+    def signature(self):
+        return self._get_launcher().signature
+
+    def __call__(self, *tensors: torch.Tensor) -> None:
+        self._get_launcher()(*tensors)
 
 
 class ShapeSpecializingJITCompiler:

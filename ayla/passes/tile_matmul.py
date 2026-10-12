@@ -47,13 +47,14 @@ _OPERAND_DIMS = {
     "rhs": frozenset(("N", "K")),
     "dst": frozenset(("M", "N")),
 }
+_OPERAND_INDICES = {"lhs": 0, "rhs": 1, "dst": 2}
 
 
 def _refine_tiling_schemes(
     hero: MatmulOp,
     op_dims: list[str],
     tile_counts: list[int],
-) -> dict[str, int]:
+) -> dict[int, int]:
     """Retain each operand's ID while its tiled accesses stay disjoint."""
     partitioned_dims = {
         dim
@@ -67,19 +68,19 @@ def _refine_tiling_schemes(
     ]
 
     existing = {
-        name: scheme_id
-        for name in _OPERAND_DIMS
-        if (
-            scheme_id := cast(
-                int | None, hero.attrs.get(f"{name}_tiling_scheme")
-            )
-        ) is not None
+        operand_index: scheme_id
+        for operand_index, scheme_id in enumerate(cast(
+            list[int | None], hero.attrs.get("operand_tiling_scheme", []),
+        ))
+        if scheme_id is not None
     }
     if existing:
         return {
-            name: scheme_id
-            for name, scheme_id in existing.items()
-            if name in disjoint_operands
+            operand_index: scheme_id
+            for operand_index, scheme_id in existing.items()
+            if operand_index in {
+                _OPERAND_INDICES[name] for name in disjoint_operands
+            }
         }
 
     can_initialize = (
@@ -90,7 +91,7 @@ def _refine_tiling_schemes(
         return {}
 
     return {
-        name: MemoryEffect.fresh_tiling_scheme_id()
+        _OPERAND_INDICES[name]: MemoryEffect.fresh_tiling_scheme_id()
         for name in disjoint_operands
     }
 
@@ -457,10 +458,11 @@ class TileMatmul(LoweringPass):
                     level,
                 )
         attrs = hero.extra_attrs
-        for name in _OPERAND_DIMS:
-            attrs.pop(f"{name}_tiling_scheme", None)
-        for name, scheme_id in tiling_schemes.items():
-            attrs[f"{name}_tiling_scheme"] = scheme_id
+        attrs.pop("operand_tiling_scheme", None)
+        if tiling_schemes:
+            attrs["operand_tiling_scheme"] = [
+                tiling_schemes.get(i) for i in range(3)
+            ]
         body_ops.append(
             MatmulOp.build(
                 lhs=lhs,

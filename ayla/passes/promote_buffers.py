@@ -1,4 +1,4 @@
-"""Promote matmul operands to a target memory space.
+"""Promote compute operands to a target memory space.
 
 For each ``MatmulOp``, selected operands are promoted by inserting
 ``alloc`` + ``move`` pairs that stage data into the target memory.
@@ -22,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import cast
 
-from ..base.ir import Block, Op, Type, Value, clone_type
+from ..base.ir import Block, Op, Type, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
@@ -45,13 +45,16 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     MoveOp,
+    ReduceOp,
     RmemTensorType,
     SmemTensorType,
     ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
+    WrmemTensorType,
     WgrmemTensorType,
     is_elementwise,
+    operand_tiling_scheme,
 )
 from ._utils import label_matches
 
@@ -61,6 +64,8 @@ def _target_level(target_type: str) -> str:
         return "block"
     if target_type == "wgrmem":
         return "wg"
+    if target_type == "wrmem":
+        return "warp"
     if target_type == "rmem":
         return "thread"
     if target_type == "gmem":
@@ -71,6 +76,8 @@ def _target_level(target_type: str) -> str:
 def _narrowest_level(a: str, b: str) -> str:
     if a == "thread" or b == "thread":
         return "thread"
+    if a == "warp" or b == "warp":
+        return "warp"
     if a == "wg" or b == "wg":
         return "wg"
     return "block"
@@ -79,7 +86,7 @@ def _narrowest_level(a: str, b: str) -> str:
 def _collective_level(value: Value) -> str:
     """Determine the hardware parallelism level at which *value* varies.
 
-    Returns "block", "wg", or "thread".
+    Returns "block", "wg", "warp", or "thread".
     """
     defn = value.definition
 
@@ -103,6 +110,8 @@ def _collective_level(value: Value) -> str:
             return "block"
         if isinstance(ty, WgrmemTensorType):
             return "wg"
+        if isinstance(ty, WrmemTensorType):
+            return "warp"
         if isinstance(ty, (RmemTensorType, GmemTensorType)):
             return "thread"
 
@@ -143,6 +152,8 @@ def _resolve_type(name: str):
         return SmemTensorType
     if name == "rmem":
         return RmemTensorType
+    if name == "wrmem":
+        return WrmemTensorType
     if name == "wgrmem":
         return WgrmemTensorType
     if name == "gmem":
@@ -220,7 +231,7 @@ def _sliced_moves(
 
 
 class PromoteBuffers(LoweringPass):
-    """Promote matmul operands to *target_type* memory space.
+    """Promote compute operands to *target_type* memory space.
 
     When promoting to smem, operands are loaded block-collectively. If
     an operand's tile chain depends on a narrower level (e.g. warp
@@ -235,9 +246,11 @@ class PromoteBuffers(LoweringPass):
     Parameters
     ----------
     target_type : str
-        Memory space to promote into: ``"gmem"``, ``"smem"``, ``"rmem"``, ``"wgrmem"``.
+        Memory space to promote into: ``"gmem"``, ``"smem"`, ``"rmem"``,
+        ``"wrmem"``, or ``"wgrmem"``.
     operands : list[str]
-        Which matmul operands to promote: ``"lhs"``, ``"rhs"``, ``"dst"``.
+        Which operands to promote: ``"lhs"``, ``"rhs"``, and ``"dst"`` for
+        matmuls; ``"src"`` and ``"dst"`` for reductions.
     swizzle : str or None
         Smem swizzle mode (``"128B"``, ``"64B"``, ``"32B"``).
     layout : str or None
@@ -358,22 +371,26 @@ class PromoteBuffers(LoweringPass):
             return self._build_smem_type(sizes, dtype)
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
+        if tensor_cls is WrmemTensorType:
+            if self.layout is None:
+                raise ValueError("wrmem promotion requires a layout")
+            return WrmemTensorType.build(sizes, dtype, layout=self.layout)
         if tensor_cls is WgrmemTensorType:
             assert self.warps is not None and self.layout is not None
             return WgrmemTensorType.build(sizes, dtype, warps=self.warps, layout=self.layout)
         raise ValueError(f"unsupported target type {self.target_type!r}")
 
     def _build_buffer_attrs(
-        self, matmul_label: str | None, operand_name: str
+        self, compute_label: str | None, operand_name: str
     ) -> dict[str, object]:
-        """The label identifying the buffer promoted for one matmul operand."""
-        if matmul_label is None:
+        """The label identifying the buffer promoted for one compute operand."""
+        if compute_label is None:
             return {}
         attrs: dict[str, object] = {
-            "label": f"{matmul_label}_{operand_name}_{self.target_type}",
+            "label": f"{compute_label}_{operand_name}_{self.target_type}",
         }
         if self.unsafe_reuse_smem and self.target_type == "smem":
-            attrs["reuse_group"] = f"{matmul_label}_compute"
+            attrs["reuse_group"] = f"{compute_label}_compute"
         return attrs
 
     def _build_move_attrs(
@@ -395,8 +412,9 @@ class PromoteBuffers(LoweringPass):
         src: Value,
         operand_name: str,
         collective: dict[CollectiveAxis, CollectiveLevel],
-        matmul_label: str | None = None,
+        compute_label: str | None = None,
         init: float | int | None = None,
+        load: bool = True,
     ) -> tuple[list[Op], list[Value]]:
         """Promote an operand to the target memory, handling any collective level.
 
@@ -444,8 +462,8 @@ class PromoteBuffers(LoweringPass):
         # The allocation carries the same label as the move that fills it, so a
         # later pass can name the buffer it wants -- multi_buffer only touches
         # labelled ones.
-        buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
-        if init is not None:
+        buffer_attrs = self._build_buffer_attrs(compute_label, operand_name)
+        if not load or init is not None:
             # SMEM initialization has no lowering. Keep the initialization on
             # the matmul so a subsequent register promotion can materialize it.
             alloc = AllocOp.build_with_fresh_id(
@@ -455,7 +473,7 @@ class PromoteBuffers(LoweringPass):
             )
             new_ops.append(alloc)
         else:
-            attrs = self._build_move_attrs(matmul_label, operand_name)
+            attrs = self._build_move_attrs(compute_label, operand_name)
             chain_root_type = chain_root.type
             assert isinstance(chain_root_type, MemTensorType)
             alloc = AllocOp.build_with_fresh_id(
@@ -584,7 +602,7 @@ class PromoteBuffers(LoweringPass):
             }
             store_attrs.update(self.move_attrs.get("dst", {}))
             if writeback_tiling_scheme is not None:
-                store_attrs["dst_tiling_scheme"] = writeback_tiling_scheme
+                store_attrs["operand_tiling_scheme"] = [writeback_tiling_scheme, None]
             store = MoveOp.build(
                 dst=store_dst_value,
                 src=smem.result(),
@@ -652,7 +670,7 @@ class PromoteBuffers(LoweringPass):
             return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         if writeback_tiling_scheme is not None:
-            attrs["dst_tiling_scheme"] = writeback_tiling_scheme
+            attrs["operand_tiling_scheme"] = [writeback_tiling_scheme, None]
         move = MoveOp.build(
             dst=dst, src=src, collective=collective, attrs=attrs,
         )
@@ -685,13 +703,16 @@ class PromoteBuffers(LoweringPass):
                 i += 1
                 continue
             epilogue = self._epilogue(ops, i)
-            assert isinstance(op, MatmulOp)
+            assert isinstance(op, (MatmulOp, ReduceOp))
             new_ops.extend(self._promote(op, epilogue))
             i += 1 + len(epilogue)
         block.ops = new_ops
 
     def _promotes(self, op: Op) -> bool:
-        return isinstance(op, MatmulOp) and label_matches(op, self.label_filter)
+        return (
+            isinstance(op, (MatmulOp, ReduceOp))
+            and label_matches(op, self.label_filter)
+        )
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[ElementwiseOp]:
         """The ops directly behind ``ops[hero]`` that promote with it.
@@ -709,7 +730,7 @@ class PromoteBuffers(LoweringPass):
             return []
         found: list[ElementwiseOp] = []
         hero_op = ops[hero]
-        assert isinstance(hero_op, MatmulOp)
+        assert isinstance(hero_op, (MatmulOp, ReduceOp))
         dst = hero_op.dst
         for op in ops[hero + 1:]:
             if not is_elementwise(op):
@@ -723,10 +744,16 @@ class PromoteBuffers(LoweringPass):
         return found
 
     def _promote(
+        self, op: MatmulOp | ReduceOp, epilogue: list[ElementwiseOp],
+    ) -> list[Op]:
+        if isinstance(op, MatmulOp):
+            return self._promote_matmul(op, epilogue)
+        return self._promote_reduce(op, epilogue)
+
+    def _promote_matmul(
         self, op: MatmulOp, epilogue: list[ElementwiseOp],
     ) -> list[Op]:
         lhs, rhs, dst = op.lhs, op.rhs, op.dst
-
         label = op.attrs.get("label")
         assert label is None or isinstance(label, str)
         pre_ops: list[Op] = []
@@ -752,16 +779,21 @@ class PromoteBuffers(LoweringPass):
                 init=init,
             )
             pre_ops.extend(ops)
-            # A staged SMEM destination is intermediate IR; its matmul still
-            # owns initialization until the destination reaches registers.
             if self.target_type != "smem":
                 init = None
             if fill is not None:
                 init_value = None
 
         matmul_attrs = op.extra_attrs
+        tiling_schemes = list(cast(
+            list[int | None], matmul_attrs.get("operand_tiling_scheme", [None] * 3),
+        ))
         for operand_name in self.operand_names:
-            matmul_attrs.pop(f"{operand_name}_tiling_scheme", None)
+            tiling_schemes[{"lhs": 0, "rhs": 1, "dst": 2}[operand_name]] = None
+        if any(scheme is not None for scheme in tiling_schemes):
+            matmul_attrs["operand_tiling_scheme"] = tiling_schemes
+        else:
+            matmul_attrs.pop("operand_tiling_scheme", None)
         matmul = MatmulOp.build(
             lhs=new_lhs,
             rhs=new_rhs,
@@ -772,18 +804,14 @@ class PromoteBuffers(LoweringPass):
             attrs=matmul_attrs,
         )
 
-        # The epilogue runs on the promoted buffer, before it is written back:
-        # that is the whole point of promoting the destination, and it is only
-        # reachable here because the ops behind the matmul came along.
-        promoted_epilogue: list[ElementwiseOp] = [
-            type(e)(operands=[new_dst, new_dst], results=[], attrs=e.attrs)
-            for e in epilogue
-        ]
+        promoted_epilogue: list[ElementwiseOp] = []
+        for epilogue_op in epilogue:
+            cloned = clone_op(epilogue_op, {dst: new_dst})
+            assert isinstance(cloned, ElementwiseOp)
+            promoted_epilogue.append(cloned)
         post_ops: list[Op] = list(promoted_epilogue)
         if "dst" in self.operand_names:
-            writeback_tiling_scheme = cast(
-                int | None, op.attrs.get("dst_tiling_scheme")
-            )
+            writeback_tiling_scheme = operand_tiling_scheme(op, 2)
             post_ops, _ = self._build_operand_writeback(
                 dst, new_dst, "dst", op.collective, label,
                 promoted_epilogue,
@@ -791,6 +819,47 @@ class PromoteBuffers(LoweringPass):
             )
 
         return pre_ops + [matmul] + post_ops
+
+    def _promote_reduce(
+        self, op: ReduceOp, epilogue: list[ElementwiseOp],
+    ) -> list[Op]:
+        label = op.attrs.get("label")
+        assert label is None or isinstance(label, str)
+        collective = {
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        }
+        replacements: dict[Value, Value] = {}
+        pre_ops: list[Op] = []
+        for name, operand in {"src": op.src, "dst": op.dst}.items():
+            if name not in self.operand_names:
+                continue
+            is_dst = name == "dst"
+            init = op.init if is_dst else None
+            load = not is_dst or init is None
+            ops, [replacement] = self._build_operand_promotion(
+                operand, name, collective, label, init=init, load=load,
+            )
+            pre_ops.extend(ops)
+            replacements[operand] = replacement
+
+        compute = clone_op(op, replacements)
+        if "dst" in self.operand_names and self.target_type != "smem":
+            compute.attrs.pop("init", None)
+
+        promoted_epilogue: list[ElementwiseOp] = []
+        for epilogue_op in epilogue:
+            cloned = clone_op(epilogue_op, replacements)
+            assert isinstance(cloned, ElementwiseOp)
+            promoted_epilogue.append(cloned)
+        post_ops: list[Op] = list(promoted_epilogue)
+        if "dst" in self.operand_names:
+            dst = op.dst
+            new_dst = replacements[dst]
+            post_ops, _ = self._build_operand_writeback(
+                dst, new_dst, "dst", collective, label, promoted_epilogue,
+            )
+
+        return pre_ops + [compute] + post_ops
 
 
 def promote_buffers(

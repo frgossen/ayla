@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Set
 from typing import cast
 
 from ..base.ir import (
@@ -25,12 +26,14 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexModOp,
     KernelOp,
+    MemoryEffect,
     MemTensorType,
     ModuleOp,
     ReduceOp,
     ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
+    is_grid_collective,
 )
 from ._utils import label_matches
 
@@ -162,6 +165,89 @@ def _narrow_collective(
     return result
 
 
+def refine_operand_tiling_schemes(
+    tiling_schemes: list[int | None],
+    operand_dims: dict[int, Set[int]],
+    bounds: dict[int, int],
+    *,
+    allow_initialize: bool,
+) -> list[int | None]:
+    """Update operand schemes in place while their tiles remain disjoint."""
+    partitioned_dims = {dim for dim, bound in bounds.items() if bound > 1}
+    for operand_index, dims in operand_dims.items():
+        if not partitioned_dims <= dims:
+            tiling_schemes[operand_index] = None
+        elif tiling_schemes[operand_index] is None and allow_initialize:
+            tiling_schemes[operand_index] = MemoryEffect.fresh_tiling_scheme_id()
+    return tiling_schemes
+
+
+def _reduction_operand_dims(hero: ReduceOp) -> dict[int, Set[int]]:
+    """Map operands to logical dimensions, with distinct final dimensions."""
+    src_type = hero.src.type
+    assert isinstance(src_type, MemTensorType)
+    rank = src_type.rank
+    parallel_dims = tuple(range(rank - 1))
+    # The source reduces dimension rank-1; the destination has unit dimension rank.
+    return {
+        0: frozenset((*parallel_dims, rank)),
+        1: frozenset((*parallel_dims, rank - 1)),
+    }
+
+
+def _update_partial_tiling_schemes(
+    hero: ReduceOp,
+    partial_reduce: ReduceOp,
+    operand_tiling_scheme: list[int | None],
+    bounds: dict[int, int],
+    *,
+    vector_accumulation: bool,
+    allow_initialize_tiling_scheme: bool,
+) -> None:
+    """Tag disjoint source tiles and scalar slices of the new partial buffer."""
+    hero_operand_dims = _reduction_operand_dims(hero)
+    operand_dims = {1: hero_operand_dims[1]}
+    if not vector_accumulation:
+        # Scalar partials are indexed by the source's reduction tile index.
+        operand_dims[0] = hero_operand_dims[1]
+    schemes = refine_operand_tiling_schemes(
+        [None, operand_tiling_scheme[1]],
+        operand_dims,
+        bounds,
+        allow_initialize=allow_initialize_tiling_scheme,
+    )
+    partial_reduce.attrs.pop("operand_tiling_scheme", None)
+    if any(scheme is not None for scheme in schemes):
+        partial_reduce.attrs["operand_tiling_scheme"] = schemes
+
+
+def _update_final_tiling_schemes(
+    hero: ReduceOp,
+    final_reduce: ReduceOp,
+    operand_tiling_scheme: list[int | None],
+    bounds: dict[int, int],
+    reduction_dim: int | None,
+    *,
+    vector_accumulation: bool,
+    allow_initialize_tiling_scheme: bool,
+) -> None:
+    """Refine original operand schemes, excluding reads of the partial buffer."""
+    operand_tiling_scheme = list(operand_tiling_scheme)
+    operand_dims = _reduction_operand_dims(hero)
+    if reduction_dim is not None:
+        operand_tiling_scheme[1] = None
+        del operand_dims[1]
+    schemes = refine_operand_tiling_schemes(
+        operand_tiling_scheme,
+        operand_dims,
+        bounds,
+        allow_initialize=allow_initialize_tiling_scheme,
+    )
+    final_reduce.attrs.pop("operand_tiling_scheme", None)
+    if any(scheme is not None for scheme in schemes):
+        final_reduce.attrs["operand_tiling_scheme"] = schemes
+
+
 class TileReduce(LoweringPass):
     """Tile reduction iteration spaces and selected epilogues.
 
@@ -259,6 +345,15 @@ class TileReduce(LoweringPass):
             dim: cast(int, src_type.sizes[dim]) // tile_size
             for dim, tile_size in self.tile_sizes.items()
         }
+
+        # Read operand tiling schemes and determine whether new IDs are allowed.
+        operand_tiling_scheme = list(cast(
+            list[int | None], hero.attrs.get("operand_tiling_scheme", [None, None]),
+        ))
+        allow_initialize_tiling_scheme = (
+            is_grid_collective(hero.collective)
+            and find_ancestor_of_type(hero, ForOp) is None
+        )
 
         # Update launch dimensions.
         if self.parallel_iteration_space is not None:
@@ -386,6 +481,14 @@ class TileReduce(LoweringPass):
                 collective=tiled_collectiveness,
                 attrs=partial_attrs,
             )
+            _update_partial_tiling_schemes(
+                hero,
+                partial_reduce,
+                operand_tiling_scheme,
+                bounds,
+                vector_accumulation=self.vector_accumulation,
+                allow_initialize_tiling_scheme=allow_initialize_tiling_scheme,
+            )
             reduction_body_insertion_point.extend([
                 *partial_ops,
                 *src_ops,
@@ -401,6 +504,12 @@ class TileReduce(LoweringPass):
             hero,
             {hero.dst: dst, hero.src: final_src},
             {"collective": final_reduction_collectiveness},
+        )
+        assert isinstance(final_reduce, ReduceOp)
+        _update_final_tiling_schemes(
+            hero, final_reduce, operand_tiling_scheme, bounds, reduction_dim,
+            vector_accumulation=self.vector_accumulation,
+            allow_initialize_tiling_scheme=allow_initialize_tiling_scheme,
         )
         parallel_body_insertion_point.append(final_reduce)
 

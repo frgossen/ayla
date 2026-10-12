@@ -12,6 +12,7 @@ from .base.pipeline import Pipeline
 from .gpu_dialect import (
     BlockIdOp,
     ClusterBlockIdsOp,
+    F32Type,
     ForOp,
     GmemTensorType,
     IfOp,
@@ -35,6 +36,7 @@ from .gpu_dialect import (
     TmaDescType,
     ToPtrOp,
     WarpGroupIdOp,
+    WrmemTensorType,
     WgrmemTensorType,
 )
 from .passes.canonicalize import Canonicalize
@@ -142,6 +144,16 @@ def map_type_to_registers(type):
         )
         return TypeRegisterMapping(
             member_register_types=tuple(ptx_dtype for _ in range(n)),
+            member_names=tuple(f"r{i}" for i in range(n)),
+        )
+    if isinstance(type, WrmemTensorType):
+        if not isinstance(type.dtype, F32Type):
+            raise NotImplementedError(
+                f"map_type_to_registers: wrmem dtype {type.dtype.name}"
+            )
+        n = type.num_elements_per_thread
+        return TypeRegisterMapping(
+            member_register_types=tuple(PtxType.F32 for _ in range(n)),
             member_names=tuple(f"r{i}" for i in range(n)),
         )
     if isinstance(type, IndexType):
@@ -290,12 +302,16 @@ def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
 
 def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
+    module = PtxLoweringPipeline().run(module)
+    return make_ptx_kernel_from_lowered(module)
+
+
+def make_ptx_kernel_from_lowered(module: ModuleOp) -> PtxKernel:
+    """Emit a PtxKernel from a PTX-template ModuleOp."""
     top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    module = PtxLoweringPipeline().run(module)
-
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
     grid_dim = cast(

@@ -48,7 +48,7 @@ from torch._inductor.codegen.cuda_combined_scheduling import CUDACombinedSchedul
 from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 from torch._inductor.ir import TensorBox, is_contiguous_strides_for_shape
 from torch._inductor.kernel.mm_common import mm_args
-from torch._inductor.lowering import user_lowerings
+from torch._inductor.lowering import fallback_handler, user_lowerings
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
@@ -65,15 +65,20 @@ from .gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
+    F32Type,
     GmemTensorType,
     KernelOp,
     MatmulOp,
     ModuleOp,
+    ReduceOp,
     ReshapeOp,
 )
+from .jit_compiler import JITCompiler
+from .torch_custom_call import OperandKind, make_torch_custom_call
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
 _MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
+_GLIMMER_MEAN = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,12 @@ class _GatedAttentionOutputProjectionMatch:
     gated_attention: Node
     output_projection_weight: Node
     projected_attention: Node
+
+
+@dataclass(frozen=True)
+class _MeanMatch:
+    src: Node
+    output: Node
 
 
 def _match_node_val(
@@ -280,6 +291,38 @@ def _match_permute(
     return src
 
 
+def _match_mean(
+    node: Node,
+    *,
+    m: int,
+    k: int,
+) -> _MeanMatch | None:
+    if not _match_node_target(
+        node, torch.ops.aten.mean.dim, num_args=3,
+    ):
+        return None
+    dims = cast(tuple[int, ...], node.args[1])
+    if dims != (-1,) or node.args[2] is not True:
+        return None
+    src = node.args[0]
+    if not _match_node_val(
+        src,
+        shape=(m, k),
+        strides=(k, 1),
+        dtype=torch.float32,
+    ):
+        return None
+    if not _match_node_val(
+        node,
+        shape=(m, 1),
+        strides=(1, 1),
+        dtype=torch.float32,
+    ):
+        return None
+    assert isinstance(src, Node)
+    return _MeanMatch(src=src, output=node)
+
+
 def _match_gated_attention_output_projection(
     node: Node,
     *,
@@ -394,15 +437,25 @@ def _match_gated_attention_output_projection(
 def _build_gmem_type(node: Node) -> GmemTensorType:
     tensor = node.meta.get("val")
     assert isinstance(tensor, torch.Tensor)
+    if tensor.dtype == torch.bfloat16:
+        dtype = BF16Type()
+    elif tensor.dtype == torch.float32:
+        dtype = F32Type()
+    else:
+        raise NotImplementedError(f"unsupported tensor dtype {tensor.dtype}")
     return GmemTensorType.build(
         list(tensor.shape),
-        BF16Type(),
+        dtype,
         strides=list(tensor.stride()),
     )
 
 
 def _build_gmem_value(name: str, node: Node) -> Value:
     return Value(name=name, type=_build_gmem_type(node))
+
+
+def _grid_collective() -> dict[CollectiveAxis, CollectiveLevel]:
+    return {axis: CollectiveLevel.GRID for axis in CollectiveAxis}
 
 
 def _build_gated_attention_output_projection_module(
@@ -430,11 +483,7 @@ def _build_gated_attention_output_projection_module(
         gate_input,
         gate_weight,
         alloc.result(),
-        collective={
-            CollectiveAxis.X: CollectiveLevel.GRID,
-            CollectiveAxis.Y: CollectiveLevel.GRID,
-            CollectiveAxis.Z: CollectiveLevel.GRID,
-        },
+        collective=_grid_collective(),
         init=0.0,
         attrs={"label": "gate_projection"},
     )
@@ -454,11 +503,7 @@ def _build_gated_attention_output_projection_module(
         alloc.result(),
         output_projection_weight,
         projected_attention,
-        collective={
-            CollectiveAxis.X: CollectiveLevel.GRID,
-            CollectiveAxis.Y: CollectiveLevel.GRID,
-            CollectiveAxis.Z: CollectiveLevel.GRID,
-        },
+        collective=_grid_collective(),
         init=0.0,
         attrs={"label": "output_projection"},
     )
@@ -484,6 +529,34 @@ def _build_gated_attention_output_projection_module(
     return ModuleOp.build(Block(ops=[kernel]))
 
 
+def _build_mean_module(
+    match: _MeanMatch,
+) -> ModuleOp:
+    src = _build_gmem_value("src", match.src)
+    output = _build_gmem_value("output", match.output)
+    assert isinstance(src.type, GmemTensorType)
+    reduction_size = src.type.sizes[1]
+    assert isinstance(reduction_size, int)
+    sum = AllocOp.build_with_fresh_id(output.type)
+    reduce = ReduceOp.build(
+        sum.result(),
+        src,
+        fn="sum",
+        collective=_grid_collective(),
+        init=0.0,
+        attrs={"label": "mean"},
+    )
+    divide = ElementwiseOp.build(
+        output,
+        srcs=[sum.result()],
+        fn="div",
+        attrs={"divisor": reduction_size, "label": "mean_epilogue"},
+    )
+    body = Block(arguments=[src, output], ops=[sum, reduce, divide])
+    kernel = KernelOp.build("mean", body)
+    return ModuleOp.build(Block(ops=[kernel]))
+
+
 def _try_lower_glimmer_attention_subgraph(node: Node) -> None:
     match = _match_gated_attention_output_projection(
         node, m=8, n=6656, k=4096,
@@ -495,6 +568,24 @@ def _try_lower_glimmer_attention_subgraph(node: Node) -> None:
         "Muse Glimmer attention subgraph lowering is not implemented\n"
         f"{module}"
     )
+
+def _try_lower_glimmer_mean(node: Node, src):
+    global _GLIMMER_MEAN
+    match = _match_mean(node, m=8, k=6656)
+    if match is None:
+        return None
+    module = _build_mean_module(match)
+    if _GLIMMER_MEAN is None:
+        compiler = JITCompiler(module)
+        _GLIMMER_MEAN = make_torch_custom_call(
+            compiler,
+            [OperandKind.R, OperandKind.RESULT],
+            name="glimmer_mean_8x6656",
+        )
+    return fallback_handler(
+        _GLIMMER_MEAN, add_to_fallback_set=False,
+    )(src)
+
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
     """A matmul ayla will run."""
@@ -647,14 +738,26 @@ def _lower_mm(lhs, rhs, *, layout=None):
     )
 
 
-_LOWERING_TARGET = torch.ops.aten.mm.default
-_displaced_user_lowering = None
+def _lower_mean(x, axis=None, keepdim=False, *, dtype=None):
+    current = V.graph.current_node
+    assert isinstance(current, Node)
+    lowered = _try_lower_glimmer_mean(current, x)
+    if lowered is not None:
+        return lowered
+    return None
+
+
+_USER_LOWERINGS = {
+    torch.ops.aten.mm.default: _lower_mm,
+    torch.ops.aten.mean.dim: _lower_mean,
+}
+_displaced_user_lowerings = {}
 _displaced_backend = None
 
 
 def install() -> None:
-    """Claim ``aten.mm``, and the cuda scheduling that decides what fuses into it."""
-    global _displaced_user_lowering, _displaced_backend
+    """Install Ayla's Inductor lowerings and CUDA scheduling."""
+    global _displaced_backend
     init_backend_registration()
     if _displaced_backend is None:
         _displaced_backend = device_codegens["cuda"]
@@ -662,15 +765,16 @@ def install() -> None:
             "cuda", AylaCombinedScheduling, PythonWrapperCodegen, CppWrapperGpu,
         )
 
-    current = user_lowerings.get(_LOWERING_TARGET)
-    if current is _lower_mm:
-        return
-    _displaced_user_lowering = current
-    user_lowerings[_LOWERING_TARGET] = _lower_mm
+    for target, lowering in _USER_LOWERINGS.items():
+        current = user_lowerings.get(target)
+        if current is lowering:
+            continue
+        _displaced_user_lowerings[target] = current
+        user_lowerings[target] = lowering
 
 
 def uninstall() -> None:
-    """Hand back ``aten.mm`` and the cuda scheduling."""
+    """Hand back Ayla's Inductor lowerings and CUDA scheduling."""
     global _displaced_backend
     # Stand down if someone has claimed cuda since, rather than overwrite them.
     installed = device_codegens.get("cuda")
@@ -679,8 +783,10 @@ def uninstall() -> None:
         device_codegens["cuda"] = _displaced_backend
         _displaced_backend = None
 
-    if user_lowerings.get(_LOWERING_TARGET) is not _lower_mm:
-        return
-    del user_lowerings[_LOWERING_TARGET]
-    if _displaced_user_lowering is not None:
-        user_lowerings[_LOWERING_TARGET] = _displaced_user_lowering
+    for target, lowering in _USER_LOWERINGS.items():
+        if user_lowerings.get(target) is not lowering:
+            continue
+        del user_lowerings[target]
+        displaced = _displaced_user_lowerings.pop(target, None)
+        if displaced is not None:
+            user_lowerings[target] = displaced

@@ -25,6 +25,7 @@ from ayla.gpu_dialect import (
 from ayla.passes.folding import Folding
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
+from ayla.ptx_codegen import make_ptx_kernel
 from tests.testing_utils import assert_contains_in_order
 
 
@@ -91,6 +92,7 @@ def _lower_barrier(scope: str) -> str:
 
 @pytest.mark.parametrize("scope, expected", [
     ("thread", ""),                # program order, no barrier
+    ("warp", "bar.warp.sync 0xffffffff;\n"),
     ("block", "bar.sync 0;\n"),    # full-CTA barrier
     ("leader_to_cluster", textwrap.dedent("""\
         barrier.cluster.arrive.release;
@@ -255,6 +257,52 @@ def test_grid_barrier_uses_last_arriver_to_release_waiters():
     assert "setp.eq.u32 ${pred:grid_last}, ${b32:grid_ticket}, 7;" in template
     assert "cp.async.bulk.wait_group" not in template
     assert "grid_count_wait" not in template
+
+
+def _warp_reduction_module():
+    return gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @sum(%src: smem<1x32xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %partials: wrmem<1x32xf32 layout="lane"> = alloc() attrs={id: 0, init: 0.0}
+            reduce sum(%partials: wrmem<1x32xf32 layout="lane">, %src: smem<1x32xf32>)
+            %sum: wrmem<1x1xf32 layout="lane0"> = alloc() attrs={id: 1, init: 0.0}
+            reduce sum(%sum: wrmem<1x1xf32 layout="lane0">, %partials: wrmem<1x32xf32 layout="lane">)
+          }
+        }"""))
+
+
+def test_lower_warp_reduction_steps():
+    lowered = lower_to_ptx_template(_warp_reduction_module())
+    reductions = [
+        op.attrs["template"]
+        for op in find_ops(lowered, lambda op: isinstance(op, PTXTemplateOp))
+        if str(op.attrs.get("description", "")).startswith("reduce sum")
+    ]
+
+    assert reductions[0] == textwrap.dedent("""\
+        mov.u32 ${b32:lane}, %laneid;
+        mad.lo.u32 ${b32:addr}, ${b32:lane}, 4, ${b32:operand.src.ptr};
+        ld.shared.f32 ${f32:value}, [${b32:addr}];
+        add.rn.f32 ${f32:operand.dst.r0}, ${f32:operand.dst.r0}, ${f32:value};
+    """)
+    assert reductions[1] == (
+        "mov.f32 ${f32:operand.dst.r0}, ${f32:operand.src.r0};\n"
+        + "".join(
+            "shfl.sync.down.b32 ${f32:tmp}, "
+            f"${{f32:operand.dst.r0}}, {offset}, 0x1f, 0xffffffff;\n"
+            "add.rn.f32 ${f32:operand.dst.r0}, "
+            "${f32:operand.dst.r0}, ${f32:tmp};\n"
+            for offset in (16, 8, 4, 2, 1)
+        )
+    )
+
+
+def test_warp_reduction_reaches_ptx():
+    ptx = make_ptx_kernel(_warp_reduction_module()).ptx
+
+    assert "ld.shared.f32" in ptx
+    assert "shfl.sync.down.b32" in ptx
+    assert "bar.warp.sync 0xffffffff;" in ptx
 
 
 def test_lower_tma_load_with_l2_cache_hint():
