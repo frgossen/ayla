@@ -342,7 +342,11 @@ def test_matmul_tensor_initializer_roundtrips():
     assert matmul.init is None
     assert matmul.init_value is not None
     assert list(matmul.init_value.type.strides) == [0, 1]
-    assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
+    assert CollectiveLevel.THREAD_32.granularity == 32
+    assert (
+        CollectiveLevel.THREAD_32.join(CollectiveLevel.WG)
+        == CollectiveLevel.WG
+    )
     assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
     assert not is_grid_collective(matmul.collective, (CollectiveAxis.X,))
