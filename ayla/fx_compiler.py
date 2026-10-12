@@ -11,6 +11,7 @@ from torch._inductor.pattern_matcher import Match, PatternExpr, PatternMatcherPa
 
 from .base.ir import Block, Op, Value
 from .fx_pipeline import register_fx_kernel_rewrite
+from .jit_compiler import JITCompiler, LauncherPlan, TensorSignature
 from .gpu_dialect import (
     AllocOp,
     CollectiveAxis,
@@ -24,9 +25,6 @@ from .gpu_dialect import (
     TileOp,
     Type,
 )
-from .ptx_codegen import PtxKernel, make_ptx_kernel
-from .ptx_runtime import PtxLauncher, make_ptx_launcher
-from .jit_compiler import TensorSignature
 from .torch_custom_call import (
     DEFAULT_NAMESPACE,
     OperandKind,
@@ -329,48 +327,6 @@ def _match_signature(match: FxRegionMatch) -> TensorSignature:
     return tuple(tensors)
 
 
-class FxToAylaCompiler:
-    """Compile each concrete matched FX signature to one reusable PTX kernel."""
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        schedule: Callable[[ModuleOp], ModuleOp],
-        compile_module: Callable[[ModuleOp], PtxKernel] = make_ptx_kernel,
-    ) -> None:
-        self.name = name
-        self._schedule = schedule
-        self._compile_module = compile_module
-        self._kernels: dict[TensorSignature, PtxKernel] = {}
-
-    @property
-    def cache_size(self) -> int:
-        return len(self._kernels)
-
-    def prepare(
-        self,
-        torch_match: Match,
-        inputs: tuple[Node, ...],
-    ) -> None:
-        self.prepare_region(FxRegionMatch(torch_match.output_node(), inputs))
-
-    def prepare_region(self, region: FxRegionMatch) -> None:
-        signature = _match_signature(region)
-        if signature in self._kernels:
-            return
-        module = fx_region_to_module(region, name=self.name)
-        self._kernels[signature] = self._compile_module(self._schedule(module))
-
-    def build_route(self, signature: TensorSignature) -> PtxLauncher:
-        kernel = self._kernels.get(signature)
-        if kernel is None:
-            raise RuntimeError(
-                f"{self.name}: no compiled FX region for tensor signature"
-            )
-        return make_ptx_launcher(kernel)
-
-
 def make_fx_to_ayla_rewrite(
     patterns: PatternMatcherPass,
     *,
@@ -379,23 +335,33 @@ def make_fx_to_ayla_rewrite(
     name: str,
     signature: list[Type],
     signature_mapping: list[OperandKind],
-    schedule: Callable[[ModuleOp], ModuleOp],
+    compile_region: Callable[[ModuleOp], LauncherPlan],
     extra_check: Callable[[Match], bool] | None = None,
     namespace: str = DEFAULT_NAMESPACE,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
-) -> torch._ops.OpOverload:
+) -> None:
     """Build a rewrite that compiles matched FX regions through Ayla."""
-    compiler = FxToAylaCompiler(name=name, schedule=schedule)
-    return register_fx_kernel_rewrite(
+    compiler = JITCompiler(
+        name=name,
+        signature=signature,
+        compile_fn=compile_region,
+    )
+
+    def prepare(torch_match: Match, inputs: tuple[Node, ...]) -> None:
+        region = FxRegionMatch(torch_match.output_node(), inputs)
+        compiler.prepare_module(
+            _match_signature(region),
+            fx_region_to_module(region, name=name),
+        )
+
+    register_fx_kernel_rewrite(
         patterns,
         pattern=pattern,
         input_names=input_names,
-        name=name,
-        signature=signature,
+        compiler=compiler,
         signature_mapping=signature_mapping,
-        build_route=compiler.build_route,
         extra_check=extra_check,
         namespace=namespace,
         infer_result_shapes=infer_result_shapes,
-        prepare=compiler.prepare,
+        prepare=prepare,
     )
