@@ -34,6 +34,7 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
+    join_collectives,
 )
 
 
@@ -273,10 +274,7 @@ class VerifyGpuDialect(VerificationPass):
             if collective is None:
                 continue
             assert isinstance(collective, dict)
-            joined_collective = {
-                axis: joined_collective[axis].join(collective[axis])
-                for axis in CollectiveAxis
-            }
+            joined_collective = join_collectives(joined_collective, collective)
         if joined_collective != op.collective:
             raise ValueError(
                 "async collective must match the join of its contained "
