@@ -186,9 +186,10 @@ def _refine_tiling_schemes(
 
     existing = {
         operand_index: scheme_id
-        for operand_index, scheme_id in cast(
-            dict[int, int], hero.attrs.get("tiling_scheme", {}),
-        ).items()
+        for operand_index, scheme_id in enumerate(cast(
+            list[int | None], hero.attrs.get("operand_tiling_scheme", []),
+        ))
+        if scheme_id is not None
     }
     if existing:
         return {
@@ -425,11 +426,9 @@ class TileReduce(LoweringPass):
         if reduction_dim is not None:
             assert partial is not None
             partial_attrs = hero.extra_attrs
-            partial_attrs.pop("tiling_scheme", None)
+            partial_attrs.pop("operand_tiling_scheme", None)
             if 1 in tiling_schemes:
-                partial_attrs["tiling_scheme"] = {
-                    1: tiling_schemes[1],
-                }
+                partial_attrs["operand_tiling_scheme"] = [None, tiling_schemes[1]]
             label = partial_attrs.get("label")
             if isinstance(label, str):
                 partial_attrs["label"] = f"{label}_partial"
@@ -456,7 +455,7 @@ class TileReduce(LoweringPass):
             {hero.dst: dst, hero.src: final_src},
             {"collective": final_reduction_collectiveness},
         )
-        final_reduce.attrs.pop("tiling_scheme", None)
+        final_reduce.attrs.pop("operand_tiling_scheme", None)
         final_operand_indices = (
             (0,) if reduction_dim is not None else (0, 1)
         )
@@ -466,7 +465,9 @@ class TileReduce(LoweringPass):
             if operand_index in tiling_schemes
         }
         if final_tiling_schemes:
-            final_reduce.attrs["tiling_scheme"] = final_tiling_schemes
+            final_reduce.attrs["operand_tiling_scheme"] = [
+                final_tiling_schemes.get(i) for i in range(2)
+            ]
         parallel_body_insertion_point.append(final_reduce)
 
         # Rewrite the epilogue.

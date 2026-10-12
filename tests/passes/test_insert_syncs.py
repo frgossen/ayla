@@ -56,10 +56,10 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
             %value: rmem<64x64xbf16> = alloc()
             %lock: lock<bulk> = alloc()
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
-            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback0", tiling_scheme: {0: 0}}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback0", operand_tiling_scheme: [0, None]}
             await(%lock: lock<bulk>)
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
-            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback1", tiling_scheme: {0: 0}}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback1", operand_tiling_scheme: [0, None]}
           }
         }"""))  # noqa: E501
     insert_syncs(module)
@@ -73,12 +73,12 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
             %lock: lock<bulk> = alloc()
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
             barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
-            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback0", tiling_scheme: {0: 0}}
+            async(%lock: lock<bulk>) attrs={label: "writeback0_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback0", operand_tiling_scheme: [0, None]}
             await(%lock: lock<bulk>)
             barrier() attrs={scope: "block"}
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
             barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
-            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback1", tiling_scheme: {0: 0}}
+            async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={label: "writeback1", operand_tiling_scheme: [0, None]}
           }
         }""")  # noqa: E501
 

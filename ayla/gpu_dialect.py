@@ -2772,9 +2772,9 @@ def _memory_effect(
 
 def operand_tiling_scheme(op: Op, operand_index: int) -> int | None:
     schemes = cast(
-        dict[int, int] | None, op.attrs.get("tiling_scheme"),
+        list[int | None] | None, op.attrs.get("operand_tiling_scheme"),
     )
-    return None if schemes is None else schemes.get(operand_index)
+    return None if schemes is None else schemes[operand_index]
 
 
 def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:

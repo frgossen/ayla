@@ -206,7 +206,7 @@ def test_reduce_reports_operand_tiling_schemes():
         collective={
             axis: CollectiveLevel.GRID for axis in CollectiveAxis
         },
-        attrs={"tiling_scheme": {0: 7, 1: 8}},
+        attrs={"operand_tiling_scheme": [7, 8]},
     )
 
     effects = memory_effects(reduce)
@@ -776,7 +776,7 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
         collective={
             axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
         },
-        attrs={"tiling_scheme": {0: 7, 1: 8}},
+        attrs={"operand_tiling_scheme": [7, 8]},
     ))
 
     assert effects is not None

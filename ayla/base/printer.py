@@ -122,27 +122,17 @@ class Printer:
             self.write("]")
 
     def write_dict_attr(self, v: dict, braces: bool = True) -> None:
-        """Write ``{k: v, ...}`` with identifier or integer keys."""
+        """Write `{k: v, ...}` with identifier-like keys (asserted)."""
         if braces:
             self.write("{")
-        items = sorted(
-            v.items(),
-            key=lambda item: (
-                0 if type(item[0]) is int else 1,
-                item[0],
-            ),
-        )
-        for i, (k, x) in enumerate(items):
+        for i, (k, x) in enumerate(sorted(v.items())):
             if i:
                 self.write(", ")
-            if type(k) is int:
-                self.write_literal_attr(k)
-            else:
-                assert isinstance(k, str) and k.isidentifier(), (
-                    "write_dict_attr: key must be an integer or an "
-                    f"identifier-like str, got {k!r}"
-                )
-                self.write(k)
+            assert isinstance(k, str) and k.isidentifier(), (
+                f"write_dict_attr: key must be an identifier-like str, "
+                f"got {k!r}"
+            )
+            self.write(k)
             self.write(": ")
             self.write_attr(x)
         if braces:

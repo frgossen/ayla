@@ -75,20 +75,18 @@ def _verify_collective_attr(op: Op) -> None:
         )
 
 
-def _verify_tiling_scheme_attr(op: Op, num_operands: int) -> None:
-    schemes = op.attrs.get("tiling_scheme")
+def _verify_operand_tiling_scheme_attr(op: Op, num_operands: int) -> None:
+    schemes = op.attrs.get("operand_tiling_scheme")
     if schemes is None:
         return
-    if not isinstance(schemes, dict):
-        raise ValueError("tiling_scheme must be an operand-indexed map")
-    for operand_index, scheme_id in schemes.items():
-        if type(operand_index) is not int or not 0 <= operand_index < num_operands:
+    if not isinstance(schemes, list):
+        raise ValueError("operand_tiling_scheme must be a list")
+    if len(schemes) != num_operands:
+        raise ValueError("operand_tiling_scheme must have one entry per operand")
+    for scheme_id in schemes:
+        if scheme_id is not None and (type(scheme_id) is not int or scheme_id < 0):
             raise ValueError(
-                f"tiling_scheme operand index must be in [0, {num_operands})"
-            )
-        if type(scheme_id) is not int or scheme_id < 0:
-            raise ValueError(
-                "tiling_scheme IDs must be non-negative integers"
+                "operand_tiling_scheme IDs must be non-negative integers or None"
             )
 
 
@@ -331,7 +329,7 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
-        _verify_tiling_scheme_attr(op, 2)
+        _verify_operand_tiling_scheme_attr(op, 2)
         _verify_tma_multicast(op)
 
     @verifies(TmaMoveOp)
@@ -362,7 +360,7 @@ class VerifyGpuDialect(VerificationPass):
                 f"{descriptor_type.gmem_type.rank}"
             )
         _verify_collective_attr(op)
-        _verify_tiling_scheme_attr(op, 2)
+        _verify_operand_tiling_scheme_attr(op, 2)
         _verify_tma_multicast(op)
 
     @verifies(MatmulOp)
@@ -370,7 +368,7 @@ class VerifyGpuDialect(VerificationPass):
         if op.init is not None and op.init_value is not None:
             raise ValueError("matmul accepts a scalar or tensor init, not both")
         _verify_collective_attr(op)
-        _verify_tiling_scheme_attr(op, 3)
+        _verify_operand_tiling_scheme_attr(op, 3)
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if (
@@ -408,7 +406,7 @@ class VerifyGpuDialect(VerificationPass):
         if op.fn not in ReduceOp.NEUTRAL_ELEMENTS:
             raise ValueError(f"unknown reduction function {op.fn!r}")
         _verify_collective_attr(op)
-        _verify_tiling_scheme_attr(op, 2)
+        _verify_operand_tiling_scheme_attr(op, 2)
         dst, src = op.dst.type, op.src.type
         if not isinstance(dst, MemTensorType) or not isinstance(
             src, MemTensorType,

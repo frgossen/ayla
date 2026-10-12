@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import string
 from collections.abc import Callable
-from typing import Any, Literal, overload
+from typing import Any
 
 
 class Parser:
@@ -120,7 +120,7 @@ class Parser:
         (str/int/float/bool/None/list/dict) and returns it.
         """
         if self.is_at("{"):
-            return self.read_dict_attr(allow_int_keys=True)
+            return self.read_dict_attr()
         if self.is_at("["):
             return self.read_list_attr()
         return self.read_literal_attr()
@@ -190,40 +190,17 @@ class Parser:
         self.skip_whitespace()
         return "".join(chars)
 
-    @overload
-    def read_dict_attr(
-        self, braces: bool = True, *, allow_int_keys: Literal[False] = False,
-    ) -> dict[str, object]: ...
+    def read_dict_attr(self, braces: bool = True) -> dict[str, object]:
+        """Read a comma-separated dict of `key: value` pairs (identifier
+        keys, attr values).
 
-    @overload
-    def read_dict_attr(
-        self, braces: bool = True, *, allow_int_keys: Literal[True],
-    ) -> dict[str | int, object]: ...
-
-    def read_dict_attr(
-        self, braces: bool = True, *, allow_int_keys: bool = False,
-    ) -> dict:
-        """Read a comma-separated dict of `key: value` pairs.
-
-        Keys are identifiers by default. Nested attribute maps may additionally
-        use integer keys. When ``braces=True``, a surrounding ``{...}`` is
-        required.
+        When `braces=True`, a surrounding `{...}` is required.
         """
         if braces:
             self.read_literal("{")
-        items: list[tuple[str | int, object]] = []
-        if braces and self.can_read_literal("}"):
-            self.read_literal("}")
-            return {}
+        items: list[tuple[str, object]] = []
         while True:
-            if allow_int_keys and self.is_at(string.digits + "+-"):
-                k = self.read_literal_attr()
-                if type(k) is not int:
-                    raise ValueError(
-                        f"attribute map key must be an integer at pos {self.pos}"
-                    )
-            else:
-                k = self.read_identifier()
+            k = self.read_identifier()
             self.read_literal(":")
             items.append((k, self.read_attr()))
             if not self.can_read_literal(","):

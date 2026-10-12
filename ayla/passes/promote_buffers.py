@@ -602,9 +602,7 @@ class PromoteBuffers(LoweringPass):
             }
             store_attrs.update(self.move_attrs.get("dst", {}))
             if writeback_tiling_scheme is not None:
-                store_attrs["tiling_scheme"] = {
-                    0: writeback_tiling_scheme,
-                }
+                store_attrs["operand_tiling_scheme"] = [writeback_tiling_scheme, None]
             store = MoveOp.build(
                 dst=store_dst_value,
                 src=smem.result(),
@@ -672,7 +670,7 @@ class PromoteBuffers(LoweringPass):
             return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         if writeback_tiling_scheme is not None:
-            attrs["tiling_scheme"] = {0: writeback_tiling_scheme}
+            attrs["operand_tiling_scheme"] = [writeback_tiling_scheme, None]
         move = MoveOp.build(
             dst=dst, src=src, collective=collective, attrs=attrs,
         )
@@ -787,17 +785,15 @@ class PromoteBuffers(LoweringPass):
                 init_value = None
 
         matmul_attrs = op.extra_attrs
-        tiling_schemes = dict(cast(
-            dict[int, int], matmul_attrs.get("tiling_scheme", {}),
+        tiling_schemes = list(cast(
+            list[int | None], matmul_attrs.get("operand_tiling_scheme", [None] * 3),
         ))
         for operand_name in self.operand_names:
-            tiling_schemes.pop(
-                {"lhs": 0, "rhs": 1, "dst": 2}[operand_name], None,
-            )
-        if tiling_schemes:
-            matmul_attrs["tiling_scheme"] = tiling_schemes
+            tiling_schemes[{"lhs": 0, "rhs": 1, "dst": 2}[operand_name]] = None
+        if any(scheme is not None for scheme in tiling_schemes):
+            matmul_attrs["operand_tiling_scheme"] = tiling_schemes
         else:
-            matmul_attrs.pop("tiling_scheme", None)
+            matmul_attrs.pop("operand_tiling_scheme", None)
         matmul = MatmulOp.build(
             lhs=new_lhs,
             rhs=new_rhs,

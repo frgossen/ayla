@@ -81,7 +81,7 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
-            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={init: 0.0, label: "mm", tiling_scheme: {0: 6, 2: 7}}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>) collective=[x.wg, y.block, z.thread] attrs={init: 0.0, label: "mm", operand_tiling_scheme: [6, None, 7]}
           }
         }"""))
     promote_buffers(
@@ -94,13 +94,13 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
             %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
-            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", tiling_scheme: {0: 6}}
+            matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", operand_tiling_scheme: [6, None, None]}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             elementwise convert(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
             %2: smem<128x256xbf16> = alloc() attrs={id: 2}
             %3: smem<64x256xbf16> = tile(%2: smem<128x256xbf16>, %wgx: index, 0)
             move(%3: smem<64x256xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_smem"}
-            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_tma", tiling_scheme: {0: 7}, tma: True}
+            move(%c: gmem<128x256xbf16>, %2: smem<128x256xbf16>) collective=[x.wg, y.block, z.thread] attrs={label: "mm_dst_tma", operand_tiling_scheme: [7, None], tma: True}
           }
         }""")  # noqa: E501
 
@@ -110,7 +110,7 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
         op for op in find_ops_of_type(module, TmaMoveOp)
         if op.attrs.get("label") == "mm_dst_tma"
     ]
-    assert writeback.attrs["tiling_scheme"] == {0: 7}
+    assert writeback.attrs["operand_tiling_scheme"] == [7, None]
 
 
 def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():

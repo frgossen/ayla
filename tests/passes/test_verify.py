@@ -275,13 +275,14 @@ def test_default_verification_rejects_unknown_reduction_function():
 @pytest.mark.parametrize(
     ("schemes", "match"),
     [
-        ([], "operand-indexed map"),
-        ({-1: 0}, "operand index"),
-        ({2: 0}, "operand index"),
-        ({"1": 0}, "operand index"),
-        ({1: -1}, "non-negative integers"),
-        ({1: 1.5}, "non-negative integers"),
-        ({1: True}, "non-negative integers"),
+        ({}, "must be a list"),
+        ([], "one entry per operand"),
+        ([0], "one entry per operand"),
+        ([0, None, 1], "one entry per operand"),
+        ([None, -1], "non-negative integers"),
+        ([None, 1.5], "non-negative integers"),
+        ([None, True], "non-negative integers"),
+        ([None, "1"], "non-negative integers"),
     ],
 )
 def test_default_verification_checks_reduce_tiling_schemes(schemes, match):
@@ -298,7 +299,7 @@ def test_default_verification_checks_reduce_tiling_schemes(schemes, match):
         collective={
             axis: CollectiveLevel.GRID for axis in CollectiveAxis
         },
-        attrs={"tiling_scheme": schemes},
+        attrs={"operand_tiling_scheme": schemes},
     )
 
     with pytest.raises(ValueError, match=match):

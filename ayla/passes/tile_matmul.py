@@ -69,9 +69,10 @@ def _refine_tiling_schemes(
 
     existing = {
         operand_index: scheme_id
-        for operand_index, scheme_id in cast(
-            dict[int, int], hero.attrs.get("tiling_scheme", {}),
-        ).items()
+        for operand_index, scheme_id in enumerate(cast(
+            list[int | None], hero.attrs.get("operand_tiling_scheme", []),
+        ))
+        if scheme_id is not None
     }
     if existing:
         return {
@@ -457,9 +458,11 @@ class TileMatmul(LoweringPass):
                     level,
                 )
         attrs = hero.extra_attrs
-        attrs.pop("tiling_scheme", None)
+        attrs.pop("operand_tiling_scheme", None)
         if tiling_schemes:
-            attrs["tiling_scheme"] = tiling_schemes
+            attrs["operand_tiling_scheme"] = [
+                tiling_schemes.get(i) for i in range(3)
+            ]
         body_ops.append(
             MatmulOp.build(
                 lhs=lhs,
