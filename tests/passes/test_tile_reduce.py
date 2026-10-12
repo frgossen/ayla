@@ -3,7 +3,7 @@ import textwrap
 import pytest
 
 from ayla.gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.tile_reduce import tile_reduce
 
 

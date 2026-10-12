@@ -3,7 +3,7 @@ import textwrap
 
 from ..base.pipeline import Pipeline
 from ..gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
-from ..passes.canonicalize import Canonicalize
+from ..pipelines.canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
 from ..passes.licm import LICM
 from ..passes.lower_to_async import LowerToAsync

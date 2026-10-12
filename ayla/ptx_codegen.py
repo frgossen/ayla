@@ -37,7 +37,7 @@ from .gpu_dialect import (
     WarpGroupIdOp,
     WgrmemTensorType,
 )
-from .passes.canonicalize import Canonicalize
+from .pipelines.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_ptx_template import LowerToPtxTemplate

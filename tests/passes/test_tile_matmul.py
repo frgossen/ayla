@@ -15,7 +15,7 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.tile_matmul import tile_matmul
 
 
