@@ -9,8 +9,10 @@ from ayla.gpu_dialect import (
     CollectiveLevel,
     ForOp,
     IfOp,
+    IndexAddOp,
     IndexConstantOp,
     IndexLtOp,
+    IndexMulOp,
     MatmulOp,
     TileOp,
     gpu_dialect,
@@ -333,19 +335,47 @@ def test_two_dimensional_warp_group_tiling_linearizes_coordinates():
         }""")  # noqa: E501
 
 
-def test_block_x_tiling_rejects_a_smaller_fixed_grid():
+def test_smaller_block_grid_iterates_the_linearized_tile_space():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) grid_dim=[3, 1, 1] block_dim=[128, 1, 1] {
+            matmul(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) collective=xyz.grid attrs={label: "mm"}
+          }
+        }"""))  # noqa: E501
+    binding = (CollectiveLevel.BLOCK, CollectiveAxis.X)
+
+    tile_matmul(
+        module,
+        op_dims=["M", "N"], tile_sizes=[64, 64],
+        iteration_bindings=[binding, binding],
+        for_loop_labels=[None, None],
+        op_label_filter="mm",
+    )
+
+    [kernel] = module.body.ops
+    assert kernel.grid_dim == (3, 1, 1)
+    [loop] = find_ops_of_type(module, ForOp)
+    assert loop.trip_count == 6
+    assert len(find_ops_of_type(module, IndexMulOp)) == 1
+    assert len(find_ops_of_type(module, IndexAddOp)) == 1
+    assert len(find_ops_of_type(module, IfOp)) == 1
+
+
+def test_smaller_block_grid_still_conflicts_without_linearization():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))
+        }"""))  # noqa: E501
 
     with pytest.raises(ValueError, match="launch dim conflict"):
         tile_matmul(
             module,
             op_dims=["N"], tile_sizes=[64],
-            iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
+            iteration_bindings=[
+                (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            ],
             for_loop_labels=[None],
             op_label_filter="mm",
         )

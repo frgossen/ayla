@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from ayla.base.ir import find_ops_of_type
+from ayla.base.ir import find_ancestor_of_type, find_ops_of_type
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
 )
@@ -122,6 +122,58 @@ def test_configurable_tma_gemm_supports_general_n_tiles(n_tile):
         )
     )
     assert "wgmma.mma_async" in kernel.ptx
+
+
+def test_fixed_output_grid_uses_a_persistent_tile_loop():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=512,
+        n=256,
+        k=64,
+        output_grid_size=3,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+    [kernel] = module.body.ops
+    outer_loops = [
+        loop for loop in find_ops_of_type(module, ForOp)
+        if find_ancestor_of_type(loop, ForOp) is None
+    ]
+
+    assert kernel.grid_dim == (3, 1, 1)
+    assert len(outer_loops) == 1
+    assert outer_loops[0].trip_count == 3
+    assert "bar.sync" in make_ptx_kernel(module).ptx
+
+
+@requires_cuda
+def test_fixed_output_grid_matches_torch():
+    m, n, k = 512, 256, 64
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_grid_size=3,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(23)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
 
 
 def test_multi_output_uses_requested_tile_geometry():
