@@ -35,7 +35,10 @@ def apply_gemm_schedule_seed_post_build(
     module: Any, seed: GemmScheduleSeed,
 ) -> Any:
     """Apply the measured post-builder pass sequence required by ``seed``."""
-    if seed.fixed_output_unroll_factor is not None:
+    if (
+        seed.fixed_output_unroll_factor is not None
+        and seed.fixed_output_unroll_factor > 1
+    ):
         from .base.ir import find_ancestor_of_type, find_ops_of_type
         from .gpu_dialect import ForOp
         from .passes.canonicalize import Canonicalize
@@ -104,6 +107,22 @@ def expand_gemm_heuristic(compact: dict[str, Any]) -> dict[str, Any]:
             ],
         }
 
+    exact = [
+        {
+            "operation": row[0],
+            "dtype": row[1],
+            "batch": row[2],
+            "m": row[3],
+            "n": row[4],
+            "k": row[5],
+            "seed": {
+                "configuration": config(row[6]),
+                "source": dict(zip(source_fields, row[7], strict=True)),
+                "source_percentage_of_torch": row[8],
+            },
+        }
+        for row in compact.get("exact", [])
+    ]
     return {
         "version": compact["version"],
         "workload": compact["workload"],
@@ -112,6 +131,7 @@ def expand_gemm_heuristic(compact: dict[str, Any]) -> dict[str, Any]:
         "features": compact["features"],
         "source_fields": source_fields,
         "fallback": config(compact["fallback"]),
+        "exact": exact,
         "groups": {name: node(tree) for name, tree in compact["groups"].items()},
     }
 
@@ -131,6 +151,10 @@ def collapse_gemm_heuristic(expanded: dict[str, Any]) -> dict[str, Any]:
 
     for tree in expanded["groups"].values():
         visit(tree)
+    configurations.extend(
+        entry["seed"]["configuration"]
+        for entry in expanded.get("exact", [])
+    )
     fields = sorted({field for config in configurations for field in config})
 
     rows: list[list[object]] = []
@@ -168,6 +192,19 @@ def collapse_gemm_heuristic(expanded: dict[str, Any]) -> dict[str, Any]:
         ]]
 
     groups = {name: node(tree) for name, tree in expanded["groups"].items()}
+    exact = [
+        [
+            entry["operation"], entry["dtype"], entry["batch"],
+            entry["m"], entry["n"], entry["k"],
+            config_index(entry["seed"]["configuration"]),
+            [
+                entry["seed"]["source"][field]
+                for field in expanded["source_fields"]
+            ],
+            entry["seed"]["source_percentage_of_torch"],
+        ]
+        for entry in expanded.get("exact", [])
+    ]
     return {
         "version": expanded["version"],
         "workload": expanded["workload"],
@@ -178,6 +215,7 @@ def collapse_gemm_heuristic(expanded: dict[str, Any]) -> dict[str, Any]:
         "fields": fields,
         "fallback": fallback,
         "configs": rows,
+        "exact": exact,
         "groups": groups,
     }
 
@@ -257,7 +295,8 @@ def _output_groups(
 
 
 def _adapt_config(
-    captured: dict[str, object], m: int, n: int, k: int,
+    captured: dict[str, object], m: int, n: int, k: int, *,
+    preserve_output_grid: bool = False,
 ) -> tuple[dict[str, object] | None, tuple[str, ...]]:
     """Translate a captured search config to the current builder vocabulary."""
     if captured.get("unsafe_reuse_smem", False) is True:
@@ -267,6 +306,9 @@ def _adapt_config(
     preferred_ctas = captured["output_cta_count"]
     if preferred_ctas is None:
         m_group, n_group, ctas = _output_groups(captured, m, n)
+    elif preserve_output_grid:
+        m_group, n_group = 1, 1
+        ctas = _as_int(preferred_ctas)
     else:
         m_group, n_group = 1, 1
         m_tiles = math.ceil(m / _as_int(captured["output_m_tile"]))
@@ -393,6 +435,13 @@ def select_gemm_schedules(
         raise ValueError(f"no GEMM heuristic for operation {operation}")
     if operation != "bmm" and batch != 1:
         raise ValueError("batch is only meaningful for BMM heuristics")
+    exact = next((
+        entry for entry in mapper.get("exact", [])
+        if (
+            entry["operation"], entry["dtype"], entry["batch"],
+            entry["m"], entry["n"], entry["k"],
+        ) == (operation, dtype, batch, m, n, k)
+    ), None)
     group = (
         f"{operation}/{dtype}/{'k128' if k % 128 == 0 else 'k64'}"
     )
@@ -401,14 +450,22 @@ def select_gemm_schedules(
     except KeyError as error:
         raise ValueError(f"no GEMM heuristic for {group}") from error
 
-    values = _features(m, n, k, batch)
     path = []
-    while "feature" in node:
-        feature = node["feature"]
-        threshold = float(node["threshold"])
-        branch = "left" if values[feature] <= threshold else "right"
-        path.append(f"{feature}={values[feature]:g} {branch} of {threshold:g}")
-        node = node[branch]
+    if exact is not None:
+        node = {
+            "leaf": f"exact:{operation}:{batch}:{m}:{n}:{k}",
+            "seeds": [exact["seed"]],
+        }
+    else:
+        values = _features(m, n, k, batch)
+        while "feature" in node:
+            feature = node["feature"]
+            threshold = float(node["threshold"])
+            branch = "left" if values[feature] <= threshold else "right"
+            path.append(
+                f"{feature}={values[feature]:g} {branch} of {threshold:g}"
+            )
+            node = node[branch]
 
     seeds = []
     for seed in node["seeds"]:
@@ -417,8 +474,9 @@ def select_gemm_schedules(
         builder_m, builder_n = (n, m) if transpose_output else (m, n)
         builder, adaptations = _adapt_config(
             captured, builder_m, builder_n, k,
+            preserve_output_grid=exact is not None,
         )
-        if builder is not None and not _legal(
+        if exact is None and builder is not None and not _legal(
             builder,
             builder_m,
             builder_n,
