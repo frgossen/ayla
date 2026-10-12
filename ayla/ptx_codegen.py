@@ -719,6 +719,9 @@ def _op_description(p: PtxPrinter, op: Op, max_len: int = 80) -> str:
         )
     description = op.attrs.get("description")
     s = description if isinstance(description, str) else str(op)
+    # Allocation IDs are process-global counters; keep them out of the PTX so
+    # identical kernels share a CUDA JIT cache key.
+    s = re.sub(r"(?<=attrs=\{)id: \d+(?:, )?", "", s)
     nl = s.find("\n")
     cut = min(nl, max_len) if nl != -1 else min(len(s), max_len)
     if cut < len(s):
