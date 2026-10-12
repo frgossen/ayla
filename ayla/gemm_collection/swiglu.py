@@ -78,13 +78,12 @@ def _match_swiglu_chain(
     up = next((tile for tile in tiles if tile is not gate), None)
     if gate is None or up is None:
         raise ValueError("expected gate and up projection slices")
-    intermediate = _static_pair(gate.result())[1]
     if not (
         projection.lhs is lhs
         and projection.rhs is packed_weight
         and gate.arg is projection.dst
         and up.arg is projection.dst
-        and up.indices[1] == intermediate
+        and up.indices[1] == 1
         and gate_convert.src(0) is gate.result()
         and silu.src(0) is gate_convert.dst
         and set((multiply.src(0), multiply.src(1)))

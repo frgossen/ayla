@@ -1,3 +1,5 @@
+import operator
+
 import pytest
 import torch
 from torch.fx import Graph, GraphModule, Node
@@ -12,12 +14,14 @@ from ayla.fx_compiler import (
     make_fx_to_ayla_rewrite,
 )
 from ayla.gpu_dialect import (
+    AllocOp,
     BF16Type,
     ElementwiseOp,
     F32Type,
     GmemTensorType,
     KernelOp,
     MatmulOp,
+    ReshapeOp,
     TileOp,
 )
 from ayla.gemm_collection.gemm import schedule_matmul
@@ -117,7 +121,9 @@ def test_swiglu_fx_region_imports_to_high_level_gpu_ir():
     assert len(matmuls) == 2
     assert matmuls[0].rhs.name == "packed_weight"
     assert matmuls[1].rhs.name == "down_weight"
-    assert len(find_ops_of_type(module, TileOp)) == 2
+    projection_slices = find_ops_of_type(module, TileOp)
+    assert len(projection_slices) == 2
+    assert [tile.indices[1] for tile in projection_slices] == [0, 1]
     assert [
         op.fn for op in find_ops_of_type(module, ElementwiseOp)
     ] == ["convert", "silu", "mul"]
@@ -153,6 +159,130 @@ def test_fx_region_import_rejects_intermediate_external_users():
 
     with pytest.raises(ValueError, match="region value has external users"):
         fx_region_to_module(match, name="swiglu")
+
+
+@pytest.mark.parametrize("split_kind", ["sizes", "uniform"])
+def test_split_getitems_and_cat_import_as_aliases(split_kind):
+    """Exercise the QKV/rotary split-and-concatenate structure at small sizes."""
+    graph = Graph()
+    packed = _meta(graph.placeholder("packed"), (2, 12))
+    if split_kind == "sizes":
+        split = graph.call_function(
+            torch.ops.aten.split_with_sizes.default,
+            args=(packed, [8, 2, 2], -1),
+        )
+        sizes = (8, 2, 2)
+    else:
+        split = graph.call_function(
+            torch.ops.aten.split.Tensor, args=(packed, 4, -1),
+        )
+        sizes = (4, 4, 4)
+    split.meta["val"] = tuple(
+        torch.empty_strided(
+            (2, size), (12, 1), dtype=torch.bfloat16, device="meta",
+        )
+        for size in sizes
+    )
+
+    pieces = []
+    products = []
+    start = 0
+    for index, size in enumerate(sizes):
+        piece = _meta(
+            graph.call_function(operator.getitem, args=(split, index)),
+            (2, size),
+            strides=(12, 1),
+        )
+        product = _meta(
+            graph.call_function(
+                torch.ops.aten.mul.Tensor, args=(piece, piece),
+            ),
+            (2, size),
+        )
+        pieces.append((piece, start // size))
+        products.append(product)
+        start += size
+    output = _meta(graph.call_function(
+        torch.ops.aten.cat.default, args=(products, -1),
+    ), (2, 12))
+    graph.output(output)
+
+    match = discover_supported_fx_region(output)
+    assert match is not None
+    assert match.inputs == (packed,)
+    module = fx_region_to_module(match, name="split_cat")
+
+    verify_gpu_dialect(module)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    assert not find_ops_of_type(module, AllocOp)
+    source_tiles = [
+        tile for tile in find_ops_of_type(module, TileOp)
+        if tile.arg is kernel.body.arguments[0]
+    ]
+    assert [tile.indices[-1] for tile in source_tiles] == [
+        index for _piece, index in pieces
+    ]
+    elementwise = find_ops_of_type(module, ElementwiseOp)
+    assert len(elementwise) == 3
+    assert all(
+        isinstance(op.dst.definition, TileOp)
+        and op.dst.definition.arg is kernel.body.arguments[-1]
+        for op in elementwise
+    )
+
+
+def test_singleton_view_ops_import_as_reshape_aliases():
+    graph = Graph()
+    source = _meta(
+        graph.placeholder("source"), (1, 8), strides=(12, 1),
+    )
+    clone = _meta(graph.call_function(
+        torch.ops.aten.clone.default,
+        args=(source,),
+        kwargs={"memory_format": torch.contiguous_format},
+    ), (1, 8))
+    viewed = _meta(graph.call_function(
+        torch.ops.aten.view.default, args=(clone, [2, 4]),
+    ), (2, 4))
+    unsqueezed = _meta(
+        graph.call_function(
+            torch.ops.aten.unsqueeze.default, args=(viewed, -2),
+        ),
+        (2, 1, 4),
+    )
+    output = _meta(graph.call_function(
+        torch.ops.aten.mul.Tensor, args=(unsqueezed, unsqueezed),
+    ), (2, 1, 4))
+    graph.output(output)
+
+    match = discover_supported_fx_region(output)
+    assert match is not None
+    module = fx_region_to_module(match, name="views")
+
+    verify_gpu_dialect(module)
+    assert len(find_ops_of_type(module, ReshapeOp)) == 3
+
+
+def test_clone_that_changes_layout_is_not_erased():
+    graph = Graph()
+    source = _meta(
+        graph.placeholder("source"), (2, 8), strides=(12, 1),
+    )
+    clone = _meta(graph.call_function(
+        torch.ops.aten.clone.default,
+        args=(source,),
+        kwargs={"memory_format": torch.contiguous_format},
+    ), (2, 8))
+    output = _meta(graph.call_function(
+        torch.ops.aten.mul.Tensor, args=(clone, clone),
+    ), (2, 8))
+    graph.output(output)
+
+    match = discover_supported_fx_region(output)
+    assert match is not None
+    with pytest.raises(ValueError, match="clone changes layout"):
+        fx_region_to_module(match, name="copying_clone")
 
 
 def _gemm_region() -> FxRegionMatch:
