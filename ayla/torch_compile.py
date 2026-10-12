@@ -70,6 +70,7 @@ from .gpu_dialect import (
     MatmulOp,
     ModuleOp,
     ReshapeOp,
+    TileOp,
 )
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
@@ -87,6 +88,24 @@ class _GatedAttentionOutputProjectionMatch:
     gated_attention: Node
     output_projection_weight: Node
     projected_attention: Node
+
+
+@dataclass(frozen=True)
+class _GatedMlpMatch:
+    mlp_input: Node
+    gate_up_weight: Node
+    gate_up: Node
+    gate: Node
+    gate_f32: Node
+    neg: Node
+    exp: Node
+    denominator: Node
+    gate_activation_f32: Node
+    gate_activation: Node
+    up: Node
+    gated_mlp: Node
+    down_weight: Node
+    output: Node
 
 
 def _match_node_val(
@@ -124,8 +143,8 @@ def _match_node_val(
     return True
 
 
-def _only_used_by(node: Node, user: Node) -> bool:
-    return len(node.users) == 1 and user in node.users
+def _only_used_by(node: Node, *users: Node) -> bool:
+    return set(node.users) == set(users)
 
 
 def _match_node_target(
@@ -172,47 +191,128 @@ def _match_mm(
     return lhs_node, rhs_node
 
 
-def _match_mul(
+def _match_binary(
     node: object,
     *,
+    target: object,
     shape: tuple[int | None, ...],
-    strides: tuple[int | None, ...],
+    lhs_strides: tuple[int | None, ...],
+    rhs_strides: tuple[int | None, ...],
+    result_strides: tuple[int | None, ...],
     dtype: torch.dtype,
 ) -> tuple[Node, Node] | None:
-    if not _match_node_target(node, torch.ops.aten.mul.Tensor, num_args=2):
+    if not _match_node_target(node, target, num_args=2):
         return None
     lhs_node, rhs_node = node.args
     if not _match_node_val(
-        lhs_node, shape=shape, strides=strides, dtype=dtype,
+        lhs_node, shape=shape, strides=lhs_strides, dtype=dtype,
     ):
         return None
     if not _match_node_val(
-        rhs_node, shape=shape, strides=strides, dtype=dtype,
+        rhs_node,
+        shape=shape,
+        strides=rhs_strides,
+        dtype=dtype,
     ):
         return None
     if not _match_node_val(
-        node, shape=shape, strides=strides, dtype=dtype,
+        node, shape=shape, strides=result_strides, dtype=dtype,
     ):
         return None
     return lhs_node, rhs_node
 
 
-def _match_sigmoid(
+def _match_unary(
     node: object,
     *,
+    target: object,
+    shape: tuple[int | None, ...],
+    arg_strides: tuple[int | None, ...],
+    result_strides: tuple[int | None, ...],
+    arg_dtype: torch.dtype,
+    result_dtype: torch.dtype | None = None,
+    extra_args: tuple[object, ...] = (),
+) -> Node | None:
+    if not _match_node_target(
+        node, target, num_args=1 + len(extra_args),
+    ):
+        return None
+    if node.args[1:] != extra_args:
+        return None
+    arg_node = node.args[0]
+    if not _match_node_val(
+        arg_node, shape=shape, strides=arg_strides, dtype=arg_dtype,
+    ):
+        return None
+    if not _match_node_val(
+        node,
+        shape=shape,
+        strides=result_strides,
+        dtype=arg_dtype if result_dtype is None else result_dtype,
+    ):
+        return None
+    return arg_node
+
+
+def _match_add_scalar(
+    node: object,
+    *,
+    scalar: int | float,
     shape: tuple[int | None, ...],
     strides: tuple[int | None, ...],
     dtype: torch.dtype,
 ) -> Node | None:
     if not _match_node_target(
-        node, torch.ops.aten.sigmoid.default, num_args=1,
+        node, torch.ops.aten.add.Tensor, num_args=2,
+    ):
+        return None
+    if node.args[1] != scalar:
+        return None
+    arg_node = node.args[0]
+    if not _match_node_val(
+        arg_node, shape=shape, strides=strides, dtype=dtype,
     ):
         return None
     if not _match_node_val(
         node, shape=shape, strides=strides, dtype=dtype,
     ):
         return None
+    return arg_node
+
+
+def _match_slice(
+    node: object,
+    *,
+    arg_shape: tuple[int | None, ...],
+    arg_strides: tuple[int | None, ...],
+    result_shape: tuple[int | None, ...],
+    result_strides: tuple[int | None, ...],
+    dtype: torch.dtype,
+    dim: int,
+    start: int,
+    end: int,
+) -> Node | None:
+    if not _match_node_target(
+        node, torch.ops.aten.slice.Tensor, num_args=4,
+    ):
+        return None
+    if node.args[1:] != (dim, start, end):
+        return None
     arg_node = node.args[0]
+    if not _match_node_val(
+        arg_node,
+        shape=arg_shape,
+        strides=arg_strides,
+        dtype=dtype,
+    ):
+        return None
+    if not _match_node_val(
+        node,
+        shape=result_shape,
+        strides=result_strides,
+        dtype=dtype,
+    ):
+        return None
     return arg_node if isinstance(arg_node, Node) else None
 
 
@@ -315,10 +415,13 @@ def _match_gated_attention_output_projection(
     if output_projection_weight is None:
         return None
 
-    mul_args = _match_mul(
+    mul_args = _match_binary(
         gated_attention,
+        target=torch.ops.aten.mul.Tensor,
         shape=(m, k),
-        strides=(k, 1),
+        lhs_strides=(k, 1),
+        rhs_strides=(k, 1),
+        result_strides=(k, 1),
         dtype=torch.bfloat16,
     )
     if mul_args is None:
@@ -330,11 +433,13 @@ def _match_gated_attention_output_projection(
     if not _only_used_by(attention_2d, gated_attention):
         return None
 
-    gate_logits = _match_sigmoid(
+    gate_logits = _match_unary(
         gate_activation,
+        target=torch.ops.aten.sigmoid.default,
         shape=(m, k),
-        strides=(k, 1),
-        dtype=torch.bfloat16,
+        arg_strides=(k, 1),
+        result_strides=(k, 1),
+        arg_dtype=torch.bfloat16,
     )
     if gate_logits is None:
         return None
@@ -389,6 +494,216 @@ def _match_gated_attention_output_projection(
         projected_attention=node,
     )
     return match
+
+
+def _match_gated_mlp(
+    node: Node,
+    *,
+    m: int | None,
+    hidden_size: int | None,
+    intermediate_size: int,
+) -> _GatedMlpMatch | None:
+    gate_up_size = 2 * intermediate_size
+    down_mm_args = _match_mm(
+        node,
+        m=m,
+        n=hidden_size,
+        k=intermediate_size,
+        dtype=torch.bfloat16,
+    )
+    if down_mm_args is None:
+        return None
+
+    gated_mlp, down_weight_transpose = down_mm_args
+    if not _only_used_by(gated_mlp, node):
+        return None
+    if not _only_used_by(down_weight_transpose, node):
+        return None
+
+    down_weight = _match_permute(
+        down_weight_transpose,
+        arg_shape=(hidden_size, intermediate_size),
+        arg_strides=(intermediate_size, 1),
+        result_shape=(intermediate_size, hidden_size),
+        result_strides=(1, intermediate_size),
+        dtype=torch.bfloat16,
+    )
+    if down_weight is None:
+        return None
+
+    mul_args = _match_binary(
+        gated_mlp,
+        target=torch.ops.aten.mul.Tensor,
+        shape=(m, intermediate_size),
+        lhs_strides=(intermediate_size, 1),
+        rhs_strides=(gate_up_size, 1),
+        result_strides=(intermediate_size, 1),
+        dtype=torch.bfloat16,
+    )
+    if mul_args is None:
+        return None
+
+    gate_activation, up = mul_args
+    if not _only_used_by(gate_activation, gated_mlp):
+        return None
+    if not _only_used_by(up, gated_mlp):
+        return None
+
+    gate_activation_f32 = _match_unary(
+        gate_activation,
+        target=torch.ops.prims.convert_element_type.default,
+        shape=(m, intermediate_size),
+        arg_strides=(intermediate_size, 1),
+        result_strides=(intermediate_size, 1),
+        arg_dtype=torch.float32,
+        result_dtype=torch.bfloat16,
+        extra_args=(torch.bfloat16,),
+    )
+    if gate_activation_f32 is None:
+        return None
+    if not _only_used_by(gate_activation_f32, gate_activation):
+        return None
+
+    div_args = _match_binary(
+        gate_activation_f32,
+        target=torch.ops.aten.div.Tensor,
+        shape=(m, intermediate_size),
+        lhs_strides=(intermediate_size, 1),
+        rhs_strides=(intermediate_size, 1),
+        result_strides=(intermediate_size, 1),
+        dtype=torch.float32,
+    )
+    if div_args is None:
+        return None
+
+    gate_f32, denominator = div_args
+    if not _only_used_by(denominator, gate_activation_f32):
+        return None
+
+    exp = _match_add_scalar(
+        denominator,
+        scalar=1,
+        shape=(m, intermediate_size),
+        strides=(intermediate_size, 1),
+        dtype=torch.float32,
+    )
+    if exp is None:
+        return None
+    if not _only_used_by(exp, denominator):
+        return None
+
+    neg = _match_unary(
+        exp,
+        target=torch.ops.aten.exp.default,
+        shape=(m, intermediate_size),
+        arg_strides=(intermediate_size, 1),
+        result_strides=(intermediate_size, 1),
+        arg_dtype=torch.float32,
+    )
+    if neg is None:
+        return None
+    if not _only_used_by(neg, exp):
+        return None
+
+    neg_arg = _match_unary(
+        neg,
+        target=torch.ops.aten.neg.default,
+        shape=(m, intermediate_size),
+        arg_strides=(intermediate_size, 1),
+        result_strides=(intermediate_size, 1),
+        arg_dtype=torch.float32,
+    )
+    if neg_arg is not gate_f32:
+        return None
+    if not _only_used_by(gate_f32, neg, gate_activation_f32):
+        return None
+
+    gate = _match_unary(
+        gate_f32,
+        target=torch.ops.prims.convert_element_type.default,
+        shape=(m, intermediate_size),
+        arg_strides=(gate_up_size, 1),
+        result_strides=(intermediate_size, 1),
+        arg_dtype=torch.bfloat16,
+        result_dtype=torch.float32,
+        extra_args=(torch.float32,),
+    )
+    if gate is None:
+        return None
+    if not _only_used_by(gate, gate_f32):
+        return None
+
+    gate_up = _match_slice(
+        gate,
+        arg_shape=(m, gate_up_size),
+        arg_strides=(gate_up_size, 1),
+        result_shape=(m, intermediate_size),
+        result_strides=(gate_up_size, 1),
+        dtype=torch.bfloat16,
+        dim=1,
+        start=0,
+        end=intermediate_size,
+    )
+    if gate_up is None:
+        return None
+
+    up_gate_up = _match_slice(
+        up,
+        arg_shape=(m, gate_up_size),
+        arg_strides=(gate_up_size, 1),
+        result_shape=(m, intermediate_size),
+        result_strides=(gate_up_size, 1),
+        dtype=torch.bfloat16,
+        dim=1,
+        start=intermediate_size,
+        end=9223372036854775807,
+    )
+    if up_gate_up is not gate_up:
+        return None
+    if not _only_used_by(gate_up, gate, up):
+        return None
+
+    gate_up_mm_args = _match_mm(
+        gate_up,
+        m=m,
+        n=gate_up_size,
+        k=hidden_size,
+        dtype=torch.bfloat16,
+    )
+    if gate_up_mm_args is None:
+        return None
+
+    mlp_input, gate_up_weight_transpose = gate_up_mm_args
+    if not _only_used_by(gate_up_weight_transpose, gate_up):
+        return None
+
+    gate_up_weight = _match_permute(
+        gate_up_weight_transpose,
+        arg_shape=(gate_up_size, hidden_size),
+        arg_strides=(hidden_size, 1),
+        result_shape=(hidden_size, gate_up_size),
+        result_strides=(1, hidden_size),
+        dtype=torch.bfloat16,
+    )
+    if gate_up_weight is None:
+        return None
+
+    return _GatedMlpMatch(
+        mlp_input=mlp_input,
+        gate_up_weight=gate_up_weight,
+        gate_up=gate_up,
+        gate=gate,
+        gate_f32=gate_f32,
+        neg=neg,
+        exp=exp,
+        denominator=denominator,
+        gate_activation_f32=gate_activation_f32,
+        gate_activation=gate_activation,
+        up=up,
+        gated_mlp=gated_mlp,
+        down_weight=down_weight,
+        output=node,
+    )
 
 
 def _build_gmem_type(node: Node) -> GmemTensorType:
@@ -484,6 +799,58 @@ def _build_gated_attention_output_projection_module(
     return ModuleOp.build(Block(ops=[kernel]))
 
 
+def _build_gated_mlp_module(match: _GatedMlpMatch) -> ModuleOp:
+    mlp_input = _build_gmem_value("mlp_input", match.mlp_input)
+    gate_up_weight = _build_gmem_value(
+        "gate_up_weight", match.gate_up_weight,
+    )
+    down_weight = _build_gmem_value("down_weight", match.down_weight)
+    output = _build_gmem_value("output", match.output)
+
+    gate_up_type = _build_gmem_type(match.gate_up)
+    gate_type = _build_gmem_type(match.gate)
+    up_type = _build_gmem_type(match.up)
+    gated_mlp_type = _build_gmem_type(match.gated_mlp)
+
+    alloc = AllocOp.build_with_fresh_id(gate_up_type)
+    matmul = MatmulOp.build(
+        mlp_input,
+        gate_up_weight,
+        alloc.result(),
+        init=0.0,
+        attrs={"label": "gate_up_projection"},
+    )
+    tile = TileOp.build(alloc.result(), [0, 0], gate_type)
+    tile2 = TileOp.build(alloc.result(), [0, 1], up_type)
+    alloc2 = AllocOp.build_with_fresh_id(gated_mlp_type)
+    silu = ElementwiseOp.build(
+        alloc2.result(),
+        srcs=[tile.result()],
+        fn="silu",
+        attrs={"label": "gate_activation"},
+    )
+    mul = ElementwiseOp.build(
+        alloc2.result(),
+        srcs=[alloc2.result(), tile2.result()],
+        fn="mul",
+        attrs={"label": "gated_mlp"},
+    )
+    matmul2 = MatmulOp.build(
+        alloc2.result(),
+        down_weight,
+        output,
+        init=0.0,
+        attrs={"label": "down_projection"},
+    )
+
+    body = Block(
+        arguments=[mlp_input, gate_up_weight, down_weight, output],
+        ops=[alloc, matmul, tile, tile2, alloc2, silu, mul, matmul2],
+    )
+    kernel = KernelOp.build("gated_mlp", body)
+    return ModuleOp.build(Block(ops=[kernel]))
+
+
 def _try_lower_glimmer_attention_subgraph(node: Node) -> None:
     match = _match_gated_attention_output_projection(
         node, m=8, n=6656, k=4096,
@@ -495,6 +862,20 @@ def _try_lower_glimmer_attention_subgraph(node: Node) -> None:
         "Muse Glimmer attention subgraph lowering is not implemented\n"
         f"{module}"
     )
+
+
+def _try_lower_glimmer_mlp(node: Node) -> None:
+    match = _match_gated_mlp(
+        node, m=8, hidden_size=6656, intermediate_size=19968,
+    )
+    if match is None:
+        return
+    module = _build_gated_mlp_module(match)
+    raise NotImplementedError(
+        "Muse Glimmer MLP subgraph lowering is not implemented\n"
+        f"{module}"
+    )
+
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
     """A matmul ayla will run."""
@@ -627,6 +1008,7 @@ def _lower_mm(lhs, rhs, *, layout=None):
     current = V.graph.current_node
     assert isinstance(current, Node)
     _try_lower_glimmer_attention_subgraph(current)
+    _try_lower_glimmer_mlp(current)
 
     m, n, k, layout, lhs, rhs = mm_args(lhs, rhs, layout=layout)
     if lhs.get_device().type != "cuda":

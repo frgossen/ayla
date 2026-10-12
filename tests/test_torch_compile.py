@@ -71,6 +71,61 @@ def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
+def test_glimmer_mlp_match_reaches_unimplemented_lowering():
+    def glimmer_mlp(mlp_input, gate_up_weight, down_weight):
+        gate_up = torch.ops.aten.mm.default(
+            mlp_input,
+            torch.ops.aten.permute.default(gate_up_weight, [1, 0]),
+        )
+        gate = torch.ops.aten.slice.Tensor(gate_up, 1, 0, 19968)
+        gate_f32 = torch.ops.prims.convert_element_type.default(
+            gate, torch.float32,
+        )
+        neg = torch.ops.aten.neg.default(gate_f32)
+        exp = torch.ops.aten.exp.default(neg)
+        denominator = torch.ops.aten.add.Tensor(exp, 1)
+        gate_activation = torch.ops.aten.div.Tensor(gate_f32, denominator)
+        gate_activation = torch.ops.prims.convert_element_type.default(
+            gate_activation, torch.bfloat16,
+        )
+        up = torch.ops.aten.slice.Tensor(
+            gate_up, 1, 19968, 9223372036854775807,
+        )
+        gated_mlp = torch.ops.aten.mul.Tensor(gate_activation, up)
+        return torch.ops.aten.mm.default(
+            gated_mlp,
+            torch.ops.aten.permute.default(down_weight, [1, 0]),
+        )
+
+    inputs = (
+        torch.empty(8, 6656, device="cuda", dtype=torch.bfloat16),
+        torch.empty(39936, 6656, device="cuda", dtype=torch.bfloat16),
+        torch.empty(6656, 19968, device="cuda", dtype=torch.bfloat16),
+    )
+    with pytest.raises(
+        InductorError,
+        match="Muse Glimmer MLP subgraph lowering is not implemented",
+    ) as exc_info:
+        with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+            torch.compile(glimmer_mlp, dynamic=False)(*inputs)
+
+    assert dedent("""\
+        module {
+          kernel @gated_mlp(%mlp_input: gmem<8x6656xbf16>, %gate_up_weight: gmem<39936x6656xbf16>, %down_weight: gmem<6656x19968xbf16>, %output: gmem<8x6656xbf16>) {
+            %0: gmem<8x39936xbf16> = alloc() attrs={id: 0}
+            matmul(%mlp_input: gmem<8x6656xbf16>, %gate_up_weight: gmem<39936x6656xbf16>, %0: gmem<8x39936xbf16>) attrs={init: 0.0, label: "gate_up_projection"}
+            %1: gmem<8x19968xbf16 strides=[39936, 1]> = tile(%0: gmem<8x39936xbf16>, 0, 0)
+            %2: gmem<8x19968xbf16 strides=[39936, 1]> = tile(%0: gmem<8x39936xbf16>, 0, 1)
+            %3: gmem<8x19968xbf16> = alloc() attrs={id: 1}
+            elementwise(%3: gmem<8x19968xbf16>, %1: gmem<8x19968xbf16 strides=[39936, 1]>) attrs={fn: "silu", label: "gate_activation"}
+            elementwise(%3: gmem<8x19968xbf16>, %3: gmem<8x19968xbf16>, %2: gmem<8x19968xbf16 strides=[39936, 1]>) attrs={fn: "mul", label: "gated_mlp"}
+            matmul(%3: gmem<8x19968xbf16>, %down_weight: gmem<6656x19968xbf16>, %output: gmem<8x6656xbf16>) attrs={init: 0.0, label: "down_projection"}
+          }
+        }""") in str(exc_info.value.inner_exception)
+
+
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
 @pytest.mark.parametrize("fn,op", [
     pytest.param(
         lambda x, w: torch.sigmoid(x @ w.t()),
