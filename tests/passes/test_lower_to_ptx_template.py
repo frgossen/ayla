@@ -109,10 +109,18 @@ def test_lower_barrier(scope, expected):
 def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
-        mov.u32 ${b32:bl_tid}, %tid.x;
-        setp.lt.u32 ${pred:bl_w0}, ${b32:bl_tid}, 32;
-        @${pred:bl_w0} bar.sync 1, 128;
-        @!${pred:bl_w0} bar.arrive 1, 128;
+        mov.u32 ${b32:bl_warp}, %tid.x;
+        shr.u32 ${b32:bl_warp}, ${b32:bl_warp}, 5;
+        shfl.sync.idx.b32 ${b32:bl_warp}, ${b32:bl_warp}, 0, 31, 0xffffffff;
+        mov.u32 ${b32:bl_warp_yz}, %tid.y;
+        shfl.sync.idx.b32 ${b32:bl_warp_yz}, ${b32:bl_warp_yz}, 0, 31, 0xffffffff;
+        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:bl_warp_yz};
+        mov.u32 ${b32:bl_warp_yz}, %tid.z;
+        shfl.sync.idx.b32 ${b32:bl_warp_yz}, ${b32:bl_warp_yz}, 0, 31, 0xffffffff;
+        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:bl_warp_yz};
+        setp.ne.u32 ${pred:bl_other_warp}, ${b32:bl_warp}, 0;
+        @${pred:bl_other_warp} bar.arrive 1, 128;
+        @!${pred:bl_other_warp} bar.sync 1, 128;
         """)
 
 
