@@ -123,7 +123,7 @@ def _materialize_iteration_space(
         ids = id_op_type.build(axis)
         id_ops: list[Op] = [ids]
         parallel_id = ids.value
-    elif level == CollectiveLevel.WARP:
+    elif level == CollectiveLevel.THREAD_32:
         assert axis == CollectiveAxis.X
         ids = ThreadIdOp.build(CollectiveAxis.X)
         warp_size = IndexConstantOp.build(32)
@@ -261,9 +261,9 @@ class TileReduce(LoweringPass):
             kernel = find_ancestor_of_type(hero, KernelOp)
             assert kernel is not None
             level, axis = self.parallel_iteration_space
-            if level == CollectiveLevel.WARP:
+            if level == CollectiveLevel.THREAD_32:
                 assert axis == CollectiveAxis.X
-                launch_dim *= 32
+                launch_dim *= level.granularity
             elif level == CollectiveLevel.WG:
                 assert axis == CollectiveAxis.X
                 launch_dim *= 128
