@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import cast
 
 from ..gpu_dialect import (
-    BlockIdOp,
+    HW_LEVEL_IDS,
+    build_hardware_id,
     CollectiveAxis,
     CollectiveLevel,
     ForOp,
@@ -18,9 +19,9 @@ from ..gpu_dialect import (
     MemoryEffect,
     MemTensorType,
     ModuleOp,
-    ThreadIdOp,
     TileOp,
-    WarpGroupIdOp,
+    launch_extent,
+    require_launch_extent,
     is_elementwise,
     is_grid_collective,
 )
@@ -35,12 +36,6 @@ from ..base.ir import (
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
 
-
-_PARALLEL_ID_OPS = {
-    CollectiveLevel.BLOCK: BlockIdOp,
-    CollectiveLevel.THREAD: ThreadIdOp,
-    CollectiveLevel.WG: WarpGroupIdOp,
-}
 
 _OPERAND_DIMS = {
     "lhs": frozenset(("M", "K")),
@@ -183,7 +178,7 @@ class TileMatmul(LoweringPass):
         for binding in parallel_bindings:
             level, axis = binding
             if (
-                level not in _PARALLEL_ID_OPS
+                level not in HW_LEVEL_IDS or level == CollectiveLevel.WARP
                 or level == CollectiveLevel.WG and axis != CollectiveAxis.X
             ):
                 raise ValueError(
@@ -318,21 +313,10 @@ class TileMatmul(LoweringPass):
                 required[binding] = max(required.get(binding, 0), extent)
 
         for binding, extent in required.items():
-            current = self._launch_extent(binding)
+            current = launch_extent(self._kernel, *binding)
             if current is not None and current > extent:
                 continue
             self._accumulate_constraint(binding, extent)
-
-    def _launch_extent(
-        self, binding: tuple[CollectiveLevel, CollectiveAxis],
-    ) -> int | None:
-        level, axis = binding
-        if level == CollectiveLevel.BLOCK:
-            return self._kernel.grid_dim[axis]
-        if level == CollectiveLevel.THREAD:
-            return self._kernel.block_dim[axis]
-        assert level == CollectiveLevel.WG and axis == CollectiveAxis.X
-        return self._kernel.num_warp_groups
 
     def _tile(
         self,
@@ -345,30 +329,13 @@ class TileMatmul(LoweringPass):
         tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
-        parallel_ids: dict[
-            tuple[CollectiveLevel, CollectiveAxis], Value
-        ] = {}
+        parallel_ids: dict[tuple[CollectiveLevel, CollectiveAxis], Value] = {}
         for binding in self.iteration_bindings:
             if binding is None or binding in parallel_ids:
                 continue
-            level, axis = binding
-            if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
-                op_type = {
-                    CollectiveLevel.BLOCK: BlockIdOp,
-                    CollectiveLevel.THREAD: ThreadIdOp,
-                }[level]
-                ids = op_type.build(axis)
-                parallel_ids[binding] = ids.value
-            else:
-                op_type = {
-                    CollectiveLevel.WG: WarpGroupIdOp,
-                }[level]
-                ids = op_type.build()
-                for result_axis in CollectiveAxis:
-                    parallel_ids[(level, result_axis)] = (
-                        ids.results[result_axis]
-                    )
-            new_ops.append(ids)
+            id_ops, value = build_hardware_id(*binding)
+            parallel_ids[binding] = value
+            new_ops.extend(id_ops)
 
         ivs: list[Value] = []
         iteration_ops: list[Op] = []
@@ -491,8 +458,8 @@ class TileMatmul(LoweringPass):
                 logical_extent = parallel_extents.pop(binding, None)
                 if logical_extent is None:
                     continue
-                launch_extent = self._launch_extent(binding)
-                if launch_extent is not None and launch_extent > logical_extent:
+                extent = launch_extent(self._kernel, *binding)
+                if extent is not None and extent > logical_extent:
                     linear_id = parallel_ids[binding]
                     limit = IndexConstantOp.build(logical_extent)
                     condition = IndexLtOp.build(linear_id, limit.result())
@@ -524,26 +491,14 @@ class TileMatmul(LoweringPass):
         ub: int,
     ) -> None:
         level, axis = iteration_binding
-        if level == CollectiveLevel.BLOCK:
-            required: list[int | None] = [None, None, None]
-            required[axis] = ub
-            self._kernel.grid_dim = _resolve_launch_dim_constraints(
-                list(self._kernel.grid_dim), required,
-            )
-        elif level == CollectiveLevel.THREAD:
-            required = [None, None, None]
-            required[axis] = ub
-            self._kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self._kernel.block_dim), required,
-            )
-        else:
-            assert level == CollectiveLevel.WG and axis == CollectiveAxis.X
+        require_launch_extent(self._kernel, level, axis, ub)
+        if level == CollectiveLevel.WG:
             [num_warp_groups] = _resolve_launch_dim_constraints(
                 [self._kernel.num_warp_groups], [ub],
             )
             self._kernel.num_warp_groups = num_warp_groups
             self._kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self._kernel.block_dim), [ub * 128, 1, 1],
+                list(self._kernel.block_dim), [None, 1, 1],
             )
 
 

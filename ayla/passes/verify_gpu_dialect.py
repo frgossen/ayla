@@ -7,6 +7,7 @@ import math
 from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
+    HW_LEVEL_IDS,
     AddrMemTensorType,
     AsyncOp,
     BF16Type,
@@ -193,6 +194,11 @@ class VerifyGpuDialect(VerificationPass):
                     f"tile result strides {result_type.strides} must match "
                     f"operand strides {arg_type.strides}"
                 )
+
+    @verifies(*dict.fromkeys(op_type for op_type, _ in HW_LEVEL_IDS.values()))
+    def _verify_hardware_ids(self, op: Op) -> None:
+        if find_ancestor_of_type(op, KernelOp) is None:
+            raise ValueError(f"{op.op_id} requires an enclosing kernel")
 
     @verifies(ClusterBlockIdsOp)
     def _verify_cluster_block_ids(self, op: ClusterBlockIdsOp) -> None:
