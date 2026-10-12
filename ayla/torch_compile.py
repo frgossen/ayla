@@ -193,19 +193,3 @@ def _lower_mm(lhs, rhs, *, layout=None):
     if not is_contiguous_strides_for_shape(
         tuple(reversed(rhs.get_stride())), tuple(reversed(rhs.get_size()))
     ):
-        return None
-
-    # TODO: generalize past a single hard-coded kernel. What is missing is
-    # deciding between the kernels that could serve a shape, without ayla
-    # grading its own kernels inside Inductor's autotuner.
-    if (m, k, n, lhs.get_dtype()) != (4096, 4096, 4096, torch.bfloat16):
-        return None
-
-    return TensorBox.create(
-        AylaTemplateBuffer(layout=layout, inputs=[lhs, rhs])
-    )
-
-
-_LOWERING_TARGET = torch.ops.aten.mm.default
-_displaced_user_lowering = None
-_displaced_backend = None
