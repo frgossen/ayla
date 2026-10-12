@@ -2,7 +2,7 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import TileOp, gpu_dialect
+from ayla.gpu_dialect import ForOp, TileOp, gpu_dialect
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
@@ -206,3 +206,65 @@ def test_for_that_never_runs_is_erased():
     assert "alloc()" not in after
     # ...and the rest of the kernel is untouched.
     assert "index_constant() attrs={value: 7}" in after
+
+
+def test_launch_bounded_ids_fold_mod_and_div():
+    """An ID below the modulus is its own remainder and divides to zero."""
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test() grid_dim=[2, 1, 1] block_dim=[64, 1, 1] {
+            %bx: index = block_id.x
+            %by: index = block_id.y
+            %bz: index = block_id.z
+            %tx: index = thread_id.x
+            %c2: index = index_constant() attrs={value: 2}
+            %c32: index = index_constant() attrs={value: 32}
+            %block: index = index_mod(%bx: index, %c2: index)
+            %wave: index = index_div(%bx: index, %c2: index)
+            %derived_warp: index = index_div(%tx: index, %c32: index)
+            %lane_warp: index = index_mod(%derived_warp: index, %c2: index)
+          }
+        }"""))
+
+    text = repr(folding(module))
+
+    assert "index_mod" not in text
+    assert text.count("index_div") == 1  # tx / 32 stays: 64 threads, 2 warps.
+
+
+def test_launch_bound_keeps_mod_when_extent_exceeds_modulus():
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test() grid_dim=[4, None, 1] {
+            %bx: index = block_id.x
+            %by: index = block_id.y
+            %bz: index = block_id.z
+            %c2: index = index_constant() attrs={value: 2}
+            %x: index = index_mod(%bx: index, %c2: index)
+            %y: index = index_mod(%by: index, %c2: index)
+          }
+        }""")
+
+    module = folding(gpu_dialect.parse_module(module_str))
+
+    assert repr(module) == module_str
+
+
+def test_loop_bound_folds_mod_of_induction_variable():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x16xf32>) {
+            %c4: index = index_constant() attrs={value: 4}
+            for (%i: index = 0 to 4) {
+              %r: index = index_mod(%i: index, %c4: index)
+              %t: gmem<1x16xf32> = tile(%a: gmem<4x16xf32>, %r: index, 0)
+            }
+          }
+        }"""))
+
+    module = folding(module)
+
+    [loop] = find_ops_of_type(module, ForOp)
+    [tile] = find_ops_of_type(module, TileOp)
+    assert "index_mod" not in repr(module)
+    assert tile.indices[0] is loop.iv
