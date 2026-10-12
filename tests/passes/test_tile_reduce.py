@@ -163,12 +163,12 @@ def test_tile_reduce_vector_accumulation_into_block_tiled_wrmem():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x1024xf32>) grid_dim=[8, None, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c8: index = index_constant() attrs={value: 8}
             %0: index = index_mod(%bx: index, %c8: index)
             %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
-            %2: wrmem<1x1xf32 layout="lane0"> = alloc() attrs={id: 1, init: 0.0}
-            reduce sum(%2: wrmem<1x1xf32 layout="lane0">, %1: gmem<1x1024xf32>) collective=[x.block, yz.grid] attrs={label: "mean"}
+            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
+            reduce sum(%2: wrmem<1x1xf32 layout="blocked">, %1: gmem<1x1024xf32>) collective=[x.block, yz.grid] attrs={label: "mean"}
           }
         }"""))
 
@@ -183,17 +183,17 @@ def test_tile_reduce_vector_accumulation_into_block_tiled_wrmem():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x1024xf32>) grid_dim=[8, None, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c8: index = index_constant() attrs={value: 8}
             %0: index = index_mod(%bx: index, %c8: index)
             %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
-            %2: wrmem<1x1xf32 layout="lane0"> = alloc() attrs={id: 1, init: 0.0}
-            %3: wrmem<1x128xf32 layout="lane0"> = alloc() attrs={id: 0, init: 0.0}
+            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
+            %3: wrmem<1x128xf32 layout="blocked"> = alloc() attrs={id: 0, init: 0.0}
             for (%4: index = 0 to 8) attrs={label: "d1"} {
               %5: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %4: index)
-              reduce sum(%3: wrmem<1x128xf32 layout="lane0">, %5: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
+              reduce sum(%3: wrmem<1x128xf32 layout="blocked">, %5: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
             }
-            reduce sum(%2: wrmem<1x1xf32 layout="lane0">, %3: wrmem<1x128xf32 layout="lane0">) collective=[x.block, yz.grid] attrs={label: "mean"}
+            reduce sum(%2: wrmem<1x1xf32 layout="blocked">, %3: wrmem<1x128xf32 layout="blocked">) collective=[x.block, yz.grid] attrs={label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -232,13 +232,14 @@ def test_tile_reduce_across_block_dimensions():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x1024xf32>, %output: gmem<8x1xf32>) grid_dim=[8, 8, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c8: index = index_constant() attrs={value: 8}
             %0: index = index_mod(%bx: index, %c8: index)
             %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
             %2: gmem<1x1xf32> = tile(%output: gmem<8x1xf32>, %0: index, 0)
             %3: gmem<8x8xf32> = alloc() attrs={id: 0, init: 0.0}
             %4: gmem<1x8xf32> = tile(%3: gmem<8x8xf32>, %0: index, 0)
+            %by: index = block_id.y
             %5: index = index_mod(%by: index, %c8: index)
             %6: gmem<1x1xf32 strides=[8, 1]> = tile(%4: gmem<1x8xf32>, 0, %5: index)
             %7: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %5: index)
