@@ -140,17 +140,22 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
     )
     assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
-    assert (
-        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 2;"
-        in ptx
-    )
+    # Four warps arrive at each CTA's mbarrier; the leader's counts both CTAs.
     assert_contains_in_order(
         ptx,
-        "fence.mbarrier_init.release.cluster;",
-        "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "mbarrier.arrive.shared::cta.b64 ${b64:cluster_state}, [${b32:operand.sync.val}];",
-        "mbarrier.try_wait.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b64:cluster_state};",
+        "mov.u32 ${b32:arrivals}, 4;",
+        "@${pred:rank0} mov.u32 ${b32:arrivals}, 8;",
+        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], ${b32:arrivals};",
+    )
+    release = ptx.split("fence.mbarrier_init.release.cluster;", 1)[1]
+    assert "bar.sync" not in release
+    assert_contains_in_order(
+        release,
+        "elect.sync _|${pred:cl_arrive}, 0xffffffff;",
+        "@${pred:cl_arrive} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
+        "@${pred:cl_arrive_remote} mbarrier.arrive.shared::cluster.b64 _, [${b32:leader_mbar}];",
+        "@${pred:cl_other_warp} bra ${label:cl_done};",
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
 
 
