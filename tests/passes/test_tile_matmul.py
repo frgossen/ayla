@@ -71,10 +71,10 @@ def test_tiles_tensor_initializer_with_the_output():
     )
 
     [matmul] = find_ops_of_type(module, MatmulOp)
-    assert matmul.init_value is not None
-    assert isinstance(matmul.init_value.definition, TileOp)
-    assert list(matmul.init_value.type.sizes) == [64, 32]
-    assert list(matmul.init_value.type.strides) == [0, 1]
+    assert matmul.init is not None
+    assert isinstance(matmul.init.definition, TileOp)
+    assert list(matmul.init.type.sizes) == [64, 32]
+    assert list(matmul.init.type.strides) == [0, 1]
 
 
 def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():

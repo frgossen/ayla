@@ -61,10 +61,11 @@ def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():
           kernel @gated_attention_output_projection(%attention_output: gmem<8x32x128xbf16>, %gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>) {
             %0: gmem<8x4096xbf16> = reshape(%attention_output: gmem<8x32x128xbf16>)
             %1: gmem<8x4096xbf16> = alloc() attrs={id: 0}
-            matmul(%gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %1: gmem<8x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "gate_projection"}
+            %2: rmem<f32> = constant() attrs={value: 0.0}
+            matmul(%gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %1: gmem<8x4096xbf16>, %2: rmem<f32>) collective=xyz.grid attrs={label: "gate_projection"}
             elementwise sigmoid(%1: gmem<8x4096xbf16>, %1: gmem<8x4096xbf16>) attrs={label: "gate_activation"}
             elementwise mul(%1: gmem<8x4096xbf16>, %1: gmem<8x4096xbf16>, %0: gmem<8x4096xbf16>) attrs={label: "gated_attention"}
-            matmul(%1: gmem<8x4096xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>) collective=xyz.grid attrs={init: 0.0, label: "output_projection"}
+            matmul(%1: gmem<8x4096xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>, %2: rmem<f32>) collective=xyz.grid attrs={label: "output_projection"}
           }
         }""") in str(exc_info.value.inner_exception)
 

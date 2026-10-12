@@ -6,7 +6,9 @@ from collections.abc import Callable
 import torch
 
 from .base.ir import clone_op
-from .gpu_dialect import GmemTensorType, KernelOp, MatmulOp, ModuleOp
+from .gpu_dialect import (
+    ConstantOp, GmemTensorType, KernelOp, MatmulOp, ModuleOp,
+)
 from .passes.specialize_shapes import specialize_shapes
 from .ptx_runtime import PtxLauncher
 from .torch_custom_call import to_torch_dtype
@@ -26,8 +28,9 @@ class ShapeSpecializingJITCompiler:
                 "ShapeSpecializingJITCompiler requires exactly one kernel"
             )
         kernel = top_ops[0]
-        if len(kernel.body.ops) != 1 or not isinstance(
-            kernel.body.ops[0], MatmulOp,
+        body_ops = kernel.body.ops
+        if sum(isinstance(op, MatmulOp) for op in body_ops) != 1 or not all(
+            isinstance(op, (MatmulOp, ConstantOp)) for op in body_ops
         ):
             raise ValueError(
                 "ShapeSpecializingJITCompiler requires exactly one matmul"

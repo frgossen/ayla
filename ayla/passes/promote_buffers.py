@@ -30,6 +30,7 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -120,6 +121,14 @@ def _collective_level(value: Value) -> str:
         return level
 
     return "block"
+
+
+def _scalar_constant(value: Value | None) -> float | int | None:
+    """The literal of a splat constant ``value``, or ``None``."""
+    if value is None or not isinstance(value.definition, ConstantOp):
+        return None
+    literal = value.definition.value
+    return None if isinstance(literal, list) else literal
 
 
 def _introduces_narrow(tile: TileOp, target_level: str) -> bool:
@@ -742,22 +751,27 @@ class PromoteBuffers(LoweringPass):
                 rhs, "rhs", op.collective, label,
             )
             pre_ops.extend(ops)
-        init, init_value = op.init, op.init_value
+        init = op.init
         if "dst" in self.operand_names:
-            # Registers load a tensor initializer in place of the destination;
-            # the writeback below still targets the destination.
-            fill = init_value if self.target_type == "wgrmem" else None
+            # A scalar constant initializes the promoted allocation; registers
+            # load a tensor initializer in place of the destination. The
+            # writeback below still targets the destination.
+            scalar_init = _scalar_constant(init)
+            fill = (
+                init if scalar_init is None and self.target_type == "wgrmem"
+                else None
+            )
             ops, [new_dst] = self._build_operand_promotion(
                 dst if fill is None else fill, "dst", op.collective, label,
-                init=init,
+                init=scalar_init,
             )
             pre_ops.extend(ops)
             # A staged SMEM destination is intermediate IR; its matmul still
             # owns initialization until the destination reaches registers.
-            if self.target_type != "smem":
+            if fill is not None or (
+                scalar_init is not None and self.target_type != "smem"
+            ):
                 init = None
-            if fill is not None:
-                init_value = None
 
         matmul_attrs = op.extra_attrs
         for operand_name in self.operand_names:
@@ -768,7 +782,6 @@ class PromoteBuffers(LoweringPass):
             dst=new_dst,
             collective=op.collective,
             init=init,
-            init_value=init_value,
             attrs=matmul_attrs,
         )
 

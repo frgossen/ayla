@@ -200,7 +200,7 @@ def test_default_verification_rejects_mismatched_matmul_tensor_init():
           }
         }"""))
 
-    with pytest.raises(ValueError, match="must match the destination shape"):
+    with pytest.raises(ValueError, match="scalar or match the destination shape"):
         verify_gpu_dialect(module)
 
 

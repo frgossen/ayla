@@ -64,12 +64,15 @@ from .gpu_dialect import (
     BF16Type,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
+    F32Type,
     GmemTensorType,
     KernelOp,
     MatmulOp,
     ModuleOp,
     ReshapeOp,
+    RmemTensorType,
 )
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
@@ -425,6 +428,7 @@ def _build_gated_attention_output_projection_module(
     reshape = ReshapeOp.build(attention_output, gate_type)
 
     alloc = AllocOp.build_with_fresh_id(gate_type)
+    zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
 
     matmul = MatmulOp.build(
         gate_input,
@@ -435,7 +439,7 @@ def _build_gated_attention_output_projection_module(
             CollectiveAxis.Y: CollectiveLevel.GRID,
             CollectiveAxis.Z: CollectiveLevel.GRID,
         },
-        init=0.0,
+        init=zero.result(),
         attrs={"label": "gate_projection"},
     )
     sigmoid = ElementwiseOp.build(
@@ -459,7 +463,7 @@ def _build_gated_attention_output_projection_module(
             CollectiveAxis.Y: CollectiveLevel.GRID,
             CollectiveAxis.Z: CollectiveLevel.GRID,
         },
-        init=0.0,
+        init=zero.result(),
         attrs={"label": "output_projection"},
     )
 
@@ -474,6 +478,7 @@ def _build_gated_attention_output_projection_module(
         ops=[
             reshape,
             alloc,
+            zero,
             matmul,
             sigmoid,
             mul,
