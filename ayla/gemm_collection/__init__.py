@@ -30,3 +30,10 @@ from .dynamic_m import (  # noqa: E402,F401
     dynamic_m_matmul_template,
     make_dynamic_m_matmul,
 )
+from .muse_swiglu import (  # noqa: E402,F401
+    MUSE_SWIGLU_LARGE_M_CONFIGS,
+    MUSE_SWIGLU_M_VALUES,
+    make_muse_swiglu,
+    make_muse_swiglu_launcher,
+    muse_swiglu_module,
+)

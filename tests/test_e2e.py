@@ -19,21 +19,27 @@ from tests.testing_utils import requires_cuda
 
 @requires_cuda
 @pytest.mark.parametrize("m", [1, 4, 32, 64, 512, 2048])
-def test_muse_swiglu_benchmark_route_matches_torch(m: int):
-    """Exercise the full benchmark route until torch.compile owns it."""
-    from benchmarks.benchmark_bf16_muse_swiglu import (
-        _check,
-        _inputs,
-        _torch_swiglu,
-        build_ayla_swiglu,
+def test_muse_swiglu_route_matches_torch(m: int):
+    """Exercise every tuned route independently of graph capture."""
+    from ayla.gemm_collection.muse_swiglu import (
+        make_muse_swiglu_launcher,
     )
+    from benchmarks.bench_torch_compile.corpus.muse_swiglu import (
+        build_config,
+        muse_swiglu,
+    )
+    from benchmarks.common import error_metrics
 
-    inputs = _inputs(m)
-    expected = _torch_swiglu(*inputs)
-    ayla_swiglu, _ = build_ayla_swiglu(m)
-    actual = ayla_swiglu(*inputs)
+    config = build_config(m)
+    inputs = config.make_inputs()
+    expected = muse_swiglu(*inputs)
+    output = torch.empty_like(expected)
+    ayla_swiglu = make_muse_swiglu_launcher(m)
+    ayla_swiglu(*inputs, output)
     torch.cuda.synchronize()
-    _check("Ayla benchmark route", actual, expected)
+    max_abs, relative_rms = error_metrics(output, expected)
+    assert max_abs <= .125
+    assert relative_rms <= .006
 
 
 CWISE_ADD_TEMPLATE = textwrap.dedent(
