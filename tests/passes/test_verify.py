@@ -493,7 +493,7 @@ def test_tma_multicast_async_collective_must_match_inner():
 
 
 @pytest.mark.parametrize("separate_groups", [False, True])
-def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
+def test_tma_async_lock_allows_mixed_multicast_modes(separate_groups):
     middle = """\
           }
           async(%lock: lock<mbar>) collective=xyz.cluster {
@@ -512,8 +512,7 @@ def test_tma_async_lock_rejects_mixed_multicast_modes(separate_groups):
           }}
         }}"""))
 
-    with pytest.raises(ValueError, match="same multicast mode"):
-        verify_gpu_dialect(module)
+    assert verify_gpu_dialect(module) is module
 
 
 def test_ptx_lowering_verification_rejects_dynamic_shapes():

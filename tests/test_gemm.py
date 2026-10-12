@@ -81,7 +81,7 @@ def test_register_matmul_schedules_side_by_side_gemms():
         }""")  # noqa: E501
 
 
-def test_register_matmul_keeps_multicast_and_local_loads_separate():
+def test_register_matmul_fuses_multicast_and_local_load_completion():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
@@ -101,9 +101,16 @@ def test_register_matmul_keeps_multicast_and_local_loads_separate():
         op for op in find_ops_of_type(module, AsyncOp)
         if op.body.ops and isinstance(op.body.ops[0], MoveOp)
     ]
-    assert len(load_groups) == 2
-    assert [group.is_tma_multicast for group in load_groups] == [True, False]
-    assert load_groups[0].collective != load_groups[1].collective
+    assert len(load_groups) == 1
+    [group] = load_groups
+    assert group.is_tma_multicast
+    assert len(group.body.ops) == 2
+    lhs_move, rhs_move = group.body.ops
+    assert isinstance(lhs_move, MoveOp)
+    assert isinstance(rhs_move, MoveOp)
+    assert [lhs_move.multicast, rhs_move.multicast] == [True, False]
+    assert group.collective == lhs_move.collective
+    assert group.collective != rhs_move.collective
 
 
 def test_second_hero_ignores_an_already_pipelined_singleton():
