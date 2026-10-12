@@ -328,7 +328,7 @@ def test_two_dimensional_warp_group_tiling_linearizes_coordinates():
             %4: gmem<80x64xbf16> = tile(%b: gmem<160x64xbf16>, %2: index, 0)
             %5: gmem<64x160xf32> = tile(%c: gmem<128x160xf32>, %1: index, 0)
             %6: gmem<64x80xf32 strides=[160, 1]> = tile(%5: gmem<64x160xf32>, 0, %2: index)
-            matmul(%3: gmem<64x64xbf16>, %4: gmem<80x64xbf16>, %6: gmem<64x80xf32 strides=[160, 1]>) collective=[x.wg, yz.grid] attrs={dst_tiling_scheme: 0}
+            matmul(%3: gmem<64x64xbf16>, %4: gmem<80x64xbf16>, %6: gmem<64x80xf32 strides=[160, 1]>) collective=[x.wg, yz.grid] attrs={operand_tiling_scheme: [None, None, 0]}
           }
         }""")  # noqa: E501
 

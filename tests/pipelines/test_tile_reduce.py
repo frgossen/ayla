@@ -26,7 +26,7 @@ def test_reduction_parallel_and_sequential_tiling():
             %4: wrmem<1x128xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
             for (%5: index = 0 to 8) attrs={label: "d1"} {
               %6: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %5: index)
-              reduce sum(%4: wrmem<1x128xf32 layout="blocked">, %6: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial", operand_tiling_scheme: [None, 0]}
+              reduce sum(%4: wrmem<1x128xf32 layout="blocked">, %6: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial", operand_tiling_scheme: [None, 1]}
             }
             reduce sum(%3: wrmem<1x1xf32 layout="blocked">, %4: wrmem<1x128xf32 layout="blocked">) collective=[x.block, yz.grid] attrs={label: "mean"}
             move(%2: gmem<1x1xf32>, %3: wrmem<1x1xf32 layout="blocked">) attrs={label: "mean_dst_wrmem"}
