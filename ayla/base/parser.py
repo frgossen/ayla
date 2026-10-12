@@ -121,17 +121,17 @@ class Parser:
         """
         if self.is_at("{"):
             return self.read_dict_attr()
-        if self.is_at('"'):
-            return self.read_str_attr()
         if self.is_at("["):
             return self.read_list_attr()
         return self.read_literal_attr()
 
-    def read_literal_attr(self) -> int | float | bool | None:
-        """Read an atomic literal: int / float / bool / None.
+    def read_literal_attr(self) -> str | int | float | bool | None:
+        """Read an atomic literal: str / int / float / bool / None.
 
         Booleans accept both `True`/`False` and `true`/`false`.
         """
+        if self.can_read_str_attr():
+            return self.read_str_attr()
         LITERAL_CHARS = string.ascii_letters + string.digits + "_.+-"
         start = self.pos
         while self.is_at(LITERAL_CHARS):
@@ -150,6 +150,10 @@ class Parser:
             return int(text)
         except ValueError:
             return float(text)
+
+    def can_read_str_attr(self) -> bool:
+        """Whether a quoted string starts at the current position."""
+        return self.is_at('"')
 
     def read_str_attr(self) -> str:
         """Read a quoted string literal (with `\\\\`, `\\"`, `\\n`, `\\t`
