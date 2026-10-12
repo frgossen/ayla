@@ -88,6 +88,9 @@ def make_torch_custom_call(
     name: str | None = None,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> torch._ops.OpOverload:
+    # TODO: Add a lazy variant that accepts a launcher factory and creates and
+    # caches the PtxLauncher on first invocation; eager registration currently
+    # adds roughly two seconds to importing the kernel collection.
     op_name = name or launcher.name
     schema = _make_schema(op_name, signature_mapping)
 
