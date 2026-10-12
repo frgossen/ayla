@@ -1,15 +1,12 @@
 """Dead code elimination.
 
-Removes side-effect-free ops whose results are unused.
-
-TODO: Also remove AllocOp and AwaitOp when their results/locks are
-unused — a dead alloc is harmless, and an await on a lock with no
-pending async ops is a no-op.
+Removes side-effect-free ops whose results are unused, along with empty async
+groups and their awaits.
 """
 from __future__ import annotations
 
-from ..gpu_dialect import ModuleOp, is_side_effect_free
-from ..base.ir import Block, Op
+from ..gpu_dialect import AsyncOp, AwaitOp, ModuleOp, is_side_effect_free
+from ..base.ir import Block, Op, find_ops_of_type
 from ..base.pipeline import Pass
 
 
@@ -25,6 +22,21 @@ def _collect_uses(block: Block, used: set[int]) -> None:
 class DCE(Pass):
 
     def run(self, module: ModuleOp) -> ModuleOp:
+        empty_groups: set[Op] = set()
+        for op in find_ops_of_type(module, AsyncOp):
+            users = op.lock.users()
+            if not op.body.ops and any(
+                isinstance(user, AwaitOp) for user in users
+            ) and all(
+                isinstance(user, AwaitOp)
+                or isinstance(user, AsyncOp) and not user.body.ops
+                for user in users
+            ):
+                empty_groups.update(users)
+        for op in empty_groups:
+            assert op.parent_block is not None
+            op.parent_block.ops.remove(op)
+
         for block in module.blocks:
             self.run_block(block)
         return module

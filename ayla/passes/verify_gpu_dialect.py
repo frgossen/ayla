@@ -9,6 +9,7 @@ from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
     AsyncOp,
+    AwaitOp,
     BF16Type,
     BarrierOp,
     ClusterBlockIdsOp,
@@ -305,6 +306,17 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 "cluster_mbar is a barrier resource, not an async lock"
             )
+        if not any(
+            isinstance(user, AwaitOp) for user in op.lock.users()
+        ):
+            raise ValueError("async lock must have a matching await")
+
+    @verifies(AwaitOp)
+    def _verify_await(self, op: AwaitOp) -> None:
+        if not any(
+            isinstance(user, AsyncOp) for user in op.lock.users()
+        ):
+            raise ValueError("await lock must have matching async work")
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
