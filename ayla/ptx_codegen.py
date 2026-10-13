@@ -135,9 +135,9 @@ def map_type_to_registers(type):
     if isinstance(type, RmemTensorType):
         n = type.num_elements
         assert n is not None
-        # bf16 is stored in 16-bit registers (no native `mov.bf16`).
+        # 16-bit floats are moved as raw bits in register memory.
         ptx_dtype = (
-            PtxType.B16 if type.dtype.name == "bf16"
+            PtxType.B16 if type.dtype.name in ("bf16", "f16")
             else PtxType(type.dtype.name)
         )
         return TypeRegisterMapping(

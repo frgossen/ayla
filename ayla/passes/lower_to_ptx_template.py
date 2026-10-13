@@ -44,6 +44,7 @@ from ..gpu_dialect import (
     PtrType,
     PTXTemplateOp,
     ReinterpretOp,
+    RegMemTensorType,
     ReshapeOp,
     RmemTensorType,
     ConstantOp,
@@ -102,22 +103,36 @@ def _lower_elementwise_sigmoid_bf16_ptx(
     )
 
 
-def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
-    """Return the PTX-template registers occupied by one WGRMEM operand."""
+def _register_operand_regs(value: Value, operand_name: str) -> tuple[str, list[str]]:
+    """Return the PTX storage suffix and registers selected by a value or view."""
     dtype = cast(MemTensorType, value.type).dtype
+    if isinstance(value.type, RmemTensorType):
+        suffix = _ptx_suffix(dtype)
+        count = value.type.num_elements
+        assert count is not None
+        return suffix, [
+            f"${{{suffix}:operand.{operand_name}.r{reg}}}"
+            for reg in range(count)
+        ]
+    if not isinstance(value.type, WgrmemTensorType):
+        raise NotImplementedError(f"unsupported register type {value.type}")
     if isinstance(dtype, F32Type):
-        return [
+        return "f32", [
             f"${{f32:operand.{operand_name}.r{reg}}}"
             for reg in _view_f32_register_indices(value)
         ]
     if isinstance(dtype, (BF16Type, F16Type)):
-        return [
+        return "b32", [
             f"${{b32:operand.{operand_name}.r{reg}}}"
             for reg in _view_pair_indices(value)
         ]
     raise NotImplementedError(
-        f"lower_elementwise: unsupported register dtype {dtype}"
+        f"unsupported register dtype {dtype}"
     )
+
+
+def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
+    return _register_operand_regs(value, operand_name)[1]
 
 
 def _lower_f32_to_packed16_ptx(
@@ -1207,6 +1222,11 @@ class LowerToPtxTemplate(LoweringPass):
         dst_type = op.dst.type
         src_type = op.src.type
 
+        if (
+            isinstance(dst_type, RegMemTensorType)
+            and isinstance(src_type, RegMemTensorType)
+        ):
+            return self._lower_move_regmem(op)
         if {type(dst_type), type(src_type)} == {RmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_rmem(op)
         if {type(dst_type), type(src_type)} == {RmemTensorType, SmemTensorType}:
@@ -1229,6 +1249,43 @@ class LowerToPtxTemplate(LoweringPass):
             f"lower_move: unsupported; got "
             f"{type(dst_type).__name__} <- {type(src_type).__name__}"
         )
+
+    def _lower_move_regmem(
+        self, op: MoveOp,
+    ) -> tuple[list[Op], list[object]]:
+        """Copy matching register tensors or broadcast a per-thread scalar.
+
+        Select registers from the original values so tiled destinations only
+        write their view, even after tile lowering maps them to root storage.
+        """
+        dst = cast(Value, self.value_map[op.dst])
+        src = cast(Value, self.value_map[op.src])
+        dst_type, src_type = op.dst.type, op.src.type
+        assert isinstance(dst_type, RegMemTensorType)
+        assert isinstance(src_type, RegMemTensorType)
+        if dst_type.dtype != src_type.dtype:
+            raise NotImplementedError("register move requires matching dtypes")
+        broadcast = isinstance(src_type, RmemTensorType) and src_type.num_elements == 1
+        if not broadcast and dst_type != src_type:
+            raise NotImplementedError("register move requires matching types or a scalar source")
+        suffix, dst_regs = _register_operand_regs(op.dst, "dst")
+        src_suffix, src_regs = _register_operand_regs(op.src, "src")
+        if broadcast:
+            [source] = src_regs
+            if suffix != src_suffix:
+                # A packed destination holds two scalar elements per register.
+                assert (suffix, src_suffix) == ("b32", "b16")
+                source = "{" + source + ", " + source + "}"
+            src_regs = [source] * len(dst_regs)
+        template = "".join(
+            f"mov.{suffix} {dst_reg}, {src_reg};\n"
+            for dst_reg, src_reg in zip(dst_regs, src_regs, strict=True)
+        )
+        lowered = PTXTemplateOp.build(
+            operands=[dst, src], result_types=[], template=template,
+            operand_names=["dst", "src"], result_names=[], description=str(op),
+        )
+        return [lowered], []
 
     @lowers(AwaitOp)
     def lower_await(
@@ -2488,14 +2545,14 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
 
 
 def _ptx_suffix(dtype) -> str:
-    """PTX type suffix for a dtype. bf16 uses b16 (no native suffix)."""
+    """PTX storage suffix for a dtype; 16-bit floats move as raw bits."""
     name = dtype.name
-    return "b16" if name == "bf16" else name
+    return "b16" if name in ("bf16", "f16") else name
 
 
 def _mov_literals_ptx(result: str, dtype: Type, values) -> str:
     """Move literals into a result's registers; 16-bit floats move as bits."""
-    suffix = "b16" if isinstance(dtype, (F16Type, BF16Type)) else dtype.name
+    suffix = _ptx_suffix(dtype)
     return "".join(
         f"mov.{suffix} ${{{suffix}:result.{result}.r{i}}}, "
         f"{_ptx_literal(dtype, value)};\n"
