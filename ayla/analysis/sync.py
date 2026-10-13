@@ -407,6 +407,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         self.targets: BarrierTargetsType = {}
 
     @transfers(
+        AllocOp,
         BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,
@@ -466,12 +467,6 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         # for t0's async work, so no arriving warp can lap the named barrier.
         state.named_barrier_ids_pending_await.pop(op.lock, None)
         return state
-
-    @transfers(AllocOp)
-    def transfer_alloc(self, op: AllocOp, state: SyncState) -> SyncState:
-        if op.init is None:
-            return state
-        return _transfer_memory_effects(op, state, self.targets)
 
     @transfers(AsyncOp)
     def transfer_async(self, op: AsyncOp, state: SyncState) -> SyncState:

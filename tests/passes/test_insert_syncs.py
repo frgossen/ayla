@@ -398,7 +398,9 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             %23: gmem<128x256xbf16 strides=[4096, 1]> = tile(%22: gmem<128x4096xbf16>, 0, %by: index)
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %24: gmem<64x256xbf16 strides=[4096, 1]> = tile(%23: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12, init: 0.0}
+            %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12}
+            %25_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %25_init: rmem<f32>)
             %26: smem<64x64xbf16 swizzle="128B"> = tile(%11: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %27: smem<64x64xbf16 swizzle="128B"> = tile(%8: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %28: smem<64x64xbf16 swizzle="128B"> = tile(%5: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
@@ -572,7 +574,9 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             %sb: smem<64x64xbf16> = alloc()
             %sc: smem<64x64xbf16> = alloc()
             %sd: smem<64x64xbf16> = alloc()
-            %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc()
+            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %acc_init: rmem<f32>)
             %l0: lock<mbar> = alloc()
             async(%l0: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}

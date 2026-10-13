@@ -44,6 +44,7 @@ from ..gpu_dialect import (
     PtrType,
     PTXTemplateOp,
     ReinterpretOp,
+    RegMemTensorType,
     ReshapeOp,
     RmemTensorType,
     ConstantOp,
@@ -102,22 +103,37 @@ def _lower_elementwise_sigmoid_bf16_ptx(
     )
 
 
+def _register_operand_regs(value: Value, operand_name: str) -> tuple[str, list[str]]:
+    """Return the PTX storage type and registers selected by a value or view.
+
+    WGRMEM holds each element pair in one packed 16-bit register or in two F32
+    registers; a view selects the pairs it covers in its root fragment.
+    """
+    value_type = cast(RegMemTensorType, value.type)
+    suffix = _ptx_suffix(value_type.dtype)
+    if isinstance(value_type, RmemTensorType):
+        indices = range(cast(int, value_type.num_elements))
+    elif suffix == "b16":
+        suffix, indices = "b32", _view_pair_indices(value)
+    else:
+        indices = _view_f32_register_indices(value)
+    return suffix, [
+        f"${{{suffix}:operand.{operand_name}.r{reg}}}" for reg in indices
+    ]
+
+
+def _lower_fill_ptx(op: ElementwiseOp) -> str:
+    """Broadcast a scalar source into every destination register."""
+    suffix, dst_regs = _register_operand_regs(op.dst, "dst")
+    src_suffix, [scalar] = _register_operand_regs(op.src(0), "src")
+    # Storage types differ only when a destination register packs a pair.
+    if suffix != src_suffix:
+        scalar = f"{{{scalar}, {scalar}}}"
+    return "".join(f"mov.{suffix} {dst_reg}, {scalar};\n" for dst_reg in dst_regs)
+
+
 def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
-    """Return the PTX-template registers occupied by one WGRMEM operand."""
-    dtype = cast(MemTensorType, value.type).dtype
-    if isinstance(dtype, F32Type):
-        return [
-            f"${{f32:operand.{operand_name}.r{reg}}}"
-            for reg in _view_f32_register_indices(value)
-        ]
-    if isinstance(dtype, (BF16Type, F16Type)):
-        return [
-            f"${{b32:operand.{operand_name}.r{reg}}}"
-            for reg in _view_pair_indices(value)
-        ]
-    raise NotImplementedError(
-        f"lower_elementwise: unsupported register dtype {dtype}"
-    )
+    return _register_operand_regs(value, operand_name)[1]
 
 
 def _lower_f32_to_packed16_ptx(
@@ -310,6 +326,7 @@ def _lower_silu_registers(
 
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
+    "fill": _lower_fill_ptx,
     "mul": partial(
         _lower_elementwise_in_batches,
         lower_registers=_lower_mul_register_batches,
@@ -531,10 +548,8 @@ class LowerToPtxTemplate(LoweringPass):
         result_type = op.result().type
         if isinstance(result_type, SmemTensorType):
             return self._lower_alloc_smem(op)
-        if isinstance(result_type, RmemTensorType):
-            return self._lower_alloc_rmem(op)
-        if isinstance(result_type, WgrmemTensorType):
-            return self._lower_alloc_wgrmem(op)
+        if isinstance(result_type, (RmemTensorType, WgrmemTensorType)):
+            return self._lower_alloc_registers(op)
         if isinstance(result_type, LockType):
             return self._lower_alloc_lock(op)
         raise NotImplementedError(
@@ -649,53 +664,12 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], [new_op.result()]
 
-    def _lower_alloc_rmem(
+    def _lower_alloc_registers(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
-        result_type = op.result().type
-        assert isinstance(result_type, RmemTensorType)
-        template = "" if op.init is None else _mov_literals_ptx(
-            "dst",
-            result_type.dtype,
-            itertools.repeat(op.init, cast(int, result_type.num_elements)),
-        )
-
         new_op = PTXTemplateOp.build(
-            operands=[],
-            result_types=[result_type],
-            template=template,
-            operand_names=[],
-            result_names=["dst"],
-            description=str(op),
-        )
-        return [new_op], [new_op.result()]
-
-    def _lower_alloc_wgrmem(
-        self, op: AllocOp,
-    ) -> tuple[list[Op], list[object]]:
-        result_type = op.result().type
-        assert isinstance(result_type, WgrmemTensorType)
-        n = result_type.num_elements_per_thread
-        suffix = result_type.dtype.name
-        if cast(
-            BF16Type | F16Type | F32Type | F64Type, result_type.dtype,
-        ).byte_size == 2:  # bf16/f16 packed in pairs into b32
-            n //= 2
-            suffix = "b32"
-
-        template = ""
-        if op.init is not None:
-            literal = _ptx_literal(result_type.dtype, op.init)
-            for i in range(n):
-                template += f"mov.{suffix} ${{{suffix}:result.dst.r{i}}}, {literal};\n"
-
-        new_op = PTXTemplateOp.build(
-            operands=[],
-            result_types=[result_type],
-            template=template,
-            operand_names=[],
-            result_names=["dst"],
-            description=str(op),
+            operands=[], result_types=[op.result().type], template="",
+            operand_names=[], result_names=["dst"], description=str(op),
         )
         return [new_op], [new_op.result()]
 
@@ -704,8 +678,6 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         smem_type = op.result().type
         assert isinstance(smem_type, SmemTensorType)
-        if op.init is not None:
-            raise NotImplementedError("lower_alloc: smem init not supported")
         num_elements = smem_type.num_elements
         assert num_elements is not None
         n_bytes = num_elements * cast(
@@ -735,7 +707,7 @@ class LowerToPtxTemplate(LoweringPass):
     def lower_elementwise(
         self, op: ElementwiseOp,
     ) -> tuple[list[Op], list[object]]:
-        """Lower an element-wise op on wgrmem tensors, one function per element.
+        """Lower an element-wise op on register tensors, one function per element.
 
         Source and destination dtypes are independent. Function lowering runs
         in the source dtype and a supported conversion writes the result to the
@@ -744,20 +716,13 @@ class LowerToPtxTemplate(LoweringPass):
         sources = [op.src(i) for i in range(op.num_srcs)]
         dst_value = cast(Value, self.value_map[op.dst])
         source_values = [cast(Value, self.value_map[src]) for src in sources]
-        dst_type = op.dst.type
 
-        if not isinstance(dst_type, WgrmemTensorType):
-            raise NotImplementedError(
-                f"lower_elementwise: destination must be wgrmem; got {dst_type}"
-            )
-        for src in sources:
-            src_type = src.type
-            if not isinstance(src_type, WgrmemTensorType):
+        for value in op.operands:
+            if not isinstance(value.type, (RmemTensorType, WgrmemTensorType)):
                 raise NotImplementedError(
-                    f"lower_elementwise: source must be wgrmem; got {src_type}"
+                    f"lower_elementwise: operands must be registers; "
+                    f"got {value.type}"
                 )
-            assert tuple(src_type.sizes) == tuple(dst_type.sizes)
-            assert src_type.warps == dst_type.warps
         lower = _ELEMENTWISE_LOWERERS.get(op.fn)
         if lower is None:
             raise NotImplementedError(
@@ -2488,14 +2453,14 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
 
 
 def _ptx_suffix(dtype) -> str:
-    """PTX type suffix for a dtype. bf16 uses b16 (no native suffix)."""
+    """PTX storage suffix for a dtype; 16-bit floats move as raw bits."""
     name = dtype.name
-    return "b16" if name == "bf16" else name
+    return "b16" if name in ("bf16", "f16") else name
 
 
 def _mov_literals_ptx(result: str, dtype: Type, values) -> str:
     """Move literals into a result's registers; 16-bit floats move as bits."""
-    suffix = "b16" if isinstance(dtype, (F16Type, BF16Type)) else dtype.name
+    suffix = _ptx_suffix(dtype)
     return "".join(
         f"mov.{suffix} ${{{suffix}:result.{result}.r{i}}}, "
         f"{_ptx_literal(dtype, value)};\n"

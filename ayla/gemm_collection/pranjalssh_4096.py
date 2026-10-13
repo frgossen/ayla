@@ -14,7 +14,9 @@ def pranjalssh_4096_module():
             %by: index = block_id.y
             %smem_a: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             %smem_b: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
-            %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2, init: 0.0}
+            %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 2}
+            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">, %acc_init: rmem<f32>)
             %a_block: gmem<128x4096xbf16 strides=[4096, 1]> = tile(%a: gmem<4096x4096xbf16>, %by: index, 0)
             %bt_block: gmem<128x4096xbf16 strides=[4096, 1]> = tile(%bt: gmem<4096x4096xbf16>, %bx: index, 0)
             for (%k: index = 0 to 64) {

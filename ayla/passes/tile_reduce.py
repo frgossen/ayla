@@ -19,6 +19,7 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
     ForOp,
     IndexConstantOp,
@@ -28,6 +29,7 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     ReduceOp,
+    RmemTensorType,
     ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
@@ -75,8 +77,14 @@ def _materialize_partials(
         typ = clone_type(reduction_dst.type, attrs)
         neutral_element = ReduceOp.NEUTRAL_ELEMENTS[reduction_fn]
         assert neutral_element is not None
-        alloc = AllocOp.build_with_fresh_id(typ, init=neutral_element)
-        return [alloc], alloc.result()
+        alloc = AllocOp.build_with_fresh_id(typ)
+        neutral = ConstantOp.build(
+            neutral_element, RmemTensorType.build([], reduction_dst.type.dtype),
+        )
+        fill = ElementwiseOp.build(
+            alloc.result(), srcs=[neutral.result()], fn="fill",
+        )
+        return [alloc, neutral, fill], alloc.result()
 
     tile = reduction_dst.definition
     assert isinstance(tile, TileOp), (
