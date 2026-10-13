@@ -960,7 +960,7 @@ class LowerToPtxTemplate(LoweringPass):
         the ``mma_async`` (accumulating into the shared dst), and a single
         ``wgmma.commit_group``. The hardware serializes same-accumulator mmas, so
         the await's lone ``wgmma.wait_group`` covers them all (this is the batched
-        form nvcc emits, cf. ``fastcu_5_1``). The group's await op (lock kind
+        form nvcc emits). The group's await op (lock kind
         ``wgmma``) emits the wait plus a ``bar.sync`` that closes the TMA-reload
         vs warpgroup-read WAR (see ``_lower_await_wgmma``).
         """

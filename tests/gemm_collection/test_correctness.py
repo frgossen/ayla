@@ -369,9 +369,6 @@ def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
         pytest.param(ayla.loop_4x4_matmul_4096, F32, None, id="loop_4x4_matmul_4096"),
         pytest.param(ayla.loop_8x8_matmul_4096, F32, None, id="loop_8x8_matmul_4096"),
         pytest.param(ayla.tma_matmul_4096, F32, None, id="tma_matmul_4096"),
-        pytest.param(ayla.pranjalssh_4096, BF16, None, id="pranjalssh_4096"),
-        pytest.param(ayla.pranjalssh_4096_pipelined, BF16, None, id="pranjalssh_4096_pipelined"),
-        pytest.param(ayla.auto_matmul_4096, BF16, None, id="auto_matmul_4096"),
         pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, None, id="auto_matmul_4096_wgmma256_wg"),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
@@ -397,7 +394,6 @@ def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
             None,
             id="auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2",
         ),
-        pytest.param(ayla.fastcu_5_1, BF16, None, id="fastcu_5_1"),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_sigmoid,
             BF16,
