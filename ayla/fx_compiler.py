@@ -1,6 +1,7 @@
 """Translate matched post-grad FX regions into high-level Ayla GPU IR."""
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
@@ -31,9 +32,9 @@ from .gpu_dialect import (
     MatmulOp,
     ModuleOp,
     ReshapeOp,
-    TileOp,
     Type,
 )
+from .passes._utils import build_slice_tile
 from .torch_custom_call import (
     DEFAULT_NAMESPACE,
     OperandKind,
@@ -62,7 +63,10 @@ class FxRegionMatch:
 # and neg are included only so discovery can traverse the hardcoded
 # decomposed-SiLU pattern; they are not independently importable.
 _SUPPORTED_FX_TARGETS = {
+    operator.getitem,
     torch.ops.aten.add.Tensor,
+    torch.ops.aten.cat.default,
+    torch.ops.aten.clone.default,
     torch.ops.aten.div.Tensor,
     torch.ops.aten.exp.default,
     torch.ops.aten.mm.default,
@@ -72,6 +76,9 @@ _SUPPORTED_FX_TARGETS = {
     torch.ops.aten.sigmoid.default,
     torch.ops.aten.silu.default,
     torch.ops.aten.slice.Tensor,
+    torch.ops.aten.split.Tensor,
+    torch.ops.aten.split_with_sizes.default,
+    torch.ops.aten.unsqueeze.default,
     torch.ops.aten.view.default,
     torch.ops.prims.convert_element_type.default,
 }
@@ -226,7 +233,11 @@ def _allocate(
     output: Node,
     output_value: Value,
     ops: list[Op],
+    destinations: dict[Node, Value],
 ) -> Value:
+    destination = destinations.get(node)
+    if destination is not None:
+        return destination
     if node is output:
         return output_value
     alloc = AllocOp.build_with_fresh_id(_node_type(node))
@@ -265,6 +276,42 @@ def fx_region_to_module(
     }
     output_value = Value(match.output.name, _node_type(match.output))
     ops: list[Op] = []
+    destinations = {match.output: output_value}
+    cat_values: dict[Node, Value] = {}
+    # A cat is free when its producers write directly into its result slices.
+    for node in reversed(nodes):
+        if node.target is not torch.ops.aten.cat.default:
+            continue
+        destination = destinations.get(node)
+        if destination is None:
+            allocation = AllocOp.build_with_fresh_id(_node_type(node))
+            ops.append(allocation)
+            destination = allocation.result()
+        arguments = cast(list[Node], node.args[0])
+        dim = cast(
+            int, node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0),
+        ) % _node_type(node).rank
+        offset = 0
+        for argument in arguments:
+            if not (
+                argument.target is torch.ops.aten.cat.default
+                or argument.target is torch.ops.aten.mm.default
+                or argument.target in _ELEMENTWISE_OPS
+            ):
+                raise ValueError(
+                    f"{node.name}: cat inputs must be produced in the region"
+                )
+            size = cast(int, _node_type(argument).sizes[dim])
+            index, remainder = divmod(offset, size)
+            if remainder:
+                raise ValueError(f"{node.name}: cat slices must be tile-aligned")
+            tile = build_slice_tile(destination, dim, index, size)
+            ops.append(tile)
+            if argument in destinations:
+                raise ValueError(f"{argument.name}: has multiple destinations")
+            destinations[argument] = tile.result()
+            offset += size
+        cat_values[node] = destination
     matmul_index = 0
 
     silu_sources: dict[Node, Node] = {}
@@ -283,6 +330,66 @@ def fx_region_to_module(
             raise ValueError(
                 f"{node.name}: unsupported FX node kind {node.op!r}"
             )
+
+        if node.target in (
+            torch.ops.aten.split.Tensor,
+            torch.ops.aten.split_with_sizes.default,
+        ):
+            continue
+
+        if node.target is operator.getitem:
+            split, index = cast(tuple[Node, int], node.args)
+            if index < 0:
+                raise ValueError(f"{node.name}: negative split index is unsupported")
+            source_arg, split_spec, *optional_dim = split.args
+            source = _node_argument(source_arg, owner=split)
+            dim = cast(int, optional_dim[0] if optional_dim else 0)
+            dim %= _node_type(source).rank
+            if split.target is torch.ops.aten.split_with_sizes.default:
+                sizes = cast(list[int], split_spec)
+                start = sum(sizes[:index])
+            elif split.target is torch.ops.aten.split.Tensor:
+                start = index * cast(int, split_spec)
+            else:
+                raise ValueError(f"{node.name}: getitem requires a split")
+            size = cast(int, _node_type(node).sizes[dim])
+            tile_index, remainder = divmod(start, size)
+            if remainder:
+                raise ValueError(f"{node.name}: split must be tile-aligned")
+            tile = build_slice_tile(values[source], dim, tile_index, size)
+            ops.append(tile)
+            values[node] = tile.result()
+            continue
+
+        if node.target is torch.ops.aten.cat.default:
+            values[node] = cat_values[node]
+            continue
+
+        if node.target in (
+            torch.ops.aten.clone.default,
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.view.default,
+        ):
+            source = _node_argument(node.args[0], owner=node)
+            source_type = _node_type(source)
+            result_type = _node_type(node)
+            if node.target is torch.ops.aten.clone.default and (
+                source_type.sizes != result_type.sizes
+                or any(
+                    size != 1 and source_stride != result_stride
+                    for size, source_stride, result_stride in zip(
+                        source_type.sizes,
+                        source_type.strides,
+                        result_type.strides,
+                        strict=True,
+                    )
+                )
+            ):
+                raise ValueError(f"{node.name}: clone changes layout")
+            reshape = ReshapeOp.build(values[source], _node_type(node))
+            ops.append(reshape)
+            values[node] = reshape.result()
+            continue
 
         transpose_source = _transpose_source(node)
         if transpose_source is not None:
@@ -306,7 +413,9 @@ def fx_region_to_module(
                 raise ValueError(
                     f"{node.name}: matmul RHS must be a 2D transpose"
                 )
-            dst = _allocate(node, match.output, output_value, ops)
+            dst = _allocate(
+                node, match.output, output_value, ops, destinations,
+            )
             label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
             matmul_index += 1
             ops.append(MatmulOp.build(
@@ -322,30 +431,22 @@ def fx_region_to_module(
             values[node] = dst
             continue
 
-        if node.target is torch.ops.aten.view.default:
-            source = _node_argument(node.args[0], owner=node)
-            reshape = ReshapeOp.build(values[source], _node_type(node))
-            ops.append(reshape)
-            values[node] = reshape.result()
-            continue
-
         if node.target is torch.ops.aten.slice.Tensor:
-            source = cast(Node, node.args[0])
+            source = _node_argument(node.args[0], owner=node)
             dim, start, _end = node.args[1:4]
-            dim = cast(int, dim)
             step = node.args[4] if len(node.args) == 5 else 1
-            if not isinstance(start, int):
-                raise ValueError(f"{node.name}: slice start must be static")
-            if not isinstance(step, int):
-                raise ValueError(f"{node.name}: slice step must be static")
             if step != 1:
-                raise ValueError(f"{node.name}: strided slices are unsupported")
+                raise ValueError(f"{node.name}: slice step must be one")
             source_type = values[source].type
             if not isinstance(source_type, GmemTensorType):
                 raise ValueError(f"{node.name}: slice source must be gmem")
-            indices: list[Value | int] = [0] * source_type.rank
-            indices[dim] = start
-            tile = TileOp.build(values[source], indices, _node_type(node))
+            dim = cast(int, dim) % source_type.rank
+            start = cast(int, start)
+            size = cast(int, _node_type(node).sizes[dim])
+            tile_index, remainder = divmod(start, size)
+            if remainder:
+                raise ValueError(f"{node.name}: slice must be tile-aligned")
+            tile = build_slice_tile(values[source], dim, tile_index, size)
             ops.append(tile)
             values[node] = tile.result()
             continue
@@ -366,7 +467,9 @@ def fx_region_to_module(
                 ]
 
         if elementwise_fn is not None:
-            dst = _allocate(node, match.output, output_value, ops)
+            dst = _allocate(
+                node, match.output, output_value, ops, destinations,
+            )
             ops.append(ElementwiseOp.build(
                 dst,
                 [values[source] for source in source_nodes],
