@@ -59,17 +59,17 @@ def _materialize_tile(
 def _materialize_partials(
     value: Value,
     reduction_dim: int,
-    reduction_bound: int,
+    num_partials: int,
     neutral_element: float | int,
 ) -> tuple[list[Op], Value]:
     if isinstance(value.definition, (AllocOp, Block)):
-        assert isinstance(value.type, AddrMemTensorType)
+        assert isinstance(value.type, MemTensorType)
         sizes = list(value.type.sizes)
-        sizes[reduction_dim] = reduction_bound
-        typ = clone_type(value.type, {
-            "sizes": sizes,
-            "strides": AddrMemTensorType.canonical_strides(sizes),
-        })
+        sizes[reduction_dim] = num_partials
+        attrs: dict[str, object] = {"sizes": sizes}
+        if isinstance(value.type, AddrMemTensorType):
+            attrs["strides"] = AddrMemTensorType.canonical_strides(sizes)
+        typ = clone_type(value.type, attrs)
         alloc = AllocOp.build_with_fresh_id(typ, init=neutral_element)
         return [alloc], alloc.result()
 
@@ -79,7 +79,7 @@ def _materialize_partials(
         "view chains"
     )
     ops, replayed_arg = _materialize_partials(
-        tile.arg, reduction_dim, reduction_bound, neutral_element,
+        tile.arg, reduction_dim, num_partials, neutral_element,
     )
     tile_type = tile.result().type
     replayed_type = replayed_arg.type
@@ -171,6 +171,8 @@ class TileReduce(LoweringPass):
     Nested tiling is expressed by composing multiple pass invocations.
     A dimension without a parallel iteration space is lowered to a sequential
     loop whose label is derived from the dimension.
+    The vector accumulation option selects vector accumulation instead of
+    materialized scalar partial reductions.
     """
 
     tile_sizes: dict[int, int]
@@ -179,6 +181,7 @@ class TileReduce(LoweringPass):
     )
     hero_label_filter: str | None
     epilogue_label_filter: str | None
+    vector_accumulation: bool
 
     def __init__(
         self,
@@ -188,12 +191,14 @@ class TileReduce(LoweringPass):
         ),
         hero_label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
+        vector_accumulation: bool = False,
     ) -> None:
         super().__init__(
             tile_sizes=dict(tile_sizes),
             parallel_iteration_space=parallel_iteration_space,
             hero_label_filter=hero_label_filter,
             epilogue_label_filter=epilogue_label_filter,
+            vector_accumulation=vector_accumulation,
         )
 
     @lowers(KernelOp)
@@ -299,15 +304,20 @@ class TileReduce(LoweringPass):
                 parallel_body_insertion_point = inner_loop.body.ops
 
         # Declare partials if needed.
+        # TODO: Resolve gmem allocations through buffer promotion, buffer reuse,
+        # or scratch gmem kernel arguments. See the design notes:
+        # https://docs.google.com/document/d/1UG1GMse251yAtngItIoH6W46qGGJE3VitYRJ0kw_0BM/edit?tab=t.0#heading=h.fi4redhw9yo6
         partials: Value | None = None
         if reduction_dim is not None:
             neutral_element = ReduceOp.NEUTRAL_ELEMENTS[hero.fn]
             assert neutral_element is not None
+            num_partials = (
+                self.tile_sizes[reduction_dim]
+                if self.vector_accumulation
+                else bounds[reduction_dim]
+            )
             partials_ops, partials = _materialize_partials(
-                hero.dst,
-                reduction_dim,
-                bounds[reduction_dim],
-                neutral_element,
+                hero.dst, reduction_dim, num_partials, neutral_element,
             )
             parallel_body_insertion_point.extend(partials_ops)
 
@@ -324,6 +334,8 @@ class TileReduce(LoweringPass):
                 partials, parallel_dims, self.tile_sizes, ivs,
             )
             parallel_body_insertion_point.extend(partials_ops)
+
+        final_src = partials if partials is not None else src
 
         # Create iteration spaces for the reduction dimensions.
         reduction_body_insertion_point = parallel_body_insertion_point
@@ -342,8 +354,7 @@ class TileReduce(LoweringPass):
             ivs[reduction_dim] = reduction_iv
 
         # Create tiles wrt. reduction dimension iteration space.
-        partial_ops: list[Op] = []
-        partial: Value | None = None
+        partials_ops: list[Op] = []
         if reduction_dim is not None:
             assert partials is not None
             src_ops, src = _materialize_tile(
@@ -352,32 +363,33 @@ class TileReduce(LoweringPass):
                 self.tile_sizes,
                 ivs,
             )
-            partial_ops, partial = _materialize_tile(
-                partials,
-                [reduction_dim],
-                {reduction_dim: 1},
-                ivs,
-            )
+            if not self.vector_accumulation:
+                partials_ops, partials = _materialize_tile(
+                    partials,
+                    [reduction_dim],
+                    {reduction_dim: 1},
+                    ivs,
+                )
 
         # Create the partial reduction, if needed.
         tiled_collectiveness = _narrow_collective(
             hero.collective, self.parallel_iteration_space,
         )
         if reduction_dim is not None:
-            assert partial is not None
+            assert partials is not None
             partial_attrs = hero.extra_attrs
             label = partial_attrs.get("label")
             if isinstance(label, str):
                 partial_attrs["label"] = f"{label}_partial"
             partial_reduce = ReduceOp.build(
-                partial,
+                partials,
                 src,
                 fn=hero.fn,
                 collective=tiled_collectiveness,
                 attrs=partial_attrs,
             )
             reduction_body_insertion_point.extend([
-                *partial_ops,
+                *partials_ops,
                 *src_ops,
                 partial_reduce,
             ])
@@ -386,7 +398,6 @@ class TileReduce(LoweringPass):
         final_reduction_collectiveness = (
             tiled_collectiveness if parallel_dims else dict(hero.collective)
         )
-        final_src = partials if partials is not None else src
         final_reduce = clone_op(
             hero,
             {hero.dst: dst, hero.src: final_src},
@@ -433,6 +444,16 @@ class TileReduce(LoweringPass):
             "TileReduce cannot tile parallel and reduction dimensions in "
             "one invocation"
         )
+        if self.vector_accumulation:
+            assert reduction_dim is not None, (
+                "TileReduce vector accumulation requires reduction-dimension "
+                "tiling"
+            )
+            assert self.parallel_iteration_space is None, (
+                "TileReduce does not implement parallel vector accumulation; "
+                "it would require atomic accumulator updates and is not "
+                "currently considered useful"
+            )
         for dim, tile_size in self.tile_sizes.items():
             size = cast(int, src_type.sizes[dim])
             assert 0 < tile_size <= size, (
@@ -487,10 +508,12 @@ def tile_reduce(
     ),
     hero_label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
+    vector_accumulation: bool = False,
 ) -> ModuleOp:
     return TileReduce(
         tile_sizes,
         parallel_iteration_space,
         hero_label_filter,
         epilogue_label_filter,
+        vector_accumulation,
     ).run(module)
