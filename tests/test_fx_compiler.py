@@ -3,6 +3,7 @@ import torch
 from torch.fx import Graph, GraphModule, Node
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
+import ayla.jit_compiler as jit_compiler
 from ayla.base.ir import find_ops_of_type
 from ayla.fx_compiler import (
     FxRegionMatch,
@@ -13,15 +14,16 @@ from ayla.fx_compiler import (
 from ayla.gpu_dialect import (
     BF16Type,
     ElementwiseOp,
+    F32Type,
     GmemTensorType,
     KernelOp,
     MatmulOp,
     TileOp,
 )
 from ayla.gemm_collection.gemm import schedule_matmul
-from ayla.jit_compiler import PtxRoutePlan
+from ayla.jit_compiler import PtxRoutePlan, ScratchInit
 from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
-from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_codegen import PtxKernel, make_ptx_kernel
 from ayla.torch_custom_call import OperandKind
 
 
@@ -214,3 +216,36 @@ def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
         torch.empty((64, 64), dtype=torch.bfloat16, device="meta"),
     )
     assert result.shape == (128, 64)
+
+
+def test_ptx_route_plan_binds_runtime_and_scratch_arguments(monkeypatch):
+    launched = []
+    scratch = object()
+    zeroed_scratch = object()
+    signature = [
+        GmemTensorType.build([8], BF16Type()),
+        GmemTensorType.build([2], F32Type()),
+        GmemTensorType.build([1], F32Type()),
+        GmemTensorType.build([8], BF16Type()),
+    ]
+    kernel = PtxKernel(
+        ptx="", name="scratch_test", signature=signature,
+        grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+    )
+    plan = PtxRoutePlan(
+        kernel,
+        bindings=[0, ScratchInit.EMPTY, ScratchInit.ZERO, 1],
+    )
+    monkeypatch.setattr(
+        jit_compiler, "make_ptx_launcher",
+        lambda _kernel: lambda *args: launched.append(args),
+    )
+    monkeypatch.setattr(torch, "empty", lambda *_args, **_kwargs: scratch)
+    monkeypatch.setattr(
+        torch, "zeros", lambda *_args, **_kwargs: zeroed_scratch,
+    )
+
+    route = plan()
+    route("input", "output")  # type: ignore[arg-type]
+
+    assert launched == [("input", scratch, zeroed_scratch, "output")]
