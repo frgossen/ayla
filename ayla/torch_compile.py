@@ -24,6 +24,9 @@ What makes this small is that ayla does not generate a fused kernel on demand:
 fusing is swapping in a different prebuilt op. A kernel built per epilogue
 would need real codegen here.
 
+Multi-operation regions such as Muse SwiGLU are handled earlier by the
+post-grad FX-to-Ayla pipeline, before their individual operations lower to
+Inductor IR.
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ from collections.abc import Sequence
 from typing import cast
 
 import torch
+import torch._inductor.config as inductor_config
 from torch._inductor import ir
 from torch._inductor.codegen.common import (
     BackendFeature,
@@ -48,13 +52,18 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
 )
+from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from . import gemm_collection  # noqa: F401 -- defines the ops below
+from .gemm_collection.muse_swiglu import register_muse_swiglu
 
 _MM_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_out.default
 _MM_SIGMOID_OUT = torch.ops.ayla.auto_matmul_4096_wgmma256_wg_sigmoid_out.default
+_POST_GRAD_PATTERNS = PatternMatcherPass(pass_name="ayla")
+register_muse_swiglu(_POST_GRAD_PATTERNS)
+_POST_GRAD_PASS = _POST_GRAD_PATTERNS.apply
 
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
@@ -207,12 +216,29 @@ def _lower_mm(lhs, rhs, *, layout=None):
 _LOWERING_TARGET = torch.ops.aten.mm.default
 _displaced_user_lowering = None
 _displaced_backend = None
+_displaced_post_grad_pass = None
+
+
+def _post_grad_passes(configured) -> tuple:
+    if configured is None:
+        return ()
+    if isinstance(configured, (list, tuple)):
+        return tuple(configured)
+    return (configured,)
 
 
 def install() -> None:
-    """Claim ``aten.mm``, and the cuda scheduling that decides what fuses into it."""
+    """Install Ayla's graph rewrites, lowering, and CUDA scheduling."""
     global _displaced_user_lowering, _displaced_backend
+    global _displaced_post_grad_pass
     init_backend_registration()
+    existing = inductor_config.post_grad_custom_post_pass
+    existing_passes = _post_grad_passes(existing)
+    if _POST_GRAD_PASS not in existing_passes:
+        _displaced_post_grad_pass = inductor_config.post_grad_custom_post_pass
+        inductor_config.post_grad_custom_post_pass = [
+            *existing_passes, _POST_GRAD_PASS,
+        ]
     if _displaced_backend is None:
         _displaced_backend = device_codegens["cuda"]
         register_backend_for_device(
@@ -227,12 +253,14 @@ def install() -> None:
 
 
 def uninstall() -> None:
-    """Hand back ``aten.mm`` and the cuda scheduling."""
+    """Restore the displaced graph pass, ``aten.mm``, and CUDA scheduling."""
     global _displaced_backend
+    current = inductor_config.post_grad_custom_post_pass
+    if _POST_GRAD_PASS in _post_grad_passes(current):
+        inductor_config.post_grad_custom_post_pass = _displaced_post_grad_pass
     # Stand down if someone has claimed cuda since, rather than overwrite them.
     installed = device_codegens.get("cuda")
     if installed is not None and installed.scheduling is AylaCombinedScheduling:
-        assert _displaced_backend is not None
         device_codegens["cuda"] = _displaced_backend
         _displaced_backend = None
 
