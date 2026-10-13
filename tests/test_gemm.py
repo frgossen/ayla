@@ -3,7 +3,7 @@
 import textwrap
 
 from ayla.base.ir import find_ops_of_type
-from ayla.gemm_collection.gemm import schedule_matmul, schedule_register_matmul
+from ayla.gemm_collection.gemm import schedule_matmul
 from ayla.gpu_dialect import AsyncOp, MoveOp, gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
 
@@ -42,12 +42,13 @@ def test_register_matmul_schedules_side_by_side_gemms():
           }
         }"""))  # noqa: E501
     for label in ("gate", "up"):
-        schedule_register_matmul(
+        schedule_matmul(
+            module,
             label=label,
             operand_stages=1,
             operand_k_tile=16,
             loop_label_prefix=label,
-        ).run(module)
+        )
 
     assert repr(module) == textwrap.dedent("""\
         module {
@@ -90,12 +91,13 @@ def test_register_matmul_keeps_multicast_and_local_loads_separate():
           }
         }"""))
 
-    schedule_register_matmul(
+    schedule_matmul(
+        module,
         label="mm",
         operand_stages=1,
         operand_k_tile=16,
         operand_move_attrs={"lhs": {"multicast": True}},
-    ).run(module)
+    )
 
     load_groups = [
         op for op in find_ops_of_type(module, AsyncOp)
