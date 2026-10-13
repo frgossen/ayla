@@ -9,7 +9,7 @@ from ..gpu_dialect import GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from ..jit_compiler import ShapeSpecializingJITCompiler
 from ..ptx_codegen import make_ptx_kernel
 from ..torch_custom_call import DEFAULT_NAMESPACE, OperandKind
-from .gemm import schedule_matmul
+from ..pipelines.tile_matmul_pipeline import TileMatmulPipeline
 
 
 def _cache_policy_heuristic(
@@ -103,10 +103,10 @@ def make_dynamic_m_matmul(
         assert isinstance(lhs_type, GmemTensorType)
         m = lhs_type.sizes[0]
         assert isinstance(m, int)
-        scheduled = schedule_matmul(
-            module,
+        scheduled = TileMatmulPipeline(
+            m=m, n=n, k=k,
             **_dynamic_m_schedule_heuristic(m, n, k),
-        )
+        ).run(module)
         kernel = make_ptx_kernel(scheduled)
         return ptx_runtime.make_ptx_launcher(kernel)
 

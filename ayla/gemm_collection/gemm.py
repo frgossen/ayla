@@ -1,95 +1,8 @@
 """Configurable GEMM module builders used by collection entries."""
 import textwrap
-from typing import cast
 
-from ..base.ir import find_ops_of_type
-from ..base.pipeline import op_label_matches
-from ..gpu_dialect import (
-    KernelOp,
-    MatmulOp,
-    MemTensorType,
-    ModuleOp,
-    WgrmemTensorType,
-    gpu_dialect,
-)
+from ..gpu_dialect import ModuleOp, gpu_dialect
 from ..pipelines.tile_matmul_pipeline import TileMatmulPipeline
-
-
-def schedule_matmul(
-    module: ModuleOp,
-    *,
-    output_m_tiles_per_cta: int = 1,
-    output_n_tiles_per_cta: int = 1,
-    output_m_tile: int = 128,
-    output_n_tile: int = 256,
-    warpgroup_n_tile: int | None = None,
-    operand_stages: int = 3,
-    operand_k_tile: int = 64,
-    output_slices: int = 1,
-    output_store_buffers: int = 1,
-    # Split each 256-column output row into two 128-element TMA dimensions.
-    # Shared-only padding controls the physical row stride seen by the TMA
-    # store; the best overall stride may trade some STMatrix bank expansion
-    # for faster TMA reads of the arena.
-    output_tma_inner_size: int | None = 128,
-    output_store: str = "stmatrix",
-    operand_move_attrs: dict[str, dict[str, object]] | None = None,
-    label: str | None = None,
-    epilogue_label_filter: str | None = None,
-    loop_label_prefix: str | None = None,
-    unsafe_reuse_smem: bool = False,
-) -> ModuleOp:
-    """Apply the configurable WGMMA schedule to one concrete matmul.
-
-    A label selects one matmul when the module contains several. Matmuls with
-    a WGRMEM destination already own their output tiling and promotion.
-    Keeping scheduling separate from module construction lets the JIT first
-    specialize a dynamic template, then reuse the static collection's passes.
-    """
-    [kernel] = module.body.ops
-    if not isinstance(kernel, KernelOp):
-        raise ValueError("schedule_matmul requires exactly one kernel")
-    matmuls = [
-        op for op in find_ops_of_type(module, MatmulOp)
-        if op_label_matches(op, label)
-    ]
-    if len(matmuls) != 1:
-        raise ValueError("schedule_matmul requires exactly one matmul")
-    matmul = matmuls[0]
-    assert isinstance(matmul, MatmulOp)
-    if label is None:
-        label = cast(str, matmul.attrs.get("label", "mm"))
-    register_accumulator = isinstance(matmul.dst.type, WgrmemTensorType)
-    assert isinstance(matmul.lhs.type, MemTensorType)
-    assert isinstance(matmul.rhs.type, MemTensorType)
-    m, k = matmul.lhs.type.sizes
-    n, rhs_k = matmul.rhs.type.sizes
-    if None in (m, n, k, rhs_k):
-        raise ValueError("schedule_matmul requires static dimensions")
-    if rhs_k != k:
-        raise ValueError("matmul reduction dimensions must match")
-    m, n, k = cast(tuple[int, int, int], (m, n, k))
-
-    return TileMatmulPipeline(
-        m=m, n=n, k=k,
-        register_accumulator=register_accumulator,
-        output_m_tiles_per_cta=output_m_tiles_per_cta,
-        output_n_tiles_per_cta=output_n_tiles_per_cta,
-        output_m_tile=output_m_tile,
-        output_n_tile=output_n_tile,
-        warpgroup_n_tile=warpgroup_n_tile,
-        operand_stages=operand_stages,
-        operand_k_tile=operand_k_tile,
-        output_slices=output_slices,
-        output_store_buffers=output_store_buffers,
-        output_tma_inner_size=output_tma_inner_size,
-        output_store=output_store,
-        operand_move_attrs=operand_move_attrs,
-        label=label,
-        epilogue_label_filter=epilogue_label_filter,
-        loop_label_prefix=loop_label_prefix,
-        unsafe_reuse_smem=unsafe_reuse_smem,
-    ).run(module)
 
 
 def auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -159,8 +72,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
           }}
         }}"""))
     assert isinstance(module, ModuleOp)
-    return schedule_matmul(
-        module,
+    return TileMatmulPipeline(
+        m=m, n=n, k=k,
         output_m_tiles_per_cta=output_m_tiles_per_cta,
         output_n_tiles_per_cta=output_n_tiles_per_cta,
         output_m_tile=output_m_tile,
@@ -173,4 +86,4 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tma_inner_size=output_tma_inner_size,
         output_store=output_store,
         operand_move_attrs=operand_move_attrs,
-    )
+    ).run(module)
