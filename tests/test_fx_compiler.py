@@ -1,15 +1,12 @@
 import pytest
 import torch
 from torch.fx import Graph, GraphModule, Node
-from torch._inductor.pattern_matcher import (
-    CallFunction,
-    KeywordArg,
-    PatternMatcherPass,
-)
+from torch._inductor.pattern_matcher import PatternMatcherPass
 
 from ayla.base.ir import find_ops_of_type
 from ayla.fx_compiler import (
     FxRegionMatch,
+    discover_supported_fx_region,
     fx_region_to_module,
     make_fx_to_ayla_rewrite,
 )
@@ -124,6 +121,24 @@ def test_swiglu_fx_region_imports_to_high_level_gpu_ir():
     ] == ["convert", "silu", "mul"]
 
 
+def test_discovers_complete_swiglu_region_and_ordered_inputs():
+    expected = _swiglu_region()
+    # FX/AOT is free to declare placeholders in an order unrelated to use.
+    inputs = list(expected.inputs)
+    inputs[0].prepend(inputs[1])
+
+    match = discover_supported_fx_region(expected.output)
+
+    assert match is not None
+    assert match.output is expected.output
+    assert match.inputs == expected.inputs
+    projection = [
+        node for node in expected.output.graph.nodes
+        if node.target is torch.ops.aten.mm.default
+    ][0]
+    assert discover_supported_fx_region(projection) is None
+
+
 def test_fx_region_import_rejects_intermediate_external_users():
     match = _swiglu_region()
     projection = [
@@ -131,6 +146,8 @@ def test_fx_region_import_rejects_intermediate_external_users():
         if node.target is torch.ops.aten.mm.default
     ][0]
     match.output.graph.call_function(torch.ops.aten.neg.default, (projection,))
+
+    assert discover_supported_fx_region(match.output) is None
 
     with pytest.raises(ValueError, match="region value has external users"):
         fx_region_to_module(match, name="swiglu")
@@ -166,16 +183,7 @@ def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
     bf16 = BF16Type()
     make_fx_to_ayla_rewrite(
         patterns,
-        pattern=CallFunction(
-            torch.ops.aten.mm.default,
-            KeywordArg("lhs"),
-            CallFunction(
-                torch.ops.aten.permute.default,
-                KeywordArg("weight"),
-                [1, 0],
-            ),
-        ),
-        input_names=("lhs", "weight"),
+        root=torch.ops.aten.mm.default,
         name="compiled_fx_gemm",
         signature=[
             GmemTensorType.build([128, 64], bf16),

@@ -24,20 +24,27 @@ def register_fx_rewrite(
     patterns: PatternMatcherPass,
     *,
     pattern: PatternExpr,
-    input_names: tuple[str, ...],
+    input_names: tuple[str, ...] | None = None,
+    resolve_inputs: Callable[[Match], tuple[Node, ...]] | None = None,
     replacement: Callable[..., Any],
     extra_check: Callable[[Match], bool] | None = None,
     prepare: Callable[[Match, tuple[Node, ...]], None] | None = None,
 ) -> None:
     """Replace one registered FX pattern with a callable operation."""
+    if (input_names is None) == (resolve_inputs is None):
+        raise ValueError("provide exactly one FX input source")
 
     @register_graph_pattern(
         pattern,
         extra_check=extra_check or (lambda _match: True),
         pass_dict=cast(Any, patterns),
     )
-    def rewrite(torch_match: Match, **captures) -> None:
-        inputs = tuple(captures[name] for name in input_names)
+    def rewrite(torch_match: Match, *_args, **captures) -> None:
+        inputs = (
+            resolve_inputs(torch_match)
+            if resolve_inputs is not None
+            else tuple(captures[name] for name in input_names or ())
+        )
         if not all(isinstance(value, Node) for value in inputs):
             raise ValueError("FX rewrite inputs must be graph nodes")
         if prepare is not None:
@@ -55,7 +62,8 @@ def register_fx_kernel_rewrite(
     patterns: PatternMatcherPass,
     *,
     pattern: PatternExpr,
-    input_names: tuple[str, ...],
+    input_names: tuple[str, ...] | None = None,
+    resolve_inputs: Callable[[Match], tuple[Node, ...]] | None = None,
     compiler: JITCompiler,
     signature_mapping: list[OperandKind],
     extra_check: Callable[[Match], bool] | None = None,
@@ -74,6 +82,7 @@ def register_fx_kernel_rewrite(
         patterns,
         pattern=pattern,
         input_names=input_names,
+        resolve_inputs=resolve_inputs,
         replacement=replacement,
         extra_check=extra_check,
         prepare=prepare,
