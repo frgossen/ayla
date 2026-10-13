@@ -14,16 +14,12 @@ module source -- so there is no op for a shape nobody has added.
 from .registry import register, register_gemm  # noqa: F401
 
 from . import (  # noqa: F401,E402  (each import registers its op)
-    auto_matmul_4096,
     auto_matmul_4096_wgmma256_wg,
     auto_matmul_4096_wgmma256_wg_sigmoid,
     auto_matmul_4096_wgmma256_wg_tma_store,
-    fastcu_5_1,
     loop_4x4_matmul_4096,
     loop_8x8_matmul_4096,
     naive_matmul_4096_loop,
-    pranjalssh_4096,
-    pranjalssh_4096_pipelined,
     tma_matmul_4096,
 )
 from .dynamic_m import (  # noqa: E402,F401

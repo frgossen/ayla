@@ -1,13 +1,13 @@
 """Build the collection's kernels and define them as torch ops.
 
 Every kernel here is built for one specific shape and dtype -- the shape is a
-literal in its module source, so ``auto_matmul_4096`` multiplies 4096x4096 and
+literal in its module source, so ``auto_matmul_4096_wgmma256_wg`` multiplies 4096x4096 and
 nothing else. Adding one means a module here with a decorated builder, plus
 that module in ``__init__``; decorating builds the kernel at import time and
 defines its op::
 
     @register_gemm
-    def auto_matmul_4096_module():
+    def auto_matmul_4096_wgmma256_wg_module():
         ...
 
 The name stays bound to the builder, so registrations stack; the op itself is
@@ -15,7 +15,7 @@ reached the ordinary way, once anything has imported the package::
 
     import ayla.gemm_collection  # noqa: F401 -- defines every op
 
-    c = torch.ops.ayla.auto_matmul_4096(a, bt)
+    c = torch.ops.ayla.auto_matmul_4096_wgmma256_wg(a, bt)
 
 Mind the operand layout: these kernels compute ``a @ bt.T``, not ``a @ b``. The
 dialect's matmul takes its right operand pre-transposed as ``[N, K]`` (hence the
@@ -56,10 +56,10 @@ def register(
 
         @register(
             OperandKind.R, OperandKind.R, OperandKind.RW,
-            op_name="auto_matmul_4096_out",
+            op_name="auto_matmul_4096_wgmma256_wg_out",
         )
         @register_gemm
-        def auto_matmul_4096_module():
+        def auto_matmul_4096_wgmma256_wg_module():
             ...
 
     The builder is handed back so they stack, and takes no arguments: one

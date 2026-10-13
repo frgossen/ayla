@@ -35,30 +35,6 @@ def main() -> None:
             dtype=torch.bfloat16,
         ),
         gemm_bench_config(
-            name="ayla.pranjalssh",
-            m=4096,
-            n=4096,
-            k=4096,
-            compute=torch.ops.ayla.pranjalssh_4096,
-            dtype=torch.bfloat16,
-        ),
-        gemm_bench_config(
-            name="ayla.pranjalssh_pipelined (prev best)",
-            m=4096,
-            n=4096,
-            k=4096,
-            compute=torch.ops.ayla.pranjalssh_4096_pipelined,
-            dtype=torch.bfloat16,
-        ),
-        gemm_bench_config(
-            name="ayla.auto_matmul (wgmma128)",
-            m=4096,
-            n=4096,
-            k=4096,
-            compute=torch.ops.ayla.auto_matmul_4096,
-            dtype=torch.bfloat16,
-        ),
-        gemm_bench_config(
             name="ayla.auto_matmul (wgmma256 wg)",
             m=4096,
             n=4096,
@@ -110,14 +86,6 @@ def main() -> None:
                 torch.ops.ayla
                 .auto_matmul_4096_wgmma256_wg_tma_store_k3_4tiles_split2_dbuf2
             ),
-            dtype=torch.bfloat16,
-        ),
-        gemm_bench_config(
-            name="ayla.fastcu_5_1 (fast.cu static smem)",
-            m=4096,
-            n=4096,
-            k=4096,
-            compute=torch.ops.ayla.fastcu_5_1,
             dtype=torch.bfloat16,
         ),
     ]
