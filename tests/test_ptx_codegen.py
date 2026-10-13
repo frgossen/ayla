@@ -213,7 +213,7 @@ def test_codegen_naive_matmul_4096():
         {
           .reg .b32  %r<19>;
           .reg .b64  %rd<22>;
-          .reg .f32  %f<8>;
+          .reg .f32  %f<9>;
           .reg .pred %p<1>;
 
           ld.param.b64 %rd0, [a_ptr];
@@ -260,10 +260,15 @@ def test_codegen_naive_matmul_4096():
           add.u64 %rd16, %rd10, %rd17;  // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + %r2 * 32768 + %r3 * 8
 
           // PTX template `%c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}`
-          mov.f32 %f0, 0f00000000;
-          mov.f32 %f1, 0f00000000;
-          mov.f32 %f2, 0f00000000;
-          mov.f32 %f3, 0f00000000;
+
+          // PTX template `%0: rmem<f32> = constant() attrs={value: 0.0}`
+          mov.f32 %f4, 0f00000000;
+
+          // PTX template `%c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}`
+          mov.f32 %f0, %f4;
+          mov.f32 %f1, %f4;
+          mov.f32 %f2, %f4;
+          mov.f32 %f3, %f4;
 
           // BEGIN: `for (%k: index = 0 to 4096) {...`
           mov.b32 %r16, 0;
@@ -279,20 +284,20 @@ def test_codegen_naive_matmul_4096():
           // PTX template `%a_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 1}`
 
           // PTX template `move(%a_k_rmem: rmem<2x1xf32>, %a_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc:...`
-          ld.global.nc.f32 %f4, [%rd18+0];
-          ld.global.nc.f32 %f5, [%rd18+16384];
+          ld.global.nc.f32 %f5, [%rd18+0];
+          ld.global.nc.f32 %f6, [%rd18+16384];
 
           // PTX template `%b_k_rmem: rmem<2x1xf32> = alloc() attrs={id: 2}`
 
           // PTX template `move(%b_k_rmem: rmem<2x1xf32>, %b_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc:...`
-          ld.global.nc.f32 %f6, [%rd20+0];
-          ld.global.nc.f32 %f7, [%rd20+16384];
+          ld.global.nc.f32 %f7, [%rd20+0];
+          ld.global.nc.f32 %f8, [%rd20+16384];
 
           // PTX template `matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<...`
-          fma.rn.f32 %f0, %f4, %f6, %f0;
-          fma.rn.f32 %f1, %f4, %f7, %f1;
-          fma.rn.f32 %f2, %f5, %f6, %f2;
-          fma.rn.f32 %f3, %f5, %f7, %f3;
+          fma.rn.f32 %f0, %f5, %f7, %f0;
+          fma.rn.f32 %f1, %f5, %f8, %f1;
+          fma.rn.f32 %f2, %f6, %f7, %f2;
+          fma.rn.f32 %f3, %f6, %f8, %f3;
 
           // END: `for (%k: index = 0 to 4096) {...`
           add.s32 %r16, %r16, 1;

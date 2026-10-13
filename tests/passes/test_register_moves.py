@@ -7,12 +7,13 @@ import torch
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import PTXTemplateOp, gpu_dialect
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
+from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
 
 
-@pytest.mark.parametrize("src_type", ["rmem<f32>", "rmem<1xf32>", "rmem<3xf32>"])
+@pytest.mark.parametrize("src_type", ["rmem<f32>", "rmem<3xf32>"])
 def test_register_move_copies_or_broadcasts_nonconstant_values(src_type):
     module = gpu_dialect.parse_module(textwrap.dedent(f"""\
         module {{
@@ -31,7 +32,7 @@ def test_register_move_copies_or_broadcasts_nonconstant_values(src_type):
 
 @pytest.mark.parametrize("src_type, message", [
     ("rmem<f64>", "matching dtypes"),
-    ("rmem<2xf32>", "matching types or a scalar"),
+    ("rmem<1xf32>", "match the destination or be a scalar"),
 ])
 def test_register_move_rejects_incompatible_tensors(src_type, message):
     module = gpu_dialect.parse_module(textwrap.dedent(f"""\
@@ -40,8 +41,8 @@ def test_register_move_rejects_incompatible_tensors(src_type, message):
             move(%dst: rmem<3xf32>, %src: {src_type})
           }}
         }}"""))
-    with pytest.raises(NotImplementedError, match=message):
-        lower_to_ptx_template(module)
+    with pytest.raises(ValueError, match=message):
+        verify_gpu_dialect(module)
 
 
 @requires_cuda
@@ -72,3 +73,23 @@ def test_register_copy_and_broadcast_respect_views_on_gpu(dtype, torch_dtype):
     expected = torch.full_like(out, -1.0)
     expected[:, 64:] = 2.5
     torch.testing.assert_close(out, expected)
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype, torch_dtype", [
+    ("f32", torch.float32), ("bf16", torch.bfloat16), ("f16", torch.float16),
+])
+def test_initialized_register_allocation_fills_every_element_on_gpu(
+    dtype, torch_dtype,
+):
+    fragment = f'wgrmem<64x64x{dtype} warps=4 layout="wgmma_layout_0">'
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
+        module {{
+          kernel @fill(%out: gmem<64x64x{dtype}>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %acc: {fragment} = alloc() attrs={{id: 0, init: 2.5}}
+            move(%out: gmem<64x64x{dtype}>, %acc: {fragment})
+          }}
+        }}"""))
+    out = torch.empty((64, 64), dtype=torch_dtype, device="cuda")
+    make_ptx_launcher(make_ptx_kernel(module))(out)
+    torch.testing.assert_close(out, torch.full_like(out, 2.5), rtol=0, atol=0)

@@ -104,30 +104,41 @@ def _lower_elementwise_sigmoid_bf16_ptx(
 
 
 def _register_operand_regs(value: Value, operand_name: str) -> tuple[str, list[str]]:
-    """Return the PTX storage suffix and registers selected by a value or view."""
-    dtype = cast(MemTensorType, value.type).dtype
-    if isinstance(value.type, RmemTensorType):
-        suffix = _ptx_suffix(dtype)
-        count = value.type.num_elements
-        assert count is not None
-        return suffix, [
-            f"${{{suffix}:operand.{operand_name}.r{reg}}}"
-            for reg in range(count)
-        ]
-    if not isinstance(value.type, WgrmemTensorType):
-        raise NotImplementedError(f"unsupported register type {value.type}")
-    if isinstance(dtype, F32Type):
-        return "f32", [
-            f"${{f32:operand.{operand_name}.r{reg}}}"
-            for reg in _view_f32_register_indices(value)
-        ]
-    if isinstance(dtype, (BF16Type, F16Type)):
-        return "b32", [
-            f"${{b32:operand.{operand_name}.r{reg}}}"
-            for reg in _view_pair_indices(value)
-        ]
-    raise NotImplementedError(
-        f"unsupported register dtype {dtype}"
+    """Return the PTX storage type and registers selected by a value or view.
+
+    WGRMEM holds each element pair in one packed 16-bit register or in two F32
+    registers; a view selects the pairs it covers in its root fragment.
+    """
+    value_type = cast(RegMemTensorType, value.type)
+    suffix = _ptx_suffix(value_type.dtype)
+    if isinstance(value_type, RmemTensorType):
+        indices = range(cast(int, value_type.num_elements))
+    elif suffix == "b16":
+        suffix, indices = "b32", _view_pair_indices(value)
+    else:
+        indices = _view_f32_register_indices(value)
+    return suffix, [
+        f"${{{suffix}:operand.{operand_name}.r{reg}}}" for reg in indices
+    ]
+
+
+def _register_move_ptx(dst: Value, src: Value) -> str:
+    """Copy a register tensor, or broadcast a scalar into every element.
+
+    Registers are selected from the original values so a view only writes the
+    root registers it covers, even after tile lowering maps it to the root.
+    """
+    suffix, dst_regs = _register_operand_regs(dst, "dst")
+    src_suffix, src_regs = _register_operand_regs(src, "src")
+    if cast(RmemTensorType, src.type).rank == 0:
+        [scalar] = src_regs
+        # Storage types differ only when a destination register packs a pair.
+        if suffix != src_suffix:
+            scalar = f"{{{scalar}, {scalar}}}"
+        src_regs = [scalar] * len(dst_regs)
+    return "".join(
+        f"mov.{suffix} {dst_reg}, {src_reg};\n"
+        for dst_reg, src_reg in zip(dst_regs, src_regs, strict=True)
     )
 
 
@@ -546,10 +557,8 @@ class LowerToPtxTemplate(LoweringPass):
         result_type = op.result().type
         if isinstance(result_type, SmemTensorType):
             return self._lower_alloc_smem(op)
-        if isinstance(result_type, RmemTensorType):
-            return self._lower_alloc_rmem(op)
-        if isinstance(result_type, WgrmemTensorType):
-            return self._lower_alloc_wgrmem(op)
+        if isinstance(result_type, (RmemTensorType, WgrmemTensorType)):
+            return self._lower_alloc_registers(op)
         if isinstance(result_type, LockType):
             return self._lower_alloc_lock(op)
         raise NotImplementedError(
@@ -664,55 +673,28 @@ class LowerToPtxTemplate(LoweringPass):
         )
         return [new_op], [new_op.result()]
 
-    def _lower_alloc_rmem(
+    def _lower_alloc_registers(
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
+        """Allocate registers; an initializer broadcasts a scalar constant."""
         result_type = op.result().type
-        assert isinstance(result_type, RmemTensorType)
-        template = "" if op.init is None else _mov_literals_ptx(
-            "dst",
-            result_type.dtype,
-            itertools.repeat(op.init, cast(int, result_type.num_elements)),
+        assert isinstance(result_type, RegMemTensorType)
+        storage = PTXTemplateOp.build(
+            operands=[], result_types=[result_type], template="",
+            operand_names=[], result_names=["dst"], description=str(op),
         )
-
-        new_op = PTXTemplateOp.build(
-            operands=[],
-            result_types=[result_type],
-            template=template,
-            operand_names=[],
-            result_names=["dst"],
-            description=str(op),
+        if op.init is None:
+            return [storage], [storage.result()]
+        constant = ConstantOp.build(
+            op.init, RmemTensorType.build([], result_type.dtype),
         )
-        return [new_op], [new_op.result()]
-
-    def _lower_alloc_wgrmem(
-        self, op: AllocOp,
-    ) -> tuple[list[Op], list[object]]:
-        result_type = op.result().type
-        assert isinstance(result_type, WgrmemTensorType)
-        n = result_type.num_elements_per_thread
-        suffix = result_type.dtype.name
-        if cast(
-            BF16Type | F16Type | F32Type | F64Type, result_type.dtype,
-        ).byte_size == 2:  # bf16/f16 packed in pairs into b32
-            n //= 2
-            suffix = "b32"
-
-        template = ""
-        if op.init is not None:
-            literal = _ptx_literal(result_type.dtype, op.init)
-            for i in range(n):
-                template += f"mov.{suffix} ${{{suffix}:result.dst.r{i}}}, {literal};\n"
-
-        new_op = PTXTemplateOp.build(
-            operands=[],
-            result_types=[result_type],
-            template=template,
-            operand_names=[],
-            result_names=["dst"],
-            description=str(op),
+        [scalar_op], [scalar] = self.lower_constant(constant)
+        fill = PTXTemplateOp.build(
+            operands=[storage.result(), cast(Value, scalar)], result_types=[],
+            template=_register_move_ptx(op.result(), constant.result()),
+            operand_names=["dst", "src"], result_names=[], description=str(op),
         )
-        return [new_op], [new_op.result()]
+        return [storage, scalar_op, fill], [storage.result()]
 
     def _lower_alloc_smem(
         self, op: AllocOp,
@@ -1253,36 +1235,12 @@ class LowerToPtxTemplate(LoweringPass):
     def _lower_move_regmem(
         self, op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
-        """Copy matching register tensors or broadcast a per-thread scalar.
-
-        Select registers from the original values so tiled destinations only
-        write their view, even after tile lowering maps them to root storage.
-        """
-        dst = cast(Value, self.value_map[op.dst])
-        src = cast(Value, self.value_map[op.src])
-        dst_type, src_type = op.dst.type, op.src.type
-        assert isinstance(dst_type, RegMemTensorType)
-        assert isinstance(src_type, RegMemTensorType)
-        if dst_type.dtype != src_type.dtype:
-            raise NotImplementedError("register move requires matching dtypes")
-        broadcast = isinstance(src_type, RmemTensorType) and src_type.num_elements == 1
-        if not broadcast and dst_type != src_type:
-            raise NotImplementedError("register move requires matching types or a scalar source")
-        suffix, dst_regs = _register_operand_regs(op.dst, "dst")
-        src_suffix, src_regs = _register_operand_regs(op.src, "src")
-        if broadcast:
-            [source] = src_regs
-            if suffix != src_suffix:
-                # A packed destination holds two scalar elements per register.
-                assert (suffix, src_suffix) == ("b32", "b16")
-                source = "{" + source + ", " + source + "}"
-            src_regs = [source] * len(dst_regs)
-        template = "".join(
-            f"mov.{suffix} {dst_reg}, {src_reg};\n"
-            for dst_reg, src_reg in zip(dst_regs, src_regs, strict=True)
-        )
         lowered = PTXTemplateOp.build(
-            operands=[dst, src], result_types=[], template=template,
+            operands=[
+                cast(Value, self.value_map[op.dst]),
+                cast(Value, self.value_map[op.src]),
+            ],
+            result_types=[], template=_register_move_ptx(op.dst, op.src),
             operand_names=["dst", "src"], result_names=[], description=str(op),
         )
         return [lowered], []

@@ -27,6 +27,7 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     ReduceOp,
+    RegMemTensorType,
     ReshapeOp,
     ConstantOp,
     SmemTensorType,
@@ -310,6 +311,15 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
+        dst, src = op.dst.type, op.src.type
+        if isinstance(dst, RegMemTensorType) and isinstance(src, RegMemTensorType):
+            if dst.dtype != src.dtype:
+                raise ValueError("register move requires matching dtypes")
+            if src.rank != 0 and src != dst:
+                raise ValueError(
+                    "register move source must match the destination or be "
+                    "a scalar"
+                )
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
