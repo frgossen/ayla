@@ -1,10 +1,10 @@
-"""Build the collection's kernels and define them as torch ops.
+"""Register the collection's kernel modules as Torch ops with JIT dispatch.
 
 Every kernel here is built for one specific shape and dtype -- the shape is a
 literal in its module source, so ``auto_matmul_4096`` multiplies 4096x4096 and
 nothing else. Adding one means a module here with a decorated builder, plus
-that module in ``__init__``; decorating builds the kernel at import time and
-defines its op::
+that module in ``__init__``; decorating builds the module and defines its op
+at import time. Compilation happens on its first CUDA invocation::
 
     @register_gemm
     def auto_matmul_4096_module():
@@ -30,8 +30,7 @@ import inspect
 from typing import Callable
 
 from ..gpu_dialect import ModuleOp
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
+from ..jit_compiler import JITCompiler
 from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 Builder = Callable[[], ModuleOp]
@@ -40,7 +39,7 @@ Builder = Callable[[], ModuleOp]
 def register(
     *torch_signature: OperandKind, op_name: str | None = None
 ) -> Callable[[Builder], Builder]:
-    """Build the kernel a builder produces and define its op, at import time.
+    """Build a module and define its op at import time, compiling lazily.
 
     The arguments say what the kernel does with each of its own -- read,
     read-written, or produced -- which is what `PtxKernel.signature` does not
@@ -76,8 +75,8 @@ def register(
                 f"{builder.__name__}: builders take no arguments; give each "
                 f"variant its own builder over a shared private helper"
             )
-        launcher = make_ptx_launcher(make_ptx_kernel(builder()))
-        make_torch_custom_call(launcher, list(torch_signature), name=op_name)
+        compiler = JITCompiler(builder())
+        make_torch_custom_call(compiler, list(torch_signature), name=op_name)
         return builder
 
     return decorate
