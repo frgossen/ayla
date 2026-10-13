@@ -19,12 +19,14 @@ python -m benchmarks.bench_gemm_collection  # benchmark
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, % of peak, and
 throughput as a percentage of `torch.mm`) for a bf16 4096×4096 GEMM.
 
-The OSS GEMM seed tool maps an FP16 shape to 2–3 measured neighboring schedules and
-benchmarks them against `torch.mm`:
+The OSS GEMM seed tool maps FP16 and BF16 shapes to their exact measured winner
+or 2–3 neighboring schedules and benchmarks them against `torch.mm`. Dtype is
+part of the dispatch key, so overlapping shapes retain independent winners:
 
 ```bash
 pixi run bench-oss-seed -- 8192 768 768
 pixi run bench-oss-seed -- 8192 768 768 --show-only
+pixi run bench-oss-seed -- 128 4096 4096 --dtype bfloat16 --show-only
 pixi run bench-oss-seed -- 8192 768 768 --csv results.csv  # optional output
 python -m benchmarks.convert_oss_gemm_heuristic expand ayla/oss_gemm_heuristic.json /tmp/heuristic.json
 python -m benchmarks.convert_oss_gemm_heuristic collapse /tmp/heuristic.json ayla/oss_gemm_heuristic.json
@@ -33,6 +35,9 @@ python -m benchmarks.convert_oss_gemm_heuristic merge-mapper ayla/oss_gemm_heuri
 ```
 
 The converter provides lossless editing and merges any number of result files.
+The packaged JSON covers 749 FP16 and 431 BF16 canonical signatures across MM,
+addmm and BMM. See [the BF16 import record](benchmarks/BETTER_BENCHMARK_HEURISTIC_IMPORT.md)
+for measured coverage and compiler-stack requirements.
 The benchmark generates contiguous `A`/`BT` inputs; it does not replay captured
 tensor values or source strides.
 
@@ -41,6 +46,8 @@ Library callers can select the independent fused-addmm schedule groups with
 preserves the existing `mm` routing.
 Canonical batched workloads use
 `select_gemm_schedules(m, n, k, operation="bmm", batch=batch)`.
+Pass `dtype="bfloat16"` to select the corresponding BF16 schedule;
+`dtype="float16"` remains the default.
 
 ### Using pixi
 

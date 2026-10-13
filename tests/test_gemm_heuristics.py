@@ -1,4 +1,5 @@
 import dataclasses
+from collections import Counter
 
 import pytest
 
@@ -11,6 +12,69 @@ from ayla.gemm_heuristics import (
     select_gemm_schedules,
 )
 from ayla.gpu_dialect import CollectiveAxis
+
+
+def test_packaged_heuristic_covers_both_corpora_with_exact_dtype_dispatch():
+    from ayla.gemm_heuristics import _mapper
+
+    mapper = _mapper()
+    expected = {
+        ("mm", "float16"): 405,
+        ("addmm", "float16"): 205,
+        ("bmm", "float16"): 139,
+        ("mm", "bfloat16"): 262,
+        ("addmm", "bfloat16"): 123,
+        ("bmm", "bfloat16"): 46,
+    }
+    assert Counter(
+        (entry["operation"], entry["dtype"]) for entry in mapper["exact"]
+    ) == expected
+    keys = set()
+    for entry in mapper["exact"]:
+        key = tuple(entry[field] for field in (
+            "operation", "dtype", "batch", "m", "n", "k",
+        ))
+        assert key not in keys
+        keys.add(key)
+        selection = select_gemm_schedules(
+            entry["m"], entry["n"], entry["k"],
+            operation=entry["operation"], dtype=entry["dtype"],
+            batch=entry["batch"],
+        )
+        assert selection.leaf.startswith("exact:")
+        assert len(selection.seeds) == 1
+        seed = selection.seeds[0]
+        assert seed.captured_config == entry["seed"]["configuration"]
+        assert seed.builder_config is not None
+        assert seed.source_percentage_of_torch == (
+            entry["seed"]["source_percentage_of_torch"]
+        )
+    assert mapper["source_shape_count"] == len(keys) == 1180
+
+
+def test_overlapping_fp16_and_bf16_shapes_keep_independent_winners():
+    fp16 = select_gemm_schedules(128, 4096, 4096, dtype="float16")
+    bf16 = select_gemm_schedules(128, 4096, 4096, dtype="bfloat16")
+
+    assert fp16.seeds[0].source_shape == bf16.seeds[0].source_shape
+    assert fp16.seeds[0].captured_config != bf16.seeds[0].captured_config
+    assert fp16.seeds[0].captured_config["name"] == "heuristic_exact_winner"
+    assert bf16.seeds[0].captured_config["name"] == "heuristic_bf16_exact_winner"
+
+
+def test_bf16_active_wgmma_controls_are_preserved_in_builder_mapping():
+    seed = select_gemm_schedules(
+        30522, 128, 32768, dtype="bfloat16",
+    ).seeds[0]
+
+    assert seed.builder_config is not None
+    assert seed.builder_config["wgmma_group_size"] == 4
+    assert seed.builder_config["wgmma_pending_groups"] == 1
+    seed = select_gemm_schedules(
+        32768, 512, 512, dtype="bfloat16",
+    ).seeds[0]
+    assert seed.builder_config is not None
+    assert seed.builder_config["wgmma_epilogue_pipeline"] is True
 
 
 def test_fixed_grid_seed_exposes_required_unroll():

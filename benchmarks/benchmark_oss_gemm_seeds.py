@@ -1,4 +1,4 @@
-"""Benchmark the compact seed set selected for one FP16 GEMM shape."""
+"""Benchmark the compact seed set selected for one FP16 or BF16 GEMM shape."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("m", type=int)
     parser.add_argument("n", type=int)
     parser.add_argument("k", type=int)
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--frequency", type=int, default=1)
     parser.add_argument("--show-only", action="store_true")
     parser.add_argument("--csv", type=Path)
@@ -38,7 +39,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
+def _ayla_compute(
+    m: int, n: int, k: int, seed: GemmScheduleSeed, dtype: str = "float16",
+):
     from ayla.gemm_collection.gemm import (
         auto_matmul_4096_wgmma256_wg_tma_store_module,
         schedule_matmul,
@@ -49,24 +52,25 @@ def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
 
     if seed.builder_config is None:
         raise ValueError("cannot build an unsupported GEMM schedule seed")
+    ir_dtype = {"float16": "f16", "bfloat16": "bf16"}[dtype]
     if seed.transpose_output or "output_grid_size" in seed.builder_config:
         config = dict(seed.builder_config)
         ptx_level = config.pop("ptx_optimization_level", None)
         if seed.transpose_output:
-            c_type = f"gmem<{n}x{m}xf16 strides=[1, {n}]>"
+            c_type = f"gmem<{n}x{m}x{ir_dtype} strides=[1, {n}]>"
             operands = (
-                f"%b: gmem<{n}x{k}xf16>, "
-                f"%a: gmem<{m}x{k}xf16>, %c: {c_type}"
+                f"%b: gmem<{n}x{k}x{ir_dtype}>, "
+                f"%a: gmem<{m}x{k}x{ir_dtype}>, %c: {c_type}"
             )
         else:
-            c_type = f"gmem<{m}x{n}xf16>"
+            c_type = f"gmem<{m}x{n}x{ir_dtype}>"
             operands = (
-                f"%a: gmem<{m}x{k}xf16>, "
-                f"%b: gmem<{n}x{k}xf16>, %c: {c_type}"
+                f"%a: gmem<{m}x{k}x{ir_dtype}>, "
+                f"%b: gmem<{n}x{k}x{ir_dtype}>, %c: {c_type}"
             )
         module = gpu_dialect.parse(textwrap.dedent(f"""\
             module {{
-              kernel @mm(%a: gmem<{m}x{k}xf16>, %b: gmem<{n}x{k}xf16>, %c: {c_type}) attrs={{ptx_optimization_level: {ptx_level}}} {{
+              kernel @mm(%a: gmem<{m}x{k}x{ir_dtype}>, %b: gmem<{n}x{k}x{ir_dtype}>, %c: {c_type}) attrs={{ptx_optimization_level: {ptx_level}}} {{
                 matmul({operands}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
               }}
             }}"""))
@@ -77,7 +81,7 @@ def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
             m=m,
             n=n,
             k=k,
-            dtype="f16",
+            dtype=ir_dtype,
             **seed.builder_config,
         )
     module = apply_gemm_schedule_seed_post_build(module, seed)
@@ -91,7 +95,9 @@ def _write_json(rows: list[dict[str, object]], path: Path) -> None:
 
 def main() -> int:
     args = _parser().parse_args()
-    selection = select_gemm_schedules(args.m, args.n, args.k)
+    selection = select_gemm_schedules(args.m, args.n, args.k, dtype=args.dtype)
+    torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
+    print(f"dtype: {args.dtype}")
     print(f"leaf: {selection.leaf}")
     print("path: " + " -> ".join(selection.decision_path))
     for index, seed in enumerate(selection.seeds, 1):
@@ -122,7 +128,7 @@ def main() -> int:
         n=args.n,
         k=args.k,
         compute=torch_mm_nt,
-        dtype=torch.float16,
+        dtype=torch_dtype,
     )]
     measured_seeds: list[GemmScheduleSeed | None] = [None]
     for index, seed in enumerate(selection.seeds, 1):
@@ -136,13 +142,13 @@ def main() -> int:
                 n=args.n,
                 k=args.k,
                 compute=_ayla_compute(
-                    args.m, args.n, args.k, seed,
+                    args.m, args.n, args.k, seed, args.dtype,
                 ),
-                dtype=torch.float16,
+                dtype=torch_dtype,
             )
             assert_against_torch(
                 bench,
-                max_abs_error=4,
+                max_abs_error=32 if args.dtype == "bfloat16" else 4,
                 max_relative_rms_error=2e-3,
             )
         except Exception as error:
@@ -163,12 +169,13 @@ def main() -> int:
             "m": args.m,
             "n": args.n,
             "k": args.k,
-            "dtype": "float16",
+            "dtype": args.dtype,
             "frequency": args.frequency,
             "heuristic_group": (
-                f"float16/{'k128' if args.k % 128 == 0 else 'k64'}"
+                f"mm/{args.dtype}/{'k128' if args.k % 128 == 0 else 'k64'}"
             ),
             "heuristic_features": {
+                "batch": 1,
                 "m": args.m,
                 "n": args.n,
                 "k": args.k,

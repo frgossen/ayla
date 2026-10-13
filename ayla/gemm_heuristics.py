@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from functools import cache
 from importlib.resources import files
-from typing import Any
+from typing import Any, cast
 
 from .gpu_dialect import CollectiveAxis
 
@@ -91,6 +91,7 @@ def apply_gemm_schedule_seed_post_build(
         and seed.fixed_output_unroll_factor > 1
     )
     if output_was_unrolled:
+        assert seed.fixed_output_unroll_factor is not None
         from .base.ir import find_ancestor_of_type, find_ops_of_type
         from .gpu_dialect import ForOp
         from .passes.canonicalize import Canonicalize
@@ -441,6 +442,13 @@ def _adapt_config(
         value = captured.get(key)
         if value not in (None, 1, "n"):
             builder[key] = value
+    # Preserve active controls in the measured BF16 schedules. Their compiler
+    # implementations belong to the scheduling stack, not to this mapper.
+    for key in (
+        "wgmma_group_size", "wgmma_pending_groups", "wgmma_epilogue_pipeline",
+    ):
+        if value := captured.get(key):
+            builder[key] = value
     return builder, tuple(adaptations)
 
 
@@ -455,7 +463,7 @@ def _with_output_row_order(
     if reverse is None:
         return builder, adaptations
     rows = "N" if transpose_output else "M"
-    current = tuple(builder.get("output_reversed_dims", ()))
+    current = tuple(cast(tuple[str, ...], builder.get("output_reversed_dims", ())))
     dims = tuple(dim for dim in current if dim != rows)
     if reverse:
         dims += (rows,)

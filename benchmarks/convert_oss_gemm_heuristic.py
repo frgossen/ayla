@@ -146,7 +146,7 @@ def _from_mapper(mapper: dict) -> dict:
 
 
 def _merge_mapper(expanded: dict, mapper: dict) -> dict:
-    """Add disjoint measured operation groups without rebuilding old trees."""
+    """Add disjoint operation/dtype groups and their measured exact winners."""
     addition = _from_mapper(mapper)
     for field in ("version", "workload", "layout", "source_fields"):
         if addition[field] != expanded[field]:
@@ -154,13 +154,24 @@ def _merge_mapper(expanded: dict, mapper: dict) -> dict:
                 f"incompatible heuristic {field}: "
                 f"{addition[field]!r} != {expanded[field]!r}"
             )
+    for name in addition["groups"]:
+        if name in expanded["groups"]:
+            raise ValueError(f"heuristic group already exists: {name}")
+    exact = [*expanded.get("exact", []), *addition.get("exact", [])]
+    keys = set()
+    for entry in exact:
+        key = tuple(entry[field] for field in (
+            "operation", "dtype", "batch", "m", "n", "k",
+        ))
+        if key in keys:
+            raise ValueError(f"exact GEMM winner already exists: {key}")
+        keys.add(key)
     for field in addition["features"]:
         if field not in expanded["features"]:
             expanded["features"].append(field)
     for name, tree in addition["groups"].items():
-        if name in expanded["groups"]:
-            raise ValueError(f"heuristic group already exists: {name}")
         expanded["groups"][name] = tree
+    expanded["exact"] = exact
     expanded["source_shape_count"] += addition["source_shape_count"]
     return expanded
 
