@@ -109,7 +109,7 @@ def test_constant_represents_address_backed_memory_spaces(
             "num_warp_groups": 1,
             "ptx_optimization_level": 1,
         }),
-        (MatmulOp, {"collective": {}, "init": 0.0}),
+        (MatmulOp, {"collective": {}}),
         (ReduceOp, {"fn": "sum", "collective": {}, "init": 0.0}),
         (TileOp, {"static_indices": [], "maybe_partial": True}),
         (ElementwiseOp, {"fn": "relu"}),
@@ -339,9 +339,8 @@ def test_matmul_tensor_initializer_roundtrips():
 
     assert repr(gpu_dialect.parse(repr(module))) == repr(module)
     [matmul] = find_ops_of_type(module, MatmulOp)
-    assert matmul.init is None
-    assert matmul.init_value is not None
-    assert list(matmul.init_value.type.strides) == [0, 1]
+    assert matmul.init is not None
+    assert list(matmul.init.type.strides) == [0, 1]
     assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
     assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
@@ -353,6 +352,15 @@ def test_matmul_tensor_initializer_roundtrips():
         matmul.narrow_collective_level(
             CollectiveAxis.X, CollectiveLevel.BLOCK,
         )
+
+
+def test_constant_splat_value():
+    scalar = RmemTensorType.build([], F32Type())
+    splat = ConstantOp.build(2.5, scalar)
+    data = ConstantOp.build([1.0, 2.0], RmemTensorType.build([2], F32Type()))
+    assert ConstantOp.splat_value(splat.result()) == 2.5
+    assert ConstantOp.splat_value(data.result()) is None
+    assert ConstantOp.splat_value(Value(name="arg", type=scalar)) is None
 
 
 def test_elementwise_syntax():

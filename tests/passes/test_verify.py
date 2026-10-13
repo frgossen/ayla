@@ -200,8 +200,24 @@ def test_default_verification_rejects_mismatched_matmul_tensor_init():
           }
         }"""))
 
-    with pytest.raises(ValueError, match="must match the destination shape"):
+    with pytest.raises(ValueError, match="scalar or match the destination shape"):
         verify_gpu_dialect(module)
+
+
+def test_ptx_lowering_rejects_an_unpromoted_matmul_initializer():
+    acc = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %acc: {acc} = alloc() attrs={{id: 0}}
+            %seven: rmem<f32> = constant() attrs={{value: 7.0}}
+            matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %acc: {acc}, %seven: rmem<f32>) collective=[xy.block, z.thread]
+          }}
+        }}"""))
+
+    verify_gpu_dialect(module)
+    with pytest.raises(ValueError, match="promoted before PTX lowering"):
+        verify_gpu_dialect(module, VerificationStage.PTX_LOWERING)
 
 
 def test_default_verification_checks_reduce_shapes():

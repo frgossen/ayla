@@ -378,22 +378,14 @@ class MatmulOp(GpuOp):
         dst: Value,
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
-        init: float | int | None = None,
-        init_value: Value | None = None,
+        init: Value | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if "collective" in a:
             raise ValueError("pass collective as an explicit argument")
         a["collective"] = dict(collective)
-        # TODO: Make the initializer always a value: merge ``init`` into
-        # ``init_value`` and express scalar initializers as constants.
-        if init is not None:
-            a["init"] = init
         return cls(
-            operands=[
-                lhs, rhs, dst,
-                *([init_value] if init_value is not None else []),
-            ],
+            operands=[lhs, rhs, dst, *([init] if init is not None else [])],
             results=[], attrs=a,
         )
 
@@ -410,12 +402,16 @@ class MatmulOp(GpuOp):
         return self.operands[2]
 
     @property
-    def init(self) -> float | int | None:
-        return self.attrs.get("init")  # type: ignore[return-value]
+    def init(self) -> Value | None:
+        """Accumulator initializer: a rank-0 scalar or a destination-shaped
+        tensor. Without one, the matmul accumulates into ``dst``.
 
-    @property
-    def init_value(self) -> Value | None:
-        """Tensor used to initialize the accumulator, if present."""
+        TODO: Drop the initializer so a matmul always accumulates. A scalar
+        becomes an elementwise fill of ``dst`` ahead of the matmul and a tensor
+        a ``move`` into it; PromoteBuffers carries that prologue onto the
+        promoted accumulator, as it already does the epilogue. The same fill
+        replaces ``AllocOp.init``.
+        """
         return self.operands[3] if len(self.operands) == 4 else None
 
     @property
@@ -436,7 +432,7 @@ class MatmulOp(GpuOp):
     def extra_attrs(self) -> dict[str, object]:
         return {
             k: v for k, v in self.attrs.items()
-            if k not in ("collective", "init")
+            if k != "collective"
         }
 
     def print(self, p: Printer) -> None:
@@ -467,13 +463,11 @@ class MatmulOp(GpuOp):
         p.read_literal(")")
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
-        init = attrs.pop("init", None)
         return cls.build(
             *operands[:3],
             collective=collective,
             attrs=attrs,
-            init=init,  # type: ignore[arg-type]
-            init_value=operands[3] if len(operands) == 4 else None,
+            init=operands[3] if len(operands) == 4 else None,
         )
 
 
@@ -2231,6 +2225,14 @@ class ConstantOp(GpuOp):
     def value(self) -> int | float | list[int | float]:
         return cast(int | float | list[int | float], self.attrs["value"])
 
+    @staticmethod
+    def splat_value(value: Value) -> int | float | None:
+        """The literal of the splat constant defining ``value``, if any."""
+        if not isinstance(value.definition, ConstantOp):
+            return None
+        literal = value.definition.value
+        return None if isinstance(literal, list) else literal
+
     @property
     def extra_attrs(self) -> dict[str, object]:
         return {
@@ -2836,8 +2838,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
-        init_effects = [] if op.init_value is None else _memory_effect(
-            "R", op.init_value, _type_collective_scope(op.init_value.type),
+        init_effects = [] if op.init is None else _memory_effect(
+            "R", op.init, _type_collective_scope(op.init.type),
         )
         return (
             _memory_effect(

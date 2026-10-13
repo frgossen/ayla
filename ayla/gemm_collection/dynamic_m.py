@@ -79,7 +79,8 @@ def dynamic_m_matmul_template(
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @{name}(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) {{
-            matmul(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+            %zero: rmem<f32> = constant() attrs={{value: 0.0}}
+            matmul(%a: gmem<?x{k}xbf16>, %b: gmem<{n}x{k}xbf16>, %c: gmem<?x{n}xbf16>, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
           }}
         }}"""))
     assert isinstance(module, ModuleOp)

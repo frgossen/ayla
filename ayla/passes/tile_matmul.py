@@ -341,7 +341,7 @@ class TileMatmul(LoweringPass):
         ubs: list[int],
     ) -> list[Op]:
         lhs, rhs, dst = hero.lhs, hero.rhs, hero.dst
-        init_value = hero.init_value
+        init = hero.init
         tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
@@ -434,9 +434,10 @@ class TileMatmul(LoweringPass):
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
-        if init_value is not None:  # A tensor initializer is tiled like dst.
-            ops, init_value = _build_tile_op(
-                init_value, ["M", "N"],
+        # A tensor initializer is tiled like dst; a scalar one broadcasts.
+        if init is not None and cast(MemTensorType, init.type).rank != 0:
+            ops, init = _build_tile_op(
+                init, ["M", "N"],
                 op_dims=self.op_dims,
                 tile_idxs=ivs,
                 tile_sizes=self.tile_sizes,
@@ -468,8 +469,7 @@ class TileMatmul(LoweringPass):
                 dst=dst,
                 collective=hero.collective,
                 attrs=attrs,
-                init=hero.init,
-                init_value=init_value,
+                init=init,
             ),
         )
 
