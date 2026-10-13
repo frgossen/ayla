@@ -9,7 +9,7 @@ and aspirationally to fuse GEMM epilogues.
 ## Getting started
 
 ```bash
-git submodule update --init                 # fetch the fast.cu reference submodule
+git submodule update --init                 # fetch the benchmark submodule
 pip install -e ".[dev]"                     # install (editable) + pytest
 git config core.hooksPath .githooks         # run checks before each push
 pytest                                      # run the tests
