@@ -123,14 +123,6 @@ def _collective_level(value: Value) -> str:
     return "block"
 
 
-def _scalar_constant(value: Value | None) -> float | int | None:
-    """The literal of a splat constant ``value``, or ``None``."""
-    if value is None or not isinstance(value.definition, ConstantOp):
-        return None
-    literal = value.definition.value
-    return None if isinstance(literal, list) else literal
-
-
 def _introduces_narrow(tile: TileOp, target_level: str) -> bool:
     return any(
         isinstance(idx, Value)
@@ -756,9 +748,11 @@ class PromoteBuffers(LoweringPass):
             # A scalar constant initializes the promoted allocation; registers
             # load a tensor initializer in place of the destination. The
             # writeback below still targets the destination.
-            scalar_init = _scalar_constant(init)
+            scalar_init = None if init is None else ConstantOp.splat_value(init)
             fill = (
-                init if scalar_init is None and self.target_type == "wgrmem"
+                init if init is not None
+                and cast(MemTensorType, init.type).rank != 0
+                and self.target_type == "wgrmem"
                 else None
             )
             ops, [new_dst] = self._build_operand_promotion(

@@ -334,6 +334,25 @@ def test_promote_lhs_rhs_preserves_init_on_matmul():
     assert text == expected
 
 
+def test_nonconstant_scalar_initializer_stays_on_the_matmul():
+    """Only a constant can become the promoted allocation's init."""
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: gmem<64x64xbf16>, %scale: rmem<f32>) {
+            matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: gmem<64x64xbf16>, %scale: rmem<f32>) collective=[xy.block, z.thread] attrs={label: "mm"}
+          }
+        }"""))
+
+    promote_buffers(
+        module, target_type="wgrmem", target_dtype="f32", operands=["dst"],
+        layout="wgmma_layout_0", warps=4, label_filter="mm",
+    )
+
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert matmul.init is not None and matmul.init.name == "scale"
+    assert matmul.dst.definition.init is None
+
+
 def test_promote_smem_with_warp_group_dependent_lhs():
     """Promote lhs/rhs to smem when the lhs tile depends on warp_group_id.
 

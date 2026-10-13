@@ -463,6 +463,15 @@ class VerifyGpuDialect(VerificationPass):
         ):
             raise ValueError("reshape must preserve the number of elements")
 
+    @verifies(MatmulOp, stage=VerificationStage.PTX_LOWERING)
+    def _verify_matmul_initialized(self, op: MatmulOp) -> None:
+        # Matmul lowerings accumulate; PromoteBuffers moves an initializer onto
+        # the register accumulator before then.
+        if op.init is not None:
+            raise ValueError(
+                "matmul initializer must be promoted before PTX lowering"
+            )
+
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:
         for block in op.blocks:

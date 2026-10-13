@@ -404,7 +404,14 @@ class MatmulOp(GpuOp):
     @property
     def init(self) -> Value | None:
         """Accumulator initializer: a rank-0 scalar or a destination-shaped
-        tensor. Without one, the matmul accumulates into ``dst``."""
+        tensor. Without one, the matmul accumulates into ``dst``.
+
+        TODO: Drop the initializer so a matmul always accumulates. A scalar
+        becomes an elementwise fill of ``dst`` ahead of the matmul and a tensor
+        a ``move`` into it; PromoteBuffers carries that prologue onto the
+        promoted accumulator, as it already does the epilogue. The same fill
+        replaces ``AllocOp.init``.
+        """
         return self.operands[3] if len(self.operands) == 4 else None
 
     @property
@@ -2217,6 +2224,14 @@ class ConstantOp(GpuOp):
     @property
     def value(self) -> int | float | list[int | float]:
         return cast(int | float | list[int | float], self.attrs["value"])
+
+    @staticmethod
+    def splat_value(value: Value) -> int | float | None:
+        """The literal of the splat constant defining ``value``, if any."""
+        if not isinstance(value.definition, ConstantOp):
+            return None
+        literal = value.definition.value
+        return None if isinstance(literal, list) else literal
 
     @property
     def extra_attrs(self) -> dict[str, object]:

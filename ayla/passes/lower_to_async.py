@@ -124,16 +124,14 @@ class LowerToAsync(LoweringPass):
                 and isinstance(dst.type, WgrmemTensorType)
                 and dst.type.warps == 4):
             return None
+        # PromoteBuffers moves any initializer onto the register accumulator.
+        assert op.init is None, "wgmma matmul initializer was not promoted"
         matmul = MatmulOp.build(
             lhs=lhs,
             rhs=rhs,
             dst=dst,
             collective=op.collective,
             attrs=op.extra_attrs,
-            init=(
-                cast(Value, self.value_map[op.init])
-                if op.init is not None else None
-            ),
         )
         return self._wrap(matmul, "wgmma", op.extra_attrs)
 

@@ -354,6 +354,15 @@ def test_matmul_tensor_initializer_roundtrips():
         )
 
 
+def test_constant_splat_value():
+    scalar = RmemTensorType.build([], F32Type())
+    splat = ConstantOp.build(2.5, scalar)
+    data = ConstantOp.build([1.0, 2.0], RmemTensorType.build([2], F32Type()))
+    assert ConstantOp.splat_value(splat.result()) == 2.5
+    assert ConstantOp.splat_value(data.result()) is None
+    assert ConstantOp.splat_value(Value(name="arg", type=scalar)) is None
+
+
 def test_elementwise_syntax():
     tensor_type = GmemTensorType.build((8,), F32Type())
     dst = Value(name="dst", type=tensor_type)
