@@ -12,7 +12,9 @@ def test_bulk_await_sinks_until_shared_source_is_overwritten():
           kernel @test(%g: gmem<4x4xf32>, %a: rmem<1x1xf32>, %b: rmem<1x1xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
             %s: smem<4x4xf32> = alloc() attrs={id: 0}
             %r: rmem<4x4xf32> = alloc() attrs={id: 1}
-            %acc: rmem<1x1xf32> = alloc() attrs={id: 2, init: 0.0}
+            %acc: rmem<1x1xf32> = alloc() attrs={id: 2}
+            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%acc: rmem<1x1xf32>, %acc_init: rmem<f32>)
             move(%g: gmem<4x4xf32>, %s: smem<4x4xf32>) attrs={label: "store", tma: true}
             matmul(%a: rmem<1x1xf32>, %b: rmem<1x1xf32>, %acc: rmem<1x1xf32>) attrs={label: "next_compute"}
             move(%s: smem<4x4xf32>, %r: rmem<4x4xf32>) attrs={label: "reuse"}

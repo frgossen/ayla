@@ -56,8 +56,12 @@ def test_cse_deduplicates_allocations_by_id():
             %same0: smem<4x4xf32> = alloc() attrs={id: 0}
             %same1: smem<4x4xf32> = alloc() attrs={id: 0}
             %other: smem<4x4xf32> = alloc() attrs={id: 1}
-            %init0: rmem<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
-            %init1: rmem<2x2xf32> = alloc() attrs={id: 2, init: 0.0}
+            %init0: rmem<2x2xf32> = alloc() attrs={id: 2}
+            %init0_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%init0: rmem<2x2xf32>, %init0_init: rmem<f32>)
+            %init1: rmem<2x2xf32> = alloc() attrs={id: 2}
+            %init1_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%init1: rmem<2x2xf32>, %init1_init: rmem<f32>)
           }
         }""")
 
@@ -66,6 +70,7 @@ def test_cse_deduplicates_allocations_by_id():
 
     assert text.count("alloc() attrs={id: 0}") == 1
     assert text.count("alloc() attrs={id: 1}") == 1
-    # An initialiser writes the buffer, so two of them are not interchangeable
-    # even sharing an id -- unrolling clones them, and each copy must re-zero.
-    assert text.count("alloc() attrs={id: 2, init: 0.0}") == 2
+    # Copies of one buffer merge, but each fill writes it -- unrolling clones
+    # them, and each copy must re-zero.
+    assert text.count("alloc() attrs={id: 2}") == 1
+    assert text.count("elementwise fill(") == 2

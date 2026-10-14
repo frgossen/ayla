@@ -95,7 +95,6 @@ class ReuseBuffers(LoweringPass):
         candidate_allocations = [
             op for op in kernel.body.ops
             if isinstance(op, AllocOp)
-            and op.init is None
             and isinstance(op.result().type, MemTensorType)
         ]
         op_local_conflicts = _op_local_conflicts(kernel)

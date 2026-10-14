@@ -113,7 +113,7 @@ def test_constant_represents_address_backed_memory_spaces(
         (ReduceOp, {"fn": "sum", "collective": {}, "init": 0.0}),
         (TileOp, {"static_indices": [], "maybe_partial": True}),
         (ElementwiseOp, {"fn": "relu"}),
-        (AllocOp, {"id": 1, "init": 0.0}),
+        (AllocOp, {"id": 1}),
         (ReinterpretOp, {"byte_offset": 0}),
         (MoveOp, {"collective": {}, "multicast": True}),
         (TmaMoveOp, {
@@ -860,7 +860,9 @@ def test_naive_matmul_4096_module():
             %a_thread: gmem<2x4096xf32> = tile(%a_block: gmem<64x4096xf32>, %tx: index, 0)
             %b_thread: gmem<4096x2xf32 strides=[4096, 1]> = tile(%b_block: gmem<4096x64xf32 strides=[4096, 1]>, 0, %ty: index)
             %c_thread: gmem<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
-            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
+            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0}
+            %c_thread_rmem_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%c_thread_rmem: rmem<2x2xf32>, %c_thread_rmem_init: rmem<f32>)
             for (%k: index = 0 to 4096) {
               %a_sloop: gmem<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem<2x4096xf32>, 0, %k: index)
               %b_sloop: gmem<1x2xf32 strides=[4096, 1]> = tile(%b_thread: gmem<4096x2xf32 strides=[4096, 1]>, %k: index, 0)

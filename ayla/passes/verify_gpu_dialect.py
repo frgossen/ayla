@@ -8,6 +8,7 @@ from ..base.ir import Op, Type, find_ancestor_of_type
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
+    AllocOp,
     AsyncOp,
     BF16Type,
     BarrierOp,
@@ -306,6 +307,11 @@ class VerifyGpuDialect(VerificationPass):
                 "cluster_mbar is a barrier resource, not an async lock"
             )
 
+    @verifies(AllocOp)
+    def _verify_alloc(self, op: AllocOp) -> None:
+        if "init" in op.attrs:
+            raise ValueError("alloc does not initialize; use elementwise fill")
+
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
@@ -437,6 +443,13 @@ class VerifyGpuDialect(VerificationPass):
             )
         if type(op.ilp) is not bool:
             raise ValueError(f"elementwise ilp must be a bool; got {op.ilp!r}")
+        if op.fn == "fill":
+            dst, src = op.dst.type, op.src(0).type
+            assert isinstance(dst, MemTensorType)
+            if not isinstance(src, MemTensorType) or src.rank != 0:
+                raise ValueError("elementwise fill requires a rank-0 source")
+            if src.dtype != dst.dtype:
+                raise ValueError("elementwise fill requires matching dtypes")
 
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:

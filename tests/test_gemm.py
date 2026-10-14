@@ -34,8 +34,12 @@ def test_register_matmul_schedules_side_by_side_gemms():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @dual(%a: gmem<64x16xbf16>, %gate_w: gmem<64x16xbf16>, %up_w: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
-            %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101, init: 0.0}
+            %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100}
+            %gate_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate_init: rmem<f32>)
+            %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101}
+            %up_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %up_init: rmem<f32>)
             matmul(%a: gmem<64x16xbf16>, %gate_w: gmem<64x16xbf16>, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "gate"}
             matmul(%a: gmem<64x16xbf16>, %up_w: gmem<64x16xbf16>, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={label: "up"}
             elementwise mul(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "product"}
@@ -52,8 +56,11 @@ def test_register_matmul_schedules_side_by_side_gemms():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @dual(%a: gmem<64x16xbf16>, %gate_w: gmem<64x16xbf16>, %up_w: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
-            %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101, init: 0.0}
+            %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100}
+            %gate_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate_init: rmem<f32>)
+            %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101}
+            elementwise fill(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate_init: rmem<f32>)
             %0: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0, label: "gate_lhs_smem"}
             %1: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "gate_rhs_smem"}
             %2: lock<mbar> = alloc() attrs={id: 2}
@@ -85,7 +92,9 @@ def test_register_matmul_keeps_multicast_and_local_loads_separate():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
-            %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100, init: 0.0}
+            %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100}
+            %c_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %c_init: rmem<f32>)
             matmul(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "mm"}
           }
         }"""))
