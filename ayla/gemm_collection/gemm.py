@@ -201,6 +201,7 @@ def schedule_matmul(
     output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
         CollectiveAxis.X, CollectiveAxis.Y,
     ),
+    output_grid_fast_axis: str = "n",
     output_m_tile: int = 128,
     output_n_tile: int = 256,
     warpgroup_m_tile: int | None = None,
@@ -321,10 +322,21 @@ def schedule_matmul(
             1,
         ]
     pipeline = Pipeline()
+    # Both output dimensions are flattened onto block X for a fixed grid.
+    # TileMatmul linearizes the last op dimension fastest, so preserve the
+    # selected traversal order when choosing that dimension.
+    if output_grid_fast_axis not in ("m", "n"):
+        raise ValueError("output_grid_fast_axis must be 'm' or 'n'")
+    m_fast = output_grid_size is not None and output_grid_fast_axis == "m"
+    if m_fast and group_size != 1:
+        raise ValueError("M-fast fixed grids do not support tile groups")
     if group_size == 1:
         pipeline.add_pass(TileMatmul(
-            op_dims=["M", "N"],
-            tile_sizes=[output_m_tile, output_n_tile],
+            op_dims=["N", "M"] if m_fast else ["M", "N"],
+            tile_sizes=(
+                [output_n_tile, output_m_tile]
+                if m_fast else [output_m_tile, output_n_tile]
+            ),
             iteration_bindings=output_bindings,
             for_loop_labels=[None, None],
             op_label_filter="mm",
