@@ -126,6 +126,13 @@ IR_DTYPES = {
     "float16": "f16",
     "bfloat16": "bf16",
 }
+# BF16 keeps 8 mantissa bits, so long reductions round in larger steps.
+MAX_ABS_ERROR = {
+    "float16": 4,
+    "bfloat16": 32,
+}
+# Names the configuration --jit-heuristic times through ayla.gemm_jit.
+JIT_HEURISTIC = "jit_heuristic"
 
 
 def _shapes_with_current_best(shapes, current_best):
@@ -233,9 +240,32 @@ def _result_row(
     }
 
 
+def _jit_heuristic_config(shape: Shape) -> ScheduleConfig | None:
+    """The schedule ayla.gemm_jit selects for ``shape``, recorded as a config."""
+    from ayla.gemm_jit import select_gemm_schedule
+
+    seed = select_gemm_schedule(
+        shape.op, shape.dtype, shape.m, shape.n, shape.k, shape.batch or 1,
+    )
+    if seed is None:
+        return None
+    fields = {field.name for field in dataclasses.fields(ScheduleConfig)}
+    return ScheduleConfig(name=JIT_HEURISTIC, **{
+        key: value for key, value in seed.captured_config.items()
+        if key in fields and key != "name"
+    })
+
+
 def _make_ayla_config(
     shape: Shape, schedule: ScheduleConfig,
 ) -> tuple[GemmBenchConfig, float, float]:
+    if schedule.name == JIT_HEURISTIC:
+        from ayla.gemm_jit import gemm_op
+
+        # Time the library's own routing rather than rebuilding the schedule.
+        return _bench_ayla_launcher(
+            shape, schedule, gemm_op(shape.op, shape.dtype),
+        )
     # Keep Ayla's eagerly registered collection out of the CPU-only validation
     # path. Importing this submodule compiles the collection as a side effect.
     from ayla.gemm_collection.gemm import (
@@ -422,7 +452,15 @@ def _make_ayla_config(
     if schedule.reschedule_async:
         module = ScheduleAsync().run(module)
         module = Canonicalize().run(module)
-    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    return _bench_ayla_launcher(
+        shape, schedule, make_ptx_launcher(make_ptx_kernel(module)),
+    )
+
+
+def _bench_ayla_launcher(
+    shape: Shape, schedule: ScheduleConfig, launcher: Any,
+) -> tuple[GemmBenchConfig, float, float]:
+    """Wrap ``launcher`` as a benchmark config after checking it against Torch."""
     if shape.op == "bmm":
         assert shape.batch is not None
         bench = bmm_bench_config(
@@ -439,7 +477,7 @@ def _make_ayla_config(
             batch=shape.batch,
             m=shape.m,
             seed=int(shape.shape_id[-8:], 16),
-            max_abs_error=4,
+            max_abs_error=MAX_ABS_ERROR[shape.dtype],
             max_relative_rms_error=2e-3,
         )
     else:
@@ -462,7 +500,7 @@ def _make_ayla_config(
         max_abs, relative_rms = checker(
             bench,
             seed=int(shape.shape_id[-8:], 16),
-            max_abs_error=4,
+            max_abs_error=MAX_ABS_ERROR[shape.dtype],
             max_relative_rms_error=2e-3,
         )
     return bench, max_abs, relative_rms
@@ -866,6 +904,11 @@ def main() -> int:
     parser.add_argument("--output-csv", type=Path, default=RAW_CSV)
     parser.add_argument("--output-json", type=Path, default=RAW_JSON)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--jit-heuristic", action="store_true",
+        help="time only the schedule ayla.gemm_jit selects for each shape, "
+        "through the library's JIT op",
+    )
     parser.add_argument(
         "--workload", choices=("mm", "addmm", "bmm", "all"), default="mm",
         help="benchmark mm, addmm, bmm, or all accepted workload identities",
@@ -1674,6 +1717,9 @@ def main() -> int:
                 if config_pattern is None or config_pattern.search(config.name)
             ]
         )
+        if args.jit_heuristic:
+            jit_config = _jit_heuristic_config(shape)
+            schedules = [] if jit_config is None else [jit_config]
         if config_pattern is not None:
             schedules = [
                 config for config in schedules if config_pattern.search(config.name)

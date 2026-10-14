@@ -1,7 +1,9 @@
 """Route matmuls through ayla under torch.compile, epilogue and all.
 
-Installs a lowering for `aten.mm` that claims one hard-coded shape and dtype
-and declines everything else, which falls through to Inductor's own lowering::
+Installs a lowering for `aten.mm` that claims one hard-coded shape and dtype,
+and lowerings for `aten.mm`, `aten.addmm`, and `aten.bmm` that claim FP16/BF16
+calls in ayla's native layout whenever `ayla.gemm_jit` has a measured schedule
+for them. Everything else falls through to Inductor's own lowering::
 
     from ayla import torch_compile
     torch_compile.install()
@@ -497,10 +499,15 @@ def _try_lower_glimmer_attention_subgraph(node: Node) -> None:
     )
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
-    """A matmul ayla will run."""
+    """A matmul ayla will run.
 
-    def __init__(self, layout, inputs) -> None:
+    ``jit_op``, when set, is a ``gemm_jit`` op called with the inputs (the
+    last one transposed back to ``bt``) and the output.
+    """
+
+    def __init__(self, layout, inputs, jit_op=None) -> None:
         super().__init__(layout, inputs, make_kernel_render=None)
+        self.jit_op = jit_op
 
 
 class AylaScheduling(BaseScheduling):
@@ -522,6 +529,10 @@ class AylaScheduling(BaseScheduling):
     ) -> bool:
         if not self.is_ayla_template(node1) or len(node1.get_nodes()) != 1:
             return False        # one epilogue: there is no kernel for two
+        template = node1.get_template_node()
+        assert isinstance(template, AylaTemplateBuffer)
+        if template.jit_op is not None:
+            return False        # the JIT GEMMs have no fused epilogues
         if not _is_elementwise_sigmoid_node(node2):
             return False
         # Only fuse if nothing else reads the matmul.
@@ -565,9 +576,13 @@ class AylaScheduling(BaseScheduling):
         else:
             dest = template_ir_node.get_name()
 
-        a, b = (inp.codegen_reference() for inp in template_ir_node.inputs)
+        *inputs, b = (inp.codegen_reference() for inp in template_ir_node.inputs)
+        assert isinstance(template_ir_node, AylaTemplateBuffer)
+        if template_ir_node.jit_op is not None:
+            ayla_op = template_ir_node.jit_op
+        bt = f"{b}.transpose(-1, -2)"
         V.graph.wrapper_code.writeline(
-            f"torch.ops.{ayla_op}({a}, {b}.t(), {dest})"
+            f"torch.ops.{ayla_op}({', '.join([*inputs, bt, dest])})"
         )
         self.free_buffers_in_scheduler()
         return None
@@ -622,12 +637,66 @@ class AylaCombinedScheduling(CUDACombinedScheduling):
         )
 
 
+def _static(*sizes) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(size) for size in sizes)
+    except TypeError:
+        return None
+
+
+def _lower_jit(operation, lhs, rhs, bias=None, *, layout=None):
+    """Claim a native-layout GEMM that has a measured ``gemm_jit`` schedule."""
+    from .gemm_jit import gemm_op, select_gemm_schedule
+
+    m, n, k, layout, lhs, rhs = mm_args(lhs, rhs, layout=layout)
+    dtype = {torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(
+        lhs.get_dtype(),
+    )
+    sizes = _static(*lhs.get_size(), n)
+    if (
+        lhs.get_device().type != "cuda" or dtype is None
+        or rhs.get_dtype() != lhs.get_dtype() or sizes is None
+    ):
+        return None
+    *batch, m, k, n = sizes
+    # A row-major A and a column-major B: ayla's A @ BT^T with contiguous BT.
+    contiguous = list(ir.FlexibleLayout.contiguous_strides(lhs.get_size()))
+    if _static(*lhs.get_stride()) != _static(*contiguous):
+        return None
+    if _static(*rhs.get_stride()) != (*([n * k] if batch else []), 1, k):
+        return None
+    inputs = [ir.ExternKernel.require_contiguous(lhs), rhs]
+    if bias is not None:
+        if (
+            bias.get_dtype() != lhs.get_dtype()
+            or _static(*bias.get_size()) != (n,)
+        ):
+            return None
+        inputs.insert(0, ir.ExternKernel.require_contiguous(bias))
+    if select_gemm_schedule(operation, dtype, m, n, k, *batch) is None:
+        return None
+    return TensorBox.create(AylaTemplateBuffer(
+        layout=layout, inputs=inputs, jit_op=gemm_op(operation, dtype),
+    ))
+
+
+def _lower_addmm(bias, lhs, rhs, *, beta=1, alpha=1, layout=None):
+    if beta != 1 or alpha != 1:
+        return None
+    return _lower_jit("addmm", lhs, rhs, bias, layout=layout)
+
+
+def _lower_bmm(lhs, rhs, *, layout=None):
+    return _lower_jit("bmm", lhs, rhs, layout=layout)
+
+
 def _lower_mm(lhs, rhs, *, layout=None):
     """Claim this matmul as an ayla template, or decline and leave it be."""
     current = V.graph.current_node
     assert isinstance(current, Node)
     _try_lower_glimmer_attention_subgraph(current)
 
+    jit_lhs, jit_rhs = lhs, rhs
     m, n, k, layout, lhs, rhs = mm_args(lhs, rhs, layout=layout)
     if lhs.get_device().type != "cuda":
         return None
@@ -640,21 +709,25 @@ def _lower_mm(lhs, rhs, *, layout=None):
     # deciding between the kernels that could serve a shape, without ayla
     # grading its own kernels inside Inductor's autotuner.
     if (m, k, n, lhs.get_dtype()) != (4096, 4096, 4096, torch.bfloat16):
-        return None
+        return _lower_jit("mm", jit_lhs, jit_rhs)
 
     return TensorBox.create(
         AylaTemplateBuffer(layout=layout, inputs=[lhs, rhs])
     )
 
 
-_LOWERING_TARGET = torch.ops.aten.mm.default
-_displaced_user_lowering = None
+_LOWERINGS = {
+    torch.ops.aten.mm.default: _lower_mm,
+    torch.ops.aten.addmm.default: _lower_addmm,
+    torch.ops.aten.bmm.default: _lower_bmm,
+}
+_displaced_user_lowerings: dict[object, object] = {}
 _displaced_backend = None
 
 
 def install() -> None:
-    """Claim ``aten.mm``, and the cuda scheduling that decides what fuses into it."""
-    global _displaced_user_lowering, _displaced_backend
+    """Claim the GEMMs, and the cuda scheduling that decides what fuses into them."""
+    global _displaced_backend
     init_backend_registration()
     if _displaced_backend is None:
         _displaced_backend = device_codegens["cuda"]
@@ -662,15 +735,25 @@ def install() -> None:
             "cuda", AylaCombinedScheduling, PythonWrapperCodegen, CppWrapperGpu,
         )
 
-    current = user_lowerings.get(_LOWERING_TARGET)
-    if current is _lower_mm:
-        return
-    _displaced_user_lowering = current
-    user_lowerings[_LOWERING_TARGET] = _lower_mm
+    # Register the JIT ops up front: a cached graph can call one without this
+    # process ever running the lowering that would create it.
+    from .gemm_jit import gemm_op
+
+    for operation in ("mm", "addmm", "bmm"):
+        for dtype in ("float16", "bfloat16"):
+            gemm_op(operation, dtype)
+
+    for target, lowering in _LOWERINGS.items():
+        current = user_lowerings.get(target)
+        if current is lowering:
+            continue
+        if current is not None:
+            _displaced_user_lowerings[target] = current
+        user_lowerings[target] = lowering
 
 
 def uninstall() -> None:
-    """Hand back ``aten.mm`` and the cuda scheduling."""
+    """Hand back the GEMMs and the cuda scheduling."""
     global _displaced_backend
     # Stand down if someone has claimed cuda since, rather than overwrite them.
     installed = device_codegens.get("cuda")
@@ -679,8 +762,9 @@ def uninstall() -> None:
         device_codegens["cuda"] = _displaced_backend
         _displaced_backend = None
 
-    if user_lowerings.get(_LOWERING_TARGET) is not _lower_mm:
-        return
-    del user_lowerings[_LOWERING_TARGET]
-    if _displaced_user_lowering is not None:
-        user_lowerings[_LOWERING_TARGET] = _displaced_user_lowering
+    for target, lowering in _LOWERINGS.items():
+        if user_lowerings.get(target) is not lowering:
+            continue
+        del user_lowerings[target]
+        if (displaced := _displaced_user_lowerings.pop(target, None)) is not None:
+            user_lowerings[target] = displaced
