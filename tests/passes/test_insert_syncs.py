@@ -746,3 +746,36 @@ def test_full_block_sync_releases_all_named_barrier_ids():
         'barrier() attrs={scope: "block"}',
         'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',
     ]
+
+
+def test_bulk_await_orders_tma_store_read_only_for_the_leader():
+    # wait_group completes in t0, the thread that committed the store, so the
+    # other threads still need t0's word before overwriting its source. The
+    # authored barrier retires the first write, leaving only the TMA read.
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %s0: smem<64x64xf32> = alloc()
+            %r0: rmem<64x64xf32> = alloc()
+            move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)
+            barrier() attrs={scope: "block"}
+            %l0: lock<bulk> = alloc()
+            async(%l0: lock<bulk>) tma_move(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %s0: smem<64x64xf32>, %c0: index, %c0: index)
+            await(%l0: lock<bulk>)
+            move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)
+          }
+        }"""))
+
+    insert_syncs(module)
+    order = [
+        line.strip() for line in repr(module).splitlines()
+        if line.strip().startswith(("barrier()", "await(", "move("))
+    ]
+    assert order == [
+        "move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)",
+        'barrier() attrs={scope: "block"}',
+        "await(%l0: lock<bulk>)",
+        'barrier() attrs={scope: "block"}',
+        "move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)",
+    ]
