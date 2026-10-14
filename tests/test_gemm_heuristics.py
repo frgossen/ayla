@@ -71,7 +71,7 @@ def test_bf16_active_wgmma_controls_are_preserved_in_builder_mapping():
     assert seed.builder_config["wgmma_group_size"] == 4
     assert seed.builder_config["wgmma_pending_groups"] == 1
     seed = select_gemm_schedules(
-        32768, 512, 512, dtype="bfloat16",
+        25216, 768, 192, dtype="bfloat16",
     ).seeds[0]
     assert seed.builder_config is not None
     assert seed.builder_config["wgmma_epilogue_pipeline"] is True

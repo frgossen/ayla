@@ -1,0 +1,661 @@
+{
+  "source_ranking": "/home/arseniivanov/ayla/.benchmarks/better_benchmark_gemm/ncu_goal_20261013/172_full_winners.json",
+  "source_ranking_sha256": "94059a6a0761d9d36f73111f3abf42780e15bb516a426e34e63206f71a29ddfa",
+  "validation": {
+    "full_geomean_pct": 107.2663862139674,
+    "below_torch": 16,
+    "all_correct": 2096,
+    "non_mm_rows_unchanged": 169,
+    "per_gpu": [
+      {
+        "gpu": 0,
+        "correct": 262,
+        "geomean_pct": 107.23844310082917,
+        "below_torch": 17
+      },
+      {
+        "gpu": 1,
+        "correct": 262,
+        "geomean_pct": 107.13589801684884,
+        "below_torch": 16
+      },
+      {
+        "gpu": 2,
+        "correct": 262,
+        "geomean_pct": 107.14391759614851,
+        "below_torch": 16
+      },
+      {
+        "gpu": 3,
+        "correct": 262,
+        "geomean_pct": 107.35737770950647,
+        "below_torch": 17
+      },
+      {
+        "gpu": 4,
+        "correct": 262,
+        "geomean_pct": 107.23213818655479,
+        "below_torch": 16
+      },
+      {
+        "gpu": 5,
+        "correct": 262,
+        "geomean_pct": 107.27588238244957,
+        "below_torch": 16
+      },
+      {
+        "gpu": 6,
+        "correct": 262,
+        "geomean_pct": 107.24003616995701,
+        "below_torch": 17
+      },
+      {
+        "gpu": 7,
+        "correct": 262,
+        "geomean_pct": 107.41636490292368,
+        "below_torch": 16
+      }
+    ],
+    "selected_percentages_match_raw_runs_nearest_eight_gpu_medians": true,
+    "exact_shape_median_geomean_pct": 107.26955278956113
+  },
+  "search_checkout": "/home/arseniivanov/ayla",
+  "search_branch": "perf/oss-gemm-heuristics",
+  "search_head": "80dbace42e21b15261269a91a7a9b8e9b722c131",
+  "source_freeze": {
+    "compiler": [
+      {
+        "path": "ayla/gemm_collection/gemm.py",
+        "same": false,
+        "current_sha256": "5f8e739dbdbf27de764142cd9e0fdab4e27ec48a3c8c9f9f21242b1c6cf420f5",
+        "stack_sha256": "d58cf3934046eabf58b66a631d42d92a1ea8656cf74e16d6a5a46e012f3399d2",
+        "diff_lines": 425
+      },
+      {
+        "path": "ayla/analysis/sync.py",
+        "same": false,
+        "current_sha256": "fba798e3dc11b5fe6b08a6e37d210feaef1bd660586f98fb8b69aa19a6fc7d35",
+        "stack_sha256": "0650b0e796dc87ccf1a2ed9aa549fdd3fbabab52015f1fc08ffee8cfd0e40bcb",
+        "diff_lines": 257
+      },
+      {
+        "path": "ayla/analysis/buffer_lifetime.py",
+        "same": false,
+        "current_sha256": "34048c4fd466e01fc5648c4ebda286fad538c5e329490489aeaa586be2f0d2f4",
+        "stack_sha256": "66b1c180851f231d5f842d199e2eeb2589f8cf873a7261e3232a538318e3e366",
+        "diff_lines": 34
+      },
+      {
+        "path": "ayla/passes/pipeline_loop.py",
+        "same": false,
+        "current_sha256": "3ad4f052e8703e6978e71b26dc27ac2178c0bff9953ce803c2fb52eef601d101",
+        "stack_sha256": "8b0885ef0b9f53f7f68044df9bc09c6e3b1b99f8f33fad006fa58cb774c2c491",
+        "diff_lines": 86
+      },
+      {
+        "path": "ayla/passes/schedule_async.py",
+        "same": false,
+        "current_sha256": "15009ad2481e6aae9c07171a1e3c46a649b403725f0cc0b8ef6726bdc40766dc",
+        "stack_sha256": "cd7df019327e3cd931c72e9377ae117ad4b8d5ca43fe218018fcce2d0641d7d9",
+        "diff_lines": 165
+      },
+      {
+        "path": "ayla/passes/licm.py",
+        "same": false,
+        "current_sha256": "bf11e06d6a9bf37cfb3da46bb125c89f116df4fd3881aa4ca6e8d285d44e5d04",
+        "stack_sha256": "0824b04451488dafd9f31fd4aa59efc28dce23d6b1ff4624c6237200ab81cd9b",
+        "diff_lines": 84
+      },
+      {
+        "path": "ayla/passes/insert_syncs.py",
+        "same": false,
+        "current_sha256": "fbf7211d70b1b339d3478f27af2f6e479457ecddddc06e90895140d002b69852",
+        "stack_sha256": "24558afe8dfd92aea293dba4e89723a1d70414b414badf82ec4bf26c40fd75c8",
+        "diff_lines": 142
+      },
+      {
+        "path": "ayla/passes/lower_to_ptx_template.py",
+        "same": false,
+        "current_sha256": "242c62c5ba19d4c438fa2a96f1f9a64ee08ca8e4953230d1f5fe152ab45c3f38",
+        "stack_sha256": "5e17d03437cffa75739ded1311885d79a5e5a38b247fc3e0bad3dc182e2c00f3",
+        "diff_lines": 1900
+      },
+      {
+        "path": "ayla/passes/promote_buffers.py",
+        "same": false,
+        "current_sha256": "cfc142f5ae5a9ad08fcf375ba9fab4ed3bb67db044f337a953ad7af5388f431a",
+        "stack_sha256": "ec594ea67647306b5a54aa97a21447c8d2a3b3f0e407aedd51c0c6e35966d1ab",
+        "diff_lines": 225
+      },
+      {
+        "path": "ayla/passes/tile_matmul.py",
+        "same": false,
+        "current_sha256": "a96b9e0251ba447c81e8f5a92bcfbf5dacae2d84c7ef879906bf31a180af6b39",
+        "stack_sha256": "39ff8075533cff01bbdeb3f105b68afa69ab61a1ffce6112efc792f192331352",
+        "diff_lines": 284
+      },
+      {
+        "path": "ayla/gpu_dialect.py",
+        "same": false,
+        "current_sha256": "a65c655bf391486b77de298a4e86d53f2ec977342f678911b81bdc342800dacf",
+        "stack_sha256": "2848539535e6caab8f22212683bddf1a72413d1413b848768ac1c29fd99951d4",
+        "diff_lines": 614
+      },
+      {
+        "path": "ayla/ptx_codegen.py",
+        "same": false,
+        "current_sha256": "e9fe4df6117d34cfccbdb401e89577f626cee10195a607a7c6cf0ff442b6e874",
+        "stack_sha256": "d87b718deaed09a4882034f4165d61e6499695b8d7dee21a6efd633a1302c2ea",
+        "diff_lines": 80
+      },
+      {
+        "path": "ayla/ptx_runtime.py",
+        "same": true,
+        "current_sha256": "7e6d0995d1922729db113d4016eaaf304bc1f8ab0a92d528ffc7568e31a91811",
+        "stack_sha256": "7e6d0995d1922729db113d4016eaaf304bc1f8ab0a92d528ffc7568e31a91811",
+        "diff_lines": 0
+      }
+    ],
+    "caller": [
+      {
+        "path": "benchmarks/benchmark_oss_pytorch_gemm_shapes.py",
+        "sha256": "7a28edb1773b12d5d761b433c09f3bf15d5c822be6401e471d80210d63ae5b3f"
+      },
+      {
+        "path": "benchmarks/oss_gemm_input_gather.py",
+        "sha256": "7ca84944adaa87c2a3cf5f26cc055a8d4938908c85d8891ad0f8aa94aec651c3"
+      },
+      {
+        "path": "benchmarks/oss_gemm_smem_reuse.py",
+        "sha256": "fd36e83778ac972cf0dc907347f9a5d1cb024564155a8517ace08c3234efa27f"
+      },
+      {
+        "path": "benchmarks/oss_gemm_output_store.py",
+        "sha256": "76c9d55962be81cee328927e5875765f15ded0c3171ddb9740f4d9add2df4272"
+      }
+    ]
+  },
+  "exact_bf16_mm_refreshed": 262,
+  "bf16_mm_neighbor_seeds_refreshed": 27,
+  "fp16_exact_entries_unchanged": 749,
+  "bf16_non_mm_exact_entries_unchanged": 169,
+  "all_dtype_keys_preserved": 1180,
+  "compiler_code_modified_by_this_import": false,
+  "measurement_scope": "Search checkout and recorded benchmark caller compositions; the heuristic branch compiler base was not benchmarked.",
+  "bf16_mm_benchmark_compositions": [
+    {
+      "m": 8192,
+      "n": 1024,
+      "k": 1024,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 1024,
+      "n": 1024,
+      "k": 8192,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 32768,
+      "n": 512,
+      "k": 128,
+      "helpers": [
+        "benchmarks/oss_gemm_input_gather.py"
+      ]
+    },
+    {
+      "m": 128,
+      "n": 16384,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 16384,
+      "n": 4096,
+      "k": 128,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 16384,
+      "k": 128,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 16384,
+      "n": 768,
+      "k": 384,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 32768,
+      "n": 256,
+      "k": 256,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 8192,
+      "n": 2048,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 8192,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "helpers": [
+        "benchmarks/oss_gemm_split_k.py"
+      ]
+    },
+    {
+      "m": 32768,
+      "n": 3072,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 32768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 512,
+      "n": 1024,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_input_gather.py"
+      ]
+    },
+    {
+      "m": 16384,
+      "n": 4096,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 175360,
+      "n": 3072,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 175360,
+      "n": 768,
+      "k": 2304,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 175360,
+      "n": 768,
+      "k": 3072,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 175360,
+      "n": 768,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 2304,
+      "n": 768,
+      "k": 175360,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 25216,
+      "n": 3072,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 25344,
+      "n": 3072,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 25344,
+      "n": 768,
+      "k": 3072,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 3072,
+      "n": 768,
+      "k": 175360,
+      "helpers": [
+        "benchmarks/oss_gemm_split_k.py"
+      ]
+    },
+    {
+      "m": 32768,
+      "n": 1024,
+      "k": 256,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 25216,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 25344,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 32768,
+      "n": 384,
+      "k": 192,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 8192,
+      "n": 50272,
+      "k": 1024,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 100352,
+      "n": 1024,
+      "k": 256,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 16384,
+      "n": 50008,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_smem_reuse.py"
+      ]
+    },
+    {
+      "m": 16384,
+      "n": 50264,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_smem_reuse.py"
+      ]
+    },
+    {
+      "m": 2048,
+      "n": 2560,
+      "k": 10240,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 401408,
+      "n": 128,
+      "k": 128,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py",
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 401408,
+      "n": 512,
+      "k": 128,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 256008,
+      "k": 1024,
+      "helpers": [
+        "benchmarks/oss_gemm_smem_reuse.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 50264,
+      "k": 2048,
+      "helpers": [
+        "benchmarks/oss_gemm_smem_reuse.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 8008,
+      "k": 2560,
+      "helpers": [
+        "benchmarks/oss_gemm_smem_reuse.py"
+      ]
+    },
+    {
+      "m": 50272,
+      "n": 1024,
+      "k": 16384,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 50272,
+      "n": 768,
+      "k": 8192,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 8192,
+      "n": 128112,
+      "k": 1024,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 8192,
+      "n": 50272,
+      "k": 768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 128104,
+      "n": 1536,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 128112,
+      "n": 1024,
+      "k": 8192,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 1536,
+      "n": 768,
+      "k": 32768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 197952,
+      "n": 512,
+      "k": 256,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 256008,
+      "n": 1024,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 30522,
+      "n": 768,
+      "k": 32768,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 32000,
+      "n": 1024,
+      "k": 8192,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 32768,
+      "n": 384,
+      "k": 512,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 10240,
+      "k": 2560,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 25088,
+      "k": 64,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 512,
+      "k": 250112,
+      "helpers": [
+        "benchmarks/oss_gemm_split_k.py"
+      ]
+    },
+    {
+      "m": 4096,
+      "n": 9216,
+      "k": 128,
+      "helpers": [
+        "benchmarks/oss_gemm_input_gather.py",
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 50008,
+      "n": 768,
+      "k": 16384,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 50264,
+      "n": 768,
+      "k": 16384,
+      "helpers": [
+        "benchmarks/oss_gemm_output_store.py"
+      ]
+    },
+    {
+      "m": 50272,
+      "n": 768,
+      "k": 16384,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    },
+    {
+      "m": 512,
+      "n": 197952,
+      "k": 256,
+      "helpers": [
+        "benchmarks/oss_gemm_smem_reuse.py"
+      ]
+    },
+    {
+      "m": 8008,
+      "n": 2560,
+      "k": 4096,
+      "helpers": [
+        "benchmarks/oss_gemm_output_wave.py"
+      ]
+    }
+  ]
+}
