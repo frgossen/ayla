@@ -14,17 +14,21 @@ unrolling multiplies the step.
 from __future__ import annotations
 
 from ..gpu_dialect import (
+    ConstantOp,
+    ElementwiseOp,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    MatmulOp,
     MemTensorType,
     ModuleOp,
     PtrAddOp,
     SelectOp,
     TileOp,
+    memory_effects,
 )
 from ..base.ir import Block, Op, Value, clone_op, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
@@ -78,6 +82,37 @@ class Folding(LoweringPass):
                 f"select: index {index} out of range for {len(cases)} cases"
             )
         return [], [cases[index]]
+
+    @lowers(ElementwiseOp)
+    def lower_elementwise(
+        self, op: ElementwiseOp,
+    ) -> tuple[list[Op], list[object]] | None:
+        """Fold zeroing into the matmul that next writes the buffer.
+
+        Zeroing a buffer and then accumulating into it is overwriting it, so
+        that matmul overwrites instead and the fill goes away.
+        """
+        if op.fn != "fill" or ConstantOp.splat_value(op.src(0)) != 0:
+            return None
+        effects = memory_effects(op)
+        assert effects is not None
+        filled = {root for e in effects if e.kind == "W" for root in e.roots}
+        block = op.parent_block
+        assert block is not None
+        for later in block.ops[block.ops.index(op) + 1:]:
+            later_effects = memory_effects(later)
+            if later_effects is None:
+                return None
+            if not any(e.roots & filled for e in later_effects):
+                continue
+            if not (
+                isinstance(later, MatmulOp) and later.dst is op.dst
+                and later.init is None and later.accumulate
+            ):
+                return None
+            later.attrs["accumulate"] = False
+            return [], []
+        return None
 
     def _const_val(self, value: Value) -> int | None:
         mapped = self.value_map.get(value, value)

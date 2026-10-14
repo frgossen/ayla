@@ -350,6 +350,10 @@ class VerifyGpuDialect(VerificationPass):
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
         _verify_collective_attr(op)
+        if type(op.accumulate) is not bool:
+            raise ValueError(
+                f"matmul accumulate must be a bool; got {op.accumulate!r}"
+            )
         for operand_name in ("lhs", "rhs", "dst"):
             attr_name = f"{operand_name}_tiling_scheme"
             scheme_id = op.attrs.get(attr_name)

@@ -3,6 +3,7 @@
 import textwrap
 
 import pytest
+import torch
 
 from ayla.base.ir import Block, find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
@@ -25,7 +26,9 @@ from ayla.gpu_dialect import (
 from ayla.passes.folding import Folding
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_ptx_template import lower_to_ptx_template
-from tests.testing_utils import assert_contains_in_order
+from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_runtime import make_ptx_launcher
+from tests.testing_utils import assert_contains_in_order, requires_cuda
 
 
 @pytest.mark.parametrize(
@@ -725,3 +728,45 @@ def test_lower_elementwise_silu_minimizes_temporary_live_ranges_by_default():
         line.startswith("mul.f32 ${f32:operand.src")
         for line in template.splitlines()
     )
+
+
+def _fma_matmul(accumulate: str) -> str:
+    return textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: gmem<2x1xf32>, %b: gmem<2x1xf32>, %c: gmem<2x2xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {{
+            %a_rmem: rmem<2x1xf32> = alloc() attrs={{id: 0}}
+            %b_rmem: rmem<2x1xf32> = alloc() attrs={{id: 1}}
+            %acc: rmem<2x2xf32> = alloc() attrs={{id: 2}}
+            move(%a_rmem: rmem<2x1xf32>, %a: gmem<2x1xf32>)
+            move(%b_rmem: rmem<2x1xf32>, %b: gmem<2x1xf32>)
+            %seven: rmem<f32> = constant() attrs={{value: 7.0}}
+            elementwise fill(%acc: rmem<2x2xf32>, %seven: rmem<f32>)
+            matmul(%a_rmem: rmem<2x1xf32>, %b_rmem: rmem<2x1xf32>, %acc: rmem<2x2xf32>) collective=xyz.thread attrs={{accumulate: {accumulate}}}
+            move(%c: gmem<2x2xf32>, %acc: rmem<2x2xf32>)
+          }}
+        }}""")
+
+
+def test_overwriting_fma_matmul_zeroes_its_destination_first():
+    module = gpu_dialect.parse(_fma_matmul("False"))
+    lower_to_ptx_template(module)
+    [matmul] = [
+        op for op in find_ops_of_type(module, PTXTemplateOp)
+        if "fma.rn.f32" in op.template
+    ]
+    assert matmul.template.startswith(
+        "".join(f"mov.f32 ${{f32:operand.dst.r{r}}}, 0f00000000;\n" for r in range(4))
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("accumulate, base", [("False", 0.0), ("True", 7.0)])
+def test_accumulate_decides_whether_an_fma_matmul_overwrites_on_gpu(
+    accumulate, base,
+):
+    a = torch.tensor([[2.0], [3.0]], device="cuda")
+    b = torch.tensor([[5.0], [11.0]], device="cuda")
+    c = torch.empty((2, 2), device="cuda")
+    module = gpu_dialect.parse(_fma_matmul(accumulate))
+    make_ptx_launcher(make_ptx_kernel(module))(a, b, c)
+    torch.testing.assert_close(c, base + a @ b.T)

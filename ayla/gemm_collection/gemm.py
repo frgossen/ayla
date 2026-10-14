@@ -18,6 +18,7 @@ from ..passes.fuse_async import FuseAsync
 from ..passes.licm import LICM
 from ..passes.lower_to_async import LowerToAsync
 from ..passes.multi_buffer import MultiBuffer
+from ..passes.peel_loop import PeelLoop
 from ..passes.pipeline_loop import PipelineLoop
 from ..passes.promote_buffers import PromoteBuffers
 from ..passes.schedule_async import ScheduleAsync
@@ -82,6 +83,14 @@ def schedule_register_matmul(
         depth=operand_stages, label_filter=f"{label}_rhs_smem",
     ))
     pipeline.add_pass(LICM())
+    # Unroll kk and peel the first K step, so the reduction's first WGMMA is a
+    # single op the zeroed accumulator folds into as an overwrite.
+    pipeline.add_pass(UnrollLoop(
+        unroll_factor=operand_k_tile // 16,
+        label_filter=rf"{kk_label}(?:_tail\d+)?(?:_iter\d+)?",
+    ))
+    pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(PeelLoop(label_filter=k_label, front_iterations=1))
     pipeline.add_pass(UnrollLoop(
         unroll_factor=operand_stages, label_filter=k_label,
     ))
@@ -94,10 +103,6 @@ def schedule_register_matmul(
         label_filter_loop=k_label,
         label_filter_op=rf"{label}_(lhs|rhs)_smem_iter\d+_async",
         pipelining_offset=1,
-    ))
-    pipeline.add_pass(UnrollLoop(
-        unroll_factor=operand_k_tile // 16,
-        label_filter=rf"{kk_label}(?:_tail\d+)?(?:_iter\d+)?",
     ))
     pipeline.add_pass(FuseAsync())
     for _ in range(2):
