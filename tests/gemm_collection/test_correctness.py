@@ -6,6 +6,7 @@ import torch
 from ayla.base.ir import find_ancestor_of_type, find_ops_of_type
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    schedule_matmul,
 )
 from ayla.gemm_collection.dynamic_m import (
     _dynamic_m_schedule_heuristic,
@@ -20,6 +21,7 @@ from ayla.gpu_dialect import (
     TileOp,
     TmaDescType,
     WgrmemTensorType,
+    gpu_dialect,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -173,6 +175,47 @@ def test_fixed_output_grid_matches_torch():
     launcher(lhs, rhs, actual)
     torch.cuda.synchronize()
 
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+
+
+def _fixed_grid_module(fast_axis: str):
+    module = gpu_dialect.parse("""
+        module {
+          kernel @mm(%a: gmem<512x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<512x256xbf16>) {
+            matmul(%a: gmem<512x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<512x256xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
+          }
+        }
+    """)
+    return schedule_matmul(
+        module,
+        output_grid_size=3,
+        output_grid_fast_axis=fast_axis,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+
+
+def test_fixed_output_grid_traversal_follows_the_fast_axis():
+    m_fast = make_ptx_kernel(_fixed_grid_module("m")).ptx
+    assert m_fast != make_ptx_kernel(_fixed_grid_module("n")).ptx
+    with pytest.raises(ValueError, match="output_grid_fast_axis"):
+        _fixed_grid_module("k")
+
+
+@requires_cuda
+def test_m_fast_fixed_output_grid_matches_torch():
+    launcher = make_ptx_launcher(make_ptx_kernel(_fixed_grid_module("m")))
+    torch.manual_seed(29)
+    lhs = torch.randn((512, 64), dtype=BF16, device="cuda")
+    rhs = torch.randn((256, 64), dtype=BF16, device="cuda")
+    actual = torch.empty((512, 256), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
     torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
 
 
