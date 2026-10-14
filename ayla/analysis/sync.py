@@ -473,10 +473,13 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         # Clear every effect pending on this lock -- only the ones this await
         # fully orders were made pending on it. Effects it only partially orders
         # were never pending and stay live for a barrier.
+        settle = cast(LockType, op.lock.type).kind == "bulk"
         for buffer, effects in state.concurrent_memory_effects.items():
             state.concurrent_memory_effects[buffer] = {
-                effect for effect in effects
-                if effect.pending_await != op.lock
+                dataclasses.replace(effect, pending_await=None)
+                if settle and effect.pending_await == op.lock else effect
+                for effect in effects
+                if settle or effect.pending_await != op.lock
             }
         # An mbar await also completes a block-leader handoff: all threads wait
         # for t0's async work, so no arriving warp can lap the named barrier.
