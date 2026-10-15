@@ -6,7 +6,12 @@ from dataclasses import dataclass
 
 import torch
 from torch.fx import Node
-from torch._inductor.pattern_matcher import Match, PatternExpr, PatternMatcherPass
+from torch._inductor.pattern_matcher import (
+    MULTIPLE,
+    CallFunctionVarArgs,
+    Match,
+    PatternMatcherPass,
+)
 
 from .base.ir import Block, Op, Value
 from .fx_pipeline import register_fx_kernel_rewrite
@@ -44,6 +49,55 @@ class FxRegionMatch:
 
     output: Node
     inputs: tuple[Node, ...]
+
+
+# Discovery traverses exactly what ``fx_region_to_module`` can import.
+_SUPPORTED_FX_TARGETS = {
+    torch.ops.aten.mm.default,
+    torch.ops.aten.permute.default,
+    *_ELEMENTWISE_OPS,
+}
+
+
+def _is_supported_fx_node(node: Node) -> bool:
+    return node.op == "call_function" and node.target in _SUPPORTED_FX_TARGETS
+
+
+def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
+    """Find the maximal self-contained supported region ending at ``output``.
+
+    A node is considered an anchor only when no supported operation consumes
+    it. Walking backward then identifies supported computation and treats all
+    other producers as ordered region inputs. Values escaping from the middle
+    of the candidate make it ineligible for replacement.
+    """
+    if not _is_supported_fx_node(output) or any(
+        _is_supported_fx_node(user) for user in output.users
+    ):
+        return None
+
+    region: set[Node] = set()
+    boundary_set: set[Node] = set()
+    boundaries: list[Node] = []
+
+    def visit(node: Node) -> None:
+        if node in region or node in boundary_set:
+            return
+        if not _is_supported_fx_node(node):
+            boundary_set.add(node)
+            boundaries.append(node)
+            return
+        region.add(node)
+        for argument in node.all_input_nodes:
+            visit(argument)
+
+    visit(output)
+    if any(
+        node is not output and set(node.users) - region
+        for node in region
+    ):
+        return None
+    return FxRegionMatch(output=output, inputs=tuple(boundaries))
 
 
 def _node_type(node: Node) -> GmemTensorType:
@@ -233,38 +287,98 @@ def _match_signature(match: FxRegionMatch) -> TensorSignature:
 def make_fx_to_ayla_rewrite(
     patterns: PatternMatcherPass,
     *,
-    pattern: PatternExpr,
-    input_names: tuple[str, ...],
+    root: object,
     name: str,
     signature: list[Type],
     signature_mapping: list[OperandKind],
     compile_region: Callable[[ModuleOp], LauncherPlan],
-    extra_check: Callable[[Match], bool] | None = None,
+    accept: Callable[[FxRegionMatch], bool] | None = None,
     namespace: str = DEFAULT_NAMESPACE,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> None:
     """Build a rewrite that compiles matched FX regions through Ayla."""
+    if len(signature) != len(signature_mapping):
+        raise ValueError("signature and signature mapping must have equal length")
+    if signature_mapping[-1:] != [OperandKind.RESULT] or (
+        signature_mapping.count(OperandKind.RESULT) != 1
+    ):
+        raise ValueError("FX regions require exactly one final result")
+    if not all(isinstance(typ, GmemTensorType) for typ in signature):
+        raise ValueError("FX region signatures require gmem tensors")
+    expected_types = [
+        typ for typ in signature if isinstance(typ, GmemTensorType)
+    ]
     compiler = JITCompiler(
         name=name,
         signature=signature,
         compile_fn=compile_region,
     )
 
+    def region(torch_match: Match) -> FxRegionMatch | None:
+        candidate = discover_supported_fx_region(torch_match.output_node())
+        if candidate is None or not _matches_signature(
+            candidate, expected_types,
+        ):
+            return None
+        if accept is not None and not accept(candidate):
+            return None
+        return candidate
+
+    def resolve_inputs(torch_match: Match) -> tuple[Node, ...]:
+        candidate = region(torch_match)
+        if candidate is None:
+            raise RuntimeError("accepted FX match no longer describes a region")
+        return candidate.inputs
+
     def prepare(torch_match: Match, inputs: tuple[Node, ...]) -> None:
-        region = FxRegionMatch(torch_match.output_node(), inputs)
+        candidate = FxRegionMatch(torch_match.output_node(), inputs)
         compiler.prepare_module(
-            _match_signature(region),
-            fx_region_to_module(region, name=name),
+            _match_signature(candidate),
+            fx_region_to_module(candidate, name=name),
         )
 
     register_fx_kernel_rewrite(
         patterns,
-        pattern=pattern,
-        input_names=input_names,
+        pattern=CallFunctionVarArgs(root, users=MULTIPLE),
+        resolve_inputs=resolve_inputs,
         compiler=compiler,
         signature_mapping=signature_mapping,
-        extra_check=extra_check,
+        extra_check=lambda torch_match: region(torch_match) is not None,
         namespace=namespace,
         infer_result_shapes=infer_result_shapes,
         prepare=prepare,
     )
+
+
+def _matches_signature(
+    match: FxRegionMatch,
+    signature: list[GmemTensorType],
+) -> bool:
+    actual = (*match.inputs, match.output)
+    if len(actual) != len(signature):
+        return False
+
+    for node, expected in zip(actual, signature, strict=True):
+        tensor = node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type not in (
+            "cuda", "meta",
+        ):
+            return False
+        found = _node_type(node)
+        if found.dtype != expected.dtype or found.rank != expected.rank:
+            return False
+        if any(
+            declared is not None and declared != concrete
+            for declared, concrete in zip(
+                expected.sizes, found.sizes, strict=True,
+            )
+        ):
+            return False
+        if any(
+            declared is not None and declared != concrete
+            for declared, concrete in zip(
+                expected.strides, found.strides, strict=True,
+            )
+        ):
+            return False
+    return True
