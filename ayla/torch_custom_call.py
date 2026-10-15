@@ -32,6 +32,14 @@ def to_torch_dtype(dtype) -> torch.dtype:
             return torch_dtype
     raise ValueError(f"unsupported dtype: {dtype}")
 
+
+def from_torch_dtype(dtype: torch.dtype) -> Type:
+    """Return the Ayla scalar type corresponding to a Torch dtype."""
+    for ayla_dtype, torch_dtype in _TORCH_DTYPES:
+        if dtype == torch_dtype:
+            return type(ayla_dtype)()
+    raise ValueError(f"unsupported dtype: {dtype}")
+
 DEFAULT_NAMESPACE = "ayla"
 
 _LIBRARIES: dict[str, torch.library.Library] = {}
