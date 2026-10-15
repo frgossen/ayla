@@ -63,7 +63,11 @@ def _is_supported_fx_node(node: Node) -> bool:
     return node.op == "call_function" and node.target in _SUPPORTED_FX_TARGETS
 
 
-def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
+def discover_supported_fx_region(
+    output: Node,
+    *,
+    require_maximal: bool = True,
+) -> FxRegionMatch | None:
     """Find the maximal self-contained supported region ending at ``output``.
 
     A node is considered an anchor only when no supported operation consumes
@@ -71,8 +75,9 @@ def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
     other producers as ordered region inputs. Values escaping from the middle
     of the candidate make it ineligible for replacement.
     """
-    if not _is_supported_fx_node(output) or any(
-        _is_supported_fx_node(user) for user in output.users
+    if not _is_supported_fx_node(output) or (
+        require_maximal
+        and any(_is_supported_fx_node(user) for user in output.users)
     ):
         return None
 
@@ -293,6 +298,7 @@ def make_fx_to_ayla_rewrite(
     signature_mapping: list[OperandKind],
     compile_region: Callable[[ModuleOp], LauncherPlan],
     accept: Callable[[FxRegionMatch], bool] | None = None,
+    require_maximal: bool = True,
     namespace: str = DEFAULT_NAMESPACE,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> None:
@@ -315,7 +321,9 @@ def make_fx_to_ayla_rewrite(
     )
 
     def region(torch_match: Match) -> FxRegionMatch | None:
-        candidate = discover_supported_fx_region(torch_match.output_node())
+        candidate = discover_supported_fx_region(
+            torch_match.output_node(), require_maximal=require_maximal,
+        )
         if candidate is None or not _matches_signature(
             candidate, expected_types,
         ):
