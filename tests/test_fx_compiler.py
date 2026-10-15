@@ -56,6 +56,25 @@ def _gemm_region(
     return FxRegionMatch(output, (lhs, weight))
 
 
+def _addmm_region(
+    *, m: int = 128, n: int = 64, k: int = 64, beta: int = 1,
+) -> FxRegionMatch:
+    graph = Graph()
+    bias = _meta(graph.placeholder("bias"), (n,))
+    lhs = _meta(graph.placeholder("lhs"), (m, k))
+    weight = _meta(graph.placeholder("weight"), (n, k))
+    weight_t = _meta(graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, [1, 0]),
+    ), (k, n), strides=(1, k))
+    output = _meta(graph.call_function(
+        torch.ops.aten.addmm.default,
+        args=(bias, lhs, weight_t),
+        kwargs={} if beta == 1 else {"beta": beta},
+    ), (m, n))
+    graph.output(output)
+    return FxRegionMatch(output, (bias, lhs, weight))
+
+
 def test_gemm_fx_region_imports_to_high_level_gpu_ir():
     match = _gemm_region()
     module = fx_region_to_module(match, name="gemm")
@@ -90,6 +109,29 @@ def test_gemm_epilogue_imports_through_an_intermediate_allocation():
     assert epilogue.src(0) is allocation.result()
     assert epilogue.dst is kernel.body.arguments[-1]
     assert find_ops_of_type(module, MatmulOp) == [matmul]
+
+
+def test_addmm_initializes_the_matmul_from_the_broadcast_bias():
+    match = _addmm_region()
+    assert discover_supported_fx_region(match.output) == match
+    module = fx_region_to_module(match, name="addmm")
+
+    verify_gpu_dialect(module)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    bias, lhs, weight, output = kernel.body.arguments
+    assert isinstance(bias.type, GmemTensorType)
+    assert tuple(bias.type.sizes) == (128, 64)
+    assert tuple(bias.type.strides) == (0, 1)
+    [matmul] = kernel.body.ops
+    assert isinstance(matmul, MatmulOp)
+    assert (matmul.lhs, matmul.rhs, matmul.dst) == (lhs, weight, output)
+    assert matmul.init is bias
+
+
+def test_scaled_addmm_is_not_imported():
+    with pytest.raises(ValueError, match="scaled matmuls are unsupported"):
+        fx_region_to_module(_addmm_region(beta=2), name="addmm")
 
 
 def test_discovers_complete_gemm_region_and_ordered_inputs():
