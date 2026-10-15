@@ -2,6 +2,10 @@ import textwrap
 
 import pytest
 
+
+
+
+
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     AsyncOp,
@@ -694,3 +698,38 @@ def test_verification_rejects_unknown_grid_barrier_target():
 
     with pytest.raises(ValueError, match="no residency limit.*sm_101a"):
         verify_gpu_dialect(module)
+
+
+def test_multicast_invariant_coordinates_avoid_grid_enumeration(monkeypatch):
+    import importlib
+    verifier = importlib.import_module("ayla.passes.verify_gpu_dialect")
+    module = gpu_dialect.parse('''module {
+      kernel @load(%a: gmem<128x64xbf16>) grid_dim=[2, 2, 1] cluster_dim=[1, 2, 1] {
+        %bx: index, %by: index, %bz: index = block_ids()
+        %t: gmem<64x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
+        %s: smem<64x64xbf16 swizzle="128B"> = alloc()
+        move(%s: smem<64x64xbf16 swizzle="128B">, %t: gmem<64x64xbf16>) collective=xyz.cluster attrs={tma: True, multicast: True}
+      }
+    }''')
+    def enumeration_was_unnecessary(*args):
+        raise AssertionError("cluster-N cannot affect block-M coordinates")
+    monkeypatch.setattr(verifier, "_static_index", enumeration_was_unnecessary)
+    verifier.VerifyGpuDialect().run(module)
+
+
+def test_multicast_invariant_tile_with_varying_guard_is_rejected():
+    module = gpu_dialect.parse('''module {
+      kernel @load(%a: gmem<128x64xbf16>) grid_dim=[2, 2, 1] cluster_dim=[1, 2, 1] {
+        %bx: index, %by: index, %bz: index = block_ids()
+        %one: index = index_constant() attrs={value: 1}
+        %active: pred = index_lt(%by: index, %one: index)
+        if (%active: pred) {
+          %t: gmem<64x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
+          %s: smem<64x64xbf16 swizzle="128B"> = alloc()
+          move(%s: smem<64x64xbf16 swizzle="128B">, %t: gmem<64x64xbf16>) collective=xyz.cluster attrs={tma: True, multicast: True}
+        }
+      }
+    }''')
+    with pytest.raises(ValueError, match="different tiles within a cluster"):
+        verify_gpu_dialect(module)
+
