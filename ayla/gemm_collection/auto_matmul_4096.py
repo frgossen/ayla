@@ -34,7 +34,7 @@ def auto_matmul_4096_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>, %zero: rmem<f32>) collective=xyz.grid attrs={label: "mm"}
           }
         }""")

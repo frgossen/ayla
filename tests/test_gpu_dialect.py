@@ -65,15 +65,19 @@ def assert_print_and_roundtrip(op, expected):
 def test_constant_prints_and_roundtrips():
     assert_print_and_roundtrip(
         ConstantOp.build(1e-5, RmemTensorType.build([], F32Type())),
-        "%0: rmem<f32> = constant() attrs={value: 1e-05}",
+        "%0: rmem<f32> = constant 1e-05",
     )
     assert_print_and_roundtrip(
         ConstantOp.build(
             [1.0, 2.0, 3.0, 4.0],
             RmemTensorType.build([2, 2], F32Type()),
         ),
-        "%0: rmem<2x2xf32> = constant() "
-        "attrs={value: [1.0, 2.0, 3.0, 4.0]}",
+        "%0: rmem<2x2xf32> = constant [1.0, 2.0, 3.0, 4.0]",
+    )
+    ninf = ConstantOp.build(float("-inf"), RmemTensorType.build([], F32Type()))
+    ninf.attrs["label"] = "ninf"
+    assert_print_and_roundtrip(
+        ninf, '%0: rmem<f32> = constant -inf attrs={label: "ninf"}',
     )
 
 
@@ -89,7 +93,7 @@ def test_constant_represents_address_backed_memory_spaces(
 ):
     assert_print_and_roundtrip(
         ConstantOp.build(1.0, result_type),
-        f"%0: {expected_type} = constant() attrs={{value: 1.0}}",
+        f"%0: {expected_type} = constant 1.0",
     )
 
 

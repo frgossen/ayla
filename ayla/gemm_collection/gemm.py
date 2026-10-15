@@ -378,7 +378,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     module = gpu_dialect.parse(textwrap.dedent(f"""\
         module {{
           kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
-            %zero: rmem<f32> = constant() attrs={{value: 0.0}}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
           }}
         }}"""))

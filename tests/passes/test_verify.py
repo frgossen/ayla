@@ -210,7 +210,7 @@ def test_ptx_lowering_rejects_an_unpromoted_matmul_initializer():
         module {{
           kernel @k(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %acc: {acc} = alloc() attrs={{id: 0}}
-            %seven: rmem<f32> = constant() attrs={{value: 7.0}}
+            %seven: rmem<f32> = constant 7.0
             matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %acc: {acc}, %seven: rmem<f32>) collective=[xy.block, z.thread]
           }}
         }}"""))
