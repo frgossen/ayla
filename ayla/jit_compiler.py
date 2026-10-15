@@ -9,7 +9,8 @@ from .gpu_dialect import (
     ConstantOp, GmemTensorType, KernelOp, MatmulOp, ModuleOp, Type,
 )
 from .passes.specialize_shapes import specialize_shapes
-from .ptx_runtime import PtxLauncher
+from .ptx_codegen import PtxKernel
+from .ptx_runtime import PtxLauncher, make_ptx_launcher
 from .torch_custom_call import to_torch_dtype
 
 
@@ -95,6 +96,16 @@ class JITCompiler:
 
     def __call__(self, *tensors: torch.Tensor) -> None:
         self._launcher(tuple(tensors))(*tensors)
+
+
+class PtxRoutePlan:
+    """A single compiled PTX kernel route."""
+
+    def __init__(self, kernel: PtxKernel) -> None:
+        self.kernel = kernel
+
+    def __call__(self) -> Launcher:
+        return make_ptx_launcher(self.kernel)
 
 
 class ShapeSpecializingJITCompiler(JITCompiler):
