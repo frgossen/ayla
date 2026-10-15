@@ -414,6 +414,12 @@ class MatmulOp(GpuOp):
         return self.operands[3] if len(self.operands) == 4 else None
 
     @property
+    def accumulate(self) -> bool:
+        """Whether the matmul adds into ``dst``; ``accumulate: false`` overwrites
+        it with ``lhs @ rhs``, WGMMA's ``scale-d``."""
+        return cast(bool, self.attrs.get("accumulate", True))
+
+    @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
         return self.attrs["collective"]  # type: ignore[return-value]
 

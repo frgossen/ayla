@@ -132,6 +132,16 @@ def _lower_fill_ptx(op: ElementwiseOp) -> str:
     return "".join(f"mov.{suffix} {dst_reg}, {scalar};\n" for dst_reg in dst_regs)
 
 
+def _zero_dst_ptx(op: MatmulOp, registers: int) -> str:
+    """Zero an overwriting matmul's f32 destination ahead of accumulating."""
+    if op.accumulate:
+        return ""
+    return "".join(
+        f"mov.f32 ${{f32:operand.dst.r{reg}}}, 0f00000000;\n"
+        for reg in range(registers)
+    )
+
+
 def _elementwise_operand_regs(value: Value, operand_name: str) -> list[str]:
     return _register_operand_regs(value, operand_name)[1]
 
@@ -794,7 +804,7 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(
                 f"lower_async_matmul fma: dst shape must be {m_dim}x{n_dim}; got {dst.type}"
             )
-        template = ""
+        template = _zero_dst_ptx(op, m_dim * n_dim)
         for m in range(m_dim):
             for n in range(n_dim):
                 for k in range(k_dim):
@@ -852,7 +862,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"got {m_dim}x{k_dim} @ {k_dim}x{n_dim}"
             )
         in_dtype = lhs_type.dtype.name
-        template = ""
+        template = _zero_dst_ptx(op, n_dim // 8 * 4)
         for k_tile in range(k_dim // 16):
             a_base = k_tile * 4
             for n_tile in range(n_dim // 8):
@@ -1138,7 +1148,7 @@ class LowerToPtxTemplate(LoweringPass):
                       {{{regs}}},
                       ${{b64:desc_lhs{j}_{m_it}}},
                       ${{b64:{desc_rhs}}},
-                      1, 1, 1, 0, 0;
+                      {int(mm.accumulate)}, 1, 1, 0, 0;
                 """)
                 reg_offset += num_regs_per_wgmma
 

@@ -7,6 +7,7 @@ from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
+    ElementwiseOp,
     ForOp,
     IfOp,
     IndexConstantOp,
@@ -428,3 +429,24 @@ def test_tiling_schemes_are_refined_across_two_matmuls():
         {"dst_tiling_scheme": 1},
         {"dst_tiling_scheme": 3},
     ]
+
+
+def test_splitting_k_of_an_overwriting_matmul_zeroes_dst_and_accumulates():
+    acc = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: gmem<64x32xbf16>, %b: gmem<64x32xbf16>) {{
+            %acc: {acc} = alloc() attrs={{id: 0}}
+            matmul(%a: gmem<64x32xbf16>, %b: gmem<64x32xbf16>, %acc: {acc}) collective=xyz.grid attrs={{accumulate: False, label: "mm"}}
+          }}
+        }}"""))
+    tile_matmul(module, ["K"], [16], [None], ["k"], op_label_filter="mm")
+
+    [kernel] = module.body.ops
+    [fill] = find_ops_of_type(module, ElementwiseOp)
+    [loop] = find_ops_of_type(module, ForOp)
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    body = kernel.body.ops
+    assert fill.fn == "fill" and fill.dst is matmul.dst
+    assert body.index(fill) < body.index(loop)
+    assert matmul.accumulate
