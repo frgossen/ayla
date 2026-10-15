@@ -8,10 +8,12 @@ from ..gpu_dialect import (
     CollectiveLevel,
     ForOp,
     IfOp,
+    IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
+    IndexMulOp,
     IndexType,
     KernelOp,
     MatmulOp,
@@ -106,8 +108,8 @@ class TileMatmul(LoweringPass):
         sequential ``for`` loop, or a ``(CollectiveLevel, CollectiveAxis)``
         pair for a hardware dimension. An existing parallel launch extent may
         be larger than the logical tile count; excess workers are guarded. A
-        smaller extent remains a launch conflict; express multiple waves with
-        an explicit outer ``for`` tiling level.
+        smaller block grid visits the remaining logical tiles with a
+        grid-stride loop.
       - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
         ``None`` for an iteration mapped to a hardware dimension.
 
@@ -319,8 +321,14 @@ class TileMatmul(LoweringPass):
 
         for binding, extent in required.items():
             current = self._launch_extent(binding)
-            if current is not None and current > extent:
-                continue
+            if current is not None:
+                if current >= extent:
+                    continue
+                if (
+                    binding[0] == CollectiveLevel.BLOCK
+                    and self.iteration_bindings.count(binding) > 1
+                ):
+                    continue
             self._accumulate_constraint(binding, extent)
 
     def _launch_extent(
@@ -370,8 +378,42 @@ class TileMatmul(LoweringPass):
                     )
             new_ops.append(ids)
 
-        ivs: list[Value] = []
+        # A repeated block binding whose grid is smaller than its logical
+        # extent visits the remaining tiles with one grid-stride loop.
+        logical_extents: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        for binding, ub in zip(self.iteration_bindings, ubs, strict=True):
+            if binding is not None:
+                logical_extents[binding] = logical_extents.get(binding, 1) * ub
+        linear_ids = {
+            binding: parallel_ids[binding]
+            for binding in logical_extents
+        }
+        waves: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        wave_ops: list[Op] = []
+        grid_stride: ForOp | None = None
+        for binding, logical_extent in logical_extents.items():
+            launch_extent = self._launch_extent(binding)
+            if (
+                self.iteration_bindings.count(binding) == 1
+                or launch_extent is None
+                or launch_extent >= logical_extent
+            ):
+                continue
+            if grid_stride is not None:
+                raise ValueError(
+                    "TileMatmul supports one grid-stride block dimension"
+                )
+            assert binding[0] == CollectiveLevel.BLOCK
+            waves[binding] = -(-logical_extent // launch_extent)
+            grid_stride = ForOp.build(lb=0, ub=waves[binding])
+            stride = IndexConstantOp.build(launch_extent)
+            offset = IndexMulOp.build(grid_stride.iv, stride.result())
+            advanced = IndexAddOp.build(linear_ids[binding], offset.result())
+            wave_ops = [stride, offset, advanced]
+            linear_ids[binding] = advanced.result()
+
         iteration_ops: list[Op] = []
+        ivs: list[Value] = []
         divisors: dict[
             tuple[CollectiveLevel, CollectiveAxis], int
         ] = {}
@@ -382,7 +424,7 @@ class TileMatmul(LoweringPass):
             if binding is None:
                 iv = Value(name=label, type=IndexType())
             else:
-                linear_id = parallel_ids[binding]
+                linear_id = linear_ids[binding]
                 if self.iteration_bindings.count(binding) == 1:
                     divisors[binding] = ub
                     ivs.insert(0, linear_id)
@@ -400,7 +442,6 @@ class TileMatmul(LoweringPass):
                 ]
                 iv = mod.result()
             ivs.insert(0, iv)
-        new_ops.extend(iteration_ops)
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
@@ -481,7 +522,7 @@ class TileMatmul(LoweringPass):
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
 
-        parallel_extents = dict(divisors)
+        parallel_extents = dict(logical_extents)
         for i, iv, ub, binding, label in zip(
             reversed(range(len(self.iteration_bindings))),
             reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
@@ -492,10 +533,14 @@ class TileMatmul(LoweringPass):
                 if logical_extent is None:
                     continue
                 launch_extent = self._launch_extent(binding)
-                if launch_extent is not None and launch_extent > logical_extent:
-                    linear_id = parallel_ids[binding]
+                if (
+                    launch_extent is not None
+                    and launch_extent * waves.get(binding, 1) > logical_extent
+                ):
                     limit = IndexConstantOp.build(logical_extent)
-                    condition = IndexLtOp.build(linear_id, limit.result())
+                    condition = IndexLtOp.build(
+                        linear_ids[binding], limit.result(),
+                    )
                     body_ops = [
                         limit,
                         condition,
@@ -515,6 +560,10 @@ class TileMatmul(LoweringPass):
                 tiled_epilogue = []
 
         assert not tiled_epilogue, "TileMatmul: epilogue was never placed"
+        body_ops[:0] = [*wave_ops, *iteration_ops]
+        if grid_stride is not None:
+            grid_stride.body.ops = body_ops
+            body_ops = [grid_stride]
         new_ops.extend(body_ops)
         return new_ops
 
