@@ -10,23 +10,45 @@ congruent to ``lb`` modulo ``step``. That is enough to fold ``(iv + c) % m``
 whenever ``m`` divides the step, even though ``iv`` itself is not a constant --
 which is how a per-iteration buffer choice becomes a static one after
 unrolling multiplies the step.
+
+A second fact bounds hardware IDs by the enclosing kernel's launch
+dimensions, and loop variables by their loop. When x is known to stay below m,
+x % m folds to x and x / m folds to 0. Tiling passes produce this pattern when
+they split one hardware ID into several tile indices and the hardware axis
+already has exactly as many IDs as there are tiles. This relies on launch
+dimensions never growing afterwards, which the tiling passes enforce by
+rejecting conflicts.
 """
 from __future__ import annotations
 
+from typing import cast
+
 from ..gpu_dialect import (
+    HW_LEVEL_IDS,
+    CollectiveAxis,
+    CollectiveLevel,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexModOp,
     IndexMulOp,
+    KernelOp,
     MemTensorType,
     ModuleOp,
     PtrAddOp,
     SelectOp,
     TileOp,
+    launch_extent,
 )
-from ..base.ir import Block, Op, Value, clone_op, clone_type
+from ..base.ir import (
+    Block,
+    Op,
+    Value,
+    clone_op,
+    clone_type,
+    find_ancestor_of_type,
+)
 from ..base.lowering_pass import LoweringPass, lowers
 
 
@@ -85,6 +107,47 @@ class Folding(LoweringPass):
         if isinstance(mapped.definition, IndexConstantOp):
             return mapped.definition.value
         return None
+
+    def _range(self, value: Value) -> tuple[int, int] | None:
+        """Inclusive bounds of a non-negative index, if they are known.
+
+        Hardware IDs range over the enclosing kernel's launch, an induction
+        variable over its loop, and arithmetic over its operands' ranges.
+        """
+        # Folding only ever maps values to values.
+        value = cast(Value, self.value_map.get(value, value))
+        definition = value.definition
+        if isinstance(definition, IndexConstantOp):
+            c = definition.value
+            return (c, c) if c >= 0 else None
+        if (loop := _iv_loop(value)) is not None:
+            return (loop.lb, loop.ub - 1) if loop.lb >= 0 else None
+        for level, (id_op, _) in HW_LEVEL_IDS.items():
+            if level == CollectiveLevel.WARP:
+                continue
+            if isinstance(definition, id_op):
+                kernel = find_ancestor_of_type(definition, KernelOp)
+                assert kernel is not None
+                axis = definition.axis if hasattr(definition, "axis") else CollectiveAxis(definition.results.index(value))
+                extent = launch_extent(kernel, level, axis)
+                return None if extent is None else (0, extent - 1)
+        if not isinstance(
+            definition, (IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp),
+        ):
+            return None
+        lhs, rhs = self._range(definition.lhs), self._range(definition.rhs)
+        divides = isinstance(definition, (IndexDivOp, IndexModOp))
+        if rhs is None or divides and rhs[0] == 0:
+            return None
+        if isinstance(definition, IndexModOp):
+            return (0, rhs[1] - 1 if lhs is None else min(lhs[1], rhs[1] - 1))
+        if lhs is None:
+            return None
+        if isinstance(definition, IndexAddOp):
+            return (lhs[0] + rhs[0], lhs[1] + rhs[1])
+        if isinstance(definition, IndexMulOp):
+            return (lhs[0] * rhs[0], lhs[1] * rhs[1])
+        return (lhs[0] // rhs[1], lhs[1] // rhs[0])
 
     def _decompose_add(self, value: Value) -> tuple[Value | None, int]:
         """Strip the constant part from a value.
@@ -265,6 +328,10 @@ class Folding(LoweringPass):
             return [new_op], [new_op.result()]
         if rhs_val == 1:
             return [], [lhs]
+        bounds = self._range(op.lhs)
+        if rhs_val is not None and bounds is not None and bounds[1] < rhs_val:
+            new_op = IndexConstantOp.build(0)
+            return [new_op], [new_op.result()]
         return None
 
     @lowers(IndexModOp)
@@ -288,6 +355,11 @@ class Folding(LoweringPass):
         if loop is not None and rhs_val is not None and loop.step % rhs_val == 0:
             new_op = IndexConstantOp.build((loop.lb + offset) % rhs_val)
             return [new_op], [new_op.result()]
+
+        # A value already below the modulus is its own remainder.
+        bounds = self._range(op.lhs)
+        if rhs_val is not None and bounds is not None and bounds[1] < rhs_val:
+            return [], [self.value_map[op.lhs]]
         return None
 
     @lowers(PtrAddOp)
