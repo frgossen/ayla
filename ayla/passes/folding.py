@@ -120,9 +120,8 @@ class Folding(LoweringPass):
         if isinstance(definition, IndexConstantOp):
             c = definition.value
             return (c, c) if c >= 0 else None
-        if isinstance(definition, Block):
-            loop = _iv_loop(value)
-            return None if loop is None or loop.lb < 0 else (loop.lb, loop.ub - 1)
+        if (loop := _iv_loop(value)) is not None:
+            return (loop.lb, loop.ub - 1) if loop.lb >= 0 else None
         for level, (id_op, _) in HW_LEVEL_IDS.items():
             if level == CollectiveLevel.WARP:
                 continue
