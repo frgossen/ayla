@@ -49,7 +49,6 @@ def _seed(
         n % 8  # the TMA output row stride must be 16-byte aligned
         or captured.get("cluster_m_ctas", 1) != 1
         or captured.get("cluster_n_ctas", 1) != 1
-        or (transpose and operation == "addmm")
         or (fixed_grid and operation == "bmm")
     ):
         return None
@@ -125,11 +124,16 @@ def _module(
     c = f"gmem<{m}x{n}x{d}>"
     ct = f"gmem<{n}x{m}x{d} strides=[1, {n}]>"
     if operation == "addmm":
-        bias = f"gmem<{m}x{n}x{d} strides=[0, 1]>"
+        if transpose_output:
+            bias = f"gmem<{n}x{m}x{d} strides=[1, 0]>"
+            signature, operands = ct, f"%b: {bt}, %a: {a}, %c: {ct}"
+        else:
+            bias = f"gmem<{m}x{n}x{d} strides=[0, 1]>"
+            signature, operands = c, f"%a: {a}, %b: {bt}, %c: {c}"
         text = f"""\
             module {{
-              kernel @addmm(%bias: {bias}, %a: {a}, %b: {bt}, %c: {c}) {{
-                matmul(%a: {a}, %b: {bt}, %c: {c}, %bias: {bias}) collective=xyz.grid attrs={{label: "mm"}}
+              kernel @addmm(%bias: {bias}, %a: {a}, %b: {bt}, %c: {signature}) {{
+                matmul({operands}, %bias: {bias}) collective=xyz.grid attrs={{label: "mm"}}
               }}
             }}"""
     elif operation == "bmm":

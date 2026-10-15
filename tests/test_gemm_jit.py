@@ -1,7 +1,9 @@
 import pytest
 
-from ayla.gemm_jit import gemm_jit_compiler, select_gemm_schedule
+from ayla.base.ir import find_ops_of_type
+from ayla.gemm_jit import _DEFAULTS, _module, _seed, gemm_jit_compiler, select_gemm_schedule
 from ayla.gemm_schedule_table import CONFIGS, SCHEDULES
+from ayla.gpu_dialect import MatmulOp
 
 
 def test_measured_shape_selects_its_winner():
@@ -49,3 +51,17 @@ def test_specialization_builds_the_table_schedule(operation, monkeypatch):
     launcher = compiler._launcher(())
     assert launcher.name == operation
     assert compiler.cache_size == 1
+
+
+def test_addmm_transpose_uses_existing_column_major_view():
+    module=_module('addmm','bfloat16',1,256,512,128,True)
+    [mm]=find_ops_of_type(module,MatmulOp)
+    assert list(mm.lhs.type.sizes)==[512,128]
+    assert list(mm.dst.type.sizes)==[512,256]
+    assert list(mm.dst.type.strides)==[1,512]
+    assert list(mm.init_value.type.strides)==[1,0]
+
+def test_addmm_transpose_can_transfer_when_geometry_is_legal():
+    incumbent=select_gemm_schedule('addmm','bfloat16',16384,4096,1024)
+    cfg={**_DEFAULTS,**incumbent.captured_config,'transpose_output':True}
+    assert _seed(cfg,'addmm',16384,4096,1024,(1,16384,4096,1024),exact=False) is not None
