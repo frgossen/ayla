@@ -60,10 +60,21 @@ from ..gpu_dialect import (
 
 
 def _lower_mul_registers(
-    dst_regs: list[str], lhs_regs: list[str], rhs_regs: list[str],
+    dst_regs: list[str],
+    lhs_regs: list[str],
+    rhs_regs: list[str],
+    dtype: Type,
 ) -> str:
+    if isinstance(dtype, F32Type):
+        opcode = "mul.f32"
+    elif isinstance(dtype, BF16Type):
+        opcode = "mul.rn.bf16x2"
+    else:
+        raise NotImplementedError(
+            f"lower_elementwise: mul does not support {dtype}"
+        )
     return "".join(
-        f"mul.f32 {dst}, {lhs}, {rhs};\n"
+        f"{opcode} {dst}, {lhs}, {rhs};\n"
         for dst, lhs, rhs in zip(
             dst_regs, lhs_regs, rhs_regs, strict=True,
         )
@@ -169,23 +180,18 @@ def _lower_dtype_conversion_ptx(
     dst_dtype: Type,
 ) -> str:
     """Lower a conversion independently of the element-wise function."""
+    if isinstance(src_dtype, (BF16Type, F16Type)) and isinstance(dst_dtype, F32Type):
+        return _lower_packed16_to_f32_ptx(dst_regs, src_regs, src_dtype, dst_dtype)
     if (
-        isinstance(src_dtype, (BF16Type, F16Type))
-        and isinstance(dst_dtype, F32Type)
-    ):
-        return _lower_packed16_to_f32_ptx(
-            dst_regs, src_regs, src_dtype, dst_dtype,
-        )
-    if not (
         isinstance(src_dtype, F32Type)
         and isinstance(dst_dtype, (BF16Type, F16Type))
     ):
-        raise NotImplementedError(
-            f"lower_elementwise: unsupported conversion "
-            f"{src_dtype} -> {dst_dtype}"
+        return _lower_f32_to_packed16_ptx(
+            dst_regs, src_regs, src_dtype, dst_dtype,
         )
-    return _lower_f32_to_packed16_ptx(
-        dst_regs, src_regs, src_dtype, dst_dtype,
+    raise NotImplementedError(
+        f"lower_elementwise: unsupported conversion "
+        f"{src_dtype} -> {dst_dtype}"
     )
 
 
@@ -277,13 +283,14 @@ def _lower_mul_register_batches(
     dst_regs: list[str],
     src_regs: list[list[str]],
 ) -> str:
-    if not all(
-        isinstance(cast(MemTensorType, value.type).dtype, F32Type)
+    dtype = cast(MemTensorType, op.dst.type).dtype
+    if any(
+        cast(MemTensorType, value.type).dtype != dtype
         for value in op.operands
     ):
-        raise NotImplementedError("lower_elementwise: mul supports only f32")
+        raise NotImplementedError("lower_elementwise: mul requires matching operand dtypes")
     lhs_regs, rhs_regs = src_regs
-    return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs)
+    return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs, dtype)
 
 
 def _lower_silu_registers(
@@ -304,7 +311,7 @@ def _lower_silu_registers(
         if op.dst is src else dst_regs
     )
     template = _sigmoid_ptx(dst_dtype)(tmp_regs, src_regs)
-    template += _lower_mul_registers(dst_regs, src_regs, tmp_regs)
+    template += _lower_mul_registers(dst_regs, src_regs, tmp_regs, F32Type())
     return template
 
 
