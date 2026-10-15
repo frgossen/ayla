@@ -637,6 +637,8 @@ CONFIGS: tuple[dict[str, object], ...] = (
     dict(cluster_m_ctas=1, cluster_n_ctas=1, cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint='evict_last', lhs_l2_promotion='256B', multicast=False, operand_k_tile=64, operand_stages=3, output_cta_count=256, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=1, output_slices=1, output_store='stmatrix', output_store_buffers=1, output_tile_fast_axis='n', output_tiles_per_cta=1, output_tma_inner_size=128, ptx_optimization_level=3, reschedule_async=True, rhs_l2_cache_hint='evict_last', rhs_l2_promotion=None, rhs_tma_load_slices=None, swap_output_grid_axes=False, transpose_output=False, unroll_output_tiles=True, warpgroup_fast_axis='n', warpgroup_m_tile=None, warpgroup_n_tile=256),
     dict(cluster_m_ctas=1, cluster_n_ctas=1, cyclic_operand_pipeline=True, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint='evict_first', lhs_l2_promotion=None, multicast=False, operand_k_tile=64, operand_stages=5, output_cta_count=None, output_m_tile=128, output_n_tile=128, output_n_tiles_per_cta=1, output_slices=2, output_store='stmatrix', output_store_buffers=2, output_tile_fast_axis='n', output_tiles_per_cta=4, output_tma_inner_size=128, ptx_optimization_level=1, reschedule_async=True, rhs_l2_cache_hint='evict_last', rhs_l2_promotion=None, rhs_tma_load_slices=None, swap_output_grid_axes=True, transpose_output=False, unroll_output_tiles=True, warpgroup_fast_axis='n', warpgroup_m_tile=None, warpgroup_n_tile=128),
     dict(cluster_m_ctas=1, cluster_n_ctas=1, cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint='evict_first', lhs_l2_promotion=None, multicast=False, operand_k_tile=64, operand_stages=3, output_cta_count=264, output_m_tile=192, output_n_tile=192, output_n_tiles_per_cta=1, output_slices=4, output_store='stmatrix', output_store_buffers=1, output_tile_fast_axis='n', output_tiles_per_cta=1, output_tma_inner_size=None, ptx_optimization_level=1, reschedule_async=True, rhs_l2_cache_hint='evict_first', rhs_l2_promotion=None, rhs_tma_load_slices=None, swap_output_grid_axes=False, transpose_output=False, unroll_output_tiles=True, warpgroup_fast_axis='n', warpgroup_m_tile=None, warpgroup_n_tile=192),
+    dict(dst_l2_cache_hint=None, lhs_l2_cache_hint='evict_first', lhs_l2_promotion='128B', operand_k_tile=64, operand_stages=4, output_cta_count=None, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=4, output_slices=2, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=1, output_tma_inner_size=128, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_first', swap_output_grid_axes=True, transpose_output=True, unroll_output_tiles=True, warpgroup_n_tile=256),
+    dict(dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_first', operand_k_tile=64, operand_stages=2, output_cta_count=None, output_m_tile=128, output_n_tile=128, output_n_tiles_per_cta=1, output_slices=1, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=1, output_tma_inner_size=128, ptx_optimization_level=None, reschedule_async=True, rhs_l2_cache_hint='evict_first', transpose_output=True, unroll_output_tiles=True, warpgroup_n_tile=128),
 )
 
 # (operation, dtype) -> (batch, m, n, k) -> indices into CONFIGS, best first.
@@ -685,7 +687,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 4096, 4096, 128): (106,),
         (1, 4096, 4096, 1024): (607,),
         (1, 4096, 4096, 4096): (619, 608),
-        (1, 4096, 4096, 16384): (608,),
+        (1, 4096, 4096, 16384): (629, 608),
         (1, 4096, 6144, 1536): (69,),
         (1, 4096, 8192, 2048): (624, 69),
         (1, 4096, 10240, 2560): (69,),
@@ -708,7 +710,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 8192, 50272, 768): (10,),
         (1, 16384, 384, 768): (305,),
         (1, 16384, 768, 768): (601,),
-        (1, 16384, 768, 3072): (604,),
+        (1, 16384, 768, 3072): (473, 604),
         (1, 16384, 1024, 1024): (473, 605),
         (1, 16384, 1024, 4096): (610,),
         (1, 16384, 2304, 768): (616,),
@@ -734,7 +736,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 25344, 3072, 768): (620, 613),
         (1, 32768, 128, 128): (82,),
         (1, 32768, 128, 256): (82,),
-        (1, 32768, 128, 512): (83,),
+        (1, 32768, 128, 512): (630, 83),
         (1, 32768, 192, 192): (35,),
         (1, 32768, 192, 384): (55,),
         (1, 32768, 256, 128): (5,),
