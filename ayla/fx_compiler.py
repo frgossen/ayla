@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch.fx import Node
@@ -18,6 +19,7 @@ from .fx_pipeline import register_fx_kernel_rewrite
 from .jit_compiler import JITCompiler, LauncherPlan, TensorSignature
 from .gpu_dialect import (
     AllocOp,
+    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ConstantOp,
@@ -27,7 +29,9 @@ from .gpu_dialect import (
     KernelOp,
     MatmulOp,
     ModuleOp,
+    ReshapeOp,
     RmemTensorType,
+    TileOp,
     Type,
 )
 from .torch_custom_call import (
@@ -43,10 +47,12 @@ _ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
 }
 
 # Matmul FX targets mapped to the argument positions of their accumulator
-# initializer (``None`` for zero), LHS, and transposed-weight RHS.
+# initializer (``None`` for zero), LHS, and transposed-weight RHS. Rank-3
+# operands carry a leading batch dimension.
 _MATMUL_OPS: dict[object, tuple[int | None, int, int]] = {
     torch.ops.aten.mm.default: (None, 0, 1),
     torch.ops.aten.addmm.default: (0, 1, 2),
+    torch.ops.aten.bmm.default: (None, 0, 1),
 }
 
 
@@ -182,16 +188,34 @@ def _allocate(
 
 def _transpose_source(node: Node) -> Node | None:
     # TODO: Import arbitrary FX permutations once the GPU dialect can express
-    # strided aliasing views. For now, recognize only the 2D weight transpose
-    # that can be elided because Ayla matmul already expects an [N, K] RHS.
+    # strided aliasing views. For now, recognize only the weight transpose of
+    # the two innermost dimensions that can be elided because Ayla matmul
+    # already expects an [N, K] RHS.
     if (
         node.op != "call_function"
         or node.target is not torch.ops.aten.permute.default
         or len(node.args) != 2
-        or node.args[1] not in ([1, 0], (1, 0))
     ):
         return None
+    permutation = list(cast(list[int], node.args[1]))
+    rank = len(permutation)
+    if permutation != [*range(rank - 2), rank - 1, rank - 2]:
+        return None
     return _node_argument(node.args[0], owner=node)
+
+
+def _batch_matrix(value: Value, batch: Value, ops: list[Op]) -> Value:
+    """View the matrix at index ``batch`` of a rank-3 tensor."""
+    typ = value.type
+    assert isinstance(typ, GmemTensorType) and typ.rank == 3
+    tile = TileOp.build(value, [batch, 0, 0], GmemTensorType.build(
+        [1, *typ.sizes[1:]], typ.dtype, strides=list(typ.strides),
+    ))
+    matrix = ReshapeOp.build(tile.result(), GmemTensorType.build(
+        list(typ.sizes[1:]), typ.dtype, strides=list(typ.strides[1:]),
+    ))
+    ops.extend([tile, matrix])
+    return matrix.result()
 
 
 def fx_region_to_module(
@@ -216,6 +240,8 @@ def fx_region_to_module(
     output_value = Value(match.output.name, _node_type(match.output))
     ops: list[Op] = []
     matmul_index = 0
+    grid_dim: tuple[int | None, int | None, int | None] = (None, None, None)
+    batch_id: BlockIdOp | None = None
 
     for node in nodes:
         if node.op != "call_function":
@@ -246,7 +272,7 @@ def fx_region_to_module(
             rhs_source = _transpose_source(rhs_node)
             if rhs_source is None:
                 raise ValueError(
-                    f"{node.name}: matmul RHS must be a 2D transpose"
+                    f"{node.name}: matmul RHS must be a transposed weight"
                 )
             dst = _allocate(node, match.output, output_value, ops)
             label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
@@ -269,10 +295,27 @@ def fx_region_to_module(
                 init = values[bias] = Value(bias.name, _tensor_type(
                     _node_tensor(bias).expand(_node_tensor(node).shape),
                 ))
+            operands = [values[lhs_node], values[rhs_source], dst]
+            output_type = _node_type(node)
+            if output_type.rank == 3:
+                # Each grid z index computes the matmul of one batch.
+                batch = output_type.sizes[0]
+                if not isinstance(batch, int) or grid_dim[2] not in (
+                    None, batch,
+                ):
+                    raise ValueError(
+                        f"{node.name}: batch must be static and shared"
+                    )
+                grid_dim = (None, None, batch)
+                if batch_id is None:
+                    batch_id = BlockIdOp.build(CollectiveAxis.Z)
+                    ops.append(batch_id)
+                operands = [
+                    _batch_matrix(operand, batch_id.value, ops)
+                    for operand in operands
+                ]
             ops.append(MatmulOp.build(
-                values[lhs_node],
-                values[rhs_source],
-                dst,
+                *operands,
                 collective={
                     axis: CollectiveLevel.GRID for axis in CollectiveAxis
                 },
@@ -306,6 +349,7 @@ def fx_region_to_module(
             ],
             ops=ops,
         ),
+        grid_dim=grid_dim,
     )
     return ModuleOp.build(Block(ops=[kernel]))
 

@@ -13,11 +13,14 @@ from ayla.fx_compiler import (
 from ayla.gpu_dialect import (
     AllocOp,
     BF16Type,
+    BlockIdOp,
     ConstantOp,
     ElementwiseOp,
     GmemTensorType,
     KernelOp,
     MatmulOp,
+    ReshapeOp,
+    TileOp,
 )
 from ayla.gemm_collection.gemm import schedule_matmul
 from ayla.jit_compiler import PtxRoutePlan
@@ -132,6 +135,40 @@ def test_addmm_initializes_the_matmul_from_the_broadcast_bias():
 def test_scaled_addmm_is_not_imported():
     with pytest.raises(ValueError, match="scaled matmuls are unsupported"):
         fx_region_to_module(_addmm_region(beta=2), name="addmm")
+
+
+def test_bmm_imports_one_matmul_per_grid_z_batch():
+    graph = Graph()
+    lhs = _meta(graph.placeholder("lhs"), (3, 128, 64))
+    weight = _meta(graph.placeholder("weight"), (3, 32, 64))
+    weight_t = _meta(graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, [0, 2, 1]),
+    ), (3, 64, 32), strides=(2048, 1, 64))
+    output = _meta(graph.call_function(
+        torch.ops.aten.bmm.default, args=(lhs, weight_t),
+    ), (3, 128, 32))
+    graph.output(output)
+    match = discover_supported_fx_region(output)
+    assert match == FxRegionMatch(output, (lhs, weight))
+
+    module = fx_region_to_module(match, name="bmm")
+
+    verify_gpu_dialect(module)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    assert kernel.grid_dim == (None, None, 3)
+    [batch] = find_ops_of_type(module, BlockIdOp)
+    tiles = find_ops_of_type(module, TileOp)
+    assert [tile.arg for tile in tiles] == kernel.body.arguments
+    assert all(tile.indices[0] is batch.value for tile in tiles)
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert all(
+        isinstance(operand.definition, ReshapeOp)
+        for operand in (matmul.lhs, matmul.rhs, matmul.dst)
+    )
+    assert [tuple(operand.type.sizes) for operand in (
+        matmul.lhs, matmul.rhs, matmul.dst,
+    )] == [(128, 64), (32, 64), (128, 32)]
 
 
 def test_discovers_complete_gemm_region_and_ordered_inputs():

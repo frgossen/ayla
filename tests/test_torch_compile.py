@@ -8,32 +8,37 @@ from torch._inductor.utils import run_and_get_code
 from tests.testing_utils import requires_cuda
 
 
-def _gemm_graph(m: int, n: int, k: int):
+def _gemm_graph(m: int, n: int, k: int, *, batch: int | None = None):
     graph = Graph()
+    batch_dims = () if batch is None else (batch,)
     lhs = graph.placeholder("lhs")
     lhs.meta["val"] = torch.empty(
-        (m, k), dtype=torch.bfloat16, device="meta",
+        (*batch_dims, m, k), dtype=torch.bfloat16, device="meta",
     )
     weight = graph.placeholder("weight")
     weight.meta["val"] = torch.empty(
-        (n, k), dtype=torch.bfloat16, device="meta",
+        (*batch_dims, n, k), dtype=torch.bfloat16, device="meta",
     )
+    permutation = [1, 0] if batch is None else [0, 2, 1]
     weight_t = graph.call_function(
-        torch.ops.aten.permute.default, args=(weight, [1, 0]),
+        torch.ops.aten.permute.default, args=(weight, permutation),
     )
-    weight_t.meta["val"] = weight.meta["val"].t()
-    output = graph.call_function(
-        torch.ops.aten.mm.default, args=(lhs, weight_t),
-    )
+    weight_t.meta["val"] = weight.meta["val"].permute(permutation)
+    target = torch.ops.aten.mm if batch is None else torch.ops.aten.bmm
+    output = graph.call_function(target.default, args=(lhs, weight_t))
     output.meta["val"] = torch.empty(
-        (m, n), dtype=torch.bfloat16, device="meta",
+        (*batch_dims, m, n), dtype=torch.bfloat16, device="meta",
     )
     graph.output(output)
     return GraphModule({}, graph), lhs, weight
 
 
-def test_a_non_4096_gemm_is_routed_and_compiled():
-    module, lhs, weight = _gemm_graph(128, 64, 64)
+@pytest.mark.parametrize("op,batch,shape", [
+    ("gemm", None, (128, 64)),
+    ("bmm", 3, (3, 128, 64)),
+])
+def test_a_non_4096_gemm_is_routed_and_compiled(op, batch, shape):
+    module, lhs, weight = _gemm_graph(128, 64, 64, batch=batch)
 
     from ayla import torch_compile
 
@@ -42,9 +47,9 @@ def test_a_non_4096_gemm_is_routed_and_compiled():
         node for node in module.graph.nodes if node.op == "call_function"
     ]
     assert len(calls) == 1
-    assert calls[0].target is torch.ops.ayla.gemm.default
+    assert calls[0].target is getattr(torch.ops.ayla, op).default
     result = calls[0].target(lhs.meta["val"], weight.meta["val"])
-    assert result.shape == (128, 64)
+    assert result.shape == shape
 
 
 def test_a_gemm_with_an_unsupported_k_is_not_routed():
@@ -116,6 +121,27 @@ def test_a_biased_linear_compiles_to_one_ayla_addmm(shape):
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     assert code.count("torch.ops.ayla.addmm.default(") == 1
+    assert code.count("async_compile.triton") == 0
+
+
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
+@pytest.mark.parametrize("shape", [(16, 2048, 1024, 512), (3, 100, 192, 128)])
+def test_a_batched_matmul_compiles_to_one_ayla_bmm(shape):
+    b, m, n, k = shape
+    torch.manual_seed(0)
+    x = (torch.randn(b, m, k, device="cuda") * 0.02).to(torch.bfloat16)
+    w = (torch.randn(b, n, k, device="cuda") * 0.02).to(torch.bfloat16)
+
+    def fn(x, w):
+        return torch.bmm(x, w.transpose(1, 2))
+
+    expected = fn(x, w)
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert code.count("torch.ops.ayla.bmm.default(") == 1
     assert code.count("async_compile.triton") == 0
 
 
