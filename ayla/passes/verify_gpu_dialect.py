@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+from functools import cache
 import itertools
 import math
 
@@ -240,6 +241,28 @@ def _verify_cluster_shares_multicast_tile(
         elif isinstance(ancestor, IfOp):
             guards.append(ancestor.condition)
     indices = _multicast_tile_indices(op)
+    loop_ivs = {loop.body.arguments[0] for loop in loops}
+
+    @cache
+    def cluster_invariant(value: Value | int) -> bool:
+        if isinstance(value, int) or value in loop_ivs:
+            return True
+        definition = value.definition
+        if isinstance(definition, (BlockIdsOp, ClusterBlockIdsOp)):
+            return cluster[value.result_index] == 1
+        if isinstance(definition, IndexConstantOp):
+            return True
+        if isinstance(definition, (
+            IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp, IndexLtOp, SelectOp,
+        )):
+            return all(cluster_invariant(operand) for operand in definition.operands)
+        return False
+
+    # A pure expression whose inputs cannot vary within the cluster needs no
+    # grid enumeration. Include control predicates so inactive CTAs cannot be
+    # mistaken for participants. Unknown expressions retain the exact check.
+    if all(cluster_invariant(value) for value in [*indices, *guards]):
+        return
     leaves = _index_leaves([*indices, *guards])
     loops = [loop for loop in loops if loop.body.arguments[0] in leaves]
     ranges = [range(loop.lb, loop.ub, loop.step) for loop in loops]
