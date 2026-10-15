@@ -544,13 +544,15 @@ class VerifyGpuDialect(VerificationPass):
                 dst_type.rank != 2
                 or dst_type.sizes != src_type.sizes
                 or dst_type.dtype != src_type.dtype
-                or src_type.strides[0] % 2 != 0
-                or src_type.strides[1] != 1
+                or not (
+                    (src_type.strides[0] % 2 == 0 and src_type.strides[1] == 1)
+                    or (src_type.strides[1] == 0 and src_type.dtype.byte_size in (2, 4))
+                )
             )
         ):
             raise ValueError(
                 "address-to-WGRMEM move requires equal rank-2 shapes and dtypes "
-                "with element pairs contiguous and aligned in memory"
+                "with aligned contiguous element pairs or broadcast columns"
             )
 
     @verifies(TmaMoveOp)
