@@ -1,14 +1,11 @@
 """Dead code elimination.
 
-Removes side-effect-free ops whose results are unused.
-
-TODO: Also remove AllocOp and AwaitOp when their results/locks are
-unused — a dead alloc is harmless, and an await on a lock with no
-pending async ops is a no-op.
+Removes side-effect-free ops whose results are unused, along with empty async
+groups and their awaits.
 """
 from __future__ import annotations
 
-from ..gpu_dialect import ModuleOp, is_side_effect_free
+from ..gpu_dialect import AsyncOp, AwaitOp, ModuleOp, is_side_effect_free
 from ..base.ir import Block, Op
 from ..base.pipeline import Pass
 
@@ -20,6 +17,22 @@ def _collect_uses(block: Block, used: set[int]) -> None:
             used.add(id(v))
         for inner in op.blocks:
             _collect_uses(inner, used)
+
+
+def _in_empty_async_group(op: Op) -> bool:
+    """Whether ``op`` is an async without work, or an await on only those.
+
+    One makes no sense without the other, so a lock's asyncs and awaits go
+    together. Deciding from the lock alone gives every member the same answer,
+    whichever block it sits in.
+    """
+    if not isinstance(op, (AsyncOp, AwaitOp)):
+        return False
+    return all(
+        isinstance(user, AwaitOp)
+        or isinstance(user, AsyncOp) and not user.body.ops
+        for user in op.lock.users()
+    )
 
 
 class DCE(Pass):
@@ -42,7 +55,7 @@ class DCE(Pass):
         used: set[int] = set()
         kept: list[Op] = []
         for op in reversed(block.ops):
-            if is_side_effect_free(op) and not any(
+            if _in_empty_async_group(op) or is_side_effect_free(op) and not any(
                 id(r) in used for r in op.results
             ):
                 continue

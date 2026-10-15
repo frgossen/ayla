@@ -180,6 +180,33 @@ def test_async_and_body_collectives_must_match():
         verify_gpu_dialect(module)
 
 
+def test_async_must_have_await():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() {
+            %lock: lock<mbar> = alloc()
+            async(%lock: lock<mbar>) collective=xyz.block {
+            }
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="async lock must have a matching await"):
+        verify_gpu_dialect(module)
+
+
+def test_await_must_have_async():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @invalid() {
+            %lock: lock<mbar> = alloc()
+            await(%lock: lock<mbar>)
+          }
+        }"""))
+
+    with pytest.raises(ValueError, match="await lock must have matching async"):
+        verify_gpu_dialect(module)
+
+
 def test_default_verification_rejects_inconsistent_matmul_shapes():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
