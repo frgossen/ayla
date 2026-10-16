@@ -2,57 +2,152 @@
 import pytest
 import torch
 import torch._inductor.config as inductor_config
+from torch.fx import Graph, GraphModule
 from torch._inductor.utils import run_and_get_code
 
 from tests.testing_utils import requires_cuda
 
 
+def _gemm_graph(m: int, n: int, k: int, *, batch: int | None = None):
+    graph = Graph()
+    batch_dims = () if batch is None else (batch,)
+    lhs = graph.placeholder("lhs")
+    lhs.meta["val"] = torch.empty(
+        (*batch_dims, m, k), dtype=torch.bfloat16, device="meta",
+    )
+    weight = graph.placeholder("weight")
+    weight.meta["val"] = torch.empty(
+        (*batch_dims, n, k), dtype=torch.bfloat16, device="meta",
+    )
+    permutation = [1, 0] if batch is None else [0, 2, 1]
+    weight_t = graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, permutation),
+    )
+    weight_t.meta["val"] = weight.meta["val"].permute(permutation)
+    target = torch.ops.aten.mm if batch is None else torch.ops.aten.bmm
+    output = graph.call_function(target.default, args=(lhs, weight_t))
+    output.meta["val"] = torch.empty(
+        (*batch_dims, m, n), dtype=torch.bfloat16, device="meta",
+    )
+    graph.output(output)
+    return GraphModule({}, graph), lhs, weight
+
+
+@pytest.mark.parametrize("op,batch,shape", [
+    ("gemm", None, (128, 64)),
+    ("bmm", 3, (3, 128, 64)),
+])
+def test_a_non_4096_gemm_is_routed_and_compiled(op, batch, shape):
+    module, lhs, weight = _gemm_graph(128, 64, 64, batch=batch)
+
+    from ayla import torch_compile
+
+    assert torch_compile._POST_GRAD_PATTERNS.apply(module) == 1
+    calls = [
+        node for node in module.graph.nodes if node.op == "call_function"
+    ]
+    assert len(calls) == 1
+    assert calls[0].target is getattr(torch.ops.ayla, op).default
+    result = calls[0].target(lhs.meta["val"], weight.meta["val"])
+    assert result.shape == shape
+
+
+def test_a_gemm_with_an_unsupported_k_is_not_routed():
+    module, _, _ = _gemm_graph(128, 64, 32)
+
+    from ayla import torch_compile
+
+    assert torch_compile._POST_GRAD_PATTERNS.apply(module) == 0
+
+
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
-@pytest.mark.parametrize("fn,op", [
+@pytest.mark.parametrize("fn,op,shape", [
     pytest.param(
         lambda x, w: torch.sigmoid(x @ w.t()),
-        "auto_matmul_4096_wgmma256_wg_sigmoid_out",
+        "gemm_sigmoid_4096",
+        (4096, 4096, 4096),
         id="sigmoid_epilogue",
     ),
     pytest.param(
         lambda x, w: x @ w.t(),
-        "auto_matmul_4096_wgmma256_wg_out",
-        id="no_epilogue",
+        "gemm",
+        (4096, 4096, 4096),
+        id="plain_4096",
+    ),
+    pytest.param(
+        lambda x, w: x @ w.t(),
+        "gemm",
+        (128, 64, 64),
+        id="plain_non_4096",
     ),
 ])
-def test_a_matmul_compiles_to_one_ayla_kernel(fn, op):
-    """The epilogue, where there is one, is folded in rather than left over."""
+def test_a_matmul_region_compiles_to_one_ayla_kernel(fn, op, shape):
+    m, n, k = shape
     torch.manual_seed(0)
-    # Scaled so the sigmoid lands in its transition region rather than
-    # saturating, where any wrong function would still look about right.
-    x, w = (
-        (torch.randn(4096, 4096, device="cuda") * 0.02).to(torch.bfloat16)
-        for _ in range(2)
-    )
+    x = (torch.randn(m, k, device="cuda") * 0.02).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
     expected = fn(x, w)
 
-    # The backend is not part of the Inductor cache key, so a warm cache would
-    # serve a stock-compiled graph and the lowering would never run.
     with inductor_config.patch(force_disable_caches=True), torch.no_grad():
         actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
-    calls = [line for line in code.splitlines() if "torch.ops.ayla" in line]
+    calls = [
+        line for line in code.splitlines()
+        if f"torch.ops.ayla.{op}.default(" in line
+    ]
     assert len(calls) == 1
     assert op in calls[0]
-    # Nothing is left over to read the output back and apply the epilogue.
     assert code.count("async_compile.triton") == 0
 
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
-def test_a_second_reader_of_the_matmul_keeps_both_kernels():
-    """The fused kernel stores the sigmoid and never the matmul behind it.
+@pytest.mark.parametrize("shape", [(4096, 4096, 4096), (100, 192, 128)])
+def test_a_biased_linear_compiles_to_one_ayla_addmm(shape):
+    m, n, k = shape
+    torch.manual_seed(0)
+    x = (torch.randn(m, k, device="cuda") * 0.02).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    b = torch.randn(n, device="cuda").to(torch.bfloat16)
+    fn = torch.nn.functional.linear
+    expected = fn(x, w, b)
 
-    So it can only stand in where nothing else reads that. Fusing anyway would
-    leave the graph returning a buffer the kernel never wrote.
-    """
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, dynamic=False), x, w, b,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert code.count("torch.ops.ayla.addmm.default(") == 1
+    assert code.count("async_compile.triton") == 0
+
+
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
+@pytest.mark.parametrize("shape", [(16, 2048, 1024, 512), (3, 100, 192, 128)])
+def test_a_batched_matmul_compiles_to_one_ayla_bmm(shape):
+    b, m, n, k = shape
+    torch.manual_seed(0)
+    x = (torch.randn(b, m, k, device="cuda") * 0.02).to(torch.bfloat16)
+    w = (torch.randn(b, n, k, device="cuda") * 0.02).to(torch.bfloat16)
+
+    def fn(x, w):
+        return torch.bmm(x, w.transpose(1, 2))
+
+    expected = fn(x, w)
+    with inductor_config.patch(force_disable_caches=True), torch.no_grad():
+        actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert code.count("torch.ops.ayla.bmm.default(") == 1
+    assert code.count("async_compile.triton") == 0
+
+
+@requires_cuda
+@pytest.mark.usefixtures("ayla_installed")
+def test_a_shared_matmul_falls_back_to_the_plain_gemm_rule():
     torch.manual_seed(0)
     x, w = (
         (torch.randn(4096, 4096, device="cuda") * 0.02).to(torch.bfloat16)
@@ -67,17 +162,16 @@ def test_a_second_reader_of_the_matmul_keeps_both_kernels():
     with inductor_config.patch(force_disable_caches=True), torch.no_grad():
         actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
 
-    for got, want in zip(actual, expected):
+    for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
-    assert "auto_matmul_4096_wgmma256_wg_out" in code, "the matmul is still ayla's"
-    assert "_sigmoid_out" not in code, "but the epilogue cannot fold into it"
+    assert "torch.ops.ayla.gemm.default(" in code
+    assert "torch.ops.ayla.gemm_sigmoid_4096.default(" not in code
     assert code.count("async_compile.triton") == 1
 
 
 @requires_cuda
 @pytest.mark.usefixtures("ayla_installed")
-def test_a_matmul_off_the_gpu_is_declined():
-    """Shape and dtype match, device does not -- the kernels are cuda only."""
+def test_a_matmul_off_the_gpu_is_not_rewritten():
     torch.manual_seed(0)
     x, w = (
         (torch.randn(4096, 4096) * 0.02).to(torch.bfloat16) for _ in range(2)

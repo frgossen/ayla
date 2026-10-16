@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch.fx import Node
@@ -18,6 +19,7 @@ from .fx_pipeline import register_fx_kernel_rewrite
 from .jit_compiler import JITCompiler, LauncherPlan, TensorSignature
 from .gpu_dialect import (
     AllocOp,
+    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ConstantOp,
@@ -27,7 +29,9 @@ from .gpu_dialect import (
     KernelOp,
     MatmulOp,
     ModuleOp,
+    ReshapeOp,
     RmemTensorType,
+    TileOp,
     Type,
 )
 from .torch_custom_call import (
@@ -42,6 +46,15 @@ _ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
     torch.ops.aten.sigmoid.default: ("sigmoid", 1),
 }
 
+# Matmul FX targets mapped to the argument positions of their accumulator
+# initializer (``None`` for zero), LHS, and transposed-weight RHS. Rank-3
+# operands carry a leading batch dimension.
+_MATMUL_OPS: dict[object, tuple[int | None, int, int]] = {
+    torch.ops.aten.mm.default: (None, 0, 1),
+    torch.ops.aten.addmm.default: (0, 1, 2),
+    torch.ops.aten.bmm.default: (None, 0, 1),
+}
+
 
 @dataclass(frozen=True)
 class FxRegionMatch:
@@ -53,8 +66,8 @@ class FxRegionMatch:
 
 # Discovery traverses exactly what ``fx_region_to_module`` can import.
 _SUPPORTED_FX_TARGETS = {
-    torch.ops.aten.mm.default,
     torch.ops.aten.permute.default,
+    *_MATMUL_OPS,
     *_ELEMENTWISE_OPS,
 }
 
@@ -63,7 +76,11 @@ def _is_supported_fx_node(node: Node) -> bool:
     return node.op == "call_function" and node.target in _SUPPORTED_FX_TARGETS
 
 
-def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
+def discover_supported_fx_region(
+    output: Node,
+    *,
+    require_maximal: bool = True,
+) -> FxRegionMatch | None:
     """Find the maximal self-contained supported region ending at ``output``.
 
     A node is considered an anchor only when no supported operation consumes
@@ -71,8 +88,9 @@ def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
     other producers as ordered region inputs. Values escaping from the middle
     of the candidate make it ineligible for replacement.
     """
-    if not _is_supported_fx_node(output) or any(
-        _is_supported_fx_node(user) for user in output.users
+    if not _is_supported_fx_node(output) or (
+        require_maximal
+        and any(_is_supported_fx_node(user) for user in output.users)
     ):
         return None
 
@@ -100,11 +118,14 @@ def discover_supported_fx_region(output: Node) -> FxRegionMatch | None:
     return FxRegionMatch(output=output, inputs=tuple(boundaries))
 
 
-def _node_type(node: Node) -> GmemTensorType:
+def _node_tensor(node: Node) -> torch.Tensor:
     tensor = node.meta.get("val")
     if not isinstance(tensor, torch.Tensor):
         raise ValueError(f"{node.name}: missing tensor metadata")
+    return tensor
 
+
+def _tensor_type(tensor: torch.Tensor) -> GmemTensorType:
     def static(value: object) -> int | None:
         return value if isinstance(value, int) else None
 
@@ -113,6 +134,10 @@ def _node_type(node: Node) -> GmemTensorType:
         from_torch_dtype(tensor.dtype),
         strides=[static(stride) for stride in tensor.stride()],
     )
+
+
+def _node_type(node: Node) -> GmemTensorType:
+    return _tensor_type(_node_tensor(node))
 
 
 def _region_nodes(match: FxRegionMatch) -> list[Node]:
@@ -163,16 +188,34 @@ def _allocate(
 
 def _transpose_source(node: Node) -> Node | None:
     # TODO: Import arbitrary FX permutations once the GPU dialect can express
-    # strided aliasing views. For now, recognize only the 2D weight transpose
-    # that can be elided because Ayla matmul already expects an [N, K] RHS.
+    # strided aliasing views. For now, recognize only the weight transpose of
+    # the two innermost dimensions that can be elided because Ayla matmul
+    # already expects an [N, K] RHS.
     if (
         node.op != "call_function"
         or node.target is not torch.ops.aten.permute.default
         or len(node.args) != 2
-        or node.args[1] not in ([1, 0], (1, 0))
     ):
         return None
+    permutation = list(cast(list[int], node.args[1]))
+    rank = len(permutation)
+    if permutation != [*range(rank - 2), rank - 1, rank - 2]:
+        return None
     return _node_argument(node.args[0], owner=node)
+
+
+def _batch_matrix(value: Value, batch: Value, ops: list[Op]) -> Value:
+    """View the matrix at index ``batch`` of a rank-3 tensor."""
+    typ = value.type
+    assert isinstance(typ, GmemTensorType) and typ.rank == 3
+    tile = TileOp.build(value, [batch, 0, 0], GmemTensorType.build(
+        [1, *typ.sizes[1:]], typ.dtype, strides=list(typ.strides),
+    ))
+    matrix = ReshapeOp.build(tile.result(), GmemTensorType.build(
+        list(typ.sizes[1:]), typ.dtype, strides=list(typ.strides[1:]),
+    ))
+    ops.extend([tile, matrix])
+    return matrix.result()
 
 
 def fx_region_to_module(
@@ -182,19 +225,23 @@ def fx_region_to_module(
 ) -> ModuleOp:
     """Import one single-output FX region into unscheduled Ayla GPU IR.
 
-    The importer covers what GEMM regions need: a matmul whose RHS is a
-    transposed weight, followed by elementwise epilogues from
-    ``_ELEMENTWISE_OPS``. Unsupported operations fail explicitly.
+    The importer covers what GEMM regions need: a matmul from
+    ``_MATMUL_OPS`` whose RHS is a transposed weight, followed by elementwise
+    epilogues from ``_ELEMENTWISE_OPS``. Unsupported operations fail
+    explicitly.
     """
     if match.output in match.inputs:
         raise ValueError("FX region output cannot also be an input")
     nodes = _region_nodes(match)
+    region = set(nodes)
     values = {
         node: Value(node.name, _node_type(node)) for node in match.inputs
     }
     output_value = Value(match.output.name, _node_type(match.output))
     ops: list[Op] = []
     matmul_index = 0
+    grid_dim: tuple[int | None, int | None, int | None] = (None, None, None)
+    batch_id: BlockIdOp | None = None
 
     for node in nodes:
         if node.op != "call_function":
@@ -205,9 +252,8 @@ def fx_region_to_module(
         transpose_source = _transpose_source(node)
         if transpose_source is not None:
             if not all(
-                user.target is torch.ops.aten.mm.default
-                and len(user.args) == 2
-                and user.args[1] is node
+                user.target in _MATMUL_OPS
+                and user.args[_MATMUL_OPS[user.target][2]] is node
                 for user in node.users
             ):
                 raise ValueError(
@@ -216,27 +262,64 @@ def fx_region_to_module(
             values[node] = values[transpose_source]
             continue
 
-        if node.target is torch.ops.aten.mm.default:
-            lhs_node = _node_argument(node.args[0], owner=node)
-            rhs_node = _node_argument(node.args[1], owner=node)
+        matmul = _MATMUL_OPS.get(node.target)
+        if matmul is not None:
+            init_index, lhs_index, rhs_index = matmul
+            if any(node.kwargs.get(scale, 1) != 1 for scale in ("alpha", "beta")):
+                raise ValueError(f"{node.name}: scaled matmuls are unsupported")
+            lhs_node = _node_argument(node.args[lhs_index], owner=node)
+            rhs_node = _node_argument(node.args[rhs_index], owner=node)
             rhs_source = _transpose_source(rhs_node)
             if rhs_source is None:
                 raise ValueError(
-                    f"{node.name}: matmul RHS must be a 2D transpose"
+                    f"{node.name}: matmul RHS must be a transposed weight"
                 )
             dst = _allocate(node, match.output, output_value, ops)
             label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
             matmul_index += 1
-            zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
-            ops.append(zero)
+            if init_index is None:
+                zero = ConstantOp.build(
+                    0.0, RmemTensorType.build([], F32Type()),
+                )
+                ops.append(zero)
+                init = zero.result()
+            else:
+                bias = _node_argument(node.args[init_index], owner=node)
+                region_users = set(bias.users) & region
+                if bias not in match.inputs or region_users != {node}:
+                    raise ValueError(
+                        f"{node.name}: matmul bias must be a region input"
+                    )
+                # Torch broadcasts the bias to the output; Ayla reads the same
+                # memory through the zero strides of that broadcast view.
+                init = values[bias] = Value(bias.name, _tensor_type(
+                    _node_tensor(bias).expand(_node_tensor(node).shape),
+                ))
+            operands = [values[lhs_node], values[rhs_source], dst]
+            output_type = _node_type(node)
+            if output_type.rank == 3:
+                # Each grid z index computes the matmul of one batch.
+                batch = output_type.sizes[0]
+                if not isinstance(batch, int) or grid_dim[2] not in (
+                    None, batch,
+                ):
+                    raise ValueError(
+                        f"{node.name}: batch must be static and shared"
+                    )
+                grid_dim = (None, None, batch)
+                if batch_id is None:
+                    batch_id = BlockIdOp.build(CollectiveAxis.Z)
+                    ops.append(batch_id)
+                operands = [
+                    _batch_matrix(operand, batch_id.value, ops)
+                    for operand in operands
+                ]
             ops.append(MatmulOp.build(
-                values[lhs_node],
-                values[rhs_source],
-                dst,
+                *operands,
                 collective={
                     axis: CollectiveLevel.GRID for axis in CollectiveAxis
                 },
-                init=zero.result(),
+                init=init,
                 attrs={"label": label},
             ))
             values[node] = dst
@@ -266,6 +349,7 @@ def fx_region_to_module(
             ],
             ops=ops,
         ),
+        grid_dim=grid_dim,
     )
     return ModuleOp.build(Block(ops=[kernel]))
 
@@ -293,6 +377,7 @@ def make_fx_to_ayla_rewrite(
     signature_mapping: list[OperandKind],
     compile_region: Callable[[ModuleOp], LauncherPlan],
     accept: Callable[[FxRegionMatch], bool] | None = None,
+    require_maximal: bool = True,
     namespace: str = DEFAULT_NAMESPACE,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> None:
@@ -315,7 +400,9 @@ def make_fx_to_ayla_rewrite(
     )
 
     def region(torch_match: Match) -> FxRegionMatch | None:
-        candidate = discover_supported_fx_region(torch_match.output_node())
+        candidate = discover_supported_fx_region(
+            torch_match.output_node(), require_maximal=require_maximal,
+        )
         if candidate is None or not _matches_signature(
             candidate, expected_types,
         ):
