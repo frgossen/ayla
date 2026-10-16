@@ -1,20 +1,103 @@
-"""Shape-specializing JIT compilation and launch dispatch."""
+"""JIT compilation, tensor specialization, and launch dispatch."""
 from __future__ import annotations
 
 from collections.abc import Callable
-
 import torch
 
 from .base.ir import clone_op
 from .gpu_dialect import (
-    ConstantOp, GmemTensorType, KernelOp, MatmulOp, ModuleOp,
+    ConstantOp, GmemTensorType, KernelOp, MatmulOp, ModuleOp, Type,
 )
 from .passes.specialize_shapes import specialize_shapes
 from .ptx_runtime import PtxLauncher
 from .torch_custom_call import to_torch_dtype
 
 
-class ShapeSpecializingJITCompiler:
+TensorSignature = tuple[
+    tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...
+]
+Launcher = Callable[..., None]
+LauncherPlan = Callable[[], Launcher]
+
+
+class JITCompiler:
+    """Compile and dispatch launchers for concrete tensor signatures."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        signature: list[Type],
+        compile_fn: Callable[[ModuleOp], LauncherPlan],
+    ) -> None:
+        self.name = name
+        self.signature = signature
+        self._compile_fn = compile_fn
+        self._plans: dict[TensorSignature, LauncherPlan] = {}
+        self._cache: dict[
+            tuple[torch.device, TensorSignature], Launcher
+        ] = {}
+
+    def _metadata(
+        self, tensors: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.device, TensorSignature]:
+        if not tensors:
+            raise ValueError(f"{self.name}: shape dispatch requires a tensor")
+        device = tensors[0].device
+        if device.type != "cuda":
+            raise ValueError(f"{self.name}: expected CUDA tensors")
+        if any(tensor.device != device for tensor in tensors[1:]):
+            raise ValueError(f"{self.name}: all tensors must be on one CUDA device")
+        signature = tuple(
+            (
+                tuple(int(size) for size in tensor.shape),
+                tuple(int(stride) for stride in tensor.stride()),
+                tensor.dtype,
+            )
+            for tensor in tensors
+        )
+        return device, signature
+
+    def prepare_module(
+        self, signature: TensorSignature, module: ModuleOp,
+    ) -> None:
+        """Compile one specialization before its first runtime invocation."""
+        if signature not in self._plans:
+            self._plans[signature] = self._compile_fn(module)
+
+    def _prepare_signature(self, signature: TensorSignature) -> None:
+        raise RuntimeError(
+            f"{self.name}: no compiled specialization for tensor signature"
+        )
+
+    def _launcher(self, tensors: tuple[torch.Tensor, ...]) -> Launcher:
+        device, signature = self._metadata(tensors)
+        key = (device, signature)
+        launcher = self._cache.get(key)
+        if launcher is not None:
+            return launcher
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"{self.name}: route cache miss during CUDA graph capture; "
+                "invoke the kernel once before capture"
+            )
+        if signature not in self._plans:
+            self._prepare_signature(signature)
+        plan = self._plans.get(signature)
+        if plan is None:
+            raise RuntimeError(
+                f"{self.name}: no compiled specialization for tensor signature"
+            )
+        with torch.cuda.device(device):
+            launcher = plan()
+        self._cache[key] = launcher
+        return launcher
+
+    def __call__(self, *tensors: torch.Tensor) -> None:
+        self._launcher(tuple(tensors))(*tensors)
+
+
+class ShapeSpecializingJITCompiler(JITCompiler):
     """Cache one static PTX launcher per concrete tensor signature."""
 
     def __init__(
@@ -49,37 +132,21 @@ class ShapeSpecializingJITCompiler:
                 )
 
         self._module = module
-        self._compile_fn = compile_fn
-        self._cache: dict[tuple[object, ...], PtxLauncher] = {}
-
-    @property
-    def _kernel(self) -> KernelOp:
-        [kernel] = self._module.body.ops
-        assert isinstance(kernel, KernelOp)
-        return kernel
-
-    @property
-    def name(self) -> str:
-        return self._kernel.name
-
-    @property
-    def signature(self):
-        return self._kernel.signature
-
-    @property
-    def cache_size(self) -> int:
-        return len(self._cache)
+        self._compile_specialization = compile_fn
+        super().__init__(
+            name=kernel.name,
+            signature=kernel.signature,
+            compile_fn=self._compile_module,
+        )
 
     def _metadata(
         self, tensors: tuple[torch.Tensor, ...],
-    ) -> tuple[tuple[object, ...], list[tuple[int, ...]]]:
+    ) -> tuple[torch.device, TensorSignature]:
         if len(tensors) != len(self.signature):
             raise ValueError(
                 f"{self.name}: expected {len(self.signature)} tensors, "
                 f"got {len(tensors)}"
             )
-        if any(not tensor.is_cuda for tensor in tensors):
-            raise ValueError(f"{self.name}: all tensors must be CUDA tensors")
         if any(not tensor.is_contiguous() for tensor in tensors):
             raise ValueError(f"{self.name}: all tensors must be contiguous")
         device = tensors[0].device
@@ -92,29 +159,15 @@ class ShapeSpecializingJITCompiler:
                     f"{self.name}: expected dtype {typ.dtype}, got {tensor.dtype}"
                 )
 
-        shapes = [tuple(tensor.shape) for tensor in tensors]
-        # Dtype and layout are fixed by the validated template. The cache is
-        # process-local, so concrete shapes and CUDA device identify an entry.
-        return (device, tuple(shapes)), shapes
+        return super()._metadata(tensors)
 
-    def _launcher(self, tensors: tuple[torch.Tensor, ...]) -> PtxLauncher:
-        key, shapes = self._metadata(tensors)
-        launcher = self._cache.get(key)
-        if launcher is not None:
-            return launcher
+    def _compile_module(self, module: ModuleOp) -> LauncherPlan:
+        launcher = self._compile_specialization(module)
+        return lambda: launcher
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                f"{self.name}: specialization cache miss during CUDA graph "
-                "capture; invoke the kernel once before capture"
-            )
+    def _prepare_signature(self, signature: TensorSignature) -> None:
+        shapes = [shape for shape, _strides, _dtype in signature]
         module = clone_op(self._module, {})
         assert isinstance(module, ModuleOp)
         specialize_shapes(module, shapes)
-        launcher = self._compile_fn(module)
-        self._cache[key] = launcher
-        return launcher
-
-    def __call__(self, *tensors: torch.Tensor) -> None:
-        launcher = self._launcher(tuple(tensors))
-        launcher(*tensors)
+        self.prepare_module(signature, module)
