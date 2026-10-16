@@ -1,17 +1,32 @@
 import pytest
 import torch
-from torch.fx import Graph, Node
+from torch.fx import Graph, GraphModule, Node
+from torch._inductor.pattern_matcher import (
+    CallFunction,
+    KeywordArg,
+    PatternMatcherPass,
+)
 
 from ayla.base.ir import find_ops_of_type
-from ayla.fx_compiler import FxRegionMatch, fx_region_to_module
+from ayla.fx_compiler import (
+    FxRegionMatch,
+    fx_region_to_module,
+    make_fx_to_ayla_rewrite,
+)
 from ayla.gpu_dialect import (
     AllocOp,
+    BF16Type,
     ConstantOp,
     ElementwiseOp,
+    GmemTensorType,
     KernelOp,
     MatmulOp,
 )
+from ayla.gemm_collection.gemm import schedule_matmul
+from ayla.jit_compiler import PtxRoutePlan
 from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
+from ayla.ptx_codegen import make_ptx_kernel
+from ayla.torch_custom_call import OperandKind
 
 
 def _meta(node: Node, shape, dtype=torch.bfloat16, strides=None) -> Node:
@@ -104,3 +119,61 @@ def test_fx_region_import_rejects_unsupported_targets():
 
     with pytest.raises(ValueError, match="unsupported FX target"):
         fx_region_to_module(match, name="gemm_neg")
+
+
+def _compile_gemm(module):
+    scheduled = schedule_matmul(
+        module,
+        output_n_tile=64,
+        output_tma_inner_size=None,
+    )
+    return PtxRoutePlan(make_ptx_kernel(scheduled))
+
+
+def test_compiled_fx_rewrite_prepares_kernel_and_registers_meta_op():
+    match = _gemm_region()
+
+    patterns = PatternMatcherPass(pass_name="compiled_fx_gemm_test")
+    bf16 = BF16Type()
+    make_fx_to_ayla_rewrite(
+        patterns,
+        pattern=CallFunction(
+            torch.ops.aten.mm.default,
+            KeywordArg("lhs"),
+            CallFunction(
+                torch.ops.aten.permute.default,
+                KeywordArg("weight"),
+                [1, 0],
+            ),
+        ),
+        input_names=("lhs", "weight"),
+        name="compiled_fx_gemm",
+        signature=[
+            GmemTensorType.build([128, 64], bf16),
+            GmemTensorType.build([64, 64], bf16),
+            GmemTensorType.build([128, 64], bf16),
+        ],
+        signature_mapping=[
+            OperandKind.R, OperandKind.R, OperandKind.RESULT,
+        ],
+        compile_region=_compile_gemm,
+        namespace="ayla_compiled_fx_rewrite_test",
+    )
+    replacement = (
+        torch.ops.ayla_compiled_fx_rewrite_test.compiled_fx_gemm.default
+    )
+
+    module = GraphModule({}, match.output.graph)
+    assert patterns.apply(module) == 1
+
+    calls = [
+        node for node in module.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert len(calls) == 1
+    assert calls[0].target is replacement
+    result = replacement(
+        torch.empty((128, 64), dtype=torch.bfloat16, device="meta"),
+        torch.empty((64, 64), dtype=torch.bfloat16, device="meta"),
+    )
+    assert result.shape == (128, 64)
