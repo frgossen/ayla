@@ -2240,6 +2240,30 @@ class ConstantOp(GpuOp):
             if key != "value"
         }
 
+    def print(self, p: Printer) -> None:
+        self.results[0].print(p)
+        p.write(f" = {self.op_id} ")
+        p.write_attr(self.value)
+        p.write_extra_attrs(self.attrs, skip_keys=("value",))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ConstantOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        value = p.read_attr()
+        attrs = p.read_extra_attrs()
+        if "value" in attrs:
+            raise ValueError("constant value must not also appear in attrs")
+        return cls(
+            operands=[],
+            results=results,
+            attrs={"value": value, **attrs},
+        )
+
 
 @gpu_dialect.register_op("thread_id")
 class ThreadIdOp(GpuOp):

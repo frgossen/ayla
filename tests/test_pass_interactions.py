@@ -45,7 +45,7 @@ from tests.testing_utils import assert_contains_in_order
 MODULE_STR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) {
-        %zero: rmem<f32> = constant() attrs={value: 0.0}
+        %zero: rmem<f32> = constant 0.0
         matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>, %zero: rmem<f32>) collective=xyz.grid attrs={label: "mm"}
         elementwise sigmoid(%c: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={label: "epilogue"}
       }
@@ -294,7 +294,7 @@ def test_local_and_multicast_tma_loads_keep_separate_completion():
 TILED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
-        %zero: rmem<f32> = constant() attrs={value: 0.0}
+        %zero: rmem<f32> = constant 0.0
         %bx: index = block_id.x
         %by: index = block_id.y
         %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)
@@ -312,7 +312,7 @@ TILED_IR = textwrap.dedent("""\
 PROMOTED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
-        %zero: rmem<f32> = constant() attrs={value: 0.0}
+        %zero: rmem<f32> = constant 0.0
         %bx: index = block_id.x
         %by: index = block_id.y
         %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)

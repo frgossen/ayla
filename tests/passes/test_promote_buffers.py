@@ -23,7 +23,7 @@ def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>, %zero: rmem<f32>) collective=[x.wg, y.block, z.thread] attrs={label: "mm"}
           }
         }"""))
@@ -79,7 +79,7 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16 strides=[256, 1]> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c_wg: gmem<64x256xbf16 strides=[256, 1]>, %zero: rmem<f32>) collective=[x.wg, y.block, z.thread] attrs={dst_tiling_scheme: 7, label: "mm", lhs_tiling_scheme: 6}
@@ -92,7 +92,7 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<128x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
             %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
@@ -120,7 +120,7 @@ def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>, %zero: rmem<f32>) collective=[xy.block, z.thread] attrs={label: "mm"}
           }
         }"""))
@@ -132,7 +132,7 @@ def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
@@ -153,7 +153,7 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: gmem<64x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<64x256xbf16>, %zero: rmem<f32>) attrs={label: "mm"}
           }
         }"""))
@@ -169,7 +169,7 @@ def test_promotions_can_mark_unsafe_smem_reuse_groups():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>, %zero: rmem<f32>) attrs={label: "mm"}
           }
         }"""))
@@ -190,7 +190,7 @@ def test_wgrmem_tma_writeback_propagates_destination_move_attrs():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>, %zero: rmem<f32>) collective=[xy.block, z.thread] attrs={label: "mm"}
           }
         }"""))
@@ -209,7 +209,7 @@ def test_promote_gmem_matmul_operands_to_smem():
     module_str = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: rmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: rmem<128x128xf32>, %zero: rmem<f32>) collective=[xy.block, z.thread]
           }
         }""")
@@ -221,7 +221,7 @@ def test_promote_gmem_matmul_operands_to_smem():
     expected = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: rmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             %0: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             move(%0: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) collective=[xy.block, z.thread] attrs={tma: True}
             %1: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
@@ -311,7 +311,7 @@ def test_promote_lhs_rhs_preserves_init_on_matmul():
     module_str = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: rmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: rmem<128x128xf32>, %zero: rmem<f32>) collective=[xy.block, z.thread]
           }
         }""")
@@ -323,7 +323,7 @@ def test_promote_lhs_rhs_preserves_init_on_matmul():
     expected = textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: rmem<128x128xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             %0: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
             move(%0: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) collective=[xy.block, z.thread] attrs={tma: True}
             %1: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 1}
@@ -446,7 +446,7 @@ def test_epilogue_runs_on_the_promoted_accumulator():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>, %zero: rmem<f32>) collective=[xy.block, z.thread] attrs={label: "mm"}
             elementwise sigmoid(%c: gmem<64x256xbf16>, %c: gmem<64x256xbf16>) attrs={label: "epilogue"}
           }
@@ -461,7 +461,7 @@ def test_epilogue_runs_on_the_promoted_accumulator():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
-            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %zero: rmem<f32> = constant 0.0
             %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
