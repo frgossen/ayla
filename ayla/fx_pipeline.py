@@ -12,6 +12,13 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from .jit_compiler import JITCompiler
+from .torch_custom_call import (
+    DEFAULT_NAMESPACE,
+    OperandKind,
+    make_torch_custom_call,
+)
+
 
 def register_fx_rewrite(
     patterns: PatternMatcherPass,
@@ -42,3 +49,32 @@ def register_fx_rewrite(
         output.replace_all_uses_with(result)
         torch_match.erase_nodes()
         torch_match.graph.eliminate_dead_code()
+
+
+def register_fx_kernel_rewrite(
+    patterns: PatternMatcherPass,
+    *,
+    pattern: PatternExpr,
+    input_names: tuple[str, ...],
+    compiler: JITCompiler,
+    signature_mapping: list[OperandKind],
+    extra_check: Callable[[Match], bool] | None = None,
+    namespace: str = DEFAULT_NAMESPACE,
+    infer_result_shapes: Callable[..., list[tuple]] | None = None,
+    prepare: Callable[[Match, tuple[Node, ...]], None] | None = None,
+) -> None:
+    """Register a tensor-signature-routed kernel as one FX replacement."""
+    replacement = make_torch_custom_call(
+        compiler,
+        signature_mapping,
+        namespace=namespace,
+        infer_result_shapes=infer_result_shapes,
+    )
+    register_fx_rewrite(
+        patterns,
+        pattern=pattern,
+        input_names=input_names,
+        replacement=replacement,
+        extra_check=extra_check,
+        prepare=prepare,
+    )
