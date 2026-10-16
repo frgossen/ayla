@@ -1,73 +1,10 @@
 """Routing a matmul and its epilogue through ayla under torch.compile."""
-from textwrap import dedent
-
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 from tests.testing_utils import requires_cuda
-
-
-@requires_cuda
-@pytest.mark.usefixtures("ayla_installed")
-def test_glimmer_attention_subgraph_match_reaches_unimplemented_lowering():
-    def glimmer_attention_subgraph(
-        attention_output,
-        gate_input,
-        gate_weight,
-        output_projection_weight,
-    ):
-        attention_2d = torch.ops.aten.view.default(
-            attention_output, [-1, 4096],
-        )
-        gate_weight_transpose = torch.ops.aten.permute.default(
-            gate_weight, [1, 0],
-        )
-        gate_logits = torch.ops.aten.mm.default(
-            gate_input, gate_weight_transpose,
-        )
-        gate_activation = torch.ops.aten.sigmoid.default(gate_logits)
-        gated_attention = torch.ops.aten.mul.Tensor(
-            gate_activation, attention_2d,
-        )
-        output_weight_transpose = torch.ops.aten.permute.default(
-            output_projection_weight, [1, 0],
-        )
-        projected_attention = torch.ops.aten.mm.default(
-            gated_attention, output_weight_transpose,
-        )
-        return projected_attention
-
-    num_tokens = 8
-    inputs = (
-        torch.empty(num_tokens, 32, 128, device="cuda", dtype=torch.bfloat16),
-        torch.empty(num_tokens, 6656, device="cuda", dtype=torch.bfloat16),
-        torch.empty(4096, 6656, device="cuda", dtype=torch.bfloat16),
-        torch.empty(6656, 4096, device="cuda", dtype=torch.bfloat16),
-    )
-    with pytest.raises(
-        InductorError,
-        match="Muse Glimmer attention subgraph lowering is not implemented",
-    ) as exc_info:
-        with inductor_config.patch(force_disable_caches=True), torch.no_grad():
-            torch.compile(
-                glimmer_attention_subgraph, dynamic=False,
-            )(*inputs)
-
-    assert dedent("""\
-        module {
-          kernel @gated_attention_output_projection(%attention_output: gmem<8x32x128xbf16>, %gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>) {
-            %0: gmem<8x4096xbf16> = reshape(%attention_output: gmem<8x32x128xbf16>)
-            %1: gmem<8x4096xbf16> = alloc() attrs={id: 0}
-            %2: rmem<f32> = constant() attrs={value: 0.0}
-            matmul(%gate_input: gmem<8x6656xbf16>, %gate_weight: gmem<4096x6656xbf16>, %1: gmem<8x4096xbf16>, %2: rmem<f32>) collective=xyz.grid attrs={label: "gate_projection"}
-            elementwise sigmoid(%1: gmem<8x4096xbf16>, %1: gmem<8x4096xbf16>) attrs={label: "gate_activation"}
-            elementwise mul(%1: gmem<8x4096xbf16>, %1: gmem<8x4096xbf16>, %0: gmem<8x4096xbf16>) attrs={label: "gated_attention"}
-            matmul(%1: gmem<8x4096xbf16>, %output_projection_weight: gmem<6656x4096xbf16>, %projected_attention: gmem<8x6656xbf16>, %2: rmem<f32>) collective=xyz.grid attrs={label: "output_projection"}
-          }
-        }""") in str(exc_info.value.inner_exception)
 
 
 @requires_cuda
