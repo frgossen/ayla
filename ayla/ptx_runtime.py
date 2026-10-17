@@ -1,7 +1,8 @@
 """PTX custom calls: host-side glue for launching generated PTX kernels.
 
 A :class:`PtxLauncher` bundles:
-    - the PTX source (driver-JIT'd via ``cuModuleLoadDataEx``),
+    - the PTX source (driver-JIT'd via ``cuModuleLoadDataEx``), or the cubin
+      :func:`assemble_ptx` makes from it ahead of time, off the GPU,
     - a :class:`~ayla.ptx.PtxKernel` (entry point, grid/block/cluster dims,
       shared memory, and tensor-map setup),
     - the host-side wrapper that converts ``torch.Tensor`` args into kernel
@@ -12,7 +13,11 @@ side-effects out.
 """
 from __future__ import annotations
 
+import re
+import subprocess
+import tempfile
 from functools import cache
+from pathlib import Path
 from typing import Protocol, cast
 
 import torch
@@ -297,7 +302,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 class _LauncherExtension(Protocol):
-    def module_load_data(self, ptx: str, optimization_level: int) -> int: ...
+    def module_load_data(
+        self, ptx: str | bytes, optimization_level: int,
+    ) -> int: ...
 
     def module_unload(self, module: int) -> None: ...
 
@@ -328,22 +335,49 @@ def _get_ext() -> _LauncherExtension:
     )
 
 
+def assemble_ptx(kernel: PtxKernel, ptxas: str | Path) -> bytes:
+    """Assemble ``kernel``'s PTX into the cubin the driver's JIT would make.
+
+    The options mirror ``module_load_data``'s JIT options, so a ``ptxas``
+    from the driver's CUDA release emits identical SASS. Needs no GPU.
+    """
+    target = re.search(r"^\s*\.target\s+(\w+)", kernel.ptx, re.MULTILINE)
+    if target is None:
+        raise ValueError(f"{kernel.name}: PTX names no .target")
+    level = kernel.ptx_optimization_level
+    options = ["-lineinfo", *([] if level is None or level < 0 else [f"-O{level}"])]
+    with tempfile.TemporaryDirectory() as directory:
+        source, image = Path(directory, "kernel.ptx"), Path(directory, "kernel.cubin")
+        source.write_text(kernel.ptx)
+        result = subprocess.run(
+            [str(ptxas), f"-arch={target[1]}", *options, str(source), "-o", str(image)],
+            capture_output=True, text=True,
+        )
+        if result.returncode:
+            raise RuntimeError(f"{kernel.name}: ptxas failed: {result.stderr.strip()}")
+        return image.read_bytes()
+
+
 
 
 class PtxLauncher:
     """Opaque host-side function that launches a PTX kernel.
 
-    Constructed from a :class:`PtxKernel`. Calling the instance with
-    tensors performs all required host-side setup and issues the launch on
-    the current torch CUDA stream.
+    Constructed from a :class:`PtxKernel`, and optionally the cubin
+    :func:`assemble_ptx` made from it, which is then loaded instead of
+    JIT-compiling the PTX. Calling the instance with tensors performs all
+    required host-side setup and issues the launch on the current torch CUDA
+    stream.
     """
 
     def __init__(
         self,
         kernel: PtxKernel,
+        image: bytes | None = None,
     ):
         self._ext: _LauncherExtension | None = None
         self._kernel = kernel
+        self._image = image
         self._optimization_level = kernel.ptx_optimization_level
         self._module: int | None = None
         self._function: int | None = None
@@ -356,11 +390,13 @@ class PtxLauncher:
                 ti += 1
 
     def ensure_loaded(self) -> None:
-        """Load and JIT-compile the PTX without launching the kernel."""
+        """Load the cubin, or JIT-compile the PTX, without launching."""
         if self._module is None:
             self._ext = _get_ext()
+            # The driver takes a cubin through the same call; a cubin carries
+            # its own code, so the JIT options do not apply to it.
             self._module = self._ext.module_load_data(
-                self._kernel.ptx,
+                self._kernel.ptx if self._image is None else self._image,
                 self._optimization_level
                 if self._optimization_level is not None else -1,
             )
@@ -446,5 +482,7 @@ class PtxLauncher:
             pass
 
 
-def make_ptx_launcher(kernel: PtxKernel) -> PtxLauncher:
-    return PtxLauncher(kernel)
+def make_ptx_launcher(
+    kernel: PtxKernel, image: bytes | None = None,
+) -> PtxLauncher:
+    return PtxLauncher(kernel, image)

@@ -256,9 +256,41 @@ def _jit_heuristic_config(shape: Shape) -> ScheduleConfig | None:
     })
 
 
+# CPU-only processes that build and assemble kernels for this process; set
+# from --compile-workers. Zero leaves building to the GPU workers.
+_COMPILE_WORKERS = benchmark_common.COMPILE_WORKERS
+
+
+def _assemble_schedules(
+    shape: Shape, schedules: list[ScheduleConfig], timeout_s: float | None,
+) -> list[tuple | None]:
+    """Each schedule's ``(PtxKernel, cubin)`` or ``(error type, message)``.
+
+    Built in parallel off the GPUs, so a GPU worker only loads and times.
+    The JIT-routed configuration gets None: it times the library's own
+    compiler, in its GPU worker.
+    """
+    entries: list[tuple | None] = [None] * len(schedules)
+    if not _COMPILE_WORKERS:
+        return entries
+    indices = [i for i, s in enumerate(schedules) if s.name != JIT_HEURISTIC]
+    assembled = benchmark_common.assemble_kernels(
+        _build_ptx_kernel, [(shape, schedules[i]) for i in indices],
+        _COMPILE_WORKERS, timeout_s,
+    )
+    for i, entry in zip(indices, assembled, strict=True):
+        entries[i] = entry
+    return entries
+
+
 def _make_ayla_config(
-    shape: Shape, schedule: ScheduleConfig,
+    shape: Shape, schedule: ScheduleConfig, prebuilt: tuple | None = None,
 ) -> tuple[GemmBenchConfig, float, float]:
+    """Load one configuration's kernel and check it against Torch.
+
+    ``prebuilt`` is the ``(PtxKernel, cubin)`` :func:`_assemble_schedules`
+    made off the GPU; without it the kernel is built and JIT-compiled here.
+    """
     if schedule.name == JIT_HEURISTIC:
         from ayla.gemm_jit import gemm_op
 
@@ -266,6 +298,19 @@ def _make_ayla_config(
         return _bench_ayla_launcher(
             shape, schedule, gemm_op(shape.op, shape.dtype),
         )
+    from ayla.ptx_runtime import make_ptx_launcher
+
+    kernel, image = (
+        (_build_ptx_kernel(shape, schedule), None)
+        if prebuilt is None else prebuilt
+    )
+    return _bench_ayla_launcher(
+        shape, schedule, make_ptx_launcher(kernel, image),
+    )
+
+
+def _build_ptx_kernel(shape: Shape, schedule: ScheduleConfig):
+    """Schedule one configuration and lower it to PTX; needs no GPU."""
     # Keep Ayla's eagerly registered collection out of the CPU-only validation
     # path. Importing this submodule compiles the collection as a side effect.
     from ayla.gemm_collection.gemm import (
@@ -283,7 +328,6 @@ def _make_ayla_config(
     from ayla.passes.schedule_async import ScheduleAsync
     from ayla.passes.unroll_loop import UnrollLoop
     from ayla.ptx_codegen import make_ptx_kernel
-    from ayla.ptx_runtime import make_ptx_launcher
 
     if schedule.unsafe_reuse_smem:
         raise ValueError("unsafe SMEM reuse is excluded from this search")
@@ -452,9 +496,7 @@ def _make_ayla_config(
     if schedule.reschedule_async:
         module = ScheduleAsync().run(module)
         module = Canonicalize().run(module)
-    return _bench_ayla_launcher(
-        shape, schedule, make_ptx_launcher(make_ptx_kernel(module)),
-    )
+    return make_ptx_kernel(module)
 
 
 def _bench_ayla_launcher(
@@ -512,13 +554,20 @@ def _isolated_benchmark_worker(
     include_baseline: bool,
     timing: dict[str, Any],
     sender: Connection,
+    max_timing_rounds: int,
+    prebuilt: dict[str, tuple],
 ) -> None:
     """Build and time configs in a process the parent can safely terminate."""
+    # Spawn starts a fresh interpreter, so the parent's timing cap is not
+    # inherited through benchmark_common's module globals.
+    benchmark_common._MAX_ROUNDS = max_timing_rounds
     try:
         for schedule in schedules:
             sender.send(("started", schedule.name))
             try:
-                bench, max_abs, relative_rms = _make_ayla_config(shape, schedule)
+                bench, max_abs, relative_rms = _make_ayla_config(
+                    shape, schedule, prebuilt.get(schedule.name),
+                )
                 baseline = _baseline_config(shape)
                 torch_result, result = run([baseline, bench], **timing)
             except Exception as error:
@@ -576,6 +625,21 @@ def _benchmark_isolated(
     measurements: list[
         tuple[ScheduleConfig, dict[str, float] | None, str | None]
     ] = []
+    # Configurations that fail to build or assemble never reach a GPU worker.
+    prebuilt: dict[str, tuple] = {}
+    buildable = []
+    for schedule, entry in zip(
+        schedules, _assemble_schedules(shape, schedules, timeout_s), strict=True,
+    ):
+        if entry is not None and isinstance(entry[1], str):
+            error = f"{entry[0]}: {entry[1]}"
+            print(f"  reject {schedule.name}: {error}", flush=True)
+            measurements.append((schedule, None, error))
+            continue
+        if entry is not None:
+            prebuilt[schedule.name] = entry
+        buildable.append(schedule)
+    schedules = buildable
     position = 0
 
     while position < len(schedules):
@@ -585,6 +649,8 @@ def _benchmark_isolated(
             target=_isolated_benchmark_worker,
             args=(
                 shape, remaining, baseline is None, timing, sender,
+                benchmark_common._MAX_ROUNDS,
+                {s.name: prebuilt[s.name] for s in remaining if s.name in prebuilt},
             ),
         )
         process.start()
@@ -943,6 +1009,15 @@ def main() -> int:
             "cap rotated CUDA-event samples per benchmark configuration; "
             "twenty already measure far more precisely than a shape's "
             "result carries over to a model's forward graph"
+        ),
+    )
+    parser.add_argument(
+        "--compile-workers", type=int,
+        default=benchmark_common.COMPILE_WORKERS,
+        help=(
+            "CPU-only processes that build and assemble kernels ahead of "
+            "the GPU worker, in total: concurrent shards share them out; "
+            "0 builds and JIT-compiles in the GPU worker"
         ),
     )
     parser.add_argument(
@@ -1459,6 +1534,12 @@ def main() -> int:
         else args.timing
     )
     benchmark_common._MAX_ROUNDS = args.max_timing_rounds
+    if args.compile_workers < 0:
+        parser.error("--compile-workers must be nonnegative")
+    global _COMPILE_WORKERS
+    _COMPILE_WORKERS = args.compile_workers and max(
+        1, args.compile_workers // (args.num_shards * args.config_num_shards),
+    )
     # The isolated worker always times each candidate as an interleaved
     # [Torch, Ayla] pair, so pairing and the per-configuration watchdog are
     # compatible. ``--pair-each-config`` only selects the equivalent
@@ -1840,22 +1921,33 @@ def main() -> int:
             _write_raw(rows, args.output_json, args.output_csv)
             continue
 
-        for schedule in schedules:
-            try:
-                bench, max_abs, relative_rms = _make_ayla_config(shape, schedule)
-            except Exception as error:
-                rows.append(_result_row(
-                    shape, "ayla", schedule,
-                    error=f"{type(error).__name__}: {error}",
-                    search_scope=scope(schedule),
-                ))
-                print(f"  reject {schedule.name}: {type(error).__name__}: {error}")
-            else:
-                ayla_configs.append(bench)
-                built.append((
-                    schedule, max_abs, relative_rms,
-                    scope(schedule),
-                ))
+        for schedule, entry in zip(
+            schedules, _assemble_schedules(shape, schedules, None), strict=True,
+        ):
+            error = (
+                f"{entry[0]}: {entry[1]}"
+                if entry is not None and isinstance(entry[1], str) else None
+            )
+            if error is None:
+                try:
+                    bench, max_abs, relative_rms = _make_ayla_config(
+                        shape, schedule, entry,
+                    )
+                except Exception as exception:
+                    error = f"{type(exception).__name__}: {exception}"
+                else:
+                    ayla_configs.append(bench)
+                    built.append((
+                        schedule, max_abs, relative_rms,
+                        scope(schedule),
+                    ))
+                    continue
+            rows.append(_result_row(
+                shape, "ayla", schedule,
+                error=error,
+                search_scope=scope(schedule),
+            ))
+            print(f"  reject {schedule.name}: {error}")
 
         baseline = _baseline_config(shape)
         if args.pair_each_config:
