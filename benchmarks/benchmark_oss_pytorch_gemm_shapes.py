@@ -938,8 +938,12 @@ def main() -> int:
         help="time every candidate in its own interleaved Torch/Ayla pair",
     )
     parser.add_argument(
-        "--max-timing-rounds", type=int, default=200,
-        help="cap rotated CUDA-event samples per benchmark configuration",
+        "--max-timing-rounds", type=int, default=20,
+        help=(
+            "cap rotated CUDA-event samples per benchmark configuration; "
+            "twenty already measure far more precisely than a shape's "
+            "result carries over to a model's forward graph"
+        ),
     )
     parser.add_argument(
         "--timing", choices=("inference", "cold", "warm"), default="inference",
