@@ -15,6 +15,7 @@ from ayla import (
     apply_gemm_schedule_seed_post_build,
     select_gemm_schedules,
 )
+import benchmarks.common as benchmark_common
 from benchmarks.common import (
     assert_against_torch,
     gemm_bench_config,
@@ -35,17 +36,33 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--show-only", action="store_true")
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--json", type=Path)
+    parser.add_argument(
+        "--max-timing-rounds", type=int, default=20,
+        help=(
+            "cap rotated CUDA-event samples per configuration; twenty "
+            "already measure far more precisely than a shape's result "
+            "carries over to a model's forward graph"
+        ),
+    )
+    parser.add_argument(
+        "--compile-workers", type=int,
+        default=benchmark_common.COMPILE_WORKERS,
+        help=(
+            "CPU-only processes that build and assemble the seeds' kernels "
+            "before timing; 0 builds and JIT-compiles them one by one"
+        ),
+    )
     return parser
 
 
-def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
+def _build_ptx_kernel(m: int, n: int, k: int, seed: GemmScheduleSeed):
+    """Schedule one seed and lower it to PTX; needs no GPU."""
     from ayla.gemm_collection.gemm import (
         auto_matmul_4096_wgmma256_wg_tma_store_module,
         schedule_matmul,
     )
     from ayla.gpu_dialect import gpu_dialect
     from ayla.ptx_codegen import make_ptx_kernel
-    from ayla.ptx_runtime import make_ptx_launcher
 
     if seed.builder_config is None:
         raise ValueError("cannot build an unsupported GEMM schedule seed")
@@ -81,7 +98,20 @@ def _ayla_compute(m: int, n: int, k: int, seed: GemmScheduleSeed):
             **seed.builder_config,
         )
     module = apply_gemm_schedule_seed_post_build(module, seed)
-    return out_parameter_op(make_ptx_launcher(make_ptx_kernel(module)))
+    return make_ptx_kernel(module)
+
+
+def _ayla_compute(
+    m: int, n: int, k: int, seed: GemmScheduleSeed, prebuilt: tuple | None,
+):
+    """The seed's launcher, from its ``(PtxKernel, cubin)`` when prebuilt."""
+    from ayla.ptx_runtime import make_ptx_launcher
+
+    kernel, image = (
+        (_build_ptx_kernel(m, n, k, seed), None) if prebuilt is None
+        else prebuilt
+    )
+    return out_parameter_op(make_ptx_launcher(kernel, image))
 
 
 def _write_json(rows: list[dict[str, object]], path: Path) -> None:
@@ -125,9 +155,19 @@ def main() -> int:
         dtype=torch.float16,
     )]
     measured_seeds: list[GemmScheduleSeed | None] = [None]
+    benchmark_common._MAX_ROUNDS = args.max_timing_rounds
+    buildable = [seed for seed in selection.seeds if seed.builder_config is not None]
+    prebuilt = dict(zip(map(id, buildable), benchmark_common.assemble_kernels(
+        _build_ptx_kernel, [(args.m, args.n, args.k, seed) for seed in buildable],
+        min(args.compile_workers, len(buildable)), None,
+    ))) if args.compile_workers else {}
     for index, seed in enumerate(selection.seeds, 1):
         if seed.builder_config is None:
             print(f"skipping unsafe seed {index}")
+            continue
+        entry = prebuilt.get(id(seed))
+        if entry is not None and isinstance(entry[1], str):
+            print(f"skipping seed {index}: {entry[0]}: {entry[1]}")
             continue
         try:
             bench = gemm_bench_config(
@@ -136,7 +176,7 @@ def main() -> int:
                 n=args.n,
                 k=args.k,
                 compute=_ayla_compute(
-                    args.m, args.n, args.k, seed,
+                    args.m, args.n, args.k, seed, entry,
                 ),
                 dtype=torch.float16,
             )
