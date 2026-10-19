@@ -552,12 +552,15 @@ def _isolated_benchmark_worker(
     shape: Shape,
     schedules: tuple[ScheduleConfig, ...],
     include_baseline: bool,
-    timing: dict[str, Any],
+    timing: dict[str, Any] | None,
     sender: Connection,
     max_timing_rounds: int,
     prebuilt: dict[str, tuple],
 ) -> None:
-    """Build and time configs in a process the parent can safely terminate."""
+    """Build and time configs in a process the parent can safely terminate.
+
+    Without ``timing`` each config is only loaded and checked against Torch.
+    """
     # Spawn starts a fresh interpreter, so the parent's timing cap is not
     # inherited through benchmark_common's module globals.
     benchmark_common._MAX_ROUNDS = max_timing_rounds
@@ -568,6 +571,13 @@ def _isolated_benchmark_worker(
                 bench, max_abs, relative_rms = _make_ayla_config(
                     shape, schedule, prebuilt.get(schedule.name),
                 )
+                if timing is None:
+                    sender.send(("result", schedule.name, {
+                        "max_abs": max_abs, "relative_rms": relative_rms,
+                    }))
+                    del bench
+                    torch.cuda.empty_cache()
+                    continue
                 baseline = _baseline_config(shape)
                 torch_result, result = run([baseline, bench], **timing)
             except Exception as error:
@@ -610,23 +620,126 @@ def _stop_worker(process: Any) -> None:
         process.join(timeout=5)
 
 
+def _time_against_one_torch(
+    baseline: GemmBenchConfig, benches: list[GemmBenchConfig],
+    timing: dict[str, Any],
+) -> list[tuple[Any, Any]]:
+    """``(Torch result, result)`` per bench, timed together where they fit.
+
+    A group that runs out of device memory is halved, down to pairs.
+    """
+    try:
+        torch_result, *results = run([baseline, *benches], **timing)
+    except torch.cuda.OutOfMemoryError:
+        if len(benches) == 1:
+            raise
+        torch.cuda.empty_cache()
+        half = len(benches) // 2
+        return (
+            _time_against_one_torch(baseline, benches[:half], timing)
+            + _time_against_one_torch(baseline, benches[half:], timing)
+        )
+    return [(torch_result, result) for result in results]
+
+
+def _joint_timing_worker(
+    shape: Shape,
+    schedules: tuple[ScheduleConfig, ...],
+    timing: dict[str, Any],
+    sender: Connection,
+    max_timing_rounds: int,
+    prebuilt: dict[str, tuple],
+) -> None:
+    """Time already-checked configs in one rotation with a single Torch."""
+    benchmark_common._MAX_ROUNDS = max_timing_rounds
+    try:
+        benches = [
+            _make_ayla_config(shape, schedule, prebuilt.get(schedule.name))[0]
+            for schedule in schedules
+        ]
+        timed = _time_against_one_torch(_baseline_config(shape), benches, timing)
+        sender.send(("baseline", {
+            "latency_ms": timed[0][0].median_ms, "tflops": timed[0][0].tflops,
+        }))
+        for schedule, (_, result) in zip(schedules, timed, strict=True):
+            sender.send(("result", schedule.name, {
+                "latency_ms": result.median_ms,
+                "tflops": result.tflops,
+                "torch_pct": result.torch_mm_pct,
+            }))
+        sender.send(("done", None))
+    except BaseException as error:
+        try:
+            sender.send(("fatal", type(error).__name__, str(error)))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        sender.close()
+
+
+def _time_jointly(
+    shape: Shape,
+    schedules: list[ScheduleConfig],
+    timeout_s: float,
+    timing: dict[str, Any],
+    prebuilt: dict[str, tuple],
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Run :func:`_joint_timing_worker`; raise if it fails in any way."""
+    context = mp.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_joint_timing_worker, args=(
+        shape, tuple(schedules), timing, sender, benchmark_common._MAX_ROUNDS,
+        {s.name: prebuilt[s.name] for s in schedules if s.name in prebuilt},
+    ))
+    process.start()
+    sender.close()
+    baseline: dict[str, float] | None = None
+    results: dict[str, dict[str, float]] = {}
+    deadline = time.monotonic() + timeout_s * (len(schedules) + 1)
+    try:
+        while True:
+            if not receiver.poll(max(0.0, deadline - time.monotonic())):
+                raise RuntimeError("joint timing exceeded its timeout")
+            message = receiver.recv()
+            if message[0] == "baseline":
+                baseline = message[1]
+            elif message[0] == "result":
+                results[message[1]] = message[2]
+            elif message[0] == "done":
+                break
+            else:
+                raise RuntimeError(f"joint timing failed: {message[1:]}")
+    except EOFError:
+        raise RuntimeError(f"joint timing worker exited with {process.exitcode}")
+    finally:
+        if process.is_alive():
+            _stop_worker(process)
+        else:
+            process.join(timeout=5)
+        receiver.close()
+    assert baseline is not None
+    return baseline, results
+
+
 def _benchmark_isolated(
     shape: Shape,
     schedules: list[ScheduleConfig],
     timeout_s: float,
     timing: dict[str, Any],
+    pair_each_config: bool = False,
 ) -> tuple[
     dict[str, float] | None,
     list[tuple[ScheduleConfig, dict[str, float] | None, str | None]],
 ]:
-    """Benchmark schedules with a restartable per-configuration watchdog."""
-    context = mp.get_context("spawn")
-    baseline: dict[str, float] | None = None
-    measurements: list[
-        tuple[ScheduleConfig, dict[str, float] | None, str | None]
-    ] = []
+    """Benchmark schedules with a restartable per-configuration watchdog.
+
+    Configs are checked one per watchdog step, then timed together against
+    one Torch, which halves the GPU time of timing Torch beside each; with
+    ``pair_each_config``, or if joint timing fails, each is paired instead.
+    """
     # Configurations that fail to build or assemble never reach a GPU worker.
     prebuilt: dict[str, tuple] = {}
+    rejected: list[tuple[ScheduleConfig, dict[str, float] | None, str | None]] = []
     buildable = []
     for schedule, entry in zip(
         schedules, _assemble_schedules(shape, schedules, timeout_s), strict=True,
@@ -634,12 +747,56 @@ def _benchmark_isolated(
         if entry is not None and isinstance(entry[1], str):
             error = f"{entry[0]}: {entry[1]}"
             print(f"  reject {schedule.name}: {error}", flush=True)
-            measurements.append((schedule, None, error))
+            rejected.append((schedule, None, error))
             continue
         if entry is not None:
             prebuilt[schedule.name] = entry
         buildable.append(schedule)
-    schedules = buildable
+    if pair_each_config:
+        baseline, paired = _run_isolated(
+            shape, buildable, timeout_s, timing, prebuilt,
+        )
+        return baseline, rejected + paired
+    _, checks = _run_isolated(shape, buildable, timeout_s, None, prebuilt)
+    checked = [schedule for schedule, _, error in checks if error is None]
+    failed = rejected + [entry for entry in checks if entry[2] is not None]
+    if not checked:
+        return None, failed
+    try:
+        baseline, timed = _time_jointly(shape, checked, timeout_s, timing, prebuilt)
+    except RuntimeError as error:
+        print(f"  joint timing failed ({error}); pairing each config", flush=True)
+        baseline, paired = _run_isolated(shape, checked, timeout_s, timing, prebuilt)
+        return baseline, failed + paired
+    measured = []
+    for schedule, check, _ in checks:
+        if schedule.name in timed:
+            assert check is not None
+            measurement = {**timed[schedule.name], **check}
+            print(
+                f"  measured {schedule.name}: {measurement['latency_ms']:.4f}ms",
+                flush=True,
+            )
+            measured.append((schedule, measurement, None))
+    return baseline, failed + measured
+
+
+def _run_isolated(
+    shape: Shape,
+    schedules: list[ScheduleConfig],
+    timeout_s: float,
+    timing: dict[str, Any] | None,
+    prebuilt: dict[str, tuple],
+) -> tuple[
+    dict[str, float] | None,
+    list[tuple[ScheduleConfig, dict[str, float] | None, str | None]],
+]:
+    """Check, or check and time, each schedule in a restartable worker."""
+    context = mp.get_context("spawn")
+    baseline: dict[str, float] | None = None
+    measurements: list[
+        tuple[ScheduleConfig, dict[str, float] | None, str | None]
+    ] = []
     position = 0
 
     while position < len(schedules):
@@ -701,11 +858,12 @@ def _benchmark_isolated(
                     if current is None or message[1] != current.name:
                         raise RuntimeError("benchmark worker result mismatch")
                     measurements.append((current, message[2], None))
-                    print(
-                        f"  measured {current.name}: "
-                        f"{message[2]['latency_ms']:.4f}ms",
-                        flush=True,
-                    )
+                    if "latency_ms" in message[2]:
+                        print(
+                            f"  measured {current.name}: "
+                            f"{message[2]['latency_ms']:.4f}ms",
+                            flush=True,
+                        )
                     position += 1
                     current = None
                     deadline = time.monotonic() + timeout_s
@@ -1001,13 +1159,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--pair-each-config", action="store_true",
-        help="time every candidate in its own interleaved Torch/Ayla pair",
+        help=(
+            "time every candidate in its own interleaved Torch/Ayla pair, "
+            "instead of all of a shape's candidates against one Torch"
+        ),
     )
     parser.add_argument(
-        "--max-timing-rounds", type=int, default=20,
+        "--max-timing-rounds", type=int, default=5,
         help=(
             "cap rotated CUDA-event samples per benchmark configuration; "
-            "twenty already measure far more precisely than a shape's "
+            "five already measure far more precisely than a shape's "
             "result carries over to a model's forward graph"
         ),
     )
@@ -1274,6 +1435,11 @@ def main() -> int:
         "this percent of Torch",
     )
     parser.add_argument(
+        "--minimum-current-pct", type=float,
+        help="keep shapes whose current --ranking-json winner is at or above "
+        "this percent of Torch",
+    )
+    parser.add_argument(
         "--worst-shapes", type=int,
         help="select this many shapes with the greatest frequency-weighted "
         "Ayla latency deficit in --ranking-json",
@@ -1364,6 +1530,7 @@ def main() -> int:
         or args.documented_gap_ablation_only
         or args.candidate_json is not None
         or args.maximum_current_pct is not None
+        or args.minimum_current_pct is not None
     ):
         ranking_rows = _read_existing(args.ranking_json)
         torch_by_shape = {
@@ -1419,20 +1586,24 @@ def main() -> int:
             if shape.shape_id in explicit_candidates
         ]
 
-    if args.maximum_current_pct is not None:
+    if args.maximum_current_pct is not None or args.minimum_current_pct is not None:
         def within_current_pct(shape: Shape) -> bool:
             best = current_best(shape)
             baseline = torch_by_shape.get(shape.shape_id)
             if best is None:
                 return False
             value = best.get("torch_pct")
-            if value is not None:
-                return float(value) <= args.maximum_current_pct
+            if value is None:
+                if baseline is None:
+                    return False
+                value = (
+                    float(baseline["latency_ms"]) / float(best["latency_ms"]) * 100
+                )
             return (
-                baseline is not None
-                and float(baseline["latency_ms"])
-                / float(best["latency_ms"]) * 100
-                <= args.maximum_current_pct
+                (args.maximum_current_pct is None
+                 or float(value) <= args.maximum_current_pct)
+                and (args.minimum_current_pct is None
+                     or float(value) >= args.minimum_current_pct)
             )
         supported = [shape for shape in supported if within_current_pct(shape)]
 
@@ -1540,10 +1711,8 @@ def main() -> int:
     _COMPILE_WORKERS = args.compile_workers and max(
         1, args.compile_workers // (args.num_shards * args.config_num_shards),
     )
-    # The isolated worker always times each candidate as an interleaved
-    # [Torch, Ayla] pair, so pairing and the per-configuration watchdog are
-    # compatible. ``--pair-each-config`` only selects the equivalent
-    # in-process path when isolation is disabled.
+    # Isolated and in-process runs both time a shape's candidates against
+    # one Torch unless ``--pair-each-config`` pairs each with its own.
     if args.num_shards < 1:
         parser.error("--num-shards must be positive")
     if not 0 <= args.shard_index < args.num_shards:
@@ -1892,6 +2061,7 @@ def main() -> int:
         if args.config_timeout_seconds > 0:
             baseline_result, measurements = _benchmark_isolated(
                 shape, schedules, args.config_timeout_seconds, timing,
+                args.pair_each_config,
             )
             if baseline_result is not None:
                 rows.append(_result_row(
