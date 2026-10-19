@@ -37,9 +37,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--json", type=Path)
     parser.add_argument(
-        "--max-timing-rounds", type=int, default=20,
+        "--max-timing-rounds", type=int, default=5,
         help=(
-            "cap rotated CUDA-event samples per configuration; twenty "
+            "cap rotated CUDA-event samples per configuration; five "
             "already measure far more precisely than a shape's result "
             "carries over to a model's forward graph"
         ),

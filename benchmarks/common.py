@@ -8,6 +8,7 @@ would not be a comparison.
 
 from __future__ import annotations
 
+import atexit
 import csv
 import ctypes
 import dataclasses
@@ -164,9 +165,11 @@ def _build_and_assemble(build: Callable, args: tuple, ptxas: Path):
 
 @functools.cache
 def _assembler(workers: int):
-    return multiprocessing.get_context("spawn").Pool(
+    pool = multiprocessing.get_context("spawn").Pool(
         workers, initializer=_leave_gpus_alone,
     )
+    atexit.register(pool.terminate)
+    return pool
 
 
 def assemble_kernels(
