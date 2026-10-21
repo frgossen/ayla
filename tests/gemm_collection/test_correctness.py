@@ -1,11 +1,14 @@
 """Correctness tests for all GEMM kernels in the collection."""
 
+import textwrap
+
 import pytest
 import torch
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    schedule_matmul,
 )
 from ayla.gemm_collection.dynamic_m import (
     _dynamic_m_schedule_heuristic,
@@ -20,6 +23,7 @@ from ayla.gpu_dialect import (
     TileOp,
     TmaDescType,
     WgrmemTensorType,
+    gpu_dialect,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -467,3 +471,32 @@ def test_every_registered_kernel_is_covered():
         and getattr(ayla, name).default._schema.returns
     }
     assert registered <= covered, f"not exercised: {sorted(registered - covered)}"
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("dtype", "ir_dtype"),
+    [(torch.bfloat16, "bf16"), (torch.float16, "f16")],
+)
+def test_unswizzled_column_warpgroups_store_only_owned_slice(dtype, ir_dtype):
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: gmem<64x64x{ir_dtype}>, %b: gmem<256x64x{ir_dtype}>, %c: gmem<64x256x{ir_dtype}>) {{
+            matmul(%a: gmem<64x64x{ir_dtype}>, %b: gmem<256x64x{ir_dtype}>, %c: gmem<64x256x{ir_dtype}>) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+          }}
+        }}"""))
+    module = schedule_matmul(
+        module, output_m_tile=64, output_n_tile=256, warpgroup_n_tile=128,
+        operand_stages=2, output_slices=2, output_tma_inner_size=None,
+    )
+    kernel = make_ptx_kernel(module)
+    assert kernel.block_dim == (256, 1, 1)
+    run = make_ptx_launcher(kernel)
+    out = torch.empty(64, 256, dtype=dtype, device="cuda")
+    for seed in (1, 104729, 15485863):
+        torch.manual_seed(seed)
+        a = torch.randn(64, 64, dtype=dtype, device="cuda")
+        b = torch.randn(256, 64, dtype=dtype, device="cuda")
+        out.fill_(float("nan"))
+        run(a, b, out)
+        torch.testing.assert_close(out, a @ b.T, atol=0.25, rtol=0.01)

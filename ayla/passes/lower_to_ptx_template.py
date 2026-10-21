@@ -1776,6 +1776,17 @@ class LowerToPtxTemplate(LoweringPass):
             )
             address = "${b32:base}"
             space = "shared"
+        # Column-warpgroup gathers reuse one staging buffer across slices;
+        # honor the same writer ownership as the STMatrix store path.
+        writer_wg = op.attrs.get("writer_wg") if not is_load else None
+        predicate = ""
+        if writer_wg is not None:
+            template += textwrap.dedent(f"""\
+                mov.u32 ${{b32:store_tid}}, %tid.x;
+                shr.u32 ${{b32:store_wg}}, ${{b32:store_tid}}, 7;
+                setp.eq.u32 ${{pred:store_writer}}, ${{b32:store_wg}}, {writer_wg};
+            """)
+            predicate = "@${pred:store_writer} "
         # A pair is one packed BF16/F16 register or two F32 registers.
         f32 = isinstance(wgrmem_type.dtype, F32Type)
         instruction = f"{'ld' if is_load else 'st'}.{space}{'.v2' if f32 else ''}.b32"
@@ -1790,7 +1801,7 @@ class LowerToPtxTemplate(LoweringPass):
             location = f"[{address}+{offset}]"
             template += (
                 f"{instruction} {registers}, {location};\n" if is_load
-                else f"{instruction} {location}, {registers};\n"
+                else f"{predicate}{instruction} {location}, {registers};\n"
             )
 
         new_op = PTXTemplateOp.build(

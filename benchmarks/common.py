@@ -8,11 +8,17 @@ would not be a comparison.
 
 from __future__ import annotations
 
+import atexit
 import csv
+import ctypes
 import dataclasses
+import functools
 import math
+import multiprocessing
+import os
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -118,6 +124,90 @@ _GRAPH_WARMUP = 3      # launches on the capture stream before recording
 _GRAPH_LAUNCHES = 4
 _MIN_RUN_TIME_S = 0.5
 _MAX_ROUNDS = 200
+
+
+@functools.cache
+def _libcuda() -> ctypes.CDLL:
+    return ctypes.CDLL("libcuda.so.1")
+
+
+# Kernels are built and assembled ahead of their GPU worker by this many
+# CPU-only processes in total, shared out between concurrent shards.
+COMPILE_WORKERS = 128
+
+
+def driver_ptxas() -> Path:
+    """The ptxas of the driver's CUDA release, whose SASS matches its JIT's."""
+    version = ctypes.c_int()
+    if _libcuda().cuDriverGetVersion(ctypes.byref(version)):
+        raise RuntimeError("cuDriverGetVersion failed")
+    release = f"{version.value // 1000}.{version.value % 1000 // 10}"
+    ptxas = Path(f"/usr/local/cuda-{release}/bin/ptxas")
+    if not ptxas.exists():
+        raise FileNotFoundError(f"no ptxas for the driver's CUDA {release}: {ptxas}")
+    return ptxas
+
+
+def _leave_gpus_alone() -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.nice(19)  # timing processes keep the CPU when they need it
+
+
+def _build_and_assemble(build: Callable, args: tuple, ptxas: Path):
+    from ayla.ptx_runtime import assemble_ptx
+
+    try:
+        kernel = build(*args)
+        return kernel, assemble_ptx(kernel, ptxas)
+    except Exception as error:
+        return type(error).__name__, str(error)
+
+
+@functools.cache
+def _assembler(workers: int):
+    pool = multiprocessing.get_context("spawn").Pool(
+        workers, initializer=_leave_gpus_alone,
+    )
+    atexit.register(pool.terminate)
+    return pool
+
+
+def assemble_kernels(
+    build: Callable, items: list[tuple], workers: int, timeout_s: float | None,
+) -> list[tuple]:
+    """``build(*item)`` each kernel and assemble it, off the GPUs, in parallel.
+
+    Each entry is ``(PtxKernel, cubin)``, or ``(error type, message)`` for a
+    kernel that failed to build or assemble, or took over ``timeout_s``.
+    ``build`` must be a module-level function, so workers can import it.
+    """
+    if not items:
+        return []
+    pool = _assembler(workers)
+    ptxas = driver_ptxas()
+    pending = [
+        pool.apply_async(_build_and_assemble, (build, item, ptxas))
+        for item in items
+    ]
+    # Each kernel gets ``timeout_s``; queued ones wait for a free worker first.
+    deadline = None if timeout_s is None else (
+        time.monotonic() + timeout_s * math.ceil(len(items) / workers)
+    )
+    entries: list[tuple] = []
+    for result in pending:
+        try:
+            entries.append(result.get(
+                None if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            ))
+        except multiprocessing.TimeoutError:
+            entries.append(("compile_timeout", f"exceeded {timeout_s:g}s"))
+    if any(entry[0] == "compile_timeout" for entry in entries):
+        # A stuck build would hold its worker; start the next batch afresh.
+        pool.terminate()
+        _assembler.cache_clear()
+    return entries
+
 
 
 def torch_mm_nt(a: torch.Tensor, bt: torch.Tensor) -> torch.Tensor:
