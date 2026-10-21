@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+from functools import cache
+import itertools
 import math
 
-from ..base.ir import Op, Type, find_ancestor_of_type
+from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancestors
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
@@ -21,6 +23,13 @@ from ..gpu_dialect import (
     F64Type,
     ForOp,
     GmemTensorType,
+    IfOp,
+    IndexAddOp,
+    IndexConstantOp,
+    IndexDivOp,
+    IndexLtOp,
+    IndexModOp,
+    IndexMulOp,
     KernelOp,
     LockType,
     MatmulOp,
@@ -31,12 +40,14 @@ from ..gpu_dialect import (
     ReshapeOp,
     RmemTensorType,
     ConstantOp,
+    SelectOp,
     SmemTensorType,
     TileOp,
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
     is_column_major,
+    BlockIdsOp,
     join_collectives,
     physical_layout,
     root_buffer,
@@ -141,6 +152,166 @@ def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
         raise ValueError("TMA multicast requires at least two CTAs per cluster")
     if cluster_size > 16:
         raise ValueError("TMA multicast supports at most 16 CTAs per cluster")
+    if any(dim is not None for dim in kernel.grid_dim):
+        _verify_cluster_shares_multicast_tile(kernel, op)
+
+
+# Enumerating every CTA and loop iteration is exact but grows with the grid.
+# Beyond this many evaluations the multicast-tile check is skipped.
+_MAX_MULTICAST_TILE_EVALUATIONS = 1 << 20
+
+
+def _static_index(value: Value | int, env: dict[Value, int]) -> int | None:
+    """Evaluate static index arithmetic, or ``None`` if it is not static."""
+    if isinstance(value, int):
+        return value
+    if value in env:
+        return env[value]
+    op = value.definition
+    if not isinstance(op, Op):
+        return None
+    if isinstance(op, IndexConstantOp):
+        return op.attrs["value"]  # type: ignore[return-value]
+    binary = {
+        IndexAddOp: lambda a, b: a + b,
+        IndexMulOp: lambda a, b: a * b,
+        IndexDivOp: lambda a, b: a // b,
+        IndexModOp: lambda a, b: a % b,
+        IndexLtOp: lambda a, b: int(a < b),
+    }
+    if type(op) in binary:
+        lhs, rhs = (_static_index(operand, env) for operand in op.operands)
+        if lhs is None or rhs is None:
+            return None
+        return binary[type(op)](lhs, rhs)
+    if isinstance(op, SelectOp):
+        index = _static_index(op.index, env)
+        if index is None or not 0 <= index < len(op.cases):
+            return None
+        return _static_index(op.cases[index], env)
+    return None
+
+
+def _index_leaves(values: list[Value | int]) -> set[Value]:
+    """The values with no defining op that ``values`` are computed from."""
+    leaves: set[Value] = set()
+    stack = [value for value in values if isinstance(value, Value)]
+    seen: set[Value] = set()
+    while stack:
+        value = stack.pop()
+        if value in seen:
+            continue
+        seen.add(value)
+        op = value.definition
+        if isinstance(op, (BlockIdsOp, ClusterBlockIdsOp)) or isinstance(op, Block):
+            leaves.add(value)
+        elif isinstance(op, Op):
+            stack.extend(op.operands)
+    return leaves
+
+
+def _multicast_tile_indices(op: MoveOp | TmaMoveOp) -> list[Value | int]:
+    """The indices that select a multicast load's global tile."""
+    if isinstance(op, TmaMoveOp):
+        return list(op.indices)
+    indices: list[Value | int] = []
+    source = op.src
+    while isinstance(source.definition, TileOp):
+        indices.extend(source.definition.indices)
+        source = source.definition.arg
+    return indices
+
+
+def _verify_cluster_shares_multicast_tile(
+    kernel: KernelOp, op: MoveOp | TmaMoveOp,
+) -> None:
+    """Reject a multicast load whose cluster CTAs select different tiles.
+
+    Every CTA of a cluster receives the issuer's tile, so each must ask for
+    the same one. The check evaluates the static index arithmetic for every
+    CTA and loop iteration, which also covers linearized output grids.
+    """
+    grid = tuple(dim or 1 for dim in kernel.grid_dim)
+    cluster = tuple(dim or 1 for dim in kernel.cluster_dim)
+    loops: list[ForOp] = []
+    guards: list[Value] = []
+    for ancestor in iter_ancestors(op):
+        if isinstance(ancestor, ForOp):
+            loops.append(ancestor)
+        elif isinstance(ancestor, IfOp):
+            guards.append(ancestor.condition)
+    indices = _multicast_tile_indices(op)
+    loop_ivs = {loop.body.arguments[0] for loop in loops}
+
+    @cache
+    def cluster_invariant(value: Value | int) -> bool:
+        if isinstance(value, int) or value in loop_ivs:
+            return True
+        definition = value.definition
+        if isinstance(definition, (BlockIdsOp, ClusterBlockIdsOp)):
+            return cluster[value.result_index] == 1
+        if isinstance(definition, IndexConstantOp):
+            return True
+        if isinstance(definition, (
+            IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp, IndexLtOp, SelectOp,
+        )):
+            return all(cluster_invariant(operand) for operand in definition.operands)
+        return False
+
+    # A pure expression whose inputs cannot vary within the cluster needs no
+    # grid enumeration. Include control predicates so inactive CTAs cannot be
+    # mistaken for participants. Unknown expressions retain the exact check.
+    if all(cluster_invariant(value) for value in [*indices, *guards]):
+        return
+    leaves = _index_leaves([*indices, *guards])
+    loops = [loop for loop in loops if loop.body.arguments[0] in leaves]
+    ranges = [range(loop.lb, loop.ub, loop.step) for loop in loops]
+    evaluations = math.prod(grid) * math.prod(len(r) for r in ranges)
+    if evaluations > _MAX_MULTICAST_TILE_EVALUATIONS:
+        return
+    block_ids = [
+        leaf for leaf in leaves if isinstance(leaf.definition, BlockIdsOp)
+    ]
+    cluster_ids = [
+        leaf for leaf in leaves
+        if isinstance(leaf.definition, ClusterBlockIdsOp)
+    ]
+
+    def tile(block: tuple[int, ...], ivs: tuple[int, ...]):
+        env: dict[Value, int] = {}
+        for value in block_ids:
+            env[value] = block[value.result_index]
+        for value in cluster_ids:
+            env[value] = block[value.result_index] % cluster[value.result_index]
+        for loop, iv in zip(loops, ivs, strict=True):
+            env[loop.body.arguments[0]] = iv
+        if not all(_static_index(guard, env) for guard in guards):
+            return ()
+        return tuple(_static_index(index, env) for index in indices)
+
+    origins = itertools.product(
+        *(range(0, g, c) for g, c in zip(grid, cluster, strict=True))
+    )
+    for origin in origins:
+        members = [
+            tuple(o + d for o, d in zip(origin, offset, strict=True))
+            for offset in itertools.product(*(range(c) for c in cluster))
+        ]
+        for ivs in itertools.product(*ranges):
+            tiles = {member: tile(member, ivs) for member in members}
+            if any(None in t for t in tiles.values()):
+                return  # Not static: nothing to prove.
+            if len(set(tiles.values())) > 1:
+                (a, ta), (b, tb) = [
+                    (member, t) for member, t in tiles.items()
+                    if t != tiles[members[0]]
+                ][:1] + [(members[0], tiles[members[0]])]
+                raise ValueError(
+                    "multicast load selects different tiles within a "
+                    f"cluster: block {a} loads {ta or 'nothing'} but block "
+                    f"{b} loads {tb or 'nothing'}; the cluster must run "
+                    "along an axis on which the multicast tile is shared"
+                )
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -373,13 +544,15 @@ class VerifyGpuDialect(VerificationPass):
                 dst_type.rank != 2
                 or dst_type.sizes != src_type.sizes
                 or dst_type.dtype != src_type.dtype
-                or src_type.strides[0] % 2 != 0
-                or src_type.strides[1] != 1
+                or not (
+                    (src_type.strides[0] % 2 == 0 and src_type.strides[1] == 1)
+                    or (src_type.strides[1] == 0 and src_type.dtype.byte_size in (2, 4))
+                )
             )
         ):
             raise ValueError(
                 "address-to-WGRMEM move requires equal rank-2 shapes and dtypes "
-                "with element pairs contiguous and aligned in memory"
+                "with aligned contiguous element pairs or broadcast columns"
             )
 
     @verifies(TmaMoveOp)

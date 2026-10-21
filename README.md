@@ -83,6 +83,51 @@ shapes, and any exact-CTA adaptation, for example:
 pixi run python -m benchmarks.generate_oss_gemm_mapper --query 8192 768 768
 ```
 
+### JIT-routed GEMMs
+
+`ayla.gemm_jit` compiles FP16/BF16 `mm`, `addmm`, and `bmm` for any shape from
+the measured winners in `ayla/gemm_schedule_table.py`: a measured shape gets its
+own winner, any other shape the nearest measured shape's first schedule that is
+legal for it. `gemm_op(operation, dtype)` is the torch op
+(`op([bias,] a, bt, out)` writes `out = [bias +] a @ bt.T`), and
+`ayla.torch_compile.install()` routes native-layout `aten.mm`/`addmm`/`bmm` that
+have a schedule through it.
+
+`bench-oss --jit-heuristic` times exactly that routing: for every corpus shape
+it runs the JIT op against Torch, with the usual correctness check, isolated
+workers, and resumable raw rows (configuration `jit_heuristic`):
+
+```bash
+pixi run bench-oss --jit-heuristic --workload all --output-json .benchmarks/jit/oss.json --output-csv .benchmarks/jit/oss.csv
+```
+
+`--corpus` takes any corpus in the OSS format.
+`benchmarks/better_benchmark_gemm_shapes.json` holds better-benchmark's BF16
+GEMM shapes; give that run its own validation reports so it leaves the OSS ones
+alone:
+
+```bash
+pixi run bench-oss --jit-heuristic --workload all --corpus benchmarks/better_benchmark_gemm_shapes.json --validation-csv .benchmarks/jit/bb_validation.csv --validation-json .benchmarks/jit/bb_validation.json --output-json .benchmarks/jit/bb.json --output-csv .benchmarks/jit/bb.csv
+```
+
+To split a run across GPUs, start one shard per GPU with
+`--num-shards`, `--shard-index`, and its own output files, and pass
+`--skip-validation-write` so the shards do not rewrite the shared validation
+report, for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 pixi run bench-oss --jit-heuristic --workload all --skip-validation-write --num-shards 8 --shard-index 1 --output-json .benchmarks/jit/oss_1.json --output-csv .benchmarks/jit/oss_1.csv
+```
+
+`benchmarks/bench_better_benchmark.py` times better-benchmark's full graphs
+under stock Inductor and with `ayla.torch_compile.install()`, and prints the
+per-graph delta. It runs the `third_party/better-benchmark` submodule:
+
+```bash
+git submodule update --init third_party/better-benchmark
+pixi run python benchmarks/bench_better_benchmark.py --models-root repros/models/hf/infer --gpus 0,1,2,3,4,5,6,7
+```
+
 ### Using pixi
 
 If you don't already have pixi installed, get it with curl:
