@@ -4,7 +4,7 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import schedule_matmul, schedule_register_matmul
-from ayla.gpu_dialect import AsyncOp, MoveOp, gpu_dialect
+from ayla.gpu_dialect import AsyncOp, ModuleOp, MoveOp, gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
 
 
@@ -81,7 +81,7 @@ def test_register_matmul_schedules_side_by_side_gemms():
         }""")  # noqa: E501
 
 
-def test_register_matmul_keeps_multicast_and_local_loads_separate():
+def test_register_matmul_fuses_multicast_and_local_load_completion():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<64x16xbf16>) grid_dim=[1, 2, 1] block_dim=[128, 1, 1] cluster_dim=[1, 2, 1] {
@@ -101,6 +101,55 @@ def test_register_matmul_keeps_multicast_and_local_loads_separate():
         op for op in find_ops_of_type(module, AsyncOp)
         if op.body.ops and isinstance(op.body.ops[0], MoveOp)
     ]
-    assert len(load_groups) == 2
-    assert [group.is_tma_multicast for group in load_groups] == [True, False]
-    assert load_groups[0].collective != load_groups[1].collective
+    assert len(load_groups) == 1
+    [group] = load_groups
+    assert group.is_tma_multicast
+    assert len(group.body.ops) == 2
+    lhs_move, rhs_move = group.body.ops
+    assert isinstance(lhs_move, MoveOp)
+    assert isinstance(rhs_move, MoveOp)
+    assert [lhs_move.multicast, rhs_move.multicast] == [True, False]
+    assert group.collective == lhs_move.collective
+    assert group.collective != rhs_move.collective
+
+
+def test_second_hero_ignores_an_already_pipelined_singleton():
+    # The prior load was pipelined as a singleton, so its await precedes it.
+    # Scheduling the second GEMM leaves it as is and fuses only the new loads.
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @second_hero(%prior: gmem<64x16xbf16>, %lhs: gmem<64x16xbf16>, %rhs: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %prior_smem: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 100}
+            %prior_lock: lock<mbar> = alloc() attrs={id: 101}
+            await(%prior_lock: lock<mbar>)
+            async(%prior_lock: lock<mbar>) collective=xyz.block attrs={label: "prior_async"} move(%prior_smem: smem<64x16xbf16 swizzle="128B">, %prior: gmem<64x16xbf16>) collective=xyz.block attrs={label: "prior", tma: True}
+            %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 102, init: 0.0}
+            matmul(%lhs: gmem<64x16xbf16>, %rhs: gmem<64x16xbf16>, %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "second"}
+          }
+        }"""))  # noqa: E501
+
+    schedule_register_matmul(
+        label="second", operand_stages=1, operand_k_tile=16,
+    ).run(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @second_hero(%prior: gmem<64x16xbf16>, %lhs: gmem<64x16xbf16>, %rhs: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %prior_smem: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 100}
+            %prior_lock: lock<mbar> = alloc() attrs={id: 101}
+            await(%prior_lock: lock<mbar>)
+            async(%prior_lock: lock<mbar>) collective=xyz.block attrs={label: "prior_async"} move(%prior_smem: smem<64x16xbf16 swizzle="128B">, %prior: gmem<64x16xbf16>) collective=xyz.block attrs={label: "prior", tma: True}
+            %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 102, init: 0.0}
+            %0: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0, label: "second_lhs_smem"}
+            %1: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "second_rhs_smem"}
+            %2: lock<mbar> = alloc() attrs={id: 2}
+            %3: lock<wgmma> = alloc() attrs={id: 4}
+            async(%2: lock<mbar>) collective=xyz.block attrs={label: "second_lhs_smem_async"} {
+              move(%0: smem<64x16xbf16 swizzle="128B">, %lhs: gmem<64x16xbf16>) collective=xyz.block attrs={label: "second_lhs_smem", tma: True}
+              move(%1: smem<64x16xbf16 swizzle="128B">, %rhs: gmem<64x16xbf16>) collective=xyz.block attrs={label: "second_rhs_smem", tma: True}
+            }
+            await(%2: lock<mbar>)
+            async(%3: lock<wgmma>) collective=xyz.block attrs={label: "second_async"} matmul(%0: smem<64x16xbf16 swizzle="128B">, %1: smem<64x16xbf16 swizzle="128B">, %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "second"}
+            await(%3: lock<wgmma>)
+          }
+        }""")  # noqa: E501
