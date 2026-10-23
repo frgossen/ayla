@@ -68,8 +68,13 @@ def _insert_barriers(
                 raise NotImplementedError(
                     f"no lowering for barrier {target.scope.name}"
                 )
+            sync = (
+                barrier_syncs.get(op) if barrier_syncs is not None else None
+            )
+            # A cluster gather's id selects its mbarrier, the sync operand.
             attrs: dict[str, object] = (
-                {} if target.named_id is None else {"id": target.named_id}
+                {} if target.named_id is None or sync is not None
+                else {"id": target.named_id}
             )
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
                 assert num_threads is not None, (
@@ -81,9 +86,6 @@ def _insert_barriers(
                         f"warps; got {num_threads} threads"
                     )
                 attrs["num_threads"] = num_threads
-            sync = (
-                barrier_syncs.get(op) if barrier_syncs is not None else None
-            )
             if target.scope == BarrierScope.CLUSTER_TO_LEADER:
                 assert sync is not None
                 # Split the release: every warp arrives as soon as the
@@ -135,21 +137,24 @@ def _materialize_cluster_mbars(
     kernel: KernelOp,
     targets: BarrierTargetsType,
 ) -> dict[Op, Value]:
-    """Allocate one cluster mbarrier per cluster-to-leader barrier site."""
+    """Allocate one cluster mbarrier per cluster-to-leader barrier id.
+
+    Sites share an id once the analysis proves every CTA completed the id's
+    prior handoff, as they share a named barrier.
+    """
     barrier_syncs: dict[Op, Value] = {}
-    allocs: list[AllocOp] = []
-    # TODO: Track cluster-mbarrier lifetimes and reuse an allocation after a
-    # cluster/grid rendezvous proves that every CTA completed its prior use.
-    # Until then, allocate one mbarrier per static barrier site.
+    allocs: dict[object, AllocOp] = {}
     for op, target in targets.items():
         if target.scope != BarrierScope.CLUSTER_TO_LEADER:
             continue
-        alloc = AllocOp.build_with_fresh_id(
-            LockType.build(kind="cluster_mbar"),
-        )
-        allocs.append(alloc)
-        barrier_syncs[op] = alloc.result()
-    kernel.body.ops[0:0] = allocs
+        # A site without an id keeps an mbarrier of its own.
+        key = op if target.named_id is None else target.named_id
+        if key not in allocs:
+            allocs[key] = AllocOp.build_with_fresh_id(
+                LockType.build(kind="cluster_mbar"),
+            )
+        barrier_syncs[op] = allocs[key].result()
+    kernel.body.ops[0:0] = list(allocs.values())
     return barrier_syncs
 
 

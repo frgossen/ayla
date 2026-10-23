@@ -328,6 +328,57 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     assert ops.index(barriers[0]) == ops.index(read) + 1
 
 
+def test_cluster_gathers_share_an_mbarrier_after_its_handoff_ends():
+    load = (
+        "tma_move(%{s}: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) "
+        "collective=xyz.cluster attrs={{multicast: True}}"
+    )
+    a, b = load.format(s="sa"), load.format(s="sb")
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {{
+            %c0: index = index_constant() attrs={{value: 0}}
+            %sa: smem<16x16xf32> = alloc()
+            %sb: smem<16x16xf32> = alloc()
+            %r: rmem<16x16xf32> = alloc()
+            %la: lock<mbar> = alloc()
+            %lb: lock<mbar> = alloc()
+            async(%la: lock<mbar>) collective=xyz.cluster {a}
+            async(%lb: lock<mbar>) collective=xyz.cluster {b}
+            await(%la: lock<mbar>)
+            move(%r: rmem<16x16xf32>, %sa: smem<16x16xf32>)
+            async(%la: lock<mbar>) collective=xyz.cluster {a}
+            await(%lb: lock<mbar>)
+            move(%r: rmem<16x16xf32>, %sb: smem<16x16xf32>)
+            async(%lb: lock<mbar>) collective=xyz.cluster {b}
+            await(%la: lock<mbar>)
+            move(%r: rmem<16x16xf32>, %sa: smem<16x16xf32>)
+            async(%la: lock<mbar>) collective=xyz.cluster {a}
+            await(%la: lock<mbar>)
+            await(%lb: lock<mbar>)
+          }}
+        }}"""))
+
+    insert_syncs(module)
+
+    waits = [
+        op for op in find_ops_of_type(module, BarrierOp)
+        if op.attrs.get("phase") == "wait"
+    ]
+    # The refill of B starts while A's handoff is still pending on A's lock,
+    # so it needs a second mbarrier. Awaiting A's lock ends that handoff: the
+    # next refill of A reuses the first mbarrier.
+    assert len(waits) == 3
+    assert waits[0].sync is waits[2].sync
+    assert waits[1].sync is not waits[0].sync
+    allocs = [
+        op for op in find_ops_of_type(module, AllocOp)
+        if isinstance(op.result().type, LockType)
+        and op.result().type.kind == "cluster_mbar"
+    ]
+    assert len(allocs) == 2
+
+
 def test_preexisting_barrier_updates_dataflow_state():
     source = """\
         module {
