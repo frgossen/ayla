@@ -485,7 +485,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(AllocOp)
     def transfer_alloc(self, op: AllocOp, state: SyncState) -> SyncState:
-        if op.init is None:
+        if op.init is None and not isinstance(op.result().type, LockType):
             return state
         return _transfer_memory_effects(op, state, self.targets)
 

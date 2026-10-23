@@ -246,6 +246,31 @@ def test_cluster_mbar_materialization_depends_on_barrier_scope():
     assert kernel.body.ops[0].result() is sync
 
 
+def test_batches_lock_initialization_publication():
+    # Both locks are initialized before either is used, so the barrier before
+    # the first use publishes both.
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %local0: lock<mbar> = alloc()
+            %buffer0: smem<16x16xf32> = alloc()
+            %local1: lock<mbar> = alloc()
+            %buffer1: smem<16x16xf32> = alloc()
+            async(%local0: lock<mbar>) collective=xyz.block tma_move(%buffer0: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.block
+            async(%local1: lock<mbar>) collective=xyz.block tma_move(%buffer1: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.block
+            await(%local0: lock<mbar>)
+            await(%local1: lock<mbar>)
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+
+    assert [
+        barrier.scope for barrier in find_ops_of_type(module, BarrierOp)
+    ] == ["block"]
+
+
 def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
@@ -265,9 +290,10 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
     insert_syncs(module)
 
     text = repr(module)
-    # The parent multicast lowering synchronizes mbarrier initialization. This
-    # pass only needs the one-way reuse handoff to the next multicast issuer.
-    assert 'barrier() attrs={scope: "cluster"}' not in text
+    # One cluster rendezvous publishes both the lock and the barrier's cluster
+    # mbarrier. Reuse only needs the separate one-way handoff to the next
+    # multicast issuer.
+    assert text.count('barrier() attrs={scope: "cluster"}') == 1
     barriers = [
         op for op in find_ops_of_type(module, BarrierOp)
         if op.scope == "cluster_to_leader"
@@ -343,8 +369,9 @@ def test_war_on_shared_buffer_gets_barrier():
             for (%k: index = 0 to 4) attrs={label: "k"} {
               %ak: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %k: index)
               %bk: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %k: index)
+              barrier() attrs={scope: "block"}
               %lm: lock<mbar> = alloc() attrs={id: 2}
-              barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+              barrier() attrs={scope: "block"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem<128x64xbf16 swizzle="128B">, %ak: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem<128x64xbf16 swizzle="128B">, %bk: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -562,7 +589,9 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
     # order. It's block_leader, not block, because the TMA write is issued by a
     # single leader thread.
     text = repr(module)
-    assert text.count("barrier()") == 4
+    # Constants split these into four static allocation runs.
+    assert text.count('barrier() attrs={scope: "block"}') == 1
+    assert text.count('scope: "block_leader"') == 4
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
@@ -587,6 +616,8 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             %sd: smem<64x64xbf16> = alloc()
             %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
             %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            %l2: lock<mbar> = alloc()
             async(%l0: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
@@ -595,14 +626,12 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             }
             await(%l0: lock<mbar>)
             matmul(%sa: smem<64x64xbf16>, %sb: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            %l1: lock<mbar> = alloc()
             async(%l1: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
             }
             await(%l1: lock<mbar>)
             matmul(%sc: smem<64x64xbf16>, %sd: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            %l2: lock<mbar> = alloc()
             async(%l2: lock<mbar>) {
               move(%sc: smem<64x64xbf16>, %c: gmem<64x64xbf16>) attrs={tma: True}
               move(%sd: smem<64x64xbf16>, %d: gmem<64x64xbf16>) attrs={tma: True}

@@ -9,7 +9,13 @@ from ..analysis.sync import (
 )
 from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
-from ..gpu_dialect import AllocOp, BarrierOp, KernelOp, LockType, ModuleOp
+from ..gpu_dialect import (
+    AllocOp,
+    BarrierOp,
+    KernelOp,
+    LockType,
+    ModuleOp,
+)
 
 
 # BarrierScope -> the BarrierOp ``scope`` attr.
