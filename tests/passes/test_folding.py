@@ -1,8 +1,10 @@
 """Tests for the `folding` pass."""
 import textwrap
 
+import pytest
+
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import TileOp, gpu_dialect
+from ayla.gpu_dialect import KernelOp, TileOp, gpu_dialect
 from ayla.passes.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
@@ -206,3 +208,204 @@ def test_for_that_never_runs_is_erased():
     assert "alloc()" not in after
     # ...and the rest of the kernel is untouched.
     assert "index_constant() attrs={value: 7}" in after
+
+
+def test_launch_bounded_ids_fold_mod_and_div():
+    """An ID below the modulus is its own remainder and divides to zero."""
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<2x16xf32>) grid_dim=[2, 1, 1] block_dim=[64, 1, 1] {
+            %bx: index = block_id.x
+            %tx: index = thread_id.x
+            %c2: index = index_constant() attrs={value: 2}
+            %c32: index = index_constant() attrs={value: 32}
+            %block: index = index_mod(%bx: index, %c2: index)
+            %wave: index = index_div(%bx: index, %c2: index)
+            %warp: index = index_div(%tx: index, %c32: index)
+            %warp_in_pair: index = index_mod(%warp: index, %c2: index)
+            %t0: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %block: index, 0)
+            %t1: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %wave: index, 0)
+            %t2: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %warp_in_pair: index, 0)
+          }
+        }"""))  # noqa: E501
+
+    module = folding(module)
+
+    # bx < 2: bx % 2 is bx and bx / 2 is 0 (which then becomes a static tile
+    # index). tx < 64 gives tx / 32 < 2, so its % 2 goes too, but the / 32
+    # itself stays because tx can reach 32.
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<2x16xf32>) grid_dim=[2, 1, 1] block_dim=[64, 1, 1] {
+            %bx: index = block_id.x
+            %tx: index = thread_id.x
+            %c2: index = index_constant() attrs={value: 2}
+            %c32: index = index_constant() attrs={value: 32}
+            %c0: index = index_constant() attrs={value: 0}
+            %warp: index = index_div(%tx: index, %c32: index)
+            %t0: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %bx: index, 0)
+            %0: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, 0, 0)
+            %t2: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %warp: index, 0)
+          }
+        }""")  # noqa: E501
+
+
+def test_launch_bound_keeps_mod_when_extent_exceeds_modulus():
+    """bx reaches 3 and by is unbounded, so neither % 2 can fold."""
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<2x16xf32>) grid_dim=[4, None, 1] {
+            %bx: index = block_id.x
+            %by: index = block_id.y
+            %c2: index = index_constant() attrs={value: 2}
+            %x: index = index_mod(%bx: index, %c2: index)
+            %y: index = index_mod(%by: index, %c2: index)
+            %tx: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %x: index, 0)
+            %ty: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %y: index, 0)
+          }
+        }""")
+
+    module = folding(gpu_dialect.parse_module(module_str))
+
+    assert repr(module) == module_str
+
+
+def test_loop_bound_folds_mod_of_induction_variable():
+    """i < 4, so i % 4 is i and the tile indexes the loop variable directly."""
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x16xf32>) {
+            %c4: index = index_constant() attrs={value: 4}
+            for (%i: index = 0 to 4) {
+              %r: index = index_mod(%i: index, %c4: index)
+              %t: gmem<1x16xf32> = tile(%a: gmem<4x16xf32>, %r: index, 0)
+            }
+          }
+        }"""))
+
+    module = folding(module)
+
+    assert repr(module) == textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x16xf32>) {
+            %c4: index = index_constant() attrs={value: 4}
+            for (%i: index = 0 to 4) {
+              %t: gmem<1x16xf32> = tile(%a: gmem<4x16xf32>, %i: index, 0)
+            }
+          }
+        }""")
+
+
+@pytest.mark.parametrize("threads", [4, 5])
+def test_launch_bounds_compose_through_multiply_and_add(threads):
+    source = textwrap.dedent(f"""\
+        module {{
+          kernel @test(%a: gmem<8x16xf32>) grid_dim=[2, 1, 1] block_dim=[{threads}, 1, 1] {{
+            %bx: index = block_id.x
+            %tx: index = thread_id.x
+            %c4: index = index_constant() attrs={{value: 4}}
+            %c8: index = index_constant() attrs={{value: 8}}
+            %b: index = index_mul(%bx: index, %c4: index)
+            %x: index = index_add(%b: index, %tx: index)
+            %r: index = index_mod(%x: index, %c8: index)
+            %t: gmem<1x16xf32> = tile(%a: gmem<8x16xf32>, %r: index, 0)
+          }}
+        }}""")
+    expected = source
+    if threads == 4:
+        # 4*bx + tx reaches 7 with four threads, but 8 with five threads.
+        expected = expected.replace(
+            "    %r: index = index_mod(%x: index, %c8: index)\n", "",
+        ).replace("%r: index, 0)", "%x: index, 0)")
+    assert repr(folding(gpu_dialect.parse_module(source))) == expected
+
+
+def test_loop_bound_with_nonzero_lower_bound_keeps_mod():
+    source = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x16xf32>) {
+            %c4: index = index_constant() attrs={value: 4}
+            for (%i: index = 2 to 6) {
+              %r: index = index_mod(%i: index, %c4: index)
+              %t: gmem<1x16xf32> = tile(%a: gmem<4x16xf32>, %r: index, 0)
+            }
+          }
+        }""")
+    assert repr(folding(gpu_dialect.parse_module(source))) == source
+
+
+@pytest.mark.parametrize(
+    "axis,modulus,should_fold", [("x", 2, False), ("y", 4, True), ("z", 2, True)],
+)
+def test_thread_id_bounds_use_thread_count_and_actual_axis(axis, modulus, should_fold):
+    source = textwrap.dedent(f"""\
+        module {{
+          kernel @test(%a: gmem<2x16xf32>) block_dim=[64, 4, 2] {{
+            %tid: index = thread_id.{axis}
+            %c: index = index_constant() attrs={{value: {modulus}}}
+            %r: index = index_mod(%tid: index, %c: index)
+            %t: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %r: index, 0)
+          }}
+        }}""")
+    expected = source
+    if should_fold:
+        expected = expected.replace(
+            "    %r: index = index_mod(%tid: index, %c: index)\n", "",
+        ).replace("%r: index, 0)", "%tid: index, 0)")
+    assert repr(folding(gpu_dialect.parse_module(source))) == expected
+
+
+def test_range_of_mod_with_unknown_numerator_bounds_outer_division():
+    source = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<1x16xf32>) {
+            %bx: index = block_id.x
+            %c4: index = index_constant() attrs={value: 4}
+            %r: index = index_mod(%bx: index, %c4: index)
+            %q: index = index_div(%r: index, %c4: index)
+            %t: gmem<1x16xf32> = tile(%a: gmem<1x16xf32>, %q: index, 0)
+          }
+        }""")
+    expected = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<1x16xf32>) {
+            %bx: index = block_id.x
+            %c4: index = index_constant() attrs={value: 4}
+            %r: index = index_mod(%bx: index, %c4: index)
+            %c0: index = index_constant() attrs={value: 0}
+          }
+        }""")
+    assert repr(folding(gpu_dialect.parse_module(source))) == expected
+
+
+def test_launch_cannot_grow_after_folding_removes_modulo():
+    source = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<64x16xf32>) block_dim=[64, 1, 1] {
+            %tx: index = thread_id.x
+            %c64: index = index_constant() attrs={value: 64}
+            %r: index = index_mod(%tx: index, %c64: index)
+            %t: gmem<1x16xf32> = tile(%a: gmem<64x16xf32>, %r: index, 0)
+          }
+        }""")
+    module = folding(gpu_dialect.parse_module(source))
+    assert "index_mod(" not in repr(module)
+    [kernel] = find_ops_of_type(module, KernelOp)
+    with pytest.raises(ValueError, match=r"block_dim\[0\] cannot change"):
+        kernel.block_dim = (128, 1, 1)
+
+
+def test_warp_group_id_uses_its_result_axis_and_group_count():
+    source = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<2x16xf32>) block_dim=[256, 1, 1] {
+            %wgx: index, %wgy: index, %wgz: index = warp_group_id()
+            %c2: index = index_constant() attrs={value: 2}
+            %r: index = index_mod(%wgx: index, %c2: index)
+            %t: gmem<1x16xf32> = tile(%a: gmem<2x16xf32>, %r: index, 0)
+          }
+        }""")
+    expected = source.replace(
+        "    %r: index = index_mod(%wgx: index, %c2: index)\n", "",
+    ).replace("%r: index, 0)", "%wgx: index, 0)")
+    assert repr(folding(gpu_dialect.parse_module(source))) == expected
