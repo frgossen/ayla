@@ -150,16 +150,29 @@ class KernelOp(GpuOp):
         return tuple(self.attrs["grid_dim"])  # type: ignore[return-value]
 
     @grid_dim.setter
-    def grid_dim(self, value) -> None:
-        self.attrs["grid_dim"] = list(value)
+    def grid_dim(self, value: Sequence[int | None]) -> None:
+        self._set_launch_dim("grid_dim", value)
 
     @property
     def block_dim(self) -> tuple[int | None, int | None, int | None]:
         return tuple(self.attrs["block_dim"])  # type: ignore[return-value]
 
     @block_dim.setter
-    def block_dim(self, value) -> None:
-        self.attrs["block_dim"] = list(value)
+    def block_dim(self, value: Sequence[int | None]) -> None:
+        self._set_launch_dim("block_dim", value)
+
+    def _set_launch_dim(self, name: str, value: Sequence[int | None]) -> None:
+        """Fill unknown axes while preserving bounds used by folding."""
+        dims = list(value)
+        if len(dims) != 3:
+            raise ValueError(f"{name} must have three axes, got {dims}")
+        current = cast(Sequence[int | None], self.attrs[name])
+        for axis, (old, new) in enumerate(zip(current, dims, strict=True)):
+            if old is not None and new != old:
+                raise ValueError(
+                    f"{name}[{axis}] cannot change from {old} to {new}"
+                )
+        self.attrs[name] = dims
 
     @property
     def cluster_dim(self) -> tuple[int | None, int | None, int | None]:
@@ -2424,35 +2437,48 @@ class WarpGroupIdOp(GpuOp):
         return self.results[2]
 
 
-# The ID op of each hardware-mapped collective level, and how many threads one
-# of its IDs spans along x. Block IDs count the grid; the others count threads
-# of a block, where warps and warp groups are numbered along x only.
-HW_LEVEL_IDS: dict[
-    CollectiveLevel,
-    tuple[type[BlockIdOp | WarpGroupIdOp | ThreadIdOp], int],
-] = {
-    CollectiveLevel.BLOCK: (BlockIdOp, 1),
-    CollectiveLevel.WG: (WarpGroupIdOp, 128),
-    CollectiveLevel.WARP: (ThreadIdOp, 32),
-    CollectiveLevel.THREAD: (ThreadIdOp, 1),
+@dataclass(frozen=True)
+class HardwareLevelId:
+    """An ID's raw operation, thread span, and the level that operation emits."""
+
+    op_type: type[BlockIdOp | WarpGroupIdOp | ThreadIdOp]
+    threads_per_id: int
+    raw_level: CollectiveLevel
+
+
+# Block IDs count the grid; the others count threads within a block. A warp
+# ID derives from a raw thread ID, whereas a warp-group op already emits a
+# group ID. Keep that distinction explicit so consumers can bound raw ops.
+HW_LEVEL_IDS: dict[CollectiveLevel, HardwareLevelId] = {
+    CollectiveLevel.BLOCK: HardwareLevelId(BlockIdOp, 1, CollectiveLevel.BLOCK),
+    CollectiveLevel.WG: HardwareLevelId(WarpGroupIdOp, 128, CollectiveLevel.WG),
+    CollectiveLevel.WARP: HardwareLevelId(ThreadIdOp, 32, CollectiveLevel.THREAD),
+    CollectiveLevel.THREAD: HardwareLevelId(ThreadIdOp, 1, CollectiveLevel.THREAD),
 }
+
+# Derived from the same metadata: aliases such as WARP and THREAD agree on
+# the level of the raw op, independent of table order or thread scaling.
+HW_ID_LEVELS = {spec.op_type: spec.raw_level for spec in HW_LEVEL_IDS.values()}
 
 
 def build_hardware_id(level: CollectiveLevel, axis: CollectiveAxis) -> tuple[list[Op], Value]:
     """Materialize one axis of a hardware ID using the shared level metadata."""
-    op_type, threads = HW_LEVEL_IDS[level]
+    spec = HW_LEVEL_IDS[level]
+    op_type = spec.op_type
     if op_type in (BlockIdOp, ThreadIdOp):
         ids = op_type.build(axis)
         value = ids.value
     else:
-        ids = op_type.build()
+        ids = WarpGroupIdOp.build()
         value = ids.results[axis]
     ops: list[Op] = [ids]
-    if level == CollectiveLevel.WARP:
+    raw_threads = HW_LEVEL_IDS[spec.raw_level].threads_per_id
+    divisor = spec.threads_per_id // raw_threads
+    if divisor != 1:
         assert axis == CollectiveAxis.X
-        divisor = IndexConstantOp.build(threads)
-        divided = IndexDivOp.build(value, divisor.result())
-        ops.extend([divisor, divided])
+        constant = IndexConstantOp.build(divisor)
+        divided = IndexDivOp.build(value, constant.result())
+        ops.extend([constant, divided])
         value = divided.result()
     return ops, value
 
@@ -2461,7 +2487,7 @@ def launch_extent(
     kernel: KernelOp, level: CollectiveLevel, axis: CollectiveAxis,
 ) -> int | None:
     """How many ``level`` IDs ``kernel`` launches along ``axis``, if known."""
-    _, threads = HW_LEVEL_IDS[level]
+    threads = HW_LEVEL_IDS[level].threads_per_id
     if level == CollectiveLevel.BLOCK:
         return kernel.grid_dim[axis]
     extent = kernel.block_dim[axis]
@@ -2474,7 +2500,7 @@ def require_launch_extent(
     kernel: KernelOp, level: CollectiveLevel, axis: CollectiveAxis, count: int,
 ) -> None:
     """Make ``kernel`` launch ``count`` ``level`` IDs along ``axis``."""
-    _, threads = HW_LEVEL_IDS[level]
+    threads = HW_LEVEL_IDS[level].threads_per_id
     assert threads == 1 or axis == CollectiveAxis.X, (
         "warps and warp groups are numbered along x"
     )

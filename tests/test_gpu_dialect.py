@@ -16,6 +16,7 @@ from ayla import (
 )
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
+    HW_ID_LEVELS,
     AddrMemTensorType,
     AllocOp,
     AsyncOp,
@@ -30,6 +31,7 @@ from ayla.gpu_dialect import (
     ForOp,
     IfOp,
     IndexConstantOp,
+    IndexDivOp,
     IndexLtOp,
     IndexType,
     LockType,
@@ -47,12 +49,15 @@ from ayla.gpu_dialect import (
     TileOp,
     WgrmemTensorType,
     WrmemTensorType,
+    build_hardware_id,
     gpu_dialect,
     has_ordering_effect,
     is_grid_collective,
+    launch_extent,
     memory_effects,
     root_buffer,
     root_buffers,
+    require_launch_extent,
 )
 
 
@@ -868,3 +873,56 @@ def test_naive_matmul_4096_module():
     module = gpu_dialect.parse(module_str)
 
     assert_print_and_roundtrip(module, module_str)
+
+
+@pytest.mark.parametrize("dimension", ["grid_dim", "block_dim"])
+def test_launch_dimensions_allow_filling_unknown_axes_and_repeating_values(dimension):
+    kernel = KernelOp.build("test", Block())
+    setattr(kernel, dimension, (2, None, None))
+    setattr(kernel, dimension, [2, 4, None])
+    setattr(kernel, dimension, (2, 4, 8))
+    setattr(kernel, dimension, [2, 4, 8])
+    assert getattr(kernel, dimension) == (2, 4, 8)
+
+
+@pytest.mark.parametrize("dimension", ["grid_dim", "block_dim"])
+@pytest.mark.parametrize("new_extent", [128, 32, None])
+def test_launch_dimensions_reject_growing_shrinking_and_clearing_known_axes(
+    dimension, new_extent,
+):
+    kernel = KernelOp.build("test", Block())
+    setattr(kernel, dimension, (None, 64, None))
+    with pytest.raises(ValueError, match=rf"{dimension}\[1\] cannot change"):
+        setattr(kernel, dimension, (2, new_extent, 1))
+    # A conflict on a later axis must not partially fill earlier axes.
+    assert getattr(kernel, dimension) == (None, 64, None)
+
+
+@pytest.mark.parametrize(
+    "level,count,raw_count",
+    [
+        (CollectiveLevel.BLOCK, 3, 3),
+        (CollectiveLevel.THREAD, 64, 64),
+        (CollectiveLevel.WARP, 2, 64),
+        (CollectiveLevel.WG, 2, 2),
+    ],
+)
+def test_constructed_hardware_ids_preserve_raw_operation_bounds(level, count, raw_count):
+    kernel = KernelOp.build("test", Block())
+    require_launch_extent(kernel, level, CollectiveAxis.X, count)
+    ops, value = build_hardware_id(level, CollectiveAxis.X)
+    kernel.body.ops = ops
+
+    raw_op = ops[0]
+    raw_level = HW_ID_LEVELS[type(raw_op)]
+    assert launch_extent(kernel, raw_level, CollectiveAxis.X) == raw_count
+    assert launch_extent(kernel, level, CollectiveAxis.X) == count
+    if level == CollectiveLevel.WARP:
+        quotient = value.definition
+        assert isinstance(quotient, IndexDivOp)
+        assert quotient.lhs is raw_op.result()
+        divisor = quotient.rhs.definition
+        assert isinstance(divisor, IndexConstantOp)
+        assert divisor.value == 32
+    else:
+        assert value in raw_op.results
