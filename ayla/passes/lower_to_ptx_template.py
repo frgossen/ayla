@@ -54,7 +54,6 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WgrmemTensorType,
-    is_column_major,
     physical_layout,
     root_buffer,
 )
@@ -457,7 +456,7 @@ class LowerToPtxTemplate(LoweringPass):
             if isinstance(view_root_type, SmemTensorType) else None
         )
         # Blocks split the contiguous dimension; the other one is the row.
-        inner_dim = 0 if is_column_major(view_root_type) else 1
+        inner_dim = 0 if view_root_type.is_column_major_2d else 1
         outer_rows = view_root_type.sizes[1 - inner_dim]
 
         # Accumulate byte offset for each dimension.
@@ -1828,7 +1827,7 @@ class LowerToPtxTemplate(LoweringPass):
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = cast(tuple[int, ...], root_type.sizes)
-        transposed = is_column_major(root_type)
+        transposed = root_type.is_column_major_2d
         # TODO: Model writer ownership as a warpgroup-uniform IR condition so
         # loop peeling/unrolling can specialize each slice and lower the whole
         # gather to one branch instead of predicating every stmatrix.
@@ -2469,11 +2468,6 @@ def _tma_coordinates(
 def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_type = op.dst.type
     src_type = op.src.type
-    dst_root = root_buffer(op.dst)
-    if dst_root is not None and is_column_major(dst_root.type):
-        # The verifier admits only STMatrix-compatible transposed stores.
-        # Each start names a 16-column group of up to four pairs.
-        return [pair for pair, _, _ in _stmatrix_pairs(op) if pair % 4 == 0]
     layout = (
         physical_layout(dst_type)
         if isinstance(dst_type, SmemTensorType) else None
@@ -2485,7 +2479,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         and isinstance(src_type.dtype, (BF16Type, F16Type))
         and dst_type.dtype == src_type.dtype
         and dst_type.rank == 2
-        and dst_type.strides[-1] == 1
+        and (dst_type.strides[-1] == 1 or dst_type.is_column_major_2d)
         and dst_type.swizzle == "128B"
         and layout == (64, "block_major")
     ):
@@ -2494,11 +2488,18 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_root = root_buffer(op.dst)
     assert dst_root is not None
     root_type = dst_root.type
+    if not isinstance(root_type, SmemTensorType) or root_type.rank != 2:
+        return None
+    transposed = root_type.is_column_major_2d
+    dense = (
+        root_type.strides == (1, root_type.sizes[0]) if transposed
+        else root_type.is_canonical_strides
+    )
     if (
-        not isinstance(root_type, SmemTensorType)
-        or root_type.rank != 2
-        or not root_type.is_canonical_strides
+        root_type.swizzle != "128B"
+        or physical_layout(root_type) != (64, "block_major")
         or cast(int, root_type.sizes[0]) % 64
+        or not dense
     ):
         return None
 
@@ -2524,12 +2525,21 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         or col_start % 16
         or (not is_view and col_start + dst_n > n_dim)
         or m_dim % 64
-        or dst_n % 64
-        or root_n % 16
+        or dst_n % (8 if transposed else 64)
+        or root_n % (8 if transposed else 16)
         or not (8 <= root_n <= 256)
     ):
         return None
 
+    if transposed:
+        # A trailing 8-column group uses x2; other groups must contain all
+        # four pairs of a 16-column fragment block.
+        if dst_n % 16 and col_start + dst_n != root_n:
+            return None
+        pairs_per_m_tile = root_n // 4
+        return [
+            pair for pair, _, _ in pairs if pair % pairs_per_m_tile % 4 == 0
+        ]
     if len(pairs) % 4:
         return None
     register_starts = [pair for pair, _, _ in pairs if pair % 4 == 0]

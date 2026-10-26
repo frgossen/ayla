@@ -1,9 +1,14 @@
 """Tests for the promote_buffers pass."""
 import textwrap
 
+import pytest
+
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import (
     AllocOp,
+    BF16Type,
+    GmemTensorType,
+    SmemTensorType,
     ElementwiseOp,
     F32Type,
     MatmulOp,
@@ -14,7 +19,7 @@ from ayla.gpu_dialect import (
 )
 from ayla.passes.lower_to_async import lower_to_async
 from ayla.passes.lower_to_tma_move import lower_to_tma_move
-from ayla.passes.promote_buffers import promote_buffers
+from ayla.passes.promote_buffers import PromoteBuffers, promote_buffers
 
 
 def test_wgrmem_tma_writeback_stages_block_tile_in_smem():
@@ -437,3 +442,68 @@ def test_epilogue_runs_on_the_promoted_accumulator():
             move(%c: gmem<64x256xbf16>, %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm_dst_wgrmem"}
           }
         }""")  # noqa: E501
+
+
+@pytest.mark.parametrize(
+    ("sizes", "permutation", "expected"),
+    [
+        ([64, 16], None, [16, 1]),
+        ([64, 16], [0, 1], [16, 1]),
+        ([64, 16], [1, 0], [1, 64]),
+    ],
+)
+def test_smem_promotion_uses_explicit_permutation(sizes, permutation, expected):
+    a = "gmem<" + "x".join(map(str, sizes)) + "xbf16>"
+    module = gpu_dialect.parse_module(textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: {a}, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>) {{
+            matmul(%a: {a}, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>)
+          }}
+        }}"""))
+    module = promote_buffers(
+        module, "smem", operands=["lhs"], permutation=permutation,
+    )
+    [alloc] = find_ops_of_type(module, AllocOp)
+    assert isinstance(alloc.result().type, SmemTensorType)
+    assert list(alloc.result().type.sizes) == sizes
+    assert list(alloc.result().type.strides) == expected
+
+
+@pytest.mark.parametrize("permutation", [[0, 0], [0], [0, 2], [-1, 0]])
+def test_smem_promotion_rejects_invalid_permutation(permutation):
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>) {
+            matmul(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>)
+          }
+        }"""))
+    with pytest.raises(ValueError, match="each buffer dimension exactly once"):
+        promote_buffers(module, "smem", operands=["lhs"], permutation=permutation)
+
+
+@pytest.mark.parametrize("permutation", [None, [0, 1], [1, 0]])
+def test_tma_writeback_permutation_uses_sliced_staging_shape(permutation):
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @mm(%a: smem<128x16xbf16>, %b: smem<128x16xbf16>, %c: gmem<128x128xbf16 strides=[1, 128]>) {
+            matmul(%a: smem<128x16xbf16>, %b: smem<128x16xbf16>, %c: gmem<128x128xbf16 strides=[1, 128]>)
+          }
+        }"""))
+    module = promote_buffers(
+        module, "wgrmem", operands=["dst"], layout="wgmma_layout_0",
+        warps=4, tma=True, writeback_slices=2, permutation=permutation,
+    )
+    [smem] = [
+        op.result().type for op in find_ops_of_type(module, AllocOp)
+        if isinstance(op.result().type, SmemTensorType)
+    ]
+    assert list(smem.sizes) == [128, 64]
+    assert list(smem.strides) == ([1, 128] if permutation == [1, 0] else [64, 1])
+
+
+def test_smem_permutation_maps_logical_dimensions_to_physical_dimensions():
+    promotion = PromoteBuffers("smem", operands=["lhs"], permutation=[2, 0, 1])
+    tensor = promotion._build_target_type(GmemTensorType.build([4, 8, 16], BF16Type()))
+    assert isinstance(tensor, SmemTensorType)
+    assert list(tensor.sizes) == [4, 8, 16]
+    assert list(tensor.strides) == [1, 64, 4]

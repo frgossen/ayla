@@ -29,7 +29,6 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
-    is_column_major,
     is_side_effect_free,
 )
 from ..base.ir import Block, Op, Value
@@ -92,10 +91,10 @@ class LowerToTmaMove(LoweringPass):
         tile_shape = list(smem.type.sizes)
         assert all(isinstance(size, int) for size in tile_shape)
         gmem_type = root.type
-        if is_column_major(gmem_type):
+        if gmem_type.is_column_major_2d:
             # A transposed view of a row-major tensor: describe the tensor
             # itself, so the box and coordinates use its dimension order.
-            if not is_column_major(smem.type):
+            if not smem.type.is_column_major_2d:
                 raise ValueError(
                     "lower_to_tma_move: a column-major gmem view needs a "
                     f"column-major smem tile; got {smem.type}"

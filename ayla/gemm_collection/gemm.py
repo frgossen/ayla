@@ -7,6 +7,7 @@ from ..base.pipeline import Pipeline
 from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
+    GmemTensorType,
     KernelOp,
     MatmulOp,
     MemTensorType,
@@ -117,6 +118,7 @@ def schedule_tiled_matmul(
     output_slices: int = 1,
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
+    output_permutation: list[int] | None = None,
     unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
@@ -151,6 +153,7 @@ def schedule_tiled_matmul(
             }
             if output_tma_inner_size is not None else None
         ),
+        permutation=output_permutation,
         writeback_slices=output_slices,
         writeback_buffers=output_store_buffers,
         move_attrs=operand_move_attrs,
@@ -211,6 +214,7 @@ def schedule_matmul(
     assert isinstance(matmul, MatmulOp)
     assert isinstance(matmul.lhs.type, MemTensorType)
     assert isinstance(matmul.rhs.type, MemTensorType)
+    assert isinstance(matmul.dst.type, GmemTensorType)
     m, k = matmul.lhs.type.sizes
     n, rhs_k = matmul.rhs.type.sizes
     if None in (m, n, k, rhs_k):
@@ -303,6 +307,7 @@ def schedule_matmul(
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,
+        output_permutation=[1, 0] if matmul.dst.type.is_column_major_2d else None,
         operand_move_attrs=operand_move_attrs,
     ))
     if group_size > 1:

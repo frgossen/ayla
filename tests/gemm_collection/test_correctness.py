@@ -26,6 +26,7 @@ from ayla.gpu_dialect import (
     WgrmemTensorType,
     gpu_dialect,
 )
+from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda
@@ -505,11 +506,13 @@ def test_transposed_output_stores_fragments_with_stmatrix_trans():
 
 
 def test_transposed_output_needs_a_blocked_staging_layout():
-    with pytest.raises(ValueError, match="transposed WGMMA fragment store"):
-        make_ptx_kernel(_transposed_output_matmul(
-            128, 128, 64, output_m_tile=128, output_n_tile=128,
-            output_tma_inner_size=None,
-        ))
+    module = _transposed_output_matmul(
+        128, 128, 64, output_m_tile=128, output_n_tile=128,
+        output_tma_inner_size=None,
+    )
+    assert verify_gpu_dialect(module) is module
+    with pytest.raises(AssertionError, match="element pairs must be contiguous and aligned"):
+        make_ptx_kernel(module)
 
 
 @requires_cuda
