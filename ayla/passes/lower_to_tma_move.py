@@ -90,9 +90,28 @@ class LowerToTmaMove(LoweringPass):
             desc_attrs["physical_layout"] = layout
         tile_shape = list(smem.type.sizes)
         assert all(isinstance(size, int) for size in tile_shape)
+        gmem_type = root.type
+        if gmem_type.is_column_major_2d:
+            # A transposed view of a row-major tensor: describe the tensor
+            # itself, so the box and coordinates use its dimension order.
+            if not smem.type.is_column_major_2d:
+                raise ValueError(
+                    "lower_to_tma_move: a column-major gmem view needs a "
+                    f"column-major smem tile; got {smem.type}"
+                )
+            gmem_type = GmemTensorType.build(
+                list(reversed(gmem_type.sizes)), gmem_type.dtype,
+            )
+            if list(gmem_type.strides) != list(reversed(root.type.strides)):
+                raise ValueError(
+                    "lower_to_tma_move: column-major view must be a dense "
+                    f"transpose; got {root.type}"
+                )
+            indices.reverse()
+            tile_shape.reverse()
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
-            gmem_type=root.type,
+            gmem_type=gmem_type,
             tile_shape=cast(list[int], tile_shape),
             swizzle=smem.type.swizzle,
             l2_promotion=cast(str | None, move.attrs.get("l2_promotion")),

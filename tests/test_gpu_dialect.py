@@ -816,6 +816,9 @@ def test_canonical_strides():
     assert AddrMemTensorType.canonical_strides([64, 128]) == [128, 1]
     assert AddrMemTensorType.canonical_strides([16]) == [1]
     assert AddrMemTensorType.canonical_strides([4, 3, 2]) == [6, 2, 1]
+    assert AddrMemTensorType.canonical_strides([64, 16], [1, 0]) == [1, 64]
+    assert AddrMemTensorType.canonical_strides([4, 8, 16], [2, 0, 1]) == [1, 64, 4]
+    assert AddrMemTensorType.canonical_strides([None, 16], [1, 0]) == [1, None]
 
     t = GmemTensorType.build([128, 64], F32Type())
     assert list(t.strides) == [64, 1]
@@ -827,6 +830,22 @@ def test_canonical_strides():
 
     t_smem = SmemTensorType.build([128, 64], F32Type())
     assert list(t_smem.strides) == [64, 1]
+
+
+@pytest.mark.parametrize(
+    ("sizes", "strides", "expected"),
+    [
+        ([64, 128], [128, 1], False),
+        ([64, 128], [1, 64], True),
+        ([64, 128], [1, 80], True),
+        ([1, 128], [1, 1], False),
+        ([64], [1], False),
+        ([64, 128, 2], [1, 64, 8192], False),
+    ],
+)
+def test_is_column_major_2d(sizes, strides, expected):
+    tensor = GmemTensorType.build(sizes, F32Type(), strides=strides)
+    assert tensor.is_column_major_2d is expected
 
 
 def test_dynamic_gmem_shape_roundtrips_and_defers_static_properties():

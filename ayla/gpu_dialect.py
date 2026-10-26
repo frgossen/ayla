@@ -1505,18 +1505,35 @@ class AddrMemTensorType(MemTensorType):
     @staticmethod
     def canonical_strides(
         sizes: Sequence[int | None],
+        permutation: Sequence[int] | None = None,
     ) -> list[int | None]:
-        """Row-major dense strides (in elements)."""
-        strides: list[int | None] = []
+        """Dense strides in elements; logical dim i maps to permutation[i].
+
+        Without a permutation, dimensions use row-major order.
+        """
+        dimensions = list(range(len(sizes)))
+        if permutation is not None:
+            if sorted(permutation) != dimensions:
+                raise ValueError(
+                    "permutation must contain each buffer dimension exactly once"
+                )
+            dimensions.sort(key=permutation.__getitem__)
+        strides: list[int | None] = [None] * len(sizes)
         running: int | None = 1
-        for s in reversed(sizes):
-            strides.insert(0, running)
-            running = None if running is None or s is None else running * s
+        for dim in reversed(dimensions):
+            strides[dim] = running
+            size = sizes[dim]
+            running = None if running is None or size is None else running * size
         return strides
 
     @property
     def is_canonical_strides(self) -> bool:
         return list(self.strides) == self.canonical_strides(list(self.sizes))
+
+    @property
+    def is_column_major_2d(self) -> bool:
+        """Whether a rank-2 tensor is contiguous along its first dimension."""
+        return self.rank == 2 and self.strides[0] == 1 and self.strides[1] != 1
 
     @classmethod
     def build(  # type: ignore[override]
