@@ -3,7 +3,9 @@
 Sinks ``await`` ops as late as possible — just before the first
 consumer of the guarded buffer — and hoists ``async_move`` ops as
 early as possible. This maximizes the window where async loads
-overlap with compute.
+overlap with compute. Loads from global memory into registers are
+hoisted too, since only their first use waits; they go first, so the
+async moves hoisted after them still issue ahead of them.
 
 Hoisting an async op drags its full dependency cone of
 side-effect-free ops (alloc, index arithmetic, tile ops) up with it,
@@ -17,6 +19,8 @@ from __future__ import annotations
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
+    GmemTensorType,
+    RegMemTensorType,
     TmaMoveOp,
     effective_operands,
     has_ordering_effect,
@@ -39,6 +43,14 @@ def _is_async_move(op: Op) -> bool:
         return True
     return isinstance(op, AsyncOp) and all(
         isinstance(o, MoveOp) for o in op.body.ops
+    )
+
+
+def _is_register_load(op: Op) -> bool:
+    return (
+        isinstance(op, MoveOp)
+        and isinstance(op.src.type, GmemTensorType)
+        and isinstance(op.dst.type, RegMemTensorType)
     )
 
 
@@ -138,13 +150,15 @@ def _bubble(
 
 
 def _hoist_async_moves(ops: list[Op]) -> None:
-    # Targets: the async moves (matmuls are tracked as lock peers but never
-    # moved) plus the side-effect-free dependency cone feeding each. Then hoist
-    # each up.
-    targets = _side_effect_free_operand_closure(
-        [op for op in ops if _is_async_move(op)], ops
-    )
-    _bubble(ops, targets, step=-1)
+    # Targets: the register loads, then the async moves (matmuls are tracked as
+    # lock peers but never moved), each with the side-effect-free dependency
+    # cone feeding it. Then hoist each up. The async moves go second, so they
+    # issue ahead of any register load they can pass.
+    for is_target in (_is_register_load, _is_async_move):
+        targets = _side_effect_free_operand_closure(
+            [op for op in ops if is_target(op)], ops
+        )
+        _bubble(ops, targets, step=-1)
 
 
 def _sink_awaits(ops: list[Op]) -> None:
