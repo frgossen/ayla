@@ -4,9 +4,11 @@ The row that matters is `ayla_compiled` against `compiled`: the same graph
 lowered the same way everywhere except the matmul. What gets measured lives
 in `corpus/`, one module per graph.
 
-    python -m benchmarks.bench_torch_compile.bench_torch_compile
+    python -m benchmarks.bench_torch_compile.bench_torch_compile -k gemm_sigmoid
 """
 from __future__ import annotations
+
+import argparse
 
 import torch
 import torch._dynamo.config as dynamo_config
@@ -53,7 +55,18 @@ def variants(config: BenchConfig) -> list[BenchConfig]:
 
 
 def main() -> None:
-    configs = build_configs()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-k", "--filter",
+        help="only run configurations whose name contains this text",
+    )
+    args = parser.parse_args()
+    configs = [
+        config for config in build_configs()
+        if args.filter is None or args.filter in config.name
+    ]
+    if not configs:
+        parser.error(f"no benchmark config matches {args.filter!r}")
     # Both span the run: the backend is outside the cache key, and dynamo
     # guards on grad mode.
     with (

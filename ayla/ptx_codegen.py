@@ -35,6 +35,7 @@ from .gpu_dialect import (
     TmaDescType,
     ToPtrOp,
     WarpGroupIdOp,
+    WarpIdsOp,
     WgrmemTensorType,
 )
 from .pipelines.canonicalize import Canonicalize
@@ -135,9 +136,9 @@ def map_type_to_registers(type):
     if isinstance(type, RmemTensorType):
         n = type.num_elements
         assert n is not None
-        # bf16 is stored in 16-bit registers (no native `mov.bf16`).
+        # 16-bit floats are moved as raw bits in register memory.
         ptx_dtype = (
-            PtxType.B16 if type.dtype.name == "bf16"
+            PtxType.B16 if type.dtype.name in ("bf16", "f16")
             else PtxType(type.dtype.name)
         )
         return TypeRegisterMapping(
@@ -199,8 +200,8 @@ def map_type_to_registers(type):
             )
         if type.kind == "cluster_mbar":
             return TypeRegisterMapping(
-                member_register_types=PtxType.B32,
-                member_names="val",
+                member_register_types=(PtxType.B32, PtxType.B32),
+                member_names=("val", "parity"),
             )
         return TypeRegisterMapping(
             member_register_types=(),
@@ -349,6 +350,8 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_index_lt(p, op)
     elif isinstance(op, IndexModOp):
         _emit_index_mod(p, op)
+    elif isinstance(op, WarpIdsOp):
+        _emit_warp_ids(p, op)
     elif isinstance(op, WarpGroupIdOp):
         _emit_warp_group_id(p, op)
     elif isinstance(op, ToPtrOp):
@@ -537,6 +540,22 @@ def _emit_cluster_block_ids(p: PtxPrinter, op: ClusterBlockIdsOp) -> None:
 
 
 # TODO: Emit S index computations instead.
+def _emit_warp_ids(p: PtxPrinter, op: WarpIdsOp) -> None:
+    # Broadcast from the warp's first thread (CUTLASS's
+    # canonical_warp_idx_sync), so ptxas can prove each index warp-uniform and
+    # branch on it without diverging.
+    p.write_newline_once()
+    for value, sreg, shift in (
+        (op.x, "%tid.x", 5), (op.y, "%tid.y", 0), (op.z, "%tid.z", 0),
+    ):
+        reg = p.unique_ptx_names_for_value(value)
+        p.write_line(f"mov.u32 {reg}, {sreg};")
+        if shift:
+            p.write_line(f"shr.u32 {reg}, {reg}, {shift};")
+        p.write_line(f"shfl.sync.idx.b32 {reg}, {reg}, 0, 31, 0xffffffff;")
+    p.write_newline_once()
+
+
 def _emit_warp_group_id(p: PtxPrinter, op: WarpGroupIdOp) -> None:
     rx = p.unique_ptx_names_for_value(op.x)
     ry = p.unique_ptx_names_for_value(op.y)

@@ -252,7 +252,7 @@ def test_separately_tiled_matmul_chain_keeps_raw_dependency():
         insert_syncs(module)
 
 
-def test_local_and_multicast_tma_loads_keep_separate_completion():
+def test_local_and_multicast_tma_loads_share_completion():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @loads(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
@@ -269,26 +269,22 @@ def test_local_and_multicast_tma_loads_keep_separate_completion():
     local = "mbarrier::complete_tx::bytes ["
     multicast = "mbarrier::complete_tx::bytes.multicast::cluster"
     expect = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
-    local_wait = "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
     cluster_wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-    local_expect_pos = ptx.index(expect)
-    cluster_expect_pos = ptx.index(expect, local_expect_pos + 1)
+    expect_pos = ptx.index(expect)
     assert_contains_in_order(
         ptx,
         "fence.mbarrier_init.release.cluster;",
-        "barrier.cluster.arrive.release;",
+        "barrier.cluster.arrive.relaxed;",
         "barrier.cluster.wait.acquire;",
     )
     assert (
         ptx.index(local)
-        < local_expect_pos
-        < ptx.index(local_wait)
         < ptx.index(multicast)
-        < cluster_expect_pos
+        < expect_pos
         < ptx.index(cluster_wait)
     )
-    assert ptx.count(f"{expect} _,") == 2
-    assert ptx.count("], 1024;") == 2
+    assert ptx.count(f"{expect} _,") == 1
+    assert "], 2048;" in ptx
 
 
 TILED_IR = textwrap.dedent("""\
@@ -322,7 +318,8 @@ PROMOTED_IR = textwrap.dedent("""\
         %wgx: index, %wgy: index, %wgz: index = warp_group_id()
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-        %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+        %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, label: "mm_dst_wgrmem"}
+        elementwise fill(%6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %zero: rmem<f32>)
         matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.grid] attrs={label: "mm"}
         %7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
         elementwise sigmoid(%7: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %6: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}

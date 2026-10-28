@@ -34,6 +34,7 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WarpGroupIdOp,
+    WarpIdsOp,
     memory_effects,
 )
 from .dataflow import DataflowAnalysis, DataflowState, transfers
@@ -71,13 +72,15 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
             )
         kind = "R" if self._direction == self.Direction.FORWARD else "W"
         arguments = set(op.body.arguments)
-        return BufferLivenessState(frozenset(
-            buffer
-            for effect in effects
-            if effect.kind == kind
-            for buffer in effect.roots
-            if buffer in arguments
-        ))
+        return BufferLivenessState(
+            frozenset(
+                buffer
+                for effect in effects
+                if effect.kind == kind
+                for buffer in effect.roots
+                if buffer in arguments
+            )
+        )
 
     @transfers(
         AllocOp,
@@ -91,7 +94,9 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
         TmaMoveOp,
     )
     def transfer_access(
-        self, op: Op, state: BufferLivenessState,
+        self,
+        op: Op,
+        state: BufferLivenessState,
     ) -> BufferLivenessState:
         effects = memory_effects(op)
         if effects is None:
@@ -99,9 +104,7 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
                 f"unmodelled memory effects for {type(op).__name__}"
             )
         return BufferLivenessState(
-            state.buffers | {
-                buffer for effect in effects for buffer in effect.roots
-            }
+            state.buffers | {buffer for effect in effects for buffer in effect.roots}
         )
 
     @transfers(
@@ -123,9 +126,12 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,
+        WarpIdsOp,
     )
     def transfer_no_memory_effect(
-        self, op: Op, state: BufferLivenessState,
+        self,
+        op: Op,
+        state: BufferLivenessState,
     ) -> BufferLivenessState:
         return state
 
@@ -145,12 +151,12 @@ class BufferLifetimeAnalysis:
         operations = iter_ops(op, self.has_liveness)
         for index, current in enumerate(operations):
             for buffer in self.live_in(current).buffers:
-                self._lifetimes[buffer] = (
-                    self._lifetimes.get(buffer, 0) | 1 << (2 * index)
+                self._lifetimes[buffer] = self._lifetimes.get(buffer, 0) | 1 << (
+                    2 * index
                 )
             for buffer in self.live_out(current).buffers:
-                self._lifetimes[buffer] = (
-                    self._lifetimes.get(buffer, 0) | 1 << (2 * index + 1)
+                self._lifetimes[buffer] = self._lifetimes.get(buffer, 0) | 1 << (
+                    2 * index + 1
                 )
 
     def has_liveness(self, op: Op) -> bool:

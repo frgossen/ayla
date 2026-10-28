@@ -24,7 +24,9 @@ def tma_matmul_4096_module():
             %b_block: gmem<64x4096xf32> = tile(%b: gmem<4096x4096xf32>, %cy: index, 0)
             %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)
             %c_thread: gmem<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem<64x64xf32 strides=[4096, 1]>, %ty: index, %tx: index)
-            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0, init: 0.0}
+            %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0}
+            %c_thread_rmem_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%c_thread_rmem: rmem<2x2xf32>, %c_thread_rmem_init: rmem<f32>)
             for (%ko: index = 0 to 64) {
               %a_ko: gmem<64x64xf32 strides=[4096, 1]> = tile(%a_block: gmem<64x4096xf32>, 0, %ko: index)
               %b_ko: gmem<64x64xf32 strides=[4096, 1]> = tile(%b_block: gmem<64x4096xf32>, 0, %ko: index)

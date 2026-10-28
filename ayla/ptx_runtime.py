@@ -1,7 +1,8 @@
 """PTX custom calls: host-side glue for launching generated PTX kernels.
 
 A :class:`PtxLauncher` bundles:
-    - the PTX source (driver-JIT'd via ``cuModuleLoadDataEx``),
+    - the PTX source (driver-JIT'd via ``cuModuleLoadDataEx``), or the cubin
+      :func:`assemble_ptx` makes from it ahead of time, off the GPU,
     - a :class:`~ayla.ptx.PtxKernel` (entry point, grid/block/cluster dims,
       shared memory, and tensor-map setup),
     - the host-side wrapper that converts ``torch.Tensor`` args into kernel
@@ -12,7 +13,11 @@ side-effects out.
 """
 from __future__ import annotations
 
+import re
+import subprocess
+import tempfile
 from functools import cache
+from pathlib import Path
 from typing import Protocol, cast
 
 import torch
@@ -96,37 +101,7 @@ static CUtensorMapL2promotion parse_l2_promotion(
     return CU_TENSOR_MAP_L2_PROMOTION_NONE;
 }
 
-static CUtensorMap tensor_map_encode_2d(
-    const at::Tensor& tensor,
-    const std::vector<int64_t>& tile_shape,
-    CUtensorMapDataType dtype,
-    CUtensorMapSwizzle swizzle,
-    const std::string& l2_promotion
-) {
-    cuuint64_t global_dim[2] = {
-        static_cast<cuuint64_t>(tensor.size(1)),
-        static_cast<cuuint64_t>(tensor.size(0)),
-    };
-    cuuint64_t global_strides[1] = {
-        static_cast<cuuint64_t>(tensor.stride(0) * tensor.element_size()),
-    };
-    cuuint32_t box_dim[2] = {
-        static_cast<cuuint32_t>(tile_shape[1]),
-        static_cast<cuuint32_t>(tile_shape[0]),
-    };
-    cuuint32_t elem_strides[2] = {1, 1};
-    CUtensorMap map{};
-    CU_CHECK(cuTensorMapEncodeTiled(
-        &map, dtype, 2, tensor.data_ptr(),
-        global_dim, global_strides, box_dim, elem_strides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        parse_l2_promotion(l2_promotion),
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    ));
-    return map;
-}
-
-static CUtensorMap tensor_map_encode_3d(
+static CUtensorMap tensor_map_encode_tiled(
     const at::Tensor& tensor,
     const std::vector<int64_t>& tile_shape,
     CUtensorMapDataType dtype,
@@ -135,40 +110,76 @@ static CUtensorMap tensor_map_encode_3d(
     const std::string& block_order,
     const std::string& l2_promotion
 ) {
-    TORCH_CHECK(block_width > 0, "TMA block width must be positive");
-    TORCH_CHECK(tensor.size(1) % block_width == 0,
-                "tensor columns must be divisible by TMA block width");
-    TORCH_CHECK(tile_shape[1] % block_width == 0,
-                "tile columns must be divisible by TMA block width");
-    TORCH_CHECK(block_order == "row_major" || block_order == "block_major",
-                "unsupported TMA blocked layout order");
+    int64_t logical_rank = tensor.dim();
+    TORCH_CHECK(logical_rank >= 1 && logical_rank <= 5,
+                "TMA tensors must have rank in [1, 5]");
+    TORCH_CHECK(static_cast<int64_t>(tile_shape.size()) == logical_rank,
+                "TMA tile rank must match tensor rank");
+    TORCH_CHECK(tensor.stride(logical_rank - 1) == 1,
+                "TMA tensors must be contiguous in their innermost dimension");
 
-    bool block_major = block_order == "block_major";
-    auto rows = tensor.size(0);
-    auto blocks = tensor.size(1) / block_width;
-    auto tile_rows = tile_shape[0];
-    auto tile_blocks = tile_shape[1] / block_width;
-    cuuint64_t global_dim[3] = {
-        static_cast<cuuint64_t>(block_width),
-        static_cast<cuuint64_t>(block_major ? rows : blocks),
-        static_cast<cuuint64_t>(block_major ? blocks : rows),
-    };
-    cuuint64_t global_strides[2] = {
-        static_cast<cuuint64_t>((block_major ? tensor.stride(0) : block_width)
-                                * tensor.element_size()),
-        static_cast<cuuint64_t>((block_major ? block_width : tensor.stride(0))
-                                * tensor.element_size()),
-    };
-    cuuint32_t box_dim[3] = {
-        static_cast<cuuint32_t>(block_width),
-        static_cast<cuuint32_t>(block_major ? tile_rows : tile_blocks),
-        static_cast<cuuint32_t>(block_major ? tile_blocks : tile_rows),
-    };
-    cuuint32_t elem_strides[3] = {1, 1, 1};
+    std::vector<cuuint64_t> global_dim;
+    std::vector<cuuint64_t> global_strides;
+    std::vector<cuuint32_t> box_dim;
+    int64_t tensor_map_rank = logical_rank;
+
+    if (block_width > 0) {
+        TORCH_CHECK(logical_rank >= 2 && logical_rank <= 4,
+                    "blocked TMA layouts require logical rank in [2, 4]");
+        TORCH_CHECK(tensor.size(logical_rank - 1) % block_width == 0,
+                    "tensor columns must be divisible by TMA block width");
+        TORCH_CHECK(tile_shape[logical_rank - 1] % block_width == 0,
+                    "tile columns must be divisible by TMA block width");
+        TORCH_CHECK(block_order == "row_major" || block_order == "block_major",
+                    "unsupported TMA blocked layout order");
+
+        bool block_major = block_order == "block_major";
+        auto rows = tensor.size(logical_rank - 2);
+        auto blocks = tensor.size(logical_rank - 1) / block_width;
+        auto tile_rows = tile_shape[logical_rank - 2];
+        auto tile_blocks = tile_shape[logical_rank - 1] / block_width;
+        global_dim = {
+            static_cast<cuuint64_t>(block_width),
+            static_cast<cuuint64_t>(block_major ? rows : blocks),
+            static_cast<cuuint64_t>(block_major ? blocks : rows),
+        };
+        global_strides = {
+            static_cast<cuuint64_t>((block_major
+                ? tensor.stride(logical_rank - 2) : block_width)
+                * tensor.element_size()),
+            static_cast<cuuint64_t>((block_major
+                ? block_width : tensor.stride(logical_rank - 2))
+                * tensor.element_size()),
+        };
+        box_dim = {
+            static_cast<cuuint32_t>(block_width),
+            static_cast<cuuint32_t>(block_major ? tile_rows : tile_blocks),
+            static_cast<cuuint32_t>(block_major ? tile_blocks : tile_rows),
+        };
+        for (int64_t dim = logical_rank - 3; dim >= 0; --dim) {
+            global_dim.push_back(static_cast<cuuint64_t>(tensor.size(dim)));
+            global_strides.push_back(static_cast<cuuint64_t>(
+                tensor.stride(dim) * tensor.element_size()));
+            box_dim.push_back(static_cast<cuuint32_t>(tile_shape[dim]));
+        }
+        tensor_map_rank += 1;
+    } else {
+        for (int64_t dim = logical_rank - 1; dim >= 0; --dim) {
+            global_dim.push_back(static_cast<cuuint64_t>(tensor.size(dim)));
+            box_dim.push_back(static_cast<cuuint32_t>(tile_shape[dim]));
+            if (dim != logical_rank - 1) {
+                global_strides.push_back(static_cast<cuuint64_t>(
+                    tensor.stride(dim) * tensor.element_size()));
+            }
+        }
+    }
+
+    std::vector<cuuint32_t> elem_strides(tensor_map_rank, 1);
     CUtensorMap map{};
     CU_CHECK(cuTensorMapEncodeTiled(
-        &map, dtype, 3, tensor.data_ptr(),
-        global_dim, global_strides, box_dim, elem_strides,
+        &map, dtype, static_cast<cuuint32_t>(tensor_map_rank),
+        tensor.data_ptr(), global_dim.data(), global_strides.data(),
+        box_dim.data(), elem_strides.data(),
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
         parse_l2_promotion(l2_promotion),
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
@@ -193,8 +204,6 @@ static const CUtensorMap* tensor_map_cached(
     std::string l2_promotion
 ) {
     TORCH_CHECK(tensor.is_cuda(), "tensor must be on CUDA");
-    TORCH_CHECK(tensor.dim() == 2, "only 2D tensors supported");
-    TORCH_CHECK(tile_shape.size() == 2, "tile_shape must have 2 elements");
 
     CUtensorMapDataType dtype;
     auto scalar_type = tensor.scalar_type();
@@ -209,24 +218,22 @@ static const CUtensorMap* tensor_map_cached(
     else if (swizzle == "64B") tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
     else if (swizzle == "128B") tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
 
+    std::vector<int64_t> tensor_shape(
+        tensor.sizes().begin(), tensor.sizes().end());
+    std::vector<int64_t> tensor_strides(
+        tensor.strides().begin(), tensor.strides().end());
     auto key = std::make_tuple(
         reinterpret_cast<uintptr_t>(tensor.data_ptr()),
         static_cast<int>(tensor.scalar_type()),
-        static_cast<int64_t>(tensor.size(0)),
-        static_cast<int64_t>(tensor.size(1)),
-        static_cast<int64_t>(tensor.stride(0)),
-        tile_shape[0], tile_shape[1],
+        tensor_shape, tensor_strides, tile_shape,
         swizzle, block_width, block_order, l2_promotion
     );
     static std::map<decltype(key), CUtensorMap> cache;
     auto it = cache.find(key);
     if (it == cache.end()) {
-        CUtensorMap map = block_width > 0
-            ? tensor_map_encode_3d(
-                tensor, tile_shape, dtype, tensor_swizzle,
-                block_width, block_order, l2_promotion)
-            : tensor_map_encode_2d(
-                tensor, tile_shape, dtype, tensor_swizzle, l2_promotion);
+        CUtensorMap map = tensor_map_encode_tiled(
+            tensor, tile_shape, dtype, tensor_swizzle,
+            block_width, block_order, l2_promotion);
         it = cache.emplace(key, map).first;
     }
     return &it->second;
@@ -295,7 +302,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 class _LauncherExtension(Protocol):
-    def module_load_data(self, ptx: str, optimization_level: int) -> int: ...
+    def module_load_data(
+        self, ptx: str | bytes, optimization_level: int,
+    ) -> int: ...
 
     def module_unload(self, module: int) -> None: ...
 
@@ -326,22 +335,49 @@ def _get_ext() -> _LauncherExtension:
     )
 
 
+def assemble_ptx(kernel: PtxKernel, ptxas: str | Path) -> bytes:
+    """Assemble ``kernel``'s PTX into the cubin the driver's JIT would make.
+
+    The options mirror ``module_load_data``'s JIT options, so a ``ptxas``
+    from the driver's CUDA release emits identical SASS. Needs no GPU.
+    """
+    target = re.search(r"^\s*\.target\s+(\w+)", kernel.ptx, re.MULTILINE)
+    if target is None:
+        raise ValueError(f"{kernel.name}: PTX names no .target")
+    level = kernel.ptx_optimization_level
+    options = ["-lineinfo", *([] if level is None or level < 0 else [f"-O{level}"])]
+    with tempfile.TemporaryDirectory() as directory:
+        source, image = Path(directory, "kernel.ptx"), Path(directory, "kernel.cubin")
+        source.write_text(kernel.ptx)
+        result = subprocess.run(
+            [str(ptxas), f"-arch={target[1]}", *options, str(source), "-o", str(image)],
+            capture_output=True, text=True,
+        )
+        if result.returncode:
+            raise RuntimeError(f"{kernel.name}: ptxas failed: {result.stderr.strip()}")
+        return image.read_bytes()
+
+
 
 
 class PtxLauncher:
     """Opaque host-side function that launches a PTX kernel.
 
-    Constructed from a :class:`PtxKernel`. Calling the instance with
-    tensors performs all required host-side setup and issues the launch on
-    the current torch CUDA stream.
+    Constructed from a :class:`PtxKernel`, and optionally the cubin
+    :func:`assemble_ptx` made from it, which is then loaded instead of
+    JIT-compiling the PTX. Calling the instance with tensors performs all
+    required host-side setup and issues the launch on the current torch CUDA
+    stream.
     """
 
     def __init__(
         self,
         kernel: PtxKernel,
+        image: bytes | None = None,
     ):
         self._ext: _LauncherExtension | None = None
         self._kernel = kernel
+        self._image = image
         self._optimization_level = kernel.ptx_optimization_level
         self._module: int | None = None
         self._function: int | None = None
@@ -354,11 +390,13 @@ class PtxLauncher:
                 ti += 1
 
     def ensure_loaded(self) -> None:
-        """Load and JIT-compile the PTX without launching the kernel."""
+        """Load the cubin, or JIT-compile the PTX, without launching."""
         if self._module is None:
             self._ext = _get_ext()
+            # The driver takes a cubin through the same call; a cubin carries
+            # its own code, so the JIT options do not apply to it.
             self._module = self._ext.module_load_data(
-                self._kernel.ptx,
+                self._kernel.ptx if self._image is None else self._image,
                 self._optimization_level
                 if self._optimization_level is not None else -1,
             )
@@ -444,5 +482,7 @@ class PtxLauncher:
             pass
 
 
-def make_ptx_launcher(kernel: PtxKernel) -> PtxLauncher:
-    return PtxLauncher(kernel)
+def make_ptx_launcher(
+    kernel: PtxKernel, image: bytes | None = None,
+) -> PtxLauncher:
+    return PtxLauncher(kernel, image)

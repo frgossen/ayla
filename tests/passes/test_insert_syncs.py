@@ -1,4 +1,5 @@
 """Tests for the cross-thread sync-barrier insertion pass."""
+
 import textwrap
 
 import pytest
@@ -30,7 +31,8 @@ from tests.testing_utils import assert_contains_in_order
 
 
 def test_tma_descriptors_for_the_same_argument_alias():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%h: gmem<2x2xf32>, %store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>) {
             %c0: index = index_constant() attrs={value: 0}
@@ -39,7 +41,8 @@ def test_tma_descriptors_for_the_same_argument_alias():
             tma_move(%store: tma_desc<arg_idx=0 gmem<2x2xf32> tile=2x2>, %s0: smem<2x2xf32>, %c0: index, %c0: index)
             tma_move(%s1: smem<1x2xf32>, %load: tma_desc<arg_idx=0 gmem<2x2xf32> tile=1x2>, %c0: index, %c0: index)
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     analysis = SyncAnalysis()
     analysis.analyze(module)
     store, load = find_ops_of_type(module, TmaMoveOp)
@@ -48,7 +51,8 @@ def test_tma_descriptors_for_the_same_argument_alias():
 
 
 def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -61,7 +65,8 @@ def test_disjoint_tiled_writebacks_only_need_block_leader_barrier():
             move(%tile: smem<64x64xbf16>, %value: rmem<64x64xbf16>)
             async(%lock: lock<bulk>) attrs={label: "writeback1_async"} tma_move(%dst: tma_desc<arg_idx=0 gmem<128x64xbf16> tile=64x64>, %tile: smem<64x64xbf16>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0, label: "writeback1"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     insert_syncs(module)
 
     assert repr(module) == textwrap.dedent("""\
@@ -154,32 +159,56 @@ def test_barrier_scopes_form_a_lattice():
     ],
 )
 def test_cluster_leader_hazards_choose_a_sufficient_barrier(
-    prior, current, expected,
+    prior,
+    current,
+    expected,
 ):
     assert _barrier_scope(prior, current) == expected
 
 
 def test_block_barrier_does_not_cover_a_cluster_leader_effect():
     assert not _barrier_covers(
-        BarrierScope.BLOCK, CollectiveScope.CLUSTER_LEADER,
+        BarrierScope.BLOCK,
+        CollectiveScope.CLUSTER_LEADER,
     )
     assert _barrier_covers(
-        BarrierScope.CLUSTER, CollectiveScope.CLUSTER_LEADER,
+        BarrierScope.CLUSTER,
+        CollectiveScope.CLUSTER_LEADER,
     )
 
 
 def test_cluster_leader_barrier_coverage_is_directional():
     assert not _barrier_covers(
-        BarrierScope.CLUSTER_TO_LEADER, CollectiveScope.CLUSTER_LEADER,
+        BarrierScope.CLUSTER_TO_LEADER,
+        CollectiveScope.CLUSTER_LEADER,
     )
     assert _barrier_covers(
-        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.CLUSTER_LEADER,
+        BarrierScope.LEADER_TO_CLUSTER,
+        CollectiveScope.CLUSTER_LEADER,
     )
     assert not _barrier_covers(
-        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK_LEADER,
+        BarrierScope.LEADER_TO_CLUSTER,
+        CollectiveScope.BLOCK_LEADER,
     )
     assert not _barrier_covers(
-        BarrierScope.LEADER_TO_CLUSTER, CollectiveScope.BLOCK,
+        BarrierScope.LEADER_TO_CLUSTER,
+        CollectiveScope.BLOCK,
+    )
+    assert not _barrier_covers(
+        BarrierScope.CLUSTER_TO_LEADER,
+        CollectiveScope.BLOCK,
+    )
+
+
+def test_cluster_to_leader_join_retains_its_local_gather():
+    assert (
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK_TO_LEADER)
+        == BarrierScope.CLUSTER_TO_LEADER
+    )
+    # The release gathers at the leaders only, so a block hazard at the same
+    # op needs a full cluster barrier.
+    assert (
+        BarrierScope.CLUSTER_TO_LEADER.join(BarrierScope.BLOCK) == BarrierScope.CLUSTER
     )
 
 
@@ -201,7 +230,9 @@ def test_insert_syncs_preserves_cluster_barrier_direction(scope, expected):
     barrier_syncs = {op: sync} if sync is not None else None
 
     _insert_barriers(
-        block, {op: BarrierTarget(scope)}, num_threads=32,
+        block,
+        {op: BarrierTarget(scope)},
+        num_threads=32,
         barrier_syncs=barrier_syncs,
     )
 
@@ -212,12 +243,14 @@ def test_insert_syncs_preserves_cluster_barrier_direction(scope, expected):
 
 
 def test_cluster_mbar_materialization_depends_on_barrier_scope():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test() grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %r: rmem<1xf32> = alloc() attrs={id: 0}
           }
-        }"""))
+        }""")
+    )
     kernel = find_ops_of_type(module, KernelOp)[0]
     target_op = kernel.body.ops[0]
 
@@ -233,8 +266,36 @@ def test_cluster_mbar_materialization_depends_on_barrier_scope():
     assert kernel.body.ops[0].result() is sync
 
 
+def test_batches_lock_initialization_publication():
+    # Both locks are initialized before either is used, so the barrier before
+    # the first use publishes both.
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @k(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %local0: lock<mbar> = alloc()
+            %buffer0: smem<16x16xf32> = alloc()
+            %local1: lock<mbar> = alloc()
+            %buffer1: smem<16x16xf32> = alloc()
+            async(%local0: lock<mbar>) collective=xyz.block tma_move(%buffer0: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.block
+            async(%local1: lock<mbar>) collective=xyz.block tma_move(%buffer1: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.block
+            await(%local0: lock<mbar>)
+            await(%local1: lock<mbar>)
+          }
+        }""")
+    )  # noqa: E501
+
+    insert_syncs(module)
+
+    assert [barrier.scope for barrier in find_ops_of_type(module, BarrierOp)] == [
+        "block"
+    ]
+
+
 def test_tma_multicast_reuse_waits_for_every_recipient_cta():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -247,23 +308,91 @@ def test_tma_multicast_reuse_waits_for_every_recipient_cta():
             async(%lock: lock<mbar>) collective=xyz.cluster tma_move(%smem: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
             await(%lock: lock<mbar>)
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
 
     text = repr(module)
-    # The parent multicast lowering synchronizes mbarrier initialization. This
-    # pass only needs the one-way reuse handoff to the next multicast issuer.
-    assert 'barrier() attrs={scope: "cluster"}' not in text
+    # One cluster rendezvous publishes both the lock and the barrier's cluster
+    # mbarrier. Reuse only needs the separate one-way handoff to the next
+    # multicast issuer.
+    assert (
+        text.count(
+            'barrier() attrs={initialization_publication: True, scope: "cluster"}'
+        )
+        == 1
+    )
     barriers = [
-        op for op in find_ops_of_type(module, BarrierOp)
+        op
+        for op in find_ops_of_type(module, BarrierOp)
         if op.scope == "cluster_to_leader"
     ]
-    assert len(barriers) == 1
+    # The release is split: every warp arrives after its read, and the
+    # leader waits before the next multicast write.
+    assert [op.attrs["phase"] for op in barriers] == ["arrive", "wait"]
     sync = barriers[0].sync
-    assert sync is not None
+    assert sync is not None and barriers[1].sync is sync
     assert isinstance(sync.type, LockType)
     assert sync.type.kind == "cluster_mbar"
+    ops = module.body.ops[0].body.ops
+    read = next(op for op in ops if type(op).__name__ == "MoveOp")
+    assert ops.index(barriers[0]) == ops.index(read) + 1
+
+
+def test_cluster_gathers_share_an_mbarrier_after_its_handoff_ends():
+    load = (
+        "tma_move(%{s}: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) "
+        "collective=xyz.cluster attrs={{multicast: True}}"
+    )
+    a, b = load.format(s="sa"), load.format(s="sb")
+    module = gpu_dialect.parse(
+        textwrap.dedent(f"""\
+        module {{
+          kernel @test(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {{
+            %c0: index = index_constant() attrs={{value: 0}}
+            %sa: smem<16x16xf32> = alloc()
+            %sb: smem<16x16xf32> = alloc()
+            %r: rmem<16x16xf32> = alloc()
+            %la: lock<mbar> = alloc()
+            %lb: lock<mbar> = alloc()
+            async(%la: lock<mbar>) collective=xyz.cluster {a}
+            async(%lb: lock<mbar>) collective=xyz.cluster {b}
+            await(%la: lock<mbar>)
+            move(%r: rmem<16x16xf32>, %sa: smem<16x16xf32>)
+            async(%la: lock<mbar>) collective=xyz.cluster {a}
+            await(%lb: lock<mbar>)
+            move(%r: rmem<16x16xf32>, %sb: smem<16x16xf32>)
+            async(%lb: lock<mbar>) collective=xyz.cluster {b}
+            await(%la: lock<mbar>)
+            move(%r: rmem<16x16xf32>, %sa: smem<16x16xf32>)
+            async(%la: lock<mbar>) collective=xyz.cluster {a}
+            await(%la: lock<mbar>)
+            await(%lb: lock<mbar>)
+          }}
+        }}""")
+    )
+
+    insert_syncs(module)
+
+    waits = [
+        op
+        for op in find_ops_of_type(module, BarrierOp)
+        if op.attrs.get("phase") == "wait"
+    ]
+    # The refill of B starts while A's handoff is still pending on A's lock,
+    # so it needs a second mbarrier. Awaiting A's lock ends that handoff: the
+    # next refill of A reuses the first mbarrier.
+    assert len(waits) == 3
+    assert waits[0].sync is waits[2].sync
+    assert waits[1].sync is not waits[0].sync
+    allocs = [
+        op
+        for op in find_ops_of_type(module, AllocOp)
+        if isinstance(op.result().type, LockType)
+        and op.result().type.kind == "cluster_mbar"
+    ]
+    assert len(allocs) == 2
 
 
 def test_preexisting_barrier_updates_dataflow_state():
@@ -279,21 +408,28 @@ def test_preexisting_barrier_updates_dataflow_state():
 
     # A block barrier cannot discharge a grid-scoped global-memory effect.
     with pytest.raises(NotImplementedError, match="barrier GRID"):
-        insert_syncs(gpu_dialect.parse(textwrap.dedent(
-            source.replace("__SCOPE__", "block"),
-        )))
+        insert_syncs(
+            gpu_dialect.parse(
+                textwrap.dedent(
+                    source.replace("__SCOPE__", "block"),
+                )
+            )
+        )
 
     # Scheduling passes may author structural barriers before InsertSyncs. The
     # grid barrier discharges the effect, so the pass must not insert another.
-    module = gpu_dialect.parse(textwrap.dedent(
-        source.replace("__SCOPE__", "grid"),
-    ))
+    module = gpu_dialect.parse(
+        textwrap.dedent(
+            source.replace("__SCOPE__", "grid"),
+        )
+    )
     insert_syncs(module)
     assert repr(module).count("barrier()") == 1
 
 
 def test_war_on_shared_buffer_gets_barrier():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<128x4096xbf16>, %b: gmem<128x4096xbf16>, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %sa: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
@@ -312,7 +448,8 @@ def test_war_on_shared_buffer_gets_barrier():
               await(%lw: lock<wgmma>)
             }
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     insert_syncs(module)
 
@@ -331,7 +468,7 @@ def test_war_on_shared_buffer_gets_barrier():
               %ak: gmem<128x64xbf16 strides=[4096, 1]> = tile(%a: gmem<128x4096xbf16>, 0, %k: index)
               %bk: gmem<128x64xbf16 strides=[4096, 1]> = tile(%b: gmem<128x4096xbf16>, 0, %k: index)
               %lm: lock<mbar> = alloc() attrs={id: 2}
-              barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}
+              barrier() attrs={initialization_publication: True, scope: "block"}
               async(%lm: lock<mbar>) {
                 move(%sa: smem<128x64xbf16 swizzle="128B">, %ak: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
                 move(%sb: smem<128x64xbf16 swizzle="128B">, %bk: gmem<128x64xbf16 strides=[4096, 1]>) attrs={tma: True}
@@ -345,9 +482,9 @@ def test_war_on_shared_buffer_gets_barrier():
         }""")  # noqa: E501
 
 
-
 def test_wgmma256_wg_pipeline_inserts_barriers():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @auto_matmul_4096_wgmma256_wg(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, 1] block_dim=[256, 1, 1] num_warp_groups=2 {
             %c0: index = index_constant() attrs={value: 0}
@@ -398,7 +535,9 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             %23: gmem<128x256xbf16 strides=[4096, 1]> = tile(%22: gmem<128x4096xbf16>, 0, %by: index)
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %24: gmem<64x256xbf16 strides=[4096, 1]> = tile(%23: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12, init: 0.0}
+            %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 12}
+            %25_init: rmem<f32> = constant 0.0
+            elementwise fill(%25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %25_init: rmem<f32>)
             %26: smem<64x64xbf16 swizzle="128B"> = tile(%11: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %27: smem<64x64xbf16 swizzle="128B"> = tile(%8: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
             %28: smem<64x64xbf16 swizzle="128B"> = tile(%5: smem<128x64xbf16 swizzle="128B">, %wgx: index, 0)
@@ -541,7 +680,8 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
             elementwise convert(%78: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %25: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">)
             move(%24: gmem<64x256xbf16 strides=[4096, 1]>, %78: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_wgrmem"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     insert_syncs(module)
 
     # One named (block_leader) barrier per stage reload (WAR: the next TMA load
@@ -549,7 +689,12 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
     # order. It's block_leader, not block, because the TMA write is issued by a
     # single leader thread.
     text = repr(module)
-    assert text.count("barrier()") == 4
+    # Constants split these into four static allocation runs.
+    assert (
+        text.count('barrier() attrs={initialization_publication: True, scope: "block"}')
+        == 1
+    )
+    assert text.count('scope: "block_leader"') == 4
     assert_contains_in_order(
         text,
         textwrap.dedent("""\
@@ -565,15 +710,20 @@ def test_wgmma256_wg_pipeline_inserts_barriers():
 
 
 def test_named_barrier_id_is_reused_after_mbar_await():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<64x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<64x64xbf16>, %d: gmem<64x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %sa: smem<64x64xbf16> = alloc()
             %sb: smem<64x64xbf16> = alloc()
             %sc: smem<64x64xbf16> = alloc()
             %sd: smem<64x64xbf16> = alloc()
-            %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={init: 0.0}
+            %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc()
+            %acc_init: rmem<f32> = constant 0.0
+            elementwise fill(%acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %acc_init: rmem<f32>)
             %l0: lock<mbar> = alloc()
+            %l1: lock<mbar> = alloc()
+            %l2: lock<mbar> = alloc()
             async(%l0: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
@@ -582,24 +732,24 @@ def test_named_barrier_id_is_reused_after_mbar_await():
             }
             await(%l0: lock<mbar>)
             matmul(%sa: smem<64x64xbf16>, %sb: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            %l1: lock<mbar> = alloc()
             async(%l1: lock<mbar>) {
               move(%sa: smem<64x64xbf16>, %a: gmem<64x64xbf16>) attrs={tma: True}
               move(%sb: smem<64x64xbf16>, %b: gmem<64x64xbf16>) attrs={tma: True}
             }
             await(%l1: lock<mbar>)
             matmul(%sc: smem<64x64xbf16>, %sd: smem<64x64xbf16>, %acc: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
-            %l2: lock<mbar> = alloc()
             async(%l2: lock<mbar>) {
               move(%sc: smem<64x64xbf16>, %c: gmem<64x64xbf16>) attrs={tma: True}
               move(%sd: smem<64x64xbf16>, %d: gmem<64x64xbf16>) attrs={tma: True}
             }
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
     barriers = [
-        line.strip() for line in repr(module).splitlines()
+        line.strip()
+        for line in repr(module).splitlines()
         if 'scope: "block_leader"' in line
     ]
     assert barriers == [
@@ -609,7 +759,8 @@ def test_named_barrier_id_is_reused_after_mbar_await():
 
 
 def test_bulk_await_does_not_release_named_barrier_id():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -625,11 +776,13 @@ def test_bulk_await_does_not_release_named_barrier_id():
             %l1: lock<bulk> = alloc()
             async(%l1: lock<bulk>) tma_move(%d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>, %s1: smem<64x64xf32>, %c0: index, %c0: index)
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
     barriers = [
-        line.strip() for line in repr(module).splitlines()
+        line.strip()
+        for line in repr(module).splitlines()
         if 'scope: "block_leader"' in line
     ]
     assert barriers == [
@@ -638,8 +791,34 @@ def test_bulk_await_does_not_release_named_barrier_id():
     ]
 
 
+def test_loop_backedge_upgrades_live_named_barrier_to_block_sync():
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @test(%d: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %s: smem<64x64xf32> = alloc()
+            %r: rmem<64x64xf32> = alloc()
+            %l: lock<bulk> = alloc()
+            move(%s: smem<64x64xf32>, %r: rmem<64x64xf32>)
+            for (%i: index = 0 to 2) {
+              async(%l: lock<bulk>) tma_move(%d: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %s: smem<64x64xf32>, %c0: index, %c0: index) attrs={dst_tiling_scheme: 0}
+              await(%l: lock<bulk>)
+            }
+          }
+        }""")
+    )
+
+    insert_syncs(module)
+
+    barriers = find_ops_of_type(module, BarrierOp)
+    assert len(barriers) == 1
+    assert barriers[0].scope == "block"
+
+
 def test_full_block_sync_releases_all_named_barrier_ids():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @test(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %c0: index = index_constant() attrs={value: 0}
@@ -659,15 +838,51 @@ def test_full_block_sync_releases_all_named_barrier_ids():
             %l1: lock<bulk> = alloc()
             async(%l1: lock<bulk>) tma_move(%d1: tma_desc<arg_idx=1 gmem<64x64xf32> tile=64x64>, %s1: smem<64x64xf32>, %c0: index, %c0: index)
           }
-        }"""))
+        }""")
+    )
 
     insert_syncs(module)
     barriers = [
-        line.strip() for line in repr(module).splitlines()
-        if "barrier()" in line
+        line.strip() for line in repr(module).splitlines() if "barrier()" in line
     ]
     assert barriers == [
         'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',
         'barrier() attrs={scope: "block"}',
         'barrier() attrs={id: 1, num_threads: 128, scope: "block_leader"}',
+    ]
+
+
+def test_bulk_await_orders_tma_store_read_only_for_the_leader():
+    # wait_group completes in t0, the thread that committed the store, so the
+    # other threads still need t0's word before overwriting its source. The
+    # authored barrier retires the first write, leaving only the TMA read.
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
+        module {
+          kernel @test(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %s0: smem<64x64xf32> = alloc()
+            %r0: rmem<64x64xf32> = alloc()
+            move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)
+            barrier() attrs={scope: "block"}
+            %l0: lock<bulk> = alloc()
+            async(%l0: lock<bulk>) tma_move(%d0: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %s0: smem<64x64xf32>, %c0: index, %c0: index)
+            await(%l0: lock<bulk>)
+            move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)
+          }
+        }""")
+    )
+
+    insert_syncs(module)
+    order = [
+        line.strip()
+        for line in repr(module).splitlines()
+        if line.strip().startswith(("barrier()", "await(", "move("))
+    ]
+    assert order == [
+        "move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)",
+        'barrier() attrs={scope: "block"}',
+        "await(%l0: lock<bulk>)",
+        'barrier() attrs={scope: "block"}',
+        "move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)",
     ]

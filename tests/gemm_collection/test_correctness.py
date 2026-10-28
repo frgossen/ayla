@@ -1,11 +1,16 @@
 """Correctness tests for all GEMM kernels in the collection."""
 
+import textwrap
+
+import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
+import re
 import pytest
 import torch
 
-from ayla.base.ir import find_ops_of_type
+from ayla.base.ir import find_ancestor_of_type, find_ops_of_type
 from ayla.gemm_collection.gemm import (
     auto_matmul_4096_wgmma256_wg_tma_store_module,
+    schedule_matmul,
 )
 from ayla.gemm_collection.dynamic_m import (
     _dynamic_m_schedule_heuristic,
@@ -15,11 +20,16 @@ from ayla.gemm_collection.auto_matmul_4096_wgmma256_wg_sigmoid import (
     auto_matmul_4096_wgmma256_wg_sigmoid_module,
 )
 from ayla.gpu_dialect import (
+    CollectiveAxis,
     ElementwiseOp,
     ForOp,
+    ModuleOp,
+    KernelOp,
     TileOp,
     TmaDescType,
     WgrmemTensorType,
+    gpu_dialect,
+    physical_layout,
 )
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -32,18 +42,24 @@ ayla = torch.ops.ayla
 F32 = torch.float32
 BF16 = torch.bfloat16
 
+
 def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_m_tiles_per_cta=2,
-    ))
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_m_tiles_per_cta=2,
+        )
+    )
     lines = kernel.ptx.splitlines()
-    stores = [i for i, line in enumerate(lines)
-              if "cp.async.bulk.tensor.3d.global.shared" in line]
-    waits = [i for i, line in enumerate(lines)
-             if "cp.async.bulk.wait_group" in line]
+    stores = [
+        i
+        for i, line in enumerate(lines)
+        if "cp.async.bulk.tensor.3d.global.shared" in line
+    ]
+    waits = [i for i, line in enumerate(lines) if "cp.async.bulk.wait_group" in line]
     gathers = [i for i, line in enumerate(lines) if "stmatrix." in line]
     second_tile_mmas = [
-        i for i, line in enumerate(lines)
+        i
+        for i, line in enumerate(lines)
         if "wgmma.mma_async" in line and stores[0] < i < waits[0]
     ]
     assert kernel.grid_dim == (16, 16, 1)
@@ -65,26 +81,43 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
     assert len(gathers) == 32
     assert second_tile_mmas
     assert all(
-        any("bar.sync " in line and "bar.sync 0" not in line
-            for line in lines[max(0, store - 20):store])
+        any(
+            "bar.sync " in line and "bar.sync 0" not in line
+            for line in lines[max(0, store - 20) : store]
+        )
         for store in stores
     )
     assert not any(
-        "bar.sync 0" in line
-        for line in lines[stores[0]:second_tile_mmas[0]]
+        "bar.sync 0" in line for line in lines[stores[0] : second_tile_mmas[0]]
     )
     assert waits[0] < gathers[len(gathers) // 2] < stores[1] < waits[1]
 
 
+def test_scheduled_gemm_overwrites_its_accumulator_instead_of_zeroing_it():
+    ptx = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_m_tiles_per_cta=2,
+        )
+    ).ptx
+    assert "elementwise fill" not in ptx
+    scale_d = re.findall(r"^\s+(\S+), 1, 1, 0, 0;$", ptx, re.MULTILINE)
+    assert len(scale_d) == ptx.count("wgmma.mma_async")
+    # The peeled first WGMMA of each of the two tiles overwrites.
+    assert sorted(set(scale_d)) == ["0", "1"]
+    assert scale_d.count("0") == 2
+
+
 def test_configurable_tma_gemm_supports_rectangular_shapes():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        m=512,
-        n=19968,
-        k=6656,
-        output_m_tiles_per_cta=2,
-        operand_stages=4,
-        output_slices=2,
-    ))
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=512,
+            n=19968,
+            k=6656,
+            output_m_tiles_per_cta=2,
+            operand_stages=4,
+            output_slices=2,
+        )
+    )
     assert kernel.name.startswith("auto_matmul_m512_n19968_k6656_")
     assert kernel.grid_dim == (2, 78, 1)
     assert kernel.block_dim == (256, 1, 1)
@@ -92,7 +125,8 @@ def test_configurable_tma_gemm_supports_rectangular_shapes():
 
 @pytest.mark.parametrize("m_tile,expected_threads", [(64, 128), (256, 512)])
 def test_configurable_tma_gemm_supports_extended_m_tiles(
-    m_tile, expected_threads,
+    m_tile,
+    expected_threads,
 ):
     kernel = make_ptx_kernel(
         auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -124,6 +158,193 @@ def test_configurable_tma_gemm_supports_general_n_tiles(n_tile):
     assert "wgmma.mma_async" in kernel.ptx
 
 
+def test_fixed_output_grid_uses_a_persistent_tile_loop():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=512,
+        n=256,
+        k=64,
+        output_grid_size=3,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    outer_loops = [
+        loop
+        for loop in find_ops_of_type(module, ForOp)
+        if find_ancestor_of_type(loop, ForOp) is None
+    ]
+
+    assert kernel.grid_dim == (3, 1, 1)
+    assert len(outer_loops) == 1
+    assert outer_loops[0].trip_count == 3
+    assert "bar.sync" in make_ptx_kernel(module).ptx
+
+
+@requires_cuda
+def test_fixed_output_grid_matches_torch():
+    m, n, k = 512, 256, 64
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_grid_size=3,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+    make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(23)
+    torch.randn((m, k), dtype=BF16, device="cuda")
+    torch.randn((n, k), dtype=BF16, device="cuda")
+    torch.empty((m, n), dtype=BF16, device="cuda")
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "n_tile,slices,block_width,swizzle",
+    [
+        (256, 1, 64, "128B"),
+        (224, 1, 32, "64B"),
+        (144, 1, 16, "32B"),
+        (192, 4, 16, "32B"),
+        (168, 1, 8, None),
+    ],
+)
+def test_blocked_output_staging_narrows_to_the_slice_width(
+    n_tile,
+    slices,
+    block_width,
+    swizzle,
+):
+    # A partial last tile, with a row width only the narrow block divides.
+    m, k = 256, 128
+    n = 3 * n_tile - block_width
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=m,
+            n=n,
+            k=k,
+            output_n_tile=n_tile,
+            warpgroup_n_tile=n_tile,
+            output_slices=slices,
+            operand_stages=2,
+        )
+    )
+    [store] = [
+        typ
+        for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and physical_layout(typ) is not None
+    ]
+    assert physical_layout(store) == (block_width, "block_major")
+    assert store.swizzle == swizzle
+    launcher = make_ptx_launcher(kernel)
+    torch.manual_seed(11)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.full((m, n), float("nan"), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+
+
+@pytest.mark.parametrize(
+    "axes,expected_grid",
+    [
+        ((CollectiveAxis.X, CollectiveAxis.Y), (4, 3, 1)),
+        ((CollectiveAxis.Y, CollectiveAxis.X), (3, 4, 1)),
+    ],
+)
+def test_output_grid_axis_bindings(axes, expected_grid):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=256,
+            n=192,
+            k=64,
+            output_m_tile=64,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            output_grid_axes=axes,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.grid_dim == expected_grid
+
+
+@pytest.mark.parametrize(
+    "axes,expected_grid",
+    [
+        ((CollectiveAxis.X, CollectiveAxis.Y), (3, 1, 1)),
+        ((CollectiveAxis.Y, CollectiveAxis.X), (1, 3, 1)),
+    ],
+)
+def test_grouped_output_grid_axis_bindings(axes, expected_grid):
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=384,
+            n=256,
+            k=64,
+            output_n_tiles_per_cta=4,
+            output_m_tile=128,
+            output_n_tile=64,
+            warpgroup_n_tile=64,
+            output_grid_axes=axes,
+            output_tma_inner_size=None,
+        )
+    )
+    assert kernel.grid_dim == expected_grid
+
+
+def _fixed_grid_module(fast_axis: str):
+    module = gpu_dialect.parse_module("""
+        module {
+          kernel @mm(%a: gmem<512x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<512x256xbf16>) {
+            matmul(%a: gmem<512x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<512x256xbf16>) collective=xyz.grid attrs={accumulate: false, label: "mm"}
+          }
+        }
+    """)
+    return schedule_matmul(
+        module,
+        output_grid_size=3,
+        output_grid_fast_axis=fast_axis,
+        output_m_tile=128,
+        output_n_tile=128,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=8,
+        output_tma_inner_size=None,
+    )
+
+
+def test_fixed_output_grid_traversal_follows_the_fast_axis():
+    m_fast = make_ptx_kernel(_fixed_grid_module("m")).ptx
+    assert m_fast != make_ptx_kernel(_fixed_grid_module("n")).ptx
+    with pytest.raises(ValueError, match="output_grid_fast_axis"):
+        _fixed_grid_module("k")
+
+
+@requires_cuda
+def test_m_fast_fixed_output_grid_matches_torch():
+    launcher = make_ptx_launcher(make_ptx_kernel(_fixed_grid_module("m")))
+    torch.manual_seed(29)
+    lhs = torch.randn((512, 64), dtype=BF16, device="cuda")
+    rhs = torch.randn((256, 64), dtype=BF16, device="cuda")
+    actual = torch.empty((512, 256), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+
+
 def test_multi_output_uses_requested_tile_geometry():
     kernel = make_ptx_kernel(
         auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -142,7 +363,8 @@ def test_multi_output_uses_requested_tile_geometry():
 
 
 @pytest.mark.parametrize(
-    "tiles_per_cta,expected_grid_x", [(3, 6), (6, 3), (8, 2), (16, 1)],
+    "tiles_per_cta,expected_grid_x",
+    [(3, 6), (5, 4), (6, 3), (8, 2), (16, 1)],
 )
 def test_extended_output_tiles_per_cta(tiles_per_cta, expected_grid_x):
     kernel = make_ptx_kernel(
@@ -165,7 +387,13 @@ def test_extended_output_tiles_per_cta(tiles_per_cta, expected_grid_x):
     ],
 )
 def test_n_output_groups_infer_the_grid(
-    m, n, k, m_tile, n_tile, n_group, expected_grid,
+    m,
+    n,
+    k,
+    m_tile,
+    n_tile,
+    n_group,
+    expected_grid,
 ):
     kernel = make_ptx_kernel(
         auto_matmul_4096_wgmma256_wg_tma_store_module(
@@ -212,6 +440,101 @@ def test_configurable_tma_gemm_supports_fp16():
     assert ".f32.bf16.bf16" not in kernel.ptx
 
 
+def test_cyclic_wgmma_pipeline_reaches_ptx():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            m=128,
+            n=256,
+            k=1024,
+            operand_stages=4,
+            cyclic_operand_pipeline=True,
+            output_slices=2,
+        )
+    )
+
+    assert "wgmma.wait_group.sync.aligned 1;" in kernel.ptx
+
+
+@requires_cuda
+def test_cyclic_wgmma_pipeline_matches_torch():
+    m, n, k = 128, 256, 1024
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        operand_stages=4,
+        cyclic_operand_pipeline=True,
+        output_slices=2,
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(17)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "cluster_m_ctas", "cluster_n_ctas", "multicast_operand"),
+    [
+        (256, 256, 2, 1, "rhs"),
+        (128, 512, 1, 2, "lhs"),
+    ],
+)
+@requires_cuda
+def test_cluster_multicast_gemm_matches_torch(
+    m: int,
+    n: int,
+    cluster_m_ctas: int,
+    cluster_n_ctas: int,
+    multicast_operand: str,
+):
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=128,
+        output_m_tile=128,
+        output_n_tile=256,
+        warpgroup_n_tile=128,
+        cluster_m_ctas=cluster_m_ctas,
+        cluster_n_ctas=cluster_n_ctas,
+        operand_move_attrs={multicast_operand: {"multicast": True}},
+    )
+    kernel = make_ptx_kernel(module)
+    launcher = make_ptx_launcher(kernel)
+    torch.manual_seed(19)
+    lhs = torch.randn((m, 128), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, 128), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert kernel.cluster_dim == (cluster_m_ctas, cluster_n_ctas, 1)
+    assert ".multicast::cluster" in kernel.ptx
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+
+
+@requires_cuda
+def test_cluster_dimensions_follow_swapped_output_grid_axes():
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=256,
+        n=512,
+        k=64,
+        output_grid_axes=(CollectiveAxis.Y, CollectiveAxis.X),
+        cluster_n_ctas=2,
+        operand_move_attrs={"lhs": {"multicast": True}},
+    )
+    kernel = make_ptx_kernel(module)
+
+    assert kernel.grid_dim == (2, 2, 1)
+    assert kernel.cluster_dim == (2, 1, 1)
+
+
 @requires_cuda
 def test_k128_block_major_nested_tiles_match_torch():
     m, n, k = 128, 256, 128
@@ -234,17 +557,70 @@ def test_k128_block_major_nested_tiles_match_torch():
     assert torch.equal(actual, torch.mm(lhs, rhs.T))
 
 
-def test_four_tile_output_evict_first_reaches_tma_stores():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_m_tiles_per_cta=4,
+@requires_cuda
+def test_two_dimensional_warpgroup_tiles_match_torch():
+    m, n, k = 256, 256, 128
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_m_tile=128,
+        output_n_tile=256,
+        warpgroup_m_tile=64,
+        warpgroup_n_tile=128,
         operand_stages=3,
+    )
+    kernel = make_ptx_kernel(module)
+    make_ptx_launcher(kernel)
+    torch.manual_seed(17)
+
+
+@requires_cuda
+@pytest.mark.parametrize("cluster", [(2, 1), (1, 2)])
+@pytest.mark.parametrize("output_m_tiles_per_cta", [1, 2])
+def test_multicast_gemm_matches_torch(cluster, output_m_tiles_per_cta):
+    # Four stages over eight k-steps release and refill every stage; two
+    # output tiles per CTA refill stages again after the first epilogue.
+    m, n, k = 512, 512, 512
+    shared = "rhs" if cluster == (2, 1) else "lhs"
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_m_tile=64,
+        output_n_tile=128,
+        warpgroup_n_tile=64,
         output_slices=2,
-        output_store_buffers=2,
-        operand_move_attrs={
-            "lhs": {"l2_cache_hint": "evict_first"},
-            "dst": {"l2_cache_hint": "evict_first"},
-        },
-    ))
+        operand_stages=4,
+        output_m_tiles_per_cta=output_m_tiles_per_cta,
+        operand_move_attrs={shared: {"multicast": True}},
+    )
+    module.body.ops[0].attrs["cluster_dim"] = [*cluster, 1]
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(11)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))
+
+
+def test_four_tile_output_evict_first_reaches_tma_stores():
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_m_tiles_per_cta=4,
+            operand_stages=3,
+            output_slices=2,
+            output_store_buffers=2,
+            operand_move_attrs={
+                "lhs": {"l2_cache_hint": "evict_first"},
+                "dst": {"l2_cache_hint": "evict_first"},
+            },
+        )
+    )
     assert kernel.name.endswith("_4tiles_split2_dbuf2")
     assert kernel.ptx.count("createpolicy.fractional.L2::evict_first") == 1
     assert kernel.ptx.count("bytes.L2::cache_hint") == 28
@@ -252,21 +628,24 @@ def test_four_tile_output_evict_first_reaches_tma_stores():
 
 
 def test_lhs_l2_promotion_reaches_tma_descriptor():
-    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
-        output_m_tiles_per_cta=4,
-        operand_stages=3,
-        output_slices=2,
-        output_store_buffers=2,
-        operand_move_attrs={
-            "lhs": {
-                "l2_cache_hint": "evict_first",
-                "l2_promotion": "256B",
+    kernel = make_ptx_kernel(
+        auto_matmul_4096_wgmma256_wg_tma_store_module(
+            output_m_tiles_per_cta=4,
+            operand_stages=3,
+            output_slices=2,
+            output_store_buffers=2,
+            operand_move_attrs={
+                "lhs": {
+                    "l2_cache_hint": "evict_first",
+                    "l2_promotion": "256B",
+                },
+                "dst": {"l2_cache_hint": "evict_first"},
             },
-            "dst": {"l2_cache_hint": "evict_first"},
-        },
-    ))
+        )
+    )
     input_descs = {
-        typ.arg_idx: typ for typ in kernel.signature
+        typ.arg_idx: typ
+        for typ in kernel.signature
         if isinstance(typ, TmaDescType) and typ.arg_idx in (0, 1)
     }
     assert input_descs[0].l2_promotion == "256B"
@@ -283,7 +662,8 @@ def test_dynamic_m_schedule_uses_broad_muse_regimes():
 
 def test_dynamic_m_gemm_returns_an_inferred_meta_output():
     op = make_dynamic_m_matmul(
-        256, 64,
+        256,
+        64,
         name="test_dynamic_m_gemm_returns_an_inferred_meta_output",
         namespace="ayla_dynamic_schema_test",
     )
@@ -301,7 +681,8 @@ def test_dynamic_m_gemm_returns_an_inferred_meta_output():
 @requires_cuda
 def test_dynamic_m_gemm_specializes_distinct_shapes():
     op = make_dynamic_m_matmul(
-        256, 64,
+        256,
+        64,
         name="test_dynamic_m_gemm_specializes_distinct_shapes",
         namespace="ayla_dynamic_test",
     )
@@ -315,9 +696,7 @@ def test_dynamic_m_gemm_specializes_distinct_shapes():
 
 
 def test_sigmoid_output_tiles_lower_to_ptx():
-    kernel = make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_sigmoid_module()
-    )
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_sigmoid_module())
     lines = kernel.ptx.splitlines()
 
     def at(pattern):
@@ -340,15 +719,15 @@ def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
     loops = find_ops_of_type(module, ForOp)
     assert all(loop.attrs.get("label") != "outn" for loop in loops)
     wgrmem_tiles = [
-        op for op in find_ops_of_type(module, TileOp)
+        op
+        for op in find_ops_of_type(module, TileOp)
         if isinstance(op.result().type, WgrmemTensorType)
     ]
     assert wgrmem_tiles
     assert all(None not in tile.static_indices for tile in wgrmem_tiles)
 
     epilogues = [
-        op for op in find_ops_of_type(module, ElementwiseOp)
-        if op.fn == "sigmoid"
+        op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "sigmoid"
     ]
     assert [op.attrs.get("label") for op in epilogues[:4]] == [
         "epi_iter0_iter0",
@@ -365,14 +744,23 @@ def test_sigmoid_output_tiles_are_static_before_ptx_lowering():
     "op,dtype,epilogue",
     [
         pytest.param(lambda a, b: torch.mm(a, b.t()), F32, None, id="torch.mm"),
-        pytest.param(ayla.naive_matmul_4096_loop, F32, None, id="naive_matmul_4096_loop"),
+        pytest.param(
+            ayla.naive_matmul_4096_loop, F32, None, id="naive_matmul_4096_loop"
+        ),
         pytest.param(ayla.loop_4x4_matmul_4096, F32, None, id="loop_4x4_matmul_4096"),
         pytest.param(ayla.loop_8x8_matmul_4096, F32, None, id="loop_8x8_matmul_4096"),
         pytest.param(ayla.tma_matmul_4096, F32, None, id="tma_matmul_4096"),
         pytest.param(ayla.pranjalssh_4096, BF16, None, id="pranjalssh_4096"),
-        pytest.param(ayla.pranjalssh_4096_pipelined, BF16, None, id="pranjalssh_4096_pipelined"),
+        pytest.param(
+            ayla.pranjalssh_4096_pipelined, BF16, None, id="pranjalssh_4096_pipelined"
+        ),
         pytest.param(ayla.auto_matmul_4096, BF16, None, id="auto_matmul_4096"),
-        pytest.param(ayla.auto_matmul_4096_wgmma256_wg, BF16, None, id="auto_matmul_4096_wgmma256_wg"),
+        pytest.param(
+            ayla.auto_matmul_4096_wgmma256_wg,
+            BF16,
+            None,
+            id="auto_matmul_4096_wgmma256_wg",
+        ),
         pytest.param(
             ayla.auto_matmul_4096_wgmma256_wg_tma_store_k3,
             BF16,
@@ -434,9 +822,9 @@ def test_gemm_correctness(op, dtype, epilogue, seed):
     else:
         atol = 1e-3 if dtype == torch.float32 else 2.0
     assert torch.isfinite(c).all(), f"{op}: output contains NaN or Inf"
-    assert torch.allclose(
-        c, ref, atol=atol
-    ), f"{op}: max error {(c - ref).abs().max().item()}"
+    assert torch.allclose(c, ref, atol=atol), (
+        f"{op}: max error {(c - ref).abs().max().item()}"
+    )
     # Poison the output and inputs so the next test can't accidentally
     # reuse correct results from the CUDA allocator.
     c.fill_(float("nan"))
@@ -453,10 +841,13 @@ def test_every_registered_kernel_is_covered():
     and the collection.
     """
     parametrize = next(
-        mark for mark in getattr(test_gemm_correctness, "pytestmark")
+        mark
+        for mark in getattr(test_gemm_correctness, "pytestmark")
         if mark.args and mark.args[0] == "op,dtype,epilogue"
     )
     covered = {param.id for param in parametrize.args[1]}
+    # Fused operations with non-GEMM signatures have dedicated end-to-end
+    # correctness tests instead of fitting the two-input matrix above.
     registered = {
         name
         for name in dir(ayla)
@@ -467,3 +858,180 @@ def test_every_registered_kernel_is_covered():
         and getattr(ayla, name).default._schema.returns
     }
     assert registered <= covered, f"not exercised: {sorted(registered - covered)}"
+
+
+def _transposed_output_matmul(m, n, k, **schedule):
+    """Schedule C = A B^T as C^T = B A^T through C's column-major view."""
+    a, b = f"gmem<{m}x{k}xf16>", f"gmem<{n}x{k}xf16>"
+    c = f"gmem<{n}x{m}xf16 strides=[1, {n}]>"
+    module = gpu_dialect.parse_module(
+        textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: {a}, %b: {b}, %c: {c}) {{
+            matmul(%b: {b}, %a: {a}, %c: {c}) collective=xyz.grid attrs={{accumulate: false, label: "mm"}}
+          }}
+        }}""")
+    )
+    assert isinstance(module, ModuleOp)
+    return schedule_matmul(module, **schedule)
+
+
+def test_transposed_output_stores_fragments_with_stmatrix_trans():
+    kernel = make_ptx_kernel(
+        _transposed_output_matmul(
+            200,
+            256,
+            128,
+            output_m_tile=128,
+            output_n_tile=104,
+        )
+    )
+
+    assert "stmatrix.sync.aligned.m8n8.x4.trans" in kernel.ptx
+    assert "stmatrix.sync.aligned.m8n8.x2.trans" in kernel.ptx
+    output_desc = next(
+        typ
+        for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and typ.arg_idx == 2
+    )
+    # The store describes the row-major C behind the column-major view.
+    assert list(output_desc.gmem_type.sizes) == [200, 256]
+    assert list(output_desc.tile_sizes) == [104, 128]
+
+
+def test_transposed_output_needs_a_blocked_staging_layout():
+    with pytest.raises(ValueError, match="transposed WGMMA fragment store"):
+        make_ptx_kernel(
+            _transposed_output_matmul(
+                128,
+                128,
+                64,
+                output_m_tile=128,
+                output_n_tile=128,
+                output_tma_inner_size=None,
+            )
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("m", "n", "k", "schedule"),
+    [
+        (196, 384, 384, {"output_m_tile": 128, "output_n_tile": 200}),
+        (
+            130,
+            512,
+            512,
+            {
+                "output_m_tile": 64,
+                "output_n_tile": 64,
+                "warpgroup_n_tile": 64,
+                "operand_stages": 4,
+            },
+        ),
+        (
+            700,
+            768,
+            256,
+            {"output_m_tile": 192, "output_n_tile": 176, "operand_stages": 2},
+        ),
+        (
+            300,
+            512,
+            128,
+            {
+                "output_m_tile": 128,
+                "output_n_tile": 128,
+                "output_slices": 2,
+                "output_store_buffers": 2,
+            },
+        ),
+    ],
+)
+def test_transposed_output_matches_torch(m, n, k, schedule):
+    launcher = make_ptx_launcher(
+        make_ptx_kernel(
+            _transposed_output_matmul(m, n, k, **schedule),
+        )
+    )
+    torch.manual_seed(11)
+    lhs = torch.randn((m, k), dtype=torch.float16, device="cuda")
+    rhs = torch.randn((n, k), dtype=torch.float16, device="cuda")
+    actual = torch.full((m, n), float("nan"), dtype=torch.float16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T), rtol=2e-3, atol=0.25)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("dtype", "ir_dtype"),
+    [(torch.bfloat16, "bf16"), (torch.float16, "f16")],
+)
+def test_unswizzled_column_warpgroups_store_only_owned_slice(dtype, ir_dtype):
+    module = gpu_dialect.parse_module(
+        textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: gmem<64x64x{ir_dtype}>, %b: gmem<256x64x{ir_dtype}>, %c: gmem<64x256x{ir_dtype}>) {{
+            matmul(%a: gmem<64x64x{ir_dtype}>, %b: gmem<256x64x{ir_dtype}>, %c: gmem<64x256x{ir_dtype}>) collective=xyz.grid attrs={{accumulate: false, label: "mm"}}
+          }}
+        }}""")
+    )
+    module = schedule_matmul(
+        module,
+        output_m_tile=64,
+        output_n_tile=256,
+        warpgroup_n_tile=128,
+        operand_stages=2,
+        output_slices=2,
+        output_tma_inner_size=None,
+    )
+    kernel = make_ptx_kernel(module)
+    assert kernel.block_dim == (256, 1, 1)
+    run = make_ptx_launcher(kernel)
+    out = torch.empty(64, 256, dtype=dtype, device="cuda")
+    for seed in (1, 104729, 15485863):
+        torch.manual_seed(seed)
+        a = torch.randn(64, 64, dtype=dtype, device="cuda")
+        b = torch.randn(256, 64, dtype=dtype, device="cuda")
+        out.fill_(float("nan"))
+        run(a, b, out)
+        torch.testing.assert_close(out, a @ b.T, atol=0.25, rtol=0.01)
+
+
+@requires_cuda
+@pytest.mark.parametrize("cluster", [(2, 1), (1, 2)])
+@pytest.mark.parametrize("output_m_tiles_per_cta", [1, 2])
+def test_multicast_gemm_with_split_release_matches_torch(
+    cluster,
+    output_m_tiles_per_cta,
+):
+    # Four stages over eight k-steps refill every stage; two output tiles per
+    # CTA refill stages again after the first tile's epilogue.
+    m, n, k = 512, 512, 512
+    shared = "rhs" if cluster == (2, 1) else "lhs"
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_m_tile=64,
+        output_n_tile=128,
+        warpgroup_n_tile=64,
+        output_slices=2,
+        operand_stages=4,
+        output_m_tiles_per_cta=output_m_tiles_per_cta,
+        operand_move_attrs={shared: {"multicast": True}},
+    )
+    module.body.ops[0].attrs["cluster_dim"] = [*cluster, 1]
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(11)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.empty((m, n), dtype=BF16, device="cuda")
+
+    launcher(lhs, rhs, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))

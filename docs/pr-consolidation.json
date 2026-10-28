@@ -1,0 +1,318 @@
+{
+  "main_base": "24e1e2a02bf6b5b444ef13afa46cc767aabbf61b",
+  "main_branch": "review/main-small-fixes",
+  "feature_branch": "feature/consolidated",
+  "prs": [
+    {
+      "number": 81,
+      "destination": "hold",
+      "source_head": "1455974ee67814646dbdbc77d20d04b3af6430e3",
+      "title": "Benchmark the recorded model shapes ayla has a kernel for"
+    },
+    {
+      "number": 196,
+      "destination": "hold",
+      "source_head": "91e6c23547312013c6eb59461fd99e5bc597d851",
+      "title": "[DO NOT MERGE] Debug-only fastest GEMM transformation pipeline"
+    },
+    {
+      "number": 239,
+      "destination": "hold",
+      "source_head": "1d8b31ca80f88a884a895546ac245dd3861a8c40",
+      "title": "Prototype Muse Glimmer MLP subgraph capture"
+    },
+    {
+      "number": 257,
+      "destination": "hold",
+      "source_head": "899ed6dcb201f4af1bbd89212263acc025682616",
+      "title": "Capture Muse Glimmer mean reduction"
+    },
+    {
+      "number": 292,
+      "destination": "hold",
+      "source_head": "9e55de67aad33b0769235ecbcb476664abd30fcb",
+      "title": "[DO NOT MERGE] Contains affine index analysis, which may be useful at some later point "
+    },
+    {
+      "number": 312,
+      "destination": "hold",
+      "source_head": "cb672431ca9150d4d439ef14daf749b8078c5532",
+      "title": "[DO NOT MERGE] Benchmark captured Torch graphs"
+    },
+    {
+      "number": 315,
+      "destination": "development",
+      "source_head": "9653976fa3b80810a4d71b4a0e8aa6086f8eae6f",
+      "title": "[MEGAKERNEL] Stage standalone register writebacks in PromoteBuffers"
+    },
+    {
+      "number": 321,
+      "destination": "development",
+      "source_head": "834408a4460b03a0f3bc77f415f920ed7addea3b",
+      "title": "[MEGAKERNEL] Muse SwiGLU benchmark"
+    },
+    {
+      "number": 342,
+      "destination": "development",
+      "source_head": "7f6f104a93688eb93021a68a6bd767cd46724035",
+      "title": "Add generic post-grad FX JIT pipeline"
+    },
+    {
+      "number": 343,
+      "destination": "development",
+      "source_head": "0378a956ba6d60d6296ce19cd66caed18951923c",
+      "title": "Add generic FX kernel registration"
+    },
+    {
+      "number": 344,
+      "destination": "development",
+      "source_head": "6e0ddc3d9bed6af416deb82e8c79bd8c9e192d03",
+      "title": "Fx to Ayla IR translation"
+    },
+    {
+      "number": 345,
+      "destination": "development",
+      "source_head": "77ee5fb876a51f6fc660c3db99f02a5b3d48c0b8",
+      "title": "Fx to Ayla compile pipeline"
+    },
+    {
+      "number": 346,
+      "destination": "development",
+      "source_head": "1184bb85b5f23d4682428c2bdaeb02b82e970f28",
+      "title": "Find and capture Ayla-supported Fx-region discovery"
+    },
+    {
+      "number": 347,
+      "destination": "development",
+      "source_head": "3310d36aea20c9a4e807bcbba82b584686b260ce",
+      "title": "Support explicit FX kernel workspaces"
+    },
+    {
+      "number": 348,
+      "destination": "development",
+      "source_head": "36f44a708ebf15237f76a8a4b2465bb3a7763676",
+      "title": "[MEGAKERNEL] Schedule imported SwiGLU regions"
+    },
+    {
+      "number": 349,
+      "destination": "development",
+      "source_head": "a60924c394ad2e875e4feb1913fbfacfa050e750",
+      "title": "Remove late Glimmer subgraph matching"
+    },
+    {
+      "number": 351,
+      "destination": "consolidated",
+      "source_head": "b066f9f3936cfc5e820161f8962d80729b4a8e22",
+      "title": "Move single GEMM/GEMM+sigmoid benchmark routing to FX",
+      "note": "Single-GEMM functionality retained through direct JIT routing; FX implementation lives on development."
+    },
+    {
+      "number": 356,
+      "destination": "consolidated",
+      "source_head": "e32bb43720a4da967bd051667f2ada66b5f776f3",
+      "title": "Route general BF16 GEMMs through FX",
+      "note": "Single-GEMM functionality retained through direct JIT routing; FX implementation lives on development."
+    },
+    {
+      "number": 410,
+      "destination": "development",
+      "source_head": "d5efc5a6537a33d1594498d7870603a1d2411fff",
+      "title": "Normalize structural FX views during import"
+    },
+    {
+      "number": 425,
+      "destination": "consolidated",
+      "source_head": "6713f65d5c1f227a50b3d26effd0c73419fa1918",
+      "title": "OSS GEMM benchmark heuristics"
+    },
+    {
+      "number": 429,
+      "destination": "consolidated",
+      "source_head": "07dfe4753fb537849169e359e41aadf9a2e8a9fd",
+      "title": "Unify GEMM output tile scheduling"
+    },
+    {
+      "number": 430,
+      "destination": "consolidated",
+      "source_head": "6724ba2742fff41d401ae08bec10fd054c247475",
+      "title": "Expose grid-stride loops to loop transforms"
+    },
+    {
+      "number": 432,
+      "destination": "hold",
+      "source_head": "3d75e5057a4a689559a0a746db5037206a410d24",
+      "title": "[DEFER TO QUEUE, BUT IMPORTANT] Pipeline and overlap wgmma group execution"
+    },
+    {
+      "number": 434,
+      "destination": "consolidated",
+      "source_head": "fd416db0747b491d3d24fdfcf074632ad3f217f0",
+      "title": "Fuse local and multicast TMA loads"
+    },
+    {
+      "number": 435,
+      "destination": "consolidated",
+      "source_head": "5929681d199d270ac37edbc51718d7eb91dae6fc",
+      "title": "Account for local sync in cluster leader barriers"
+    },
+    {
+      "number": 436,
+      "destination": "consolidated",
+      "source_head": "ada00a46a0c7ef9da5017c11df64becb87195558",
+      "title": "Batch mbarrier initialization publication"
+    },
+    {
+      "number": 455,
+      "destination": "consolidated",
+      "source_head": "1d9c21301d9df202789d27c0eaee1c5f90c4d42b",
+      "title": "Express warp collectivity as 32 threads"
+    },
+    {
+      "number": 456,
+      "destination": "consolidated",
+      "source_head": "33da05d099acc1392ef2b6c911e954dff7f4a098",
+      "title": "Share hardware level IDs and launch extents"
+    },
+    {
+      "number": 461,
+      "destination": "consolidated",
+      "source_head": "e57c2038e8811b183fef7b6c6ce530b3b968922c",
+      "title": "Support transposed STMATRIX to handle non-64-multiple M-shapes better"
+    },
+    {
+      "number": 465,
+      "destination": "consolidated",
+      "source_head": "5cb9056408c2cf83983ce01d83b58001cb14c883",
+      "title": "Fold redundant index computations"
+    },
+    {
+      "number": 467,
+      "destination": "consolidated",
+      "source_head": "f528e9b0e4b15876806d2527acdbb8a4eba0f9bb",
+      "title": "Wait at gather barriers with the leader's warp"
+    },
+    {
+      "number": 468,
+      "destination": "consolidated",
+      "source_head": "4bdfd2647a9352b5e86a1fe1a887902e7453dd8f",
+      "title": "Issue leader work from one elected thread of a uniform warp"
+    },
+    {
+      "number": 472,
+      "destination": "consolidated",
+      "source_head": "c5503f80e13d4ef7cea512994a1a07063479d364",
+      "title": "Multicast cluster release"
+    },
+    {
+      "number": 476,
+      "destination": "consolidated",
+      "source_head": "6bdff2ad45591cec43e82df7dd7a263db836f156",
+      "title": "Reduce ScheduleAsync compilation overhead by going from cubic to quadradic comparison on swaps"
+    },
+    {
+      "number": 477,
+      "destination": "main",
+      "source_head": "abfc0e533096eb74cc88c249cd311fe78087cda3",
+      "title": "Keep allocation IDs out of PTX cache keys"
+    },
+    {
+      "number": 479,
+      "destination": "consolidated",
+      "source_head": "a7633f803b3e641477646125c612ba297e79b85c",
+      "title": "Compile registered GEMM kernels lazily"
+    },
+    {
+      "number": 480,
+      "destination": "consolidated",
+      "source_head": "2c88e5eb9bb3222c8434aebb4bafed711495658b",
+      "title": "Attribute to reverse traversal of tiles for GEMMs"
+    },
+    {
+      "number": 482,
+      "destination": "consolidated",
+      "source_head": "c753beffc226b298e0b29d80e88f91aa89084fdb",
+      "title": "Extract configurable matmul scheduling pipeline"
+    },
+    {
+      "number": 483,
+      "destination": "consolidated",
+      "source_head": "e60c5a007d75c0f78487840fc34f8151f38da0be",
+      "title": "Use TileMatmulPipeline directly in GEMM builders and tests"
+    },
+    {
+      "number": 485,
+      "destination": "hold",
+      "source_head": "b4e18dd542c1a9c00a2cde52ca43a378d2dd3c94",
+      "title": "Remove four slow GEMM kernels"
+    },
+    {
+      "number": 486,
+      "destination": "consolidated",
+      "source_head": "f74a2178d9ebfcb1b43002aebf4dda9f2cbb1bda",
+      "title": "Route Torch custom calls through JITCompiler"
+    },
+    {
+      "number": 487,
+      "destination": "hold",
+      "source_head": "799f60fd93c903da20aac48e8ffeaf5667450997",
+      "title": "Remove unused CUDA experiments"
+    },
+    {
+      "number": 489,
+      "destination": "consolidated",
+      "source_head": "9599ff4a9374289ef84c6f914ea673ceea395a63",
+      "title": "Traverse fixed GEMM output grids along a selected axis"
+    },
+    {
+      "number": 490,
+      "destination": "main",
+      "source_head": "efc2ae9b3a7df7c3086a361403dcabb2d14ecaeb",
+      "title": "Compare better-benchmark arms like bench_parallel --compare"
+    },
+    {
+      "number": 491,
+      "destination": "consolidated",
+      "source_head": "2cdc2572c7fc85700392a3f3c2a8358f6b61bfe6",
+      "title": "Initialize buffers with elementwise fill instead of alloc init"
+    },
+    {
+      "number": 492,
+      "destination": "consolidated",
+      "source_head": "3e46aa2f991e250f39d5b5d827dcfdd9ea181271",
+      "title": "Route GEMMs through the JIT compiler from a measured schedule table for benchmarking standalone shapes"
+    },
+    {
+      "number": 493,
+      "destination": "consolidated",
+      "source_head": "89a6fe093fde0baba274b989a1ecf56735540c4c",
+      "title": "Matmul Scale-D for native WGMMA PTX attr "
+    },
+    {
+      "number": 498,
+      "destination": "consolidated",
+      "source_head": "bb27d8247cb1ed2a38200e851d3544512f5a9e09",
+      "title": "Fx bmm kernel selection",
+      "note": "Single-GEMM functionality retained through direct JIT routing; FX implementation lives on development."
+    },
+    {
+      "number": 500,
+      "destination": "consolidated",
+      "source_head": "eab299ed3019231387d6796038a9d950cc751e1e",
+      "title": "Narrow blocked output staging to the slice width"
+    },
+    {
+      "number": 501,
+      "destination": "consolidated",
+      "source_head": "120c3ff039ce134f37ba415db5fc0c57a3f87e87",
+      "title": "Hoist GMEM->RMEM sync loads in ScheduleAsync"
+    },
+    {
+      "number": 502,
+      "destination": "consolidated",
+      "source_head": "1b270133ed62a43d5b5559a57ba399599583b4a4",
+      "title": "Relax the cluster arrive that publishes mbarrier initialization"
+    }
+  ],
+  "development_branch": "feature/gemm-chains",
+  "pre_split_head": "839ab19"
+}

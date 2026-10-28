@@ -3,7 +3,9 @@
 Sinks ``await`` ops as late as possible — just before the first
 consumer of the guarded buffer — and hoists ``async_move`` ops as
 early as possible. This maximizes the window where async loads
-overlap with compute.
+overlap with compute. Loads from global memory into registers are
+hoisted too, since only their first use waits; they go first, so the
+async moves hoisted after them still issue ahead of them.
 
 Hoisting an async op drags its full dependency cone of
 side-effect-free ops (alloc, index arithmetic, tile ops) up with it,
@@ -14,9 +16,14 @@ the ops that define its operands.
 
 from __future__ import annotations
 
+import functools
+
 from ..gpu_dialect import (
+    AllocOp,
     AsyncOp,
     AwaitOp,
+    GmemTensorType,
+    RegMemTensorType,
     TmaMoveOp,
     effective_operands,
     has_ordering_effect,
@@ -42,11 +49,36 @@ def _is_async_move(op: Op) -> bool:
     )
 
 
+def _is_register_load(op: Op) -> bool:
+    return (
+        isinstance(op, MoveOp)
+        and isinstance(op.src.type, GmemTensorType)
+        and isinstance(op.dst.type, RegMemTensorType)
+    )
+
+
 def _is_await(op: Op) -> bool:
     return isinstance(op, AwaitOp)
 
 
-def _can_swap(upper: Op, lower: Op) -> bool:
+def _effect_roots(op: Op) -> tuple[set[Value], set[Value]] | None:
+    """The buffers ``op`` reads and writes, or None if unknown."""
+    # An await resolves to its lock peers via memory_effects.
+    effects = memory_effects(op)
+    if effects is None:
+        return None
+    reads = {
+        root for effect in effects if effect.kind == "R"
+        for root in effect.roots
+    }
+    writes = {
+        root for effect in effects if effect.kind == "W"
+        for root in effect.roots
+    }
+    return reads, writes
+
+
+def _can_swap(upper: Op, lower: Op, effect_roots=_effect_roots) -> bool:
 
     if has_ordering_effect(upper) or has_ordering_effect(lower):
         return False
@@ -56,29 +88,14 @@ def _can_swap(upper: Op, lower: Op) -> bool:
     if any(v in upper_results for v in effective_operands(lower)):
         return False
 
-    # Memory effects (an await resolves to its lock peers via memory_effects).
-    upper_effs = memory_effects(upper)
-    lower_effs = memory_effects(lower)
-    if upper_effs is None or lower_effs is None:
+    upper_roots = effect_roots(upper)
+    lower_roots = effect_roots(lower)
+    if upper_roots is None or lower_roots is None:
         return False
 
     # RAW, WAR, or WAW conflict on the same buffer.
-    upper_r = {
-        root for effect in upper_effs if effect.kind == "R"
-        for root in effect.roots
-    }
-    upper_w = {
-        root for effect in upper_effs if effect.kind == "W"
-        for root in effect.roots
-    }
-    lower_r = {
-        root for effect in lower_effs if effect.kind == "R"
-        for root in effect.roots
-    }
-    lower_w = {
-        root for effect in lower_effs if effect.kind == "W"
-        for root in effect.roots
-    }
+    upper_r, upper_w = upper_roots
+    lower_r, lower_w = lower_roots
     if lower_w & upper_r or lower_r & upper_w or lower_w & upper_w:
         return False
 
@@ -127,24 +144,37 @@ def _bubble(
     stacked on them.
     """
     assert step in (-1, 1), f"step must be -1 or +1; got {step}"
+    # Reordering doesn't change an op's effects, and recomputing them for
+    # every candidate swap dominates the pass's runtime.
+    effect_roots = functools.cache(_effect_roots)
     for op in targets:
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
             lo, hi = sorted((j, j + step))
-            if not _can_swap(ops[lo], ops[hi]):
+            if not _can_swap(ops[lo], ops[hi], effect_roots):
                 break
             ops[j], ops[j + step] = ops[j + step], ops[j]
             j += step
 
 
 def _hoist_async_moves(ops: list[Op]) -> None:
-    # Targets: the async moves (matmuls are tracked as lock peers but never
-    # moved) plus the side-effect-free dependency cone feeding each. Then hoist
-    # each up.
-    targets = _side_effect_free_operand_closure(
-        [op for op in ops if _is_async_move(op)], ops
-    )
-    _bubble(ops, targets, step=-1)
+    # Targets: the register loads, then the async moves (matmuls are tracked as
+    # lock peers but never moved), each with the side-effect-free dependency
+    # cone feeding it. Then hoist each up. The async moves go second, so they
+    # issue ahead of any register load they can pass.
+    for is_target in (_is_register_load, _is_async_move):
+        targets = _side_effect_free_operand_closure(
+            [op for op in ops if is_target(op)], ops
+        )
+        _bubble(ops, targets, step=-1)
+    # Each move now sits just below its own allocations, between the others'.
+    # An allocation without an initializer has no operands, so move those back
+    # to the front, in order: lock initializations then stay together, and one
+    # barrier publishes them all.
+    allocations = [
+        op for op in ops if isinstance(op, AllocOp)
+    ]
+    ops[:] = allocations + [op for op in ops if op not in set(allocations)]
 
 
 def _sink_awaits(ops: list[Op]) -> None:
@@ -156,8 +186,12 @@ def _sink_awaits(ops: list[Op]) -> None:
 class ScheduleAsync(Pass):
 
     def run_block(self, block: Block) -> None:
-        _hoist_async_moves(block.ops)
-        _sink_awaits(block.ops)
+        # Reorder a plain list: every write to ``block.ops`` re-syncs the whole
+        # block, which makes bubbling through it cubic.
+        ops = list(block.ops)
+        _hoist_async_moves(ops)
+        _sink_awaits(ops)
+        block.ops = ops
         super().run_block(block)
 
 

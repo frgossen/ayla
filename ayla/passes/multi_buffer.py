@@ -50,9 +50,6 @@ class MultiBuffer(LoweringPass):
             return None
         if not label_matches(op, self.label_filter):
             return None
-        # A per-iteration initializer would have to be re-run per buffer.
-        if op.init is not None:
-            return None
 
         # Unrolling is the only thing that gives a loop a step other than 1, and
         # it runs after this pass, so a strided loop here means the pipeline is

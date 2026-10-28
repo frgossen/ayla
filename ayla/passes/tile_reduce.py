@@ -14,11 +14,12 @@ from ..base.ir import (
 )
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
+    build_hardware_id,
     AddrMemTensorType,
     AllocOp,
-    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
     ForOp,
     IndexConstantOp,
@@ -28,9 +29,8 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     ReduceOp,
-    ThreadIdOp,
+    RmemTensorType,
     TileOp,
-    WarpGroupIdOp,
 )
 from ._utils import label_matches
 
@@ -75,8 +75,14 @@ def _materialize_partials(
         typ = clone_type(reduction_dst.type, attrs)
         neutral_element = ReduceOp.NEUTRAL_ELEMENTS[reduction_fn]
         assert neutral_element is not None
-        alloc = AllocOp.build_with_fresh_id(typ, init=neutral_element)
-        return [alloc], alloc.result()
+        alloc = AllocOp.build_with_fresh_id(typ)
+        neutral = ConstantOp.build(
+            neutral_element, RmemTensorType.build([], reduction_dst.type.dtype),
+        )
+        fill = ElementwiseOp.build(
+            alloc.result(), srcs=[neutral.result()], fn="fill",
+        )
+        return [alloc, neutral, fill], alloc.result()
 
     tile = reduction_dst.definition
     assert isinstance(tile, TileOp), (
@@ -120,28 +126,7 @@ def _materialize_iteration_space(
         return [loop], loop.iv, loop
 
     level, axis = parallel_iteration_space
-    if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
-        id_op_type = {
-            CollectiveLevel.BLOCK: BlockIdOp,
-            CollectiveLevel.THREAD: ThreadIdOp,
-        }[level]
-        ids = id_op_type.build(axis)
-        id_ops: list[Op] = [ids]
-        parallel_id = ids.value
-    elif level == CollectiveLevel.WARP:
-        assert axis == CollectiveAxis.X
-        ids = ThreadIdOp.build(CollectiveAxis.X)
-        warp_size = IndexConstantOp.build(32)
-        warp_id = IndexDivOp.build(ids.value, warp_size.result())
-        id_ops = [ids, warp_size, warp_id]
-        parallel_id = warp_id.result()
-    else:
-        id_op_type = {
-            CollectiveLevel.WG: WarpGroupIdOp,
-        }[level]
-        ids = id_op_type.build()
-        id_ops = [ids]
-        parallel_id = ids.results[axis]
+    id_ops, parallel_id = build_hardware_id(level, axis)
     cdivisor = IndexConstantOp.build(divisor)
     div = IndexDivOp.build(
         parallel_id, cdivisor.result(),
@@ -287,7 +272,7 @@ class TileReduce(LoweringPass):
         kernel = find_ancestor_of_type(hero, KernelOp)
         assert kernel is not None
         level, axis = self.parallel_iteration_space
-        if level == CollectiveLevel.WARP:
+        if level == CollectiveLevel.THREAD_32:
             assert axis == CollectiveAxis.X
             launch_dim *= 32
         elif level == CollectiveLevel.WG:

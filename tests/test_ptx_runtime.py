@@ -4,14 +4,17 @@ Skips when CUDA isn't available. When it runs, it loads a tiny element-wise
 add PTX kernel via the driver, launches it on torch tensors, and checks the
 result.
 """
+
 import textwrap
 
+import pytest
 import torch
 
 from ayla.base.ir import Block, Value
 from ayla.gpu_dialect import (
     AllocOp,
     BarrierOp,
+    BlockIdOp,
     ClusterBlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
@@ -21,7 +24,9 @@ from ayla.gpu_dialect import (
     ModuleOp,
     MoveOp,
     PTXTemplateOp,
+    ReshapeOp,
     SmemTensorType,
+    TileOp,
 )
 from ayla.ptx_codegen import PtxKernel, make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
@@ -115,17 +120,26 @@ def test_cluster_block_ids_and_barrier_reach_the_launch():
         result_names=[],
         description="write cluster block x",
     )
-    module = ModuleOp.build(Block(ops=[KernelOp.build(
-        "cluster_block_ids",
-        Block(arguments=[output], ops=[
-            ids,
-            BarrierOp.build("cluster"),
-            write_x,
-        ]),
-        grid_dim=(2, 1, 1),
-        block_dim=(1, 1, 1),
-        cluster_dim=(2, 1, 1),
-    )]))
+    module = ModuleOp.build(
+        Block(
+            ops=[
+                KernelOp.build(
+                    "cluster_block_ids",
+                    Block(
+                        arguments=[output],
+                        ops=[
+                            ids,
+                            BarrierOp.build("cluster"),
+                            write_x,
+                        ],
+                    ),
+                    grid_dim=(2, 1, 1),
+                    block_dim=(1, 1, 1),
+                    cluster_dim=(2, 1, 1),
+                )
+            ]
+        )
+    )
     launcher = make_ptx_launcher(make_ptx_kernel(module))
     actual = torch.empty(2, device="cuda")
 
@@ -168,15 +182,21 @@ def test_grid_barrier_makes_prior_block_writes_visible():
         operand_names=["data"],
         result_names=[],
     )
-    module = ModuleOp.build(Block(ops=[KernelOp.build(
-        "grid_barrier",
+    module = ModuleOp.build(
         Block(
-            arguments=[data, sync],
-            ops=[write, BarrierOp.build("grid", sync), read],
-        ),
-        grid_dim=(2, 1, 1),
-        block_dim=(1, 1, 1),
-    )]))
+            ops=[
+                KernelOp.build(
+                    "grid_barrier",
+                    Block(
+                        arguments=[data, sync],
+                        ops=[write, BarrierOp.build("grid", sync), read],
+                    ),
+                    grid_dim=(2, 1, 1),
+                    block_dim=(1, 1, 1),
+                )
+            ]
+        )
+    )
     data_tensor = torch.zeros(2, device="cuda", dtype=torch.float32)
     sync_tensor = torch.zeros(2, device="cuda", dtype=torch.float32)
 
@@ -196,9 +216,7 @@ def test_tma_multicast_copies_to_every_cluster_block():
     load = MoveOp.build(
         smem.result(),
         input_value,
-        collective={
-            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
-        },
+        collective={axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis},
         attrs={
             "l2_cache_hint": "evict_last",
             "tma": True,
@@ -219,16 +237,27 @@ def test_tma_multicast_copies_to_every_cluster_block():
         result_names=[],
         description="write multicast result",
     )
-    module = ModuleOp.build(Block(ops=[KernelOp.build(
-        "tma_multicast",
-        Block(arguments=[input_value, output], ops=[smem, load, ids, write]),
-        grid_dim=(2, 1, 1),
-        block_dim=(32, 1, 1),
-        cluster_dim=(2, 1, 1),
-    )]))
+    module = ModuleOp.build(
+        Block(
+            ops=[
+                KernelOp.build(
+                    "tma_multicast",
+                    Block(
+                        arguments=[input_value, output], ops=[smem, load, ids, write]
+                    ),
+                    grid_dim=(2, 1, 1),
+                    block_dim=(32, 1, 1),
+                    cluster_dim=(2, 1, 1),
+                )
+            ]
+        )
+    )
     launcher = make_ptx_launcher(make_ptx_kernel(module))
     input_tensor = torch.full(
-        (16, 16), 7.0, dtype=torch.float32, device="cuda",
+        (16, 16),
+        7.0,
+        dtype=torch.float32,
+        device="cuda",
     )
     actual = torch.empty(2, dtype=torch.float32, device="cuda")
 
@@ -236,3 +265,108 @@ def test_tma_multicast_copies_to_every_cluster_block():
     torch.cuda.synchronize()
 
     assert actual.cpu().tolist() == [7.0, 7.0]
+
+
+@requires_cuda
+def test_rank3_tma_load_through_singleton_batch_view():
+    input_type = GmemTensorType.build((2, 16, 16), F32Type())
+    output_type = GmemTensorType.build((2,), F32Type())
+    input_value = Value("input", input_type)
+    output = Value("output", output_type)
+    ids = BlockIdOp.build(CollectiveAxis.Z)
+    batch = TileOp.build(
+        input_value,
+        [ids.value, 0, 0],
+        GmemTensorType.build((1, 16, 16), F32Type()),
+    )
+    matrix = ReshapeOp.build(
+        batch.result(),
+        GmemTensorType.build((16, 16), F32Type()),
+    )
+    smem = AllocOp.build(SmemTensorType.build((16, 16), F32Type()), id=0)
+    load = MoveOp.build(
+        smem.result(),
+        matrix.result(),
+        collective={axis: CollectiveLevel.BLOCK for axis in CollectiveAxis},
+        attrs={"tma": True},
+    )
+    write = PTXTemplateOp.build(
+        operands=[smem.result(), output, ids.value],
+        result_types=[],
+        template=textwrap.dedent("""\
+            ld.shared.f32 ${f32:value}, [${b32:operand.smem.ptr}];
+            mul.wide.u32 ${b64:offset}, ${b32:operand.batch.val}, 4;
+            add.u64 ${b64:dst}, ${b64:operand.output.ptr}, ${b64:offset};
+            st.global.f32 [${b64:dst}], ${f32:value};
+        """),
+        operand_names=["smem", "output", "batch"],
+        result_names=[],
+    )
+    module = ModuleOp.build(
+        Block(
+            ops=[
+                KernelOp.build(
+                    "rank3_tma_load",
+                    Block(
+                        arguments=[input_value, output],
+                        ops=[
+                            ids,
+                            batch,
+                            matrix,
+                            smem,
+                            load,
+                            write,
+                        ],
+                    ),
+                    grid_dim=(1, 1, 2),
+                    block_dim=(32, 1, 1),
+                )
+            ]
+        )
+    )
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    input_tensor = torch.stack(
+        [
+            torch.full((16, 16), 3.0, device="cuda"),
+            torch.full((16, 16), 7.0, device="cuda"),
+        ]
+    )
+    actual = torch.empty(2, dtype=torch.float32, device="cuda")
+
+    launcher(input_tensor, actual)
+    torch.cuda.synchronize()
+
+    assert actual.cpu().tolist() == [3.0, 7.0]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "ir_dtype, torch_dtype",
+    [
+        ("bf16", torch.bfloat16),
+        ("f16", torch.float16),
+        ("f32", torch.float32),
+    ],
+)
+def test_wgmma_fragment_load_column_broadcast(ir_dtype, torch_dtype):
+    from ayla.gpu_dialect import gpu_dialect
+
+    module = gpu_dialect.parse(f"""module {{
+      kernel @broadcast(%a: gmem<64x128x{ir_dtype} strides=[1, 0]>, %out: gmem<64x128x{ir_dtype}>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+        %r: wgrmem<64x128x{ir_dtype} warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+        move(%r: wgrmem<64x128x{ir_dtype} warps=4 layout="wgmma_layout_0">, %a: gmem<64x128x{ir_dtype} strides=[1, 0]>)
+        move(%out: gmem<64x128x{ir_dtype}>, %r: wgrmem<64x128x{ir_dtype} warps=4 layout="wgmma_layout_0">)
+      }}
+    }}""")
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    # Odd row stride exercises scalar loads rather than packed pairs. Reusing
+    # the launcher with changed data catches accidental constant materialization.
+    for seed in (13, 97, 251):
+        torch.manual_seed(seed)
+        source = torch.randn(64, dtype=torch_dtype, device="cuda")
+        actual = torch.full((64, 128), float("nan"), dtype=torch_dtype, device="cuda")
+        launcher(source, actual)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            actual, source[:, None].expand_as(actual), rtol=0, atol=0
+        )

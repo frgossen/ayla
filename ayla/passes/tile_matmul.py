@@ -3,24 +3,30 @@ from __future__ import annotations
 from typing import cast
 
 from ..gpu_dialect import (
-    BlockIdOp,
+    HW_LEVEL_IDS,
+    build_hardware_id,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
+    ElementwiseOp,
     ForOp,
     IfOp,
+    IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
+    IndexMulOp,
     IndexType,
     KernelOp,
     MatmulOp,
     MemoryEffect,
     MemTensorType,
     ModuleOp,
-    ThreadIdOp,
+    RmemTensorType,
     TileOp,
-    WarpGroupIdOp,
+    launch_extent,
+    require_launch_extent,
     is_elementwise,
     is_grid_collective,
 )
@@ -36,12 +42,6 @@ from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
 
 
-_PARALLEL_ID_OPS = {
-    CollectiveLevel.BLOCK: BlockIdOp,
-    CollectiveLevel.THREAD: ThreadIdOp,
-    CollectiveLevel.WG: WarpGroupIdOp,
-}
-
 _OPERAND_DIMS = {
     "lhs": frozenset(("M", "K")),
     "rhs": frozenset(("N", "K")),
@@ -56,24 +56,17 @@ def _refine_tiling_schemes(
 ) -> dict[str, int]:
     """Retain each operand's ID while its tiled accesses stay disjoint."""
     partitioned_dims = {
-        dim
-        for dim, count in zip(op_dims, tile_counts, strict=True)
-        if count > 1
+        dim for dim, count in zip(op_dims, tile_counts, strict=True) if count > 1
     }
     disjoint_operands = [
-        name
-        for name, dims in _OPERAND_DIMS.items()
-        if partitioned_dims <= dims
+        name for name, dims in _OPERAND_DIMS.items() if partitioned_dims <= dims
     ]
 
     existing = {
         name: scheme_id
         for name in _OPERAND_DIMS
-        if (
-            scheme_id := cast(
-                int | None, hero.attrs.get(f"{name}_tiling_scheme")
-            )
-        ) is not None
+        if (scheme_id := cast(int | None, hero.attrs.get(f"{name}_tiling_scheme")))
+        is not None
     }
     if existing:
         return {
@@ -89,10 +82,7 @@ def _refine_tiling_schemes(
     if not can_initialize:
         return {}
 
-    return {
-        name: MemoryEffect.fresh_tiling_scheme_id()
-        for name in disjoint_operands
-    }
+    return {name: MemoryEffect.fresh_tiling_scheme_id() for name in disjoint_operands}
 
 
 class TileMatmul(LoweringPass):
@@ -106,10 +96,11 @@ class TileMatmul(LoweringPass):
         sequential ``for`` loop, or a ``(CollectiveLevel, CollectiveAxis)``
         pair for a hardware dimension. An existing parallel launch extent may
         be larger than the logical tile count; excess workers are guarded. A
-        smaller extent remains a launch conflict; express multiple waves with
-        an explicit outer ``for`` tiling level.
-      - ``for_loop_labels[i]``: the label for a generated ``for`` loop, or
-        ``None`` for an iteration mapped to a hardware dimension.
+        smaller block grid visits the remaining logical tiles with a
+        grid-stride loop.
+      - ``for_loop_labels[i]``: the label for a generated ``for`` loop. For
+        dimensions sharing an underprovisioned hardware binding, the first
+        dimension's label names the resulting grid-stride loop.
 
     Nesting order is outer→inner along the list.
 
@@ -128,29 +119,30 @@ class TileMatmul(LoweringPass):
     rounding the logical tile count up. Addressing remains full-tile; callers
     must use memory operations with defined out-of-bounds behavior, such as
     TMA.
+
+    ``reversed_dims`` names tiled dimensions visited last-to-first. Hardware
+    workers keep their launch order but take the mirrored logical tile.
     """
 
     op_dims: list[str]
     tile_sizes: list[int]
-    iteration_bindings: list[
-        tuple[CollectiveLevel, CollectiveAxis] | None
-    ]
+    iteration_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None]
     for_loop_labels: list[str | None]
     op_label_filter: str | None
     epilogue_label_filter: str | None
     allow_partial_tiles: bool
+    reversed_dims: list[str]
 
     def __init__(
         self,
         op_dims: list[str],
         tile_sizes: list[int],
-        iteration_bindings: list[
-            tuple[CollectiveLevel, CollectiveAxis] | None
-        ],
+        iteration_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None],
         for_loop_labels: list[str | None],
         op_label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
         allow_partial_tiles: bool = False,
+        reversed_dims: list[str] | None = None,
     ) -> None:
         super().__init__(
             op_dims=list(op_dims),
@@ -160,7 +152,13 @@ class TileMatmul(LoweringPass):
             op_label_filter=op_label_filter,
             epilogue_label_filter=epilogue_label_filter,
             allow_partial_tiles=allow_partial_tiles,
+            reversed_dims=list(reversed_dims or []),
         )
+        unknown = set(self.reversed_dims) - set(op_dims)
+        if unknown:
+            raise ValueError(
+                f"TileMatmul: reversed dims {sorted(unknown)} are not tiled"
+            )
         assert (
             len(op_dims)
             == len(tile_sizes)
@@ -173,18 +171,16 @@ class TileMatmul(LoweringPass):
             f"{len(tile_sizes)}, {len(iteration_bindings)}, "
             f"{len(for_loop_labels)}"
         )
-        assert all(
-            binding is None or label is None
-            for binding, label in zip(iteration_bindings, for_loop_labels)
-        ), "TileMatmul: only sequential iterations may have loop labels"
         parallel_bindings = [
             binding for binding in iteration_bindings if binding is not None
         ]
         for binding in parallel_bindings:
             level, axis = binding
             if (
-                level not in _PARALLEL_ID_OPS
-                or level == CollectiveLevel.WG and axis != CollectiveAxis.X
+                level not in HW_LEVEL_IDS
+                or level == CollectiveLevel.THREAD_32
+                or level == CollectiveLevel.WG
+                and axis != CollectiveAxis.X
             ):
                 raise ValueError(
                     f"TileMatmul: unsupported iteration binding {binding!r}"
@@ -193,7 +189,8 @@ class TileMatmul(LoweringPass):
 
     @lowers(KernelOp)
     def lower_kernel(
-        self, op: KernelOp,
+        self,
+        op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
         self._kernel = op
         heroes = cast(list[MatmulOp], find_ops(op, self._is_hero))
@@ -233,7 +230,8 @@ class TileMatmul(LoweringPass):
 
     def _is_hero(self, op: Op) -> bool:
         return isinstance(op, MatmulOp) and label_matches(
-            op, self.op_label_filter,
+            op,
+            self.op_label_filter,
         )
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
@@ -274,12 +272,13 @@ class TileMatmul(LoweringPass):
         }
         ubs: list[int] = []
         for op_dim, tile_size, iteration_binding in zip(
-            self.op_dims, self.tile_sizes, self.iteration_bindings,
+            self.op_dims,
+            self.tile_sizes,
+            self.iteration_bindings,
         ):
             if op_dim not in sizes_by_dim:
                 raise ValueError(
-                    f"TileMatmul: op_dim must be 'M', 'N', or 'K'; "
-                    f"got {op_dim!r}"
+                    f"TileMatmul: op_dim must be 'M', 'N', or 'K'; got {op_dim!r}"
                 )
             op_dim_size = sizes_by_dim[op_dim]
             assert isinstance(op_dim_size, int), (
@@ -292,7 +291,7 @@ class TileMatmul(LoweringPass):
                     iteration_binding is None
                     or iteration_binding[0] == CollectiveLevel.BLOCK
                 )
-                ):
+            ):
                 raise ValueError(
                     f"TileMatmul: op_dim {op_dim} size "
                     f"({op_dim_size}) is not divisible by tile "
@@ -304,13 +303,12 @@ class TileMatmul(LoweringPass):
         return ubs
 
     def _resolve_launch_extents(
-        self, bounds: dict[MatmulOp, list[int]],
+        self,
+        bounds: dict[MatmulOp, list[int]],
     ) -> None:
         required: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
         for ubs in bounds.values():
-            extents: dict[
-                tuple[CollectiveLevel, CollectiveAxis], int
-            ] = {}
+            extents: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
             for binding, ub in zip(self.iteration_bindings, ubs):
                 if binding is not None:
                     extents[binding] = extents.get(binding, 1) * ub
@@ -318,21 +316,16 @@ class TileMatmul(LoweringPass):
                 required[binding] = max(required.get(binding, 0), extent)
 
         for binding, extent in required.items():
-            current = self._launch_extent(binding)
-            if current is not None and current > extent:
-                continue
+            current = launch_extent(self._kernel, *binding)
+            if current is not None:
+                if current >= extent:
+                    continue
+                if (
+                    binding[0] == CollectiveLevel.BLOCK
+                    and self.iteration_bindings.count(binding) > 1
+                ):
+                    continue
             self._accumulate_constraint(binding, extent)
-
-    def _launch_extent(
-        self, binding: tuple[CollectiveLevel, CollectiveAxis],
-    ) -> int | None:
-        level, axis = binding
-        if level == CollectiveLevel.BLOCK:
-            return self._kernel.grid_dim[axis]
-        if level == CollectiveLevel.THREAD:
-            return self._kernel.block_dim[axis]
-        assert level == CollectiveLevel.WG and axis == CollectiveAxis.X
-        return self._kernel.num_warp_groups
 
     def _tile(
         self,
@@ -345,99 +338,148 @@ class TileMatmul(LoweringPass):
         tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
-        parallel_ids: dict[
-            tuple[CollectiveLevel, CollectiveAxis], Value
-        ] = {}
+        # Only the first K step of an overwriting matmul overwrites: zero dst
+        # ahead of the K loop instead and let every step accumulate.
+        split_overwrite = not hero.accumulate and "K" in self.op_dims
+        if split_overwrite:
+            dst_type = cast(MemTensorType, dst.type)
+            zero = ConstantOp.build(0.0, RmemTensorType.build([], dst_type.dtype))
+            fill = ElementwiseOp.build(dst, srcs=[zero.result()], fn="fill")
+            new_ops.extend([zero, fill])
+        parallel_ids: dict[tuple[CollectiveLevel, CollectiveAxis], Value] = {}
         for binding in self.iteration_bindings:
             if binding is None or binding in parallel_ids:
                 continue
-            level, axis = binding
-            if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
-                op_type = {
-                    CollectiveLevel.BLOCK: BlockIdOp,
-                    CollectiveLevel.THREAD: ThreadIdOp,
-                }[level]
-                ids = op_type.build(axis)
-                parallel_ids[binding] = ids.value
-            else:
-                op_type = {
-                    CollectiveLevel.WG: WarpGroupIdOp,
-                }[level]
-                ids = op_type.build()
-                for result_axis in CollectiveAxis:
-                    parallel_ids[(level, result_axis)] = (
-                        ids.results[result_axis]
-                    )
-            new_ops.append(ids)
+            id_ops, value = build_hardware_id(*binding)
+            parallel_ids[binding] = value
+            new_ops.extend(id_ops)
 
-        ivs: list[Value] = []
+        # A repeated block binding whose grid is smaller than its logical
+        # extent visits the remaining tiles with one grid-stride loop.
+        logical_extents: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        for binding, ub in zip(self.iteration_bindings, ubs, strict=True):
+            if binding is not None:
+                logical_extents[binding] = logical_extents.get(binding, 1) * ub
+        linear_ids = {binding: parallel_ids[binding] for binding in logical_extents}
+        waves: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        wave_ops: list[Op] = []
+        grid_stride: ForOp | None = None
+        for binding, logical_extent in logical_extents.items():
+            extent = launch_extent(self._kernel, *binding)
+            if (
+                self.iteration_bindings.count(binding) == 1
+                or extent is None
+                or extent >= logical_extent
+            ):
+                continue
+            if grid_stride is not None:
+                raise ValueError("TileMatmul supports one grid-stride block dimension")
+            assert binding[0] == CollectiveLevel.BLOCK
+            waves[binding] = -(-logical_extent // extent)
+            label = self.for_loop_labels[self.iteration_bindings.index(binding)]
+            grid_stride = ForOp.build(
+                lb=0,
+                ub=waves[binding],
+                attrs={"label": label} if label is not None else None,
+            )
+            stride = IndexConstantOp.build(extent)
+            offset = IndexMulOp.build(grid_stride.iv, stride.result())
+            advanced = IndexAddOp.build(linear_ids[binding], offset.result())
+            wave_ops = [stride, offset, advanced]
+            linear_ids[binding] = advanced.result()
+
         iteration_ops: list[Op] = []
-        divisors: dict[
-            tuple[CollectiveLevel, CollectiveAxis], int
-        ] = {}
-        for ub, binding, label in reversed(list(zip(
-            ubs, self.iteration_bindings, self.for_loop_labels,
-            strict=True,
-        ))):
+        ivs: list[Value] = []
+        divisors: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
+        loop_ivs: dict[int, Value] = {}
+        loop_prefix: dict[int, list[Op]] = {}
+        for i, ub, binding, label in reversed(
+            list(
+                zip(
+                    range(len(ubs)),
+                    ubs,
+                    self.iteration_bindings,
+                    self.for_loop_labels,
+                    strict=True,
+                )
+            )
+        ):
             if binding is None:
                 iv = Value(name=label, type=IndexType())
+                loop_ivs[i] = iv
+                if self.op_dims[i] in self.reversed_dims:
+                    loop_prefix[i], iv = _reversed_index(iv, ub)
             else:
-                linear_id = parallel_ids[binding]
+                linear_id = linear_ids[binding]
                 if self.iteration_bindings.count(binding) == 1:
                     divisors[binding] = ub
-                    ivs.insert(0, linear_id)
+                    iv = linear_id
+                    if self.op_dims[i] in self.reversed_dims:
+                        ops, iv = _reversed_index(iv, ub)
+                        iteration_ops.extend(ops)
+                    ivs.insert(0, iv)
                     continue
                 divisor = divisors.get(binding, 1)
                 divisors[binding] = divisor * ub
                 cdivisor = IndexConstantOp.build(divisor)
                 div = IndexDivOp.build(
-                    linear_id, cdivisor.result(),
+                    linear_id,
+                    cdivisor.result(),
                 )
                 cbound = IndexConstantOp.build(ub)
                 mod = IndexModOp.build(div.result(), cbound.result())
                 iteration_ops = [
-                    cdivisor, div, cbound, mod, *iteration_ops,
+                    cdivisor,
+                    div,
+                    cbound,
+                    mod,
+                    *iteration_ops,
                 ]
                 iv = mod.result()
+                if self.op_dims[i] in self.reversed_dims:
+                    ops, iv = _reversed_index(iv, ub)
+                    iteration_ops.extend(ops)
             ivs.insert(0, iv)
-        new_ops.extend(iteration_ops)
 
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
         outside_of = min(
             (
-                i for i, dim in enumerate(self.op_dims)
-                if dim not in ("M", "N")
-                and self.iteration_bindings[i] is None
+                i
+                for i, dim in enumerate(self.op_dims)
+                if dim not in ("M", "N") and self.iteration_bindings[i] is None
             ),
             default=None,
         )
 
         body_ops: list[Op] = []
         ops, lhs = _build_tile_op(
-            lhs, ["M", "K"],
+            lhs,
+            ["M", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
         ops, rhs = _build_tile_op(
-            rhs, ["N", "K"],
+            rhs,
+            ["N", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
         dst_ops, dst = _build_tile_op(
-            dst, ["M", "N"],
+            dst,
+            ["M", "N"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
-        # A tensor initializer is tiled like dst; a scalar one broadcasts.
         if init is not None and cast(MemTensorType, init.type).rank != 0:
             ops, init = _build_tile_op(
-                init, ["M", "N"],
+                init,
+                ["M", "N"],
                 op_dims=self.op_dims,
                 tile_idxs=ivs,
                 tile_sizes=self.tile_sizes,
@@ -458,6 +500,8 @@ class TileMatmul(LoweringPass):
                     level,
                 )
         attrs = hero.extra_attrs
+        if split_overwrite:
+            del attrs["accumulate"]
         for name in _OPERAND_DIMS:
             attrs.pop(f"{name}_tiling_scheme", None)
         for name, scheme_id in tiling_schemes.items():
@@ -474,35 +518,44 @@ class TileMatmul(LoweringPass):
         )
 
         tiled_epilogue = [
-            type(op)(operands=[dst, dst], results=[], attrs=op.attrs)
-            for op in epilogue
+            type(op)(operands=[dst, dst], results=[], attrs=op.attrs) for op in epilogue
         ]
         if outside_of is None:
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []
 
-        parallel_extents = dict(divisors)
+        parallel_extents = dict(logical_extents)
         for i, iv, ub, binding, label in zip(
             reversed(range(len(self.iteration_bindings))),
-            reversed(ivs), reversed(ubs), reversed(self.iteration_bindings),
+            reversed(ivs),
+            reversed(ubs),
+            reversed(self.iteration_bindings),
             reversed(self.for_loop_labels),
         ):
             if binding is not None:
                 logical_extent = parallel_extents.pop(binding, None)
                 if logical_extent is None:
                     continue
-                launch_extent = self._launch_extent(binding)
-                if launch_extent is not None and launch_extent > logical_extent:
-                    linear_id = parallel_ids[binding]
+                extent = launch_extent(self._kernel, *binding)
+                if (
+                    extent is not None
+                    and extent * waves.get(binding, 1) > logical_extent
+                ):
                     limit = IndexConstantOp.build(logical_extent)
-                    condition = IndexLtOp.build(linear_id, limit.result())
+                    condition = IndexLtOp.build(
+                        linear_ids[binding],
+                        limit.result(),
+                    )
                     body_ops = [
                         limit,
                         condition,
                         IfOp.build(condition.result(), Block(ops=body_ops)),
                     ]
                 continue
-            body = Block(arguments=[iv], ops=body_ops)
+            body = Block(
+                arguments=[loop_ivs[i]],
+                ops=[*loop_prefix.get(i, []), *body_ops],
+            )
             attrs: dict[str, object] | None = (
                 {"label": label} if label is not None else None
             )
@@ -515,6 +568,10 @@ class TileMatmul(LoweringPass):
                 tiled_epilogue = []
 
         assert not tiled_epilogue, "TileMatmul: epilogue was never placed"
+        body_ops[:0] = [*wave_ops, *iteration_ops]
+        if grid_stride is not None:
+            grid_stride.body.ops = body_ops
+            body_ops = [grid_stride]
         new_ops.extend(body_ops)
         return new_ops
 
@@ -524,31 +581,22 @@ class TileMatmul(LoweringPass):
         ub: int,
     ) -> None:
         level, axis = iteration_binding
-        if level == CollectiveLevel.BLOCK:
-            required: list[int | None] = [None, None, None]
-            required[axis] = ub
-            self._kernel.grid_dim = _resolve_launch_dim_constraints(
-                list(self._kernel.grid_dim), required,
-            )
-        elif level == CollectiveLevel.THREAD:
-            required = [None, None, None]
-            required[axis] = ub
-            self._kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self._kernel.block_dim), required,
-            )
-        else:
-            assert level == CollectiveLevel.WG and axis == CollectiveAxis.X
+        require_launch_extent(self._kernel, level, axis, ub)
+        if level == CollectiveLevel.WG:
             [num_warp_groups] = _resolve_launch_dim_constraints(
-                [self._kernel.num_warp_groups], [ub],
+                [self._kernel.num_warp_groups],
+                [ub],
             )
             self._kernel.num_warp_groups = num_warp_groups
             self._kernel.block_dim = _resolve_launch_dim_constraints(
-                list(self._kernel.block_dim), [ub * 128, 1, 1],
+                list(self._kernel.block_dim),
+                [None, 1, 1],
             )
 
 
 def _resolve_launch_dim_constraints(
-    a_list: list[int | None], b_list: list[int | None],
+    a_list: list[int | None],
+    b_list: list[int | None],
 ) -> list[int | None]:
     """Symmetric per-axis merge of two ``int | None`` lists.
 
@@ -565,10 +613,24 @@ def _resolve_launch_dim_constraints(
         elif a == b:
             result.append(a)
         else:
-            raise ValueError(
-                f"launch dim conflict: {a_list} vs {b_list}"
-            )
+            raise ValueError(f"launch dim conflict: {a_list} vs {b_list}")
     return result
+
+
+def _reversed_index(index: Value, extent: int) -> tuple[list[Op], Value]:
+    """Build ``extent - 1 - index`` with non-negative index operations."""
+    # TODO: Move this to the shared pass utilities and let TileReduce reverse
+    # its parallel dimensions, so a consumer can start where an unchangeable
+    # producer finished. Reversing a reduction dimension would change the
+    # floating-point summation order, and reversing both a producer and its
+    # consumer cancels the L2 benefit.
+    one = IndexConstantOp.build(1)
+    shifted = IndexAddOp.build(index, one.result())
+    last = IndexConstantOp.build(extent - 1)
+    scaled = IndexMulOp.build(shifted.result(), last.result())
+    bound = IndexConstantOp.build(extent)
+    mirrored = IndexModOp.build(scaled.result(), bound.result())
+    return [one, shifted, last, scaled, bound, mirrored], mirrored.result()
 
 
 def _build_tile_op(
@@ -592,8 +654,7 @@ def _build_tile_op(
         f"per arg dim ({arg_type.sizes})"
     )
     assert len(op_dims) == len(tile_idxs) == len(tile_sizes), (
-        "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the "
-        "same length"
+        "_build_tile_op: op_dims, tile_idxs, tile_sizes must have the same length"
     )
     name_to_idx = {n: i for i, n in enumerate(dim_names)}
     ops: list[Op] = []
@@ -618,7 +679,10 @@ def _build_tile_op(
         sizes[d] = ts
         new_type.sizes = sizes
         tile_op = TileOp.build(
-            cur, indices, new_type, maybe_partial=maybe_partial,
+            cur,
+            indices,
+            new_type,
+            maybe_partial=maybe_partial,
         )
         ops.append(tile_op)
         cur = tile_op.result()
@@ -629,16 +693,21 @@ def tile_matmul(
     module: ModuleOp,
     op_dims: list[str],
     tile_sizes: list[int],
-    iteration_bindings: list[
-        tuple[CollectiveLevel, CollectiveAxis] | None
-    ],
+    iteration_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None],
     for_loop_labels: list[str | None],
     op_label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
     allow_partial_tiles: bool = False,
+    reversed_dims: list[str] | None = None,
 ) -> ModuleOp:
     """Convenience entry point."""
     return TileMatmul(
-        op_dims, tile_sizes, iteration_bindings, for_loop_labels,
-        op_label_filter, epilogue_label_filter, allow_partial_tiles,
+        op_dims,
+        tile_sizes,
+        iteration_bindings,
+        for_loop_labels,
+        op_label_filter,
+        epilogue_label_filter,
+        allow_partial_tiles,
+        reversed_dims,
     ).run(module)

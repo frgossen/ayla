@@ -19,6 +19,7 @@ Example — promote lhs/rhs to smem::
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import cast
 
@@ -30,7 +31,6 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
-    ConstantOp,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -52,6 +52,7 @@ from ..gpu_dialect import (
     TileOp,
     WarpGroupIdOp,
     WgrmemTensorType,
+    is_column_major,
     is_elementwise,
 )
 from ._utils import label_matches
@@ -165,7 +166,9 @@ def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
             new_sizes[i] = tile_type.sizes[i]
     new_tile_type.sizes = new_sizes
     new_tile = TileOp.build(
-        new_arg, list(tile.indices), new_tile_type,
+        new_arg,
+        list(tile.indices),
+        new_tile_type,
         maybe_partial=tile.maybe_partial,
     )
     return [new_tile], [new_tile.result()]
@@ -194,14 +197,17 @@ def _sliced_moves(
     attrs = dict(attrs)
     multicast = cast(bool, attrs.pop("multicast", False))
     if multicast is True:
-        collective = {
-            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
-        }
+        collective = {axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis}
     if count == 1:
-        return [MoveOp.build(
-            dst, src, collective=collective,
-            multicast=multicast, attrs=attrs,
-        )]
+        return [
+            MoveOp.build(
+                dst,
+                src,
+                collective=collective,
+                multicast=multicast,
+                attrs=attrs,
+            )
+        ]
     src_type = src.type
     assert isinstance(src_type, MemTensorType)
     extent = src_type.sizes[dim]
@@ -213,8 +219,11 @@ def _sliced_moves(
     for index in range(count):
         src_tile, dst_tile = [_slice_tile(v, dim, index, size) for v in (src, dst)]
         move = MoveOp.build(
-            dst_tile.result(), src_tile.result(),
-            collective=collective, multicast=multicast, attrs=attrs,
+            dst_tile.result(),
+            src_tile.result(),
+            collective=collective,
+            multicast=multicast,
+            attrs=attrs,
         )
         ops.extend([src_tile, dst_tile, move])
     return ops
@@ -250,6 +259,10 @@ class PromoteBuffers(LoweringPass):
         block-wide SMEM staging buffer because TMA cannot read registers.
     nc : bool
         Non-coherent cache hint for scalar gmem→rmem loads.
+    permutation : list[int] or None
+        Dense SMEM dimension permutation: logical dim i maps to physical
+        dim permutation[i]. Defaults to identity; [1, 0] stages rank-2
+        tensors column-major. Also applies to TMA writeback staging buffers.
     physical_layout : dict or None
         Physical layout attrs for promoted shared-memory buffers.
     move_attrs : dict[str, dict[str, object]] or None
@@ -273,6 +286,7 @@ class PromoteBuffers(LoweringPass):
     warps: int | None
     tma: bool
     nc: bool
+    permutation: list[int] | None
     physical_layout: dict[str, object] | None
     move_attrs: dict[str, dict[str, object]]
     writeback_slices: int
@@ -294,6 +308,7 @@ class PromoteBuffers(LoweringPass):
         warps: int | None = None,
         tma: bool = False,
         nc: bool = False,
+        permutation: list[int] | None = None,
         physical_layout: dict[str, object] | None = None,
         move_attrs: dict[str, dict[str, object]] | None = None,
         writeback_slices: int = 1,
@@ -312,6 +327,7 @@ class PromoteBuffers(LoweringPass):
             warps=warps,
             tma=tma,
             nc=nc,
+            permutation=list(permutation) if permutation is not None else None,
             physical_layout=physical_layout,
             move_attrs=dict(move_attrs or {}),
             writeback_slices=writeback_slices,
@@ -331,20 +347,47 @@ class PromoteBuffers(LoweringPass):
         self.operand_names = set(operands)
 
     def _build_smem_type(
-        self, sizes: Sequence[int], dtype: Type,
+        self,
+        sizes: Sequence[int],
+        dtype: Type,
+        column_major: bool = False,
+        strides: Sequence[int] | None = None,
     ) -> SmemTensorType:
         layout = dict(self.physical_layout or {})
         swizzle = layout.pop("swizzle", self.swizzle)
         assert swizzle is None or isinstance(swizzle, str)
+        if "block_width" in layout:
+            # Blocks tile the contiguous dimension; a narrower one gets the
+            # widest block that divides it, swizzled across one block row.
+            requested = cast(int, layout["block_width"])
+            block_width = math.gcd(sizes[-2] if column_major else sizes[-1], requested)
+            if block_width != requested:
+                layout["block_width"] = block_width
+                row_bytes = (
+                    block_width
+                    * cast(
+                        BF16Type | F16Type | F32Type | F64Type,
+                        dtype,
+                    ).byte_size
+                )
+                swizzle = f"{row_bytes}B" if row_bytes >= 32 else None
         attrs: dict[str, object] | None = (
             {"physical_layout": layout} if layout else None
         )
         return SmemTensorType.build(
-            sizes, dtype, swizzle=swizzle, attrs=attrs,
+            sizes,
+            dtype,
+            swizzle=swizzle,
+            attrs=attrs,
+            strides=strides
+            if strides is not None
+            else ([1, sizes[0]] if column_major else None),
         )
 
     def _build_target_type(
-        self, base_type: MemTensorType, dtype: Type | None = None,
+        self,
+        base_type: MemTensorType,
+        dtype: Type | None = None,
     ) -> MemTensorType:
         assert not base_type.is_dynamic
         sizes = [size for size in base_type.sizes if size is not None]
@@ -356,12 +399,20 @@ class PromoteBuffers(LoweringPass):
         if tensor_cls is GmemTensorType:
             return GmemTensorType.build(sizes, dtype)
         if tensor_cls is SmemTensorType:
-            return self._build_smem_type(sizes, dtype)
+            strides = SmemTensorType.canonical_strides(sizes, self.permutation)
+            return self._build_smem_type(
+                sizes,
+                dtype,
+                column_major=len(strides) == 2 and strides[-2] == 1,
+                strides=cast(list[int], strides),
+            )
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WgrmemTensorType:
             assert self.warps is not None and self.layout is not None
-            return WgrmemTensorType.build(sizes, dtype, warps=self.warps, layout=self.layout)
+            return WgrmemTensorType.build(
+                sizes, dtype, warps=self.warps, layout=self.layout
+            )
         raise ValueError(f"unsupported target type {self.target_type!r}")
 
     def _build_buffer_attrs(
@@ -397,7 +448,8 @@ class PromoteBuffers(LoweringPass):
         operand_name: str,
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
-        init: float | int | None = None,
+        init: Value | None = None,
+        overwrite: bool = False,
     ) -> tuple[list[Op], list[Value]]:
         """Promote an operand to the target memory, handling any collective level.
 
@@ -419,7 +471,10 @@ class PromoteBuffers(LoweringPass):
         v = src
         while isinstance(v.definition, TileOp):
             tile_op = v.definition
-            if _narrowest_level(_collective_level(tile_op.result()), target_level) == target_level:
+            if (
+                _narrowest_level(_collective_level(tile_op.result()), target_level)
+                == target_level
+            ):
                 break
             chain.append(tile_op)
             v = tile_op.arg
@@ -446,35 +501,50 @@ class PromoteBuffers(LoweringPass):
         # later pass can name the buffer it wants -- multi_buffer only touches
         # labelled ones.
         buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
-        if init is not None:
-            # SMEM initialization has no lowering. Keep the initialization on
-            # the matmul so a subsequent register promotion can materialize it.
-            alloc = AllocOp.build_with_fresh_id(
-                target_type,
-                init=None if self.target_type == "smem" else init,
-                attrs=buffer_attrs,
-            )
+        if overwrite:
+            alloc = AllocOp.build_with_fresh_id(target_type, attrs=buffer_attrs)
             new_ops.append(alloc)
+        elif init is not None:
+            # SMEM fill has no lowering. Keep the initialization on the matmul
+            # so a subsequent register promotion can materialize it.
+            alloc = AllocOp.build_with_fresh_id(target_type, attrs=buffer_attrs)
+            new_ops.append(alloc)
+            if self.target_type != "smem":
+                new_ops.append(
+                    ElementwiseOp.build(
+                        alloc.result(),
+                        srcs=[init],
+                        fn="fill",
+                    )
+                )
         else:
             attrs = self._build_move_attrs(matmul_label, operand_name)
             chain_root_type = chain_root.type
             assert isinstance(chain_root_type, MemTensorType)
             alloc = AllocOp.build_with_fresh_id(
                 self._build_target_type(
-                    chain_root_type, dtype=chain_root_type.dtype,
+                    chain_root_type,
+                    dtype=chain_root_type.dtype,
                 ),
                 attrs=buffer_attrs,
             )
             new_ops.append(alloc)
-            new_ops.extend(_sliced_moves(
-                alloc.result(), chain_root,
-                self.tma_load_slices.get(operand_name, 1), 0,
-                collective, attrs,
-            ))
+            new_ops.extend(
+                _sliced_moves(
+                    alloc.result(),
+                    chain_root,
+                    self.tma_load_slices.get(operand_name, 1),
+                    0,
+                    collective,
+                    attrs,
+                )
+            )
             if target_type.dtype != chain_root_type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
                 cvt = ElementwiseOp.build(
-                    dst=cvt_alloc.result(), srcs=[alloc.result()], fn="convert",
+                    dst=cvt_alloc.result(),
+                    srcs=[alloc.result()],
+                    fn="convert",
                 )
                 new_ops.extend([cvt_alloc, cvt])
                 alloc = cvt_alloc
@@ -523,12 +593,18 @@ class PromoteBuffers(LoweringPass):
         smem_sizes[-1] = output_cols // self.writeback_slices
         static_smem_sizes = [size for size in smem_sizes if size is not None]
         assert len(static_smem_sizes) == len(smem_sizes)
+        # Stage in the destination's dimension order so the bulk store copies
+        # a dense box; a column-major (transposed) destination is staged
+        # column-major.
         smem_type = self._build_smem_type(
-            static_smem_sizes, block_dst.type.dtype,
+            static_smem_sizes,
+            block_dst.type.dtype,
+            column_major=is_column_major(block_dst.type),
         )
         attrs: dict[str, object] | None = (
             {"reuse_group": f"{matmul_label}_writeback"}
-            if self.unsafe_reuse_smem and matmul_label is not None else None
+            if self.unsafe_reuse_smem and matmul_label is not None
+            else None
         )
         smems = [
             AllocOp.build_with_fresh_id(smem_type, attrs=attrs)
@@ -537,14 +613,15 @@ class PromoteBuffers(LoweringPass):
         new_ops: list[Op] = list(smems)
         slice_cols = static_smem_sizes[-1]
         wg_column_tile = None
-        for tile in narrow_tiles:
-            result_type = tile.result().type
-            arg_type = tile.arg.type
-            assert isinstance(result_type, MemTensorType)
-            assert isinstance(arg_type, MemTensorType)
-            if result_type.sizes[-1] != arg_type.sizes[-1]:
-                wg_column_tile = tile
-                break
+        if self.writeback_slices > 1:
+            for tile in narrow_tiles:
+                result_type = tile.result().type
+                arg_type = tile.arg.type
+                assert isinstance(result_type, MemTensorType)
+                assert isinstance(arg_type, MemTensorType)
+                if result_type.sizes[-1] != arg_type.sizes[-1]:
+                    wg_column_tile = tile
+                    break
         dst_cols = block_dst.type.sizes[-1]
         src_cols = src.type.sizes[-1]
         assert dst_cols is not None and src_cols is not None
@@ -576,7 +653,8 @@ class PromoteBuffers(LoweringPass):
             )
             store_tiles = (
                 [_slice_tile(block_dst, -1, slice_idx, slice_cols)]
-                if self.writeback_slices > 1 else []
+                if self.writeback_slices > 1
+                else []
             )
             store_dst_value = store_tiles[0].result() if store_tiles else block_dst
             store_attrs: dict[str, object] = {
@@ -627,35 +705,49 @@ class PromoteBuffers(LoweringPass):
                 # epilogues such as SwiGLU. Retarget the final operation's
                 # destination while preserving and remapping all its sources.
                 assert final.dst is src and final.src(0) is src
-                new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), srcs=[src], fn=final.fn,
-                    attrs=final.extra_attrs,
-                ))
+                new_ops.append(
+                    ElementwiseOp.build(
+                        dst=tmp_alloc.result(),
+                        srcs=[src],
+                        fn=final.fn,
+                        attrs=final.extra_attrs,
+                    )
+                )
             else:
-                new_ops.append(ElementwiseOp.build(
-                    dst=tmp_alloc.result(), srcs=[src], fn="convert",
-                    attrs=(
-                        {"label": f"{matmul_label}_{operand_name}_convert"}
-                        if matmul_label is not None else None
-                    ),
-                ))
+                new_ops.append(
+                    ElementwiseOp.build(
+                        dst=tmp_alloc.result(),
+                        srcs=[src],
+                        fn="convert",
+                        attrs=(
+                            {"label": f"{matmul_label}_{operand_name}_convert"}
+                            if matmul_label is not None
+                            else None
+                        ),
+                    )
+                )
             src = tmp_alloc.result()
         else:
             new_ops.extend(epilogue)
         if self.tma and self.target_type == "wgrmem":
-            new_ops.extend(self._build_tma_writeback(
-                dst,
-                src,
-                collective,
-                matmul_label,
-                writeback_tiling_scheme,
-            ))
+            new_ops.extend(
+                self._build_tma_writeback(
+                    dst,
+                    src,
+                    collective,
+                    matmul_label,
+                    writeback_tiling_scheme,
+                )
+            )
             return new_ops, []
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         if writeback_tiling_scheme is not None:
             attrs["dst_tiling_scheme"] = writeback_tiling_scheme
         move = MoveOp.build(
-            dst=dst, src=src, collective=collective, attrs=attrs,
+            dst=dst,
+            src=src,
+            collective=collective,
+            attrs=attrs,
         )
         new_ops.append(move)
         return new_ops, []
@@ -712,7 +804,7 @@ class PromoteBuffers(LoweringPass):
         hero_op = ops[hero]
         assert isinstance(hero_op, MatmulOp)
         dst = hero_op.dst
-        for op in ops[hero + 1:]:
+        for op in ops[hero + 1 :]:
             if not is_elementwise(op):
                 break
             assert isinstance(op, ElementwiseOp)
@@ -724,7 +816,9 @@ class PromoteBuffers(LoweringPass):
         return found
 
     def _promote(
-        self, op: MatmulOp, epilogue: list[ElementwiseOp],
+        self,
+        op: MatmulOp,
+        epilogue: list[ElementwiseOp],
     ) -> list[Op]:
         lhs, rhs, dst = op.lhs, op.rhs, op.dst
 
@@ -735,34 +829,45 @@ class PromoteBuffers(LoweringPass):
 
         if "lhs" in self.operand_names:
             ops, [new_lhs] = self._build_operand_promotion(
-                lhs, "lhs", op.collective, label,
+                lhs,
+                "lhs",
+                op.collective,
+                label,
             )
             pre_ops.extend(ops)
         if "rhs" in self.operand_names:
             ops, [new_rhs] = self._build_operand_promotion(
-                rhs, "rhs", op.collective, label,
+                rhs,
+                "rhs",
+                op.collective,
+                label,
             )
             pre_ops.extend(ops)
         init = op.init
         if "dst" in self.operand_names:
-            # A scalar constant initializes the promoted allocation; registers
+            # A scalar initializer fills the promoted allocation; registers
             # load a tensor initializer in place of the destination. The
             # writeback below still targets the destination.
-            scalar_init = None if init is None else ConstantOp.splat_value(init)
-            fill = (
-                init if init is not None
-                and cast(MemTensorType, init.type).rank != 0
-                and self.target_type == "wgrmem"
+            scalar_init = (
+                init
+                if init is not None and cast(MemTensorType, init.type).rank == 0
                 else None
             )
+            tensor_init = (
+                init if scalar_init is None and self.target_type == "wgrmem" else None
+            )
             ops, [new_dst] = self._build_operand_promotion(
-                dst if fill is None else fill, "dst", op.collective, label,
+                dst if tensor_init is None else tensor_init,
+                "dst",
+                op.collective,
+                label,
                 init=scalar_init,
+                overwrite=not op.accumulate and init is None,
             )
             pre_ops.extend(ops)
             # A staged SMEM destination is intermediate IR; its matmul still
             # owns initialization until the destination reaches registers.
-            if fill is not None or (
+            if tensor_init is not None or (
                 scalar_init is not None and self.target_type != "smem"
             ):
                 init = None
@@ -792,7 +897,11 @@ class PromoteBuffers(LoweringPass):
                 int | None, op.attrs.get("dst_tiling_scheme")
             )
             post_ops, _ = self._build_operand_writeback(
-                dst, new_dst, "dst", op.collective, label,
+                dst,
+                new_dst,
+                "dst",
+                op.collective,
+                label,
                 promoted_epilogue,
                 writeback_tiling_scheme,
             )
@@ -811,6 +920,7 @@ def promote_buffers(
     warps: int | None = None,
     tma: bool = False,
     nc: bool = False,
+    permutation: list[int] | None = None,
     physical_layout: dict[str, object] | None = None,
     move_attrs: dict[str, dict[str, object]] | None = None,
     writeback_slices: int = 1,
@@ -830,6 +940,7 @@ def promote_buffers(
         warps=warps,
         tma=tma,
         nc=nc,
+        permutation=permutation,
         physical_layout=physical_layout,
         move_attrs=move_attrs,
         writeback_slices=writeback_slices,

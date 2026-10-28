@@ -1,8 +1,11 @@
 """Tests for the `folding` pass."""
+
 import textwrap
 
+import pytest
+
 from ayla.base.ir import find_ops_of_type
-from ayla.gpu_dialect import TileOp, gpu_dialect
+from ayla.gpu_dialect import ElementwiseOp, MatmulOp, TileOp, gpu_dialect
 from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
@@ -46,13 +49,15 @@ def test_fold_constants():
 
 
 def test_fold_constant_tile_indices_to_static_indices():
-    module = gpu_dialect.parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             %c3: index = index_constant() attrs={value: 3}
             %tile: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %c3: index)
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     folding(module)
 
@@ -159,7 +164,8 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
 
 
 def test_distribute_constant_multiply_over_affine_offset():
-    module = gpu_dialect.parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test() {
             %bx: index = block_id.x
@@ -168,7 +174,8 @@ def test_distribute_constant_multiply_over_affine_offset():
             %c64: index = index_constant() attrs={value: 64}
             %coordinate: index = index_mul(%offset: index, %c64: index)
           }
-        }"""))
+        }""")
+    )
     folding(module)
     assert repr(module) == textwrap.dedent("""\
         module {
@@ -206,3 +213,44 @@ def test_for_that_never_runs_is_erased():
     assert "alloc()" not in after
     # ...and the rest of the kernel is untouched.
     assert "index_constant() attrs={value: 7}" in after
+
+
+_ACC = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+
+
+def _filled_then_matmul(value: float, between: str) -> str:
+    return textwrap.dedent(f"""\
+        module {{
+          kernel @mm(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: gmem<64x16xbf16>) {{
+            %acc: {_ACC} = alloc() attrs={{id: 0}}
+            %value: rmem<f32> = constant() attrs={{value: {value}}}
+            elementwise fill(%acc: {_ACC}, %value: rmem<f32>)
+            {between}
+            matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %acc: {_ACC}) collective=[xy.block, z.thread]
+          }}
+        }}""")
+
+
+_UNRELATED = "move(%a: smem<64x16xbf16>, %c: gmem<64x16xbf16>)"
+_READS_ACC = f"elementwise sigmoid(%acc: {_ACC}, %acc: {_ACC})"
+
+
+@pytest.mark.parametrize(
+    "value, between, folds",
+    [
+        (0.0, "", True),
+        (0.0, _UNRELATED, True),  # Ops that leave the accumulator alone are skipped.
+        (2.5, "", False),  # Only zero is an overwrite.
+        (0.0, _READS_ACC, False),  # Something sees the zeros first.
+    ],
+)
+def test_zero_fill_folds_into_the_matmul_that_next_writes_the_buffer(
+    value,
+    between,
+    folds,
+):
+    module = folding(gpu_dialect.parse_module(_filled_then_matmul(value, between)))
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    fills = [op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "fill"]
+    assert matmul.accumulate != folds
+    assert bool(fills) != folds

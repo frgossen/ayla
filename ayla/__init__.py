@@ -16,7 +16,13 @@ from .base.ir import (
     Value,
 )
 from .ptx_codegen import PtxPrinter, PtxKernel, make_ptx_kernel
-from .jit_compiler import ShapeSpecializingJITCompiler
+from .jit_compiler import JITCompiler, ShapeSpecializingJITCompiler
+from .gemm_jit import (
+    GemmScheduleSeed,
+    apply_gemm_schedule_seed_post_build,
+    select_gemm_schedule,
+)
+
 
 __all__ = [
     "AsyncOp",
@@ -35,5 +41,9 @@ __all__ = [
     "PtxPrinter",
     "PtxKernel",
     "make_ptx_kernel",
+    "JITCompiler",
     "ShapeSpecializingJITCompiler",
+    "select_gemm_schedule",
+    "GemmScheduleSeed",
+    "apply_gemm_schedule_seed_post_build",
 ]

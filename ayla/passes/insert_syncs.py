@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from ..analysis.sync import (
     BarrierScope,
     BarrierTargetsType,
@@ -9,12 +11,21 @@ from ..analysis.sync import (
 )
 from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
-from ..gpu_dialect import AllocOp, BarrierOp, KernelOp, LockType, ModuleOp
+from ..gpu_dialect import (
+    AllocOp,
+    BarrierOp,
+    KernelOp,
+    LockType,
+    ModuleOp,
+    effective_operands,
+    lock_has_tma_multicast,
+)
 
 
 # BarrierScope -> the BarrierOp ``scope`` attr.
 _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
     BarrierScope.BLOCK_TO_LEADER: "block_leader",
+    BarrierScope.LEADER_TO_BLOCK: "block",
     BarrierScope.BLOCK: "block",
     BarrierScope.CLUSTER_TO_LEADER: "cluster_to_leader",
     BarrierScope.LEADER_TO_CLUSTER: "leader_to_cluster",
@@ -30,15 +41,40 @@ def _insert_barriers(
 ) -> None:
     """Insert a ``barrier`` before every op the analysis assigned one."""
     new_ops: list[Op] = []
+    # Locks initialized above whose publication is still owed, and its scope.
+    # Publish once something uses one of them, or a barrier is due anyway.
+    pending_locks: set[Value] = set()
+    pending_init = BarrierScope.THREAD
+    # Arrivals may move up, but never above a publication of their lock.
+    published = 0
     for op in block.ops:
         target = targets.get(op)
+        if pending_locks and (
+            (target is not None and target.scope != BarrierScope.THREAD)
+            or not pending_locks.isdisjoint(effective_operands(op))
+        ):
+            new_ops.extend(_publication_barriers(pending_init))
+            published = len(new_ops)
+            if (
+                target is not None
+                and target.scope.leq(pending_init)
+                and op not in (barrier_syncs or {})
+            ):
+                target = None  # The publication already orders this hazard.
+            pending_locks.clear()
+            pending_init = BarrierScope.THREAD
         if target is not None and target.scope != BarrierScope.THREAD:
             if target.scope not in _BARRIER_OP_SCOPE:
                 raise NotImplementedError(
                     f"no lowering for barrier {target.scope.name}"
                 )
+            sync = (
+                barrier_syncs.get(op) if barrier_syncs is not None else None
+            )
+            # A cluster gather's id selects its mbarrier, the sync operand.
             attrs: dict[str, object] = (
-                {} if target.named_id is None else {"id": target.named_id}
+                {} if target.named_id is None or sync is not None
+                else {"id": target.named_id}
             )
             if target.scope == BarrierScope.BLOCK_TO_LEADER:
                 assert num_threads is not None, (
@@ -50,40 +86,96 @@ def _insert_barriers(
                         f"warps; got {num_threads} threads"
                     )
                 attrs["num_threads"] = num_threads
-            sync = (
-                barrier_syncs.get(op) if barrier_syncs is not None else None
-            )
+            if target.scope == BarrierScope.CLUSTER_TO_LEADER:
+                assert sync is not None
+                # Split the release: every warp arrives as soon as the
+                # accesses it orders are complete, and only the leader waits,
+                # just before the op.
+                arrival = BarrierOp.build(
+                    scope="cluster_to_leader", sync=sync,
+                    attrs={**attrs, "phase": "arrive"},
+                )
+                new_ops.insert(
+                    _arrival_index(new_ops, target.release_after, published),
+                    arrival,
+                )
+                attrs = {**attrs, "phase": "wait"}
             new_ops.append(BarrierOp.build(
                 scope=_BARRIER_OP_SCOPE[target.scope],
                 sync=sync,
                 attrs=attrs,
             ))
         new_ops.append(op)
+        if (init := _lock_init_barrier(op)) != BarrierScope.THREAD:
+            pending_locks.add(op.result())
+            pending_init = pending_init.join(init)
         for inner in op.blocks:
             _insert_barriers(inner, targets, num_threads, barrier_syncs)
+    new_ops.extend(_publication_barriers(pending_init))
     block.ops = new_ops
+
+
+def _arrival_index(
+    new_ops: list[Op], release_after: frozenset[Op | None], published: int,
+) -> int:
+    """Where a release may arrive: after the last access it orders completes.
+
+    That access must be earlier in this block, so the arrival and its wait
+    run once each per execution of the block; otherwise the arrival stays
+    beside its wait.
+    """
+    positions = [
+        next((i for i, op in enumerate(new_ops) if op is after), None)
+        for after in release_after
+    ]
+    if not positions or None in positions:
+        return len(new_ops)
+    return max(published, max(cast(list[int], positions)) + 1)
 
 
 def _materialize_cluster_mbars(
     kernel: KernelOp,
     targets: BarrierTargetsType,
 ) -> dict[Op, Value]:
-    """Allocate one cluster mbarrier per cluster-to-leader barrier site."""
+    """Allocate one cluster mbarrier per cluster-to-leader barrier id.
+
+    Sites share an id once the analysis proves every CTA completed the id's
+    prior handoff, as they share a named barrier.
+    """
     barrier_syncs: dict[Op, Value] = {}
-    allocs: list[AllocOp] = []
-    # TODO: Track cluster-mbarrier lifetimes and reuse an allocation after a
-    # cluster/grid rendezvous proves that every CTA completed its prior use.
-    # Until then, allocate one mbarrier per static barrier site.
+    allocs: dict[object, AllocOp] = {}
     for op, target in targets.items():
         if target.scope != BarrierScope.CLUSTER_TO_LEADER:
             continue
-        alloc = AllocOp.build_with_fresh_id(
-            LockType.build(kind="cluster_mbar"),
-        )
-        allocs.append(alloc)
-        barrier_syncs[op] = alloc.result()
-    kernel.body.ops[0:0] = allocs
+        # A site without an id keeps an mbarrier of its own.
+        key = op if target.named_id is None else target.named_id
+        if key not in allocs:
+            allocs[key] = AllocOp.build_with_fresh_id(
+                LockType.build(kind="cluster_mbar"),
+            )
+        barrier_syncs[op] = allocs[key].result()
+    kernel.body.ops[0:0] = list(allocs.values())
     return barrier_syncs
+
+
+def _lock_init_barrier(op: Op) -> BarrierScope:
+    """Publication barrier required by an implicitly initialized lock."""
+    lock = op.result() if isinstance(op, AllocOp) else None
+    if lock is None or not isinstance(lock.type, LockType):
+        return BarrierScope.THREAD
+    if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
+        return BarrierScope.CLUSTER
+    return BarrierScope.BLOCK if lock.type.kind == "mbar" else BarrierScope.THREAD
+
+
+def _publication_barriers(scope: BarrierScope) -> list[Op]:
+    """A CTA barrier, followed by a cluster rendezvous for cluster scope."""
+    scopes = {
+        BarrierScope.THREAD: [],
+        BarrierScope.BLOCK: [BarrierScope.BLOCK],
+        BarrierScope.CLUSTER: [BarrierScope.BLOCK, BarrierScope.CLUSTER],
+    }[scope]
+    return [BarrierOp.build(_BARRIER_OP_SCOPE[s], attrs={"initialization_publication": True}) for s in scopes]
 
 
 class InsertSyncs(Pass):
