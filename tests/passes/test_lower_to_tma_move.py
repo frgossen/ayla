@@ -11,13 +11,15 @@ from ayla.passes.lower_to_tma_move import lower_to_tma_move
 
 
 def test_lower_move_preserves_collective():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>) {
             %s: smem<16x16xf32> = alloc() attrs={id: 0}
             move(%s: smem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
           }
-        }"""))
+        }""")
+    )
     assert isinstance(module, ModuleOp)
 
     lower_to_tma_move(module)
@@ -33,17 +35,21 @@ def test_lower_move_preserves_collective():
 
 
 def test_lower_tma_through_singleton_batch_reshape():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<2x16x16xf32>) grid_dim=[2, 1, 2] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
+%by: index = block_id.y
+%bz: index = block_id.z
             %batch: gmem<1x16x16xf32> = tile(%a: gmem<2x16x16xf32>, %bz: index, 0, 0)
             %matrix: gmem<16x16xf32> = reshape(%batch: gmem<1x16x16xf32>)
             %tile: gmem<8x16xf32 strides=[16, 1]> = tile(%matrix: gmem<16x16xf32>, %bx: index, 0)
             %smem: smem<8x16xf32> = alloc() attrs={id: 0}
             move(%smem: smem<8x16xf32>, %tile: gmem<8x16xf32 strides=[16, 1]>) attrs={tma: True}
           }
-        }"""))
+        }""")
+    )
 
     lower_to_tma_move(module)
 
@@ -55,14 +61,16 @@ def test_lower_tma_through_singleton_batch_reshape():
 
 
 def _multicast_load(sizes: str) -> ModuleOp:
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent(f"""\
         module {{
           kernel @test(%a: gmem<256x64xf16>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {{
             %s: smem<{sizes}xf16 swizzle="128B"> = alloc() attrs={{id: 0}}
             %t: gmem<{sizes}xf16 strides=[64, 1]> = tile(%a: gmem<256x64xf16>, 0, 0)
             move(%s: smem<{sizes}xf16 swizzle="128B">, %t: gmem<{sizes}xf16 strides=[64, 1]>) collective=xyz.cluster attrs={{multicast: True, tma: True}}
           }}
-        }}"""))
+        }}""")
+    )
     assert isinstance(module, ModuleOp)
     return module
 
@@ -73,8 +81,11 @@ def test_multicast_load_splits_into_one_row_slice_per_cluster_cta():
     text = repr(module)
     assert text.count("tma_move(") == 2
     # Two 64-row boxes, the second offset by 64 rows into tile and buffer.
-    assert text.count("tile=64x64 swizzle=\"128B\">, ") == 2
-    assert 'smem<64x64xf16 swizzle="128B"> = tile(%s: smem<128x64xf16 swizzle="128B">, 1, 0)' in text
+    assert text.count('tile=64x64 swizzle="128B">, ') == 2
+    assert (
+        'smem<64x64xf16 swizzle="128B"> = tile(%s: smem<128x64xf16 swizzle="128B">, 1, 0)'
+        in text
+    )
     assert "index_constant() attrs={value: 64}" in text
 
 
@@ -84,4 +95,4 @@ def test_multicast_load_without_whole_swizzle_atoms_stays_whole():
 
     text = repr(module)
     assert text.count("tma_move(") == 1
-    assert "tile=24x64 swizzle=\"128B\">" in text
+    assert 'tile=24x64 swizzle="128B">' in text

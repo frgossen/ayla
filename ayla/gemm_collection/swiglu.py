@@ -1,4 +1,5 @@
 """Import matching, scheduling, and compilation for packed SwiGLU."""
+
 from __future__ import annotations
 
 from typing import cast
@@ -17,7 +18,9 @@ from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BarrierOp,
-    BlockIdsOp,
+    BlockIdOp,
+    ConstantOp,
+    RmemTensorType,
     CollectiveAxis,
     CollectiveLevel,
     ElementwiseOp,
@@ -28,9 +31,9 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     TileOp,
-    WrmemTensorType,
+    WgrmemTensorType,
 )
-from ..passes.canonicalize import Canonicalize
+from ..pipelines.canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
 from ..passes.lower_to_async import LowerToAsync
 from ..passes.promote_buffers import PromoteBuffers
@@ -61,9 +64,7 @@ def _match_swiglu_chain(
         raise ValueError("SwiGLU schedule requires one kernel")
     kernel = top_ops[0]
     if len(kernel.body.arguments) != 4:
-        raise ValueError(
-            "SwiGLU schedule requires three inputs and one result"
-        )
+        raise ValueError("SwiGLU schedule requires three inputs and one result")
     lhs, packed_weight, down_weight, output = kernel.body.arguments
     matmuls = find_ops_of_type(module, MatmulOp)
     tiles = find_ops_of_type(module, TileOp)
@@ -86,8 +87,7 @@ def _match_swiglu_chain(
         and up.indices[1] == 1
         and gate_convert.src(0) is gate.result()
         and silu.src(0) is gate_convert.dst
-        and set((multiply.src(0), multiply.src(1)))
-        == {silu.dst, up.result()}
+        and set((multiply.src(0), multiply.src(1))) == {silu.dst, up.result()}
         and down.lhs is multiply.dst
         and down.rhs is down_weight
         and down.dst is output
@@ -117,7 +117,9 @@ def _projection_ops(
     m_tile: int,
     n_tile: int,
 ) -> tuple[list[Op], MoveOp]:
-    block_ids = BlockIdsOp.build()
+    bx = BlockIdOp.build(CollectiveAxis.X)
+    by = BlockIdOp.build(CollectiveAxis.Y)
+    zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
     packed_type = _gmem(packed_weight)
     lhs_type = _gmem(lhs)
     hidden_type = _gmem(hidden)
@@ -125,7 +127,8 @@ def _projection_ops(
         packed_weight,
         [0, 0],
         GmemTensorType.build(
-            [intermediate, k], packed_type.dtype,
+            [intermediate, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
     )
@@ -133,53 +136,64 @@ def _projection_ops(
         packed_weight,
         [1, 0],
         GmemTensorType.build(
-            [intermediate, k], packed_type.dtype,
+            [intermediate, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
     )
     lhs_tile = TileOp.build(
         lhs,
-        [block_ids.y, 0],
+        [by.value, 0],
         GmemTensorType.build(
-            [m_tile, k], lhs_type.dtype, strides=list(lhs_type.strides),
+            [m_tile, k],
+            lhs_type.dtype,
+            strides=list(lhs_type.strides),
         ),
         maybe_partial=m % m_tile != 0,
     )
     gate_tile = TileOp.build(
         gate_weight.result(),
-        [block_ids.x, 0],
+        [bx.value, 0],
         GmemTensorType.build(
-            [n_tile, k], packed_type.dtype,
+            [n_tile, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
     )
     up_tile = TileOp.build(
         up_weight.result(),
-        [block_ids.x, 0],
+        [bx.value, 0],
         GmemTensorType.build(
-            [n_tile, k], packed_type.dtype,
+            [n_tile, k],
+            packed_type.dtype,
             strides=list(packed_type.strides),
         ),
     )
     hidden_tile = TileOp.build(
         hidden,
-        [block_ids.y, block_ids.x],
+        [by.value, bx.value],
         GmemTensorType.build(
-            [m_tile, n_tile], hidden_type.dtype,
+            [m_tile, n_tile],
+            hidden_type.dtype,
             strides=list(hidden_type.strides),
         ),
         maybe_partial=m % m_tile != 0,
     )
 
-    accumulator_type = WrmemTensorType.build(
-        [m_tile, n_tile], F32Type(), warps=4, layout="wgmma_layout_0",
+    accumulator_type = WgrmemTensorType.build(
+        [m_tile, n_tile],
+        F32Type(),
+        warps=4,
+        layout="wgmma_layout_0",
     )
-    epilogue_type = WrmemTensorType.build(
-        [m_tile, n_tile], _gmem(hidden).dtype,
-        warps=4, layout="wgmma_layout_0",
+    epilogue_type = WgrmemTensorType.build(
+        [m_tile, n_tile],
+        _gmem(hidden).dtype,
+        warps=4,
+        layout="wgmma_layout_0",
     )
-    gate_acc = AllocOp.build_with_fresh_id(accumulator_type, init=0.0)
-    up_acc = AllocOp.build_with_fresh_id(accumulator_type, init=0.0)
+    gate_acc = AllocOp.build_with_fresh_id(accumulator_type)
+    up_acc = AllocOp.build_with_fresh_id(accumulator_type)
     activation = AllocOp.build_with_fresh_id(epilogue_type)
     product = AllocOp.build_with_fresh_id(epilogue_type)
     collective = {
@@ -188,36 +202,56 @@ def _projection_ops(
         CollectiveAxis.Z: CollectiveLevel.GRID,
     }
     gate_matmul = MatmulOp.build(
-        lhs_tile.result(), gate_tile.result(), gate_acc.result(),
-        collective=collective, attrs={"label": "gate"},
+        lhs_tile.result(),
+        gate_tile.result(),
+        gate_acc.result(),
+        collective=collective,
+        attrs={"label": "gate"},
     )
     up_matmul = MatmulOp.build(
-        lhs_tile.result(), up_tile.result(), up_acc.result(),
-        collective=collective, attrs={"label": "up"},
+        lhs_tile.result(),
+        up_tile.result(),
+        up_acc.result(),
+        collective=collective,
+        attrs={"label": "up"},
     )
     round_gate = ElementwiseOp.build(
-        activation.result(), [gate_acc.result()], "convert",
+        activation.result(),
+        [gate_acc.result()],
+        "convert",
     )
     widen_gate = ElementwiseOp.build(
-        gate_acc.result(), [activation.result()], "convert",
+        gate_acc.result(),
+        [activation.result()],
+        "convert",
     )
     activate = ElementwiseOp.build(
-        activation.result(), [gate_acc.result()], "silu",
+        activation.result(),
+        [gate_acc.result()],
+        "silu",
         attrs={"label": "gate_epi"},
     )
     round_up = ElementwiseOp.build(
-        product.result(), [up_acc.result()], "convert",
+        product.result(),
+        [up_acc.result()],
+        "convert",
     )
     multiply = ElementwiseOp.build(
-        product.result(), [product.result(), activation.result()], "mul",
+        product.result(),
+        [product.result(), activation.result()],
+        "mul",
         attrs={"label": "up_epi"},
     )
     writeback = MoveOp.build(
-        hidden_tile.result(), product.result(), collective=collective,
+        hidden_tile.result(),
+        product.result(),
+        collective=collective,
         attrs={"label": "up_dst_wrmem"},
     )
     return [
-        block_ids,
+        bx,
+        by,
+        zero,
         gate_weight,
         up_weight,
         lhs_tile,
@@ -228,6 +262,8 @@ def _projection_ops(
         up_acc,
         activation,
         product,
+        ElementwiseOp.build(gate_acc.result(), [zero.result()], "fill"),
+        ElementwiseOp.build(up_acc.result(), [zero.result()], "fill"),
         gate_matmul,
         # Gate and up have distinct logical SMEM allocations that are overlaid
         # later by ReuseSmemAllocs. Keep ScheduleAsync from hoisting up's TMA
@@ -343,9 +379,7 @@ def schedule_swiglu(
     ):
         raise ValueError("inconsistent packed SwiGLU dimensions")
     if m > output_m_tile:
-        raise ValueError(
-            f"SwiGLU schedule supports M <= {output_m_tile}, got {m}"
-        )
+        raise ValueError(f"SwiGLU schedule supports M <= {output_m_tile}, got {m}")
     if intermediate % projection_n_tile or output_n % 64:
         raise ValueError("SwiGLU output dimensions must divide schedule tiles")
     projection_blocks = intermediate // projection_n_tile
@@ -374,23 +408,30 @@ def schedule_swiglu(
         m_tile=output_m_tile,
         n_tile=projection_n_tile,
     )
+    down_zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
     down_op = MatmulOp.build(
         hidden,
         down_weight,
         output,
         collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
-        init=0.0,
+        init=down_zero.result(),
         attrs={"label": "down"},
     )
     kernel = KernelOp.build(
         source_kernel.name,
         Block(
             arguments=[
-                lhs, packed_weight, down_weight, hidden, output, sync,
+                lhs,
+                packed_weight,
+                down_weight,
+                hidden,
+                output,
+                sync,
             ],
             ops=[
                 *projection_ops,
                 BarrierOp.build("grid", sync=sync),
+                down_zero,
                 down_op,
             ],
         ),

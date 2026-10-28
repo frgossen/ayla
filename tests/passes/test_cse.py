@@ -1,4 +1,5 @@
 """Tests for the CSE pass."""
+
 import textwrap
 
 from ayla.gpu_dialect import IndexConstantOp, gpu_dialect
@@ -57,10 +58,10 @@ def test_cse_deduplicates_allocations_by_id():
             %same1: smem<4x4xf32> = alloc() attrs={id: 0}
             %other: smem<4x4xf32> = alloc() attrs={id: 1}
             %init0: rmem<2x2xf32> = alloc() attrs={id: 2}
-            %init0_init: rmem<f32> = constant() attrs={value: 0.0}
+            %init0_init: rmem<f32> = constant 0.0
             elementwise fill(%init0: rmem<2x2xf32>, %init0_init: rmem<f32>)
             %init1: rmem<2x2xf32> = alloc() attrs={id: 2}
-            %init1_init: rmem<f32> = constant() attrs={value: 0.0}
+            %init1_init: rmem<f32> = constant 0.0
             elementwise fill(%init1: rmem<2x2xf32>, %init1_init: rmem<f32>)
           }
         }""")

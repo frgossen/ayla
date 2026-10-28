@@ -1,5 +1,4 @@
 """Configurable GEMM module builders used by collection entries."""
-import textwrap
 
 from ..base.ir import find_ops_of_type
 from ..base.pipeline import Pipeline
@@ -10,7 +9,6 @@ from ..gpu_dialect import (
     MatmulOp,
     MemTensorType,
     ModuleOp,
-    gpu_dialect,
 )
 from .canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
@@ -23,6 +21,9 @@ from ..passes.promote_buffers import PromoteBuffers
 from ..passes.schedule_async import ScheduleAsync
 from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
+
+
+from typing import cast
 
 
 def schedule_register_matmul(
@@ -49,51 +50,76 @@ def schedule_register_matmul(
     kk_label = f"{loop_label_prefix}_kk" if loop_label_prefix else "kk"
 
     pipeline = Pipeline()
-    pipeline.add_pass(TileMatmul(
-        op_dims=["K"], tile_sizes=[operand_k_tile],
-        iteration_bindings=[None], for_loop_labels=[k_label],
-        op_label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="smem", operands=["lhs", "rhs"],
-        swizzle="128B", layout=None, warps=None, tma=True,
-        physical_layout=(
-            {"block_width": 64, "order": "block_major"}
-            if operand_k_tile > 64 else None
-        ),
-        tma_load_slices=(
-            {"rhs": rhs_tma_load_slices}
-            if rhs_tma_load_slices > 1 else None
-        ),
-        move_attrs=operand_move_attrs,
-        unsafe_reuse_smem=unsafe_reuse_smem,
-        label_filter=label,
-    ))
-    pipeline.add_pass(TileMatmul(
-        op_dims=["K"], tile_sizes=[16],
-        iteration_bindings=[None], for_loop_labels=[kk_label],
-        op_label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
-    ))
-    pipeline.add_pass(MultiBuffer(
-        depth=operand_stages, label_filter=f"{label}_lhs_smem",
-    ))
-    pipeline.add_pass(MultiBuffer(
-        depth=operand_stages, label_filter=f"{label}_rhs_smem",
-    ))
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["K"],
+            tile_sizes=[operand_k_tile],
+            iteration_bindings=[None],
+            for_loop_labels=[k_label],
+            op_label_filter=label,
+            epilogue_label_filter=epilogue_label_filter,
+        )
+    )
+    pipeline.add_pass(
+        PromoteBuffers(
+            target_type="smem",
+            operands=["lhs", "rhs"],
+            swizzle="128B",
+            layout=None,
+            warps=None,
+            tma=True,
+            physical_layout=(
+                {"block_width": 64, "order": "block_major"}
+                if operand_k_tile > 64
+                else None
+            ),
+            tma_load_slices=(
+                {"rhs": rhs_tma_load_slices} if rhs_tma_load_slices > 1 else None
+            ),
+            move_attrs=operand_move_attrs,
+            unsafe_reuse_smem=unsafe_reuse_smem,
+            label_filter=label,
+        )
+    )
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["K"],
+            tile_sizes=[16],
+            iteration_bindings=[None],
+            for_loop_labels=[kk_label],
+            op_label_filter=label,
+            epilogue_label_filter=epilogue_label_filter,
+        )
+    )
+    pipeline.add_pass(
+        MultiBuffer(
+            depth=operand_stages,
+            label_filter=f"{label}_lhs_smem",
+        )
+    )
+    pipeline.add_pass(
+        MultiBuffer(
+            depth=operand_stages,
+            label_filter=f"{label}_rhs_smem",
+        )
+    )
     pipeline.add_pass(LICM())
     # Unroll kk and peel the first K step, so the reduction's first WGMMA is a
     # single op the zeroed accumulator folds into as an overwrite.
-    pipeline.add_pass(UnrollLoop(
-        unroll_factor=operand_k_tile // 16,
-        label_filter=rf"{kk_label}(?:_tail\d+)?(?:_iter\d+)?",
-    ))
+    pipeline.add_pass(
+        UnrollLoop(
+            unroll_factor=operand_k_tile // 16,
+            label_filter=rf"{kk_label}(?:_tail\d+)?(?:_iter\d+)?",
+        )
+    )
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(PeelLoop(label_filter=k_label, front_iterations=1))
-    pipeline.add_pass(UnrollLoop(
-        unroll_factor=operand_stages, label_filter=k_label,
-    ))
+    pipeline.add_pass(
+        UnrollLoop(
+            unroll_factor=operand_stages,
+            label_filter=k_label,
+        )
+    )
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(LowerToAsync())
     pipeline.add_pass(FuseAsync())
@@ -101,21 +127,25 @@ def schedule_register_matmul(
     pipeline.add_pass(Canonicalize())
     # A cyclic pipeline leaves the last stage's loads to the queued wgmma ring.
     stages = "|".join(map(str, range(operand_stages - cyclic_operand_pipeline)))
-    pipeline.add_pass(PipelineLoop(
-        label_filter_loop=k_label,
-        label_filter_op=rf"{label}_(lhs|rhs)_smem_iter(?:{stages})_async",
-        pipelining_offset=1,
-    ))
+    pipeline.add_pass(
+        PipelineLoop(
+            label_filter_loop=k_label,
+            label_filter_op=rf"{label}_(lhs|rhs)_smem_iter(?:{stages})_async",
+            pipelining_offset=1,
+        )
+    )
     pipeline.add_pass(FuseAsync())
     for _ in range(2):
         pipeline.add_pass(LICM())
         pipeline.add_pass(Canonicalize())
     if cyclic_operand_pipeline:
-        pipeline.add_pass(PipelineLoop(
-            label_filter_loop=k_label,
-            label_filter_op=rf"{label}_iter\d+_async_iter0",
-            pipelining_offset=1,
-        ))
+        pipeline.add_pass(
+            PipelineLoop(
+                label_filter_loop=k_label,
+                label_filter_op=rf"{label}(?:_iter\d+)+_async(?:_iter\d+)?",
+                pipelining_offset=1,
+            )
+        )
     return pipeline
 
 
@@ -149,50 +179,62 @@ def schedule_tiled_matmul(
     )
 
     pipeline = Pipeline()
-    pipeline.add_pass(TileMatmul(
-        op_dims=list(wg_tiles), tile_sizes=list(wg_tiles.values()),
-        iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)] * len(wg_tiles),
-        for_loop_labels=[None] * len(wg_tiles),
-        op_label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
-        allow_partial_tiles=(
-            list(wg_tiles) == ["M"] and output_m_tile % wg_tiles["M"] != 0
-        ),
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="wgrmem", operands=["dst"], swizzle=None,
-        layout="wgmma_layout_0", warps=4, tma=True,
-        physical_layout=(
-            {
-                "swizzle": "128B",
-                "block_width": 64,
-                "order": "block_major",
-            }
-            if output_tma_inner_size is not None else None
-        ),
-        writeback_slices=output_slices,
-        writeback_buffers=output_store_buffers,
-        move_attrs=operand_move_attrs,
-        target_dtype="f32", label_filter=label,
-        epilogue_label_filter=epilogue_label_filter,
-        unsafe_reuse_smem=unsafe_reuse_smem,
-    ))
-    pipeline.add_pass(schedule_register_matmul(
-        label=label,
-        operand_stages=operand_stages,
-        operand_k_tile=operand_k_tile,
-        cyclic_operand_pipeline=cyclic_operand_pipeline,
-        # Preserve the existing three 128-row RHS loads for the tuned N=384
-        # schedule; other supported schedules use one RHS load.
-        rhs_tma_load_slices=(
-            output_n_tile // warpgroup_n_tile
-            if output_n_tile == 384 else 1
-        ),
-        unsafe_reuse_smem=unsafe_reuse_smem,
-        operand_move_attrs=operand_move_attrs,
-        epilogue_label_filter=epilogue_label_filter,
-        loop_label_prefix=loop_label_prefix,
-    ))
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=list(wg_tiles),
+            tile_sizes=list(wg_tiles.values()),
+            iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)] * len(wg_tiles),
+            for_loop_labels=[None] * len(wg_tiles),
+            op_label_filter=label,
+            epilogue_label_filter=epilogue_label_filter,
+            allow_partial_tiles=(
+                list(wg_tiles) == ["M"] and output_m_tile % wg_tiles["M"] != 0
+            ),
+        )
+    )
+    pipeline.add_pass(
+        PromoteBuffers(
+            target_type="wgrmem",
+            operands=["dst"],
+            swizzle=None,
+            layout="wgmma_layout_0",
+            warps=4,
+            tma=True,
+            physical_layout=(
+                {
+                    "swizzle": "128B",
+                    "block_width": 64,
+                    "order": "block_major",
+                }
+                if output_tma_inner_size is not None
+                else None
+            ),
+            writeback_slices=output_slices,
+            writeback_buffers=output_store_buffers,
+            move_attrs=operand_move_attrs,
+            target_dtype="f32",
+            label_filter=label,
+            epilogue_label_filter=epilogue_label_filter,
+            unsafe_reuse_smem=unsafe_reuse_smem,
+        )
+    )
+    pipeline.add_pass(
+        schedule_register_matmul(
+            label=label,
+            operand_stages=operand_stages,
+            operand_k_tile=operand_k_tile,
+            cyclic_operand_pipeline=cyclic_operand_pipeline,
+            # Preserve the existing three 128-row RHS loads for the tuned N=384
+            # schedule; other supported schedules use one RHS load.
+            rhs_tma_load_slices=(
+                output_n_tile // warpgroup_n_tile if output_n_tile == 384 else 1
+            ),
+            unsafe_reuse_smem=unsafe_reuse_smem,
+            operand_move_attrs=operand_move_attrs,
+            epilogue_label_filter=epilogue_label_filter,
+            loop_label_prefix=loop_label_prefix,
+        )
+    )
     return pipeline
 
 
@@ -203,7 +245,8 @@ def _schedule_matmul(
     output_n_tiles_per_cta: int = 1,
     output_grid_size: int | None = None,
     output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
-        CollectiveAxis.X, CollectiveAxis.Y,
+        CollectiveAxis.X,
+        CollectiveAxis.Y,
     ),
     output_grid_fast_axis: str = "n",
     output_reversed_dims: tuple[str, ...] = (),
@@ -251,9 +294,7 @@ def _schedule_matmul(
 
     output_groups = (output_m_tiles_per_cta, output_n_tiles_per_cta)
     if any(group not in (1, 2, 3, 4, 5, 6, 8, 16) for group in output_groups):
-        raise ValueError(
-            "output tile groups must each be 1, 2, 3, 4, 5, 6, 8, or 16"
-        )
+        raise ValueError("output tile groups must each be 1, 2, 3, 4, 5, 6, 8, or 16")
     if output_m_tiles_per_cta > 1 and output_n_tiles_per_cta > 1:
         raise ValueError("output tiles may be grouped along only one axis")
     if min(cluster_m_ctas, cluster_n_ctas) < 1:
@@ -267,15 +308,11 @@ def _schedule_matmul(
     if output_m_tile not in (64, 128, 192, 256):
         raise ValueError("output_m_tile must be 64, 128, 192, or 256")
     if not 48 <= output_n_tile <= 384 or output_n_tile % 8:
-        raise ValueError(
-            "output_n_tile must be a multiple of 8 between 48 and 384"
-        )
+        raise ValueError("output_n_tile must be a multiple of 8 between 48 and 384")
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
     if cyclic_operand_pipeline and operand_stages < 2:
-        raise ValueError(
-            "cyclic_operand_pipeline requires at least two operand stages"
-        )
+        raise ValueError("cyclic_operand_pipeline requires at least two operand stages")
     if warpgroup_n_tile is None:
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     if output_n_tile % warpgroup_n_tile:
@@ -301,7 +338,7 @@ def _schedule_matmul(
     if output_grid_size is not None:
         kernel.grid_dim = (output_grid_size, 1, 1)
     block_x = (CollectiveLevel.BLOCK, CollectiveAxis.X)
-    output_bindings = (
+    output_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None] = (
         [block_x, block_x]
         if output_grid_size is not None
         else [
@@ -312,11 +349,13 @@ def _schedule_matmul(
     m_grid = (m_blocks + output_m_tiles_per_cta - 1) // output_m_tiles_per_cta
     n_grid = (n_blocks + output_n_tiles_per_cta - 1) // output_n_tiles_per_cta
     grid_by_axis = dict(zip(output_grid_axes, (m_grid, n_grid), strict=True))
-    cluster_by_axis = dict(zip(
-        output_grid_axes,
-        (cluster_m_ctas, cluster_n_ctas),
-        strict=True,
-    ))
+    cluster_by_axis = dict(
+        zip(
+            output_grid_axes,
+            (cluster_m_ctas, cluster_n_ctas),
+            strict=True,
+        )
+    )
     if any(
         grid_by_axis[axis] % cluster_by_axis[axis]
         for axis in (CollectiveAxis.X, CollectiveAxis.Y)
@@ -338,65 +377,76 @@ def _schedule_matmul(
     if m_fast and group_size != 1:
         raise ValueError("M-fast fixed grids do not support tile groups")
     if group_size == 1:
-        pipeline.add_pass(TileMatmul(
-            op_dims=["N", "M"] if m_fast else ["M", "N"],
-            tile_sizes=(
-                [output_n_tile, output_m_tile]
-                if m_fast else [output_m_tile, output_n_tile]
-            ),
-            iteration_bindings=output_bindings,
-            for_loop_labels=[None, None],
-            op_label_filter="mm",
-            allow_partial_tiles=(
-                m % output_m_tile != 0
-                or n % output_n_tile != 0
-            ),
-            reversed_dims=list(output_reversed_dims),
-        ))
+        pipeline.add_pass(
+            TileMatmul(
+                op_dims=["N", "M"] if m_fast else ["M", "N"],
+                tile_sizes=(
+                    [output_n_tile, output_m_tile]
+                    if m_fast
+                    else [output_m_tile, output_n_tile]
+                ),
+                iteration_bindings=output_bindings,
+                for_loop_labels=[None, None],
+                op_label_filter="mm",
+                allow_partial_tiles=(m % output_m_tile != 0 or n % output_n_tile != 0),
+                reversed_dims=list(output_reversed_dims),
+            )
+        )
     else:
         grid = (blocks + group_size - 1) // group_size
-        pipeline.add_pass(TileMatmul(
-            op_dims=[group_dim, "M", "N"],
-            tile_sizes=[
-                grid * tile_size, output_m_tile, output_n_tile,
-            ],
-            iteration_bindings=[None, *output_bindings],
-            for_loop_labels=[group_label, None, None], op_label_filter="mm",
-            allow_partial_tiles=(
-                m % output_m_tile != 0
-                or n % output_n_tile != 0
-                or blocks % group_size != 0
-            ),
-            reversed_dims=list(output_reversed_dims),
-        ))
-    pipeline.add_pass(schedule_tiled_matmul(
-        label="mm",
-        output_m_tile=output_m_tile,
-        output_n_tile=output_n_tile,
-        operand_stages=operand_stages,
-        operand_k_tile=operand_k_tile,
-        warpgroup_m_tile=warpgroup_m_tile,
-        cyclic_operand_pipeline=cyclic_operand_pipeline,
-        warpgroup_n_tile=warpgroup_n_tile,
-        output_slices=output_slices,
-        output_store_buffers=output_store_buffers,
-        output_tma_inner_size=output_tma_inner_size,
-        operand_move_attrs=operand_move_attrs,
-    ))
+        pipeline.add_pass(
+            TileMatmul(
+                op_dims=[group_dim, "M", "N"],
+                tile_sizes=[
+                    grid * tile_size,
+                    output_m_tile,
+                    output_n_tile,
+                ],
+                iteration_bindings=[None, *output_bindings],
+                for_loop_labels=[group_label, None, None],
+                op_label_filter="mm",
+                allow_partial_tiles=(
+                    m % output_m_tile != 0
+                    or n % output_n_tile != 0
+                    or blocks % group_size != 0
+                ),
+                reversed_dims=list(output_reversed_dims),
+            )
+        )
+    pipeline.add_pass(
+        schedule_tiled_matmul(
+            label="mm",
+            output_m_tile=output_m_tile,
+            output_n_tile=output_n_tile,
+            operand_stages=operand_stages,
+            operand_k_tile=operand_k_tile,
+            warpgroup_m_tile=warpgroup_m_tile,
+            cyclic_operand_pipeline=cyclic_operand_pipeline,
+            warpgroup_n_tile=warpgroup_n_tile,
+            output_slices=output_slices,
+            output_store_buffers=output_store_buffers,
+            output_tma_inner_size=output_tma_inner_size,
+            operand_move_attrs=operand_move_attrs,
+        )
+    )
     if group_size > 1:
-        pipeline.add_pass(UnrollLoop(
-            unroll_factor=group_size,
-            label_filter=group_label,
-        ))
+        pipeline.add_pass(
+            UnrollLoop(
+                unroll_factor=group_size,
+                label_filter=group_label,
+            )
+        )
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     return pipeline.run(module)
 
 
-
 class TileMatmulPipeline(Pipeline):
     """Apply the unified configurable schedule to a concrete matmul."""
-    def __init__(self, *, m: int, n: int, k: int, register_accumulator: bool = False, **config) -> None:
+
+    def __init__(
+        self, *, m: int, n: int, k: int, register_accumulator: bool = False, **config
+    ) -> None:
         super().__init__()
         self.dimensions = (m, n, k)
         self.register_accumulator = register_accumulator

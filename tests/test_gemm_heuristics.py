@@ -15,11 +15,13 @@ from ayla.gpu_dialect import CollectiveAxis
 
 def test_fixed_grid_seed_exposes_required_unroll():
     selection = select_gemm_schedules(
-        8192, 768, 768, operation="addmm",
+        8192,
+        768,
+        768,
+        operation="addmm",
     )
     seed = next(
-        seed for seed in selection.seeds
-        if seed.fixed_output_unroll_factor is not None
+        seed for seed in selection.seeds if seed.fixed_output_unroll_factor is not None
     )
 
     assert seed.builder_config is not None
@@ -68,7 +70,7 @@ def test_fixed_grid_unroll_is_rescheduled_after_unrolling(monkeypatch):
         lambda self, module: calls.append("schedule_async") or module,
     )
     monkeypatch.setattr(
-        "ayla.passes.canonicalize.Canonicalize.run",
+        "ayla.pipelines.canonicalize.Canonicalize.run",
         lambda self, module: calls.append("canonicalize") or module,
     )
     module = object()
@@ -111,10 +113,12 @@ def test_rolled_wave_pipeline_is_composed_for_selected_mm(monkeypatch):
     monkeypatch.setattr("ayla.gpu_dialect.AwaitOp", FakeAwait)
     monkeypatch.setattr("ayla.gpu_dialect.ForOp", FakeFor)
     monkeypatch.setattr(
-        "ayla.base.ir.find_ops_of_type", lambda module, op_type: [loop],
+        "ayla.base.ir.find_ops_of_type",
+        lambda module, op_type: [loop],
     )
     monkeypatch.setattr(
-        "ayla.base.ir.find_ancestor_of_type", lambda loop, op_type: None,
+        "ayla.base.ir.find_ancestor_of_type",
+        lambda loop, op_type: None,
     )
     monkeypatch.setattr(
         PipelineLoop,
@@ -126,7 +130,7 @@ def test_rolled_wave_pipeline_is_composed_for_selected_mm(monkeypatch):
         lambda self, module: calls.append("schedule_async") or module,
     )
     monkeypatch.setattr(
-        "ayla.passes.canonicalize.Canonicalize.run",
+        "ayla.pipelines.canonicalize.Canonicalize.run",
         lambda self, module: calls.append("canonicalize") or module,
     )
 
@@ -134,9 +138,7 @@ def test_rolled_wave_pipeline_is_composed_for_selected_mm(monkeypatch):
     assert apply_gemm_schedule_seed_post_build(module, seed) is module
     assert calls == ["pipeline_loop", "schedule_async", "canonicalize"]
     assert loop.attrs["label"] == "heuristic_output_grid"
-    assert loop.body.ops[0].attrs["label"] == (
-        "heuristic_wave_prologue_async"
-    )
+    assert loop.body.ops[0].attrs["label"] == ("heuristic_wave_prologue_async")
 
 
 def test_compact_round_trip_preserves_exact_dispatch():
@@ -148,28 +150,41 @@ def test_compact_round_trip_preserves_exact_dispatch():
         "features": ["m"],
         "source_fields": ["m", "n", "k"],
         "fallback": {"name": "fallback"},
-        "exact": [{
-            "operation": "mm", "dtype": "float16", "batch": 1,
-            "m": 128, "n": 256, "k": 512,
-            "seed": {
-                "configuration": {"name": "winner", "operand_stages": 4},
-                "source": {"m": 128, "n": 256, "k": 512},
-                "source_percentage_of_torch": 110.0,
-            },
-        }],
-        "groups": {"mm/float16/k128": {
-            "leaf": "fallback-leaf",
-            "seeds": [{
-                "configuration": {"name": "fallback"},
-                "source": {"m": 64, "n": 64, "k": 128},
-                "source_percentage_of_torch": 100.0,
-            }],
-        }},
+        "exact": [
+            {
+                "operation": "mm",
+                "dtype": "float16",
+                "batch": 1,
+                "m": 128,
+                "n": 256,
+                "k": 512,
+                "seed": {
+                    "configuration": {"name": "winner", "operand_stages": 4},
+                    "source": {"m": 128, "n": 256, "k": 512},
+                    "source_percentage_of_torch": 110.0,
+                },
+            }
+        ],
+        "groups": {
+            "mm/float16/k128": {
+                "leaf": "fallback-leaf",
+                "seeds": [
+                    {
+                        "configuration": {"name": "fallback"},
+                        "source": {"m": 64, "n": 64, "k": 128},
+                        "source_percentage_of_torch": 100.0,
+                    }
+                ],
+            }
+        },
     }
 
-    assert expand_gemm_heuristic(
-        collapse_gemm_heuristic(expanded),
-    ) == expanded
+    assert (
+        expand_gemm_heuristic(
+            collapse_gemm_heuristic(expanded),
+        )
+        == expanded
+    )
 
 
 def test_compact_seeds_omit_dropped_experimental_controls():
@@ -184,10 +199,7 @@ def test_compact_seeds_omit_dropped_experimental_controls():
     }
 
     assert selection.seeds
-    assert all(
-        redundant.isdisjoint(seed.captured_config)
-        for seed in selection.seeds
-    )
+    assert all(redundant.isdisjoint(seed.captured_config) for seed in selection.seeds)
 
 
 def test_rescheduled_seed_exposes_and_executes_post_builder_passes(
@@ -207,7 +219,7 @@ def test_rescheduled_seed_exposes_and_executes_post_builder_passes(
         lambda self, module: calls.append("schedule_async") or module,
     )
     monkeypatch.setattr(
-        "ayla.passes.canonicalize.Canonicalize.run",
+        "ayla.pipelines.canonicalize.Canonicalize.run",
         lambda self, module: calls.append("canonicalize") or module,
     )
     module = object()
@@ -219,7 +231,10 @@ def test_rescheduled_seed_exposes_and_executes_post_builder_passes(
 def test_addmm_uses_an_independent_operation_group():
     mm = select_gemm_schedules(128, 4096, 4096)
     addmm = select_gemm_schedules(
-        128, 4096, 4096, operation="addmm",
+        128,
+        4096,
+        4096,
+        operation="addmm",
     )
 
     assert addmm.leaf.startswith("exact:addmm:")
@@ -228,20 +243,31 @@ def test_addmm_uses_an_independent_operation_group():
 
 def test_bmm_uses_batch_aware_operation_group_and_partial_edge_tiles():
     partial = select_gemm_schedules(
-        64, 16, 128, operation="bmm", batch=128,
+        64,
+        16,
+        128,
+        operation="bmm",
+        batch=128,
     )
     small_batch = select_gemm_schedules(
-        768, 64, 64, operation="bmm", batch=12,
+        768,
+        64,
+        64,
+        operation="bmm",
+        batch=12,
     )
     large_batch = select_gemm_schedules(
-        768, 64, 64, operation="bmm", batch=144,
+        768,
+        64,
+        64,
+        operation="bmm",
+        batch=144,
     )
 
     assert partial.leaf.startswith("bmm_")
     assert partial.seeds
     assert any(
-        seed.builder_config is not None
-        and seed.builder_config["output_n_tile"] > 16
+        seed.builder_config is not None and seed.builder_config["output_n_tile"] > 16
         for seed in partial.seeds
     )
     assert small_batch.leaf != large_batch.leaf
@@ -254,7 +280,11 @@ def test_batch_is_rejected_for_non_bmm_operations():
 
 def test_bmm_filters_illegal_blocked_output_tma_transfers():
     selection = select_gemm_schedules(
-        128, 32, 128, operation="bmm", batch=128,
+        128,
+        32,
+        128,
+        operation="bmm",
+        batch=128,
     )
 
     assert selection.seeds
@@ -268,10 +298,15 @@ def test_bmm_filters_illegal_blocked_output_tma_transfers():
 
 def test_rhs_promotion_is_forwarded_to_the_builder():
     selection = select_gemm_schedules(
-        512, 512, 64, operation="bmm", batch=72,
+        512,
+        512,
+        64,
+        operation="bmm",
+        batch=72,
     )
     seed = next(
-        seed for seed in selection.seeds
+        seed
+        for seed in selection.seeds
         if seed.captured_config.get("rhs_l2_promotion") is not None
     )
 
@@ -283,7 +318,8 @@ def test_rhs_promotion_is_forwarded_to_the_builder():
 def test_n_grouped_winner_routes_existing_builder_controls():
     selection = select_gemm_schedules(4096, 4096, 64)
     seed = next(
-        seed for seed in selection.seeds
+        seed
+        for seed in selection.seeds
         if seed.captured_config["output_n_tiles_per_cta"] > 1
     )
 
@@ -294,25 +330,34 @@ def test_n_grouped_winner_routes_existing_builder_controls():
 
 def test_swapped_grid_winner_routes_existing_builder_controls():
     selection = select_gemm_schedules(
-        100480, 128, 128, operation="addmm",
+        100480,
+        128,
+        128,
+        operation="addmm",
     )
     seed = next(
-        seed for seed in selection.seeds
+        seed
+        for seed in selection.seeds
         if seed.captured_config["swap_output_grid_axes"] is True
     )
 
     assert seed.builder_config is not None
     assert seed.builder_config["output_grid_axes"] == (
-        CollectiveAxis.Y, CollectiveAxis.X,
+        CollectiveAxis.Y,
+        CollectiveAxis.X,
     )
 
 
 def test_fixed_grid_addmm_winner_is_preserved():
     selection = select_gemm_schedules(
-        4096, 2304, 768, operation="addmm",
+        4096,
+        2304,
+        768,
+        operation="addmm",
     )
     seed = next(
-        seed for seed in selection.seeds
+        seed
+        for seed in selection.seeds
         if seed.captured_config.get("output_cta_count") == 132
     )
 
@@ -324,7 +369,8 @@ def test_fixed_grid_addmm_winner_is_preserved():
 def test_group_five_family_routes_existing_builder_controls():
     selection = select_gemm_schedules(30522, 768, 2048)
     seed = next(
-        seed for seed in selection.seeds
+        seed
+        for seed in selection.seeds
         if seed.captured_config["output_tiles_per_cta"] == 5
     )
 
@@ -335,7 +381,11 @@ def test_group_five_family_routes_existing_builder_controls():
 
 def test_transpose_winner_is_selected_for_the_original_problem():
     selection = select_gemm_schedules(
-        196, 384, 768, operation="bmm", batch=64,
+        196,
+        384,
+        768,
+        operation="bmm",
+        batch=64,
     )
     seed = next(seed for seed in selection.seeds if seed.transpose_output)
 
@@ -349,7 +399,10 @@ def test_default_output_row_order_reverses_only_large_non_batched_outputs():
     assert default_reverse_output_rows(12608, 3072)
     assert not default_reverse_output_rows(8192, 768)
     assert not default_reverse_output_rows(
-        512, 512, operation="bmm", batch=256,
+        512,
+        512,
+        operation="bmm",
+        batch=256,
     )
 
 
@@ -366,7 +419,10 @@ def test_unmeasured_large_output_reverses_output_rows():
 
 def test_caller_can_forbid_reversed_output_rows():
     selection = select_gemm_schedules(
-        20000, 3072, 768, reverse_output_rows=False,
+        20000,
+        3072,
+        768,
+        reverse_output_rows=False,
     )
 
     for seed in selection.seeds:
@@ -381,7 +437,10 @@ def test_exact_winner_keeps_its_measured_output_row_order():
     assert "output rows visited last-to-first" not in seed.adaptations
 
     [forced] = select_gemm_schedules(
-        12608, 3072, 768, reverse_output_rows=False,
+        12608,
+        3072,
+        768,
+        reverse_output_rows=False,
     ).seeds
     assert forced.builder_config is not None
     assert "output_reversed_dims" not in forced.builder_config
@@ -390,7 +449,10 @@ def test_exact_winner_keeps_its_measured_output_row_order():
 
 def test_addmm_exact_winner_keeps_its_measured_output_row_order():
     [seed] = select_gemm_schedules(
-        100352, 512, 64, operation="addmm",
+        100352,
+        512,
+        64,
+        operation="addmm",
     ).seeds
 
     assert seed.builder_config is not None
@@ -399,7 +461,11 @@ def test_addmm_exact_winner_keeps_its_measured_output_row_order():
 
 def test_bmm_exact_winner_remains_forward_order():
     [seed] = select_gemm_schedules(
-        196, 640, 128, operation="bmm", batch=128,
+        196,
+        640,
+        128,
+        operation="bmm",
+        batch=128,
     ).seeds
 
     assert seed.builder_config is not None
@@ -409,10 +475,15 @@ def test_bmm_exact_winner_remains_forward_order():
 def test_measured_output_tile_reverse_is_routed_to_the_builder():
     selection = select_gemm_schedules(12608, 3072, 768)
     captured = {
-        **selection.seeds[0].captured_config, "output_tile_reverse": "m",
+        **selection.seeds[0].captured_config,
+        "output_tile_reverse": "m",
     }
     builder, _ = _adapt_config(
-        captured, 12608, 3072, 768, preserve_output_grid=True,
+        captured,
+        12608,
+        3072,
+        768,
+        preserve_output_grid=True,
     )
     assert builder is not None
     assert builder["output_reversed_dims"] == ("M",)

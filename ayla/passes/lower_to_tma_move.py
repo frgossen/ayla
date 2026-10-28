@@ -13,6 +13,7 @@ plain, side-effect-free arithmetic with no reason to sit inside the mbarrier
 block, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
 ``tma_move`` body it expects. Non-tma moves and other ops are left untouched.
 """
+
 from __future__ import annotations
 
 import math
@@ -48,10 +49,10 @@ _SWIZZLE_ATOM_BYTES = {"128B": 1024, "64B": 512, "32B": 256}
 
 
 class LowerToTmaMove(LoweringPass):
-
     @lowers(MoveOp)
     def lower_move(
-        self, op: MoveOp,
+        self,
+        op: MoveOp,
     ) -> tuple[list[Op], list[object]] | None:
         if not op.attrs.get("tma"):
             return None
@@ -73,14 +74,17 @@ class LowerToTmaMove(LoweringPass):
         for index in range(slices):
             view = TileOp.build(smem, [index, 0], slice_type)
             index_ops, tma_op = self._materialize(
-                op, smem=view.result(), row_offset=index * (rows // slices),
+                op,
+                smem=view.result(),
+                row_offset=index * (rows // slices),
             )
             new_ops += [view, *index_ops, tma_op]
         return new_ops, []
 
     @lowers(AsyncOp)
     def lower_async(
-        self, op: AsyncOp,
+        self,
+        op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:
         """Lower the async body, hoisting materialized index ops before it.
 
@@ -122,7 +126,9 @@ class LowerToTmaMove(LoweringPass):
             assert isinstance(view_type, GmemTensorType)
             view_type.sizes = list(smem.type.sizes)
             gmem_operand = TileOp.build(
-                gmem_operand, [row_offset // rows, 0], view_type,
+                gmem_operand,
+                [row_offset // rows, 0],
+                view_type,
             ).result()
         else:
             smem = cast(Value, self.value_map[smem_operand])
@@ -134,7 +140,8 @@ class LowerToTmaMove(LoweringPass):
         assert all(isinstance(size, int) for size in tile_shape)
         transpose = is_column_major(gmem_operand.type)
         index_ops, root, indices, tile_shape = _build_tile_chain_indices(
-            gmem_operand, cast(list[int], tile_shape),
+            gmem_operand,
+            cast(list[int], tile_shape),
         )
 
         assert isinstance(root.type, GmemTensorType), (
@@ -160,12 +167,11 @@ class LowerToTmaMove(LoweringPass):
                 )
             sizes = list(gmem_type.sizes)
             strides = list(gmem_type.strides)
-            for values in (sizes, indices, tile_shape):
-                values[-2], values[-1] = values[-1], values[-2]
+            sizes[-2], sizes[-1] = sizes[-1], sizes[-2]
+            indices[-2], indices[-1] = indices[-1], indices[-2]
+            tile_shape[-2], tile_shape[-1] = tile_shape[-1], tile_shape[-2]
             gmem_type = GmemTensorType.build(sizes, gmem_type.dtype)
-            expected_strides = [
-                strides[i] for i in [*range(len(strides) - 2), -1, -2]
-            ]
+            expected_strides = [strides[i] for i in [*range(len(strides) - 2), -1, -2]]
             if list(gmem_type.strides) != expected_strides:
                 raise ValueError(
                     "lower_to_tma_move: column-major view must be a dense "
@@ -181,7 +187,8 @@ class LowerToTmaMove(LoweringPass):
         )
         desc_value = next(
             (
-                arg for arg in entry_block.arguments
+                arg
+                for arg in entry_block.arguments
                 if isinstance(arg.type, TmaDescType) and arg.type == tma_type
             ),
             None,
@@ -241,7 +248,8 @@ def _multicast_slices(move: MoveOp, smem: Value) -> int:
     rows, columns = smem_type.sizes
     assert isinstance(rows, int) and isinstance(columns, int)
     dtype_bytes = cast(
-        BF16Type | F16Type | F32Type | F64Type, smem_type.dtype,
+        BF16Type | F16Type | F32Type | F64Type,
+        smem_type.dtype,
     ).byte_size
     atom = _SWIZZLE_ATOM_BYTES.get(cast(str, smem_type.swizzle), 0)
     slice_rows, remainder = divmod(rows, cluster_size)
@@ -251,7 +259,8 @@ def _multicast_slices(move: MoveOp, smem: Value) -> int:
 
 
 def _build_tile_chain_indices(
-    value: Value, tile_shape: list[int],
+    value: Value,
+    tile_shape: list[int],
 ) -> tuple[list[Op], Value, list[Value], list[int]]:
     """Walk up tiled/singleton-reshaped views to the root tensor.
 
@@ -277,9 +286,7 @@ def _build_tile_chain_indices(
             arg_sizes = list(arg_type.sizes)
             assert all(isinstance(size, int) for size in result_sizes)
             assert all(isinstance(size, int) for size in arg_sizes)
-            result_nonunit = [
-                i for i, size in enumerate(result_sizes) if size != 1
-            ]
+            result_nonunit = [i for i, size in enumerate(result_sizes) if size != 1]
             arg_nonunit = [i for i, size in enumerate(arg_sizes) if size != 1]
             if [result_sizes[i] for i in result_nonunit] != [
                 arg_sizes[i] for i in arg_nonunit
@@ -291,7 +298,9 @@ def _build_tile_chain_indices(
             mapped_indices = [zero.result()] * len(arg_sizes)
             mapped_shape = [1] * len(arg_sizes)
             for result_dim, arg_dim in zip(
-                result_nonunit, arg_nonunit, strict=True,
+                result_nonunit,
+                arg_nonunit,
+                strict=True,
             ):
                 mapped_indices[arg_dim] = indices[result_dim]
                 mapped_shape[arg_dim] = tile_shape[result_dim]

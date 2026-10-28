@@ -1,12 +1,24 @@
 """Configurable GEMM module builders used by collection entries."""
+
 import textwrap
-from ..gpu_dialect import CollectiveAxis, CollectiveLevel, KernelOp, ModuleOp, gpu_dialect
-from ..pipelines.tile_matmul_pipeline import TileMatmulPipeline, _schedule_matmul, schedule_register_matmul, schedule_tiled_matmul
+from ..gpu_dialect import (
+    CollectiveAxis,
+    ModuleOp,
+    gpu_dialect,
+)
+from ..pipelines.tile_matmul_pipeline import (
+    TileMatmulPipeline,
+    _schedule_matmul,
+    schedule_register_matmul as schedule_register_matmul,
+    schedule_tiled_matmul as schedule_tiled_matmul,
+)
 
 schedule_matmul = _schedule_matmul
 
+
 def auto_matmul_4096_wgmma256_wg_tma_store_module(
-    *, problem_size: int = 4096,
+    *,
+    problem_size: int = 4096,
     m: int | None = None,
     n: int | None = None,
     k: int | None = None,
@@ -14,7 +26,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_n_tiles_per_cta: int = 1,
     output_grid_size: int | None = None,
     output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
-        CollectiveAxis.X, CollectiveAxis.Y,
+        CollectiveAxis.X,
+        CollectiveAxis.Y,
     ),
     output_reversed_dims: tuple[str, ...] = (),
     output_m_tile: int = 128,
@@ -43,15 +56,11 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     if dtype not in ("bf16", "f16"):
         raise ValueError("dtype must be 'bf16' or 'f16'")
     problem_name = (
-        str(problem_size)
-        if m == n == k == problem_size
-        else f"m{m}_n{n}_k{k}"
+        str(problem_size) if m == n == k == problem_size else f"m{m}_n{n}_k{k}"
     )
     resolved_warpgroup_n_tile = warpgroup_n_tile
     if resolved_warpgroup_n_tile is None:
-        resolved_warpgroup_n_tile = (
-            output_n_tile if output_n_tile <= 256 else 128
-        )
+        resolved_warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
     if dtype != "bf16":
         name += f"_{dtype}"
@@ -87,16 +96,20 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     if output_reversed_dims:
         name += "_rev" + "".join(output_reversed_dims).lower()
 
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = gpu_dialect.parse(
+        textwrap.dedent(f"""\
         module {{
           kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
             %zero: rmem<f32> = constant 0.0
             matmul(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
           }}
-        }}"""))
+        }}""")
+    )
     assert isinstance(module, ModuleOp)
     return TileMatmulPipeline(
-        m=m, n=n, k=k,
+        m=m,
+        n=n,
+        k=k,
         output_m_tiles_per_cta=output_m_tiles_per_cta,
         output_n_tiles_per_cta=output_n_tiles_per_cta,
         output_grid_size=output_grid_size,

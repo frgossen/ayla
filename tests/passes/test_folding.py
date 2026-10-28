@@ -1,4 +1,5 @@
 """Tests for the `folding` pass."""
+
 import textwrap
 
 import pytest
@@ -48,13 +49,15 @@ def test_fold_constants():
 
 
 def test_fold_constant_tile_indices_to_static_indices():
-    module = gpu_dialect.parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) {
             %c3: index = index_constant() attrs={value: 3}
             %tile: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = tile(%a: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, 0, %c3: index)
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     folding(module)
 
@@ -161,7 +164,8 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
 
 
 def test_distribute_constant_multiply_over_affine_offset():
-    module = gpu_dialect.parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test() {
             %bx: index = block_id.x
@@ -170,7 +174,8 @@ def test_distribute_constant_multiply_over_affine_offset():
             %c64: index = index_constant() attrs={value: 64}
             %coordinate: index = index_mul(%offset: index, %c64: index)
           }
-        }"""))
+        }""")
+    )
     folding(module)
     assert repr(module) == textwrap.dedent("""\
         module {
@@ -230,18 +235,22 @@ _UNRELATED = "move(%a: smem<64x16xbf16>, %c: gmem<64x16xbf16>)"
 _READS_ACC = f"elementwise sigmoid(%acc: {_ACC}, %acc: {_ACC})"
 
 
-@pytest.mark.parametrize("value, between, folds", [
-    (0.0, "", True),
-    (0.0, _UNRELATED, True),  # Ops that leave the accumulator alone are skipped.
-    (2.5, "", False),  # Only zero is an overwrite.
-    (0.0, _READS_ACC, False),  # Something sees the zeros first.
-])
+@pytest.mark.parametrize(
+    "value, between, folds",
+    [
+        (0.0, "", True),
+        (0.0, _UNRELATED, True),  # Ops that leave the accumulator alone are skipped.
+        (2.5, "", False),  # Only zero is an overwrite.
+        (0.0, _READS_ACC, False),  # Something sees the zeros first.
+    ],
+)
 def test_zero_fill_folds_into_the_matmul_that_next_writes_the_buffer(
-    value, between, folds,
+    value,
+    between,
+    folds,
 ):
-    module = folding(gpu_dialect.parse(_filled_then_matmul(value, between)))
+    module = folding(gpu_dialect.parse_module(_filled_then_matmul(value, between)))
     [matmul] = find_ops_of_type(module, MatmulOp)
     fills = [op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "fill"]
     assert matmul.accumulate != folds
     assert bool(fills) != folds
-

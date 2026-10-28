@@ -7,7 +7,10 @@ measured in log2 of (batch, m, n, k)::
     op = gemm_op("mm", "bfloat16")      # op(a, bt, out): out = a @ bt.T
     op(a, bt, out)
 """
+
 from __future__ import annotations
+
+from typing import cast
 
 import math
 import textwrap
@@ -39,8 +42,13 @@ _MAX_TRANSFERRED_WAVES = 8
 
 
 def _seed(
-    captured: dict[str, object], operation: str, m: int, n: int, k: int,
-    source: tuple[int, int, int, int], exact: bool,
+    captured: dict[str, object],
+    operation: str,
+    m: int,
+    n: int,
+    k: int,
+    source: tuple[int, int, int, int],
+    exact: bool,
 ) -> GemmScheduleSeed | None:
     """Adapt a table entry to this GEMM, or None if it cannot transfer."""
     transpose = bool(captured.get("transpose_output"))
@@ -54,19 +62,25 @@ def _seed(
         return None
     builder_m, builder_n = (n, m) if transpose else (m, n)
     builder, _ = _adapt_config(
-        captured, builder_m, builder_n, k, preserve_output_grid=True,
+        captured,
+        builder_m,
+        builder_n,
+        k,
+        preserve_output_grid=True,
     )
     assert builder is not None
     unroll = None
     if fixed_grid and captured["unroll_output_tiles"]:
-        tiles = (
-            math.ceil(builder_m / int(captured["output_m_tile"]))
-            * math.ceil(builder_n / int(captured["output_n_tile"]))
-        )
-        unroll = math.ceil(tiles / int(captured["output_cta_count"]))
+        tiles = math.ceil(
+            builder_m / int(cast(int, captured["output_m_tile"]))
+        ) * math.ceil(builder_n / int(cast(int, captured["output_n_tile"])))
+        unroll = math.ceil(tiles / int(cast(int, captured["output_cta_count"])))
     if not exact and (
         not _legal(
-            builder, builder_m, builder_n, k,
+            builder,
+            builder_m,
+            builder_n,
+            k,
             allow_partial_output_tiles=operation == "bmm",
         )
         or (unroll or 0) > _MAX_TRANSFERRED_WAVES
@@ -80,7 +94,8 @@ def _seed(
         source_percentage_of_torch=None,
         post_builder_passes=(
             ("schedule_async", "canonicalize")
-            if captured.get("reschedule_async") else ()
+            if captured.get("reschedule_async")
+            else ()
         ),
         transpose_output=transpose,
         fixed_output_unroll_factor=unroll,
@@ -90,7 +105,12 @@ def _seed(
 
 
 def select_gemm_schedule(
-    operation: str, dtype: str, m: int, n: int, k: int, batch: int = 1,
+    operation: str,
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    batch: int = 1,
 ) -> GemmScheduleSeed | None:
     """Return the nearest measured schedule legal for this GEMM, if any.
 
@@ -101,15 +121,19 @@ def select_gemm_schedule(
 
     def distance(shape: tuple[int, int, int, int]) -> float:
         return sum(
-            abs(math.log2(a) - math.log2(b))
-            for a, b in zip(shape, query, strict=True)
+            abs(math.log2(a) - math.log2(b)) for a, b in zip(shape, query, strict=True)
         )
 
     for shape in sorted(table, key=distance):
         for index in table[shape]:
             seed = _seed(
-                {**_DEFAULTS, **CONFIGS[index]}, operation, m, n, k,
-                shape, exact=shape == query,
+                {**_DEFAULTS, **CONFIGS[index]},
+                operation,
+                m,
+                n,
+                k,
+                shape,
+                exact=shape == query,
             )
             if seed is not None:
                 return seed
@@ -117,7 +141,12 @@ def select_gemm_schedule(
 
 
 def _module(
-    operation: str, dtype: str, batch: int, m: int, n: int, k: int,
+    operation: str,
+    dtype: str,
+    batch: int,
+    m: int,
+    n: int,
+    k: int,
     transpose_output: bool,
 ) -> ModuleOp:
     d = _IR_DTYPES[dtype]
@@ -150,14 +179,15 @@ def _module(
         text = f"""\
             module {{
               kernel @bmm(%a: {a3}, %bt: {bt3}, %c: {c3}) grid_dim=[None, None, {batch}] {{
-                %bx: index, %by: index, %bz: index = block_ids()
+                %bz: index = block_id.z
                 %a3: {a1} = tile(%a: {a3}, %bz: index, 0, 0)
                 %a2: {a} = reshape(%a3: {a1})
                 %bt3: {bt1} = tile(%bt: {bt3}, %bz: index, 0, 0)
                 %bt2: {bt} = reshape(%bt3: {bt1})
                 %c3: {c1} = tile(%c: {c3}, %bz: index, 0, 0)
                 %c2: {c2} = reshape(%c3: {c1})
-                matmul({operands}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+                %zero: rmem<f32> = constant 0.0
+                matmul({operands}, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
               }}
             }}"""
     else:
@@ -168,7 +198,8 @@ def _module(
         text = f"""\
             module {{
               kernel @mm(%a: {a}, %b: {bt}, %c: {signature}) {{
-                matmul({operands}) collective=xyz.grid attrs={{init: 0.0, label: "mm"}}
+                %zero: rmem<f32> = constant 0.0
+                matmul({operands}, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
               }}
             }}"""
     module = gpu_dialect.parse(textwrap.dedent(text))
@@ -177,7 +208,12 @@ def _module(
 
 
 def build_gemm_module(
-    operation: str, dtype: str, batch: int, m: int, n: int, k: int,
+    operation: str,
+    dtype: str,
+    batch: int,
+    m: int,
+    n: int,
+    k: int,
     seed: GemmScheduleSeed,
 ) -> ModuleOp:
     """Build and schedule one GEMM exactly as the sweep measured ``seed``."""
@@ -196,7 +232,8 @@ def build_gemm_module(
 
 
 def gemm_jit_compiler(
-    operation: str, dtype: str,
+    operation: str,
+    dtype: str,
 ) -> ShapeSpecializingJITCompiler:
     """Compile each concrete mm, addmm, or bmm shape from the schedule table.
 
@@ -211,31 +248,40 @@ def gemm_jit_compiler(
     d = _IR_DTYPES[dtype]
     t = f"gmem<{'?x?x?' if operation == 'bmm' else '?x?'}x{d}>"
     bias = f"%bias: gmem<?x{d}>, " if operation == "addmm" else ""
-    template = gpu_dialect.parse(textwrap.dedent(f"""\
+    template = gpu_dialect.parse(
+        textwrap.dedent(f"""\
         module {{
           kernel @jit_{operation}_{d}({bias}%a: {t}, %bt: {t}, %c: {t}) {{
             matmul(%a: {t}, %bt: {t}, %c: {t}) collective=xyz.grid
           }}
-        }}"""))
+        }}""")
+    )
     assert isinstance(template, ModuleOp)
 
     def compile_specialization(module: ModuleOp):
         [kernel] = module.body.ops
         assert isinstance(kernel, KernelOp)
         *_, a, bt, _c = (
-            typ.sizes for typ in kernel.signature
-            if isinstance(typ, GmemTensorType)
+            typ.sizes for typ in kernel.signature if isinstance(typ, GmemTensorType)
         )
+        assert all(size is not None for size in (*a, *bt))
+        a = cast(tuple[int, ...], a)
+        bt = cast(tuple[int, ...], bt)
         *batch, m, k = a
         n = bt[-2]
         schedule = select_gemm_schedule(operation, dtype, m, n, k, *batch)
         if schedule is None:
             raise ValueError(
-                f"{kernel.name}: no schedule for {operation} "
-                f"{tuple(batch)}x{m}x{n}x{k}"
+                f"{kernel.name}: no schedule for {operation} {tuple(batch)}x{m}x{n}x{k}"
             )
         scheduled = build_gemm_module(
-            operation, dtype, batch[0] if batch else 1, m, n, k, schedule,
+            operation,
+            dtype,
+            batch[0] if batch else 1,
+            m,
+            n,
+            k,
+            schedule,
         )
         return make_ptx_launcher(make_ptx_kernel(scheduled))
 
@@ -244,7 +290,9 @@ def gemm_jit_compiler(
 
 @cache
 def gemm_op(
-    operation: str, dtype: str, namespace: str = DEFAULT_NAMESPACE,
+    operation: str,
+    dtype: str,
+    namespace: str = DEFAULT_NAMESPACE,
 ) -> torch._ops.OpOverload:
     """Torch op ``(bias?, a, bt, out) -> ()`` writing ``out = [bias +] a @ bt^T``."""
     from .torch_custom_call import make_torch_custom_call
@@ -252,6 +300,7 @@ def gemm_op(
     compiler = gemm_jit_compiler(operation, dtype)
     inputs = 3 if operation == "addmm" else 2
     return make_torch_custom_call(
-        compiler, [OperandKind.R] * inputs + [OperandKind.RW],
+        compiler,
+        [OperandKind.R] * inputs + [OperandKind.RW],
         namespace=namespace,
     )

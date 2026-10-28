@@ -1,4 +1,5 @@
 """JIT compilation, tensor specialization, and launch dispatch."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
@@ -8,16 +9,22 @@ from typing import cast
 import torch
 
 from .base.ir import clone_op
-from .gpu_dialect import ConstantOp, GmemTensorType, KernelOp, MatmulOp, ModuleOp, Type, TmaDescType
+from .gpu_dialect import (
+    ConstantOp,
+    GmemTensorType,
+    KernelOp,
+    MatmulOp,
+    ModuleOp,
+    Type,
+    TmaDescType,
+)
 from .passes.specialize_shapes import specialize_shapes
 from .ptx_codegen import PtxKernel, make_ptx_kernel
 from .ptx_runtime import PtxLauncher, make_ptx_launcher
 from .torch_custom_call import to_torch_dtype
 
 
-TensorSignature = tuple[
-    tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...
-]
+TensorSignature = tuple[tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...]
 Launcher = Callable[..., None]
 LauncherPlan = Callable[[], Launcher]
 
@@ -36,12 +43,11 @@ class _RegionJITCompiler:
         self.signature = signature
         self._compile_fn = compile_fn
         self._plans: dict[TensorSignature, LauncherPlan] = {}
-        self._cache: dict[
-            tuple[torch.device, TensorSignature], Launcher
-        ] = {}
+        self._cache: dict[tuple[torch.device, TensorSignature], Launcher] = {}
 
     def _metadata(
-        self, tensors: tuple[torch.Tensor, ...],
+        self,
+        tensors: tuple[torch.Tensor, ...],
     ) -> tuple[torch.device, TensorSignature]:
         if not tensors:
             raise ValueError(f"{self.name}: shape dispatch requires a tensor")
@@ -61,7 +67,9 @@ class _RegionJITCompiler:
         return device, signature
 
     def prepare_module(
-        self, signature: TensorSignature, module: ModuleOp,
+        self,
+        signature: TensorSignature,
+        module: ModuleOp,
     ) -> None:
         """Compile one specialization before its first runtime invocation."""
         if signature not in self._plans:
@@ -114,11 +122,10 @@ class PtxRoutePlan:
     ) -> None:
         self.kernel = kernel
         gmem_types = [
-            typ for typ in kernel.signature
-            if isinstance(typ, GmemTensorType)
+            typ for typ in kernel.signature if isinstance(typ, GmemTensorType)
         ]
-        self.bindings = tuple(range(len(gmem_types))) if bindings is None else (
-            tuple(bindings)
+        self.bindings = (
+            tuple(range(len(gmem_types))) if bindings is None else (tuple(bindings))
         )
         if len(self.bindings) != len(gmem_types):
             raise ValueError(
@@ -130,8 +137,7 @@ class PtxRoutePlan:
         launcher = make_ptx_launcher(self.kernel)
         arguments: list[int | torch.Tensor] = []
         gmem_types = (
-            typ for typ in self.kernel.signature
-            if isinstance(typ, GmemTensorType)
+            typ for typ in self.kernel.signature if isinstance(typ, GmemTensorType)
         )
         for typ, binding in zip(gmem_types, self.bindings, strict=True):
             if type(binding) is int:
@@ -144,20 +150,17 @@ class PtxRoutePlan:
                     f"{self.kernel.name}: scratch buffer shape must be static"
                 )
             sizes = cast(tuple[int, ...], typ.sizes)
-            allocate = (
-                torch.zeros if binding is ScratchInit.ZERO else torch.empty
+            allocate = torch.zeros if binding is ScratchInit.ZERO else torch.empty
+            arguments.append(
+                allocate(
+                    sizes,
+                    dtype=to_torch_dtype(typ.dtype),
+                    device="cuda",
+                )
             )
-            arguments.append(allocate(
-                sizes,
-                dtype=to_torch_dtype(typ.dtype),
-                device="cuda",
-            ))
 
         def run(*tensors: torch.Tensor) -> None:
-            launcher(*(
-                tensors[arg] if type(arg) is int else arg
-                for arg in arguments
-            ))
+            launcher(*(tensors[arg] if type(arg) is int else arg for arg in arguments))
 
         return run
 
@@ -184,7 +187,11 @@ class JITCompiler(_RegionJITCompiler):
         ):
             raise ValueError("JITCompiler supports only gmem and TMA arguments")
         self._module = module
-        self._cache: dict[tuple[object, ...], PtxLauncher] = {}
+        self._static_cache: dict[tuple[torch.device, TensorSignature], Launcher] = {}
+        self.name = self._kernel.name
+        self.signature: list[Type] = [
+            typ for typ in self._kernel.signature if isinstance(typ, GmemTensorType)
+        ]
 
     @property
     def _kernel(self) -> KernelOp:
@@ -193,24 +200,13 @@ class JITCompiler(_RegionJITCompiler):
         return kernel
 
     @property
-    def name(self) -> str:
-        return self._kernel.name
-
-    @property
-    def signature(self) -> list[Type]:
-        # TMA descriptors are synthesized by the launcher, not supplied by Torch.
-        return [
-            typ for typ in self._kernel.signature
-            if isinstance(typ, GmemTensorType)
-        ]
-
-    @property
     def cache_size(self) -> int:
-        return len(self._cache)
+        return len(self._static_cache if self._module_mode else self._cache)
 
     def _metadata(
-        self, tensors: tuple[torch.Tensor, ...],
-    ) -> tuple[tuple[object, ...], list[tuple[int, ...]]]:
+        self,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.device, TensorSignature]:
         if not self._module_mode:
             return super()._metadata(tensors)
         if len(tensors) != len(self.signature):
@@ -221,7 +217,8 @@ class JITCompiler(_RegionJITCompiler):
         if any(not tensor.is_cuda for tensor in tensors):
             raise ValueError(f"{self.name}: all tensors must be CUDA tensors")
         device = (
-            tensors[0].device if tensors
+            tensors[0].device
+            if tensors
             else torch.device("cuda", torch.cuda.current_device())
         )
         if any(tensor.device != device for tensor in tensors[1:]):
@@ -246,15 +243,17 @@ class JITCompiler(_RegionJITCompiler):
                     f"{self.name}: expected shape {typ.sizes}, got {shape}"
                 )
 
-        shapes = [tuple(tensor.shape) for tensor in tensors]
-        return (device, tuple(shapes)), shapes
+        return device, tuple(
+            (tuple(t.shape), tuple(t.stride()), t.dtype) for t in tensors
+        )
 
     def _prepare_module(
-        self, module: ModuleOp, shapes: list[tuple[int, ...]],
+        self,
+        module: ModuleOp,
+        shapes: list[tuple[int, ...]],
     ) -> ModuleOp:
         if any(
-            isinstance(typ, GmemTensorType) and typ.is_dynamic
-            for typ in self.signature
+            isinstance(typ, GmemTensorType) and typ.is_dynamic for typ in self.signature
         ):
             raise ValueError(
                 "JITCompiler requires static shapes; use ShapeSpecializingJITCompiler"
@@ -266,14 +265,13 @@ class JITCompiler(_RegionJITCompiler):
         launcher.ensure_loaded()
         return launcher
 
-    def _launcher(self, tensors: tuple[torch.Tensor, ...]) -> PtxLauncher:
+    def _launcher(self, tensors: tuple[torch.Tensor, ...]) -> Launcher:
         if not self._module_mode:
             return super()._launcher(tensors)
-        key, shapes = self._metadata(tensors)
-        if isinstance(key, torch.device):
-            metadata = shapes
-            key, shapes = (key, metadata), [entry[0] for entry in metadata]
-        launcher = self._cache.get(key)
+        device, signature = self._metadata(tensors)
+        key = (device, signature)
+        shapes = [entry[0] for entry in signature]
+        launcher = self._static_cache.get(key)
         if launcher is not None:
             return launcher
         if torch.cuda.is_current_stream_capturing():
@@ -285,7 +283,7 @@ class JITCompiler(_RegionJITCompiler):
         assert isinstance(module, ModuleOp)
         module = self._prepare_module(module, shapes)
         launcher = self._compile(module)
-        self._cache[key] = launcher
+        self._static_cache[key] = launcher
         return launcher
 
     def __call__(self, *tensors: torch.Tensor) -> None:
@@ -303,24 +301,18 @@ class ShapeSpecializingJITCompiler(JITCompiler):
     def __init__(
         self,
         module: ModuleOp,
-        compile_fn: Callable[[ModuleOp], PtxLauncher],
+        compile_fn: Callable[[ModuleOp], PtxLauncher | ModuleOp],
     ) -> None:
         top_ops = module.body.ops
         if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
-            raise ValueError(
-                "ShapeSpecializingJITCompiler requires exactly one kernel"
-            )
+            raise ValueError("ShapeSpecializingJITCompiler requires exactly one kernel")
         kernel = top_ops[0]
         body_ops = kernel.body.ops
         if sum(isinstance(op, MatmulOp) for op in body_ops) != 1 or not all(
             isinstance(op, (MatmulOp, ConstantOp)) for op in body_ops
         ):
-            raise ValueError(
-                "ShapeSpecializingJITCompiler requires exactly one matmul"
-            )
-        if not all(
-            isinstance(typ, GmemTensorType) for typ in kernel.signature
-        ):
+            raise ValueError("ShapeSpecializingJITCompiler requires exactly one matmul")
+        if not all(isinstance(typ, GmemTensorType) for typ in kernel.signature):
             raise ValueError(
                 "ShapeSpecializingJITCompiler currently supports only gmem arguments"
             )
@@ -340,7 +332,8 @@ class ShapeSpecializingJITCompiler(JITCompiler):
         )
 
     def _metadata(
-        self, tensors: tuple[torch.Tensor, ...],
+        self,
+        tensors: tuple[torch.Tensor, ...],
     ) -> tuple[torch.device, TensorSignature]:
         if len(tensors) != len(self.signature):
             raise ValueError(

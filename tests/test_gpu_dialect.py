@@ -59,6 +59,9 @@ from ayla.gpu_dialect import (
 )
 
 
+from ayla.gpu_dialect import WrmemTensorType, build_hardware_id
+
+
 def assert_print_and_roundtrip(op, expected):
     text = repr(op)
     assert text == expected
@@ -68,15 +71,14 @@ def assert_print_and_roundtrip(op, expected):
 def test_constant_prints_and_roundtrips():
     assert_print_and_roundtrip(
         ConstantOp.build(1e-5, RmemTensorType.build([], F32Type())),
-        "%0: rmem<f32> = constant() attrs={value: 1e-05}",
+        "%0: rmem<f32> = constant 1e-05",
     )
     assert_print_and_roundtrip(
         ConstantOp.build(
             [1.0, 2.0, 3.0, 4.0],
             RmemTensorType.build([2, 2], F32Type()),
         ),
-        "%0: rmem<2x2xf32> = constant() "
-        "attrs={value: [1.0, 2.0, 3.0, 4.0]}",
+        "%0: rmem<2x2xf32> = constant [1.0, 2.0, 3.0, 4.0]",
     )
 
 
@@ -88,30 +90,37 @@ def test_constant_prints_and_roundtrips():
     ],
 )
 def test_constant_represents_address_backed_memory_spaces(
-    result_type, expected_type,
+    result_type,
+    expected_type,
 ):
     assert_print_and_roundtrip(
         ConstantOp.build(1.0, result_type),
-        f"%0: {expected_type} = constant() attrs={{value: 1.0}}",
+        f"%0: {expected_type} = constant 1.0",
     )
 
 
 @pytest.mark.parametrize(
     ("op_type", "explicit_attrs"),
     [
-        (ModuleOp, {
-            "version": "9.0",
-            "target": "sm_90a",
-            "address_size": 64,
-        }),
-        (KernelOp, {
-            "name": "k",
-            "grid_dim": [],
-            "block_dim": [],
-            "cluster_dim": [],
-            "num_warp_groups": 1,
-            "ptx_optimization_level": 1,
-        }),
+        (
+            ModuleOp,
+            {
+                "version": "9.0",
+                "target": "sm_90a",
+                "address_size": 64,
+            },
+        ),
+        (
+            KernelOp,
+            {
+                "name": "k",
+                "grid_dim": [],
+                "block_dim": [],
+                "cluster_dim": [],
+                "num_warp_groups": 1,
+                "ptx_optimization_level": 1,
+            },
+        ),
         (MatmulOp, {"collective": {}}),
         (ReduceOp, {"fn": "sum", "collective": {}, "init": 0.0}),
         (TileOp, {"static_indices": [], "maybe_partial": True}),
@@ -119,11 +128,14 @@ def test_constant_represents_address_backed_memory_spaces(
         (AllocOp, {"id": 1}),
         (ReinterpretOp, {"byte_offset": 0}),
         (MoveOp, {"collective": {}, "multicast": True}),
-        (TmaMoveOp, {
-            "collective": {},
-            "l2_cache_hint": "evict_last",
-            "multicast": True,
-        }),
+        (
+            TmaMoveOp,
+            {
+                "collective": {},
+                "l2_cache_hint": "evict_last",
+                "multicast": True,
+            },
+        ),
         (BarrierOp, {"scope": "block"}),
         (AsyncOp, {"collective": {}}),
         (PTXTemplateOp, {"template": "ret;", "description": "test"}),
@@ -134,7 +146,9 @@ def test_constant_represents_address_backed_memory_spaces(
 )
 def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
     op = op_type(
-        operands=[], results=[], attrs={**explicit_attrs, "label": "keep"},
+        operands=[],
+        results=[],
+        attrs={**explicit_attrs, "label": "keep"},
     )
     assert op.extra_attrs == {"label": "keep"}
 
@@ -205,13 +219,13 @@ def test_memory_effect_retains_accessed_view_and_exposes_roots():
         SmemTensorType.build([2], F32Type()),
     ).result()
     dst = Value(name="dst", type=SmemTensorType.build([2], F32Type()))
-    effects = memory_effects(MoveOp.build(
-        dst,
-        view,
-        collective={
-            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
-        },
-    ))
+    effects = memory_effects(
+        MoveOp.build(
+            dst,
+            view,
+            collective={axis: CollectiveLevel.THREAD for axis in CollectiveAxis},
+        )
+    )
 
     assert effects is not None
     read = next(effect for effect in effects if effect.kind == "R")
@@ -221,21 +235,25 @@ def test_memory_effect_retains_accessed_view_and_exposes_roots():
 
 def test_move_writes_distributed_registers_at_thread_scope():
     source = Value(
-        name="source", type=GmemTensorType.build([64, 64], BF16Type()),
+        name="source",
+        type=GmemTensorType.build([64, 64], BF16Type()),
     )
     fragment = Value(
         name="fragment",
         type=WgrmemTensorType.build(
-            [64, 64], BF16Type(), warps=4, layout="wgmma_layout_0",
+            [64, 64],
+            BF16Type(),
+            warps=4,
+            layout="wgmma_layout_0",
         ),
     )
-    effects = memory_effects(MoveOp.build(
-        fragment,
-        source,
-        collective={
-            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
-        },
-    ))
+    effects = memory_effects(
+        MoveOp.build(
+            fragment,
+            source,
+            collective={axis: CollectiveLevel.THREAD for axis in CollectiveAxis},
+        )
+    )
 
     assert effects is not None
     write = next(effect for effect in effects if effect.kind == "W")
@@ -248,7 +266,8 @@ def test_reshape_op():
         type=GmemTensorType.build([2, 3, 4], F32Type()),
     )
     reshape = ReshapeOp.build(
-        source, GmemTensorType.build([6, 4], F32Type()),
+        source,
+        GmemTensorType.build([6, 4], F32Type()),
     )
 
     assert reshape.arg is source
@@ -265,10 +284,12 @@ def test_reduce_op():
         "sum": 0.0,
     }
     src = Value(
-        name="src", type=GmemTensorType.build([8, 32], F32Type()),
+        name="src",
+        type=GmemTensorType.build([8, 32], F32Type()),
     )
     dst = Value(
-        name="dst", type=GmemTensorType.build([8, 1], F32Type()),
+        name="dst",
+        type=GmemTensorType.build([8, 1], F32Type()),
     )
     reduce = ReduceOp.build(
         dst,
@@ -292,7 +313,7 @@ def test_reduce_op():
     assert_print_and_roundtrip(
         reduce,
         "reduce sum(%dst: gmem<8x1xf32>, %src: gmem<8x32xf32>) "
-        "collective=[xz.thread, y.block] attrs={init: 0.0, label: \"sum\"}",
+        'collective=[xz.thread, y.block] attrs={init: 0.0, label: "sum"}',
     )
 
 
@@ -333,32 +354,32 @@ def test_matmul_program():
 
 
 def test_matmul_tensor_initializer_roundtrips():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @addmm(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>, %bias: gmem<64x32xbf16 strides=[0, 1]>) {
             matmul(%a: gmem<64x16xbf16>, %b: gmem<32x16xbf16>, %c: gmem<64x32xbf16>, %bias: gmem<64x32xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))
+        }""")
+    )
 
     assert repr(gpu_dialect.parse(repr(module))) == repr(module)
     [matmul] = find_ops_of_type(module, MatmulOp)
-    assert matmul.init is None
-    assert matmul.init_value is not None
-    assert list(matmul.init_value.type.strides) == [0, 1]
+    assert matmul.init is not None
+    assert list(matmul.init.type.strides) == [0, 1]
     assert CollectiveLevel.THREAD_32.granularity == 32
-    assert (
-        CollectiveLevel.THREAD_32.join(CollectiveLevel.WG)
-        == CollectiveLevel.WG
-    )
+    assert CollectiveLevel.THREAD_32.join(CollectiveLevel.WG) == CollectiveLevel.WG
     assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
     assert not is_grid_collective(matmul.collective, (CollectiveAxis.X,))
     assert is_grid_collective(
-        matmul.collective, (CollectiveAxis.Y, CollectiveAxis.Z),
+        matmul.collective,
+        (CollectiveAxis.Y, CollectiveAxis.Z),
     )
     with pytest.raises(AssertionError):
         matmul.narrow_collective_level(
-            CollectiveAxis.X, CollectiveLevel.BLOCK,
+            CollectiveAxis.X,
+            CollectiveLevel.BLOCK,
         )
 
 
@@ -376,18 +397,21 @@ def test_elementwise_syntax():
     dst = Value(name="dst", type=tensor_type)
     src = Value(name="src", type=tensor_type)
     op = ElementwiseOp.build(
-        dst, [src], fn="sigmoid", attrs={"label": "activation"},
+        dst,
+        [src],
+        fn="sigmoid",
+        attrs={"label": "activation"},
     )
     assert op.ilp is False
 
     assert_print_and_roundtrip(
         op,
-        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+        "elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) "
         'attrs={label: "activation"}',
     )
     with pytest.raises(ValueError, match="must not also appear in attrs"):
         gpu_dialect.parse(
-            'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+            "elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) "
             'attrs={fn: "convert"}'
         )
 
@@ -395,8 +419,7 @@ def test_elementwise_syntax():
     assert wide.ilp is True
     assert_print_and_roundtrip(
         wide,
-        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
-        'attrs={ilp: True}',
+        "elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) attrs={ilp: True}",
     )
 
 
@@ -408,11 +431,17 @@ def test_kernel_op():
     rhs = Value(name="rhs", type=buf_type)
     dst = Value(name="dst", type=buf_type)
     template = "add.f32 ${f32:s}, ${f32:a}, ${f32:b};\n"
-    body = Block(arguments=[lhs, rhs, dst], ops=[
-        PTXTemplateOp.build([lhs, rhs, dst], [buf_type], template=template),
-    ])
+    body = Block(
+        arguments=[lhs, rhs, dst],
+        ops=[
+            PTXTemplateOp.build([lhs, rhs, dst], [buf_type], template=template),
+        ],
+    )
     kernel = KernelOp.build(
-        "cwise_add", body, ptx_optimization_level=1, attrs={"version": 1},
+        "cwise_add",
+        body,
+        ptx_optimization_level=1,
+        attrs={"version": 1},
     )
     assert kernel.ptx_optimization_level == 1
     module = ModuleOp.build(
@@ -434,8 +463,10 @@ def test_kernel_op():
 
 def test_kernel_num_threads():
     kernel = KernelOp.build(
-        "k", Block(),
-        block_dim=(256, 1, 1), num_warp_groups=2,
+        "k",
+        Block(),
+        block_dim=(256, 1, 1),
+        num_warp_groups=2,
     )
 
     assert kernel.num_threads == 256
@@ -443,8 +474,10 @@ def test_kernel_num_threads():
 
 def test_kernel_num_threads_is_unresolved_with_an_unset_axis():
     kernel = KernelOp.build(
-        "k", Block(),
-        block_dim=(256, None, None), num_warp_groups=2,
+        "k",
+        Block(),
+        block_dim=(256, None, None),
+        num_warp_groups=2,
     )
 
     assert kernel.num_threads is None
@@ -452,16 +485,22 @@ def test_kernel_num_threads_is_unresolved_with_an_unset_axis():
 
 def test_kernel_cluster_dimensions_round_trip():
     kernel = KernelOp.build(
-        "k", Block(), grid_dim=(12, 1, 1), cluster_dim=(3, 1, 1),
+        "k",
+        Block(),
+        grid_dim=(12, 1, 1),
+        cluster_dim=(3, 1, 1),
     )
     module = ModuleOp.build(Block(ops=[kernel]))
 
     assert kernel.cluster_dim == (3, 1, 1)
-    assert_print_and_roundtrip(module, textwrap.dedent("""\
+    assert_print_and_roundtrip(
+        module,
+        textwrap.dedent("""\
         module {
           kernel @k() grid_dim=[12, 1, 1] cluster_dim=[3, 1, 1] {
           }
-        }"""))
+        }"""),
+    )
 
 
 def test_kernel_cluster_dimensions_default_to_unresolved():
@@ -469,11 +508,14 @@ def test_kernel_cluster_dimensions_default_to_unresolved():
     module = ModuleOp.build(Block(ops=[kernel]))
 
     assert kernel.cluster_dim == (None, None, None)
-    assert_print_and_roundtrip(module, textwrap.dedent("""\
+    assert_print_and_roundtrip(
+        module,
+        textwrap.dedent("""\
         module {
           kernel @k() {
           }
-        }"""))
+        }"""),
+    )
 
 
 def test_cluster_block_ids_round_trip():
@@ -482,8 +524,7 @@ def test_cluster_block_ids_round_trip():
     assert ids.results == [ids.x, ids.y, ids.z]
     assert_print_and_roundtrip(
         ids,
-        "%cbx: index, %cby: index, %cbz: index "
-        "= cluster_block_ids()",
+        "%cbx: index, %cby: index, %cbz: index = cluster_block_ids()",
     )
 
 
@@ -519,13 +560,9 @@ def test_thread_id_round_trip():
 
 def test_cluster_collective_scope_is_between_block_and_grid():
     assert (
-        CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER)
-        == CollectiveScope.CLUSTER
+        CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER) == CollectiveScope.CLUSTER
     )
-    assert (
-        CollectiveScope.CLUSTER.join(CollectiveScope.GRID)
-        == CollectiveScope.GRID
-    )
+    assert CollectiveScope.CLUSTER.join(CollectiveScope.GRID) == CollectiveScope.GRID
 
 
 def test_cluster_leader_collective_scope_is_directional():
@@ -542,11 +579,7 @@ def test_cluster_leader_collective_scope_is_directional():
         for b in scopes
         for c in scopes
     )
-    assert all(
-        a.leq(a.join(b)) and b.leq(a.join(b))
-        for a in scopes
-        for b in scopes
-    )
+    assert all(a.leq(a.join(b)) and b.leq(a.join(b)) for a in scopes for b in scopes)
     assert all(
         not (a.leq(upper) and b.leq(upper)) or a.join(b).leq(upper)
         for a in scopes
@@ -568,9 +601,12 @@ def test_for_loop():
 def test_if_op():
     condition = Value(name="condition", type=PredicateType())
     op = IfOp.build(condition, Block())
-    assert_print_and_roundtrip(op, textwrap.dedent("""\
+    assert_print_and_roundtrip(
+        op,
+        textwrap.dedent("""\
         if(%condition: pred) {
-        }"""))
+        }"""),
+    )
 
     with pytest.raises(AssertionError, match="expected PredicateType"):
         IfOp.build(Value(name="i", type=IndexType()), Block())
@@ -619,33 +655,33 @@ def test_async_op():
     rhs1 = Value(name="rhs1", type=t)
     dst = Value(name="dst", type=t)
     lock = Value(name="lock", type=LockType.build(kind="wgmma"))
-    body = Block(ops=[
-        MatmulOp.build(
-            lhs0,
-            rhs0,
-            dst,
-            collective={
-                CollectiveAxis.X: CollectiveLevel.GRID,
-                CollectiveAxis.Y: CollectiveLevel.GRID,
-                CollectiveAxis.Z: CollectiveLevel.GRID,
-            },
-        ),
-        MatmulOp.build(
-            lhs1,
-            rhs1,
-            dst,
-            collective={
-                CollectiveAxis.X: CollectiveLevel.GRID,
-                CollectiveAxis.Y: CollectiveLevel.GRID,
-                CollectiveAxis.Z: CollectiveLevel.GRID,
-            },
-        ),
-    ])
+    body = Block(
+        ops=[
+            MatmulOp.build(
+                lhs0,
+                rhs0,
+                dst,
+                collective={
+                    CollectiveAxis.X: CollectiveLevel.GRID,
+                    CollectiveAxis.Y: CollectiveLevel.GRID,
+                    CollectiveAxis.Z: CollectiveLevel.GRID,
+                },
+            ),
+            MatmulOp.build(
+                lhs1,
+                rhs1,
+                dst,
+                collective={
+                    CollectiveAxis.X: CollectiveLevel.GRID,
+                    CollectiveAxis.Y: CollectiveLevel.GRID,
+                    CollectiveAxis.Z: CollectiveLevel.GRID,
+                },
+            ),
+        ]
+    )
     op = AsyncOp.build(
         lock,
-        collective={
-            axis: CollectiveLevel.GRID for axis in CollectiveAxis
-        },
+        collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
         body=body,
     )
     expected = textwrap.dedent("""\
@@ -661,12 +697,16 @@ def test_async_op_single_move():
     dst = Value(name="dst", type=t)
     src = Value(name="src", type=t)
     lock = Value(name="lock", type=LockType.build(kind="bulk"))
-    collective = {
-        axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
-    }
-    body = Block(ops=[MoveOp.build(
-        dst, src, collective=collective,
-    )])
+    collective = {axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis}
+    body = Block(
+        ops=[
+            MoveOp.build(
+                dst,
+                src,
+                collective=collective,
+            )
+        ]
+    )
     op = AsyncOp.build(lock, collective=collective, body=body)
     expected = "async(%lock: lock<bulk>) collective=xyz.cluster move(%dst: gmem<64x64xf32>, %src: gmem<64x64xf32>) collective=xyz.cluster"  # noqa: E501
     assert_print_and_roundtrip(op, expected)
@@ -685,9 +725,7 @@ def test_tma_move_build_accepts_l2_cache_hint():
         smem,
         desc,
         indices=indices,
-        collective={
-            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
-        },
+        collective={axis: CollectiveLevel.BLOCK for axis in CollectiveAxis},
         l2_cache_hint="evict_last",
     )
 
@@ -730,15 +768,15 @@ def test_tma_move_reports_both_memory_effects(smem_is_dst, expected):
     index = Value(name="index", type=IndexType())
     dst, src = (smem, desc) if smem_is_dst else (desc, smem)
 
-    effects = memory_effects(TmaMoveOp.build(
-        dst,
-        src,
-        indices=[index],
-        collective={
-            axis: CollectiveLevel.BLOCK for axis in CollectiveAxis
-        },
-        attrs={"dst_tiling_scheme": 7, "src_tiling_scheme": 8},
-    ))
+    effects = memory_effects(
+        TmaMoveOp.build(
+            dst,
+            src,
+            indices=[index],
+            collective={axis: CollectiveLevel.BLOCK for axis in CollectiveAxis},
+            attrs={"dst_tiling_scheme": 7, "src_tiling_scheme": 8},
+        )
+    )
 
     assert effects is not None
     assert {
@@ -757,37 +795,41 @@ def test_tma_multicast_reports_cluster_leader_write():
     smem = Value(name="smem", type=SmemTensorType.build((64, 64), F32Type()))
     index = Value(name="index", type=IndexType())
 
-    effects = memory_effects(TmaMoveOp.build(
-        smem,
-        desc,
-        indices=[index],
-        collective={
-            axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis
-        },
-        multicast=True,
-    ))
+    effects = memory_effects(
+        TmaMoveOp.build(
+            smem,
+            desc,
+            indices=[index],
+            collective={axis: CollectiveLevel.CLUSTER for axis in CollectiveAxis},
+            multicast=True,
+        )
+    )
 
     assert effects is not None
     assert {
         (effect.kind, root.name, effect.scope)
         for effect in effects
         for root in effect.roots
-        } == {
-            ("W", "smem", CollectiveScope.CLUSTER_LEADER),
-            ("R", "desc", CollectiveScope.GRID),
-        }
+    } == {
+        ("W", "smem", CollectiveScope.CLUSTER_LEADER),
+        ("R", "desc", CollectiveScope.GRID),
+    }
 
 
 def test_tma_descriptor_validates_l2_promotion():
     gmem_type = GmemTensorType.build((64, 64), F32Type())
     desc = TmaDescType.build(
-        0, gmem_type, tile_shape=[64, 64],
+        0,
+        gmem_type,
+        tile_shape=[64, 64],
         l2_promotion="256B",
     )
     assert desc.l2_promotion == "256B"
     with pytest.raises(ValueError, match="unsupported TMA L2 promotion"):
         TmaDescType.build(
-            0, gmem_type, tile_shape=[64, 64],
+            0,
+            gmem_type,
+            tile_shape=[64, 64],
             l2_promotion="512B",
         )
 
@@ -805,13 +847,6 @@ def test_for_loop_default_step():
 def test_for_loop_trip_count():
     assert ForOp.build(0, 5, 2).trip_count == 3
     assert ForOp.build(4, 2).trip_count == 0
-
-
-
-
-
-
-
 
 
 def test_canonical_strides():
@@ -855,9 +890,13 @@ def test_is_column_major_2d(sizes, strides, expected):
 def test_dynamic_gmem_shape_roundtrips_and_defers_static_properties():
     t = GmemTensorType.build([None, 64], F32Type())
 
-    module = ModuleOp.build(Block(ops=[
-        KernelOp.build("k", Block(arguments=[Value(name="a", type=t)])),
-    ]))
+    module = ModuleOp.build(
+        Block(
+            ops=[
+                KernelOp.build("k", Block(arguments=[Value(name="a", type=t)])),
+            ]
+        )
+    )
     expected = textwrap.dedent("""\
         module {
           kernel @k(%a: gmem<?x64xf32>) {
@@ -888,7 +927,7 @@ def test_naive_matmul_4096_module():
             %b_thread: gmem<4096x2xf32 strides=[4096, 1]> = tile(%b_block: gmem<4096x64xf32 strides=[4096, 1]>, 0, %ty: index)
             %c_thread: gmem<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
             %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0}
-            %c_thread_rmem_init: rmem<f32> = constant() attrs={value: 0.0}
+            %c_thread_rmem_init: rmem<f32> = constant 0.0
             elementwise fill(%c_thread_rmem: rmem<2x2xf32>, %c_thread_rmem_init: rmem<f32>)
             for (%k: index = 0 to 4096) {
               %a_sloop: gmem<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem<2x4096xf32>, 0, %k: index)
@@ -920,7 +959,8 @@ def test_launch_dimensions_allow_filling_unknown_axes_and_repeating_values(dimen
 @pytest.mark.parametrize("dimension", ["grid_dim", "block_dim"])
 @pytest.mark.parametrize("new_extent", [128, 32, None])
 def test_launch_dimensions_reject_growing_shrinking_and_clearing_known_axes(
-    dimension, new_extent,
+    dimension,
+    new_extent,
 ):
     kernel = KernelOp.build("test", Block())
     setattr(kernel, dimension, (None, 64, None))
@@ -939,7 +979,9 @@ def test_launch_dimensions_reject_growing_shrinking_and_clearing_known_axes(
         (CollectiveLevel.WG, 2, 2),
     ],
 )
-def test_constructed_hardware_ids_preserve_raw_operation_bounds(level, count, raw_count):
+def test_constructed_hardware_ids_preserve_raw_operation_bounds(
+    level, count, raw_count
+):
     kernel = KernelOp.build("test", Block())
     require_launch_extent(kernel, level, CollectiveAxis.X, count)
     ops, value = build_hardware_id(level, CollectiveAxis.X)

@@ -30,9 +30,7 @@ from ..gpu_dialect import (
     ModuleOp,
     ReduceOp,
     RmemTensorType,
-    ThreadIdOp,
     TileOp,
-    require_launch_extent,
 )
 from ._utils import label_matches
 

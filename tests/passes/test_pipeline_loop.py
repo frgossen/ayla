@@ -1,4 +1,5 @@
 """Tests for the pipeline_loop pass."""
+
 import textwrap
 
 from ayla.gpu_dialect import gpu_dialect
@@ -19,7 +20,7 @@ def test_pipeline_reorders_across_inner_loop():
             %buf0: smem<4x1xf32> = alloc() attrs={id: 0}
             %buf1: smem<4x1xf32> = alloc() attrs={id: 1}
             %acc: smem<4x1xf32> = alloc() attrs={id: 2}
-            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %acc_init: rmem<f32> = constant 0.0
             elementwise fill(%acc: smem<4x1xf32>, %acc_init: rmem<f32>)
             for (%k: index = 0 to 4) attrs={label: "k"} {
               for (%l: index = 0 to 2) {
@@ -32,7 +33,10 @@ def test_pipeline_reorders_across_inner_loop():
         }""")  # noqa: E501
     module = gpu_dialect.parse_module(module_str)
     pipelined = pipeline_loop(
-        module, label_filter_loop="k", label_filter_op="load", pipelining_offset=1,
+        module,
+        label_filter_loop="k",
+        label_filter_op="load",
+        pipelining_offset=1,
     )
     expected = textwrap.dedent("""\
         module {
@@ -40,7 +44,7 @@ def test_pipeline_reorders_across_inner_loop():
             %buf0: smem<4x1xf32> = alloc() attrs={id: 0}
             %buf1: smem<4x1xf32> = alloc() attrs={id: 1}
             %acc: smem<4x1xf32> = alloc() attrs={id: 2}
-            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %acc_init: rmem<f32> = constant 0.0
             elementwise fill(%acc: smem<4x1xf32>, %acc_init: rmem<f32>)
             %c0: index = index_constant() attrs={value: 0}
             %a_k: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %c0: index)
@@ -66,7 +70,8 @@ def test_pipeline_reorders_across_inner_loop():
 
 
 def test_pipeline_queued_async_completion():
-    module = gpu_dialect.parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) {
             %l0: lock<wgmma> = alloc()
@@ -78,7 +83,8 @@ def test_pipeline_queued_async_completion():
               await(%l1: lock<wgmma>)
             }
           }
-        }"""))
+        }""")
+    )
 
     pipeline_loop(
         module,
@@ -88,9 +94,9 @@ def test_pipeline_queued_async_completion():
     )
 
     text = repr(module)
-    assert 'await(%l1: lock<wgmma>) attrs={pending: 1}' in text
-    assert 'await(%l0: lock<wgmma>) attrs={pending: 1}' in text
-    assert text.rfind('await(%l1: lock<wgmma>)') > text.rfind("for (%k")
+    assert "await(%l1: lock<wgmma>) attrs={pending: 1}" in text
+    assert "await(%l0: lock<wgmma>) attrs={pending: 1}" in text
+    assert text.rfind("await(%l1: lock<wgmma>)") > text.rfind("for (%k")
 
 
 def test_pipeline_matmul_smem_skeleton():
@@ -102,7 +108,7 @@ def test_pipeline_matmul_smem_skeleton():
             %sa2: smem<8x1xf32> = alloc() attrs={id: 2}
             %sb2: smem<8x1xf32> = alloc() attrs={id: 3}
             %sc: smem<8x1xf32> = alloc() attrs={id: 4}
-            %sc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %sc_init: rmem<f32> = constant 0.0
             elementwise fill(%sc: smem<8x1xf32>, %sc_init: rmem<f32>)
             for (%k: index = 0 to 4 step 2) {
               %a_k: gmem<8x1xf32 strides=[8, 1]> = tile(%a: gmem<8x8xf32>, 0, %k: index)
@@ -122,7 +128,9 @@ def test_pipeline_matmul_smem_skeleton():
         }""")  # noqa: E501
 
     module = gpu_dialect.parse_module(module_str)
-    pipelined = pipeline_loop(module, label_filter_loop=".*", label_filter_op="load", pipelining_offset=1)
+    pipelined = pipeline_loop(
+        module, label_filter_loop=".*", label_filter_op="load", pipelining_offset=1
+    )
     text = repr(pipelined)
     expected = textwrap.dedent("""\
         module {
@@ -132,7 +140,7 @@ def test_pipeline_matmul_smem_skeleton():
             %sa2: smem<8x1xf32> = alloc() attrs={id: 2}
             %sb2: smem<8x1xf32> = alloc() attrs={id: 3}
             %sc: smem<8x1xf32> = alloc() attrs={id: 4}
-            %sc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %sc_init: rmem<f32> = constant 0.0
             elementwise fill(%sc: smem<8x1xf32>, %sc_init: rmem<f32>)
             %c0: index = index_constant() attrs={value: 0}
             %a_k: gmem<8x1xf32 strides=[8, 1]> = tile(%a: gmem<8x8xf32>, 0, %c0: index)
@@ -202,7 +210,9 @@ def test_pipeline_clones_matched_pure_ops_for_unlabeled_consumers():
         }""")  # noqa: E501
     module = gpu_dialect.parse_module(module_str)
     pipelined = pipeline_loop(
-        module, label_filter_loop="k", label_filter_op="(?!store).*",
+        module,
+        label_filter_loop="k",
+        label_filter_op="(?!store).*",
         pipelining_offset=1,
     )
     expected = textwrap.dedent("""\

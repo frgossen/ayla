@@ -67,8 +67,8 @@ class BenchResult:
     """One row's measurement. Times are milliseconds."""
 
     name: str
-    rounds: int   # timed event-pairs (the sample count for median/stdev/min/max)
-    iters: int    # launches averaged within each round
+    rounds: int  # timed event-pairs (the sample count for median/stdev/min/max)
+    iters: int  # launches averaged within each round
     median_ms: float
     mean_ms: float
     stdev_ms: float
@@ -91,10 +91,16 @@ class GemmBenchConfig(BenchConfig):
 
 
 def gemm_bench_config(
-    *, name: str, m: int, n: int, k: int, compute: Callable,
+    *,
+    name: str,
+    m: int,
+    n: int,
+    k: int,
+    compute: Callable,
     dtype: torch.dtype,
 ) -> GemmBenchConfig:
     """A :class:`GemmBenchConfig` with its operands and check derived."""
+
     def make_inputs() -> list[torch.Tensor]:
         return [
             torch.randn(m, k, dtype=dtype, device="cuda"),
@@ -107,16 +113,29 @@ def gemm_bench_config(
         )
 
     return GemmBenchConfig(
-        name=name, compute=compute, make_inputs=make_inputs, verify=verify,
-        weight_inputs=(1,), m=m, n=n, k=k, dtype=dtype,
+        name=name,
+        compute=compute,
+        make_inputs=make_inputs,
+        verify=verify,
+        weight_inputs=(1,),
+        m=m,
+        n=n,
+        k=k,
+        dtype=dtype,
     )
 
 
 def addmm_bench_config(
-    *, name: str, m: int, n: int, k: int, compute: Callable,
+    *,
+    name: str,
+    m: int,
+    n: int,
+    k: int,
+    compute: Callable,
     dtype: torch.dtype,
 ) -> GemmBenchConfig:
     """A GEMM benchmark with a vector-N bias epilogue."""
+
     def make_inputs() -> list[torch.Tensor]:
         return [
             torch.randn(n, dtype=dtype, device="cuda"),
@@ -130,19 +149,33 @@ def addmm_bench_config(
         )
 
     return GemmBenchConfig(
-        name=name, compute=compute, make_inputs=make_inputs, verify=verify,
-        weight_inputs=(0, 2), m=m, n=n, k=k, dtype=dtype,
+        name=name,
+        compute=compute,
+        make_inputs=make_inputs,
+        verify=verify,
+        weight_inputs=(0, 2),
+        m=m,
+        n=n,
+        k=k,
+        dtype=dtype,
     )
 
 
 def bmm_bench_config(
-    *, name: str, batch: int, m: int, n: int, k: int, compute: Callable,
+    *,
+    name: str,
+    batch: int,
+    m: int,
+    n: int,
+    k: int,
+    compute: Callable,
     dtype: torch.dtype,
 ) -> GemmBenchConfig:
     """A batched GEMM benchmark using contiguous ``A`` and ``BT``.
 
     Both operands are activations (attention-style), so neither is a weight.
     """
+
     def make_inputs() -> list[torch.Tensor]:
         return [
             torch.randn(batch, m, k, dtype=dtype, device="cuda"),
@@ -156,8 +189,14 @@ def bmm_bench_config(
         )
 
     return GemmBenchConfig(
-        name=name, compute=compute, make_inputs=make_inputs, verify=verify,
-        m=batch * m, n=n, k=k, dtype=dtype,
+        name=name,
+        compute=compute,
+        make_inputs=make_inputs,
+        verify=verify,
+        m=batch * m,
+        n=n,
+        k=k,
+        dtype=dtype,
     )
 
 
@@ -172,9 +211,9 @@ class GemmBenchResult(BenchResult):
 
 # Everything is captured and replayed on one stream, so launch overhead is not
 # attributed to one implementation but not another.
-_WARMUP_S = 0.5        # clock-ramp warmup budget...
-_WARMUP_ITERS = 100    # ...capped at this many launches (survive slow kernels)
-_GRAPH_WARMUP = 3      # launches on the capture stream before recording
+_WARMUP_S = 0.5  # clock-ramp warmup budget...
+_WARMUP_ITERS = 100  # ...capped at this many launches (survive slow kernels)
+_GRAPH_WARMUP = 3  # launches on the capture stream before recording
 _GRAPH_LAUNCHES = 4
 _MIN_RUN_TIME_S = 0.5
 _MAX_ROUNDS = 200
@@ -185,88 +224,9 @@ _INFERENCE_MIN_LAYERS = 4
 _INFERENCE_MAX_LAYERS = 32
 
 
-@functools.cache
-def _libcuda() -> ctypes.CDLL:
-    return ctypes.CDLL("libcuda.so.1")
-
-
 # Kernels are built and assembled ahead of their GPU worker by this many
 # CPU-only processes in total, shared out between concurrent shards.
 COMPILE_WORKERS = 128
-
-
-def driver_ptxas() -> Path:
-    """The ptxas of the driver's CUDA release, whose SASS matches its JIT's."""
-    version = ctypes.c_int()
-    if _libcuda().cuDriverGetVersion(ctypes.byref(version)):
-        raise RuntimeError("cuDriverGetVersion failed")
-    release = f"{version.value // 1000}.{version.value % 1000 // 10}"
-    ptxas = Path(f"/usr/local/cuda-{release}/bin/ptxas")
-    if not ptxas.exists():
-        raise FileNotFoundError(f"no ptxas for the driver's CUDA {release}: {ptxas}")
-    return ptxas
-
-
-def _leave_gpus_alone() -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.nice(19)  # timing processes keep the CPU when they need it
-
-
-def _build_and_assemble(build: Callable, args: tuple, ptxas: Path):
-    from ayla.ptx_runtime import assemble_ptx
-
-    try:
-        kernel = build(*args)
-        return kernel, assemble_ptx(kernel, ptxas)
-    except Exception as error:
-        return type(error).__name__, str(error)
-
-
-@functools.cache
-def _assembler(workers: int):
-    pool = multiprocessing.get_context("spawn").Pool(
-        workers, initializer=_leave_gpus_alone,
-    )
-    atexit.register(pool.terminate)
-    return pool
-
-
-def assemble_kernels(
-    build: Callable, items: list[tuple], workers: int, timeout_s: float | None,
-) -> list[tuple]:
-    """``build(*item)`` each kernel and assemble it, off the GPUs, in parallel.
-
-    Each entry is ``(PtxKernel, cubin)``, or ``(error type, message)`` for a
-    kernel that failed to build or assemble, or took over ``timeout_s``.
-    ``build`` must be a module-level function, so workers can import it.
-    """
-    if not items:
-        return []
-    pool = _assembler(workers)
-    ptxas = driver_ptxas()
-    pending = [
-        pool.apply_async(_build_and_assemble, (build, item, ptxas))
-        for item in items
-    ]
-    # Each kernel gets ``timeout_s``; queued ones wait for a free worker first.
-    deadline = None if timeout_s is None else (
-        time.monotonic() + timeout_s * math.ceil(len(items) / workers)
-    )
-    entries: list[tuple] = []
-    for result in pending:
-        try:
-            entries.append(result.get(
-                None if deadline is None
-                else max(0.0, deadline - time.monotonic())
-            ))
-        except multiprocessing.TimeoutError:
-            entries.append(("compile_timeout", f"exceeded {timeout_s:g}s"))
-    if any(entry[0] == "compile_timeout" for entry in entries):
-        # A stuck build would hold its worker; start the next batch afresh.
-        pool.terminate()
-        _assembler.cache_clear()
-    return entries
-
 
 
 def torch_mm_nt(a: torch.Tensor, bt: torch.Tensor) -> torch.Tensor:
@@ -275,7 +235,9 @@ def torch_mm_nt(a: torch.Tensor, bt: torch.Tensor) -> torch.Tensor:
 
 
 def torch_addmm_nt(
-    bias: torch.Tensor, a: torch.Tensor, bt: torch.Tensor,
+    bias: torch.Tensor,
+    a: torch.Tensor,
+    bt: torch.Tensor,
 ) -> torch.Tensor:
     """The addmm baseline in Ayla's operand layout."""
     return torch.addmm(bias, a, bt.t())
@@ -294,7 +256,9 @@ def out_parameter_op(launcher: Callable) -> Callable:
         nonlocal output
         if output is None:
             output = torch.empty(
-                (a.shape[0], bt.shape[0]), dtype=a.dtype, device=a.device,
+                (a.shape[0], bt.shape[0]),
+                dtype=a.dtype,
+                device=a.device,
             )
         launcher(a, bt, output)
         return output
@@ -307,12 +271,16 @@ def out_parameter_addmm_op(launcher: Callable) -> Callable:
     output = None
 
     def op(
-        bias: torch.Tensor, a: torch.Tensor, bt: torch.Tensor,
+        bias: torch.Tensor,
+        a: torch.Tensor,
+        bt: torch.Tensor,
     ) -> torch.Tensor:
         nonlocal output
         if output is None:
             output = torch.empty(
-                (a.shape[0], bt.shape[0]), dtype=a.dtype, device=a.device,
+                (a.shape[0], bt.shape[0]),
+                dtype=a.dtype,
+                device=a.device,
             )
         launcher(bias, a, bt, output)
         return output
@@ -459,14 +427,18 @@ def _build_and_assemble(build: Callable, args: tuple, ptxas: Path):
 @functools.cache
 def _assembler(workers: int):
     pool = multiprocessing.get_context("spawn").Pool(
-        workers, initializer=_leave_gpus_alone,
+        workers,
+        initializer=_leave_gpus_alone,
     )
     atexit.register(pool.terminate)
     return pool
 
 
 def assemble_kernels(
-    build: Callable, items: list[tuple], workers: int, timeout_s: float | None,
+    build: Callable,
+    items: list[tuple],
+    workers: int,
+    timeout_s: float | None,
 ) -> list[tuple]:
     """``build(*item)`` each kernel and assemble it, off the GPUs, in parallel.
 
@@ -479,20 +451,22 @@ def assemble_kernels(
     pool = _assembler(workers)
     ptxas = driver_ptxas()
     pending = [
-        pool.apply_async(_build_and_assemble, (build, item, ptxas))
-        for item in items
+        pool.apply_async(_build_and_assemble, (build, item, ptxas)) for item in items
     ]
     # Each kernel gets ``timeout_s``; queued ones wait for a free worker first.
-    deadline = None if timeout_s is None else (
-        time.monotonic() + timeout_s * math.ceil(len(items) / workers)
+    deadline = (
+        None
+        if timeout_s is None
+        else (time.monotonic() + timeout_s * math.ceil(len(items) / workers))
     )
     entries: list[tuple] = []
     for result in pending:
         try:
-            entries.append(result.get(
-                None if deadline is None
-                else max(0.0, deadline - time.monotonic())
-            ))
+            entries.append(
+                result.get(
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+            )
         except multiprocessing.TimeoutError:
             entries.append(("compile_timeout", f"exceeded {timeout_s:g}s"))
     if any(entry[0] == "compile_timeout" for entry in entries):
@@ -583,12 +557,17 @@ def _with_percentages(
     filled = []
     for cfg, result in zip(configs, results, strict=True):
         peak = _PEAK_DENSE_TC_TFLOPS.get((device_name, cfg.dtype))
-        filled.append(dataclasses.replace(
-            result,
-            peak_pct=result.tflops / peak * 100 if peak else None,
-            torch_mm_pct=(None if torch_mm_tflops is None
-                          else result.tflops / torch_mm_tflops * 100),
-        ))
+        filled.append(
+            dataclasses.replace(
+                result,
+                peak_pct=result.tflops / peak * 100 if peak else None,
+                torch_mm_pct=(
+                    None
+                    if torch_mm_tflops is None
+                    else result.tflops / torch_mm_tflops * 100
+                ),
+            )
+        )
     return filled
 
 
@@ -635,7 +614,9 @@ def run(
     if not configs:
         return []
     timed = run_bench(
-        configs, cold_cache_bytes=cold_cache_bytes, inference=inference,
+        configs,
+        cold_cache_bytes=cold_cache_bytes,
+        inference=inference,
     )
     carried = [field.name for field in dataclasses.fields(BenchResult)]
     results = [
@@ -667,22 +648,26 @@ def print_results(
     if label_width is None:
         label_width = max(
             [len(f.name) for f in fields if _is_str_field(f)]
-            + [len(str(getattr(r, f.name)))
-               for r in results for f in fields if _is_str_field(f)],
+            + [
+                len(str(getattr(r, f.name)))
+                for r in results
+                for f in fields
+                if _is_str_field(f)
+            ],
             default=len("label"),
         )
     if with_header:
-        print("  ".join(
-            f"{f.name:{_align(f)}{_width(f, label_width)}s}" for f in fields
-        ))
+        print(
+            "  ".join(f"{f.name:{_align(f)}{_width(f, label_width)}s}" for f in fields)
+        )
     for result in results:
-        print("  ".join(
-            _format_field(result, f, label_width) for f in fields
-        ))
+        print("  ".join(_format_field(result, f, label_width) for f in fields))
 
 
 def _capture(
-    config: BenchConfig, stream, graph_launches: int,
+    config: BenchConfig,
+    stream,
+    graph_launches: int,
 ) -> tuple[torch.cuda.CUDAGraph, list[torch.Tensor]]:
     """Capture one config's compute into a graph that can be replayed.
 
@@ -714,7 +699,8 @@ def _capture(
 
 
 def _capture_inference(
-    config: BenchConfig, stream,
+    config: BenchConfig,
+    stream,
 ) -> tuple[torch.cuda.CUDAGraph, list[list[torch.cuda.Event]], list[object]]:
     """Capture a chain of model layers, with events around what is timed.
 
@@ -733,21 +719,21 @@ def _capture_inference(
     if config.verify is not None:
         config.verify(output, inputs)
     weight_bytes = sum(inputs[i].nbytes for i in config.weight_inputs)
-    layers = _INFERENCE_MAX_LAYERS if not weight_bytes else max(
-        _INFERENCE_MIN_LAYERS,
-        min(_INFERENCE_MAX_LAYERS,
-            math.ceil(_INFERENCE_WEIGHT_BYTES / weight_bytes)),
+    layers = (
+        _INFERENCE_MAX_LAYERS
+        if not weight_bytes
+        else max(
+            _INFERENCE_MIN_LAYERS,
+            min(
+                _INFERENCE_MAX_LAYERS, math.ceil(_INFERENCE_WEIGHT_BYTES / weight_bytes)
+            ),
+        )
     )
     layer_inputs = [inputs] + [
-        [
-            x.clone() if i in config.weight_inputs else x
-            for i, x in enumerate(inputs)
-        ]
+        [x.clone() if i in config.weight_inputs else x for i, x in enumerate(inputs)]
         for _ in range(layers - 1)
     ]
-    activations = [
-        x for i, x in enumerate(inputs) if i not in config.weight_inputs
-    ]
+    activations = [x for i, x in enumerate(inputs) if i not in config.weight_inputs]
     events = [
         [torch.cuda.Event(enable_timing=True, external=True) for _ in range(4)]
         for _ in layer_inputs
@@ -810,9 +796,12 @@ def run_bench(
     graph_launches = 1 if cold_cache_bytes else _GRAPH_LAUNCHES
     cache_flush = (
         torch.zeros(
-            max(1, cold_cache_bytes // 4), dtype=torch.float32, device="cuda",
+            max(1, cold_cache_bytes // 4),
+            dtype=torch.float32,
+            device="cuda",
         )
-        if cold_cache_bytes else None
+        if cold_cache_bytes
+        else None
     )
     samplers: list[Callable[[], tuple[float, float]]] = []
     iters: list[int] = []
@@ -824,23 +813,34 @@ def run_bench(
         if inference:
             assert cache_flush is not None
             chain, events, tensors = _capture_inference(config, stream)
-            samplers.append(functools.partial(
-                _time_inference, chain, events, stream,
-                cache_flush=cache_flush,
-            ))
+            samplers.append(
+                functools.partial(
+                    _time_inference,
+                    chain,
+                    events,
+                    stream,
+                    cache_flush=cache_flush,
+                )
+            )
             iters.append(len(events))
             keep_alive.append((chain, events, tensors))
         else:
             graph, inputs = _capture(config, stream, graph_launches)
-            samplers.append(functools.partial(
-                _time_graph, graph, stream,
-                graph_launches=graph_launches, cache_flush=cache_flush,
-            ))
+            samplers.append(
+                functools.partial(
+                    _time_graph,
+                    graph,
+                    stream,
+                    graph_launches=graph_launches,
+                    cache_flush=cache_flush,
+                )
+            )
             iters.append(graph_launches)
             keep_alive.append((graph, inputs))
         # Capturing a long suite takes minutes; say where it is up to.
-        print(f"[capture {i}/{len(configs)}] {config.name}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[capture {i}/{len(configs)}] {config.name}", file=sys.stderr, flush=True
+        )
 
     def replay_all(offset: int = 0) -> tuple[list[float], list[float]]:
         """Time every row once, starting at `offset`: per launch, and wall."""
@@ -855,14 +855,14 @@ def run_bench(
     # times over. One round replays every config, so it is spent against their
     # sum -- unlike `rounds` below, which sizes off the slowest.
     per_round_ms = max(sum(replay_all()[1]), 1e-3)
-    for _ in range(max(1, min(_WARMUP_ITERS // max(iters),
-                              round(_WARMUP_S * 1e3 / per_round_ms)))):
+    for _ in range(
+        max(1, min(_WARMUP_ITERS // max(iters), round(_WARMUP_S * 1e3 / per_round_ms)))
+    ):
         replay_all()
 
     # Size the run off the slowest config, priced warm.
     slowest = max(max(replay_all()[1]), 1e-3)
-    rounds = max(3, min(_MAX_ROUNDS,
-                        round(_MIN_RUN_TIME_S * 1e3 / slowest)))
+    rounds = max(3, min(_MAX_ROUNDS, round(_MIN_RUN_TIME_S * 1e3 / slowest)))
 
     # Rotate the starting row each round, so no row sits permanently first
     # (cold) or permanently behind the same neighbour.
@@ -907,12 +907,20 @@ def plot_tflops_curve(
     """Plot and annotate an Ayla/cuBLAS throughput comparison curve."""
     axis.plot(x_values, ayla_tflops, marker="o", linewidth=2, label="Ayla")
     axis.plot(
-        x_values, torch_tflops, marker="o", linewidth=2,
+        x_values,
+        torch_tflops,
+        marker="o",
+        linewidth=2,
         label="cuBLAS (torch.mm)",
     )
-    for index, (x, ayla_value, torch_value) in enumerate(zip(
-        x_values, ayla_tflops, torch_tflops, strict=True,
-    )):
+    for index, (x, ayla_value, torch_value) in enumerate(
+        zip(
+            x_values,
+            ayla_tflops,
+            torch_tflops,
+            strict=True,
+        )
+    ):
         difference = ayla_value - torch_value
         advantage = 100 * difference / torch_value
         axis.annotate(
@@ -927,11 +935,14 @@ def plot_tflops_curve(
         )
     axis.set_xscale("log", base=2)
     axis.set_xticks(
-        x_values, [f"{value:,}" for value in x_values], rotation=45, ha="right",
+        x_values,
+        [f"{value:,}" for value in x_values],
+        rotation=45,
+        ha="right",
     )
     log_min = math.log2(min(x_values))
     log_max = math.log2(max(x_values))
-    padding = max(.4, .05 * (log_max - log_min))
+    padding = max(0.4, 0.05 * (log_max - log_min))
     axis.set_xlim(2 ** (log_min - padding), 2 ** (log_max + padding))
-    axis.grid(True, alpha=.3)
-    axis.margins(y=.25)
+    axis.grid(True, alpha=0.3)
+    axis.margins(y=0.25)

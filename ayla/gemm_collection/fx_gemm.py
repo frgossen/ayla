@@ -1,4 +1,5 @@
-"""FX-to-Ayla rewrites for BF16 GEMM kernels."""
+"""FX-to-Ayla rewrites for BF16 and FP16 GEMM kernels."""
+
 from __future__ import annotations
 
 import torch
@@ -12,6 +13,7 @@ from ..fx_compiler import (
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
+    F16Type,
     ConstantOp,
     ElementwiseOp,
     GmemTensorType,
@@ -131,16 +133,36 @@ def _compile_gemm(module: ModuleOp) -> LauncherPlan:
     shape = _static_gemm_shape(matmul)
     assert shape is not None and shape[2] % 64 == 0
     m, n, k = shape
-    schedule_matmul(
-        module, **_dynamic_m_schedule_heuristic(m, n, k),
-    )
+    from ..gemm_jit import build_gemm_module, select_gemm_schedule
+
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    arguments = kernel.body.arguments
+    lhs_type = matmul.lhs.type
+    assert isinstance(lhs_type, GmemTensorType)
+    dtype = "bfloat16" if isinstance(lhs_type.dtype, BF16Type) else "float16"
+    operation = "addmm" if len(arguments) == 4 else "mm"
+    batch = 1
+    first_type = arguments[0].type
+    if isinstance(first_type, GmemTensorType) and first_type.rank == 3:
+        operation = "bmm"
+        batch_size = first_type.sizes[0]
+        assert isinstance(batch_size, int)
+        batch = batch_size
+    schedule = select_gemm_schedule(operation, dtype, m, n, k, batch)
+    if schedule is not None:
+        module = build_gemm_module(operation, dtype, batch, m, n, k, schedule)
+    else:
+        schedule_matmul(module, **_dynamic_m_schedule_heuristic(m, n, k))
     return PtxRoutePlan(make_ptx_kernel(module))
 
 
 def _compile_gemm_sigmoid(_module: ModuleOp) -> LauncherPlan:
-    return PtxRoutePlan(make_ptx_kernel(
-        auto_matmul_4096_wgmma256_wg_sigmoid_module(),
-    ))
+    return PtxRoutePlan(
+        make_ptx_kernel(
+            auto_matmul_4096_wgmma256_wg_sigmoid_module(),
+        )
+    )
 
 
 def register_gemm_fx_rules(patterns: PatternMatcherPass) -> None:
@@ -194,3 +216,27 @@ def register_gemm_fx_rules(patterns: PatternMatcherPass) -> None:
             (lhs.shape[0], lhs.shape[1], weight.shape[1]),
         ],
     )
+
+    # The FP16 routes use the same measured table and transformation pipeline.
+    for operation, root, operands, ranks in (
+        ("gemm", torch.ops.aten.mm.default, _GEMM_OPERANDS, [2, 2, 2]),
+        ("addmm", torch.ops.aten.addmm.default, _ADDMM_OPERANDS, [1, 2, 2, 2]),
+        ("bmm", torch.ops.aten.bmm.default, _GEMM_OPERANDS, [3, 3, 3]),
+    ):
+        make_fx_to_ayla_rewrite(
+            patterns,
+            root=root,
+            name=f"{operation}_fp16",
+            signature=[
+                GmemTensorType.build([None] * rank, F16Type()) for rank in ranks
+            ],
+            signature_mapping=operands,
+            compile_region=_compile_gemm,
+            accept=lambda match: _is_gemm_region(match, sigmoid=False),
+            require_maximal=False,
+            infer_result_shapes=(
+                (lambda _bias, lhs, weight: [(lhs.shape[0], weight.shape[0])])
+                if operation == "addmm"
+                else (lambda lhs, weight: [(*lhs.shape[:-1], weight.shape[-2])])
+            ),
+        )

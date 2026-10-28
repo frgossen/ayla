@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import json
 import math
 import re
@@ -17,7 +19,11 @@ _REVERSE_OUTPUT_MIN_BYTES = 64 * 2**20
 
 
 def default_reverse_output_rows(
-    m: int, n: int, *, operation: str = "mm", batch: int = 1,
+    m: int,
+    n: int,
+    *,
+    operation: str = "mm",
+    batch: int = 1,
     element_bytes: int = 2,
 ) -> bool:
     """Whether to write an unmeasured output's rows last-to-first."""
@@ -49,7 +55,8 @@ class GemmHeuristicSelection:
 
 
 def apply_gemm_schedule_seed_post_build(
-    module: Any, seed: GemmScheduleSeed,
+    module: Any,
+    seed: GemmScheduleSeed,
 ) -> Any:
     """Apply the measured post-builder pass sequence required by ``seed``."""
     if seed.pipeline_output_waves or seed.pipeline_output_writeback:
@@ -61,12 +68,13 @@ def apply_gemm_schedule_seed_post_build(
             raise ValueError("wave pipelining requires a rolled fixed grid")
         from .base.ir import find_ancestor_of_type, find_ops_of_type
         from .gpu_dialect import AsyncOp, AwaitOp, ForOp
-        from .passes.canonicalize import Canonicalize
+        from .pipelines.canonicalize import Canonicalize
         from .passes.pipeline_loop import PipelineLoop
         from .passes.schedule_async import ScheduleAsync
 
         outer_loops = [
-            loop for loop in find_ops_of_type(module, ForOp)
+            loop
+            for loop in find_ops_of_type(module, ForOp)
             if find_ancestor_of_type(loop, ForOp) is None
         ]
         if len(outer_loops) != 1:
@@ -103,23 +111,22 @@ def apply_gemm_schedule_seed_post_build(
     if output_was_unrolled:
         from .base.ir import find_ancestor_of_type, find_ops_of_type
         from .gpu_dialect import ForOp
-        from .passes.canonicalize import Canonicalize
+        from .pipelines.canonicalize import Canonicalize
         from .passes.licm import LICM
         from .passes.unroll_loop import UnrollLoop
 
         module = LICM().run(module)
         module = LICM().run(module)
         outer_loops = [
-            loop for loop in find_ops_of_type(module, ForOp)
+            loop
+            for loop in find_ops_of_type(module, ForOp)
             if find_ancestor_of_type(loop, ForOp) is None
         ]
         if len(outer_loops) != 1:
-            raise ValueError(
-                "fixed output-grid unrolling requires one outer tile loop"
-            )
+            raise ValueError("fixed output-grid unrolling requires one outer tile loop")
         outer_loops[0].attrs["label"] = "heuristic_output_grid"
         module = UnrollLoop(
-            unroll_factor=seed.fixed_output_unroll_factor,
+            unroll_factor=cast(int, seed.fixed_output_unroll_factor),
             label_filter="heuristic_output_grid",
         ).run(module)
         module = Canonicalize().run(module)
@@ -131,7 +138,7 @@ def apply_gemm_schedule_seed_post_build(
     if not output_was_unrolled and not seed.post_builder_passes:
         return module
     # Keep pass imports lazy so selecting a heuristic remains lightweight.
-    from .passes.canonicalize import Canonicalize
+    from .pipelines.canonicalize import Canonicalize
     from .passes.schedule_async import ScheduleAsync
 
     return Canonicalize().run(ScheduleAsync().run(module))
@@ -144,9 +151,7 @@ def expand_gemm_heuristic(compact: dict[str, Any]) -> dict[str, Any]:
 
     def config(index: int) -> dict[str, object]:
         mask, *values = compact["configs"][index]
-        present = [
-            field for bit, field in enumerate(fields) if mask & (1 << bit)
-        ]
+        present = [field for bit, field in enumerate(fields) if mask & (1 << bit)]
         return dict(zip(present, values, strict=True))
 
     def node(value: list[Any]) -> dict[str, Any]:
@@ -207,15 +212,12 @@ def collapse_gemm_heuristic(expanded: dict[str, Any]) -> dict[str, Any]:
             visit(value["left"])
             visit(value["right"])
         else:
-            configurations.extend(
-                seed["configuration"] for seed in value["seeds"]
-            )
+            configurations.extend(seed["configuration"] for seed in value["seeds"])
 
     for tree in expanded["groups"].values():
         visit(tree)
     configurations.extend(
-        entry["seed"]["configuration"]
-        for entry in expanded.get("exact", [])
+        entry["seed"]["configuration"] for entry in expanded.get("exact", [])
     )
     fields = sorted({field for config in configurations for field in config})
 
@@ -232,9 +234,7 @@ def collapse_gemm_heuristic(expanded: dict[str, Any]) -> dict[str, Any]:
         return row_indices[key]
 
     fallback = config_index(expanded["fallback"])
-    feature_indices = {
-        name: index for index, name in enumerate(expanded["features"])
-    }
+    feature_indices = {name: index for index, name in enumerate(expanded["features"])}
 
     def node(value: dict[str, Any]) -> list[Any]:
         if "feature" in value:
@@ -244,25 +244,29 @@ def collapse_gemm_heuristic(expanded: dict[str, Any]) -> dict[str, Any]:
                 node(value["left"]),
                 node(value["right"]),
             ]
-        return [value["leaf"], [
+        return [
+            value["leaf"],
             [
-                config_index(seed["configuration"]),
-                [seed["source"][field] for field in expanded["source_fields"]],
-                seed["source_percentage_of_torch"],
-            ]
-            for seed in value["seeds"]
-        ]]
+                [
+                    config_index(seed["configuration"]),
+                    [seed["source"][field] for field in expanded["source_fields"]],
+                    seed["source_percentage_of_torch"],
+                ]
+                for seed in value["seeds"]
+            ],
+        ]
 
     groups = {name: node(tree) for name, tree in expanded["groups"].items()}
     exact = [
         [
-            entry["operation"], entry["dtype"], entry["batch"],
-            entry["m"], entry["n"], entry["k"],
+            entry["operation"],
+            entry["dtype"],
+            entry["batch"],
+            entry["m"],
+            entry["n"],
+            entry["k"],
             config_index(entry["seed"]["configuration"]),
-            [
-                entry["seed"]["source"][field]
-                for field in expanded["source_fields"]
-            ],
+            [entry["seed"]["source"][field] for field in expanded["source_fields"]],
             entry["seed"]["source_percentage_of_torch"],
         ]
         for entry in expanded.get("exact", [])
@@ -289,7 +293,10 @@ def _mapper() -> dict[str, Any]:
 
 
 def _features(
-    m: int, n: int, k: int, batch: int = 1,
+    m: int,
+    n: int,
+    k: int,
+    batch: int = 1,
 ) -> dict[str, float]:
     return {
         "batch": float(batch),
@@ -297,9 +304,7 @@ def _features(
         "n": float(n),
         "k": float(k),
         "aspect_m_over_n": m / n,
-        "output_tiles_64": float(
-            batch * ((m + 63) // 64) * ((n + 63) // 64)
-        ),
+        "output_tiles_64": float(batch * ((m + 63) // 64) * ((n + 63) // 64)),
         "reduction_tiles_64": float((k + 63) // 64),
     }
 
@@ -311,21 +316,22 @@ def _as_int(value: object) -> int:
 
 
 def _output_groups(
-    config: dict[str, object], m: int, n: int,
+    config: dict[str, object],
+    m: int,
+    n: int,
 ) -> tuple[int, int, int]:
     if "output_n_tiles_per_cta" in config:
-        m_group = _as_int(config.get(
-            "output_m_tiles_per_cta",
-            config.get("output_tiles_per_cta", 1),
-        ))
+        m_group = _as_int(
+            config.get(
+                "output_m_tiles_per_cta",
+                config.get("output_tiles_per_cta", 1),
+            )
+        )
         n_group = _as_int(config["output_n_tiles_per_cta"])
-        ctas = (
-            math.ceil(
-                math.ceil(m / _as_int(config["output_m_tile"])) / m_group,
-            )
-            * math.ceil(
-                math.ceil(n / _as_int(config["output_n_tile"])) / n_group,
-            )
+        ctas = math.ceil(
+            math.ceil(m / _as_int(config["output_m_tile"])) / m_group,
+        ) * math.ceil(
+            math.ceil(n / _as_int(config["output_n_tile"])) / n_group,
         )
         return m_group, n_group, ctas
 
@@ -343,21 +349,29 @@ def _output_groups(
             *(("n", 1, group) for group in (1, 2, 3, 4, 6, 8, 16)),
         ):
             ctas = math.ceil(m_tiles / m_group) * math.ceil(n_tiles / n_group)
-            choices.append((
-                abs(ctas - _as_int(preferred)), axis != fast_axis,
-                ctas, m_group, n_group,
-            ))
+            choices.append(
+                (
+                    abs(ctas - _as_int(preferred)),
+                    axis != fast_axis,
+                    ctas,
+                    m_group,
+                    n_group,
+                )
+            )
         _, _, _, *groups = min(choices)
     m_group, n_group = groups
-    ctas = (
-        math.ceil(math.ceil(m / _as_int(config["output_m_tile"])) / m_group)
-        * math.ceil(math.ceil(n / _as_int(config["output_n_tile"])) / n_group)
-    )
+    ctas = math.ceil(
+        math.ceil(m / _as_int(config["output_m_tile"])) / m_group
+    ) * math.ceil(math.ceil(n / _as_int(config["output_n_tile"])) / n_group)
     return m_group, n_group, ctas
 
 
 def _adapt_config(
-    captured: dict[str, object], m: int, n: int, k: int, *,
+    captured: dict[str, object],
+    m: int,
+    n: int,
+    k: int,
+    *,
     preserve_output_grid: bool = False,
 ) -> tuple[dict[str, object] | None, tuple[str, ...]]:
     """Translate a captured search config to the current builder vocabulary."""
@@ -377,20 +391,21 @@ def _adapt_config(
         n_tiles = math.ceil(n / _as_int(captured["output_n_tile"]))
         logical_tiles = m_tiles * n_tiles
         divisors = [
-            count for count in range(64, 265)
+            count
+            for count in range(64, 265)
             if logical_tiles % count == 0
             and logical_tiles // count <= 8
             and not (k > 2048 and logical_tiles // count > 2)
         ]
         ctas = (
             min(divisors, key=lambda count: abs(count - _as_int(preferred_ctas)))
-            if divisors else _as_int(preferred_ctas)
+            if divisors
+            else _as_int(preferred_ctas)
         )
     adaptations = []
     if preferred_ctas is not None:
         adaptations.append(
-            f"output_cta_count={preferred_ctas} -> "
-            f"fixed output grid of {ctas} CTAs"
+            f"output_cta_count={preferred_ctas} -> fixed output grid of {ctas} CTAs"
         )
     if captured["unroll_output_tiles"] is False:
         adaptations.append(
@@ -419,7 +434,8 @@ def _adapt_config(
         "operand_stages": captured["operand_stages"],
         "operand_k_tile": captured["operand_k_tile"],
         "cyclic_operand_pipeline": captured.get(
-            "cyclic_operand_pipeline", False,
+            "cyclic_operand_pipeline",
+            False,
         ),
         "output_slices": captured["output_slices"],
         "output_store_buffers": captured["output_store_buffers"],
@@ -435,17 +451,22 @@ def _adapt_config(
     if preferred_ctas is not None:
         builder["output_grid_size"] = ctas
         builder["output_grid_fast_axis"] = captured.get(
-            "output_tile_fast_axis", "n",
+            "output_tile_fast_axis",
+            "n",
         )
     if captured.get("swap_output_grid_axes") is True:
         builder["output_grid_axes"] = (
-            CollectiveAxis.Y, CollectiveAxis.X,
+            CollectiveAxis.Y,
+            CollectiveAxis.X,
         )
     if reverse := str(captured.get("output_tile_reverse") or ""):
         builder["output_reversed_dims"] = tuple(reverse.upper())
     optional = (
-        "warpgroup_m_tile", "warpgroup_fast_axis", "rhs_tma_load_slices",
-        "cluster_m_ctas", "cluster_n_ctas",
+        "warpgroup_m_tile",
+        "warpgroup_fast_axis",
+        "rhs_tma_load_slices",
+        "cluster_m_ctas",
+        "cluster_n_ctas",
     )
     for key in optional:
         value = captured.get(key)
@@ -465,15 +486,14 @@ def _with_output_row_order(
     if reverse is None:
         return builder, adaptations
     rows = "N" if transpose_output else "M"
-    current = tuple(builder.get("output_reversed_dims", ()))
+    current = tuple(cast(tuple[str, ...], builder.get("output_reversed_dims", ())))
     dims = tuple(dim for dim in current if dim != rows)
     if reverse:
         dims += (rows,)
     if dims == current:
         return builder, adaptations
     builder = {
-        key: value for key, value in builder.items()
-        if key != "output_reversed_dims"
+        key: value for key, value in builder.items() if key != "output_reversed_dims"
     }
     if dims:
         builder["output_reversed_dims"] = dims
@@ -535,16 +555,23 @@ def select_gemm_schedules(
         raise ValueError(f"no GEMM heuristic for operation {operation}")
     if operation != "bmm" and batch != 1:
         raise ValueError("batch is only meaningful for BMM heuristics")
-    exact = next((
-        entry for entry in mapper.get("exact", [])
-        if (
-            entry["operation"], entry["dtype"], entry["batch"],
-            entry["m"], entry["n"], entry["k"],
-        ) == (operation, dtype, batch, m, n, k)
-    ), None)
-    group = (
-        f"{operation}/{dtype}/{'k128' if k % 128 == 0 else 'k64'}"
+    exact = next(
+        (
+            entry
+            for entry in mapper.get("exact", [])
+            if (
+                entry["operation"],
+                entry["dtype"],
+                entry["batch"],
+                entry["m"],
+                entry["n"],
+                entry["k"],
+            )
+            == (operation, dtype, batch, m, n, k)
+        ),
+        None,
     )
+    group = f"{operation}/{dtype}/{'k128' if k % 128 == 0 else 'k64'}"
     try:
         node = mapper["groups"][group]
     except KeyError as error:
@@ -562,9 +589,7 @@ def select_gemm_schedules(
             feature = node["feature"]
             threshold = float(node["threshold"])
             branch = "left" if values[feature] <= threshold else "right"
-            path.append(
-                f"{feature}={values[feature]:g} {branch} of {threshold:g}"
-            )
+            path.append(f"{feature}={values[feature]:g} {branch} of {threshold:g}")
             node = node[branch]
 
     seeds = []
@@ -573,7 +598,10 @@ def select_gemm_schedules(
         transpose_output = bool(captured.get("transpose_output", False))
         builder_m, builder_n = (n, m) if transpose_output else (m, n)
         builder, adaptations = _adapt_config(
-            captured, builder_m, builder_n, k,
+            captured,
+            builder_m,
+            builder_n,
+            k,
             preserve_output_grid=exact is not None,
         )
         if builder is not None:
@@ -584,17 +612,24 @@ def select_gemm_schedules(
                     reverse_output_rows
                     if reverse_output_rows is not None or exact is not None
                     else default_reverse_output_rows(
-                        m, n, operation=operation, batch=batch,
+                        m,
+                        n,
+                        operation=operation,
+                        batch=batch,
                     )
                 ),
                 transpose_output=transpose_output,
             )
-        if exact is None and builder is not None and not _legal(
-            builder,
-            builder_m,
-            builder_n,
-            k,
-            allow_partial_output_tiles=operation == "bmm",
+        if (
+            exact is None
+            and builder is not None
+            and not _legal(
+                builder,
+                builder_m,
+                builder_n,
+                k,
+                allow_partial_output_tiles=operation == "bmm",
+            )
         ):
             continue
         unroll_factor = None
@@ -603,33 +638,35 @@ def select_gemm_schedules(
             and builder.get("output_grid_size") is not None
             and captured.get("unroll_output_tiles", False) is True
         ):
-            logical_tiles = (
-                math.ceil(builder_m / _as_int(builder["output_m_tile"]))
-                * math.ceil(builder_n / _as_int(builder["output_n_tile"]))
-            )
+            logical_tiles = math.ceil(
+                builder_m / _as_int(builder["output_m_tile"])
+            ) * math.ceil(builder_n / _as_int(builder["output_n_tile"]))
             unroll_factor = math.ceil(
                 logical_tiles / _as_int(builder["output_grid_size"]),
             )
         source = seed["source"]
-        seeds.append(GemmScheduleSeed(
-            captured_config=captured,
-            builder_config=builder,
-            adaptations=adaptations,
-            source_shape=(source["m"], source["n"], source["k"]),
-            source_percentage_of_torch=seed["source_percentage_of_torch"],
-            post_builder_passes=(
-                ("schedule_async", "canonicalize")
-                if captured.get("reschedule_async") is True else ()
-            ),
-            transpose_output=transpose_output,
-            fixed_output_unroll_factor=unroll_factor,
-            pipeline_output_writeback=bool(
-                captured.get("pipeline_output_writeback", False)
-            ),
-            pipeline_output_waves=bool(
-                captured.get("pipeline_output_waves", False)
-            ),
-        ))
+        seeds.append(
+            GemmScheduleSeed(
+                captured_config=captured,
+                builder_config=builder,
+                adaptations=adaptations,
+                source_shape=(source["m"], source["n"], source["k"]),
+                source_percentage_of_torch=seed["source_percentage_of_torch"],
+                post_builder_passes=(
+                    ("schedule_async", "canonicalize")
+                    if captured.get("reschedule_async") is True
+                    else ()
+                ),
+                transpose_output=transpose_output,
+                fixed_output_unroll_factor=unroll_factor,
+                pipeline_output_writeback=bool(
+                    captured.get("pipeline_output_writeback", False)
+                ),
+                pipeline_output_waves=bool(
+                    captured.get("pipeline_output_waves", False)
+                ),
+            )
+        )
 
     if not any(seed.builder_config is not None for seed in seeds):
         captured = dict(mapper["fallback"])
@@ -639,9 +676,13 @@ def select_gemm_schedules(
                 builder,
                 adaptations,
                 reverse=(
-                    reverse_output_rows if reverse_output_rows is not None
+                    reverse_output_rows
+                    if reverse_output_rows is not None
                     else default_reverse_output_rows(
-                        m, n, operation=operation, batch=batch,
+                        m,
+                        n,
+                        operation=operation,
+                        batch=batch,
                     )
                 ),
                 transpose_output=bool(captured.get("transpose_output", False)),
@@ -653,10 +694,14 @@ def select_gemm_schedules(
             k,
             allow_partial_output_tiles=operation == "bmm",
         ):
-            seeds.append(GemmScheduleSeed(
-                captured, builder, adaptations, None, None,
-                transpose_output=bool(
-                    captured.get("transpose_output", False)
-                ),
-            ))
+            seeds.append(
+                GemmScheduleSeed(
+                    captured,
+                    builder,
+                    adaptations,
+                    None,
+                    None,
+                    transpose_output=bool(captured.get("transpose_output", False)),
+                )
+            )
     return GemmHeuristicSelection(node["leaf"], tuple(path), tuple(seeds))

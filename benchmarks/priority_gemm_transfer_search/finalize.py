@@ -1,52 +1,117 @@
 """Audit the installed-route run and produce a report with explicit score scope."""
-import hashlib
+
 import json
 import math
 from pathlib import Path
 import statistics as st
 
-HERE=Path(__file__).resolve().parent;ROOT=HERE.parents[1]
-ps=json.loads((HERE/'priorities.json').read_text());verified=json.loads((HERE/'verified.json').read_text())
-winners={r['target']:r for r in verified if r['status']=='updated'}
-rows_by_shape={}
-for path in (HERE/'final').glob('[0-9][0-9][0-9][0-9].json'):
-    rows=json.loads(path.read_text());assert len(rows)==2 and all(r['status']=='ok' for r in rows),(path,rows)
-    rows_by_shape[rows[0]['target']]={r['entry']['kind']:r for r in rows}
-assert set(rows_by_shape)=={p['target'] for p in ps}
-graph=[r for path in (HERE/'graph').glob('[0-9][0-9][0-9][0-9].json') for r in json.loads(path.read_text())]
-assert len(graph)==len(winners) and {r['target'] for r in graph}==set(winners)
-assert all(r['status']=='ok' and len(r['checks'])==9 for r in graph)
-confirmation=[r for path in (HERE/'confirmation').glob('[0-9][0-9][0-9][0-9].json') for r in json.loads(path.read_text())]
-assert len(confirmation)==288 and all(r['status']=='ok' for r in confirmation)
-for target,rows in rows_by_shape.items():
-    old,new=rows['control'],rows['installed']
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+ps = json.loads((HERE / "priorities.json").read_text())
+verified = json.loads((HERE / "verified.json").read_text())
+winners = {r["target"]: r for r in verified if r["status"] == "updated"}
+rows_by_shape = {}
+for path in (HERE / "final").glob("[0-9][0-9][0-9][0-9].json"):
+    rows = json.loads(path.read_text())
+    assert len(rows) == 2 and all(r["status"] == "ok" for r in rows), (path, rows)
+    rows_by_shape[rows[0]["target"]] = {r["entry"]["kind"]: r for r in rows}
+assert set(rows_by_shape) == {p["target"] for p in ps}
+graph = [
+    r
+    for path in (HERE / "graph").glob("[0-9][0-9][0-9][0-9].json")
+    for r in json.loads(path.read_text())
+]
+assert len(graph) == len(winners) and {r["target"] for r in graph} == set(winners)
+assert all(r["status"] == "ok" and len(r["checks"]) == 9 for r in graph)
+confirmation = [
+    r
+    for path in (HERE / "confirmation").glob("[0-9][0-9][0-9][0-9].json")
+    for r in json.loads(path.read_text())
+]
+assert len(confirmation) == 288 and all(r["status"] == "ok" for r in confirmation)
+for target, rows in rows_by_shape.items():
+    old, new = rows["control"], rows["installed"]
     if target in winners:
-        assert old['code_fingerprint']!=new['code_fingerprint']
-        hashes={r['code_fingerprint'] for r in confirmation if r['target']==target and r['entry']['kind']=='candidate'}
-        assert hashes=={new['code_fingerprint']},(target,hashes,new['code_fingerprint'])
-    else:assert old['code_fingerprint']==new['code_fingerprint'],target
-gm=lambda values:math.exp(st.mean(math.log(x) for x in values))
-metrics=dict(scope='35 requested BF16 shapes, equally weighted; current production JIT',
-    before_geomean_pct=gm([r['control']['torch_pct'] for r in rows_by_shape.values()]),
-    after_geomean_pct=gm([r['installed']['torch_pct'] for r in rows_by_shape.values()]),
-    before_call_weighted_pct=100*sum(p['calls']*rows_by_shape[p['target']]['control']['torch_ms'] for p in ps)/sum(p['calls']*rows_by_shape[p['target']]['control']['ayla_ms'] for p in ps),
-    after_call_weighted_pct=100*sum(p['calls']*rows_by_shape[p['target']]['installed']['torch_ms'] for p in ps)/sum(p['calls']*rows_by_shape[p['target']]['installed']['ayla_ms'] for p in ps),
-    unchanged_kernel_shapes=len(ps)-len(winners),changed_kernel_shapes=len(winners),
-    unchanged_median_normalized_ratio=st.median(rows['installed']['torch_pct']/rows['control']['torch_pct'] for target,rows in rows_by_shape.items() if target not in winners),
-    changed_only_geomean_ratio=gm([rows['installed']['torch_pct']/rows['control']['torch_pct'] if target in winners else 1 for target,rows in rows_by_shape.items()]),
-    eight_replica_confirmed_geomean_ratio=gm([winners[target]['candidate_pct']/winners[target]['old_pct'] if target in winners else 1 for target in rows_by_shape]))
-metrics['relative_geomean_gain']=metrics['after_geomean_pct']/metrics['before_geomean_pct']-1
-screen=[r for d in ('transfer','followup','ncu_concepts') for path in (HERE/d).glob('[0-9][0-9][0-9][0-9].json') for r in json.loads(path.read_text())]
-candidate=[r for r in screen if r['entry']['kind']!='control']
-metrics.update(screen_trials=len(screen),candidate_trials=len(candidate),screen_controls=len(screen)-len(candidate),
-    screen_rejections=sum(r['status']!='ok' for r in candidate),
-    distinct_generated_code_signatures=len({(r['target'],r['code_fingerprint']) for r in candidate if r['status']=='ok'}),
-    confirmation_pairs=len(confirmation),installed_route_pairs=70,installed_route_graph_checks=99,
-    ncu_profiles=len(json.loads((HERE/'ncu_summary.json').read_text())))
-(HERE/'final_summary.json').write_text(json.dumps(metrics,indent=2)+'\n')
-summary=json.loads((HERE/'screen_summary.json').read_text())
-search_counts={r['target']:r['trials'] for r in summary}
-report=f'''# Priority BF16 GEMM transfer search
+        assert old["code_fingerprint"] != new["code_fingerprint"]
+        hashes = {
+            r["code_fingerprint"]
+            for r in confirmation
+            if r["target"] == target and r["entry"]["kind"] == "candidate"
+        }
+        assert hashes == {new["code_fingerprint"]}, (
+            target,
+            hashes,
+            new["code_fingerprint"],
+        )
+    else:
+        assert old["code_fingerprint"] == new["code_fingerprint"], target
+
+
+def gm(values):
+    return math.exp(st.mean(math.log(x) for x in values))
+
+
+metrics = dict(
+    scope="35 requested BF16 shapes, equally weighted; current production JIT",
+    before_geomean_pct=gm([r["control"]["torch_pct"] for r in rows_by_shape.values()]),
+    after_geomean_pct=gm([r["installed"]["torch_pct"] for r in rows_by_shape.values()]),
+    before_call_weighted_pct=100
+    * sum(p["calls"] * rows_by_shape[p["target"]]["control"]["torch_ms"] for p in ps)
+    / sum(p["calls"] * rows_by_shape[p["target"]]["control"]["ayla_ms"] for p in ps),
+    after_call_weighted_pct=100
+    * sum(p["calls"] * rows_by_shape[p["target"]]["installed"]["torch_ms"] for p in ps)
+    / sum(p["calls"] * rows_by_shape[p["target"]]["installed"]["ayla_ms"] for p in ps),
+    unchanged_kernel_shapes=len(ps) - len(winners),
+    changed_kernel_shapes=len(winners),
+    unchanged_median_normalized_ratio=st.median(
+        rows["installed"]["torch_pct"] / rows["control"]["torch_pct"]
+        for target, rows in rows_by_shape.items()
+        if target not in winners
+    ),
+    changed_only_geomean_ratio=gm(
+        [
+            rows["installed"]["torch_pct"] / rows["control"]["torch_pct"]
+            if target in winners
+            else 1
+            for target, rows in rows_by_shape.items()
+        ]
+    ),
+    eight_replica_confirmed_geomean_ratio=gm(
+        [
+            winners[target]["candidate_pct"] / winners[target]["old_pct"]
+            if target in winners
+            else 1
+            for target in rows_by_shape
+        ]
+    ),
+)
+metrics["relative_geomean_gain"] = (
+    metrics["after_geomean_pct"] / metrics["before_geomean_pct"] - 1
+)
+screen = [
+    r
+    for d in ("transfer", "followup", "ncu_concepts")
+    for path in (HERE / d).glob("[0-9][0-9][0-9][0-9].json")
+    for r in json.loads(path.read_text())
+]
+candidate = [r for r in screen if r["entry"]["kind"] != "control"]
+metrics.update(
+    screen_trials=len(screen),
+    candidate_trials=len(candidate),
+    screen_controls=len(screen) - len(candidate),
+    screen_rejections=sum(r["status"] != "ok" for r in candidate),
+    distinct_generated_code_signatures=len(
+        {(r["target"], r["code_fingerprint"]) for r in candidate if r["status"] == "ok"}
+    ),
+    confirmation_pairs=len(confirmation),
+    installed_route_pairs=70,
+    installed_route_graph_checks=99,
+    ncu_profiles=len(json.loads((HERE / "ncu_summary.json").read_text())),
+)
+(HERE / "final_summary.json").write_text(json.dumps(metrics, indent=2) + "\n")
+summary = json.loads((HERE / "screen_summary.json").read_text())
+search_counts = {r["target"]: r["trials"] for r in summary}
+report = f"""# Priority BF16 GEMM transfer search
 
 ## Current results
 
@@ -57,16 +122,16 @@ normal compiler and inference-v2 benchmark used before and after.
 
 | Scope | Before, % of Torch | Installed, % of Torch |
 | --- | ---: | ---: |
-| Equal-weight geomean, all 35 requested shapes | {metrics['before_geomean_pct']:.3f} | {metrics['after_geomean_pct']:.3f} |
-| Call-weighted speed, the same 35 shapes | {metrics['before_call_weighted_pct']:.3f} | {metrics['after_call_weighted_pct']:.3f} |
+| Equal-weight geomean, all 35 requested shapes | {metrics["before_geomean_pct"]:.3f} | {metrics["after_geomean_pct"]:.3f} |
+| Call-weighted speed, the same 35 shapes | {metrics["before_call_weighted_pct"]:.3f} | {metrics["after_call_weighted_pct"]:.3f} |
 
-The geomean gain is {100*metrics['relative_geomean_gain']:.3f}% relative.
+The geomean gain is {100 * metrics["relative_geomean_gain"]:.3f}% relative.
 Eleven kernels changed; 24 kernels are identical before and after. Holding
-unchanged shapes neutral gives a {100*(metrics['changed_only_geomean_ratio']-1):.3f}%
+unchanged shapes neutral gives a {100 * (metrics["changed_only_geomean_ratio"] - 1):.3f}%
 geomean gain in the final run. The independent eight-GPU confirmations give
-{100*(metrics['eight_replica_confirmed_geomean_ratio']-1):.3f}% for that same
+{100 * (metrics["eight_replica_confirmed_geomean_ratio"] - 1):.3f}% for that same
 change-only calculation. The median normalized ratio on unchanged kernels is
-{metrics['unchanged_median_normalized_ratio']:.5f}; small before/after differences
+{metrics["unchanged_median_normalized_ratio"]:.5f}; small before/after differences
 on those rows are measurement variation.
 
 This is the requested 35-shape scope, which accounts for about 75.7% of the
@@ -83,10 +148,10 @@ sampling runs; the 35-shape table below comes from the final installed-route run
 
 | Priority | Operation M×N×K | Before % | Candidate % | Conservative gain | Decision |
 | ---: | --- | ---: | ---: | ---: | --- |
-'''
+"""
 for r in verified:
-    report+=f"| {r['rank']} | {r['op']} {r['m']}×{r['n']}×{r['k']} | {r['old_pct']:.3f} | {r['candidate_pct']:.3f} | {100*(r['conservative_gain']-1):.3f}% | {r['status']} |\n"
-report+='''
+    report += f"| {r['rank']} | {r['op']} {r['m']}×{r['n']}×{r['k']} | {r['old_pct']:.3f} | {r['candidate_pct']:.3f} | {100 * (r['conservative_gain'] - 1):.3f}% | {r['status']} |\n"
+report += """
 The deep-K 4096×4096×16384 candidate gained 0.990%, just below the predeclared
 1% admission threshold, and was retained. Every installed winner had positive
 conservative gains on all eight GPUs, stable Torch references on all eight,
@@ -184,11 +249,14 @@ are stored per result; caps are not claimed as actual sample counts.
 
 | Priority | Operation M×N×K | Before % of Torch | Installed % of Torch | Candidate trials | Config changed |
 | ---: | --- | ---: | ---: | ---: | --- |
-'''
+"""
 for pr in ps:
-    old,new=rows_by_shape[pr['target']]['control'],rows_by_shape[pr['target']]['installed']
-    report+=f"| {pr['rank']} | {pr['op']} {pr['m']}×{pr['n']}×{pr['k']} | {old['torch_pct']:.3f} | {new['torch_pct']:.3f} | {search_counts.get(pr['target'],0)} | {'yes' if pr['target'] in winners else 'no'} |\n"
-report+='''
+    old, new = (
+        rows_by_shape[pr["target"]]["control"],
+        rows_by_shape[pr["target"]]["installed"],
+    )
+    report += f"| {pr['rank']} | {pr['op']} {pr['m']}×{pr['n']}×{pr['k']} | {old['torch_pct']:.3f} | {new['torch_pct']:.3f} | {search_counts.get(pr['target'], 0)} | {'yes' if pr['target'] in winners else 'no'} |\n"
+report += """
 ## Integration and evidence
 
 The eleven winners are merged into the existing branches
@@ -214,6 +282,6 @@ source hashes, manifests, raw results, confirmations, graph checks, and NCU
 summaries. Full PTX/cubin/SASS and NCU reports remain in
 `.benchmarks/priority_transfer_20261014/` in the JIT worktree. The benchmark-only
 runners are included alongside the evidence with reproduction instructions.
-'''
-(HERE/'report.md').write_text(report)
-print(json.dumps(metrics,indent=2))
+"""
+(HERE / "report.md").write_text(report)
+print(json.dumps(metrics, indent=2))

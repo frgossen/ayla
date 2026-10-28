@@ -1,4 +1,5 @@
 """Tests for the fuse_async pass."""
+
 import textwrap
 
 import pytest
@@ -108,7 +109,8 @@ def test_does_not_fuse_incompatible_tma_loads(
 
 
 def test_fuses_launches_whose_awaits_follow_the_run():
-    module = gpu_dialect.parse_module(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(
+        textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %sa: smem<16x16xf32> = alloc()
@@ -120,7 +122,8 @@ def test_fuses_launches_whose_awaits_follow_the_run():
             await(%l0: lock<mbar>)
             await(%l1: lock<mbar>)
           }
-        }"""))
+        }""")
+    )
 
     module = fuse_async(module)
 
@@ -140,8 +143,11 @@ def test_fuses_launches_whose_awaits_follow_the_run():
         }""")
 
 
-@pytest.mark.parametrize("module_str", [
-    pytest.param(textwrap.dedent("""\
+@pytest.mark.parametrize(
+    "module_str",
+    [
+        pytest.param(
+            textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %sa: smem<16x16xf32> = alloc()
@@ -153,8 +159,11 @@ def test_fuses_launches_whose_awaits_follow_the_run():
             async(%multicast: lock<mbar>) collective=xyz.cluster move(%sb: smem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.cluster attrs={multicast: True, tma: True}
             await(%multicast: lock<mbar>)
           }
-        }"""), id="adjacent_awaits"),
-    pytest.param(textwrap.dedent("""\
+        }"""),
+            id="adjacent_awaits",
+        ),
+        pytest.param(
+            textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[2, 1, 1] block_dim=[32, 1, 1] cluster_dim=[2, 1, 1] {
             %sa: smem<16x16xf32> = alloc()
@@ -166,8 +175,11 @@ def test_fuses_launches_whose_awaits_follow_the_run():
             await(%local: lock<mbar>)
             await(%multicast: lock<mbar>)
           }
-        }"""), id="awaits_after_launches"),
-])
+        }"""),
+            id="awaits_after_launches",
+        ),
+    ],
+)
 def test_fuses_local_and_multicast_tma_loads_at_joined_collective(module_str):
     # The moves keep their own collectives; only the completion is shared:
     # one async at their join, one mbarrier, one await.
@@ -207,10 +219,6 @@ def test_rerun_ignores_a_pipelined_singleton_async():
     module = fuse_async(gpu_dialect.parse_module(module_str))
 
     assert repr(module) == module_str
-
-
-def test_still_rejects_truly_unawaited_fusible_async():
-    module = gpu_dialect.parse(textwrap.dedent("""\
 
 
 def test_leaves_an_unawaited_async_unfused():

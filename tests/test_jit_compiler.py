@@ -95,7 +95,8 @@ def test_jit_compiler_rejects_noncontiguous_tensors():
             return False
 
     compiler = ShapeSpecializingJITCompiler(
-        _template(), lambda module: module,
+        _template(),
+        lambda module: module,
     )
     with pytest.raises(ValueError, match="contiguous"):
         compiler._metadata((Tensor(), Tensor(), Tensor()))
@@ -156,7 +157,12 @@ def test_static_jit_compiler_caches_per_device(monkeypatch):
     monkeypatch.setattr(compiler, "_compile", compile_fn)
     for device in (0, 1, 0):
         monkeypatch.setattr(
-            compiler, "_metadata", lambda tensors: ((device,), [(4, 8)] * 2),
+            compiler,
+            "_metadata",
+            lambda tensors: (
+                torch.device(f"cuda:{device}"),
+                (((4, 8), (8, 1), torch.bfloat16),) * 2,
+            ),
         )
         compiler(_Tensor(), _Tensor())
     assert len(compiled) == 2
@@ -210,12 +216,16 @@ def test_jit_signature_excludes_launcher_tma_descriptors():
     assert isinstance(kernel, KernelOp)
     gmem_type = kernel.signature[0]
     assert isinstance(gmem_type, GmemTensorType)
-    kernel.body.append_argument(Value(
-        name="desc",
-        type=TmaDescType.build(
-            arg_idx=0, gmem_type=gmem_type, tile_shape=[4, 8],
-        ),
-    ))
+    kernel.body.append_argument(
+        Value(
+            name="desc",
+            type=TmaDescType.build(
+                arg_idx=0,
+                gmem_type=gmem_type,
+                tile_shape=[4, 8],
+            ),
+        )
+    )
     compiler = JITCompiler(module)
     assert len(compiler.signature) == 2
     assert len(kernel.signature) == 3

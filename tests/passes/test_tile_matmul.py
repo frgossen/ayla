@@ -1,4 +1,5 @@
 """Tests for the tile_matmul pass."""
+
 import textwrap
 
 import pytest
@@ -19,8 +20,11 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.tile_matmul import TileMatmul, tile_matmul
+
+
+from ayla.passes.unroll_loop import UnrollLoop
 
 
 def test_tiles_gmem_matmul_along_m_and_k():
@@ -55,12 +59,14 @@ def test_tiles_gmem_matmul_along_m_and_k():
 
 
 def test_tiles_tensor_initializer_with_the_output():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @addmm(%a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>, %bias: gmem<128x64xbf16 strides=[0, 1]>) {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>, %bias: gmem<128x64xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))
+        }""")
+    )
 
     tile_matmul(
         module,
@@ -75,22 +81,25 @@ def test_tiles_tensor_initializer_with_the_output():
     )
 
     [matmul] = find_ops_of_type(module, MatmulOp)
-    assert matmul.init_value is not None
-    assert isinstance(matmul.init_value.definition, TileOp)
-    assert list(matmul.init_value.type.sizes) == [64, 32]
-    assert list(matmul.init_value.type.strides) == [0, 1]
+    assert matmul.init is not None
+    assert isinstance(matmul.init.definition, TileOp)
+    assert list(matmul.init.type.sizes) == [64, 32]
+    assert list(matmul.init.type.strides) == [0, 1]
 
 
 def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xbf16>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))
+        }""")
+    )
     module = tile_matmul(
         module,
-        op_dims=["M", "M"], tile_sizes=[2048, 128],
+        op_dims=["M", "M"],
+        tile_sizes=[2048, 128],
         iteration_bindings=[
             None,
             (CollectiveLevel.BLOCK, CollectiveAxis.X),
@@ -106,16 +115,19 @@ def test_hierarchical_output_tiling_maps_two_waves_to_16_blocks():
 
 
 def test_warp_group_tiling_sets_block_dim():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) collective=xyz.grid
           }
-        }"""))
+        }""")
+    )
 
     module = tile_matmul(
         module,
-        op_dims=["M"], tile_sizes=[64],
+        op_dims=["M"],
+        tile_sizes=[64],
         iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)],
         for_loop_labels=[None],
     )
@@ -126,17 +138,22 @@ def test_warp_group_tiling_sets_block_dim():
 
 
 def test_partial_block_tile_rounds_up_the_grid():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) {
             matmul(%a: gmem<192x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<192x128xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))
+        }""")
+    )
     tile_matmul(
-        module, op_dims=["M"], tile_sizes=[128],
+        module,
+        op_dims=["M"],
+        tile_sizes=[128],
         iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
         for_loop_labels=[None],
-        op_label_filter="mm", allow_partial_tiles=True,
+        op_label_filter="mm",
+        allow_partial_tiles=True,
     )
     assert "grid_dim=[2, None, None]" in repr(module)
     tiles = find_ops_of_type(module, TileOp)
@@ -161,9 +178,12 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
 
     module = tile_matmul(
         gpu_dialect.parse(module_str),
-        ["M", "K"], [32, 16],
-        [(CollectiveLevel.BLOCK, CollectiveAxis.X), None], [None, "k"],
-        op_label_filter="mm", epilogue_label_filter="epilogue",
+        ["M", "K"],
+        [32, 16],
+        [(CollectiveLevel.BLOCK, CollectiveAxis.X), None],
+        [None, "k"],
+        op_label_filter="mm",
+        epilogue_label_filter="epilogue",
     )
 
     assert repr(module) == textwrap.dedent("""\
@@ -183,20 +203,24 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
 
 
 def test_block_x_tiling_guards_more_blocks_than_tiles():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) collective=xyz.grid attrs={label: "mm"}
             elementwise sigmoid(%c: gmem<64x192xf32>, %c: gmem<64x192xf32>) attrs={label: "epi"}
           }
-        }"""))
+        }""")
+    )
 
     tile_matmul(
         module,
-        op_dims=["N"], tile_sizes=[64],
+        op_dims=["N"],
+        tile_sizes=[64],
         iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
         for_loop_labels=[None],
-        op_label_filter="mm", epilogue_label_filter="epi",
+        op_label_filter="mm",
+        epilogue_label_filter="epi",
     )
 
     assert repr(module) == textwrap.dedent("""\
@@ -219,49 +243,70 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
     ("op_dim", "iteration_binding", "launch_dims", "index_name"),
     [
         (
-            "M", (CollectiveLevel.BLOCK, CollectiveAxis.X),
-            "grid_dim=[4, 1, 1]", "bx",
+            "M",
+            (CollectiveLevel.BLOCK, CollectiveAxis.X),
+            "grid_dim=[4, 1, 1]",
+            "bx",
         ),
         (
-            "N", (CollectiveLevel.BLOCK, CollectiveAxis.Y),
-            "grid_dim=[1, 4, 1]", "by",
+            "N",
+            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+            "grid_dim=[1, 4, 1]",
+            "by",
         ),
         (
-            "K", (CollectiveLevel.BLOCK, CollectiveAxis.Z),
-            "grid_dim=[1, 1, 4]", "bz",
+            "K",
+            (CollectiveLevel.BLOCK, CollectiveAxis.Z),
+            "grid_dim=[1, 1, 4]",
+            "bz",
         ),
         (
-            "M", (CollectiveLevel.THREAD, CollectiveAxis.X),
-            "block_dim=[4, 1, 1]", "tx",
+            "M",
+            (CollectiveLevel.THREAD, CollectiveAxis.X),
+            "block_dim=[4, 1, 1]",
+            "tx",
         ),
         (
-            "N", (CollectiveLevel.THREAD, CollectiveAxis.Y),
-            "block_dim=[1, 4, 1]", "ty",
+            "N",
+            (CollectiveLevel.THREAD, CollectiveAxis.Y),
+            "block_dim=[1, 4, 1]",
+            "ty",
         ),
         (
-            "K", (CollectiveLevel.THREAD, CollectiveAxis.Z),
-            "block_dim=[1, 1, 4]", "tz",
+            "K",
+            (CollectiveLevel.THREAD, CollectiveAxis.Z),
+            "block_dim=[1, 1, 4]",
+            "tz",
         ),
         (
-            "M", (CollectiveLevel.WG, CollectiveAxis.X),
-            "block_dim=[512, 1, 1] num_warp_groups=4", "wgx",
+            "M",
+            (CollectiveLevel.WG, CollectiveAxis.X),
+            "block_dim=[512, 1, 1] num_warp_groups=4",
+            "wgx",
         ),
     ],
 )
 def test_parallel_tiling_guards_every_supported_binding(
-    op_dim, iteration_binding, launch_dims, index_name,
+    op_dim,
+    iteration_binding,
+    launch_dims,
+    index_name,
 ):
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = gpu_dialect.parse(
+        textwrap.dedent(f"""\
         module {{
           kernel @mm(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) {launch_dims} {{
             matmul(%a: gmem<192x192xbf16>, %b: gmem<192x192xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
           }}
-        }}"""))  # noqa: E501
+        }}""")
+    )  # noqa: E501
 
     tile_matmul(
         module,
-        op_dims=[op_dim], tile_sizes=[64],
-        iteration_bindings=[iteration_binding], for_loop_labels=[None],
+        op_dims=[op_dim],
+        tile_sizes=[64],
+        iteration_bindings=[iteration_binding],
+        for_loop_labels=[None],
     )
 
     [guard] = find_ops_of_type(module, IfOp)
@@ -274,16 +319,19 @@ def test_parallel_tiling_guards_every_supported_binding(
 
 
 def test_parallel_tiling_guards_multiple_dimensions():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) grid_dim=[4, 5, 1] {
             matmul(%a: gmem<192x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<192x192xf32>) collective=xyz.grid
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     tile_matmul(
         module,
-        op_dims=["M", "N"], tile_sizes=[64, 64],
+        op_dims=["M", "N"],
+        tile_sizes=[64, 64],
         iteration_bindings=[
             (CollectiveLevel.BLOCK, CollectiveAxis.X),
             (CollectiveLevel.BLOCK, CollectiveAxis.Y),
@@ -303,12 +351,14 @@ def test_parallel_tiling_guards_multiple_dimensions():
 
 
 def test_two_dimensional_warp_group_tiling_linearizes_coordinates():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<160x64xbf16>, %c: gmem<128x160xf32>) {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<160x64xbf16>, %c: gmem<128x160xf32>) collective=xyz.grid
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     binding = (CollectiveLevel.WG, CollectiveAxis.X)
 
     module = tile_matmul(
@@ -337,17 +387,20 @@ def test_two_dimensional_warp_group_tiling_linearizes_coordinates():
 
 
 def test_smaller_block_grid_iterates_the_linearized_tile_space():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) grid_dim=[3, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     binding = (CollectiveLevel.BLOCK, CollectiveAxis.X)
 
     tile_matmul(
         module,
-        op_dims=["M", "N"], tile_sizes=[64, 64],
+        op_dims=["M", "N"],
+        tile_sizes=[64, 64],
         iteration_bindings=[binding, binding],
         for_loop_labels=[None, None],
         op_label_filter="mm",
@@ -363,17 +416,20 @@ def test_smaller_block_grid_iterates_the_linearized_tile_space():
 
 
 def test_smaller_block_grid_still_conflicts_without_linearization():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<64x64xbf16>, %b: gmem<384x64xbf16>, %c: gmem<64x384xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     with pytest.raises(ValueError, match="launch dim conflict"):
         tile_matmul(
             module,
-            op_dims=["N"], tile_sizes=[64],
+            op_dims=["N"],
+            tile_sizes=[64],
             iteration_bindings=[
                 (CollectiveLevel.BLOCK, CollectiveAxis.X),
             ],
@@ -383,17 +439,20 @@ def test_smaller_block_grid_still_conflicts_without_linearization():
 
 
 def test_grid_stride_loop_reuses_dimension_label_for_unrolling():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<256x64xbf16>, %b: gmem<256x64xbf16>, %c: gmem<256x256xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     binding = (CollectiveLevel.BLOCK, CollectiveAxis.X)
 
     tile_matmul(
         module,
-        op_dims=["M", "N"], tile_sizes=[64, 64],
+        op_dims=["M", "N"],
+        tile_sizes=[64, 64],
         iteration_bindings=[binding, binding],
         for_loop_labels=["outmn", None],
         op_label_filter="mm",
@@ -421,7 +480,8 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
     module = gpu_dialect.parse(source)
     tile_matmul(
         module,
-        op_dims=["N"], tile_sizes=[64],
+        op_dims=["N"],
+        tile_sizes=[64],
         iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
         for_loop_labels=[None],
     )
@@ -434,7 +494,8 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
     before = repr(unmatched)
     tile_matmul(
         unmatched,
-        op_dims=["N"], tile_sizes=[64],
+        op_dims=["N"],
+        tile_sizes=[64],
         iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
         for_loop_labels=[None],
         op_label_filter="missing",
@@ -443,27 +504,26 @@ def test_block_x_tiling_sets_an_unconstrained_grid():
 
 
 def test_tiling_schemes_are_refined_across_two_matmuls():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) {
             matmul(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "up"}
             matmul(%intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) collective=xyz.grid attrs={label: "down"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     tile_matmul(
         module,
-        op_dims=["N"], tile_sizes=[64],
+        op_dims=["N"],
+        tile_sizes=[64],
         iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.Y)],
         for_loop_labels=[None],
     )
     matmuls = find_ops_of_type(module, MatmulOp)
     assert [
-        {
-            name: op.attrs[name]
-            for name in op.attrs
-            if name.endswith("_tiling_scheme")
-        }
+        {name: op.attrs[name] for name in op.attrs if name.endswith("_tiling_scheme")}
         for op in matmuls
     ] == [
         {"rhs_tiling_scheme": 0, "dst_tiling_scheme": 1},
@@ -472,17 +532,14 @@ def test_tiling_schemes_are_refined_across_two_matmuls():
 
     tile_matmul(
         module,
-        op_dims=["M"], tile_sizes=[32],
+        op_dims=["M"],
+        tile_sizes=[32],
         iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
         for_loop_labels=[None],
     )
     matmuls = find_ops_of_type(module, MatmulOp)
     assert [
-        {
-            name: op.attrs[name]
-            for name in op.attrs
-            if name.endswith("_tiling_scheme")
-        }
+        {name: op.attrs[name] for name in op.attrs if name.endswith("_tiling_scheme")}
         for op in matmuls
     ] == [
         {"dst_tiling_scheme": 1},
@@ -491,15 +548,18 @@ def test_tiling_schemes_are_refined_across_two_matmuls():
 
 
 def test_reversed_dim_mirrors_the_parallel_tile_index():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<256x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<256x128xf32>) block_dim=[128, 1, 1] {
             matmul(%a: gmem<256x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<256x128xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     tile_matmul(
         module,
-        op_dims=["M", "N"], tile_sizes=[64, 64],
+        op_dims=["M", "N"],
+        tile_sizes=[64, 64],
         iteration_bindings=[
             (CollectiveLevel.BLOCK, CollectiveAxis.X),
             (CollectiveLevel.BLOCK, CollectiveAxis.Y),
@@ -513,22 +573,23 @@ def test_reversed_dim_mirrors_the_parallel_tile_index():
     assert kernel.grid_dim[:2] == (4, 2)
     mods = find_ops_of_type(module, IndexModOp)
     assert len(mods) == 1
-    constants = {
-        op.value for op in find_ops_of_type(module, IndexConstantOp)
-    }
+    constants = {op.value for op in find_ops_of_type(module, IndexConstantOp)}
     assert {1, 3, 4} <= constants
 
 
 def test_reversed_dim_mirrors_a_sequential_tile_loop():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xf32>) grid_dim=[16, 1, 1] block_dim=[128, 1, 1] {
             matmul(%a: gmem<4096x16xbf16>, %b: gmem<256x16xbf16>, %c: gmem<4096x256xf32>) collective=xyz.grid attrs={label: "mm"}
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
     tile_matmul(
         module,
-        op_dims=["M", "M"], tile_sizes=[2048, 128],
+        op_dims=["M", "M"],
+        tile_sizes=[2048, 128],
         iteration_bindings=[
             None,
             (CollectiveLevel.BLOCK, CollectiveAxis.X),
@@ -548,7 +609,8 @@ def test_reversed_dim_mirrors_a_sequential_tile_loop():
 def test_reversed_dim_must_be_tiled():
     with pytest.raises(ValueError, match="not tiled"):
         TileMatmul(
-            op_dims=["M"], tile_sizes=[64],
+            op_dims=["M"],
+            tile_sizes=[64],
             iteration_bindings=[(CollectiveLevel.BLOCK, CollectiveAxis.X)],
             for_loop_labels=[None],
             reversed_dims=["N"],
@@ -557,13 +619,15 @@ def test_reversed_dim_must_be_tiled():
 
 def test_splitting_k_of_an_overwriting_matmul_zeroes_dst_and_accumulates():
     acc = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
-    module = gpu_dialect.parse(textwrap.dedent(f"""\
+    module = gpu_dialect.parse(
+        textwrap.dedent(f"""\
         module {{
           kernel @mm(%a: gmem<64x32xbf16>, %b: gmem<64x32xbf16>) {{
             %acc: {acc} = alloc() attrs={{id: 0}}
             matmul(%a: gmem<64x32xbf16>, %b: gmem<64x32xbf16>, %acc: {acc}) collective=xyz.grid attrs={{accumulate: False, label: "mm"}}
           }}
-        }}"""))
+        }}""")
+    )
     tile_matmul(module, ["K"], [16], [None], ["k"], op_label_filter="mm")
 
     [kernel] = module.body.ops
@@ -580,7 +644,8 @@ def test_splitting_k_of_an_overwriting_matmul_zeroes_dst_and_accumulates():
 def test_rejects_hardware_levels_without_matmul_tiling(level):
     with pytest.raises(ValueError, match="unsupported iteration binding"):
         TileMatmul(
-            op_dims=["M"], tile_sizes=[64],
+            op_dims=["M"],
+            tile_sizes=[64],
             iteration_bindings=[(level, CollectiveAxis.X)],
             for_loop_labels=[None],
         )

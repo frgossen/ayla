@@ -1,4 +1,5 @@
 """Analyze cross-thread synchronization hazards."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -34,6 +35,7 @@ from ..gpu_dialect import (
     TmaMoveOp,
     ToPtrOp,
     WarpGroupIdOp,
+    WarpIdsOp,
     memory_effects,
 )
 from ..base.ir import Op, Value
@@ -71,6 +73,7 @@ class BarrierScope(enum.IntEnum):
     leaders release nothing in it, so it does not include ``LEADER_TO_BLOCK``.
     The other directional scopes are pairwise independent.
     """
+
     THREAD = 0
     WARP = 1
     WARPGROUP = 2
@@ -95,7 +98,8 @@ class BarrierScope(enum.IntEnum):
             BarrierScope.WARP: (BarrierScope.WARPGROUP,),
             BarrierScope.WARPGROUP: (BarrierScope.BLOCK,),
             BarrierScope.BLOCK_TO_LEADER: (
-                BarrierScope.BLOCK, BarrierScope.CLUSTER_TO_LEADER,
+                BarrierScope.BLOCK,
+                BarrierScope.CLUSTER_TO_LEADER,
             ),
             BarrierScope.LEADER_TO_BLOCK: (BarrierScope.BLOCK,),
             BarrierScope.BLOCK: (BarrierScope.CLUSTER,),
@@ -118,8 +122,7 @@ class BarrierScope(enum.IntEnum):
     def leq(self, other: BarrierScope) -> bool:
         """The partial order (<=) of the BarrierScope lattice."""
         return self == other or any(
-            upper.leq(other)
-            for upper in _BARRIER_SCOPE_IMMEDIATE_UPPER_BOUNDS[self]
+            upper.leq(other) for upper in _BARRIER_SCOPE_IMMEDIATE_UPPER_BOUNDS[self]
         )
 
 
@@ -134,7 +137,8 @@ _BARRIER_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
     BarrierScope.WARP: (BarrierScope.WARPGROUP,),
     BarrierScope.WARPGROUP: (BarrierScope.BLOCK,),
     BarrierScope.BLOCK_TO_LEADER: (
-        BarrierScope.BLOCK, BarrierScope.CLUSTER_TO_LEADER,
+        BarrierScope.BLOCK,
+        BarrierScope.CLUSTER_TO_LEADER,
     ),
     BarrierScope.LEADER_TO_BLOCK: (BarrierScope.BLOCK,),
     BarrierScope.BLOCK: (BarrierScope.CLUSTER,),
@@ -194,7 +198,9 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
         return scope in (CollectiveScope.THREAD, CollectiveScope.WARP)
     if barrier == BarrierScope.WARPGROUP:
         return scope in (
-            CollectiveScope.THREAD, CollectiveScope.WARP, CollectiveScope.WARPGROUP
+            CollectiveScope.THREAD,
+            CollectiveScope.WARP,
+            CollectiveScope.WARPGROUP,
         )
     if barrier == BarrierScope.BLOCK_TO_LEADER:
         return scope == CollectiveScope.THREAD  # gather: nothing cross-thread
@@ -233,6 +239,7 @@ class ConcurrentMemoryEffect:
     at collective ``scope``. Matching non-null ``tiling_scheme`` IDs prove two
     accesses disjoint. ``pending_await`` names the lock that clears the effect,
     or is ``None`` when it is already live for barriers to order."""
+
     kind: str
     scope: CollectiveScope
     tiling_scheme: int | None
@@ -250,15 +257,16 @@ class SyncState(DataflowState):
     root buffer, gather barrier ids in use until a rendezvous that includes the
     gather, ids in use until an await on a particular lock, and where each
     released id's last handoff ended."""
+
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
     named_barrier_ids: set[BarrierId] = dataclasses.field(default_factory=set)
-    named_barrier_ids_pending_await: dict[Value, set[BarrierId]] = (
-        dataclasses.field(default_factory=dict)
+    named_barrier_ids_pending_await: dict[Value, set[BarrierId]] = dataclasses.field(
+        default_factory=dict
     )
-    named_barrier_ids_released_after: dict[BarrierId, set[Op]] = (
-        dataclasses.field(default_factory=dict)
+    named_barrier_ids_released_after: dict[BarrierId, set[Op]] = dataclasses.field(
+        default_factory=dict
     )
 
     @classmethod
@@ -283,10 +291,11 @@ class SyncState(DataflowState):
         return SyncState(
             {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
             self.named_barrier_ids | other.named_barrier_ids,
-            {lock: p.get(lock, set()) | q.get(lock, set())
-             for lock in p.keys() | q.keys()},
-            {key: r.get(key, set()) | t.get(key, set())
-             for key in r.keys() | t.keys()},
+            {
+                lock: p.get(lock, set()) | q.get(lock, set())
+                for lock in p.keys() | q.keys()
+            },
+            {key: r.get(key, set()) | t.get(key, set()) for key in r.keys() | t.keys()},
         )
 
 
@@ -295,14 +304,17 @@ _RENDEZVOUS = (BarrierScope.BLOCK, BarrierScope.CLUSTER, BarrierScope.GRID)
 
 
 def _after_barrier(
-    live: SyncState, barrier: BarrierScope, at: Op,
+    live: SyncState,
+    barrier: BarrierScope,
+    at: Op,
 ) -> SyncState:
     """Discharge the settled effects ordered by ``barrier`` before ``at``."""
     live = live.clone()
     if barrier in _RENDEZVOUS:
         # A rendezvous ends every handoff through a gather it includes.
         ended = {
-            key for key in live.named_barrier_ids.union(
+            key
+            for key in live.named_barrier_ids.union(
                 *live.named_barrier_ids_pending_await.values(),
             )
             if key[0].leq(barrier)
@@ -314,7 +326,8 @@ def _after_barrier(
             live.named_barrier_ids_released_after[key] = {at}
     for buf, effects in live.concurrent_memory_effects.items():
         live.concurrent_memory_effects[buf] = {
-            effect for effect in effects
+            effect
+            for effect in effects
             if effect.pending_await is not None
             or not _barrier_covers(barrier, effect.scope)
         }
@@ -327,6 +340,7 @@ class BarrierTarget:
     ``named_id`` of the barrier resource to lower to (``None`` otherwise): a
     named barrier for a block-leader gather, a cluster mbarrier for a
     cluster-to-leader gather."""
+
     scope: BarrierScope
     named_id: int | None = None
     # For a cluster-to-leader barrier: where each access it orders is
@@ -371,9 +385,7 @@ def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
         # leader-owned read of shared memory. This is the completed memory
         # effect's collective scope, not the execution width of wait_group.
         return CollectiveScope.BLOCK_LEADER
-    raise NotImplementedError(
-        f"_async_completion_scope: unmodeled lock kind {kind!r}"
-    )
+    raise NotImplementedError(f"_async_completion_scope: unmodeled lock kind {kind!r}")
 
 
 def _transfer_memory_effects(
@@ -385,9 +397,7 @@ def _transfer_memory_effects(
     """Transfer one synchronous or asynchronous memory-effect operation."""
     effects = memory_effects(op)
     if effects is None:
-        raise NotImplementedError(
-            f"unmodelled effect-bearing op: {type(op).__name__}"
-        )
+        raise NotImplementedError(f"unmodelled effect-bearing op: {type(op).__name__}")
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
@@ -423,7 +433,8 @@ def _transfer_memory_effects(
             if scope == barrier_scope
         }
         if (
-            recorded is not None and recorded.named_id is not None
+            recorded is not None
+            and recorded.named_id is not None
             and recorded.scope == barrier_scope
         ):
             named_id = recorded.named_id
@@ -444,10 +455,12 @@ def _transfer_memory_effects(
                 {
                     target.named_id
                     for target_op, target in targets.items()
-                    if target_op is not op and target.named_id is not None
+                    if target_op is not op
+                    and target.named_id is not None
                     and target.scope == barrier_scope
                 }
-                if recorded is not None else set()
+                if recorded is not None
+                else set()
             )
             ids = _GATHER_BARRIER_IDS[barrier_scope] or range(
                 len(used_ids) + len(reserved_ids) + 1,
@@ -469,14 +482,16 @@ def _transfer_memory_effects(
                 and cast(LockType, async_lock.type).kind == "mbar"
             ):
                 live.named_barrier_ids_pending_await.setdefault(
-                    async_lock, set(),
+                    async_lock,
+                    set(),
                 ).add(key)
             else:
                 live.named_barrier_ids.add(key)
             # A cluster release arrives early: never before the end of the
             # id's previous handoff.
             release_after |= live.named_barrier_ids_released_after.pop(
-                key, set(),
+                key,
+                set(),
             )
     if barrier_scope == BarrierScope.CLUSTER_TO_LEADER:
         recorded = targets.get(op)
@@ -485,7 +500,9 @@ def _transfer_memory_effects(
     else:
         release_after = set()
     targets[op] = BarrierTarget(
-        barrier_scope, named_id, frozenset(release_after),
+        barrier_scope,
+        named_id,
+        frozenset(release_after),
     )
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
@@ -494,21 +511,18 @@ def _transfer_memory_effects(
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for
     # a later barrier to order.
-    async_scope = (
-        _async_completion_scope(op) if isinstance(op, AsyncOp) else None
-    )
+    async_scope = _async_completion_scope(op) if isinstance(op, AsyncOp) else None
     for memory_effect in effects:
         pending = (
             async_lock
-            if (
-                async_scope is not None
-                and memory_effect.scope.leq(async_scope)
-            )
+            if (async_scope is not None and memory_effect.scope.leq(async_scope))
             else None
         )
         effect = ConcurrentMemoryEffect(
-            memory_effect.kind, memory_effect.scope,
-            memory_effect.tiling_scheme, pending,
+            memory_effect.kind,
+            memory_effect.scope,
+            memory_effect.tiling_scheme,
+            pending,
             lock=async_lock,
             completed_after=None if async_lock is not None else op,
         )
@@ -541,6 +555,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,
+        WarpIdsOp,
     )
     def transfer_no_effect(self, op: Op, state: SyncState) -> SyncState:
         return state
@@ -557,7 +572,9 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(BarrierOp)
     def transfer_barrier(
-        self, op: BarrierOp, state: SyncState,
+        self,
+        op: BarrierOp,
+        state: SyncState,
     ) -> SyncState:
         # Schedulers may author structural barriers before this pass, such as
         # block barriers between persistent-grid waves or grid barriers between
@@ -581,10 +598,16 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             state.concurrent_memory_effects[buffer] = {
                 dataclasses.replace(
                     effect,
-                    pending_await=(None if settle and effect.pending_await == op.lock
-                                   else effect.pending_await),
-                    completed_after=(op if effect.lock == op.lock and effect.completed_after is None
-                                     else effect.completed_after),
+                    pending_await=(
+                        None
+                        if settle and effect.pending_await == op.lock
+                        else effect.pending_await
+                    ),
+                    completed_after=(
+                        op
+                        if effect.lock == op.lock and effect.completed_after is None
+                        else effect.completed_after
+                    ),
                 )
                 for effect in effects
                 if settle or effect.pending_await != op.lock
@@ -598,7 +621,10 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
     @transfers(AsyncOp)
     def transfer_async(self, op: AsyncOp, state: SyncState) -> SyncState:
         return _transfer_memory_effects(
-            op, state, self.targets, async_lock=op.lock,
+            op,
+            state,
+            self.targets,
+            async_lock=op.lock,
         )
 
     @transfers(ElementwiseOp, MatmulOp, MoveOp, TmaMoveOp)

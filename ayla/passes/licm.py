@@ -5,6 +5,7 @@ are defined outside the loop. Uninitialized shared-memory allocations are also
 hoisted through guards inside loops, letting an enclosing loop reuse one arena
 across guarded iterations.
 """
+
 from __future__ import annotations
 
 from ..gpu_dialect import (
@@ -21,10 +22,10 @@ from ..base.lowering_pass import LoweringPass, lowers
 
 
 class LICM(LoweringPass):
-
     @lowers(IfOp)
     def lower_if(
-        self, op: IfOp,
+        self,
+        op: IfOp,
     ) -> tuple[list[Op], list[object]] | None:
         # Conditional allocation hoisting only serves loop storage reuse. Do
         # not lengthen lifetimes across unrelated, top-level guards.
@@ -34,10 +35,8 @@ class LICM(LoweringPass):
         hoisted: list[Op] = []
         remaining: list[Op] = []
         for body_op in op.body.ops:
-            if (
-                isinstance(body_op, AllocOp)
-                and isinstance(body_op.result().type, SmemTensorType)
-                and body_op.init is None
+            if isinstance(body_op, AllocOp) and isinstance(
+                body_op.result().type, SmemTensorType
             ):
                 hoisted.append(body_op)
             else:
@@ -47,7 +46,8 @@ class LICM(LoweringPass):
 
     @lowers(ForOp)
     def lower_block_op(
-        self, op: ForOp,
+        self,
+        op: ForOp,
     ) -> tuple[list[Op], list[object]]:
         body = op.body
         # Defined inside the loop: block arguments (e.g. the iv) plus the

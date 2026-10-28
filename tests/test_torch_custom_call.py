@@ -3,8 +3,7 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from ayla.base.ir import Type
-from ayla.gpu_dialect import BF16Type, GmemTensorType
+from ayla.gpu_dialect import BF16Type, GmemTensorType, gpu_dialect, ModuleOp
 from ayla.jit_compiler import JITCompiler
 from ayla.torch_custom_call import (
     OperandKind,
@@ -62,9 +61,6 @@ def test_jit_compiler_dispatches_by_tensor_signature(monkeypatch):
     class Tensor:
         device = torch.device("cuda:0")
 
-        def __init__(self, rows, value=1):
-
-
         def __init__(self, rows, value: int | None = 1):
             self.shape = (rows, 8)
             self.dtype = torch.bfloat16
@@ -110,3 +106,11 @@ def test_jit_compiler_rejects_cpu_tensors():
 
     with pytest.raises(ValueError, match="expected CUDA tensors"):
         compiler(torch.empty(1))
+
+
+def _compiler(name: str) -> JITCompiler:
+    module = gpu_dialect.parse(
+        f"module {{ kernel @{name}(%a: gmem<?x8xbf16>, %b: gmem<?x16xbf16>) {{}} }}"
+    )
+    assert isinstance(module, ModuleOp)
+    return JITCompiler(module)

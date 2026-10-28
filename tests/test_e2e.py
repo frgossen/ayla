@@ -1,4 +1,5 @@
 """End-to-end tests: parse serialized IR → codegen → load + launch on CUDA."""
+
 import json
 import textwrap
 
@@ -68,7 +69,8 @@ def test_cwise_add_from_ir():
 
 @requires_cuda
 def test_reshape_from_ir():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @reshape_copy(%src: gmem<2x2xf32>, %dst: gmem<1x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
             %view: gmem<1x4xf32> = reshape(%src: gmem<2x2xf32>)
@@ -76,7 +78,8 @@ def test_reshape_from_ir():
             move(%values: rmem<1x4xf32>, %view: gmem<1x4xf32>) attrs={nc: true}
             move(%dst: gmem<1x4xf32>, %values: rmem<1x4xf32>)
           }
-        }"""))  # noqa: E501
+        }""")
+    )  # noqa: E501
 
     kernel = make_ptx_kernel(module)
     src = torch.randn(2, 2, dtype=torch.float32, device="cuda")
@@ -173,7 +176,7 @@ def test_naive_matmul_4096_from_ir():
             %b_thread: gmem<2x4096xf32> = tile(%b_block: gmem<64x4096xf32>, %ty: index, 0)
             %c_thread: gmem<2x2xf32 strides=[4096, 1]> = tile(%c_block: gmem<64x64xf32 strides=[4096, 1]>, %tx: index, %ty: index)
             %c_thread_rmem: rmem<2x2xf32> = alloc() attrs={id: 0}
-            %c_thread_rmem_init: rmem<f32> = constant() attrs={value: 0.0}
+            %c_thread_rmem_init: rmem<f32> = constant 0.0
             elementwise fill(%c_thread_rmem: rmem<2x2xf32>, %c_thread_rmem_init: rmem<f32>)
             for (%k: index = 0 to 4096) {
               %a_k: gmem<2x1xf32 strides=[4096, 1]> = tile(%a_thread: gmem<2x4096xf32>, 0, %k: index)
@@ -278,42 +281,69 @@ def test_experimental_auto_matmul_4096_with_excess_block():
         }""")
     module = gpu_dialect.parse(module_str)
     pipeline = Pipeline()
-    pipeline.add_pass(TileMatmul(
-        op_dims=["M", "N"], tile_sizes=[128, 128],
-        iteration_bindings=[
-            (CollectiveLevel.BLOCK, CollectiveAxis.X),
-            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
-        ],
-        for_loop_labels=[None, None],
-        op_label_filter="mm",
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="wgrmem", operands=["dst"],
-        swizzle=None, layout="wgmma_layout_0", warps=4,
-        tma=False, nc=False, target_dtype="f32", label_filter="mm",
-    ))
-    pipeline.add_pass(TileMatmul(
-        op_dims=["K"], tile_sizes=[64],
-        iteration_bindings=[None], for_loop_labels=["k"],
-        op_label_filter="mm",
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="smem", operands=["lhs", "rhs"],
-        swizzle="128B", layout=None, warps=None,
-        tma=True, label_filter="mm",
-    ))
-    pipeline.add_pass(TileMatmul(
-        op_dims=["K"], tile_sizes=[16],
-        iteration_bindings=[None], for_loop_labels=["l"],
-        op_label_filter="mm",
-    ))
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["M", "N"],
+            tile_sizes=[128, 128],
+            iteration_bindings=[
+                (CollectiveLevel.BLOCK, CollectiveAxis.X),
+                (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+            ],
+            for_loop_labels=[None, None],
+            op_label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        PromoteBuffers(
+            target_type="wgrmem",
+            operands=["dst"],
+            swizzle=None,
+            layout="wgmma_layout_0",
+            warps=4,
+            tma=False,
+            nc=False,
+            target_dtype="f32",
+            label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["K"],
+            tile_sizes=[64],
+            iteration_bindings=[None],
+            for_loop_labels=["k"],
+            op_label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        PromoteBuffers(
+            target_type="smem",
+            operands=["lhs", "rhs"],
+            swizzle="128B",
+            layout=None,
+            warps=None,
+            tma=True,
+            label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["K"],
+            tile_sizes=[16],
+            iteration_bindings=[None],
+            for_loop_labels=["l"],
+            op_label_filter="mm",
+        )
+    )
     pipeline.add_pass(UnrollLoop(unroll_factor=2, label_filter="k"))
     pipeline.add_pass(LICM())
-    pipeline.add_pass(PipelineLoop(
-        label_filter_loop="k",
-        label_filter_op="mm_(lhs|rhs)_smem_iter0",
-        pipelining_offset=1,
-    ))
+    pipeline.add_pass(
+        PipelineLoop(
+            label_filter_loop="k",
+            label_filter_op="mm_(lhs|rhs)_smem_iter0",
+            pipelining_offset=1,
+        )
+    )
     module = pipeline.run(module)
 
     print(repr(module))
@@ -344,35 +374,60 @@ def test_dbg_module():
         }""")
     module = gpu_dialect.parse(module_str)
     pipeline = Pipeline()
-    pipeline.add_pass(TileMatmul(
-        op_dims=["M", "N"], tile_sizes=[128, 256],
-        iteration_bindings=[
-            (CollectiveLevel.BLOCK, CollectiveAxis.X),
-            (CollectiveLevel.BLOCK, CollectiveAxis.Y),
-        ],
-        for_loop_labels=[None, None],
-        op_label_filter="mm",
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="wgrmem", operands=["dst"],
-        swizzle=None, layout="wgmma_layout_0", warps=4,
-        tma=False, nc=False, target_dtype="f32", label_filter="mm",
-    ))
-    pipeline.add_pass(TileMatmul(
-        op_dims=["K"], tile_sizes=[64],
-        iteration_bindings=[None], for_loop_labels=["k"],
-        op_label_filter="mm",
-    ))
-    pipeline.add_pass(PromoteBuffers(
-        target_type="smem", operands=["lhs", "rhs"],
-        swizzle="128B", layout=None, warps=None,
-        tma=True, label_filter="mm",
-    ))
-    pipeline.add_pass(TileMatmul(
-        op_dims=["K"], tile_sizes=[16],
-        iteration_bindings=[None], for_loop_labels=["k"],
-        op_label_filter="mm",
-    ))
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["M", "N"],
+            tile_sizes=[128, 256],
+            iteration_bindings=[
+                (CollectiveLevel.BLOCK, CollectiveAxis.X),
+                (CollectiveLevel.BLOCK, CollectiveAxis.Y),
+            ],
+            for_loop_labels=[None, None],
+            op_label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        PromoteBuffers(
+            target_type="wgrmem",
+            operands=["dst"],
+            swizzle=None,
+            layout="wgmma_layout_0",
+            warps=4,
+            tma=False,
+            nc=False,
+            target_dtype="f32",
+            label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["K"],
+            tile_sizes=[64],
+            iteration_bindings=[None],
+            for_loop_labels=["k"],
+            op_label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        PromoteBuffers(
+            target_type="smem",
+            operands=["lhs", "rhs"],
+            swizzle="128B",
+            layout=None,
+            warps=None,
+            tma=True,
+            label_filter="mm",
+        )
+    )
+    pipeline.add_pass(
+        TileMatmul(
+            op_dims=["K"],
+            tile_sizes=[16],
+            iteration_bindings=[None],
+            for_loop_labels=["k"],
+            op_label_filter="mm",
+        )
+    )
     module = pipeline.run(module)
 
     print(module)

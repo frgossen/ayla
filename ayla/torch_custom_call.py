@@ -1,11 +1,12 @@
 """Wrap a :class:`JITCompiler` as a torch custom op so it's callable from
 eager torch and visible to ``torch.compile`` / ``torch.export``.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
-from typing import TYPE_CHECKING, cast
+from typing import Protocol, cast
 
 import torch
 
@@ -17,8 +18,17 @@ from .gpu_dialect import (
     MemTensorType,
 )
 
-if TYPE_CHECKING:
-    from .jit_compiler import JITCompiler
+from .base.ir import Type
+
+
+class _Launcher(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def signature(self) -> list[Type]: ...
+
+    def __call__(self, *tensors: torch.Tensor) -> None: ...
 
 
 _TORCH_DTYPES = [
@@ -42,6 +52,7 @@ def from_torch_dtype(dtype: torch.dtype) -> Type:
         if dtype == torch_dtype:
             return type(ayla_dtype)()
     raise ValueError(f"unsupported dtype: {dtype}")
+
 
 DEFAULT_NAMESPACE = "ayla"
 
@@ -74,15 +85,15 @@ def _make_schema(op_name: str, signature_mapping: list[OperandKind]) -> str:
             input_idx += 1
 
     num_outputs = signature_mapping.count(OperandKind.RESULT)
-    ret = ', '.join(['Tensor'] * num_outputs)
+    ret = ", ".join(["Tensor"] * num_outputs)
     if num_outputs != 1:
         ret = f"({ret})"
-    params_str = ', '.join(params)
+    params_str = ", ".join(params)
     return f"{op_name}({params_str}) -> {ret}"
 
 
 def make_torch_custom_call(
-    compiler: JITCompiler,
+    compiler: _Launcher,
     signature_mapping: list[OperandKind],
     *,
     namespace: str = DEFAULT_NAMESPACE,
@@ -111,10 +122,7 @@ def make_torch_custom_call(
                 f"{op_name}: expected {len(result_types)} result shapes, "
                 f"got {len(result_shapes)}"
             )
-        device = (
-            input_tensors[0].device
-            if input_tensors else torch.device("cuda")
-        )
+        device = input_tensors[0].device if input_tensors else torch.device("cuda")
         return [
             torch.empty(
                 shape,

@@ -5,7 +5,8 @@ from ayla.passes.reuse_buffers import reuse_buffers
 
 
 def test_reuses_output_buffer_for_matmul_temporary():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -13,7 +14,8 @@ def test_reuses_output_buffer_for_matmul_temporary():
             matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %tmp: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
             elementwise sigmoid(%output: gmem<16x16xf32>, %tmp: gmem<16x16xf32>)
           }
-        }"""))
+        }""")
+    )
 
     reuse_buffers(module)
 
@@ -28,26 +30,28 @@ def test_reuses_output_buffer_for_matmul_temporary():
 
 
 def test_reuses_output_buffer_between_matmuls():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
             %first_acc: smem<16x16xf32> = alloc() attrs={id: 1}
-            %first_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %first_acc_init: rmem<f32> = constant 0.0
             elementwise fill(%first_acc: smem<16x16xf32>, %first_acc_init: rmem<f32>)
             matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) collective=xyz.grid
             move(%tmp: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) attrs={tma: True}
             %second_lhs: smem<16x16xf32> = alloc() attrs={id: 2}
-            %second_lhs_init: rmem<f32> = constant() attrs={value: 0.0}
+            %second_lhs_init: rmem<f32> = constant 0.0
             elementwise fill(%second_lhs: smem<16x16xf32>, %second_lhs_init: rmem<f32>)
             move(%second_lhs: smem<16x16xf32>, %tmp: gmem<16x16xf32>) attrs={tma: True}
             %second_acc: smem<16x16xf32> = alloc() attrs={id: 3}
-            %second_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %second_acc_init: rmem<f32> = constant 0.0
             elementwise fill(%second_acc: smem<16x16xf32>, %second_acc_init: rmem<f32>)
             matmul(%second_lhs: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
             move(%output: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) attrs={tma: True}
           }
-        }"""))
+        }""")
+    )
 
     reuse_buffers(module)
 
@@ -55,15 +59,15 @@ def test_reuses_output_buffer_between_matmuls():
         module {
           kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %first_acc: smem<16x16xf32> = alloc() attrs={id: 1}
-            %first_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %first_acc_init: rmem<f32> = constant 0.0
             elementwise fill(%first_acc: smem<16x16xf32>, %first_acc_init: rmem<f32>)
             matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) collective=xyz.grid
             move(%output: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) attrs={tma: True}
-            %second_lhs_init: rmem<f32> = constant() attrs={value: 0.0}
+            %second_lhs_init: rmem<f32> = constant 0.0
             elementwise fill(%first_acc: smem<16x16xf32>, %second_lhs_init: rmem<f32>)
             move(%first_acc: smem<16x16xf32>, %output: gmem<16x16xf32>) attrs={tma: True}
             %second_acc: smem<16x16xf32> = alloc() attrs={id: 3}
-            %second_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            %second_acc_init: rmem<f32> = constant 0.0
             elementwise fill(%second_acc: smem<16x16xf32>, %second_acc_init: rmem<f32>)
             matmul(%first_acc: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
             move(%output: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) attrs={tma: True}
@@ -72,7 +76,8 @@ def test_reuses_output_buffer_between_matmuls():
 
 
 def test_reuses_one_buffer_for_elementwise_chain():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @elementwise_chain(%src: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -83,7 +88,8 @@ def test_reuses_one_buffer_for_elementwise_chain():
             elementwise tanh(%c: gmem<16x16xf32>, %b: gmem<16x16xf32>)
             elementwise sigmoid(%output: gmem<16x16xf32>, %c: gmem<16x16xf32>)
           }
-        }"""))
+        }""")
+    )
 
     reuse_buffers(module)
 
@@ -99,7 +105,8 @@ def test_reuses_one_buffer_for_elementwise_chain():
 
 
 def test_does_not_reuse_buffer_that_remains_live_after_handoff():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -108,21 +115,22 @@ def test_does_not_reuse_buffer_that_remains_live_after_handoff():
             elementwise sigmoid(%output: gmem<16x16xf32>, %tmp: gmem<16x16xf32>)
             move(%tmp: gmem<16x16xf32>, %tmp: gmem<16x16xf32>)
           }
-        }"""))
+        }""")
+    )
 
     reuse_buffers(module)
 
     assert any(isinstance(op, AllocOp) for op in module.body.ops[0].body.ops)
     [elementwise] = [
-        op for op in module.body.ops[0].body.ops
-        if isinstance(op, ElementwiseOp)
+        op for op in module.body.ops[0].body.ops if isinstance(op, ElementwiseOp)
     ]
     assert elementwise.src(0) is not elementwise.dst
     assert any(isinstance(op, MatmulOp) for op in module.body.ops[0].body.ops)
 
 
 def test_reuse_union_includes_lifetimes_of_previous_members():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0, label: "a"}
@@ -133,18 +141,18 @@ def test_reuse_union_includes_lifetimes_of_previous_members():
             elementwise sigmoid(%b: gmem<16x16xf32>, %b: gmem<16x16xf32>)
             elementwise sigmoid(%output: gmem<16x16xf32>, %a: gmem<16x16xf32>)
           }
-        }"""))
+        }""")
+    )
 
     reuse_buffers(module)
 
-    allocations = [
-        op for op in module.body.ops[0].body.ops if isinstance(op, AllocOp)
-    ]
+    allocations = [op for op in module.body.ops[0].body.ops if isinstance(op, AllocOp)]
     assert [op.attrs["label"] for op in allocations] == ["b"]
 
 
 def test_allocation_starts_a_reuse_set():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse(
+        textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0}
@@ -154,7 +162,8 @@ def test_allocation_starts_a_reuse_set():
             elementwise sigmoid(%a: gmem<16x16xf32>, %a: gmem<16x16xf32>)
             matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %b: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
           }
-        }"""))
+        }""")
+    )
 
     reuse_buffers(module)
 
