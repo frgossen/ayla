@@ -81,3 +81,23 @@ def test_hoisted_loads_leave_lock_allocations_together():
     first_load = next(i for i, op in enumerate(ops) if isinstance(op, AsyncOp))
     acc = next(i for i, op in enumerate(ops) if op.attrs.get("init") is not None)
     assert first_load < acc
+
+
+def test_register_load_hoists_behind_async_loads():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @test(%g: gmem<4x4xf32>, %h: gmem<4x4xf32>, %a: rmem<1x1xf32>, %b: rmem<1x1xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            %s: smem<4x4xf32> = alloc() attrs={id: 0}
+            %r: rmem<4x4xf32> = alloc() attrs={id: 1}
+            %acc: rmem<1x1xf32> = alloc() attrs={id: 2, init: 0.0}
+            matmul(%a: rmem<1x1xf32>, %b: rmem<1x1xf32>, %acc: rmem<1x1xf32>) attrs={label: "compute"}
+            move(%r: rmem<4x4xf32>, %h: gmem<4x4xf32>) attrs={label: "register_load"}
+            move(%s: smem<4x4xf32>, %g: gmem<4x4xf32>) attrs={label: "shared_load", tma: true}
+          }
+        }"""))
+    assert isinstance(module, ModuleOp)
+    text = repr(schedule_async(lower_to_async(module)))
+    shared_load = text.index('label: "shared_load_async"')
+    register_load = text.index('label: "register_load"')
+    compute = text.index('label: "compute"')
+    assert shared_load < register_load < compute
