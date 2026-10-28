@@ -8,9 +8,23 @@ import re
 from dataclasses import dataclass
 from functools import cache
 from importlib.resources import files
-from typing import Any
+from typing import Any, cast
 
 from .gpu_dialect import CollectiveAxis
+
+
+_REVERSE_OUTPUT_MIN_BYTES = 64 * 2**20
+
+
+def default_reverse_output_rows(
+    m: int, n: int, *, operation: str = "mm", batch: int = 1,
+    element_bytes: int = 2,
+) -> bool:
+    """Whether to write an unmeasured output's rows last-to-first."""
+    return (
+        operation != "bmm"
+        and m * n * batch * element_bytes >= _REVERSE_OUTPUT_MIN_BYTES
+    )
 
 
 @dataclass(frozen=True)
@@ -24,6 +38,7 @@ class GemmScheduleSeed:
     transpose_output: bool = False
     fixed_output_unroll_factor: int | None = None
     pipeline_output_waves: bool = False
+    pipeline_output_writeback: bool = False
 
 
 @dataclass(frozen=True)
@@ -37,7 +52,7 @@ def apply_gemm_schedule_seed_post_build(
     module: Any, seed: GemmScheduleSeed,
 ) -> Any:
     """Apply the measured post-builder pass sequence required by ``seed``."""
-    if seed.pipeline_output_waves:
+    if seed.pipeline_output_waves or seed.pipeline_output_writeback:
         if (
             seed.fixed_output_unroll_factor is not None
             or seed.builder_config is None
@@ -57,19 +72,28 @@ def apply_gemm_schedule_seed_post_build(
         if len(outer_loops) != 1:
             raise ValueError("wave pipelining requires one outer tile loop")
         outer_loops[0].attrs["label"] = "heuristic_output_grid"
-        for body_op in outer_loops[0].body.ops:
-            if isinstance(body_op, AwaitOp):
-                break
-            if isinstance(body_op, AsyncOp) and re.fullmatch(
-                r"mm_(lhs|rhs)_smem_iter\d+_async",
-                str(body_op.attrs.get("label", "")),
-            ):
-                body_op.attrs["label"] = "heuristic_wave_prologue_async"
-        module = PipelineLoop(
-            label_filter_loop="heuristic_output_grid",
-            label_filter_op=r"heuristic_wave_prologue_async",
-            pipelining_offset=1,
-        ).run(module)
+        if seed.pipeline_output_waves:
+            for body_op in outer_loops[0].body.ops:
+                if isinstance(body_op, AwaitOp):
+                    break
+                if isinstance(body_op, AsyncOp) and re.fullmatch(
+                    r"mm_(lhs|rhs)_smem_iter\d+_async",
+                    str(body_op.attrs.get("label", "")),
+                ):
+                    body_op.attrs["label"] = "heuristic_wave_prologue_async"
+            module = PipelineLoop(
+                label_filter_loop="heuristic_output_grid",
+                label_filter_op=r"heuristic_wave_prologue_async",
+                pipelining_offset=1,
+            ).run(module)
+        if seed.pipeline_output_writeback:
+            # Issue everything but the output writeback one tile early, so a
+            # tile's writeback runs while the next tile's work is in flight.
+            module = PipelineLoop(
+                label_filter_loop="heuristic_output_grid",
+                label_filter_op=r"(?!mm_dst_(smem|tma)).*",
+                pipelining_offset=1,
+            ).run(module)
         module = ScheduleAsync().run(module)
         module = Canonicalize().run(module)
     output_was_unrolled = (
@@ -77,6 +101,7 @@ def apply_gemm_schedule_seed_post_build(
         and seed.fixed_output_unroll_factor > 1
     )
     if output_was_unrolled:
+        assert seed.fixed_output_unroll_factor is not None
         from .base.ir import find_ancestor_of_type, find_ops_of_type
         from .gpu_dialect import ForOp
         from .passes.canonicalize import Canonicalize
@@ -417,6 +442,8 @@ def _adapt_config(
         builder["output_grid_axes"] = (
             CollectiveAxis.Y, CollectiveAxis.X,
         )
+    if reverse := str(captured.get("output_tile_reverse") or ""):
+        builder["output_reversed_dims"] = tuple(reverse.upper())
     optional = (
         "warpgroup_m_tile", "warpgroup_fast_axis", "rhs_tma_load_slices",
         "cluster_m_ctas", "cluster_n_ctas",
@@ -426,6 +453,33 @@ def _adapt_config(
         if value not in (None, 1, "n"):
             builder[key] = value
     return builder, tuple(adaptations)
+
+
+def _with_output_row_order(
+    builder: dict[str, object],
+    adaptations: tuple[str, ...],
+    *,
+    reverse: bool | None,
+    transpose_output: bool,
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """Apply a caller/default row-order choice over the captured order."""
+    if reverse is None:
+        return builder, adaptations
+    rows = "N" if transpose_output else "M"
+    current = tuple(cast(tuple[str, ...], builder.get("output_reversed_dims", ())))
+    dims = tuple(dim for dim in current if dim != rows)
+    if reverse:
+        dims += (rows,)
+    if dims == current:
+        return builder, adaptations
+    builder = {
+        key: value for key, value in builder.items()
+        if key != "output_reversed_dims"
+    }
+    if dims:
+        builder["output_reversed_dims"] = dims
+    order = "last-to-first" if reverse else "first-to-last"
+    return builder, (*adaptations, f"output rows visited {order}")
 
 
 def _legal(
@@ -463,8 +517,14 @@ def select_gemm_schedules(
     batch: int = 1,
     dtype: str = "float16",
     layout: str = "canonical_nt",
+    reverse_output_rows: bool | None = None,
 ) -> GemmHeuristicSelection:
-    """Return nearby captured configurations and current-library adaptations."""
+    """Return nearby captured configurations and current-library adaptations.
+
+    ``reverse_output_rows`` forces or forbids visiting output rows
+    last-to-first. ``None`` keeps an exact measured choice and applies the
+    size-based default only to unmeasured shapes.
+    """
     if min(m, n, k) <= 0:
         raise ValueError("GEMM dimensions must be positive")
     if batch <= 0:
@@ -517,6 +577,19 @@ def select_gemm_schedules(
             captured, builder_m, builder_n, k,
             preserve_output_grid=exact is not None,
         )
+        if builder is not None:
+            builder, adaptations = _with_output_row_order(
+                builder,
+                adaptations,
+                reverse=(
+                    reverse_output_rows
+                    if reverse_output_rows is not None or exact is not None
+                    else default_reverse_output_rows(
+                        m, n, operation=operation, batch=batch,
+                    )
+                ),
+                transpose_output=transpose_output,
+            )
         if exact is None and builder is not None and not _legal(
             builder,
             builder_m,
@@ -551,6 +624,9 @@ def select_gemm_schedules(
             ),
             transpose_output=transpose_output,
             fixed_output_unroll_factor=unroll_factor,
+            pipeline_output_writeback=bool(
+                captured.get("pipeline_output_writeback", False)
+            ),
             pipeline_output_waves=bool(
                 captured.get("pipeline_output_waves", False)
             ),
@@ -559,6 +635,18 @@ def select_gemm_schedules(
     if not any(seed.builder_config is not None for seed in seeds):
         captured = dict(mapper["fallback"])
         builder, adaptations = _adapt_config(captured, m, n, k)
+        if builder is not None:
+            builder, adaptations = _with_output_row_order(
+                builder,
+                adaptations,
+                reverse=(
+                    reverse_output_rows if reverse_output_rows is not None
+                    else default_reverse_output_rows(
+                        m, n, operation=operation, batch=batch,
+                    )
+                ),
+                transpose_output=bool(captured.get("transpose_output", False)),
+            )
         if builder is not None and _legal(
             builder,
             m,

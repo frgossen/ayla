@@ -6,6 +6,7 @@ result.
 """
 import textwrap
 
+import pytest
 import torch
 
 from ayla.base.ir import Block, Value
@@ -296,3 +297,29 @@ def test_rank3_tma_load_through_singleton_batch_view():
     torch.cuda.synchronize()
 
     assert actual.cpu().tolist() == [3.0, 7.0]
+
+
+@requires_cuda
+@pytest.mark.parametrize("ir_dtype, torch_dtype", [
+    ("bf16", torch.bfloat16), ("f16", torch.float16), ("f32", torch.float32),
+])
+def test_wgmma_fragment_load_column_broadcast(ir_dtype, torch_dtype):
+    from ayla.gpu_dialect import gpu_dialect
+
+    module = gpu_dialect.parse(f'''module {{
+      kernel @broadcast(%a: gmem<64x128x{ir_dtype} strides=[1, 0]>, %out: gmem<64x128x{ir_dtype}>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+        %r: wgrmem<64x128x{ir_dtype} warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+        move(%r: wgrmem<64x128x{ir_dtype} warps=4 layout="wgmma_layout_0">, %a: gmem<64x128x{ir_dtype} strides=[1, 0]>)
+        move(%out: gmem<64x128x{ir_dtype}>, %r: wgrmem<64x128x{ir_dtype} warps=4 layout="wgmma_layout_0">)
+      }}
+    }}''')
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    # Odd row stride exercises scalar loads rather than packed pairs. Reusing
+    # the launcher with changed data catches accidental constant materialization.
+    for seed in (13, 97, 251):
+        torch.manual_seed(seed)
+        source = torch.randn(64, dtype=torch_dtype, device="cuda")
+        actual = torch.full((64, 128), float("nan"), dtype=torch_dtype, device="cuda")
+        launcher(source, actual)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, source[:, None].expand_as(actual), rtol=0, atol=0)

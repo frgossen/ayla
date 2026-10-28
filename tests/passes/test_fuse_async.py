@@ -108,7 +108,7 @@ def test_does_not_fuse_incompatible_tma_loads(
 
 
 def test_fuses_launches_whose_awaits_follow_the_run():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>, %b: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %sa: smem<16x16xf32> = alloc()
@@ -175,13 +175,13 @@ def test_rerun_ignores_a_pipelined_singleton_async():
           }
         }""")
 
-    module = fuse_async(gpu_dialect.parse(module_str))
+    module = fuse_async(gpu_dialect.parse_module(module_str))
 
     assert repr(module) == module_str
 
 
 def test_still_rejects_truly_unawaited_fusible_async():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
             %s: smem<16x16xf32> = alloc()

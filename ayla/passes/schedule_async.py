@@ -14,6 +14,8 @@ the ops that define its operands.
 
 from __future__ import annotations
 
+import functools
+
 from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
@@ -46,7 +48,24 @@ def _is_await(op: Op) -> bool:
     return isinstance(op, AwaitOp)
 
 
-def _can_swap(upper: Op, lower: Op) -> bool:
+def _effect_roots(op: Op) -> tuple[set[Value], set[Value]] | None:
+    """The buffers ``op`` reads and writes, or None if unknown."""
+    # An await resolves to its lock peers via memory_effects.
+    effects = memory_effects(op)
+    if effects is None:
+        return None
+    reads = {
+        root for effect in effects if effect.kind == "R"
+        for root in effect.roots
+    }
+    writes = {
+        root for effect in effects if effect.kind == "W"
+        for root in effect.roots
+    }
+    return reads, writes
+
+
+def _can_swap(upper: Op, lower: Op, effect_roots=_effect_roots) -> bool:
 
     if has_ordering_effect(upper) or has_ordering_effect(lower):
         return False
@@ -56,29 +75,14 @@ def _can_swap(upper: Op, lower: Op) -> bool:
     if any(v in upper_results for v in effective_operands(lower)):
         return False
 
-    # Memory effects (an await resolves to its lock peers via memory_effects).
-    upper_effs = memory_effects(upper)
-    lower_effs = memory_effects(lower)
-    if upper_effs is None or lower_effs is None:
+    upper_roots = effect_roots(upper)
+    lower_roots = effect_roots(lower)
+    if upper_roots is None or lower_roots is None:
         return False
 
     # RAW, WAR, or WAW conflict on the same buffer.
-    upper_r = {
-        root for effect in upper_effs if effect.kind == "R"
-        for root in effect.roots
-    }
-    upper_w = {
-        root for effect in upper_effs if effect.kind == "W"
-        for root in effect.roots
-    }
-    lower_r = {
-        root for effect in lower_effs if effect.kind == "R"
-        for root in effect.roots
-    }
-    lower_w = {
-        root for effect in lower_effs if effect.kind == "W"
-        for root in effect.roots
-    }
+    upper_r, upper_w = upper_roots
+    lower_r, lower_w = lower_roots
     if lower_w & upper_r or lower_r & upper_w or lower_w & upper_w:
         return False
 
@@ -127,11 +131,14 @@ def _bubble(
     stacked on them.
     """
     assert step in (-1, 1), f"step must be -1 or +1; got {step}"
+    # Reordering doesn't change an op's effects, and recomputing them for
+    # every candidate swap dominates the pass's runtime.
+    effect_roots = functools.cache(_effect_roots)
     for op in targets:
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
             lo, hi = sorted((j, j + step))
-            if not _can_swap(ops[lo], ops[hi]):
+            if not _can_swap(ops[lo], ops[hi], effect_roots):
                 break
             ops[j], ops[j + step] = ops[j + step], ops[j]
             j += step
@@ -156,8 +163,12 @@ def _sink_awaits(ops: list[Op]) -> None:
 class ScheduleAsync(Pass):
 
     def run_block(self, block: Block) -> None:
-        _hoist_async_moves(block.ops)
-        _sink_awaits(block.ops)
+        # Reorder a plain list: every write to ``block.ops`` re-syncs the whole
+        # block, which makes bubbling through it cubic.
+        ops = list(block.ops)
+        _hoist_async_moves(ops)
+        _sink_awaits(ops)
+        block.ops = ops
         super().run_block(block)
 
 

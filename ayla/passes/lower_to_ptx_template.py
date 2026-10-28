@@ -1696,6 +1696,7 @@ class LowerToPtxTemplate(LoweringPass):
         m_dim, n_dim = cast(tuple[int, int], wgrmem_type.sizes)
         root = root_buffer(fragment)
         assert root is not None
+        assert isinstance(root.type, WgrmemTensorType)
         root_n = cast(int, root.type.sizes[1])
         if isinstance(fragment.definition, TileOp):
             assert list(memory_type.sizes) == [m_dim, n_dim], (
@@ -1706,7 +1707,7 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             # Keep accepting the legacy producer until PromoteBuffers switches
             # from an attribute-based slice to an explicit WGRMEM view.
-            col_start = int(op.attrs.get("wgmma_col_start", 0))
+            col_start = int(cast(int, op.attrs.get("wgmma_col_start", 0)))
             memory_m, memory_n = cast(tuple[int, int], memory_type.sizes)
             assert memory_m == m_dim and 0 <= col_start < n_dim
             assert col_start + memory_n <= n_dim
@@ -1721,11 +1722,14 @@ class LowerToPtxTemplate(LoweringPass):
         assert root_n % 8 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
         )
+        assert isinstance(memory_type.dtype, (BF16Type, F16Type, F32Type, F64Type))
         dtype_bytes = memory_type.dtype.byte_size
         row_stride_bytes = cast(int, memory_type.strides[0]) * dtype_bytes
+        column_stride_bytes = cast(int, memory_type.strides[1]) * dtype_bytes
+        column_broadcast = is_load and column_stride_bytes == 0
 
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
-            row_stride_bytes, dtype_bytes,
+            row_stride_bytes, column_stride_bytes,
         )
         if isinstance(memory_type, GmemTensorType):
             template = textwrap.dedent(r"""
@@ -1741,12 +1745,45 @@ class LowerToPtxTemplate(LoweringPass):
             )
             address = "${b32:base}"
             space = "shared"
+        # Column-warpgroup gathers reuse one staging buffer across slices;
+        # honor the same writer ownership as the STMatrix store path.
+        writer_wg = op.attrs.get("writer_wg") if not is_load else None
+        predicate = ""
+        if writer_wg is not None:
+            template += textwrap.dedent(f"""\
+                mov.u32 ${{b32:store_tid}}, %tid.x;
+                shr.u32 ${{b32:store_wg}}, ${{b32:store_tid}}, 7;
+                setp.eq.u32 ${{pred:store_writer}}, ${{b32:store_wg}}, {writer_wg};
+            """)
+            predicate = "@${pred:store_writer} "
         # A pair is one packed BF16/F16 register or two F32 registers.
         f32 = isinstance(wgrmem_type.dtype, F32Type)
         instruction = f"{'ld' if is_load else 'st'}.{space}{'.v2' if f32 else ''}.b32"
 
+        # Broadcast columns load one scalar per distinct row and duplicate its
+        # bits into the fragment pair. Other columns reuse that register value.
+        # This reads the original strided view; it does not materialize a bias.
+        loaded_rows: dict[int, str] = {}
         for pair, di, dj in pairs:
-            offset = di * row_stride_bytes + dj * dtype_bytes
+            offset = di * row_stride_bytes + dj * column_stride_bytes
+            if column_broadcast:
+                first = (
+                    f"${{f32:operand.fragment.r{2 * pair}}}"
+                    if f32 else f"${{b32:operand.fragment.r{pair}}}"
+                )
+                if offset in loaded_rows:
+                    template += f"mov.b32 {first}, {loaded_rows[offset]};\n"
+                elif f32:
+                    template += f"ld.{space}.b32 {first}, [{address}+{offset}];\n"
+                else:
+                    scalar = f"${{b16:broadcast{pair}}}"
+                    template += f"ld.{space}.b16 {scalar}, [{address}+{offset}];\n"
+                    template += f"mov.b32 {first}, {{{scalar}, {scalar}}};\n"
+                loaded_rows.setdefault(offset, first)
+                if f32:
+                    second = f"${{f32:operand.fragment.r{2 * pair + 1}}}"
+                    template += f"mov.b32 {second}, {first};\n"
+                continue
             registers = (
                 f"{{${{f32:operand.fragment.r{2 * pair}}}, "
                 f"${{f32:operand.fragment.r{2 * pair + 1}}}}}"
@@ -1755,12 +1792,13 @@ class LowerToPtxTemplate(LoweringPass):
             location = f"[{address}+{offset}]"
             template += (
                 f"{instruction} {registers}, {location};\n" if is_load
-                else f"{instruction} {location}, {registers};\n"
+                else f"{predicate}{instruction} {location}, {registers};\n"
             )
 
         new_op = PTXTemplateOp.build(
             operands=[
-                self.value_map[memory], self.value_map[fragment], byte_offset,
+                cast(Value, self.value_map[memory]),
+                cast(Value, self.value_map[fragment]), byte_offset,
             ],
             result_types=[], template=template,
             operand_names=["memory", "fragment", "offset"], result_names=[],
@@ -2187,7 +2225,7 @@ class LowerToPtxTemplate(LoweringPass):
 
 def _build_wgmma_layout_0_dynamic_offset(
     row_stride_bytes: int,
-    dtype_bytes: int,
+    column_stride_bytes: int,
 ) -> tuple[list[Op], Value]:
     """Emit index ops for the wgmma_layout_0 per-thread byte offset.
 
@@ -2195,7 +2233,7 @@ def _build_wgmma_layout_0_dynamic_offset(
     lane = tid.x % 32
     row = warp_in_wg * 16 + lane / 4
     col = (lane % 4) * 2
-    byte_offset = row * row_stride_bytes + col * dtype_bytes
+    byte_offset = row * row_stride_bytes + col * column_stride_bytes
     """
     ops: list[Op] = []
 
@@ -2235,12 +2273,12 @@ def _build_wgmma_layout_0_dynamic_offset(
     col = IndexMulOp.build(lane_mod_4.result(), c2.result())
     ops.append(col)
 
-    # byte_offset = row * row_stride_bytes + col * dtype_bytes
+    # byte_offset = row * row_stride_bytes + col * column_stride_bytes
     row_stride = IndexConstantOp.build(row_stride_bytes)
     ops.append(row_stride)
     row_bytes = IndexMulOp.build(row.result(), row_stride.result())
     ops.append(row_bytes)
-    col_stride = IndexConstantOp.build(dtype_bytes)
+    col_stride = IndexConstantOp.build(column_stride_bytes)
     ops.append(col_stride)
     col_bytes = IndexMulOp.build(col.result(), col_stride.result())
     ops.append(col_bytes)

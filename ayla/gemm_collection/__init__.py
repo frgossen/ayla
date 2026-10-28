@@ -1,4 +1,4 @@
-"""A small collection of pre-built GEMM kernels.
+"""A small collection of GEMM kernels, each built on its first use.
 
 Each kernel lives in its own module here: a ``*_module`` builder plus
 self-registration as a ``torch.ops.ayla.*`` overload at import time. Importing

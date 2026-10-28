@@ -144,3 +144,20 @@ def test_scalar_store_uses_root_registers_for_nested_wgrmem_view():
     assert "${b32:operand.fragment.r112}" in template
     assert "${b32:operand.fragment.r127}" in template
     assert "${b32:operand.fragment.r111}" not in template
+
+
+def test_scalar_gather_honors_writer_warpgroup():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @k() block_dim=[256, 1, 1] {
+            %s: smem<64x128xbf16> = alloc() attrs={id: 0}
+            %r: wgrmem<64x128xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            move(%s: smem<64x128xbf16>, %r: wgrmem<64x128xbf16 warps=4 layout="wgmma_layout_0">) attrs={writer_wg: 1}
+          }
+        }"""))
+    templates = find_ops_of_type(lower_to_ptx_template(module), PTXTemplateOp)
+    template = "".join(op.template for op in templates)
+    stores = [line for line in template.splitlines() if "st.shared.b32" in line]
+    assert len(stores) == 32
+    assert all(line.startswith("@${pred:store_writer} ") for line in stores)
+    assert "${b32:store_wg}, 1;" in template

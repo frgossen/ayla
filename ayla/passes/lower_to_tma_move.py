@@ -108,8 +108,9 @@ class LowerToTmaMove(LoweringPass):
                 )
             sizes = list(gmem_type.sizes)
             strides = list(gmem_type.strides)
-            for values in (sizes, indices, tile_shape):
-                values[-2], values[-1] = values[-1], values[-2]
+            sizes[-2], sizes[-1] = sizes[-1], sizes[-2]
+            indices[-2], indices[-1] = indices[-1], indices[-2]
+            tile_shape[-2], tile_shape[-1] = tile_shape[-1], tile_shape[-2]
             gmem_type = GmemTensorType.build(sizes, gmem_type.dtype)
             expected_strides = [
                 strides[i] for i in [*range(len(strides) - 2), -1, -2]

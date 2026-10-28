@@ -11,7 +11,7 @@ from ayla.passes.lower_to_tma_move import lower_to_tma_move
 
 
 def test_lower_move_preserves_collective():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<16x16xf32>) {
             %s: smem<16x16xf32> = alloc() attrs={id: 0}
@@ -33,7 +33,7 @@ def test_lower_move_preserves_collective():
 
 
 def test_lower_tma_through_singleton_batch_reshape():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<2x16x16xf32>) grid_dim=[2, 1, 2] {
             %bx: index, %by: index, %bz: index = block_ids()

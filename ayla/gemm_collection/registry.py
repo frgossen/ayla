@@ -3,8 +3,8 @@
 Every kernel here is built for one specific shape and dtype -- the shape is a
 literal in its module source, so ``auto_matmul_4096`` multiplies 4096x4096 and
 nothing else. Adding one means a module here with a decorated builder, plus
-that module in ``__init__``; decorating builds the kernel at import time and
-defines its op::
+that module in ``__init__``; decorating defines its op at import time, and the
+kernel is built on the op's first use::
 
     @register_gemm
     def auto_matmul_4096_module():
@@ -26,6 +26,7 @@ silently returns wrong numbers rather than raising.
 
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Callable
 
@@ -37,10 +38,30 @@ from ..torch_custom_call import OperandKind, make_torch_custom_call
 Builder = Callable[[], ModuleOp]
 
 
+@functools.cache
+def _launcher(builder: Builder):
+    return make_ptx_launcher(make_ptx_kernel(builder()))
+
+
+class _LazyLauncher:
+    """Builds the kernel on first use, so importing the collection is cheap."""
+
+    def __init__(self, builder: Builder) -> None:
+        self.name = builder.__name__.removesuffix("_module")
+        self._builder = builder
+
+    @property
+    def signature(self):
+        return _launcher(self._builder).signature
+
+    def __call__(self, *tensors) -> None:
+        _launcher(self._builder)(*tensors)
+
+
 def register(
     *torch_signature: OperandKind, op_name: str | None = None
 ) -> Callable[[Builder], Builder]:
-    """Build the kernel a builder produces and define its op, at import time.
+    """Define the op for the kernel a builder produces, at import time.
 
     The arguments say what the kernel does with each of its own -- read,
     read-written, or produced -- which is what `PtxKernel.signature` does not
@@ -76,8 +97,9 @@ def register(
                 f"{builder.__name__}: builders take no arguments; give each "
                 f"variant its own builder over a shared private helper"
             )
-        launcher = make_ptx_launcher(make_ptx_kernel(builder()))
-        make_torch_custom_call(launcher, list(torch_signature), name=op_name)
+        make_torch_custom_call(
+            _LazyLauncher(builder), list(torch_signature), name=op_name
+        )
         return builder
 
     return decorate

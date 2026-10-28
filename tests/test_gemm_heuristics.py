@@ -3,8 +3,10 @@ import dataclasses
 import pytest
 
 from ayla.gemm_heuristics import (
+    _adapt_config,
     apply_gemm_schedule_seed_post_build,
     collapse_gemm_heuristic,
+    default_reverse_output_rows,
     expand_gemm_heuristic,
     select_gemm_schedules,
 )
@@ -35,6 +37,106 @@ def test_single_iteration_fixed_grid_requires_no_unroll_passes():
     )
 
     assert apply_gemm_schedule_seed_post_build(module, seed) is module
+
+
+def test_fixed_grid_unroll_is_rescheduled_after_unrolling(monkeypatch):
+    seed = dataclasses.replace(
+        select_gemm_schedules(8192, 768, 768, operation="addmm").seeds[0],
+        fixed_output_unroll_factor=2,
+        post_builder_passes=(),
+    )
+    calls = []
+    loop = type("Loop", (), {"attrs": {}})()
+    monkeypatch.setattr(
+        "ayla.passes.licm.LICM.run",
+        lambda self, module: calls.append("licm") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ops_of_type",
+        lambda module, op_type: [loop],
+    )
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ancestor_of_type",
+        lambda loop, op_type: None,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.unroll_loop.UnrollLoop.run",
+        lambda self, module: calls.append("unroll") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.schedule_async.ScheduleAsync.run",
+        lambda self, module: calls.append("schedule_async") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.canonicalize.Canonicalize.run",
+        lambda self, module: calls.append("canonicalize") or module,
+    )
+    module = object()
+
+    assert apply_gemm_schedule_seed_post_build(module, seed) is module
+    assert calls == [
+        "licm",
+        "licm",
+        "unroll",
+        "canonicalize",
+        "schedule_async",
+        "canonicalize",
+    ]
+
+
+def test_rolled_wave_pipeline_is_composed_for_selected_mm(monkeypatch):
+    from ayla.passes.pipeline_loop import PipelineLoop
+
+    seed = select_gemm_schedules(4096, 16384, 1024).seeds[0]
+    assert seed.pipeline_output_waves is True
+    assert seed.fixed_output_unroll_factor is None
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_grid_fast_axis"] == "n"
+
+    class FakeAsync:
+        def __init__(self):
+            self.attrs = {"label": "mm_lhs_smem_iter0_async"}
+
+    class FakeAwait:
+        pass
+
+    class FakeFor:
+        def __init__(self):
+            self.attrs = {}
+            self.body = type("Body", (), {"ops": [FakeAsync(), FakeAwait()]})()
+
+    loop = FakeFor()
+    calls = []
+    monkeypatch.setattr("ayla.gpu_dialect.AsyncOp", FakeAsync)
+    monkeypatch.setattr("ayla.gpu_dialect.AwaitOp", FakeAwait)
+    monkeypatch.setattr("ayla.gpu_dialect.ForOp", FakeFor)
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ops_of_type", lambda module, op_type: [loop],
+    )
+    monkeypatch.setattr(
+        "ayla.base.ir.find_ancestor_of_type", lambda loop, op_type: None,
+    )
+    monkeypatch.setattr(
+        PipelineLoop,
+        "run",
+        lambda self, module: calls.append("pipeline_loop") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.schedule_async.ScheduleAsync.run",
+        lambda self, module: calls.append("schedule_async") or module,
+    )
+    monkeypatch.setattr(
+        "ayla.passes.canonicalize.Canonicalize.run",
+        lambda self, module: calls.append("canonicalize") or module,
+    )
+
+    module = object()
+    assert apply_gemm_schedule_seed_post_build(module, seed) is module
+    assert calls == ["pipeline_loop", "schedule_async", "canonicalize"]
+    assert loop.attrs["label"] == "heuristic_output_grid"
+    assert loop.body.ops[0].attrs["label"] == (
+        "heuristic_wave_prologue_async"
+    )
 
 
 def test_compact_round_trip_preserves_exact_dispatch():
@@ -73,7 +175,6 @@ def test_compact_round_trip_preserves_exact_dispatch():
 def test_compact_seeds_omit_dropped_experimental_controls():
     selection = select_gemm_schedules(2048, 768, 768)
     redundant = {
-        "output_tile_fast_axis",
         "rhs_tma_load_slices",
         "unsafe_reuse_smem",
         "warpgroup_fast_axis",
@@ -206,17 +307,18 @@ def test_swapped_grid_winner_routes_existing_builder_controls():
     )
 
 
-def test_two_dimensional_warpgroup_winner_is_preserved():
+def test_fixed_grid_addmm_winner_is_preserved():
     selection = select_gemm_schedules(
         4096, 2304, 768, operation="addmm",
     )
     seed = next(
         seed for seed in selection.seeds
-        if seed.captured_config.get("warpgroup_m_tile") is not None
+        if seed.captured_config.get("output_cta_count") == 132
     )
 
     assert seed.builder_config is not None
-    assert seed.builder_config["warpgroup_m_tile"] == 64
+    assert seed.builder_config["output_grid_size"] == 132
+    assert seed.builder_config.get("warpgroup_m_tile") is None
 
 
 def test_group_five_family_routes_existing_builder_controls():
@@ -241,3 +343,76 @@ def test_transpose_winner_is_selected_for_the_original_problem():
     assert seed.builder_config is not None
     assert seed.builder_config["output_m_tile"] == 192
     assert seed.builder_config["output_n_tile"] == 200
+
+
+def test_default_output_row_order_reverses_only_large_non_batched_outputs():
+    assert default_reverse_output_rows(12608, 3072)
+    assert not default_reverse_output_rows(8192, 768)
+    assert not default_reverse_output_rows(
+        512, 512, operation="bmm", batch=256,
+    )
+
+
+def test_unmeasured_large_output_reverses_output_rows():
+    selection = select_gemm_schedules(20000, 3072, 768)
+
+    seeds = [seed for seed in selection.seeds if seed.builder_config is not None]
+    assert seeds
+    for seed in seeds:
+        rows = "N" if seed.transpose_output else "M"
+        assert rows in seed.builder_config["output_reversed_dims"]
+        assert "output rows visited last-to-first" in seed.adaptations
+
+
+def test_caller_can_forbid_reversed_output_rows():
+    selection = select_gemm_schedules(
+        20000, 3072, 768, reverse_output_rows=False,
+    )
+
+    for seed in selection.seeds:
+        assert seed.builder_config is not None
+        assert "output_reversed_dims" not in seed.builder_config
+
+
+def test_exact_winner_keeps_its_measured_output_row_order():
+    [seed] = select_gemm_schedules(12608, 3072, 768).seeds
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_reversed_dims"] == ("M",)
+    assert "output rows visited last-to-first" not in seed.adaptations
+
+    [forced] = select_gemm_schedules(
+        12608, 3072, 768, reverse_output_rows=False,
+    ).seeds
+    assert forced.builder_config is not None
+    assert "output_reversed_dims" not in forced.builder_config
+    assert "output rows visited first-to-last" in forced.adaptations
+
+
+def test_addmm_exact_winner_keeps_its_measured_output_row_order():
+    [seed] = select_gemm_schedules(
+        100352, 512, 64, operation="addmm",
+    ).seeds
+
+    assert seed.builder_config is not None
+    assert seed.builder_config["output_reversed_dims"] == ("M",)
+
+
+def test_bmm_exact_winner_remains_forward_order():
+    [seed] = select_gemm_schedules(
+        196, 640, 128, operation="bmm", batch=128,
+    ).seeds
+
+    assert seed.builder_config is not None
+    assert "output_reversed_dims" not in seed.builder_config
+
+
+def test_measured_output_tile_reverse_is_routed_to_the_builder():
+    selection = select_gemm_schedules(12608, 3072, 768)
+    captured = {
+        **selection.seeds[0].captured_config, "output_tile_reverse": "m",
+    }
+    builder, _ = _adapt_config(
+        captured, 12608, 3072, 768, preserve_output_grid=True,
+    )
+    assert builder is not None
+    assert builder["output_reversed_dims"] == ("M",)

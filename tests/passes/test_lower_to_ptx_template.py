@@ -4,6 +4,7 @@ import textwrap
 
 import pytest
 
+
 from ayla.base.ir import Block, find_ops, find_ops_of_type
 from ayla.gpu_dialect import (
     BF16Type,
@@ -729,3 +730,19 @@ def test_lower_elementwise_silu_with_bf16_output():
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r0}, ${f32:silu_result1}, ${f32:silu_result0};
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r1}, ${f32:silu_result3}, ${f32:silu_result2};
         """))
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "f16", "f32"])
+def test_wgmma_fragment_load_supports_column_broadcast(dtype):
+    from ayla.ptx_codegen import make_ptx_kernel
+    module = gpu_dialect.parse(f'''module {{
+      kernel @broadcast(%a: gmem<64x128x{dtype} strides=[1, 0]>, %out: gmem<64x128x{dtype}>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+        %r: wgrmem<64x128x{dtype} warps=4 layout="wgmma_layout_0"> = alloc() attrs={{id: 0}}
+        move(%r: wgrmem<64x128x{dtype} warps=4 layout="wgmma_layout_0">, %a: gmem<64x128x{dtype} strides=[1, 0]>)
+        move(%out: gmem<64x128x{dtype}>, %r: wgrmem<64x128x{dtype} warps=4 layout="wgmma_layout_0">)
+      }}
+    }}''')
+    ptx = make_ptx_kernel(module).ptx
+    load = "ld.global.b32" if dtype == "f32" else "ld.global.b16"
+    assert ptx.count(load) == 2  # Two distinct source rows per thread.
+    assert "ld.global.v2" not in ptx
