@@ -1362,8 +1362,9 @@ class LowerToPtxTemplate(LoweringPass):
             operands = [cast(Value, self.value_map[op.sync])]
             operand_names = ["sync"]
         elif scope in ("leader_to_cluster", "cluster"):
-            template = textwrap.dedent("""\
-                barrier.cluster.arrive.release;
+            arrive = "relaxed" if op.attrs.get("initialization_publication") else "release"
+            template = textwrap.dedent(f"""\
+                barrier.cluster.arrive.{arrive};
                 barrier.cluster.wait.acquire;
                 """)
         elif scope == "block_leader":

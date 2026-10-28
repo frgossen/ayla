@@ -133,7 +133,7 @@ def _publication_barriers(scope: BarrierScope) -> list[Op]:
         BarrierScope.BLOCK: [BarrierScope.BLOCK],
         BarrierScope.CLUSTER: [BarrierScope.BLOCK, BarrierScope.CLUSTER],
     }[scope]
-    return [BarrierOp.build(_BARRIER_OP_SCOPE[s]) for s in scopes]
+    return [BarrierOp.build(_BARRIER_OP_SCOPE[s], attrs={"initialization_publication": True}) for s in scopes]
 
 
 class InsertSyncs(Pass):
