@@ -2797,6 +2797,8 @@ class MemoryEffect:
 
     @property
     def roots(self) -> set[Value]:
+        if isinstance(self.value.type, LockType):
+            return {self.value}
         return root_buffers(self.value)
 
 
@@ -2829,6 +2831,10 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
     Returns ``None`` for ops we don't know how to model; callers must treat that
     as a worst-case conflict.
     """
+    if isinstance(op, AllocOp) and isinstance(op.result().type, LockType):
+        # Initializing a lock writes it; every later use reads it.
+        scope = _lock_scope(op.result())
+        return [] if scope is None else _memory_effect("W", op.result(), scope)
     if is_side_effect_free(op):
         return []
     if isinstance(op, MoveOp):
@@ -2956,6 +2962,10 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return effects
     if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
         effects: list[MemoryEffect] = []
+        if isinstance(op, AsyncOp):
+            scope = _lock_scope(op.lock)
+            if scope is not None:
+                effects.extend(_memory_effect("R", op.lock, scope))
         for block in op.blocks:
             for body_op in block.ops:
                 body_effects = memory_effects(body_op)
@@ -2975,6 +2985,16 @@ def has_ordering_effect(op: Op) -> bool:
         for block in op.blocks
         for nested in block.ops
     )
+
+
+def _lock_scope(lock: Value) -> CollectiveScope | None:
+    """The scope at which a lock's initialization must be visible, if any."""
+    assert isinstance(lock.type, LockType)
+    if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
+        return CollectiveScope.CLUSTER
+    if lock.type.kind == "mbar":
+        return CollectiveScope.BLOCK
+    return None
 
 
 def lock_has_tma_multicast(lock: Value) -> bool:

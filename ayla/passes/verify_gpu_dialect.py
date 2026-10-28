@@ -47,11 +47,8 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
-    is_column_major,
-    BlockIdsOp,
+    BlockIdOp,
     join_collectives,
-    physical_layout,
-    root_buffer,
 )
 
 
@@ -197,7 +194,7 @@ def _index_leaves(values: list[Value | int]) -> set[Value]:
             continue
         seen.add(value)
         op = value.definition
-        if isinstance(op, (BlockIdsOp, ClusterBlockIdsOp)) or isinstance(op, Block):
+        if isinstance(op, (BlockIdOp, ClusterBlockIdsOp)) or isinstance(op, Block):
             leaves.add(value)
         elif isinstance(op, Op):
             stack.extend(op.operands)
@@ -242,8 +239,8 @@ def _verify_cluster_shares_multicast_tile(
         if isinstance(value, int) or value in loop_ivs:
             return True
         definition = value.definition
-        if isinstance(definition, (BlockIdsOp, ClusterBlockIdsOp)):
-            return cluster[value.result_index] == 1
+        if isinstance(definition, (BlockIdOp, ClusterBlockIdsOp)):
+            return cluster[definition.axis] == 1
         if isinstance(definition, IndexConstantOp):
             return True
         if isinstance(definition, (
@@ -264,7 +261,7 @@ def _verify_cluster_shares_multicast_tile(
     if evaluations > _MAX_MULTICAST_TILE_EVALUATIONS:
         return
     block_ids = [
-        leaf for leaf in leaves if isinstance(leaf.definition, BlockIdsOp)
+        leaf for leaf in leaves if isinstance(leaf.definition, BlockIdOp)
     ]
     cluster_ids = [
         leaf for leaf in leaves
@@ -274,9 +271,9 @@ def _verify_cluster_shares_multicast_tile(
     def tile(block: tuple[int, ...], ivs: tuple[int, ...]):
         env: dict[Value, int] = {}
         for value in block_ids:
-            env[value] = block[value.result_index]
+            env[value] = block[value.definition.axis]
         for value in cluster_ids:
-            env[value] = block[value.result_index] % cluster[value.result_index]
+            env[value] = block[value.result_index] % cluster[definition.axis]
         for loop, iv in zip(loops, ivs, strict=True):
             env[loop.body.arguments[0]] = iv
         if not all(_static_index(guard, env) for guard in guards):

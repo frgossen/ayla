@@ -24,9 +24,10 @@ Side-effect-free ops between members (lock allocs, tile views) are transparent
 
 **Placement matters** (caller's responsibility): fuse TMA loads *before*
 pipelining, while each stage's loads and awaits are still adjacent. After
-pipelining a load's await moves to the loop top, away from the load, so it would
-not be dropped onto the fused lock — caught by the await assert in
-:meth:`FuseAsync.run_block` rather than silently deadlocking. wgmma matmuls fuse
+pipelining a load's await moves to the loop top, away from the load, so the
+load's run is replayed unfused rather than leaving the load unawaited. This also
+lets a later call skip loads that were pipelined as singletons, such as a
+multicast LHS next to a local RHS. wgmma matmuls fuse
 after pipelining + kk-unroll, where they become consecutive. Both points just
 call ``fuse_async(module)``; the single-op + same-kind gating does the rest.
 """
@@ -78,43 +79,46 @@ class FuseAsync(Pass):
             op.lock for op in ops if isinstance(op, AwaitOp)
         }
         new_ops: list[Op] = []
-        group_inner: list[Op] = []
         group_lock: Value | None = None
         group_kind: str | None = None
         group_attrs: dict[str, object] | None = None
         group_collective: dict[CollectiveAxis, CollectiveLevel] | None = None
+        # The members and the awaits dropped for them, as found. Fusing takes
+        # the members' bodies; a run that cannot fuse is replayed as is.
+        group_ops: list[Op] = []
         # Member locks still awaiting their (to-be-dropped) await. Each fused
-        # async adds its lock; its await removes it. Must be empty at finalize.
+        # async adds its lock; its await removes it. Left over at finalize,
+        # the run is replayed.
         in_flight_locks: set[Value] = set()
 
         def finalize() -> None:
-            nonlocal group_inner, group_lock, group_kind, group_attrs, group_collective
-            nonlocal in_flight_locks
-            if group_collective is not None:
+            nonlocal group_lock, group_kind, group_attrs, group_collective
+            nonlocal in_flight_locks, group_ops
+            if in_flight_locks:
+                # A member's await is not adjacent (e.g. TMA loads seen *after*
+                # pipelining, whose awaits sit at the loop top). Fusing would
+                # leave that member's work unawaited, so replay the run as found.
+                new_ops.extend(group_ops)
+            elif group_collective is not None:
                 assert group_lock is not None
-                # Every member's await must have been dropped (its lock removed)
-                # so the group's single await covers it. A leftover lock means a
-                # member's await wasn't adjacent (e.g. TMA loads fused *after*
-                # pipelining, whose awaits sit at the loop top) — that member's
-                # work would never be awaited and the kernel would deadlock.
-                assert not in_flight_locks, (
-                    f"fuse_async: {len(in_flight_locks)} fused async op(s) have "
-                    f"no adjacent await; members' awaits must be adjacent (fuse "
-                    f"TMA loads before pipelining)"
-                )
                 new_ops.append(AsyncOp.build(
                     group_lock,
                     collective=group_collective,
-                    body=Block(ops=group_inner),
+                    body=Block(ops=[
+                        inner
+                        for member in group_ops
+                        if isinstance(member, AsyncOp)
+                        for inner in member.body.ops
+                    ]),
                     attrs=group_attrs,
                 ))
                 new_ops.append(AwaitOp.build(group_lock))
-            group_inner = []
             group_lock = None
             group_kind = None
             group_attrs = None
             group_collective = None
             in_flight_locks = set()
+            group_ops = []
 
         for index, op in enumerate(ops):
             kind = _fusion_kind(op)
@@ -156,9 +160,10 @@ class FuseAsync(Pass):
                         group_collective, op.collective,
                     )
                 in_flight_locks.add(op.lock)
-                group_inner.extend(op.body.ops)
+                group_ops.append(op)
             elif isinstance(op, AwaitOp) and op.lock in in_flight_locks:
                 in_flight_locks.discard(op.lock)  # member's await; group covers it
+                group_ops.append(op)
             elif is_side_effect_free(op):
                 # Transparent: safe to emit before the merged block since its
                 # operands are defined outside the (single-kind) group.

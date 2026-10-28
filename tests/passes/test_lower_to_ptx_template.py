@@ -126,8 +126,15 @@ def test_lower_barrier(scope, expected):
 def test_lower_barrier_block_leader_is_named_barrier():
     # Warp 0 (t0) waits on named barrier 1; every other warp just arrives.
     assert _lower_barrier("block_leader") == textwrap.dedent("""\
-        or.b32 ${b32:bl_warp}, ${b32:operand.warp_x.val}, ${b32:operand.warp_y.val};
-        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:operand.warp_z.val};
+        mov.u32 ${b32:bl_warp}, %tid.x;
+        shr.u32 ${b32:bl_warp}, ${b32:bl_warp}, 5;
+        shfl.sync.idx.b32 ${b32:bl_warp}, ${b32:bl_warp}, 0, 31, 0xffffffff;
+        mov.u32 ${b32:bl_warp_yz}, %tid.y;
+        shfl.sync.idx.b32 ${b32:bl_warp_yz}, ${b32:bl_warp_yz}, 0, 31, 0xffffffff;
+        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:bl_warp_yz};
+        mov.u32 ${b32:bl_warp_yz}, %tid.z;
+        shfl.sync.idx.b32 ${b32:bl_warp_yz}, ${b32:bl_warp_yz}, 0, 31, 0xffffffff;
+        or.b32 ${b32:bl_warp}, ${b32:bl_warp}, ${b32:bl_warp_yz};
         setp.ne.u32 ${pred:bl_other_warp}, ${b32:bl_warp}, 0;
         @${pred:bl_other_warp} bar.arrive 1, 128;
         @!${pred:bl_other_warp} bar.sync 1, 128;
@@ -150,22 +157,57 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         for op in find_ops(module, lambda op: isinstance(op, PTXTemplateOp))
     )
     assert ".shared .align 8 .b64 ${smem:bar}[1];" in ptx
-    assert (
-        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 2;"
-        in ptx
-    )
+    # Four warps arrive at each CTA's mbarrier; the leader's counts both CTAs.
     assert_contains_in_order(
         ptx,
-        "fence.mbarrier_init.release.cluster;",
-        "bar.sync 0;",
-        "barrier.cluster.arrive.release;",
-        "barrier.cluster.wait.acquire;",
+        "mov.u32 ${b32:arrivals}, 4;",
+        "@${pred:rank0} mov.u32 ${b32:arrivals}, 8;",
+        "mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], ${b32:arrivals};",
+    )
+    release = ptx.split("fence.mbarrier_init.release.cluster;", 1)[1]
+    assert "bar.sync" not in release
+    assert_contains_in_order(
+        release,
+        "elect.sync _|${pred:cl_arrive}, 0xffffffff;",
+        "@${pred:cl_arrive} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
+        "@${pred:cl_arrive_remote} mbarrier.arrive.shared::cluster.b64 _, [${b32:leader_mbar}];",
         "@${pred:cl_other_warp} bra ${label:cl_done};",
-        "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
-        "@${pred:cl_leader} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
-        "@${pred:cl_leader} mbarrier.arrive.shared::cta.b64 _, [${b32:operand.sync.val}];",
         "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};",
     )
+
+
+def test_batches_consecutive_lock_initialization_rendezvous():
+    # The multicast load uses its lock first, so one cluster rendezvous
+    # publishes all three initializations.
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %c0: index = index_constant() attrs={value: 0}
+            %local0: lock<mbar> = alloc()
+            %buffer0: smem<16x16xf32> = alloc()
+            %local1: lock<mbar> = alloc()
+            %buffer1: smem<16x16xf32> = alloc()
+            %shared: lock<mbar> = alloc()
+            %buffer2: smem<16x16xf32> = alloc()
+            async(%shared: lock<mbar>) collective=xyz.cluster tma_move(%buffer2: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.cluster attrs={multicast: True}
+            async(%local0: lock<mbar>) collective=xyz.block tma_move(%buffer0: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.block
+            async(%local1: lock<mbar>) collective=xyz.block tma_move(%buffer1: smem<16x16xf32>, %desc: tma_desc<arg_idx=0 gmem<16x16xf32> tile=16x16>, %c0: index, %c0: index) collective=xyz.block
+            await(%shared: lock<mbar>)
+            await(%local0: lock<mbar>)
+            await(%local1: lock<mbar>)
+          }
+        }"""))  # noqa: E501
+
+    insert_syncs(module)
+    lower_to_ptx_template(module)
+    ptx = "".join(
+        op.template for op in find_ops_of_type(module, PTXTemplateOp)
+    )
+
+    assert ptx.count("mbarrier.init.shared::cta.b64") == 3
+    assert ptx.count("bar.sync 0;") == 0
+    assert ptx.count("barrier.cluster.arrive.release;") == 1
+    assert ptx.count("barrier.cluster.wait.acquire;") == 1
 
 
 def test_batches_consecutive_lock_initialization_rendezvous():
@@ -349,7 +391,6 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
     assert_contains_in_order(
         ptx,
         "fence.mbarrier_init.release.cluster;",
-        "bar.sync 0;",
         "barrier.cluster.arrive.release;",
         "barrier.cluster.wait.acquire;",
     )

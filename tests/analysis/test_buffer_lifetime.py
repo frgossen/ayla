@@ -225,8 +225,10 @@ def test_buffer_stays_live_until_its_async_await():
     analysis = BufferLifetimeAnalysis()
     analysis.analyze(module)
 
-    assert analysis.live_in(between).buffers == frozenset({alloc.result()})
-    assert analysis.live_in(await_op).buffers == frozenset({alloc.result()})
+    # The lock is accessed by the async and the await, so it is live too.
+    live = frozenset({lock.result(), alloc.result()})
+    assert analysis.live_in(between).buffers == live
+    assert analysis.live_in(await_op).buffers == live
 
 
 def test_unmodelled_memory_effect_fails_loudly():

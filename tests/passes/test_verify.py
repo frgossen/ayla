@@ -473,7 +473,7 @@ def _linearized_multicast_kernel(shared_operand: str) -> str:
     return textwrap.dedent(f"""\
         module {{
           kernel @linear(%src: gmem<32x16xf32>) grid_dim=[4, 1, 1] cluster_dim=[2, 1, 1] {{
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c2: index = index_constant() attrs={{value: 2}}
             %m: index = index_div(%bx: index, %c2: index)
             %n: index = index_mod(%bx: index, %c2: index)
@@ -504,7 +504,7 @@ def test_tma_multicast_checks_every_wave_of_a_fixed_grid():
         return textwrap.dedent(f"""\
             module {{
               kernel @waves(%src: gmem<32x16xf32>) grid_dim=[2, 1, 1] cluster_dim=[2, 1, 1] {{
-                %bx: index, %by: index, %bz: index = block_ids()
+                %bx: index = block_id.x
                 %c2: index = index_constant() attrs={{value: 2}}
                 %dst: smem<16x16xf32> = alloc() attrs={{id: 0}}
                 for (%w: index = 0 to 2) attrs={{label: "waves"}} {{

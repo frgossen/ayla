@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 
 from ..gpu_dialect import (
+    AllocOp,
     AsyncOp,
     AwaitOp,
     TmaMoveOp,
@@ -152,6 +153,14 @@ def _hoist_async_moves(ops: list[Op]) -> None:
         [op for op in ops if _is_async_move(op)], ops
     )
     _bubble(ops, targets, step=-1)
+    # Each move now sits just below its own allocations, between the others'.
+    # An allocation without an initializer has no operands, so move those back
+    # to the front, in order: lock initializations then stay together, and one
+    # barrier publishes them all.
+    allocations = [
+        op for op in ops if isinstance(op, AllocOp) and op.init is None
+    ]
+    ops[:] = allocations + [op for op in ops if op not in set(allocations)]
 
 
 def _sink_awaits(ops: list[Op]) -> None:

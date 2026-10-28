@@ -51,14 +51,22 @@ class BarrierScope(enum.IntEnum):
     Direct cover edges, from wider to narrower scope::
 
         GRID -> CLUSTER
-        CLUSTER -> {CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
-        CLUSTER_TO_LEADER -> BLOCK
+        CLUSTER -> {BLOCK, CLUSTER_TO_LEADER, LEADER_TO_CLUSTER}
+        CLUSTER_TO_LEADER -> BLOCK_TO_LEADER
         BLOCK -> {WARPGROUP, BLOCK_TO_LEADER, LEADER_TO_BLOCK}
         WARPGROUP -> WARP
-        {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK,
-         CLUSTER_TO_LEADER, LEADER_TO_CLUSTER} -> THREAD
+        {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK, LEADER_TO_CLUSTER} -> THREAD
 
-    The four directional scopes are pairwise independent.
+    ``CLUSTER_TO_LEADER -> BLOCK_TO_LEADER`` is a choice: we define the
+    cluster gather as two-level, because one cluster mbarrier arrival per CTA
+    is what the hardware offers. Each CTA first gathers its threads at its
+    block leader, then the block leaders arrive at the cluster leader. That
+    first level is a block-to-leader gather, so a group that needs both, such
+    as fused local and multicast TMA loads, is covered by one cluster gather
+    instead of a full cluster barrier. The broadcast is not the mirror image:
+    ``LEADER_TO_CLUSTER`` publishes only the cluster leader's work, and block
+    leaders release nothing in it, so it does not include ``LEADER_TO_BLOCK``.
+    The other directional scopes are pairwise independent.
     """
     THREAD = 0
     WARP = 1
@@ -73,14 +81,35 @@ class BarrierScope(enum.IntEnum):
 
     def join(self, other: BarrierScope) -> BarrierScope:
         """The join (least upper bound) on the BarrierScope lattice."""
-        common_upper_bounds = [
-            scope for scope in BarrierScope
-            if self.leq(scope) and other.leq(scope)
-        ]
-        [least] = [
-            candidate for candidate in common_upper_bounds
-            if all(candidate.leq(scope) for scope in common_upper_bounds)
-        ]
+        # The docstring's cover edges, from each scope to those directly above.
+        immediate_upper_bounds = {
+            BarrierScope.THREAD: (
+                BarrierScope.WARP,
+                BarrierScope.BLOCK_TO_LEADER,
+                BarrierScope.LEADER_TO_BLOCK,
+                BarrierScope.LEADER_TO_CLUSTER,
+            ),
+            BarrierScope.WARP: (BarrierScope.WARPGROUP,),
+            BarrierScope.WARPGROUP: (BarrierScope.BLOCK,),
+            BarrierScope.BLOCK_TO_LEADER: (
+                BarrierScope.BLOCK, BarrierScope.CLUSTER_TO_LEADER,
+            ),
+            BarrierScope.LEADER_TO_BLOCK: (BarrierScope.BLOCK,),
+            BarrierScope.BLOCK: (BarrierScope.CLUSTER,),
+            BarrierScope.CLUSTER_TO_LEADER: (BarrierScope.CLUSTER,),
+            BarrierScope.LEADER_TO_CLUSTER: (BarrierScope.CLUSTER,),
+            BarrierScope.CLUSTER: (BarrierScope.GRID,),
+            BarrierScope.GRID: (),
+        }
+
+        def upper_bounds(scope: BarrierScope) -> set[BarrierScope]:
+            bounds = {scope}
+            for upper in immediate_upper_bounds[scope]:
+                bounds |= upper_bounds(upper)
+            return bounds
+
+        common = upper_bounds(self) & upper_bounds(other)
+        [least] = [scope for scope in common if upper_bounds(scope) == common]
         return least
 
     def leq(self, other: BarrierScope) -> bool:

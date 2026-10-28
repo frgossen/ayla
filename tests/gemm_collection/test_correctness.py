@@ -465,6 +465,24 @@ def test_two_dimensional_warpgroup_tiles_match_torch():
     kernel = make_ptx_kernel(module)
     launcher = make_ptx_launcher(kernel)
     torch.manual_seed(17)
+
+
+@pytest.mark.parametrize("cluster", [(2, 1), (1, 2)])
+@pytest.mark.parametrize("output_m_tiles_per_cta", [1, 2])
+def test_multicast_gemm_matches_torch(cluster, output_m_tiles_per_cta):
+    # Four stages over eight k-steps release and refill every stage; two
+    # output tiles per CTA refill stages again after the first epilogue.
+    m, n, k = 512, 512, 512
+    shared = "rhs" if cluster == (2, 1) else "lhs"
+    module = auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m, n=n, k=k, output_m_tile=64, output_n_tile=128,
+        warpgroup_n_tile=64, output_slices=2, operand_stages=4,
+        output_m_tiles_per_cta=output_m_tiles_per_cta,
+        operand_move_attrs={shared: {"multicast": True}},
+    )
+    module.body.ops[0].attrs["cluster_dim"] = [*cluster, 1]
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    torch.manual_seed(11)
     lhs = torch.randn((m, k), dtype=BF16, device="cuda")
     rhs = torch.randn((n, k), dtype=BF16, device="cuda")
     actual = torch.empty((m, n), dtype=BF16, device="cuda")
@@ -472,8 +490,7 @@ def test_two_dimensional_warpgroup_tiles_match_torch():
     launcher(lhs, rhs, actual)
     torch.cuda.synchronize()
 
-    assert kernel.block_dim == (512, 1, 1)
-    torch.testing.assert_close(actual, torch.mm(lhs, rhs.T))
+    assert torch.equal(actual, torch.mm(lhs, rhs.T))
 
 
 def test_four_tile_output_evict_first_reaches_tma_stores():
