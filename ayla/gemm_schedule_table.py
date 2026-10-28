@@ -7,6 +7,7 @@ Each shape lists its winner first, then other seeds measured on that shape.
 BF16 shapes then add up to ten distinct schedule families from their
 inference-v2 screens (benchmarks/select_gemm_schedule_families.py).
 Canonical NT BF16 decoder schedules add their compatible measured seeds first.
+Decoder shapes whose in-graph search won end to end list that schedule first.
 Fields not listed take the defaults in :mod:`ayla.gemm_jit`.
 """
 # fmt: off
@@ -1866,6 +1867,14 @@ CONFIGS: tuple[dict[str, object], ...] = (
     dict(dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_last', operand_k_tile=64, operand_stages=4, output_cta_count=None, output_m_tile=128, output_n_tile=144, output_n_tiles_per_cta=1, output_slices=1, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=3, output_tma_inner_size=None, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_last', rhs_l2_promotion='256B', unroll_output_tiles=True, warpgroup_n_tile=144),
     dict(dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_last', operand_k_tile=64, operand_stages=4, output_cta_count=None, output_m_tile=128, output_n_tile=144, output_n_tiles_per_cta=2, output_slices=1, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=1, output_tma_inner_size=None, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_last', rhs_l2_promotion='256B', unroll_output_tiles=True, warpgroup_n_tile=144),
     dict(dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_last', operand_k_tile=64, operand_stages=4, output_cta_count=None, output_m_tile=128, output_n_tile=144, output_n_tiles_per_cta=4, output_slices=1, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=1, output_tma_inner_size=None, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_last', rhs_l2_promotion='256B', unroll_output_tiles=True, warpgroup_n_tile=144),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_last', operand_k_tile=64, operand_stages=3, output_cta_count=128, output_m_tile=256, output_n_tile=128, output_n_tiles_per_cta=1, output_slices=2, output_store='stmatrix', output_store_buffers=2, output_tile_fast_axis='n', output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=True, pipeline_output_writeback=True, ptx_optimization_level=None, reschedule_async=True, rhs_l2_cache_hint='evict_last', unroll_output_tiles=False, warpgroup_m_tile=64, warpgroup_n_tile=128),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint='evict_first', lhs_l2_promotion='256B', operand_k_tile=64, operand_stages=3, output_cta_count=128, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=1, output_slices=4, output_store='stmatrix', output_store_buffers=4, output_tile_fast_axis='n', output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=True, pipeline_output_writeback=True, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_first', unroll_output_tiles=False, warpgroup_m_tile=None, warpgroup_n_tile=256),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint=None, operand_k_tile=64, operand_stages=3, output_cta_count=None, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=1, output_slices=4, output_store='stmatrix', output_store_buffers=1, output_tile_fast_axis='m', output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=False, pipeline_output_writeback=False, ptx_optimization_level=None, reschedule_async=True, rhs_l2_cache_hint='evict_first', rhs_l2_promotion='256B', transpose_output=True, unroll_output_tiles=True, warpgroup_m_tile=None, warpgroup_n_tile=256),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_last', lhs_l2_promotion='256B', operand_k_tile=64, operand_stages=3, output_cta_count=128, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=1, output_slices=4, output_store='stmatrix', output_store_buffers=4, output_tile_fast_axis='m', output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=True, pipeline_output_writeback=True, ptx_optimization_level=1, reschedule_async=True, rhs_l2_cache_hint=None, rhs_l2_promotion=None, unroll_output_tiles=False, warpgroup_fast_axis='n', warpgroup_m_tile=None, warpgroup_n_tile=256),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint='evict_last', operand_k_tile=64, operand_stages=5, output_cta_count=None, output_m_tile=128, output_n_tile=128, output_n_tiles_per_cta=1, output_slices=2, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=False, pipeline_output_writeback=False, ptx_optimization_level=None, reschedule_async=True, rhs_l2_cache_hint='evict_first', unroll_output_tiles=True, warpgroup_m_tile=None, warpgroup_n_tile=128),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint=None, lhs_l2_promotion='256B', operand_k_tile=64, operand_stages=3, output_cta_count=None, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=1, output_slices=4, output_store='stmatrix', output_store_buffers=1, output_tile_fast_axis='m', output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=False, pipeline_output_writeback=False, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_first', rhs_l2_promotion='256B', transpose_output=True, unroll_output_tiles=True, warpgroup_m_tile=None, warpgroup_n_tile=256),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_first', lhs_l2_cache_hint='evict_last', operand_k_tile=64, operand_stages=4, output_cta_count=None, output_m_tile=128, output_n_tile=192, output_n_tiles_per_cta=1, output_slices=3, output_store='stmatrix', output_store_buffers=1, output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=False, pipeline_output_writeback=False, ptx_optimization_level=None, reschedule_async=True, rhs_l2_cache_hint='evict_first', unroll_output_tiles=True, warpgroup_m_tile=None, warpgroup_n_tile=192),
+    dict(cyclic_operand_pipeline=False, dst_l2_cache_hint='evict_last', lhs_l2_cache_hint=None, operand_k_tile=64, operand_stages=3, output_cta_count=132, output_m_tile=128, output_n_tile=256, output_n_tiles_per_cta=1, output_slices=4, output_store='stmatrix', output_store_buffers=4, output_tile_fast_axis='m', output_tiles_per_cta=1, output_tma_inner_size=128, pipeline_output_waves=True, pipeline_output_writeback=True, ptx_optimization_level=2, reschedule_async=True, rhs_l2_cache_hint='evict_last', rhs_l2_promotion='256B', unroll_output_tiles=False, warpgroup_m_tile=None, warpgroup_n_tile=256),
 )
 
 # (operation, dtype) -> (batch, m, n, k) -> indices into CONFIGS, best first.
@@ -1890,7 +1899,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 256, 1024, 512): (73, 115),
         (1, 512, 1000, 1280): (118,),
         (1, 1000, 512, 2880): (53, 8),
-        (1, 1000, 2880, 4096): (11, 19),
+        (1, 1000, 2880, 4096): (1861, 11, 19),
         (1, 1000, 4096, 2880): (14, 12),
         (1, 1500, 384, 384): (54, 53, 64),
         (1, 1500, 384, 1536): (53,),
@@ -1907,8 +1916,8 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 4096, 1024, 4096): (99,),
         (1, 4096, 1536, 1536): (103,),
         (1, 4096, 1536, 6144): (108,),
-        (1, 4096, 2048, 2048): (607,),
-        (1, 4096, 2048, 8192): (99,),
+        (1, 4096, 2048, 2048): (1856, 607),
+        (1, 4096, 2048, 8192): (1857, 99),
         (1, 4096, 2560, 2560): (606,),
         (1, 4096, 2560, 10240): (611,),
         (1, 4096, 4096, 128): (106,),
@@ -1916,7 +1925,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 4096, 4096, 4096): (619, 608, 69, 90, 106),
         (1, 4096, 4096, 16384): (629, 608, 69, 90, 14),
         (1, 4096, 6144, 1536): (69, 607),
-        (1, 4096, 8192, 2048): (624, 69),
+        (1, 4096, 8192, 2048): (1858, 624, 69),
         (1, 4096, 10240, 2560): (69, 15),
         (1, 4096, 16384, 4096): (69, 15),
         (1, 4096, 30000, 128): (104,),
@@ -1940,7 +1949,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 16384, 768, 3072): (635, 473, 604, 141),
         (1, 16384, 1024, 1024): (473, 605),
         (1, 16384, 1024, 4096): (610,),
-        (1, 16384, 2304, 768): (616, 605),
+        (1, 16384, 2304, 768): (1855, 616, 605),
         (1, 16384, 3072, 768): (626, 474, 616),
         (1, 16384, 4096, 1024): (538, 491),
         (1, 16384, 30528, 768): (632, 69),
@@ -2237,7 +2246,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (512, 128, 64, 128): (158, 170),
         (512, 128, 80, 128): (169,),
         (512, 128, 128, 64): (1625, 1626, 1627, 1628, 1629, 1630, 1631, 1632, 1633, 1634),
-        (512, 128, 128, 128): (153, 157),
+        (512, 128, 128, 128): (1859, 153, 157),
         (512, 512, 64, 512): (206, 210, 208),
         (512, 512, 512, 64): (196, 199),
         (1024, 64, 128, 128): (221, 223),
@@ -2428,9 +2437,9 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 1000, 768, 128): (129, 982, 983, 984, 486, 274, 384, 273, 985, 986),
         (1, 1000, 1024, 128): (384, 275, 1568, 1569, 506, 70, 1570, 1571, 247, 569),
         (1, 1000, 1024, 1024): (1653, 1654, 1655, 1656, 1657, 470, 1226, 1227),
-        (1, 1000, 1024, 2048): (1658, 1659, 1660, 1661, 1662, 1663, 1664, 1665, 1666, 1667),
+        (1, 1000, 1024, 2048): (407, 1658, 1659, 1660, 1661, 1662, 1663, 1664, 1665, 1666, 1667),
         (1, 1000, 1024, 2304): (1659, 1663, 1668, 1669, 1670, 1671, 263, 1426),
-        (1, 1000, 1024, 2560): (1672, 1673, 1674, 1675, 1676, 1677, 1678, 1660, 1679, 1680),
+        (1, 1000, 1024, 2560): (261, 1672, 1673, 1674, 1675, 1676, 1677, 1678, 1660, 1679, 1680),
         (1, 1000, 1024, 3072): (1681, 1682, 1683, 1684, 1685, 1686, 1687, 1679, 487, 830),
         (1, 1000, 1024, 4096): (1653, 1688, 1689, 1690, 1677, 1686, 1680, 1691, 1692, 1672),
         (1, 1000, 1280, 128): (70, 302, 717, 119, 327, 533, 506, 245, 273, 129),
@@ -2455,7 +2464,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 1000, 10240, 2560): (1645, 1646, 1647, 1648, 1649, 1650, 1651, 1652, 625, 468),
         (1, 1000, 14336, 4096): (1693, 1694, 1695, 1696, 1697, 1698, 1699, 1700, 1701, 1702),
         (1, 1000, 32768, 4096): (1780, 1781, 1782, 1783, 1784, 1785, 1786, 1787, 1788, 1789),
-        (1, 1000, 151936, 1024): (1703, 1704, 1705, 1706, 561, 747, 1486, 1487, 1488),
+        (1, 1000, 151936, 1024): (1862, 1703, 1704, 1705, 1706, 561, 747, 1486, 1487, 1488),
         (1, 1000, 201088, 2880): (1707, 1708, 1709, 1710, 1711, 1704, 1712, 1713, 1714, 1715),
         (1, 1000, 256000, 2304): (1753, 1754, 1704, 1755, 1756, 1757, 1706, 1705, 1758, 1759),
         (1, 1000, 262208, 2560): (1767, 1768, 1706, 1704, 1769, 1770, 1771, 1772, 1773, 1774),
@@ -2515,7 +2524,7 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 4096, 1024, 16384): (99, 559, 817, 456, 818, 1329, 675, 375, 819),
         (1, 4096, 1536, 1536): (463, 645, 646, 647, 648, 649, 650, 651),
         (1, 4096, 1536, 6144): (495, 1018, 1336, 1020, 1337, 1338),
-        (1, 4096, 2048, 2048): (1826, 1827, 1828, 1829, 1830, 1831, 1832, 1833, 381, 793),
+        (1, 4096, 2048, 2048): (1860, 1826, 1827, 1828, 1829, 1830, 1831, 1832, 1833, 381, 793),
         (1, 4096, 2048, 8192): (99, 818, 817, 456, 1328, 590, 1329, 69, 1330),
         (1, 4096, 2560, 2560): (530, 1151, 1152, 1153, 1154),
         (1, 4096, 2560, 10240): (589, 1211, 1153, 1212),
