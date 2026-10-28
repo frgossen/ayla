@@ -40,13 +40,24 @@ being stored on feature branches does not mean it was merged into main.
 
 ## Verification
 
-The narrowed consolidated branch passed all 777 GPU tests, Ruff, and Pyright.
-FP16/BF16 MM, ADDMM, and BMM routing and CUDA graph replay are covered.
+Both branches passed Ruff and Pyright on PyTorch 2.13/CUDA 13.0 with H100 GPUs.
 
-Current split results and commands are stored in
-`/home/arseniivanov/ayla/.git/pr-triage/split-*`. The previous combined snapshot
-passed 816 GPU tests, Ruff, and Pyright. Its benchmark evidence remains in
-`feature-benchmark-gemm.txt` and `feature-benchmark-swiglu.{txt,json}` there.
+| Branch | GPU suite | Benchmark checks |
+| --- | --- | --- |
+| `feature/consolidated` | 777 passed, no skips | OSS MM/ADDMM/BMM samples passed numerical checks; 4096 BF16 collection comparison completed |
+| `feature/gemm-chains` | 816 passed, no skips | SwiGLU M=32 passed numerical/finite-output checks; eager, compiled, and Ayla hot-cache timings completed |
+
+FP16/BF16 MM, ADDMM, and BMM routing and CUDA graph replay are covered on both
+branches. The development implementation matches the pre-split snapshot,
+except removal of one duplicate package export.
+
+Consolidated sample medians: MM 0.0102 ms, ADDMM 0.0091 ms, BMM 0.0071 ms.
+The 4096 BF16 collection sample measured Ayla 0.1973 ms versus Torch 0.2019 ms.
+SwiGLU M=32 measured Ayla 0.3848 ms versus compiled Torch 0.4032 ms. These are
+smoke measurements, not a rerun of the full OSS or better-benchmark corpus.
+
+Exact results are stored in `/home/arseniivanov/ayla/.git/pr-triage/split-*`.
+The previous full integration evidence remains in `feature-*` files there.
 
 ## Forking
 

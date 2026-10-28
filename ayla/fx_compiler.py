@@ -1,0 +1,711 @@
+"""Translate matched post-grad FX regions into high-level Ayla GPU IR."""
+
+from __future__ import annotations
+
+import operator
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import cast
+
+import torch
+from torch.fx import Node
+from torch._inductor.pattern_matcher import (
+    MULTIPLE,
+    CallFunctionVarArgs,
+    Match,
+    PatternMatcherPass,
+)
+
+from .base.ir import Block, Op, Value
+from .fx_pipeline import register_fx_kernel_rewrite
+from .jit_compiler import (
+    JITCompiler,
+    LauncherPlan,
+    TensorSignature,
+)
+from .gpu_dialect import (
+    AllocOp,
+    BlockIdOp,
+    CollectiveAxis,
+    CollectiveLevel,
+    ConstantOp,
+    ElementwiseOp,
+    F32Type,
+    GmemTensorType,
+    KernelOp,
+    MatmulOp,
+    ModuleOp,
+    ReshapeOp,
+    RmemTensorType,
+    TileOp,
+    Type,
+)
+from .passes._utils import build_slice_tile
+from .torch_custom_call import (
+    DEFAULT_NAMESPACE,
+    OperandKind,
+    from_torch_dtype,
+)
+
+
+_ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
+    torch.ops.prims.convert_element_type.default: ("convert", 1),
+    torch.ops.aten.sigmoid.default: ("sigmoid", 1),
+    torch.ops.aten.silu.default: ("silu", 1),
+    torch.ops.aten.mul.Tensor: ("mul", 2),
+}
+
+
+@dataclass(frozen=True)
+class FxRegionMatch:
+    """The boundary of one single-output FX region."""
+
+    output: Node
+    inputs: tuple[Node, ...]
+
+
+_MATMUL_OPS: dict[object, tuple[int | None, int, int]] = {
+    torch.ops.aten.mm.default: (None, 0, 1),
+    torch.ops.aten.addmm.default: (0, 1, 2),
+    torch.ops.aten.bmm.default: (None, 0, 1),
+}
+
+# TODO: Derive discovery support from the Ayla importer once primitive math
+# operations have complete import and lowering support. Today add, div, exp,
+# and neg are included only so discovery can traverse the hardcoded
+# decomposed-SiLU pattern; they are not independently importable.
+_SUPPORTED_FX_TARGETS = {
+    *_MATMUL_OPS,
+    operator.getitem,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.cat.default,
+    torch.ops.aten.clone.default,
+    torch.ops.aten.div.Tensor,
+    torch.ops.aten.exp.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.neg.default,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.sigmoid.default,
+    torch.ops.aten.silu.default,
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.split.Tensor,
+    torch.ops.aten.split_with_sizes.default,
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.view.default,
+    torch.ops.prims.convert_element_type.default,
+}
+
+
+def _is_supported_fx_node(node: Node) -> bool:
+    return node.op == "call_function" and node.target in _SUPPORTED_FX_TARGETS
+
+
+def discover_supported_fx_region(
+    output: Node,
+    *,
+    require_maximal: bool = True,
+) -> FxRegionMatch | None:
+    """Find the maximal self-contained supported region ending at ``output``.
+
+    A node is considered an anchor only when no supported operation consumes
+    it. Walking backward then identifies supported computation and treats all
+    other producers as ordered region inputs. Values escaping from the middle
+    of the candidate make it ineligible for replacement.
+    """
+    if not _is_supported_fx_node(output) or (
+        require_maximal and any(_is_supported_fx_node(user) for user in output.users)
+    ):
+        return None
+
+    region: set[Node] = set()
+    boundary_set: set[Node] = set()
+    boundaries: list[Node] = []
+
+    def visit(node: Node) -> None:
+        if node in region or node in boundary_set:
+            return
+        if not _is_supported_fx_node(node):
+            boundary_set.add(node)
+            boundaries.append(node)
+            return
+        region.add(node)
+        for argument in node.all_input_nodes:
+            visit(argument)
+
+    visit(output)
+    if any(node is not output and set(node.users) - region for node in region):
+        return None
+    return FxRegionMatch(output=output, inputs=tuple(boundaries))
+
+
+def _node_tensor(node: Node) -> torch.Tensor:
+    tensor = node.meta.get("val")
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"{node.name}: missing tensor metadata")
+    return tensor
+
+
+def _tensor_type(tensor: torch.Tensor) -> GmemTensorType:
+    def static(value: object) -> int | None:
+        return value if isinstance(value, int) else None
+
+    return GmemTensorType.build(
+        [static(size) for size in tensor.shape],
+        from_torch_dtype(tensor.dtype),
+        strides=[static(stride) for stride in tensor.stride()],
+    )
+
+
+def _node_type(node: Node) -> GmemTensorType:
+    return _tensor_type(_node_tensor(node))
+
+
+def _region_nodes(match: FxRegionMatch) -> list[Node]:
+    inputs = set(match.inputs)
+    seen: set[Node] = set()
+    ordered: list[Node] = []
+
+    def visit(node: Node) -> None:
+        if node in inputs or node in seen:
+            return
+        seen.add(node)
+        for argument in node.all_input_nodes:
+            visit(argument)
+        ordered.append(node)
+
+    visit(match.output)
+    region = set(ordered)
+    for node in ordered:
+        if node is match.output:
+            continue
+        outside_users = set(node.users) - region
+        if outside_users:
+            users = ", ".join(sorted(user.name for user in outside_users))
+            raise ValueError(f"{node.name}: region value has external users: {users}")
+    return ordered
+
+
+def _node_argument(value: object, *, owner: Node) -> Node:
+    if not isinstance(value, Node):
+        raise ValueError(f"{owner.name}: expected tensor node, got {value!r}")
+    return value
+
+
+def _call_node(node: object, target: object, num_args: int) -> Node | None:
+    if (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target is target
+        and len(node.args) == num_args
+    ):
+        return node
+    return None
+
+
+def _decomposed_silu(
+    node: Node,
+) -> tuple[Node, set[Node]] | None:
+    """Recognize the post-grad ``x * sigmoid(x)`` expansion ending in BF16."""
+    # TODO: Import the primitive math operations into Ayla IR, then recognize
+    # and lower compound expressions there. Keep this targeted FX match only
+    # until neg, exp, add, and div have complete Ayla lowering support.
+    conversion = _call_node(
+        node,
+        torch.ops.prims.convert_element_type.default,
+        2,
+    )
+    if conversion is None or conversion.args[1] is not torch.bfloat16:
+        return None
+    div = _call_node(conversion.args[0], torch.ops.aten.div.Tensor, 2)
+    if div is None:
+        return None
+    source, denominator = div.args
+    denominator = _call_node(
+        denominator,
+        torch.ops.aten.add.Tensor,
+        2,
+    )
+    if not isinstance(source, Node) or denominator is None:
+        return None
+    exp, one = denominator.args
+    exp = _call_node(exp, torch.ops.aten.exp.default, 1)
+    if one != 1 or exp is None:
+        return None
+    neg = _call_node(exp.args[0], torch.ops.aten.neg.default, 1)
+    if neg is None:
+        return None
+    if (
+        neg.args[0] is not source
+        or set(neg.users) != {exp}
+        or set(exp.users) != {denominator}
+        or set(denominator.users) != {div}
+        or set(div.users) != {conversion}
+    ):
+        return None
+    return source, {div, denominator, exp, neg}
+
+
+def _allocate(
+    node: Node,
+    output: Node,
+    output_value: Value,
+    ops: list[Op],
+    destinations: dict[Node, Value],
+) -> Value:
+    destination = destinations.get(node)
+    if destination is not None:
+        return destination
+    if node is output:
+        return output_value
+    alloc = AllocOp.build_with_fresh_id(_node_type(node))
+    ops.append(alloc)
+    return alloc.result()
+
+
+def _transpose_source(node: Node) -> Node | None:
+    # TODO: Import arbitrary FX permutations once the GPU dialect can express
+    # strided aliasing views. For now, recognize only the weight transpose of
+    # the two innermost dimensions that can be elided because Ayla matmul
+    # already expects an [N, K] RHS.
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.aten.permute.default
+        or len(node.args) != 2
+    ):
+        return None
+    permutation = list(cast(list[int], node.args[1]))
+    rank = len(permutation)
+    if permutation != [*range(rank - 2), rank - 1, rank - 2]:
+        return None
+    return _node_argument(node.args[0], owner=node)
+
+
+def _batch_matrix(value: Value, batch: Value, ops: list[Op]) -> Value:
+    """View the matrix at index ``batch`` of a rank-3 tensor."""
+    typ = value.type
+    assert isinstance(typ, GmemTensorType) and typ.rank == 3
+    tile = TileOp.build(
+        value,
+        [batch, 0, 0],
+        GmemTensorType.build(
+            [1, *typ.sizes[1:]],
+            typ.dtype,
+            strides=list(typ.strides),
+        ),
+    )
+    matrix = ReshapeOp.build(
+        tile.result(),
+        GmemTensorType.build(
+            list(typ.sizes[1:]),
+            typ.dtype,
+            strides=list(typ.strides[1:]),
+        ),
+    )
+    ops.extend([tile, matrix])
+    return matrix.result()
+
+
+def fx_region_to_module(
+    match: FxRegionMatch,
+    *,
+    name: str,
+) -> ModuleOp:
+    """Import one single-output FX region into unscheduled Ayla GPU IR.
+
+    The importer currently covers the operators needed by the fused GEMM
+    examples: transposed-weight matmul, reshape, slicing, BF16/FP32 conversion,
+    sigmoid/SiLU, and multiplication. Unsupported operations fail explicitly.
+    """
+    if match.output in match.inputs:
+        raise ValueError("FX region output cannot also be an input")
+    nodes = _region_nodes(match)
+    region = set(nodes)
+    values = {node: Value(node.name, _node_type(node)) for node in match.inputs}
+    output_value = Value(match.output.name, _node_type(match.output))
+    ops: list[Op] = []
+    destinations = {match.output: output_value}
+    cat_values: dict[Node, Value] = {}
+    # A cat is free when its producers write directly into its result slices.
+    for node in reversed(nodes):
+        if node.target is not torch.ops.aten.cat.default:
+            continue
+        destination = destinations.get(node)
+        if destination is None:
+            allocation = AllocOp.build_with_fresh_id(_node_type(node))
+            ops.append(allocation)
+            destination = allocation.result()
+        arguments = cast(list[Node], node.args[0])
+        dim = (
+            cast(
+                int,
+                node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0),
+            )
+            % _node_type(node).rank
+        )
+        offset = 0
+        for argument in arguments:
+            if not (
+                argument.target is torch.ops.aten.cat.default
+                or argument.target is torch.ops.aten.mm.default
+                or argument.target in _ELEMENTWISE_OPS
+            ):
+                raise ValueError(
+                    f"{node.name}: cat inputs must be produced in the region"
+                )
+            size = cast(int, _node_type(argument).sizes[dim])
+            index, remainder = divmod(offset, size)
+            if remainder:
+                raise ValueError(f"{node.name}: cat slices must be tile-aligned")
+            tile = build_slice_tile(destination, dim, index, size)
+            ops.append(tile)
+            if argument in destinations:
+                raise ValueError(f"{argument.name}: has multiple destinations")
+            destinations[argument] = tile.result()
+            offset += size
+        cat_values[node] = destination
+    matmul_index = 0
+    grid_dim: tuple[int | None, int | None, int | None] = (None, None, None)
+    batch_id: BlockIdOp | None = None
+
+    silu_sources: dict[Node, Node] = {}
+    skipped: set[Node] = set()
+    for node in nodes:
+        decomposed = _decomposed_silu(node)
+        if decomposed is not None:
+            source, internal = decomposed
+            silu_sources[node] = source
+            skipped.update(internal)
+
+    for node in nodes:
+        if node in skipped:
+            continue
+        if node.op != "call_function":
+            raise ValueError(f"{node.name}: unsupported FX node kind {node.op!r}")
+
+        if node.target in (
+            torch.ops.aten.split.Tensor,
+            torch.ops.aten.split_with_sizes.default,
+        ):
+            continue
+
+        if node.target is operator.getitem:
+            split, index = cast(tuple[Node, int], node.args)
+            if index < 0:
+                raise ValueError(f"{node.name}: negative split index is unsupported")
+            source_arg, split_spec, *optional_dim = split.args
+            source = _node_argument(source_arg, owner=split)
+            dim = cast(int, optional_dim[0] if optional_dim else 0)
+            dim %= _node_type(source).rank
+            if split.target is torch.ops.aten.split_with_sizes.default:
+                sizes = cast(list[int], split_spec)
+                start = sum(sizes[:index])
+            elif split.target is torch.ops.aten.split.Tensor:
+                start = index * cast(int, split_spec)
+            else:
+                raise ValueError(f"{node.name}: getitem requires a split")
+            size = cast(int, _node_type(node).sizes[dim])
+            tile_index, remainder = divmod(start, size)
+            if remainder:
+                raise ValueError(f"{node.name}: split must be tile-aligned")
+            tile = build_slice_tile(values[source], dim, tile_index, size)
+            ops.append(tile)
+            values[node] = tile.result()
+            continue
+
+        if node.target is torch.ops.aten.cat.default:
+            values[node] = cat_values[node]
+            continue
+
+        if node.target in (
+            torch.ops.aten.clone.default,
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.view.default,
+        ):
+            source = _node_argument(node.args[0], owner=node)
+            source_type = _node_type(source)
+            result_type = _node_type(node)
+            if node.target is torch.ops.aten.clone.default and (
+                source_type.sizes != result_type.sizes
+                or any(
+                    size != 1 and source_stride != result_stride
+                    for size, source_stride, result_stride in zip(
+                        source_type.sizes,
+                        source_type.strides,
+                        result_type.strides,
+                        strict=True,
+                    )
+                )
+            ):
+                raise ValueError(f"{node.name}: clone changes layout")
+            reshape = ReshapeOp.build(values[source], _node_type(node))
+            ops.append(reshape)
+            values[node] = reshape.result()
+            continue
+
+        transpose_source = _transpose_source(node)
+        if transpose_source is not None:
+            if not all(
+                user.target in _MATMUL_OPS
+                and user.args[_MATMUL_OPS[user.target][2]] is node
+                for user in node.users
+            ):
+                raise ValueError(
+                    f"{node.name}: transpose is supported only for matmul weights"
+                )
+            values[node] = values[transpose_source]
+            continue
+
+        matmul = _MATMUL_OPS.get(node.target)
+        if matmul is not None:
+            init_index, lhs_index, rhs_index = matmul
+            if any(node.kwargs.get(scale, 1) != 1 for scale in ("alpha", "beta")):
+                raise ValueError(f"{node.name}: scaled matmuls are unsupported")
+            lhs_node = _node_argument(node.args[lhs_index], owner=node)
+            rhs_node = _node_argument(node.args[rhs_index], owner=node)
+            rhs_source = _transpose_source(rhs_node)
+            if rhs_source is None:
+                raise ValueError(f"{node.name}: matmul RHS must be a transposed weight")
+            dst = _allocate(node, match.output, output_value, ops, destinations)
+            label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
+            matmul_index += 1
+            if init_index is None:
+                zero = ConstantOp.build(
+                    0.0,
+                    RmemTensorType.build([], F32Type()),
+                )
+                ops.append(zero)
+                init = zero.result()
+            else:
+                bias = _node_argument(node.args[init_index], owner=node)
+                region_users = set(bias.users) & region
+                if bias not in match.inputs or region_users != {node}:
+                    raise ValueError(f"{node.name}: matmul bias must be a region input")
+                # Torch broadcasts the bias to the output; Ayla reads the same
+                # memory through the zero strides of that broadcast view.
+                init = values[bias] = Value(
+                    bias.name,
+                    _tensor_type(
+                        _node_tensor(bias).expand(_node_tensor(node).shape),
+                    ),
+                )
+            operands = [values[lhs_node], values[rhs_source], dst]
+            output_type = _node_type(node)
+            if output_type.rank == 3:
+                # Each grid z index computes the matmul of one batch.
+                batch = output_type.sizes[0]
+                if not isinstance(batch, int) or grid_dim[2] not in (
+                    None,
+                    batch,
+                ):
+                    raise ValueError(f"{node.name}: batch must be static and shared")
+                grid_dim = (None, None, batch)
+                if batch_id is None:
+                    batch_id = BlockIdOp.build(CollectiveAxis.Z)
+                    ops.append(batch_id)
+                operands = [
+                    _batch_matrix(operand, batch_id.value, ops) for operand in operands
+                ]
+            ops.append(
+                MatmulOp.build(
+                    *operands,
+                    collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
+                    init=init,
+                    attrs={"label": label},
+                )
+            )
+            values[node] = dst
+            continue
+
+        if node.target is torch.ops.aten.slice.Tensor:
+            source = _node_argument(node.args[0], owner=node)
+            dim, start, _end = node.args[1:4]
+            step = node.args[4] if len(node.args) == 5 else 1
+            if step != 1:
+                raise ValueError(f"{node.name}: slice step must be one")
+            source_type = values[source].type
+            if not isinstance(source_type, GmemTensorType):
+                raise ValueError(f"{node.name}: slice source must be gmem")
+            dim = cast(int, dim) % source_type.rank
+            start = cast(int, start)
+            size = cast(int, _node_type(node).sizes[dim])
+            tile_index, remainder = divmod(start, size)
+            if remainder:
+                raise ValueError(f"{node.name}: slice must be tile-aligned")
+            tile = build_slice_tile(values[source], dim, tile_index, size)
+            ops.append(tile)
+            values[node] = tile.result()
+            continue
+
+        if node in silu_sources:
+            elementwise_fn = "silu"
+            source_nodes = [silu_sources[node]]
+        else:
+            elementwise = _ELEMENTWISE_OPS.get(node.target)
+            if elementwise is None:
+                elementwise_fn = None
+                source_nodes = []
+            else:
+                elementwise_fn, num_sources = elementwise
+                source_nodes = [
+                    _node_argument(source, owner=node)
+                    for source in node.args[:num_sources]
+                ]
+
+        if elementwise_fn is not None:
+            dst = _allocate(
+                node,
+                match.output,
+                output_value,
+                ops,
+                destinations,
+            )
+            ops.append(
+                ElementwiseOp.build(
+                    dst,
+                    [values[source] for source in source_nodes],
+                    elementwise_fn,
+                    attrs={"label": node.name},
+                )
+            )
+            values[node] = dst
+            continue
+
+        raise ValueError(f"{node.name}: unsupported FX target {node.target}")
+
+    kernel = KernelOp.build(
+        name,
+        Block(
+            arguments=[
+                *(values[node] for node in match.inputs),
+                output_value,
+            ],
+            ops=ops,
+        ),
+        grid_dim=grid_dim,
+    )
+    return ModuleOp.build(Block(ops=[kernel]))
+
+
+def _match_signature(match: FxRegionMatch) -> TensorSignature:
+    tensors = []
+    for node in (*match.inputs, match.output):
+        tensor = node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{node.name}: missing tensor metadata")
+        tensors.append(
+            (
+                tuple(int(size) for size in tensor.shape),
+                tuple(int(stride) for stride in tensor.stride()),
+                tensor.dtype,
+            )
+        )
+    return tuple(tensors)
+
+
+def make_fx_to_ayla_rewrite(
+    patterns: PatternMatcherPass,
+    *,
+    root: object,
+    name: str,
+    signature: list[Type],
+    signature_mapping: list[OperandKind],
+    compile_region: Callable[[ModuleOp], LauncherPlan],
+    accept: Callable[[FxRegionMatch], bool] | None = None,
+    require_maximal: bool = True,
+    namespace: str = DEFAULT_NAMESPACE,
+    infer_result_shapes: Callable[..., list[tuple]] | None = None,
+) -> None:
+    """Build a rewrite that compiles matched FX regions through Ayla."""
+    if len(signature) != len(signature_mapping):
+        raise ValueError("signature and signature mapping must have equal length")
+    if signature_mapping[-1:] != [OperandKind.RESULT] or (
+        signature_mapping.count(OperandKind.RESULT) != 1
+    ):
+        raise ValueError("FX regions require exactly one final result")
+    if not all(isinstance(typ, GmemTensorType) for typ in signature):
+        raise ValueError("FX region signatures require gmem tensors")
+    expected_types = [typ for typ in signature if isinstance(typ, GmemTensorType)]
+    compiler = JITCompiler(
+        name=name,
+        signature=signature,
+        compile_fn=compile_region,
+    )
+
+    def region(torch_match: Match) -> FxRegionMatch | None:
+        candidate = discover_supported_fx_region(
+            torch_match.output_node(),
+            require_maximal=require_maximal,
+        )
+        if candidate is None or not _matches_signature(
+            candidate,
+            expected_types,
+        ):
+            return None
+        if accept is not None and not accept(candidate):
+            return None
+        return candidate
+
+    def resolve_inputs(torch_match: Match) -> tuple[Node, ...]:
+        candidate = region(torch_match)
+        if candidate is None:
+            raise RuntimeError("accepted FX match no longer describes a region")
+        return candidate.inputs
+
+    def prepare(torch_match: Match, inputs: tuple[Node, ...]) -> None:
+        candidate = FxRegionMatch(torch_match.output_node(), inputs)
+        compiler.prepare_module(
+            _match_signature(candidate),
+            fx_region_to_module(candidate, name=name),
+        )
+
+    register_fx_kernel_rewrite(
+        patterns,
+        pattern=CallFunctionVarArgs(root, users=MULTIPLE),
+        resolve_inputs=resolve_inputs,
+        compiler=compiler,
+        signature_mapping=signature_mapping,
+        extra_check=lambda torch_match: region(torch_match) is not None,
+        namespace=namespace,
+        infer_result_shapes=infer_result_shapes,
+        prepare=prepare,
+    )
+
+
+def _matches_signature(
+    match: FxRegionMatch,
+    signature: list[GmemTensorType],
+) -> bool:
+    actual = (*match.inputs, match.output)
+    if len(actual) != len(signature):
+        return False
+
+    for node, expected in zip(actual, signature, strict=True):
+        tensor = node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type not in (
+            "cuda",
+            "meta",
+        ):
+            return False
+        found = _node_type(node)
+        if found.dtype != expected.dtype or found.rank != expected.rank:
+            return False
+        if any(
+            declared is not None and declared != concrete
+            for declared, concrete in zip(
+                expected.sizes,
+                found.sizes,
+                strict=True,
+            )
+        ):
+            return False
+        if any(
+            declared is not None and declared != concrete
+            for declared, concrete in zip(
+                expected.strides,
+                found.strides,
+                strict=True,
+            )
+        ):
+            return False
+    return True

@@ -1,6 +1,9 @@
+from contextlib import nullcontext
+
+import pytest
 import torch
 
-from ayla.gpu_dialect import gpu_dialect, ModuleOp
+from ayla.gpu_dialect import BF16Type, GmemTensorType, gpu_dialect, ModuleOp
 from ayla.jit_compiler import JITCompiler
 from ayla.torch_custom_call import (
     OperandKind,
@@ -37,6 +40,72 @@ def test_result_shape_can_be_inferred_from_inputs():
     assert result.shape == (7, 16)
     assert result.dtype == torch.bfloat16
     assert result.device.type == "meta"
+
+
+def test_jit_compiler_dispatches_by_tensor_signature(monkeypatch):
+    built = []
+    modules = {}
+
+    def compile_module(module):
+        rows = modules[id(module)]
+        built.append(rows)
+
+        def build_launcher():
+            def launch(src, dst):
+                dst.value = src.value + rows
+
+            return launch
+
+        return build_launcher
+
+    class Tensor:
+        device = torch.device("cuda:0")
+
+        def __init__(self, rows, value: int | None = 1):
+            self.shape = (rows, 8)
+            self.dtype = torch.bfloat16
+            self.value = value
+
+        def stride(self):
+            return (8, 1)
+
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    compiler = JITCompiler(
+        name="shape_dispatch_test",
+        signature=[
+            GmemTensorType.build([None, 8], BF16Type()),
+            GmemTensorType.build([None, 8], BF16Type()),
+        ],
+        compile_fn=compile_module,
+    )
+    for rows in (4, 7):
+        signature = (
+            ((rows, 8), (8, 1), torch.bfloat16),
+            ((rows, 8), (8, 1), torch.bfloat16),
+        )
+        module = object()
+        modules[id(module)] = rows
+        compiler.prepare_module(signature, module)  # type: ignore[arg-type]
+    for rows in (4, 4, 7):
+        src = Tensor(rows)
+        dst = Tensor(rows, value=None)
+        compiler(src, dst)  # type: ignore[arg-type]
+        assert dst.value == 1 + rows
+
+    assert built == [4, 7]
+
+
+def test_jit_compiler_rejects_cpu_tensors():
+    compiler = JITCompiler(
+        name="cuda_only_dispatch_test",
+        signature=[],
+        compile_fn=lambda _module: lambda: lambda *_tensors: None,
+    )
+
+    with pytest.raises(ValueError, match="expected CUDA tensors"):
+        compiler(torch.empty(1))
 
 
 def _compiler(name: str) -> JITCompiler:

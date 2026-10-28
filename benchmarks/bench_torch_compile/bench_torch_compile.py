@@ -4,7 +4,7 @@ The row that matters is `ayla_compiled` against `compiled`: the same graph
 lowered the same way everywhere except the matmul. What gets measured lives
 in `corpus/`, one module per graph.
 
-    python -m benchmarks.bench_torch_compile.bench_torch_compile -k gemm_sigmoid
+    python -m benchmarks.bench_torch_compile.bench_torch_compile -k muse_swiglu
 """
 from __future__ import annotations
 

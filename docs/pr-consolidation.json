@@ -314,5 +314,6 @@
     }
   ],
   "development_branch": "feature/gemm-chains",
-  "pre_split_head": "839ab19"
+  "pre_split_head": "839ab19",
+  "development_base": "704fc16"
 }
