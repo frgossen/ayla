@@ -6,28 +6,6 @@ async scheduling, and lowering to NVIDIA hardware primitives — using **deep pi
 specialization**. The aim is a compact toolbox that agents can use to generate SOTA GEMM kernels,
 and aspirationally to fuse GEMM epilogues.
 
-## Benchmark branch choice
-
-This checkout provides measured GEMM configuration lookup, shape-specialized
-FP16/BF16 JIT execution for `mm`, `addmm`, and `bmm`, and routing through
-`ayla.torch_compile.install()`. It uses the compiler and scheduling features
-available on main. JIT selection skips configurations that require newer
-features and uses a conservative unmeasured fallback when needed.
-
-For the **full feature space, performance search, and the best numbers**, use
-the consolidated branch:
-
-```bash
-git fetch origin
-git switch feature/consolidated
-```
-
-The saved measurements include schedules using multicast, persistent grids,
-cyclic pipelines, and other features from that branch. Main's supported
-configurations can be suboptimal; rebenchmark them on the checkout you use.
-Configuration recommendations are tied to the compiler revision and hardware
-that produced the measurements.
-
 ## Getting started
 
 ```bash
@@ -51,59 +29,42 @@ curl -fsSL https://pixi.sh/install.sh | bash
 
 Then set up the environment with [pixi](https://pixi.sh): `pixi shell` to activate the env, `pixi run install` provisions Python 3.12 with ayla (editable) plus the CUDA 12.8 (cu128) PyTorch build, then `pixi run test` runs the tests and `pixi run bench` runs the benchmark.
 
-### GEMM configuration lookup and JIT execution
+### JIT GEMMs and OSS benchmarks
 
-Select a schedule executable on this checkout without compiling a kernel:
+The JIT supports contiguous FP16/BF16 `mm`, `addmm`, and `bmm`, and routes
+supported calls through `ayla.torch_compile.install()`.
 
 ```python
-from ayla.gemm_jit import measured_gemm_configs, select_gemm_schedule
+from ayla.gemm_jit import gemm_op, measured_gemm_configs, select_gemm_schedule
 
 schedule = select_gemm_schedule("mm", "bfloat16", m=8192, n=768, k=768)
-if schedule is not None:
-    print(schedule.captured_config)
-    print(schedule.builder_config)
-    print(schedule.adaptations)  # transferred or unmeasured fallback, if applicable
-
-# Exact-shape saved configurations, winner first. These may require the
-# consolidated branch; this query preserves the original measured records.
+print(schedule.builder_config if schedule else None)
 print(measured_gemm_configs("mm", "bfloat16", m=8192, n=768, k=768))
+# gemm_op("mm", "bfloat16")(a, bt, out) writes out = a @ bt.T.
+# ADDMM takes (bias, a, bt, out); BMM takes batched (a, bt, out).
 ```
 
-For direct execution on CUDA, `gemm_op("mm", "bfloat16")(a, bt, out)` writes
-`a @ bt.T`; `gemm_op("addmm", "bfloat16")(bias, a, bt, out)` adds a length-N
-bias, and `gemm_op("bmm", "bfloat16")(a, bt, out)` accepts batched matrices.
-All tensors must be contiguous, have the selected dtype, and share one CUDA
-device. `"float16"` is also supported. Invoke the operation once before CUDA
-graph capture to populate the specialization cache. Unsupported layouts,
-dtypes, or shapes fall through to Inductor when using the torch.compile backend.
+`select_gemm_schedule` selects a main-supported configuration, using a nearby
+measured seed or an unmeasured fallback. `measured_gemm_configs` returns the
+exact-shape saved configurations, winner first, including feature-only records.
+For the **full feature space, performance search, and feature-enabled numbers**,
+check out `feature/consolidated`. Main's configurations can be suboptimal.
 
-### OSS GEMM benchmarks
-
-Validate the corpus without reserving a GPU:
+Validate, then run a small correctness-checked benchmark against Torch:
 
 ```bash
 pixi run bench-oss-validate
-```
-
-Run a small benchmark through the library's JIT dispatcher:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 pixi run bench-oss --jit-heuristic --workload all \
-  --max-shapes 3 --max-timing-rounds 3 \
+CUDA_VISIBLE_DEVICES=0 pixi run bench-oss --workload all --max-shapes 3 \
   --output-json .benchmarks/oss-smoke/raw.json \
   --output-csv .benchmarks/oss-smoke/raw.csv
 ```
 
-For the full accepted corpus, remove `--max-shapes` and use a separate output
-path. Results are written after each shape and the same command resumes completed
-rows. `--no-resume` starts fresh. The default inference timing uses hot
-activations and cold per-layer weights; `--timing warm` measures repeated calls
-on the same tensors. Correctness is checked against Torch before timing.
-
-Without `--jit-heuristic`, the benchmark evaluates candidate configurations
-supported by this checkout. Feature-only candidates are skipped. Use
-`feature/consolidated` for the full search and feature-enabled winners.
-Keep results from different branches in separate output directories.
+Remove `--max-shapes` for the full accepted corpus. Results are saved after
+each shape; repeating the command resumes successful shapes. `--no-resume`
+starts fresh. Inference timing is the default; `--timing warm` measures repeated
+calls on the same inputs. Keep outputs from different branches separate.
+Use `--corpus benchmarks/better_benchmark_gemm_shapes.json` for its recorded GEMMs.
+The full model graph suite is described below.
 
 ### better-benchmark
 
