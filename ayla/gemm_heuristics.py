@@ -38,6 +38,7 @@ class GemmScheduleSeed:
     transpose_output: bool = False
     fixed_output_unroll_factor: int | None = None
     pipeline_output_waves: bool = False
+    pipeline_output_writeback: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ def apply_gemm_schedule_seed_post_build(
     module: Any, seed: GemmScheduleSeed,
 ) -> Any:
     """Apply the measured post-builder pass sequence required by ``seed``."""
-    if seed.pipeline_output_waves:
+    if seed.pipeline_output_waves or seed.pipeline_output_writeback:
         if (
             seed.fixed_output_unroll_factor is not None
             or seed.builder_config is None
@@ -71,19 +72,28 @@ def apply_gemm_schedule_seed_post_build(
         if len(outer_loops) != 1:
             raise ValueError("wave pipelining requires one outer tile loop")
         outer_loops[0].attrs["label"] = "heuristic_output_grid"
-        for body_op in outer_loops[0].body.ops:
-            if isinstance(body_op, AwaitOp):
-                break
-            if isinstance(body_op, AsyncOp) and re.fullmatch(
-                r"mm_(lhs|rhs)_smem_iter\d+_async",
-                str(body_op.attrs.get("label", "")),
-            ):
-                body_op.attrs["label"] = "heuristic_wave_prologue_async"
-        module = PipelineLoop(
-            label_filter_loop="heuristic_output_grid",
-            label_filter_op=r"heuristic_wave_prologue_async",
-            pipelining_offset=1,
-        ).run(module)
+        if seed.pipeline_output_waves:
+            for body_op in outer_loops[0].body.ops:
+                if isinstance(body_op, AwaitOp):
+                    break
+                if isinstance(body_op, AsyncOp) and re.fullmatch(
+                    r"mm_(lhs|rhs)_smem_iter\d+_async",
+                    str(body_op.attrs.get("label", "")),
+                ):
+                    body_op.attrs["label"] = "heuristic_wave_prologue_async"
+            module = PipelineLoop(
+                label_filter_loop="heuristic_output_grid",
+                label_filter_op=r"heuristic_wave_prologue_async",
+                pipelining_offset=1,
+            ).run(module)
+        if seed.pipeline_output_writeback:
+            # Issue everything but the output writeback one tile early, so a
+            # tile's writeback runs while the next tile's work is in flight.
+            module = PipelineLoop(
+                label_filter_loop="heuristic_output_grid",
+                label_filter_op=r"(?!mm_dst_(smem|tma)).*",
+                pipelining_offset=1,
+            ).run(module)
         module = ScheduleAsync().run(module)
         module = Canonicalize().run(module)
     output_was_unrolled = (
@@ -613,6 +623,9 @@ def select_gemm_schedules(
             ),
             transpose_output=transpose_output,
             fixed_output_unroll_factor=unroll_factor,
+            pipeline_output_writeback=bool(
+                captured.get("pipeline_output_writeback", False)
+            ),
             pipeline_output_waves=bool(
                 captured.get("pipeline_output_waves", False)
             ),

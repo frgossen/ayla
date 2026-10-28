@@ -143,3 +143,54 @@ def test_pipeline_matmul_smem_skeleton():
           }
         }""")  # noqa: E501
     assert text == expected
+
+
+def test_pipeline_clones_matched_pure_ops_for_unlabeled_consumers():
+    """Pipelining everything but a store, including unlabeled pure ops.
+
+    The filter also matches the store's unlabeled ``tile`` (effective label
+    ""). Being pure, it is cloned into both sections like any pure
+    dependency, so the store keeps its own iteration's tile instead of being
+    rejected for consuming a labeled result."""
+    module_str = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x4xf32>, %c: gmem<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            %buf: smem<4x1xf32> = alloc() attrs={id: 0}
+            for (%k: index = 0 to 4) attrs={label: "k"} {
+              %a_k: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %k: index)
+              move(%buf: smem<4x1xf32>, %a_k: gmem<4x1xf32 strides=[4, 1]>) attrs={label: "load"}
+              %c_k: gmem<4x1xf32 strides=[4, 1]> = tile(%c: gmem<4x4xf32>, 0, %k: index)
+              move(%c_k: gmem<4x1xf32 strides=[4, 1]>, %buf: smem<4x1xf32>) attrs={label: "store"}
+            }
+          }
+        }""")  # noqa: E501
+    module = gpu_dialect.parse_module(module_str)
+    pipelined = pipeline_loop(
+        module, label_filter_loop="k", label_filter_op="(?!store).*",
+        pipelining_offset=1,
+    )
+    expected = textwrap.dedent("""\
+        module {
+          kernel @test(%a: gmem<4x4xf32>, %c: gmem<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            %buf: smem<4x1xf32> = alloc() attrs={id: 0}
+            %c0: index = index_constant() attrs={value: 0}
+            %a_k: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %c0: index)
+            %c_k: gmem<4x1xf32 strides=[4, 1]> = tile(%c: gmem<4x4xf32>, 0, %c0: index)
+            move(%buf: smem<4x1xf32>, %a_k: gmem<4x1xf32 strides=[4, 1]>) attrs={label: "load"}
+            for (%k: index = 0 to 3) attrs={label: "k"} {
+              %a_k1: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %k: index)
+              %c_k1: gmem<4x1xf32 strides=[4, 1]> = tile(%c: gmem<4x4xf32>, 0, %k: index)
+              move(%c_k1: gmem<4x1xf32 strides=[4, 1]>, %buf: smem<4x1xf32>) attrs={label: "store"}
+              %c1: index = index_constant() attrs={value: 1}
+              %0: index = index_add(%k: index, %c1: index)
+              %a_k2: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %0: index)
+              %c_k2: gmem<4x1xf32 strides=[4, 1]> = tile(%c: gmem<4x4xf32>, 0, %0: index)
+              move(%buf: smem<4x1xf32>, %a_k2: gmem<4x1xf32 strides=[4, 1]>) attrs={label: "load"}
+            }
+            %c3: index = index_constant() attrs={value: 3}
+            %a_k3: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %c3: index)
+            %c_k3: gmem<4x1xf32 strides=[4, 1]> = tile(%c: gmem<4x4xf32>, 0, %c3: index)
+            move(%c_k3: gmem<4x1xf32 strides=[4, 1]>, %buf: smem<4x1xf32>) attrs={label: "store"}
+          }
+        }""")  # noqa: E501
+    assert repr(pipelined) == expected
