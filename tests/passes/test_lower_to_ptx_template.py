@@ -138,7 +138,7 @@ def test_lower_cluster_to_leader_barrier_uses_its_lock():
         ptx,
         "fence.mbarrier_init.release.cluster;",
         "bar.sync 0;",
-        "barrier.cluster.arrive.release;",
+        "barrier.cluster.arrive.relaxed;",
         "barrier.cluster.wait.acquire;",
         "mapa.shared::cluster.u32 ${b32:remote_empty}, ${b32:operand.sync.val}, ${b32:cluster_rank};",
         "mbarrier.arrive.shared::cluster.b64 _, [${b32:remote_empty}];",
@@ -305,7 +305,7 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
         ptx,
         "fence.mbarrier_init.release.cluster;",
         "bar.sync 0;",
-        "barrier.cluster.arrive.release;",
+        "barrier.cluster.arrive.relaxed;",
         "barrier.cluster.wait.acquire;",
     )
     assert (

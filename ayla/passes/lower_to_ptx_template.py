@@ -590,8 +590,10 @@ class LowerToPtxTemplate(LoweringPass):
         # multicast signals each selected CTA's instance. The CTA-local bar.sync
         # publishes each initialization locally; this cluster rendezvous ensures
         # all instances are initialized before rank 0 can issue the multicast.
+        # fence.mbarrier_init already releases the initialization at cluster
+        # scope, so the arrive is relaxed.
         cluster_sync = (
-            """barrier.cluster.arrive.release;
+            """barrier.cluster.arrive.relaxed;
             barrier.cluster.wait.acquire;
             """
             if is_multicast else ""
@@ -628,7 +630,8 @@ class LowerToPtxTemplate(LoweringPass):
         assert kernel is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
         # Nonzero ranks arrive remotely at rank 0's mbarrier. Publish rank 0's
-        # initialization cluster-wide before any CTA can reach its first use.
+        # initialization cluster-wide before any CTA can reach its first use;
+        # fence.mbarrier_init releases it, so the arrive is relaxed.
         template = textwrap.dedent(f"""\
             .shared .align 8 .b64 ${{smem:bar}}[1];
             mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
@@ -646,7 +649,7 @@ class LowerToPtxTemplate(LoweringPass):
             fence.mbarrier_init.release.cluster;
             ${{label:after_init}}:
             bar.sync 0;
-            barrier.cluster.arrive.release;
+            barrier.cluster.arrive.relaxed;
             barrier.cluster.wait.acquire;
         """)
         new_op = PTXTemplateOp.build(
