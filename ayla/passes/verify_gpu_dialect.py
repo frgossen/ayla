@@ -699,16 +699,25 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError("reshape must preserve the memory space")
         if arg.dtype != result.dtype:
             raise ValueError("reshape must preserve the element type")
-        # TODO: Accept other non-canonical strides when the reshape preserves
-        # the underlying linear element order.
         if isinstance(arg, AddrMemTensorType):
             assert isinstance(result, AddrMemTensorType)
+            preserves_strided_layout = tuple(
+                (size, stride)
+                for size, stride in zip(arg.sizes, arg.strides, strict=True)
+                if size != 1
+            ) == tuple(
+                (size, stride)
+                for size, stride in zip(
+                    result.sizes, result.strides, strict=True,
+                )
+                if size != 1
+            )
             if not (
                 arg.is_canonical_strides and result.is_canonical_strides
-            ) and _non_unit_layout(arg) != _non_unit_layout(result):
+            ) and not preserves_strided_layout:
                 raise ValueError(
-                    "reshape operands must have canonical strides or differ "
-                    "only by singleton dimensions"
+                    "reshape operands must have canonical strides or preserve "
+                    "a singleton-only layout change"
                 )
         if (
             arg.num_elements is not None

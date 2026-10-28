@@ -19,13 +19,9 @@ def reset_fresh_ids():
 
 @pytest.fixture
 def ayla_installed():
-    """ayla claiming `aten.mm` for the duration of a test."""
-    # Imported here: conftest is loaded for every run, and this builds the
-    # whole kernel collection.
+    """Install Ayla's post-grad FX rewrites for the duration of a test."""
     from ayla import torch_compile
 
-    AllocOp._id_counter = itertools.count()
-    MemoryEffect._tiling_scheme_id_counter = itertools.count()
     torch_compile.install()
     try:
         yield

@@ -744,6 +744,41 @@ def test_move_loads_f32_pairs_into_wgmma_registers_as_vectors():
     assert template.count("ld.global.v2.b32") == 16
 
 
+def test_move_rejects_unaligned_wgmma_register_pairs():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k(%src: gmem<64x64xbf16 strides=[65, 1]>) {
+            %dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            move(%dst: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">, %src: gmem<64x64xbf16 strides=[65, 1]>) collective=xyz.thread
+          }
+        }"""))
+
+    with pytest.raises(AssertionError, match="contiguous and aligned"):
+        lower_to_ptx_template(module)
+
+
+def test_lower_elementwise_bf16_mul():
+    w = 'wgrmem<16x8xbf16 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %lhs: {w} = alloc() attrs={{id: 0}}
+            %rhs: {w} = alloc() attrs={{id: 1}}
+            elementwise mul(%lhs: {w}, %lhs: {w}, %rhs: {w})
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda o: isinstance(o, PTXTemplateOp)
+    )[-1].attrs["template"]
+    assert template == "".join(
+        f"mul.rn.bf16x2 ${{b32:operand.dst.r{reg}}}, "
+        f"${{b32:operand.lhs.r{reg}}}, ${{b32:operand.rhs.r{reg}}};\n"
+        for reg in range(2)
+    )
+
+
 def test_lower_elementwise_silu():
     w = 'wgrmem<16x8xf32 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
@@ -875,3 +910,30 @@ def test_accumulate_decides_whether_an_fma_matmul_overwrites_on_gpu(
     module = gpu_dialect.parse(_fma_matmul(accumulate))
     make_ptx_launcher(make_ptx_kernel(module))(a, b, c)
     torch.testing.assert_close(c, base + a @ b.T)
+
+
+def test_lower_elementwise_convert_bf16_to_f32():
+    src = 'wgrmem<16x8xbf16 layout="mma">'
+    dst = 'wgrmem<16x8xf32 layout="mma">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{
+          kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %src: {src} = alloc() attrs={{id: 0}}
+            %dst: {dst} = alloc() attrs={{id: 1}}
+            elementwise convert(%dst: {dst}, %src: {src})
+          }}
+        }}"""))
+
+    lowered = lower_to_ptx_template(module)
+    template = find_ops(
+        lowered, lambda op: isinstance(op, PTXTemplateOp)
+    )[-1].attrs["template"]
+
+    assert template == textwrap.dedent("""\
+        mov.b32 {${b16:convert_lo0}, ${b16:convert_hi0}}, ${b32:operand.src.r0};
+        cvt.f32.bf16 ${f32:operand.dst.r0}, ${b16:convert_lo0};
+        cvt.f32.bf16 ${f32:operand.dst.r1}, ${b16:convert_hi0};
+        mov.b32 {${b16:convert_lo1}, ${b16:convert_hi1}}, ${b32:operand.src.r1};
+        cvt.f32.bf16 ${f32:operand.dst.r2}, ${b16:convert_lo1};
+        cvt.f32.bf16 ${f32:operand.dst.r3}, ${b16:convert_hi1};
+        """)

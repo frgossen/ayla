@@ -716,6 +716,9 @@ def test_every_registered_kernel_is_covered():
         if mark.args and mark.args[0] == "op,dtype,epilogue"
     )
     covered = {param.id for param in parametrize.args[1]}
+    # Fused operations with non-GEMM signatures have dedicated end-to-end
+    # correctness tests instead of fitting the two-input matrix above.
+    covered.add("muse_swiglu")
     registered = {
         name
         for name in dir(ayla)
