@@ -4,12 +4,11 @@ from __future__ import annotations
 import textwrap
 from typing import NotRequired, TypedDict
 
-from .. import ptx_runtime, torch_custom_call
+from .. import torch_custom_call
 from ..gpu_dialect import GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from ..jit_compiler import ShapeSpecializingJITCompiler
-from ..ptx_codegen import make_ptx_kernel
 from ..torch_custom_call import DEFAULT_NAMESPACE, OperandKind
-from .gemm import schedule_matmul
+from ..pipelines.tile_matmul_pipeline import TileMatmulPipeline
 
 
 def _cache_policy_heuristic(
@@ -97,21 +96,19 @@ def make_dynamic_m_matmul(
     """Create an exact-shape cached ``op(lhs, rhs) -> out`` GEMM."""
     module = dynamic_m_matmul_template(n, k, name=name)
 
-    def compile_specialization(module: ModuleOp):
+    def schedule_specialization(module: ModuleOp) -> ModuleOp:
         [kernel] = module.body.ops
         assert isinstance(kernel, KernelOp)
         lhs_type = kernel.signature[0]
         assert isinstance(lhs_type, GmemTensorType)
         m = lhs_type.sizes[0]
         assert isinstance(m, int)
-        scheduled = schedule_matmul(
-            module,
+        return TileMatmulPipeline(
+            m=m, n=n, k=k,
             **_dynamic_m_schedule_heuristic(m, n, k),
-        )
-        kernel = make_ptx_kernel(scheduled)
-        return ptx_runtime.make_ptx_launcher(kernel)
+        ).run(module)
 
-    compiler = ShapeSpecializingJITCompiler(module, compile_specialization)
+    compiler = ShapeSpecializingJITCompiler(module, schedule_specialization)
     operands = [OperandKind.R, OperandKind.R, OperandKind.RESULT]
     return torch_custom_call.make_torch_custom_call(
         compiler,

@@ -44,6 +44,7 @@ __all__ = [
     "PtxPrinter",
     "PtxKernel",
     "make_ptx_kernel",
+    "JITCompiler",
     "ShapeSpecializingJITCompiler",
     "GemmHeuristicSelection",
     "GemmScheduleSeed",

@@ -1,8 +1,10 @@
+from contextlib import nullcontext
+
 import pytest
 import torch
 
 from ayla.gpu_dialect import ModuleOp, gpu_dialect
-from ayla.jit_compiler import ShapeSpecializingJITCompiler
+from ayla.jit_compiler import JITCompiler, ShapeSpecializingJITCompiler
 
 
 def _template(name="dispatch_test") -> ModuleOp:
@@ -44,6 +46,7 @@ def _patch_metadata(monkeypatch, compiler, m=4):
         lambda tensors: (torch.device("cuda"), signature),
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
 
 def test_jit_compiler_caches_by_shape(monkeypatch):
@@ -56,8 +59,9 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
 
     compiler = ShapeSpecializingJITCompiler(
         template,
-        compile_fn,
+        lambda module: module,
     )
+    monkeypatch.setattr(compiler, "_compile", compile_fn)
     _patch_metadata(monkeypatch, compiler)
 
     tensors = (_Tensor(), _Tensor(), _Tensor())
@@ -73,7 +77,7 @@ def test_jit_compiler_caches_by_shape(monkeypatch):
 def test_jit_compiler_rejects_capture_time_cache_miss(monkeypatch):
     compiler = ShapeSpecializingJITCompiler(
         _template("dispatch_capture_miss"),
-        lambda module: _Launcher(),
+        lambda module: module,
     )
     _patch_metadata(monkeypatch, compiler)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -91,7 +95,127 @@ def test_jit_compiler_rejects_noncontiguous_tensors():
             return False
 
     compiler = ShapeSpecializingJITCompiler(
-        _template(), lambda module: _Launcher(),
+        _template(), lambda module: module,
     )
     with pytest.raises(ValueError, match="contiguous"):
-        compiler(Tensor(), Tensor(), Tensor())
+        compiler._metadata((Tensor(), Tensor(), Tensor()))
+
+
+def _static_module(name="static_dispatch_test") -> ModuleOp:
+    return gpu_dialect.parse_module(f"""
+        module {{
+          kernel @{name}(%src: gmem<4x8xbf16>, %dst: gmem<4x8xbf16>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {{
+          }}
+        }}
+    """)
+
+
+def test_static_jit_compiler_is_lazy_and_preserves_the_module(monkeypatch):
+    from ayla import jit_compiler
+
+    module = _static_module()
+    original = repr(module)
+    compiled = []
+    launcher = _Launcher()
+    loaded = []
+    launcher.ensure_loaded = lambda: loaded.append(True)
+
+    def lower(cloned):
+        compiled.append(cloned)
+        cloned.body.ops.clear()
+        return object()
+
+    monkeypatch.setattr(jit_compiler, "make_ptx_kernel", lower)
+    monkeypatch.setattr(jit_compiler, "make_ptx_launcher", lambda kernel: launcher)
+    compiler = JITCompiler(module)
+    _patch_metadata(monkeypatch, compiler)
+    assert compiler.name == "static_dispatch_test"
+    assert len(compiler.signature) == 2
+    assert compiler.cache_size == 0
+    assert compiled == []
+
+    compiler(_Tensor(), _Tensor())
+    compiler(_Tensor(), _Tensor())
+    assert len(compiled) == 1
+    assert loaded == [True]
+    assert launcher.launches == 2
+    assert compiler.cache_size == 1
+    assert repr(module) == original
+
+
+def test_static_jit_compiler_caches_per_device(monkeypatch):
+    compiler = JITCompiler(_static_module("device_cache_test"))
+    _patch_metadata(monkeypatch, compiler)
+    compiled = []
+
+    def compile_fn(module):
+        launcher = _Launcher()
+        compiled.append(launcher)
+        return launcher
+
+    monkeypatch.setattr(compiler, "_compile", compile_fn)
+    for device in (0, 1, 0):
+        monkeypatch.setattr(
+            compiler, "_metadata", lambda tensors: ((device,), [(4, 8)] * 2),
+        )
+        compiler(_Tensor(), _Tensor())
+    assert len(compiled) == 2
+    assert [launcher.launches for launcher in compiled] == [2, 1]
+
+
+def test_static_jit_compiler_requires_warmup_before_capture(monkeypatch):
+    compiler = JITCompiler(_static_module("static_capture_test"))
+    _patch_metadata(monkeypatch, compiler)
+    compiled = []
+    launcher = _Launcher()
+
+    def compile_fn(module):
+        compiled.append(module)
+        return launcher
+
+    monkeypatch.setattr(compiler, "_compile", compile_fn)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="before capture"):
+        compiler(_Tensor(), _Tensor())
+    assert compiled == []
+    assert compiler.cache_size == 0
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    compiler(_Tensor(), _Tensor())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    compiler(_Tensor(), _Tensor())
+    assert len(compiled) == 1
+    assert launcher.launches == 2
+
+
+def test_failed_compilation_is_not_cached(monkeypatch):
+    compiler = JITCompiler(_static_module("failed_compile_test"))
+    _patch_metadata(monkeypatch, compiler)
+
+    def compile_fn(module):
+        raise RuntimeError("compilation failed")
+
+    monkeypatch.setattr(compiler, "_compile", compile_fn)
+    with pytest.raises(RuntimeError, match="compilation failed"):
+        compiler(_Tensor(), _Tensor())
+    assert compiler.cache_size == 0
+
+
+def test_jit_signature_excludes_launcher_tma_descriptors():
+    from ayla.base.ir import Value
+    from ayla.gpu_dialect import KernelOp, GmemTensorType, TmaDescType
+
+    module = _static_module("tma_signature_test")
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    gmem_type = kernel.signature[0]
+    assert isinstance(gmem_type, GmemTensorType)
+    kernel.body.append_argument(Value(
+        name="desc",
+        type=TmaDescType.build(
+            arg_idx=0, gmem_type=gmem_type, tile_shape=[4, 8],
+        ),
+    ))
+    compiler = JITCompiler(module)
+    assert len(compiler.signature) == 2
+    assert len(kernel.signature) == 3

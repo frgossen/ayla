@@ -1,11 +1,11 @@
-"""Wrap a :class:`PtxLauncher` as a torch custom op so it's callable from
+"""Wrap a :class:`JITCompiler` as a torch custom op so it's callable from
 eager torch and visible to ``torch.compile`` / ``torch.export``.
 """
 from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -15,8 +15,11 @@ from .gpu_dialect import (
     F32Type,
     F64Type,
     MemTensorType,
-    Type,
 )
+
+if TYPE_CHECKING:
+    from .jit_compiler import JITCompiler
+
 
 _TORCH_DTYPES = [
     (F16Type(), torch.float16),
@@ -51,16 +54,6 @@ class OperandKind(Enum):
     RESULT = "result"
 
 
-class _Launcher(Protocol):
-    @property
-    def name(self) -> str: ...
-
-    @property
-    def signature(self) -> list[Type]: ...
-
-    def __call__(self, *tensors: torch.Tensor) -> None: ...
-
-
 def _get_library(namespace: str) -> torch.library.Library:
     lib = _LIBRARIES.get(namespace)
     if lib is None:
@@ -89,14 +82,14 @@ def _make_schema(op_name: str, signature_mapping: list[OperandKind]) -> str:
 
 
 def make_torch_custom_call(
-    launcher: _Launcher,
+    compiler: JITCompiler,
     signature_mapping: list[OperandKind],
     *,
     namespace: str = DEFAULT_NAMESPACE,
     name: str | None = None,
     infer_result_shapes: Callable[..., list[tuple]] | None = None,
 ) -> torch._ops.OpOverload:
-    op_name = name or launcher.name
+    op_name = name or compiler.name
     schema = _make_schema(op_name, signature_mapping)
 
     lib = _get_library(namespace)
@@ -104,7 +97,7 @@ def make_torch_custom_call(
 
     def allocate_results(*input_tensors: torch.Tensor) -> list[torch.Tensor]:
         result_types: list[MemTensorType] = []
-        for kind, arg_type in zip(signature_mapping, launcher.signature):
+        for kind, arg_type in zip(signature_mapping, compiler.signature):
             if kind == OperandKind.RESULT:
                 assert isinstance(arg_type, MemTensorType)
                 result_types.append(arg_type)
@@ -150,7 +143,7 @@ def make_torch_custom_call(
                 kernel_args.append(output_tensors[result_idx])
                 result_idx += 1
 
-        launcher(*kernel_args)
+        compiler(*kernel_args)
         return pack_results(output_tensors)
 
     lib.impl(op_name, cuda_impl, "CUDA")

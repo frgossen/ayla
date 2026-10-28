@@ -32,13 +32,13 @@ def test_schedule_matmul_initializes_accumulator_from_broadcast_memory():
           }
         }"""))
 
-    module = schedule_matmul(
-        module,
+    module = TileMatmulPipeline(
+        m=128, n=64, k=64,
         output_n_tile=64,
         warpgroup_n_tile=64,
         operand_stages=1,
         output_tma_inner_size=64,
-    )
+    ).run(module)
     ptx = make_ptx_kernel(module).ptx
 
     assert ptx.count("ld.global.b32") == 16
@@ -62,7 +62,9 @@ def test_register_matmul_schedules_side_by_side_gemms():
           }
         }"""))  # noqa: E501
     for label in ("gate", "up"):
-        schedule_register_matmul(
+        TileMatmulPipeline(
+            m=64, n=64, k=16,
+            register_accumulator=True,
             label=label,
             operand_stages=1,
             operand_k_tile=16,
@@ -112,7 +114,9 @@ def test_register_matmul_fuses_multicast_and_local_load_completion():
           }
         }"""))
 
-    schedule_register_matmul(
+    TileMatmulPipeline(
+        m=64, n=64, k=16,
+        register_accumulator=True,
         label="mm",
         operand_stages=1,
         operand_k_tile=16,

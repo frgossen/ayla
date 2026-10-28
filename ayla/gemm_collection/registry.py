@@ -1,4 +1,4 @@
-"""Build the collection's kernels and define them as torch ops.
+"""Register the collection's kernel modules as Torch ops with JIT dispatch.
 
 Every kernel here is built for one specific shape and dtype -- the shape is a
 literal in its module source, so ``auto_matmul_4096`` multiplies 4096x4096 and
@@ -31,8 +31,7 @@ import inspect
 from typing import Callable
 
 from ..gpu_dialect import ModuleOp
-from ..ptx_codegen import make_ptx_kernel
-from ..ptx_runtime import make_ptx_launcher
+from ..jit_compiler import JITCompiler
 from ..torch_custom_call import OperandKind, make_torch_custom_call
 
 Builder = Callable[[], ModuleOp]
@@ -40,7 +39,7 @@ Builder = Callable[[], ModuleOp]
 
 @functools.cache
 def _launcher(builder: Builder):
-    return make_ptx_launcher(make_ptx_kernel(builder()))
+    return JITCompiler(builder())
 
 
 class _LazyLauncher:
