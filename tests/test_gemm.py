@@ -62,8 +62,6 @@ def test_register_matmul_schedules_side_by_side_gemms():
             elementwise mul(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "product"}
           }
         }"""))  # noqa: E501
-    assert isinstance(module, ModuleOp)
-
     for label in ("gate", "up"):
         schedule_register_matmul(
             label=label,

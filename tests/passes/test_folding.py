@@ -3,7 +3,7 @@ import textwrap
 
 from ayla.base.ir import find_ops_of_type
 from ayla.gpu_dialect import TileOp, gpu_dialect
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.folding import folding
 from ayla.passes.unroll_loop import unroll_loop
 
@@ -13,7 +13,7 @@ def test_fold_constants():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4096x4096xf32>) {
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id.x
             %c0: index = index_constant() attrs={value: 0}
             %c4096: index = index_constant() attrs={value: 4096}
             %zero_offset: index = index_mul(%c0: index, %c4096: index)
@@ -35,7 +35,7 @@ def test_fold_constants():
     assert after == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4096x4096xf32>) {
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id.x
             %c0: index = index_constant() attrs={value: 0}
             %c4096: index = index_constant() attrs={value: 4096}
             %c0_1: index = index_constant() attrs={value: 0}
@@ -142,7 +142,7 @@ def test_iv_congruence_uses_the_lower_bound_and_stays_in_its_loop():
               %c3: index = index_constant() attrs={value: 3}
               %inner: index = index_mod(%k: index, %c3: index)
             }
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id.x
             %c3b: index = index_constant() attrs={value: 3}
             %outer: index = index_mod(%cx: index, %c3b: index)
           }
@@ -162,7 +162,7 @@ def test_distribute_constant_multiply_over_affine_offset():
     module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @test() {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c3: index = index_constant() attrs={value: 3}
             %offset: index = index_add(%bx: index, %c3: index)
             %c64: index = index_constant() attrs={value: 64}
@@ -173,7 +173,7 @@ def test_distribute_constant_multiply_over_affine_offset():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test() {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c3: index = index_constant() attrs={value: 3}
             %offset: index = index_add(%bx: index, %c3: index)
             %c64: index = index_constant() attrs={value: 64}

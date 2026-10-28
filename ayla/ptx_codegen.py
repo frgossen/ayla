@@ -10,7 +10,7 @@ from . import pytree
 from .base.ir import Op, Printer, Value
 from .base.pipeline import Pipeline
 from .gpu_dialect import (
-    BlockIdsOp,
+    BlockIdOp,
     ClusterBlockIdsOp,
     ForOp,
     GmemTensorType,
@@ -23,7 +23,6 @@ from .gpu_dialect import (
     IndexMulOp,
     IndexType,
     KernelOp,
-    LaneIdOp,
     LockType,
     ModuleOp,
     PredicateType,
@@ -32,14 +31,14 @@ from .gpu_dialect import (
     PTXTemplateOp,
     RmemTensorType,
     SmemTensorType,
-    ThreadIdsOp,
+    ThreadIdOp,
     TmaDescType,
     ToPtrOp,
     WarpGroupIdOp,
     WarpIdsOp,
     WgrmemTensorType,
 )
-from .passes.canonicalize import Canonicalize
+from .pipelines.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
@@ -333,10 +332,10 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_if(p, op)
     elif isinstance(op, PTXTemplateOp):
         _emit_ptx_template(p, op)
-    elif isinstance(op, ThreadIdsOp):
-        _emit_thread_ids(p, op)
-    elif isinstance(op, BlockIdsOp):
-        _emit_block_ids(p, op)
+    elif isinstance(op, ThreadIdOp):
+        _emit_thread_id(p, op)
+    elif isinstance(op, BlockIdOp):
+        _emit_block_id(p, op)
     elif isinstance(op, ClusterBlockIdsOp):
         _emit_cluster_block_ids(p, op)
     elif isinstance(op, IndexConstantOp):
@@ -355,8 +354,6 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_warp_ids(p, op)
     elif isinstance(op, WarpGroupIdOp):
         _emit_warp_group_id(p, op)
-    elif isinstance(op, LaneIdOp):
-        _emit_lane_id(p, op)
     elif isinstance(op, ToPtrOp):
         _emit_to_ptr(p, op)
     elif isinstance(op, PtrAddOp):
@@ -513,30 +510,24 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
     p.write_newline_once()
 
 
-def _emit_thread_ids(p: PtxPrinter, op: ThreadIdsOp) -> None:
-    rx = p.unique_ptx_names_for_value(op.x)
-    ry = p.unique_ptx_names_for_value(op.y)
-    rz = p.unique_ptx_names_for_value(op.z)
+def _emit_thread_id(p: PtxPrinter, op: ThreadIdOp) -> None:
+    result = p.unique_ptx_names_for_value(op.value)
+    axis = op.axis.name.lower()
     p.write_newline_once()
-    p.write_line(f"mov.u32 {rx}, %tid.x;")
-    p.write_line(f"mov.u32 {ry}, %tid.y;")
-    p.write_line(f"mov.u32 {rz}, %tid.z;")
+    p.write_line(f"mov.u32 {result}, %tid.{axis};")
     p.write_newline_once()
 
 
-def _emit_block_ids(p: PtxPrinter, op: BlockIdsOp) -> None:
-    rx = p.unique_ptx_names_for_value(op.x)
-    ry = p.unique_ptx_names_for_value(op.y)
-    rz = p.unique_ptx_names_for_value(op.z)
+def _emit_block_id(p: PtxPrinter, op: BlockIdOp) -> None:
+    result = p.unique_ptx_names_for_value(op.value)
+    axis = op.axis.name.lower()
     p.write_newline_once()
-    p.write_line(f"mov.u32 {rx}, %ctaid.x;")
-    p.write_line(f"mov.u32 {ry}, %ctaid.y;")
-    p.write_line(f"mov.u32 {rz}, %ctaid.z;")
+    p.write_line(f"mov.u32 {result}, %ctaid.{axis};")
     p.write_newline_once()
 
 
-# TODO: Consider making the thread, block, and cluster block ID ops take an
-# axis attribute and return one value instead of always materializing x, y, z.
+# TODO: Make the cluster block ID op take an axis attribute and return one
+# value instead of always materializing x, y, z.
 def _emit_cluster_block_ids(p: PtxPrinter, op: ClusterBlockIdsOp) -> None:
     rx = p.unique_ptx_names_for_value(op.x)
     ry = p.unique_ptx_names_for_value(op.y)
@@ -663,11 +654,6 @@ def _emit_index_mod(p: PtxPrinter, op: IndexModOp) -> None:
     else:
         rhs = p.unique_ptx_names_for_value(op.rhs)
         _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs};", op)
-
-
-def _emit_lane_id(p: PtxPrinter, op: LaneIdOp) -> None:
-    dst = p.unique_ptx_names_for_value(op.result())
-    _write_with_comment(p, f"mov.u32 {dst}, %laneid;", op)
 
 
 def _emit_to_ptr(p: PtxPrinter, op: ToPtrOp) -> None:

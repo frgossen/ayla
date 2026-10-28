@@ -1,10 +1,10 @@
 """Canonicalize: folding + CSE + DCE."""
 from __future__ import annotations
 
-from .cse import CSE
-from .dce import DCE
-from .folding import Folding
 from ..base.pipeline import Pipeline
+from ..passes.cse import CSE
+from ..passes.dce import DCE
+from ..passes.folding import Folding
 
 
 class Canonicalize(Pipeline):

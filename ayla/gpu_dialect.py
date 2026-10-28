@@ -386,20 +386,14 @@ class MatmulOp(GpuOp):
         dst: Value,
         collective: dict[CollectiveAxis, CollectiveLevel],
         attrs: dict[str, object] | None = None,
-        init: float | int | None = None,
-        init_value: Value | None = None,
+        init: Value | None = None,
     ) -> "MatmulOp":
         a: dict[str, object] = dict(attrs or {})
         if "collective" in a:
             raise ValueError("pass collective as an explicit argument")
         a["collective"] = dict(collective)
-        if init is not None:
-            a["init"] = init
         return cls(
-            operands=[
-                lhs, rhs, dst,
-                *([init_value] if init_value is not None else []),
-            ],
+            operands=[lhs, rhs, dst, *([init] if init is not None else [])],
             results=[], attrs=a,
         )
 
@@ -416,8 +410,17 @@ class MatmulOp(GpuOp):
         return self.operands[2]
 
     @property
-    def init(self) -> float | int | None:
-        return self.attrs.get("init")  # type: ignore[return-value]
+    def init(self) -> Value | None:
+        """Accumulator initializer: a rank-0 scalar or a destination-shaped
+        tensor. Without one, the matmul accumulates into ``dst``.
+
+        TODO: Drop the initializer so a matmul always accumulates. A scalar
+        becomes an elementwise fill of ``dst`` ahead of the matmul and a tensor
+        a ``move`` into it; PromoteBuffers carries that prologue onto the
+        promoted accumulator, as it already does the epilogue. The same fill
+        replaces ``AllocOp.init``.
+        """
+        return self.operands[3] if len(self.operands) == 4 else None
 
     @property
     def init_value(self) -> Value | None:
@@ -442,7 +445,7 @@ class MatmulOp(GpuOp):
     def extra_attrs(self) -> dict[str, object]:
         return {
             k: v for k, v in self.attrs.items()
-            if k not in ("collective", "init")
+            if k != "collective"
         }
 
     def print(self, p: Printer) -> None:
@@ -473,13 +476,11 @@ class MatmulOp(GpuOp):
         p.read_literal(")")
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
-        init = attrs.pop("init", None)
         return cls.build(
             *operands[:3],
             collective=collective,
             attrs=attrs,
-            init=init,  # type: ignore[arg-type]
-            init_value=operands[3] if len(operands) == 4 else None,
+            init=operands[3] if len(operands) == 4 else None,
         )
 
 
@@ -628,6 +629,11 @@ class ReduceOp(GpuOp):
     a smaller destination combines those partials.
     """
 
+    NEUTRAL_ELEMENTS: ClassVar[dict[str, float | int | None]] = {
+        "max": float("-inf"),
+        "sum": 0.0,
+    }
+
     @classmethod
     def build(
         cls,
@@ -735,8 +741,20 @@ class ElementwiseOp(GpuOp):
     The first operand is the destination and the rest are sources. Passing the
     same value as the destination and first source computes in place.
 
+    Lowering minimizes temporary register live ranges by default; ``ilp``
+    asks for one wide schedule with more instruction-level parallelism
+    instead. A source is only overwritten when it is also the destination;
+    the backend remains responsible for register reuse between distinct values.
+
     TODO: generalize to several destinations.
     """
+
+    ARITIES: ClassVar[dict[str, int]] = {
+        "convert": 1,
+        "mul": 2,
+        "sigmoid": 1,
+        "silu": 1,
+    }
 
     @classmethod
     def build(
@@ -745,11 +763,13 @@ class ElementwiseOp(GpuOp):
         srcs: list[Value],
         fn: str,
         attrs: dict[str, object] | None = None,
+        *,
+        ilp: bool = False,
     ) -> "ElementwiseOp":
         return cls(
             operands=[dst, *srcs],
             results=[],
-            attrs={"fn": fn, **(attrs or {})},
+            attrs={"fn": fn, **(attrs or {}), **({"ilp": True} if ilp else {})},
         )
 
     @property
@@ -766,6 +786,11 @@ class ElementwiseOp(GpuOp):
     @property
     def fn(self) -> str:
         return self.attrs["fn"]  # type: ignore[return-value]
+
+    @property
+    def ilp(self) -> bool:
+        """Whether lowering should prefer one wide schedule over few registers."""
+        return self.attrs.get("ilp", False)  # type: ignore[return-value]
 
     @property
     def extra_attrs(self) -> dict[str, object]:
@@ -1419,7 +1444,7 @@ class MemTensorType(Type):
 
     Subclasses split along the addressing model:
       - AddrMemTensorType: byte-addressable linear memory (gmem, smem).
-      - RegMemTensorType: SIMT-distributed registers (rmem, wgrmem).
+      - RegMemTensorType: SIMT-distributed registers (rmem, wrmem, wgrmem).
 
     All subclasses encode as `<NAME><N x M x ... x DTYPE [extra] attrs={...}>`,
     differing only in the `[extra]` clauses they print/parse (strides for
@@ -1585,7 +1610,8 @@ class AddrMemTensorType(MemTensorType):
 class RegMemTensorType(MemTensorType):
     """Register-resident tensor: SIMT-distributed registers, no byte
     addressing. Storage is a fixed set of named registers per thread
-    (rmem) or per warp (wgrmem); no pointer arithmetic, no aliasing.
+    (rmem), warp (wrmem), or warp group (wgrmem); no pointer arithmetic,
+    no aliasing.
     """
 
 
@@ -1911,6 +1937,65 @@ class RmemTensorType(RegMemTensorType):
     """
 
 
+@gpu_dialect.register_type("wrmem")
+class WrmemTensorType(RegMemTensorType):
+    """Register-memory tensor collectively owned by one warp.
+
+    Each lane holds the registers assigned to it by the producing operation;
+    the logical value is the union of the 32 lane fragments.
+    ``default`` is a placeholder layout whose mapping is not yet specified.
+    """
+
+    # TODO: Move warp-level MMA support from WgrmemTensorType to WrmemTensorType,
+    # including the mma layout, bf16/f16 register mapping, matmul and elementwise
+    # lowering, and memory effects.
+    # TODO: Define the supported layout mappings and validate layout names.
+
+    @classmethod
+    def build(  # type: ignore[override]
+        cls,
+        sizes: list[int],
+        dtype: Type,
+        layout: str = "default",
+        attrs: dict[str, object] | None = None,
+    ):
+        return cls(attrs={
+            "sizes": list(sizes),
+            "dtype": dtype,
+            "layout": layout,
+            **(attrs or {}),
+        })
+
+    @property
+    def layout(self) -> str:
+        return self.attrs["layout"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write(self.name)
+        p.write("<")
+        p.write_shape(self.sizes, self.dtype)
+        p.write(f' layout="{self.layout}"')
+        p.write_extra_attrs(
+            self.attrs, skip_keys=("sizes", "dtype", "layout"),
+        )
+        p.write(">")
+
+    @classmethod
+    def parse(cls, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.TYPE_ID:
+            raise ValueError(
+                f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal("<")
+        sizes, dtype = p.read_shape_with_dtype()
+        p.read_literal("layout")
+        p.read_literal("=")
+        layout = p.read_str_attr()
+        attrs = p.read_extra_attrs()
+        p.read_literal(">")
+        return cls.build(sizes, dtype, layout, attrs=attrs)
+
+
 @gpu_dialect.register_type("wgrmem")
 class WgrmemTensorType(RegMemTensorType):
     """Warp-group register-memory tensor.
@@ -2169,60 +2254,179 @@ class ConstantOp(GpuOp):
         )
 
     @property
-    def value(self) -> object:
-        return self.attrs["value"]
+    def value(self) -> int | float | list[int | float]:
+        return cast(int | float | list[int | float], self.attrs["value"])
 
+    @staticmethod
+    def splat_value(value: Value) -> int | float | None:
+        """The literal of the splat constant defining ``value``, if any."""
+        if not isinstance(value.definition, ConstantOp):
+            return None
+        literal = value.definition.value
+        return None if isinstance(literal, list) else literal
 
-@gpu_dialect.register_op("thread_ids")
-class ThreadIdsOp(GpuOp):
-    """Produce the 3D thread index (tid.x, tid.y, tid.z)."""
+    @property
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "value"
+        }
+
+    def print(self, p: Printer) -> None:
+        self.results[0].print(p)
+        p.write(f" = {self.op_id} ")
+        p.write_attr(self.value)
+        p.write_extra_attrs(self.attrs, skip_keys=("value",))
 
     @classmethod
-    def build(cls) -> "ThreadIdsOp":
-        idx = IndexType()
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ConstantOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        value = p.read_attr()
+        attrs = p.read_extra_attrs()
+        if "value" in attrs:
+            raise ValueError("constant value must not also appear in attrs")
         return cls(
             operands=[],
-            results=[Value(name=name, type=idx) for name in ["tx", "ty", "tz"]],
+            results=results,
+            attrs={"value": value, **attrs},
+        )
+
+
+@gpu_dialect.register_op("thread_id")
+class ThreadIdOp(GpuOp):
+    """Produce one axis of the thread index."""
+
+    @classmethod
+    def build(
+        cls,
+        axis: CollectiveAxis,
+        attrs: dict[str, object] | None = None,
+    ) -> "ThreadIdOp":
+        attrs = dict(attrs or {})
+        if "axis" in attrs:
+            raise ValueError("pass axis as an explicit argument")
+        axis_name = axis.name.lower()
+        return cls(
+            operands=[],
+            results=[Value(name=f"t{axis_name}", type=IndexType())],
+            attrs={"axis": axis_name, **attrs},
         )
 
     @property
-    def x(self) -> Value:
+    def axis(self) -> CollectiveAxis:
+        axis = self.attrs["axis"]
+        assert isinstance(axis, str)
+        return CollectiveAxis[axis.upper()]
+
+    @property
+    def value(self) -> Value:
         return self.results[0]
 
     @property
-    def y(self) -> Value:
-        return self.results[1]
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "axis"
+        }
 
-    @property
-    def z(self) -> Value:
-        return self.results[2]
+    def print(self, p: Printer) -> None:
+        self.value.print(p)
+        p.write(f" = {self.op_id}.{self.axis.name.lower()}")
+        p.write_extra_attrs(self.attrs, skip_keys=("axis",))
 
-
-@gpu_dialect.register_op("block_ids")
-class BlockIdsOp(GpuOp):
-    """Produce the 3D block index (ctaid.x, ctaid.y, ctaid.z)."""
-
-    # TODO: Make the x/y/z axis an attribute and return one ID instead of
-    # coupling all three axes in one operation.
     @classmethod
-    def build(cls) -> "BlockIdsOp":
-        idx = IndexType()
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "ThreadIdOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal(".")
+        axis_name = p.read_identifier()
+        try:
+            axis = CollectiveAxis[axis_name.upper()]
+        except KeyError as error:
+            raise ValueError(f"invalid thread ID axis {axis_name!r}") from error
+        attrs = p.read_extra_attrs()
+        if "axis" in attrs:
+            raise ValueError("thread ID axis must not also appear in attrs")
         return cls(
             operands=[],
-            results=[Value(name=name, type=idx) for name in ["bx", "by", "bz"]],
+            results=results,
+            attrs={"axis": axis.name.lower(), **attrs},
+        )
+
+
+@gpu_dialect.register_op("block_id")
+class BlockIdOp(GpuOp):
+    """Produce one axis of the block index."""
+
+    @classmethod
+    def build(
+        cls,
+        axis: CollectiveAxis,
+        attrs: dict[str, object] | None = None,
+    ) -> "BlockIdOp":
+        attrs = dict(attrs or {})
+        if "axis" in attrs:
+            raise ValueError("pass axis as an explicit argument")
+        axis_name = axis.name.lower()
+        return cls(
+            operands=[],
+            results=[Value(name=f"b{axis_name}", type=IndexType())],
+            attrs={"axis": axis_name, **attrs},
         )
 
     @property
-    def x(self) -> Value:
+    def axis(self) -> CollectiveAxis:
+        axis = self.attrs["axis"]
+        assert isinstance(axis, str)
+        return CollectiveAxis[axis.upper()]
+
+    @property
+    def value(self) -> Value:
         return self.results[0]
 
     @property
-    def y(self) -> Value:
-        return self.results[1]
+    def extra_attrs(self) -> dict[str, object]:
+        return {
+            key: value for key, value in self.attrs.items()
+            if key != "axis"
+        }
 
-    @property
-    def z(self) -> Value:
-        return self.results[2]
+    def print(self, p: Printer) -> None:
+        self.value.print(p)
+        p.write(f" = {self.op_id}.{self.axis.name.lower()}")
+        p.write_extra_attrs(self.attrs, skip_keys=("axis",))
+
+    @classmethod
+    def parse_infix(
+        cls, results: list[Value], prefix: str, p,
+    ) -> "BlockIdOp":  # type: ignore[override]
+        if prefix != cls.OP_ID:
+            raise ValueError(
+                f"expected op {cls.OP_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal(".")
+        axis_name = p.read_identifier()
+        try:
+            axis = CollectiveAxis[axis_name.upper()]
+        except KeyError as error:
+            raise ValueError(f"invalid block ID axis {axis_name!r}") from error
+        attrs = p.read_extra_attrs()
+        if "axis" in attrs:
+            raise ValueError("block ID axis must not also appear in attrs")
+        return cls(
+            operands=[],
+            results=results,
+            attrs={"axis": axis.name.lower(), **attrs},
+        )
 
 
 @gpu_dialect.register_op("cluster_block_ids")
@@ -2263,31 +2467,6 @@ class WarpGroupIdOp(GpuOp):
         return cls(
             operands=[],
             results=[Value(name=name, type=idx) for name in ["wgx", "wgy", "wgz"]],
-        )
-
-    @property
-    def x(self) -> Value:
-        return self.results[0]
-
-    @property
-    def y(self) -> Value:
-        return self.results[1]
-
-    @property
-    def z(self) -> Value:
-        return self.results[2]
-
-
-@gpu_dialect.register_op("warp_ids")
-class WarpIdsOp(GpuOp):
-    """Produce the 3D warp index within the block."""
-
-    @classmethod
-    def build(cls) -> "WarpIdsOp":
-        idx = IndexType()
-        return cls(
-            operands=[],
-            results=[Value(name=name, type=idx) for name in ["wx", "wy", "wz"]],
         )
 
     @property
@@ -2488,15 +2667,6 @@ class SelectOp(GpuOp):
         return self.operands[1:]
 
 
-@gpu_dialect.register_op("lane_id")
-class LaneIdOp(GpuOp):
-    """Produce the lane index within the warp (0..31)."""
-
-    @classmethod
-    def build(cls) -> "LaneIdOp":
-        return cls(operands=[], results=[Value(name=None, type=IndexType())])
-
-
 def root_buffers(value: Value) -> set[Value]:
     """Return every physical buffer that may underlie ``value``."""
     definition = value.definition
@@ -2602,6 +2772,8 @@ _COLLECTIVE_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
 def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, RmemTensorType):
         return CollectiveScope.THREAD
+    if isinstance(t, WrmemTensorType):
+        return CollectiveScope.WARP
     if isinstance(t, WgrmemTensorType):
         return CollectiveScope.WARPGROUP
     if isinstance(t, SmemTensorType):
@@ -2722,8 +2894,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
-        init_effects = [] if op.init_value is None else _memory_effect(
-            "R", op.init_value, _type_collective_scope(op.init_value.type),
+        init_effects = [] if op.init is None else _memory_effect(
+            "R", op.init, _type_collective_scope(op.init.type),
         )
         return (
             _memory_effect(
@@ -2758,7 +2930,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             CollectiveScope.THREAD
             if isinstance(
                 op.dst.type,
-                (RmemTensorType, WgrmemTensorType),
+                (RmemTensorType, WrmemTensorType, WgrmemTensorType),
             )
             else _type_collective_scope(op.dst.type)
         )
@@ -2839,7 +3011,7 @@ def is_side_effect_free(op: Op) -> bool:
         # moves freely nor stands in for another.
         return op.init is None
     return isinstance(op, (
-        BlockIdsOp,
+        BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,
@@ -2847,16 +3019,14 @@ def is_side_effect_free(op: Op) -> bool:
         IndexLtOp,
         IndexModOp,
         IndexMulOp,
-        LaneIdOp,
         PtrAddOp,
         ConstantOp,
         SelectOp,
         ReinterpretOp,
         ReshapeOp,
-        ThreadIdsOp,
+        ThreadIdOp,
         TileOp,
         ToPtrOp,
-        WarpIdsOp,
         WarpGroupIdOp,
     ))
 

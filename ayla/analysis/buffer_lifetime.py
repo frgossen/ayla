@@ -10,7 +10,7 @@ from ..gpu_dialect import (
     AsyncOp,
     AwaitOp,
     BarrierOp,
-    BlockIdsOp,
+    BlockIdOp,
     ClusterBlockIdsOp,
     ElementwiseOp,
     IndexAddOp,
@@ -20,7 +20,6 @@ from ..gpu_dialect import (
     IndexModOp,
     IndexMulOp,
     KernelOp,
-    LaneIdOp,
     MatmulOp,
     MoveOp,
     PTXTemplateOp,
@@ -30,12 +29,11 @@ from ..gpu_dialect import (
     ReshapeOp,
     ConstantOp,
     SelectOp,
-    ThreadIdsOp,
+    ThreadIdOp,
     TileOp,
     TmaMoveOp,
     ToPtrOp,
     WarpGroupIdOp,
-    WarpIdsOp,
     memory_effects,
 )
 from .dataflow import DataflowAnalysis, DataflowState, transfers
@@ -108,7 +106,7 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
 
     @transfers(
         BarrierOp,
-        BlockIdsOp,
+        BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,
         IndexConstantOp,
@@ -116,17 +114,15 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
         IndexLtOp,
         IndexModOp,
         IndexMulOp,
-        LaneIdOp,
         PtrAddOp,
         ReinterpretOp,
         ReshapeOp,
         ConstantOp,
         SelectOp,
-        ThreadIdsOp,
+        ThreadIdOp,
         TileOp,
         ToPtrOp,
         WarpGroupIdOp,
-        WarpIdsOp,
     )
     def transfer_no_memory_effect(
         self, op: Op, state: BufferLivenessState,

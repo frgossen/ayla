@@ -9,7 +9,8 @@ def test_reuses_output_buffer_for_matmul_temporary():
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %tmp: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
+            %zero: rmem<f32> = constant 0.0
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %tmp: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
             elementwise sigmoid(%output: gmem<16x16xf32>, %tmp: gmem<16x16xf32>)
           }
         }"""))
@@ -19,7 +20,8 @@ def test_reuses_output_buffer_for_matmul_temporary():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
+            %zero: rmem<f32> = constant 0.0
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
             elementwise sigmoid(%output: gmem<16x16xf32>, %output: gmem<16x16xf32>)
           }
         }""")
@@ -90,7 +92,8 @@ def test_does_not_reuse_buffer_that_remains_live_after_handoff():
         module {
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %tmp: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
+            %zero: rmem<f32> = constant 0.0
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %tmp: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
             elementwise sigmoid(%output: gmem<16x16xf32>, %tmp: gmem<16x16xf32>)
             move(%tmp: gmem<16x16xf32>, %tmp: gmem<16x16xf32>)
           }
@@ -113,8 +116,9 @@ def test_reuse_union_includes_lifetimes_of_previous_members():
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0, label: "a"}
             %b: gmem<16x16xf32> = alloc() attrs={id: 1, label: "b"}
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
+            %zero: rmem<f32> = constant 0.0
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %a: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %b: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
             elementwise sigmoid(%b: gmem<16x16xf32>, %b: gmem<16x16xf32>)
             elementwise sigmoid(%output: gmem<16x16xf32>, %a: gmem<16x16xf32>)
           }
@@ -134,9 +138,10 @@ def test_allocation_starts_a_reuse_set():
           kernel @matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>) {
             %a: gmem<16x16xf32> = alloc() attrs={id: 0}
             %b: gmem<16x16xf32> = alloc() attrs={id: 1}
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %a: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
+            %zero: rmem<f32> = constant 0.0
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %a: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
             elementwise sigmoid(%a: gmem<16x16xf32>, %a: gmem<16x16xf32>)
-            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %b: gmem<16x16xf32>) collective=xyz.grid attrs={init: 0.0}
+            matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %b: gmem<16x16xf32>, %zero: rmem<f32>) collective=xyz.grid
           }
         }"""))
 

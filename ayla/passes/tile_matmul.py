@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 from ..gpu_dialect import (
-    BlockIdsOp,
+    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ForOp,
@@ -20,7 +20,7 @@ from ..gpu_dialect import (
     MemoryEffect,
     MemTensorType,
     ModuleOp,
-    ThreadIdsOp,
+    ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
     is_elementwise,
@@ -39,8 +39,8 @@ from ._utils import label_matches
 
 
 _PARALLEL_ID_OPS = {
-    CollectiveLevel.BLOCK: BlockIdsOp,
-    CollectiveLevel.THREAD: ThreadIdsOp,
+    CollectiveLevel.BLOCK: BlockIdOp,
+    CollectiveLevel.THREAD: ThreadIdOp,
     CollectiveLevel.WG: WarpGroupIdOp,
 }
 
@@ -360,25 +360,34 @@ class TileMatmul(LoweringPass):
         ubs: list[int],
     ) -> list[Op]:
         lhs, rhs, dst = hero.lhs, hero.rhs, hero.dst
-        init_value = hero.init_value
+        init = hero.init
         tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
         parallel_ids: dict[
-            CollectiveLevel, BlockIdsOp | ThreadIdsOp | WarpGroupIdOp
+            tuple[CollectiveLevel, CollectiveAxis], Value
         ] = {}
-        for level, op_type in (
-            (CollectiveLevel.BLOCK, BlockIdsOp),
-            (CollectiveLevel.THREAD, ThreadIdsOp),
-            (CollectiveLevel.WG, WarpGroupIdOp),
-        ):
-            if any(
-                binding is not None and binding[0] == level
-                for binding in self.iteration_bindings
-            ):
+        for binding in self.iteration_bindings:
+            if binding is None or binding in parallel_ids:
+                continue
+            level, axis = binding
+            if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
+                op_type = {
+                    CollectiveLevel.BLOCK: BlockIdOp,
+                    CollectiveLevel.THREAD: ThreadIdOp,
+                }[level]
+                ids = op_type.build(axis)
+                parallel_ids[binding] = ids.value
+            else:
+                op_type = {
+                    CollectiveLevel.WG: WarpGroupIdOp,
+                }[level]
                 ids = op_type.build()
-                parallel_ids[level] = ids
-                new_ops.append(ids)
+                for result_axis in CollectiveAxis:
+                    parallel_ids[(level, result_axis)] = (
+                        ids.results[result_axis]
+                    )
+            new_ops.append(ids)
 
         # A repeated block binding whose grid is smaller than its logical
         # extent visits the remaining tiles with one grid-stride loop.
@@ -489,9 +498,9 @@ class TileMatmul(LoweringPass):
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
-        if init_value is not None:  # A tensor initializer is tiled like dst.
-            ops, init_value = _build_tile_op(
-                init_value, ["M", "N"],
+        if init is not None and cast(MemTensorType, init.type).rank != 0:
+            ops, init = _build_tile_op(
+                init, ["M", "N"],
                 op_dims=self.op_dims,
                 tile_idxs=ivs,
                 tile_sizes=self.tile_sizes,
@@ -523,8 +532,7 @@ class TileMatmul(LoweringPass):
                 dst=dst,
                 collective=hero.collective,
                 attrs=attrs,
-                init=hero.init,
-                init_value=init_value,
+                init=init,
             ),
         )
 

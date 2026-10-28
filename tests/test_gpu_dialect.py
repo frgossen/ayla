@@ -21,6 +21,7 @@ from ayla.gpu_dialect import (
     AsyncOp,
     BarrierOp,
     BF16Type,
+    BlockIdOp,
     ClusterBlockIdsOp,
     CollectiveScope,
     ConstantOp,
@@ -42,6 +43,7 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     TmaDescType,
     TmaMoveOp,
+    ThreadIdOp,
     TileOp,
     WgrmemTensorType,
     gpu_dialect,
@@ -106,7 +108,7 @@ def test_constant_represents_address_backed_memory_spaces(
             "num_warp_groups": 1,
             "ptx_optimization_level": 1,
         }),
-        (MatmulOp, {"collective": {}, "init": 0.0}),
+        (MatmulOp, {"collective": {}}),
         (ReduceOp, {"fn": "sum", "collective": {}, "init": 0.0}),
         (TileOp, {"static_indices": [], "maybe_partial": True}),
         (ElementwiseOp, {"fn": "relu"}),
@@ -123,6 +125,7 @@ def test_constant_represents_address_backed_memory_spaces(
         (PTXTemplateOp, {"template": "ret;", "description": "test"}),
         (ForOp, {"lb": 0, "ub": 1, "step": 1}),
         (IndexConstantOp, {"value": 0}),
+        (ConstantOp, {"value": 1.0}),
     ],
 )
 def test_extra_attrs_excludes_explicit_attrs(op_type, explicit_attrs):
@@ -253,6 +256,10 @@ def test_reshape_op():
 
 
 def test_reduce_op():
+    assert ReduceOp.NEUTRAL_ELEMENTS == {
+        "max": float("-inf"),
+        "sum": 0.0,
+    }
     src = Value(
         name="src", type=GmemTensorType.build([8, 32], F32Type()),
     )
@@ -347,6 +354,15 @@ def test_matmul_tensor_initializer_roundtrips():
         )
 
 
+def test_constant_splat_value():
+    scalar = RmemTensorType.build([], F32Type())
+    splat = ConstantOp.build(2.5, scalar)
+    data = ConstantOp.build([1.0, 2.0], RmemTensorType.build([2], F32Type()))
+    assert ConstantOp.splat_value(splat.result()) == 2.5
+    assert ConstantOp.splat_value(data.result()) is None
+    assert ConstantOp.splat_value(Value(name="arg", type=scalar)) is None
+
+
 def test_elementwise_syntax():
     tensor_type = GmemTensorType.build((8,), F32Type())
     dst = Value(name="dst", type=tensor_type)
@@ -354,6 +370,7 @@ def test_elementwise_syntax():
     op = ElementwiseOp.build(
         dst, [src], fn="sigmoid", attrs={"label": "activation"},
     )
+    assert op.ilp is False
 
     assert_print_and_roundtrip(
         op,
@@ -365,6 +382,14 @@ def test_elementwise_syntax():
             'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
             'attrs={fn: "convert"}'
         )
+
+    wide = ElementwiseOp.build(dst, [src], fn="sigmoid", ilp=True)
+    assert wide.ilp is True
+    assert_print_and_roundtrip(
+        wide,
+        'elementwise sigmoid(%dst: gmem<8xf32>, %src: gmem<8xf32>) '
+        'attrs={ilp: True}',
+    )
 
 
 def test_kernel_op():
@@ -454,6 +479,36 @@ def test_cluster_block_ids_round_trip():
     )
 
 
+def test_block_id_round_trip():
+    block_id = BlockIdOp.build(
+        CollectiveAxis.Y,
+        attrs={"label": "block"},
+    )
+
+    assert block_id.axis == CollectiveAxis.Y
+    assert block_id.extra_attrs == {"label": "block"}
+    assert block_id.results == [block_id.value]
+    assert_print_and_roundtrip(
+        block_id,
+        '%by: index = block_id.y attrs={label: "block"}',
+    )
+
+
+def test_thread_id_round_trip():
+    thread_id = ThreadIdOp.build(
+        CollectiveAxis.Z,
+        attrs={"label": "thread"},
+    )
+
+    assert thread_id.axis == CollectiveAxis.Z
+    assert thread_id.extra_attrs == {"label": "thread"}
+    assert thread_id.results == [thread_id.value]
+    assert_print_and_roundtrip(
+        thread_id,
+        '%tz: index = thread_id.z attrs={label: "thread"}',
+    )
+
+
 def test_cluster_collective_scope_is_between_block_and_grid():
     assert (
         CollectiveScope.BLOCK.join(CollectiveScope.CLUSTER)
@@ -537,6 +592,15 @@ def test_index_lt_op():
         IndexLtOp.build(not_index, rhs)
     with pytest.raises(AssertionError, match="expected IndexType rhs"):
         IndexLtOp.build(lhs, not_index)
+
+
+def test_warp_register_memory_type():
+    typ = WrmemTensorType.build((1,), F32Type())
+    assert repr(typ) == 'wrmem<1xf32 layout="default">'
+    assert_print_and_roundtrip(
+        AllocOp.build(typ, id=0),
+        '%0: wrmem<1xf32 layout="default"> = alloc() attrs={id: 0}',
+    )
 
 
 def test_async_op():
@@ -786,8 +850,10 @@ def test_naive_matmul_4096_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @naive_matmul_4096(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
-            %cx: index, %cy: index, %cz: index = block_ids()
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %cx: index = block_id.x
+            %cy: index = block_id.y
+            %tx: index = thread_id.x
+            %ty: index = thread_id.y
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<4096x64xf32 strides=[4096, 1]> = tile(%b: gmem<4096x4096xf32>, 0, %cy: index)
             %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)

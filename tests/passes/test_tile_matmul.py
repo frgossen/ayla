@@ -168,7 +168,7 @@ def test_tiles_a_sigmoid_epilogue_with_the_matmul():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<128x64xbf16>, %b: gmem<128x64xbf16>, %c: gmem<128x128xf32>) grid_dim=[4, None, None] block_dim=[128, 1, 1] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %0: gmem<32x128xf32> = tile(%c: gmem<128x128xf32>, %bx: index, 0)
             for (%k: index = 0 to 4) attrs={label: "k"} {
               %1: gmem<32x64xbf16> = tile(%a: gmem<128x64xbf16>, %bx: index, 0)
@@ -201,7 +201,7 @@ def test_block_x_tiling_guards_more_blocks_than_tiles():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: gmem<64x64xbf16>, %b: gmem<192x64xbf16>, %c: gmem<64x192xf32>) grid_dim=[4, 1, 1] block_dim=[128, 1, 1] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
             %c3: index = index_constant() attrs={value: 3}
             %0: pred = index_lt(%bx: index, %c3: index)
             if(%0: pred) {

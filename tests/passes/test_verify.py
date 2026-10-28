@@ -301,6 +301,21 @@ def test_default_verification_checks_reduce_collective():
         verify_gpu_dialect(ModuleOp.build(Block(ops=[op])))
 
 
+def test_default_verification_rejects_unknown_reduction_function():
+    typ = GmemTensorType.build([8, 1], F32Type())
+    op = ReduceOp.build(
+        Value(name="dst", type=typ),
+        Value(name="src", type=typ),
+        fn="unknown",
+        collective={
+            axis: CollectiveLevel.THREAD for axis in CollectiveAxis
+        },
+    )
+
+    with pytest.raises(ValueError, match="unknown reduction function"):
+        verify_gpu_dialect(ModuleOp.build(Block(ops=[op])))
+
+
 def test_default_verification_checks_reshape():
     source = Value(
         name="source",
@@ -382,6 +397,14 @@ def test_elementwise_function_and_arity_are_verified():
     ]))
     with pytest.raises(ValueError, match="unknown elementwise function"):
         verify_gpu_dialect(unknown)
+
+    invalid_ilp = ModuleOp.build(Block(ops=[
+        ElementwiseOp.build(
+            dst, srcs=srcs[:1], fn="sigmoid", attrs={"ilp": 1},
+        ),
+    ]))
+    with pytest.raises(ValueError, match="ilp must be a bool"):
+        verify_gpu_dialect(invalid_ilp)
 
 
 @pytest.mark.parametrize("cluster_dim", [(2, 0, 1), (2, 1)])

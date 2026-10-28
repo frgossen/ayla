@@ -54,13 +54,6 @@ from ..gpu_dialect import (
 )
 
 
-_ELEMENTWISE_ARITIES = {
-    "convert": 1,
-    "mul": 2,
-    "sigmoid": 1,
-    "silu": 1,
-}
-
 # The target is the device description currently available to compilation.
 # Grid-barrier schedules conservatively assume one CTA per SM.
 _RESIDENT_GRID_CTAS_BY_TARGET = {
@@ -518,6 +511,17 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError(
                 "cluster_mbar is a barrier resource, not an async lock"
             )
+        if not any(
+            isinstance(user, AwaitOp) for user in op.lock.users()
+        ):
+            raise ValueError("async lock must have a matching await")
+
+    @verifies(AwaitOp)
+    def _verify_await(self, op: AwaitOp) -> None:
+        if not any(
+            isinstance(user, AsyncOp) for user in op.lock.users()
+        ):
+            raise ValueError("await lock must have matching async work")
 
     @verifies(AwaitOp)
     def _verify_await(self, op: AwaitOp) -> None:
@@ -625,14 +629,19 @@ class VerifyGpuDialect(VerificationPass):
                 f"inconsistent matmul shapes: {lhs.sizes}, {rhs.sizes}, "
                 f"{dst.sizes}"
             )
-        init = op.init_value
+        init = op.init
         if init is not None and (
-            not isinstance(init.type, MemTensorType) or init.type.sizes != dst.sizes
+            not isinstance(init.type, MemTensorType)
+            or (init.type.rank != 0 and init.type.sizes != dst.sizes)
         ):
-            raise ValueError("matmul tensor init must match the destination shape")
+            raise ValueError(
+                "matmul init must be a scalar or match the destination shape"
+            )
 
     @verifies(ReduceOp)
     def _verify_reduce(self, op: ReduceOp) -> None:
+        if op.fn not in ReduceOp.NEUTRAL_ELEMENTS:
+            raise ValueError(f"unknown reduction function {op.fn!r}")
         _verify_collective_attr(op)
         dst, src = op.dst.type, op.src.type
         if not isinstance(dst, MemTensorType) or not isinstance(
@@ -668,7 +677,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(ElementwiseOp)
     def _verify_elementwise(self, op: ElementwiseOp) -> None:
-        expected = _ELEMENTWISE_ARITIES.get(op.fn)
+        expected = ElementwiseOp.ARITIES.get(op.fn)
         if expected is None:
             raise ValueError(f"unknown elementwise function {op.fn!r}")
         if op.num_srcs != expected:
@@ -676,6 +685,8 @@ class VerifyGpuDialect(VerificationPass):
                 f"elementwise {op.fn} expects {expected} sources, "
                 f"got {op.num_srcs}"
             )
+        if type(op.ilp) is not bool:
+            raise ValueError(f"elementwise ilp must be a bool; got {op.ilp!r}")
 
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:
@@ -706,6 +717,15 @@ class VerifyGpuDialect(VerificationPass):
             and arg.num_elements != result.num_elements
         ):
             raise ValueError("reshape must preserve the number of elements")
+
+    @verifies(MatmulOp, stage=VerificationStage.PTX_LOWERING)
+    def _verify_matmul_initialized(self, op: MatmulOp) -> None:
+        # Matmul lowerings accumulate; PromoteBuffers moves an initializer onto
+        # the register accumulator before then.
+        if op.init is not None:
+            raise ValueError(
+                "matmul initializer must be promoted before PTX lowering"
+            )
 
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:

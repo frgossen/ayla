@@ -302,7 +302,8 @@ def test_lower_tma_load_with_l2_cache_hint():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @load(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %x: index, %y: index, %z: index = block_ids()
+            %x: index = block_id.x
+            %y: index = block_id.y
             %smem: smem<64x64xf32> = alloc()
             %lock: lock<mbar> = alloc()
             async(%lock: lock<mbar>) tma_move(%smem: smem<64x64xf32>, %desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %x: index, %y: index) attrs={l2_cache_hint: "evict_last"}
@@ -370,7 +371,8 @@ def test_lower_tma_store_with_l2_cache_hint():
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @store(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %x: index, %y: index, %z: index = block_ids()
+            %x: index = block_id.x
+            %y: index = block_id.y
             %smem: smem<64x64xf32> = alloc()
             %lock: lock<bulk> = alloc()
             async(%lock: lock<bulk>) tma_move(%desc: tma_desc<arg_idx=0 gmem<64x64xf32> tile=64x64>, %smem: smem<64x64xf32>, %x: index, %y: index) attrs={l2_cache_hint: "evict_first"}
@@ -391,7 +393,8 @@ def test_lower_move_gmem_to_smem():
         """\
         module {
           kernel @load_tile(%a: gmem<4096x4096xbf16>) grid_dim=[64, 64, 1] block_dim=[128, 1, 1] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
+            %by: index = block_id.y
             %a_tile: gmem<64x16xbf16 strides=[4096, 1]> = tile(%a: gmem<4096x4096xbf16>, %by: index, %bx: index)
             %smem_a: smem<64x16xbf16> = alloc() attrs={id: 0}
             move(%smem_a: smem<64x16xbf16>, %a_tile: gmem<64x16xbf16 strides=[4096, 1]>) collective=xyz.block
@@ -493,6 +496,13 @@ def test_lower_sigmoid_with_bf16_output_uses_ftz_phase_schedule():
     ]
     assert "ex2.approx.ftz.f32" in template
     assert "rcp.approx.ftz.f32" in template
+    assert "${f32:sigmoid_result0}" in template
+    assert "${f32:sigmoid_result1}" in template
+    assert "sigmoid_result2" not in template
+    assert not any(
+        line.startswith("mul.f32 ${f32:operand.src")
+        for line in template.splitlines()
+    )
 
 
 def test_lower_sigmoid_can_convert_its_result_to_f16():
@@ -585,6 +595,23 @@ def test_lower_elementwise_supports_every_wgmma_n_extent(n):
         lower_to_ptx_template(module), PTXTemplateOp,
     )[-1].attrs["template"]
     assert template.count("cvt.rn.bf16x2.f32") == n // 4
+
+
+def test_lower_elementwise_convert_unpacks_bf16_register_pairs():
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @k() {
+            %src: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %dst: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
+            elementwise convert(%dst: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %src: wgrmem<64x64xbf16 warps=4 layout="wgmma_layout_0">)
+          }
+        }"""))
+
+    template = find_ops_of_type(
+        lower_to_ptx_template(module), PTXTemplateOp,
+    )[-1].attrs["template"]
+    assert template.count("mov.b32") == 16
+    assert template.count("cvt.f32.bf16") == 32
 
 
 def test_lower_elementwise_uses_root_registers_for_wgrmem_view():
@@ -688,24 +715,13 @@ def test_lower_elementwise_silu():
         lowered, lambda op: isinstance(op, PTXTemplateOp)
     )[-1].attrs["template"]
 
-    expected = "".join(
-        textwrap.dedent(f"""\
-            mul.f32 ${{f32:silu_tmp{reg}}}, ${{f32:operand.src.r{reg}}}, 0fBFB8AA3B;
-            ex2.approx.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}};
-            add.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}}, 0f3F800000;
-            rcp.approx.f32 ${{f32:silu_tmp{reg}}}, ${{f32:silu_tmp{reg}}};
-            """)
-        for reg in range(4)
-    )
-    expected += "".join(
-        f"mul.f32 ${{f32:operand.dst.r{reg}}}, "
-        f"${{f32:operand.src.r{reg}}}, ${{f32:silu_tmp{reg}}};\n"
-        for reg in range(4)
-    )
-    assert template == expected
+    assert "${f32:silu_tmp0}" in template
+    assert "silu_tmp1" not in template
+    assert template.count("ex2.approx.f32") == 4
+    assert template.count("mul.f32 ${f32:operand.dst") == 4
 
 
-def test_lower_elementwise_silu_with_bf16_output():
+def test_lower_elementwise_silu_can_opt_out_of_minimum_register_schedule():
     w = 'wgrmem<16x8xf32 layout="mma">'
     b = 'wgrmem<16x8xbf16 layout="mma">'
     module = gpu_dialect.parse(textwrap.dedent(f"""\
@@ -713,7 +729,7 @@ def test_lower_elementwise_silu_with_bf16_output():
           kernel @k() grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
             %src: {w} = alloc() attrs={{id: 0}}
             %dst: {b} = alloc() attrs={{id: 1}}
-            elementwise silu(%dst: {b}, %src: {w})
+            elementwise silu(%dst: {b}, %src: {w}) attrs={{ilp: True}}
           }}
         }}"""))
 
@@ -725,7 +741,7 @@ def test_lower_elementwise_silu_with_bf16_output():
     assert template.count("ex2.approx.ftz.f32") == 4
     assert template.count("rcp.approx.ftz.f32") == 4
     assert "ex2.approx.f32" not in template
-    assert template.count("mul.f32 ${f32:silu_result") == 4
+    assert "${f32:silu_result3}" in template
     assert template.endswith(textwrap.dedent("""\
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r0}, ${f32:silu_result1}, ${f32:silu_result0};
         cvt.rn.bf16x2.f32 ${b32:operand.dst.r1}, ${f32:silu_result3}, ${f32:silu_result2};

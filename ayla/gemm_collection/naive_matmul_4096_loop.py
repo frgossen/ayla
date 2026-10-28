@@ -11,8 +11,10 @@ def naive_matmul_4096_loop_module():
     module_str = textwrap.dedent("""\
         module {
           kernel @naive_matmul_4096_loop(%a: gmem<4096x4096xf32>, %b: gmem<4096x4096xf32>, %c: gmem<4096x4096xf32>) grid_dim=[64, 64, 1] block_dim=[32, 32, 1] {
-            %cx: index, %cy: index, %cz: index = block_ids()
-            %tx: index, %ty: index, %tz: index = thread_ids()
+            %cx: index = block_id.x
+            %cy: index = block_id.y
+            %tx: index = thread_id.x
+            %ty: index = thread_id.y
             %a_block: gmem<64x4096xf32> = tile(%a: gmem<4096x4096xf32>, %cx: index, 0)
             %b_block: gmem<64x4096xf32> = tile(%b: gmem<4096x4096xf32>, %cy: index, 0)
             %c_block: gmem<64x64xf32 strides=[4096, 1]> = tile(%c: gmem<4096x4096xf32>, %cx: index, %cy: index)

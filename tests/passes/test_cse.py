@@ -11,7 +11,7 @@ def test_cse_deduplicates_index_constants():
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4096x4096xf32>) {
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id.x
             %c64a: index = index_constant() attrs={value: 64}
             %offset_a: index = index_mul(%cx: index, %c64a: index)
             %c64b: index = index_constant() attrs={value: 64}
@@ -34,7 +34,7 @@ def test_cse_deduplicates_index_constants():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<4096x4096xf32>) {
-            %cx: index, %cy: index, %cz: index = block_ids()
+            %cx: index = block_id.x
             %c64a: index = index_constant() attrs={value: 64}
             %offset_a: index = index_mul(%cx: index, %c64a: index)
             %val: rmem<1xf32> = alloc() attrs={id: 0}

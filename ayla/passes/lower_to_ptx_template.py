@@ -6,6 +6,8 @@ other ops (alloc, load, store, matmul) will be added incrementally.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 import itertools
 import math
 import struct
@@ -21,6 +23,7 @@ from ..gpu_dialect import (
     AwaitOp,
     BarrierOp,
     BF16Type,
+    CollectiveAxis,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -45,7 +48,7 @@ from ..gpu_dialect import (
     RmemTensorType,
     ConstantOp,
     SmemTensorType,
-    ThreadIdsOp,
+    ThreadIdOp,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -60,10 +63,21 @@ from ..gpu_dialect import (
 
 
 def _lower_mul_registers(
-    dst_regs: list[str], lhs_regs: list[str], rhs_regs: list[str],
+    dst_regs: list[str],
+    lhs_regs: list[str],
+    rhs_regs: list[str],
+    dtype: Type,
 ) -> str:
+    if isinstance(dtype, F32Type):
+        opcode = "mul.f32"
+    elif isinstance(dtype, BF16Type):
+        opcode = "mul.rn.bf16x2"
+    else:
+        raise NotImplementedError(
+            f"lower_elementwise: mul does not support {dtype}"
+        )
     return "".join(
-        f"mul.f32 {dst}, {lhs}, {rhs};\n"
+        f"{opcode} {dst}, {lhs}, {rhs};\n"
         for dst, lhs, rhs in zip(
             dst_regs, lhs_regs, rhs_regs, strict=True,
         )
@@ -169,23 +183,18 @@ def _lower_dtype_conversion_ptx(
     dst_dtype: Type,
 ) -> str:
     """Lower a conversion independently of the element-wise function."""
+    if isinstance(src_dtype, (BF16Type, F16Type)) and isinstance(dst_dtype, F32Type):
+        return _lower_packed16_to_f32_ptx(dst_regs, src_regs, src_dtype, dst_dtype)
     if (
-        isinstance(src_dtype, (BF16Type, F16Type))
-        and isinstance(dst_dtype, F32Type)
-    ):
-        return _lower_packed16_to_f32_ptx(
-            dst_regs, src_regs, src_dtype, dst_dtype,
-        )
-    if not (
         isinstance(src_dtype, F32Type)
         and isinstance(dst_dtype, (BF16Type, F16Type))
     ):
-        raise NotImplementedError(
-            f"lower_elementwise: unsupported conversion "
-            f"{src_dtype} -> {dst_dtype}"
+        return _lower_f32_to_packed16_ptx(
+            dst_regs, src_regs, src_dtype, dst_dtype,
         )
-    return _lower_f32_to_packed16_ptx(
-        dst_regs, src_regs, src_dtype, dst_dtype,
+    raise NotImplementedError(
+        f"lower_elementwise: unsupported conversion "
+        f"{src_dtype} -> {dst_dtype}"
     )
 
 
@@ -198,52 +207,100 @@ def _lower_convert_elementwise_ptx(op: ElementwiseOp) -> str:
     )
 
 
-def _lower_sigmoid_elementwise_ptx(op: ElementwiseOp) -> str:
+def _elementwise_source_names(op: ElementwiseOp) -> list[str]:
+    return ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
+
+
+def _sigmoid_ptx(dst_dtype: Type) -> Callable[[list[str], list[str]], str]:
+    return (
+        _lower_elementwise_sigmoid_bf16_ptx
+        if isinstance(dst_dtype, BF16Type)
+        else _lower_elementwise_sigmoid_ptx
+    )
+
+
+def _lower_elementwise_in_batches(
+    op: ElementwiseOp,
+    lower_registers: Callable[
+        [ElementwiseOp, list[str], list[list[str]]], str
+    ],
+) -> str:
+    """Lower with either bounded scratch registers or one wide ILP batch."""
+    src_regs = [
+        _elementwise_operand_regs(op.src(i), name)
+        for i, name in enumerate(_elementwise_source_names(op))
+    ]
+    register_count = len(src_regs[0])
+    assert all(len(regs) == register_count for regs in src_regs)
+
+    src_dtype = cast(MemTensorType, op.src(0).type).dtype
+    dst_dtype = cast(MemTensorType, op.dst.type).dtype
+    dst_regs = _elementwise_operand_regs(op.dst, "dst")
+    conversion_width = 1
+    if src_dtype != dst_dtype:
+        assert register_count == 2 * len(dst_regs)
+        conversion_width = 2
+    batch_size = register_count if op.ilp else conversion_width
+
+    template = ""
+    for start in range(0, register_count, batch_size):
+        end = start + batch_size
+        batch_src_regs = [regs[start:end] for regs in src_regs]
+        if src_dtype == dst_dtype:
+            result_regs = dst_regs[start:end]
+        else:
+            result_regs = [
+                f"${{f32:{op.fn}_result{i}}}"
+                for i in range(batch_size)
+            ]
+        template += lower_registers(op, result_regs, batch_src_regs)
+        if src_dtype != dst_dtype:
+            # TODO: Have PromoteBuffers emit an explicit convert after the F32
+            # epilogue; only promotion knows the register accumulator exists.
+            template += _lower_dtype_conversion_ptx(
+                dst_regs[start // conversion_width:end // conversion_width],
+                result_regs,
+                src_dtype,
+                dst_dtype,
+            )
+    return template
+
+
+def _lower_sigmoid_registers(
+    op: ElementwiseOp,
+    dst_regs: list[str],
+    src_regs: list[list[str]],
+) -> str:
     src_dtype = cast(MemTensorType, op.src(0).type).dtype
     dst_dtype = cast(MemTensorType, op.dst.type).dtype
     if not isinstance(src_dtype, F32Type):
         raise NotImplementedError(
             f"lower_elementwise: sigmoid does not support {src_dtype} input"
         )
-
-    src_regs = _elementwise_operand_regs(op.src(0), "src")
-    if src_dtype == dst_dtype:
-        result_regs = _elementwise_operand_regs(op.dst, "dst")
-    else:
-        result_regs = [
-            f"${{f32:sigmoid_tmp{reg}}}" for reg in range(len(src_regs))
-        ]
-
-    if isinstance(dst_dtype, BF16Type):
-        template = _lower_elementwise_sigmoid_bf16_ptx(
-            result_regs, src_regs,
-        )
-    else:
-        template = _lower_elementwise_sigmoid_ptx(result_regs, src_regs)
-    if src_dtype != dst_dtype:
-        template += _lower_dtype_conversion_ptx(
-            _elementwise_operand_regs(op.dst, "dst"),
-            result_regs,
-            src_dtype,
-            dst_dtype,
-        )
-    return template
+    [src] = src_regs
+    return _sigmoid_ptx(dst_dtype)(dst_regs, src)
 
 
-def _lower_mul_elementwise_ptx(op: ElementwiseOp) -> str:
-    if not all(
-        isinstance(cast(MemTensorType, value.type).dtype, F32Type)
+def _lower_mul_register_batches(
+    op: ElementwiseOp,
+    dst_regs: list[str],
+    src_regs: list[list[str]],
+) -> str:
+    dtype = cast(MemTensorType, op.dst.type).dtype
+    if any(
+        cast(MemTensorType, value.type).dtype != dtype
         for value in op.operands
     ):
-        raise NotImplementedError("lower_elementwise: mul supports only f32")
-    return _lower_mul_registers(
-        _elementwise_operand_regs(op.dst, "dst"),
-        _elementwise_operand_regs(op.src(0), "lhs"),
-        _elementwise_operand_regs(op.src(1), "rhs"),
-    )
+        raise NotImplementedError("lower_elementwise: mul requires matching operand dtypes")
+    lhs_regs, rhs_regs = src_regs
+    return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs, dtype)
 
 
-def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
+def _lower_silu_registers(
+    op: ElementwiseOp,
+    dst_regs: list[str],
+    src_reg_batches: list[list[str]],
+) -> str:
     src = op.src(0)
     src_dtype = cast(MemTensorType, src.type).dtype
     dst_dtype = cast(MemTensorType, op.dst.type).dtype
@@ -251,37 +308,28 @@ def _lower_silu_elementwise_ptx(op: ElementwiseOp) -> str:
         raise NotImplementedError(
             f"lower_elementwise: silu does not support {src_dtype} input"
         )
-
-    src_regs = _elementwise_operand_regs(src, "src")
-    if src_dtype == dst_dtype:
-        result_regs = _elementwise_operand_regs(op.dst, "dst")
-    else:
-        result_regs = [
-            f"${{f32:silu_result{reg}}}" for reg in range(len(src_regs))
-        ]
-    tmp_regs = [f"${{f32:silu_tmp{reg}}}" for reg in range(len(src_regs))]
-    if isinstance(dst_dtype, BF16Type):
-        template = _lower_elementwise_sigmoid_bf16_ptx(tmp_regs, src_regs)
-    else:
-        template = _lower_elementwise_sigmoid_ptx(tmp_regs, src_regs)
-    template += _lower_mul_registers(result_regs, src_regs, tmp_regs)
-    # TODO: Have PromoteBuffers emit an explicit convert after the F32
-    # epilogue; only promotion knows the register accumulator exists.
-    if src_dtype != dst_dtype:
-        template += _lower_dtype_conversion_ptx(
-            _elementwise_operand_regs(op.dst, "dst"),
-            result_regs,
-            src_dtype,
-            dst_dtype,
-        )
+    [src_regs] = src_reg_batches
+    tmp_regs = (
+        [f"${{f32:silu_tmp{i}}}" for i in range(len(src_regs))]
+        if op.dst is src else dst_regs
+    )
+    template = _sigmoid_ptx(dst_dtype)(tmp_regs, src_regs)
+    template += _lower_mul_registers(dst_regs, src_regs, tmp_regs, F32Type())
     return template
 
 
 _ELEMENTWISE_LOWERERS = {
     "convert": _lower_convert_elementwise_ptx,
-    "mul": _lower_mul_elementwise_ptx,
-    "sigmoid": _lower_sigmoid_elementwise_ptx,
-    "silu": _lower_silu_elementwise_ptx,
+    "mul": partial(
+        _lower_elementwise_in_batches,
+        lower_registers=_lower_mul_register_batches,
+    ),
+    "sigmoid": partial(
+        _lower_elementwise_in_batches, lower_registers=_lower_sigmoid_registers,
+    ),
+    "silu": partial(
+        _lower_elementwise_in_batches, lower_registers=_lower_silu_registers,
+    ),
 }
 
 
@@ -298,6 +346,30 @@ class LowerToPtxTemplate(LoweringPass):
         self, op: ConstantOp,
     ) -> tuple[list[Op], list[object]]:
         result_type = cast(RmemTensorType, op.result().type)
+        value = op.value
+        values = (
+            value
+            if isinstance(value, list)
+            else itertools.repeat(value, cast(int, result_type.num_elements))
+        )
+        lowered = PTXTemplateOp.build(
+            operands=[],
+            result_types=[result_type],
+            template=_mov_literals_ptx("value", result_type.dtype, values),
+            result_names=["value"],
+            description=str(op),
+        )
+        return [lowered], [lowered.result()]
+
+    @lowers(ConstantOp)
+    def lower_constant(
+        self, op: ConstantOp,
+    ) -> tuple[list[Op], list[object]]:
+        result_type = op.result().type
+        if not isinstance(result_type, RmemTensorType):
+            raise NotImplementedError(
+                f"lower_constant: unsupported result type {result_type}"
+            )
         value = op.value
         values = (
             value
@@ -742,7 +814,7 @@ class LowerToPtxTemplate(LoweringPass):
             )
         template = lower(op)
 
-        source_names = ["src"] if op.num_srcs == 1 else ["lhs", "rhs"]
+        source_names = _elementwise_source_names(op)
         assert len(source_names) == op.num_srcs
         new_op = PTXTemplateOp.build(
             operands=[dst_value, *source_values],
@@ -1696,7 +1768,9 @@ class LowerToPtxTemplate(LoweringPass):
         m_dim, n_dim = cast(tuple[int, int], wgrmem_type.sizes)
         root = root_buffer(fragment)
         assert root is not None
-        root_n = cast(int, root.type.sizes[1])
+        root_type = root.type
+        assert isinstance(root_type, WgrmemTensorType)
+        root_n = cast(int, root_type.sizes[1])
         if isinstance(fragment.definition, TileOp):
             assert list(memory_type.sizes) == [m_dim, n_dim], (
                 f"wgmma move: memory shape {list(memory_type.sizes)} does "
@@ -1706,7 +1780,8 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             # Keep accepting the legacy producer until PromoteBuffers switches
             # from an attribute-based slice to an explicit WGRMEM view.
-            col_start = int(op.attrs.get("wgmma_col_start", 0))
+            col_start = op.attrs.get("wgmma_col_start", 0)
+            assert isinstance(col_start, int)
             memory_m, memory_n = cast(tuple[int, int], memory_type.sizes)
             assert memory_m == m_dim and 0 <= col_start < n_dim
             assert col_start + memory_n <= n_dim
@@ -1795,7 +1870,9 @@ class LowerToPtxTemplate(LoweringPass):
 
         new_op = PTXTemplateOp.build(
             operands=[
-                self.value_map[memory], self.value_map[fragment], byte_offset,
+                cast(Value, self.value_map[memory]),
+                cast(Value, self.value_map[fragment]),
+                byte_offset,
             ],
             result_types=[], template=template,
             operand_names=["memory", "fragment", "offset"], result_names=[],
@@ -2234,9 +2311,9 @@ def _build_wgmma_layout_0_dynamic_offset(
     """
     ops: list[Op] = []
 
-    tid_op = ThreadIdsOp.build()
+    tid_op = ThreadIdOp.build(CollectiveAxis.X)
     ops.append(tid_op)
-    tid_x = tid_op.x
+    tid_x = tid_op.value
 
     c128 = IndexConstantOp.build(128)
     ops.append(c128)

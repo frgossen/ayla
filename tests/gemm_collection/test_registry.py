@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-import ayla.gemm_collection  # noqa: F401  (defines every op)
 from ayla.gemm_collection.registry import register_gemm
 
 

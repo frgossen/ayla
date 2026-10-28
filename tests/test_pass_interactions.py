@@ -31,7 +31,7 @@ from ayla.gpu_dialect import (
     TileOp,
     gpu_dialect,
 )
-from ayla.passes.canonicalize import Canonicalize
+from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.fuse_async import fuse_async
 from ayla.passes.insert_syncs import insert_syncs
 from ayla.passes.lower_to_async import lower_to_async
@@ -45,7 +45,8 @@ from tests.testing_utils import assert_contains_in_order
 MODULE_STR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) {
-        matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) collective=xyz.grid attrs={init: 0.0, label: "mm"}
+        %zero: rmem<f32> = constant 0.0
+        matmul(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>, %zero: rmem<f32>) collective=xyz.grid attrs={label: "mm"}
         elementwise sigmoid(%c: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) attrs={label: "epilogue"}
       }
     }""")
@@ -227,13 +228,15 @@ def test_separately_tiled_matmul_chain_keeps_raw_dependency():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @chain(%a: gmem<64x64xbf16>, %w_up: gmem<256x64xbf16>, %intermediate: gmem<64x256xbf16>, %w_down: gmem<256x256xbf16>, %out: gmem<64x256xbf16>) grid_dim=[2, 4, None] {
-            %bx: index, %by: index, %bz: index = block_ids()
+            %bx: index = block_id.x
+            %by: index = block_id.y
             %0: gmem<32x64xbf16> = tile(%a: gmem<64x64xbf16>, %bx: index, 0)
             %1: gmem<64x64xbf16> = tile(%w_up: gmem<256x64xbf16>, %by: index, 0)
             %2: gmem<32x256xbf16> = tile(%intermediate: gmem<64x256xbf16>, %bx: index, 0)
             %3: gmem<32x64xbf16 strides=[256, 1]> = tile(%2: gmem<32x256xbf16>, 0, %by: index)
             matmul(%0: gmem<32x64xbf16>, %1: gmem<64x64xbf16>, %3: gmem<32x64xbf16 strides=[256, 1]>) collective=[xy.block, z.grid] attrs={dst_tiling_scheme: 0, label: "up"}
-            %bx1: index, %by1: index, %bz1: index = block_ids()
+            %bx1: index = block_id.x
+            %by1: index = block_id.y
             %4: gmem<32x256xbf16> = tile(%intermediate: gmem<64x256xbf16>, %bx1: index, 0)
             %5: gmem<64x256xbf16> = tile(%w_down: gmem<256x256xbf16>, %by1: index, 0)
             %6: gmem<32x256xbf16> = tile(%out: gmem<64x256xbf16>, %bx1: index, 0)
@@ -287,7 +290,9 @@ def test_local_and_multicast_tma_loads_share_completion():
 TILED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
-        %bx: index, %by: index, %bz: index = block_ids()
+        %zero: rmem<f32> = constant 0.0
+        %bx: index = block_id.x
+        %by: index = block_id.y
         %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)
         %1: gmem<256x4096xbf16> = tile(%b: gmem<4096x4096xbf16>, %by: index, 0)
         %2: gmem<128x4096xbf16> = tile(%c: gmem<4096x4096xbf16>, %bx: index, 0)
@@ -295,7 +300,7 @@ TILED_IR = textwrap.dedent("""\
         %wgx: index, %wgy: index, %wgz: index = warp_group_id()
         %4: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
         %5: gmem<64x256xbf16 strides=[4096, 1]> = tile(%3: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>) collective=[x.wg, y.block, z.grid] attrs={dst_tiling_scheme: 0, init: 0.0, label: "mm"}
+        matmul(%4: gmem<64x4096xbf16>, %1: gmem<256x4096xbf16>, %5: gmem<64x256xbf16 strides=[4096, 1]>, %zero: rmem<f32>) collective=[x.wg, y.block, z.grid] attrs={dst_tiling_scheme: 0, label: "mm"}
         elementwise sigmoid(%5: gmem<64x256xbf16 strides=[4096, 1]>, %5: gmem<64x256xbf16 strides=[4096, 1]>) attrs={label: "epilogue"}
       }
     }""")
@@ -303,7 +308,9 @@ TILED_IR = textwrap.dedent("""\
 PROMOTED_IR = textwrap.dedent("""\
     module {
       kernel @mm(%a: gmem<4096x4096xbf16>, %b: gmem<4096x4096xbf16>, %c: gmem<4096x4096xbf16>) grid_dim=[32, 16, None] block_dim=[256, 1, 1] num_warp_groups=2 {
-        %bx: index, %by: index, %bz: index = block_ids()
+        %zero: rmem<f32> = constant 0.0
+        %bx: index = block_id.x
+        %by: index = block_id.y
         %0: gmem<128x4096xbf16> = tile(%a: gmem<4096x4096xbf16>, %bx: index, 0)
         %1: gmem<256x4096xbf16> = tile(%b: gmem<4096x4096xbf16>, %by: index, 0)
         %2: gmem<128x4096xbf16> = tile(%c: gmem<4096x4096xbf16>, %bx: index, 0)

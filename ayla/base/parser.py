@@ -121,17 +121,17 @@ class Parser:
         """
         if self.is_at("{"):
             return self.read_dict_attr()
-        if self.is_at('"'):
-            return self.read_str_attr()
         if self.is_at("["):
             return self.read_list_attr()
         return self.read_literal_attr()
 
-    def read_literal_attr(self) -> int | float | bool | None:
-        """Read an atomic literal: int / float / bool / None.
+    def read_literal_attr(self) -> str | int | float | bool | None:
+        """Read an atomic literal: str / int / float / bool / None.
 
         Booleans accept both `True`/`False` and `true`/`false`.
         """
+        if self.can_read_str_attr():
+            return self.read_str_attr()
         LITERAL_CHARS = string.ascii_letters + string.digits + "_.+-"
         start = self.pos
         while self.is_at(LITERAL_CHARS):
@@ -150,6 +150,10 @@ class Parser:
             return int(text)
         except ValueError:
             return float(text)
+
+    def can_read_str_attr(self) -> bool:
+        """Whether a quoted string starts at the current position."""
+        return self.is_at('"')
 
     def read_str_attr(self) -> str:
         """Read a quoted string literal (with `\\\\`, `\\"`, `\\n`, `\\t`
@@ -232,43 +236,6 @@ class Parser:
         if brackets:
             self.read_literal("]")
         return xs
-
-    def read_tuple_attr(
-        self,
-        types: tuple[type, ...] | None = None,
-        parens: bool = True,
-    ) -> tuple:
-        """Read a comma-separated tuple of attrs.
-
-        When `parens=True`, a surrounding `(...)` is required. When
-        `parens=False`, no surrounding delimiters; reads at least one
-        element and continues while the next token is `,`.
-
-        If `types` is given, asserts the tuple has exactly that length
-        and each element matches the corresponding type.
-        """
-        if parens:
-            self.read_literal("(")
-        xs: list[object] = [self.read_attr()]
-        while self.can_read_literal(","):
-            self.read_literal(",")
-            xs.append(self.read_attr())
-        if parens:
-            self.read_literal(")")
-        v = tuple(xs)
-        if types is not None:
-            if len(v) != len(types):
-                raise ValueError(
-                    f"expected tuple of length {len(types)}, "
-                    f"got length {len(v)}"
-                )
-            for i, (x, t) in enumerate(zip(v, types)):
-                if not isinstance(x, t):
-                    raise ValueError(
-                        f"tuple element {i} expected {t.__name__}, "
-                        f"got {type(x).__name__}"
-                    )
-        return v
 
     def read_op(self, results: list) -> Any:
         """Read op name, dispatch to registered parser, validate results."""
