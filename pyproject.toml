@@ -88,3 +88,6 @@ test = "pytest"
 lint = "ruff check"
 typecheck = "pyright"
 bench = "python -m benchmarks.bench_gemm_collection"
+
+bench-oss-validate = "python -m benchmarks.validate_oss_pytorch_gemm_shapes"
+bench-oss = "python -m benchmarks.benchmark_oss_pytorch_gemm_shapes"

@@ -29,6 +29,46 @@ curl -fsSL https://pixi.sh/install.sh | bash
 
 Then set up the environment with [pixi](https://pixi.sh): `pixi shell` to activate the env, `pixi run install` provisions Python 3.12 with ayla (editable) plus the CUDA 12.8 (cu128) PyTorch build, then `pixi run test` runs the tests and `pixi run bench` runs the benchmark.
 
+### JIT GEMMs and OSS benchmarks
+
+The JIT supports contiguous FP16/BF16 `mm`, `addmm`, and `bmm`, and routes
+supported calls through `ayla.torch_compile.install()`.
+
+```python
+from ayla.gemm_jit import gemm_op, measured_gemm_configs, select_gemm_schedule
+
+schedule = select_gemm_schedule("mm", "bfloat16", m=8192, n=768, k=768)
+print(schedule.builder_config if schedule else None)
+print(measured_gemm_configs("mm", "bfloat16", m=8192, n=768, k=768))
+# gemm_op("mm", "bfloat16")(a, bt, out) writes out = a @ bt.T.
+# ADDMM takes (bias, a, bt, out); BMM takes batched (a, bt, out).
+```
+
+`select_gemm_schedule` selects a main-supported configuration, using a nearby
+measured seed or an unmeasured fallback. `measured_gemm_configs` returns the
+exact-shape saved configurations, winner first, including feature-only records.
+For the **full feature space, performance search, and feature-enabled numbers**,
+check out `feature/consolidated`. Benchmark commands on this main-based checkout
+print checkout instructions and exit; the heuristic requires the full feature set.
+
+Validation works on this checkout. Switch branches before benchmarking:
+
+```bash
+pixi run bench-oss-validate
+git fetch origin
+git switch feature/consolidated
+CUDA_VISIBLE_DEVICES=0 pixi run bench-oss --workload all --max-shapes 3 \
+  --output-json .benchmarks/oss-smoke/raw.json \
+  --output-csv .benchmarks/oss-smoke/raw.csv
+```
+
+Remove `--max-shapes` for the full accepted corpus. Results are saved after
+each shape; repeating the command resumes successful shapes. `--no-resume`
+starts fresh. Inference timing is the default; `--timing warm` measures repeated
+calls on the same inputs. Keep outputs from different branches separate.
+Use `--corpus benchmarks/better_benchmark_gemm_shapes.json` for its recorded GEMMs.
+The full model graph suite is described below.
+
 ### better-benchmark
 
 [better-benchmark](third_party/better-benchmark)'s full model graphs measure ayla
@@ -46,16 +86,3 @@ time, else the default compiled time). `--models-root repros/models/hf/infer`
 narrows the run, `--output-dir` keeps each arm's raw JSON, and `--bench-root`
 points at another better-benchmark checkout (for example from a git worktree).
 Workers import this checkout's ayla, even when another one is installed.
-
-## Models to try
-
-Candidate test subjects, once ayla is ready to serve real GEMM shapes:
-
-- **Muse Glimmer 30B** — the best first target. A Meta model, open weights (Apache 2.0),
-  and it serves on a single H100 at TP=1 in bf16, which is exactly what ayla emits. Its
-  weight dimensions are all multiples of 256, so the existing tiling divides evenly.
-- **Gemma 4 31B** and **Qwen 3.5/3.6 27B** — the two models Glimmer is benchmarked
-  against, so they are the natural second and third subjects. Dense, single GPU, fp8.
-- **DeepSeek V4**, **Kimi K2.7**, **GLM 5.2** — the frontier, and the furthest away.
-  All mixture of experts, mostly fp8 with block scaling, so they need grouped GEMM and a
-  narrower operand type before ayla has anything to say about them.

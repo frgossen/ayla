@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from common import print_results
+from common import print_results, require_consolidated_benchmarks
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCH = ROOT / "third_party" / "better-benchmark"
@@ -63,6 +63,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path,
                         help="keep each arm's bench_parallel JSON here")
     args = parser.parse_args()
+    require_consolidated_benchmarks()
     args.bench_root = args.bench_root.resolve()
     if args.output_dir is not None:
         args.output_dir = args.output_dir.resolve()
