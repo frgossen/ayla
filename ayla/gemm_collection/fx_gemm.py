@@ -19,6 +19,8 @@ from ..gpu_dialect import (
     MatmulOp,
     ModuleOp,
     Type,
+    is_side_effect_free,
+    root_buffer,
 )
 from ..jit_compiler import LauncherPlan, PtxRoutePlan
 from ..ptx_codegen import make_ptx_kernel
@@ -46,6 +48,11 @@ _ADDMM_SIGNATURE: list[Type] = [
     *_GEMM_SIGNATURE,
 ]
 _ADDMM_OPERANDS = [OperandKind.R, *_GEMM_OPERANDS]
+_BMM_SIGNATURE: list[Type] = [
+    GmemTensorType.build([None, None, None], BF16Type()),
+    GmemTensorType.build([None, None, None], BF16Type()),
+    GmemTensorType.build([None, None, None], BF16Type()),
+]
 
 
 def _static_gemm_shape(op: MatmulOp) -> tuple[int, int, int] | None:
@@ -75,17 +82,17 @@ def _static_gemm_shape(op: MatmulOp) -> tuple[int, int, int] | None:
 
 
 def _gemm(module: ModuleOp) -> MatmulOp | None:
-    """The matmul of a kernel that is one GEMM writing its output."""
+    """The matmul of a kernel whose only effect is one GEMM."""
     [kernel] = module.body.ops
     assert isinstance(kernel, KernelOp)
-    *initializers, matmul = kernel.body.ops
+    effects = [op for op in kernel.body.ops if not is_side_effect_free(op)]
     if not (
-        isinstance(matmul, MatmulOp)
-        and matmul.dst is kernel.body.arguments[-1]
-        and all(isinstance(op, ConstantOp) for op in initializers)
+        len(effects) == 1
+        and isinstance(effects[0], MatmulOp)
+        and root_buffer(effects[0].dst) is kernel.body.arguments[-1]
     ):
         return None
-    return matmul
+    return effects[0]
 
 
 def _is_gemm_region(match: FxRegionMatch, *, sigmoid: bool) -> bool:
@@ -137,7 +144,7 @@ def _compile_gemm_sigmoid(_module: ModuleOp) -> LauncherPlan:
 
 
 def register_gemm_fx_rules(patterns: PatternMatcherPass) -> None:
-    """Register plain GEMM, addmm, and fixed-size GEMM-sigmoid FX rewrites."""
+    """Register GEMM, addmm, bmm, and fixed-size GEMM-sigmoid FX rewrites."""
     make_fx_to_ayla_rewrite(
         patterns,
         root=torch.ops.aten.sigmoid.default,
@@ -172,5 +179,18 @@ def register_gemm_fx_rules(patterns: PatternMatcherPass) -> None:
         require_maximal=False,
         infer_result_shapes=lambda _bias, lhs, weight: [
             (lhs.shape[0], weight.shape[0]),
+        ],
+    )
+    make_fx_to_ayla_rewrite(
+        patterns,
+        root=torch.ops.aten.bmm.default,
+        name="bmm",
+        signature=_BMM_SIGNATURE,
+        signature_mapping=_GEMM_OPERANDS,
+        compile_region=_compile_gemm,
+        accept=lambda match: _is_gemm_region(match, sigmoid=False),
+        require_maximal=False,
+        infer_result_shapes=lambda lhs, weight: [
+            (lhs.shape[0], lhs.shape[1], weight.shape[1]),
         ],
     )

@@ -175,6 +175,85 @@ def test_gemm_fx_region_imports_to_high_level_gpu_ir():
 
 def test_discovers_complete_swiglu_region_and_ordered_inputs():
     expected = _swiglu_region()
+
+
+def test_gemm_epilogue_imports_through_an_intermediate_allocation():
+    match = _gemm_region(sigmoid=True)
+    module = fx_region_to_module(match, name="gemm_sigmoid")
+
+    verify_gpu_dialect(module)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    allocation, _zero, matmul, epilogue = kernel.body.ops
+    assert isinstance(allocation, AllocOp)
+    assert isinstance(matmul, MatmulOp)
+    assert isinstance(epilogue, ElementwiseOp)
+    assert matmul.dst is allocation.result()
+    assert epilogue.fn == "sigmoid"
+    assert epilogue.src(0) is allocation.result()
+    assert epilogue.dst is kernel.body.arguments[-1]
+    assert find_ops_of_type(module, MatmulOp) == [matmul]
+
+
+def test_addmm_initializes_the_matmul_from_the_broadcast_bias():
+    match = _addmm_region()
+    assert discover_supported_fx_region(match.output) == match
+    module = fx_region_to_module(match, name="addmm")
+
+    verify_gpu_dialect(module)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    bias, lhs, weight, output = kernel.body.arguments
+    assert isinstance(bias.type, GmemTensorType)
+    assert tuple(bias.type.sizes) == (128, 64)
+    assert tuple(bias.type.strides) == (0, 1)
+    [matmul] = kernel.body.ops
+    assert isinstance(matmul, MatmulOp)
+    assert (matmul.lhs, matmul.rhs, matmul.dst) == (lhs, weight, output)
+    assert matmul.init is bias
+
+
+def test_scaled_addmm_is_not_imported():
+    with pytest.raises(ValueError, match="scaled matmuls are unsupported"):
+        fx_region_to_module(_addmm_region(beta=2), name="addmm")
+
+
+def test_bmm_imports_one_matmul_per_grid_z_batch():
+    graph = Graph()
+    lhs = _meta(graph.placeholder("lhs"), (3, 128, 64))
+    weight = _meta(graph.placeholder("weight"), (3, 32, 64))
+    weight_t = _meta(graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, [0, 2, 1]),
+    ), (3, 64, 32), strides=(2048, 1, 64))
+    output = _meta(graph.call_function(
+        torch.ops.aten.bmm.default, args=(lhs, weight_t),
+    ), (3, 128, 32))
+    graph.output(output)
+    match = discover_supported_fx_region(output)
+    assert match == FxRegionMatch(output, (lhs, weight))
+
+    module = fx_region_to_module(match, name="bmm")
+
+    verify_gpu_dialect(module)
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    assert kernel.grid_dim == (None, None, 3)
+    [batch] = find_ops_of_type(module, BlockIdOp)
+    tiles = find_ops_of_type(module, TileOp)
+    assert [tile.arg for tile in tiles] == kernel.body.arguments
+    assert all(tile.indices[0] is batch.value for tile in tiles)
+    [matmul] = find_ops_of_type(module, MatmulOp)
+    assert all(
+        isinstance(operand.definition, ReshapeOp)
+        for operand in (matmul.lhs, matmul.rhs, matmul.dst)
+    )
+    assert [tuple(operand.type.sizes) for operand in (
+        matmul.lhs, matmul.rhs, matmul.dst,
+    )] == [(128, 64), (32, 64), (128, 32)]
+
+
+def test_discovers_complete_gemm_region_and_ordered_inputs():
+    expected = _gemm_region(sigmoid=True)
     # FX/AOT is free to declare placeholders in an order unrelated to use.
     inputs = list(expected.inputs)
     inputs[0].prepend(inputs[1])
