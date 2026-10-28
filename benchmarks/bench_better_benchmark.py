@@ -63,6 +63,9 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path,
                         help="keep each arm's bench_parallel JSON here")
     args = parser.parse_args()
+    args.bench_root = args.bench_root.resolve()
+    if args.output_dir is not None:
+        args.output_dir = args.output_dir.resolve()
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -82,6 +85,12 @@ def main() -> None:
         for name in sorted(stock.keys() & ayla.keys())
     ])
     common = stock.keys() & ayla.keys()
+    if not common:
+        print(
+            "No graphs have timings in both arms; "
+            f"missing with ayla: {sorted(stock.keys() - ayla.keys())}"
+        )
+        return
     speedups = [stock[name] / ayla[name] for name in common]
     print(
         f"geomean speedup over {len(common)} graphs: "
