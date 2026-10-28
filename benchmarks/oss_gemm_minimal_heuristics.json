@@ -1,0 +1,2415 @@
+{
+  "actual_leaves": 16,
+  "fallback_seeds": [
+    {
+      "configuration": {
+        "cluster_m_ctas": 1,
+        "cluster_n_ctas": 1,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_first",
+        "lhs_l2_promotion": null,
+        "multicast": false,
+        "name": "heuristic_coverage_fallback",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_cta_count": null,
+        "output_m_tile": 64,
+        "output_n_tile": 64,
+        "output_slices": 1,
+        "output_store": "scalar",
+        "output_store_buffers": 1,
+        "output_tile_fast_axis": "n",
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": null,
+        "ptx_optimization_level": null,
+        "rhs_l2_cache_hint": "evict_first",
+        "rhs_tma_load_slices": null,
+        "unroll_output_tiles": true,
+        "unsafe_reuse_smem": false,
+        "warpgroup_fast_axis": "n",
+        "warpgroup_m_tile": null,
+        "warpgroup_n_tile": 64
+      },
+      "family_support": 0,
+      "rank": 1,
+      "source_configuration_name": "tune_m64_n64_scalar_k64_s3",
+      "source_percentage_of_torch": null,
+      "source_shape": null,
+      "source_shape_id": null
+    }
+  ],
+  "features": [
+    "m",
+    "n",
+    "k",
+    "aspect_m_over_n",
+    "output_tiles_64",
+    "reduction_tiles_64"
+  ],
+  "groups": {
+    "float16/k128": {
+      "feature": "output_tiles_64",
+      "information_gain": 0.0038390931055967137,
+      "kind": "split",
+      "left": {
+        "id": "float16_k128_L",
+        "kind": "leaf",
+        "ranges": {
+          "k": [
+            128,
+            3072
+          ],
+          "m": [
+            64,
+            2048
+          ],
+          "n": [
+            64,
+            2048
+          ]
+        },
+        "seeds": [
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_last",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k128_L_seed1",
+              "operand_k_tile": 128,
+              "operand_stages": 3,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 48,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": null,
+              "rhs_l2_cache_hint": "evict_last",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 48
+            },
+            "family_support": 2,
+            "rank": 1,
+            "source_configuration_name": "local_m64_n48_wm0_wn48_k128_s3_sl1_b1_c0_nn_lfrldl_o0_u0_t0",
+            "source_percentage_of_torch": 119.72221849441684,
+            "source_shape": {
+              "k": 128,
+              "m": 512,
+              "n": 256
+            },
+            "source_shape_id": "mm-m512-n256-k128-121027c3201a"
+          },
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_last",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k128_L_seed2",
+              "operand_k_tile": 128,
+              "operand_stages": 4,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 48,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": null,
+              "rhs_l2_cache_hint": "evict_first",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 48
+            },
+            "family_support": 2,
+            "rank": 2,
+            "source_configuration_name": "local_m64_n48_wm0_wn48_k128_s4_sl1_b1_c0_nn_lfrfdl_o0_u0_t0",
+            "source_percentage_of_torch": 117.91044635646473,
+            "source_shape": {
+              "k": 256,
+              "m": 512,
+              "n": 128
+            },
+            "source_shape_id": "mm-m512-n128-k256-f669e3d2baad"
+          },
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_first",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k128_L_seed3",
+              "operand_k_tile": 128,
+              "operand_stages": 4,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 48,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": 2,
+              "rhs_l2_cache_hint": "evict_first",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 48
+            },
+            "family_support": 2,
+            "rank": 3,
+            "source_configuration_name": "local_m64_n48_wm0_wn48_k128_s4_sl1_b1_c0_nn_lfrfdf_o2_u0_t0",
+            "source_percentage_of_torch": 116.01941960179742,
+            "source_shape": {
+              "k": 256,
+              "m": 512,
+              "n": 256
+            },
+            "source_shape_id": "mm-m512-n256-k256-c166d4e07d1d"
+          }
+        ],
+        "training_shapes": 34
+      },
+      "right": {
+        "feature": "output_tiles_64",
+        "information_gain": 0.004171545308210289,
+        "kind": "split",
+        "left": {
+          "feature": "output_tiles_64",
+          "information_gain": 0.007667623868936713,
+          "kind": "split",
+          "left": {
+            "feature": "output_tiles_64",
+            "information_gain": 0.008665318961882384,
+            "kind": "split",
+            "left": {
+              "feature": "m",
+              "information_gain": 0.00877095183140253,
+              "kind": "split",
+              "left": {
+                "feature": "m",
+                "information_gain": 0.011316872427983515,
+                "kind": "split",
+                "left": {
+                  "feature": "m",
+                  "information_gain": 0.012345679012345734,
+                  "kind": "split",
+                  "left": {
+                    "id": "float16_k128_RLLLLLL",
+                    "kind": "leaf",
+                    "ranges": {
+                      "k": [
+                        512,
+                        4096
+                      ],
+                      "m": [
+                        64,
+                        220
+                      ],
+                      "n": [
+                        2048,
+                        25088
+                      ]
+                    },
+                    "seeds": [
+                      {
+                        "configuration": {
+                          "cluster_m_ctas": 1,
+                          "cluster_n_ctas": 1,
+                          "dst_l2_cache_hint": "evict_last",
+                          "lhs_l2_cache_hint": "evict_last",
+                          "lhs_l2_promotion": null,
+                          "multicast": false,
+                          "name": "heuristic_float16_k128_RLLLLLL_seed1",
+                          "operand_k_tile": 128,
+                          "operand_stages": 5,
+                          "output_cta_count": 128,
+                          "output_m_tile": 64,
+                          "output_n_tile": 72,
+                          "output_slices": 1,
+                          "output_store": "stmatrix",
+                          "output_store_buffers": 1,
+                          "output_tile_fast_axis": "m",
+                          "output_tiles_per_cta": 1,
+                          "output_tma_inner_size": 128,
+                          "ptx_optimization_level": null,
+                          "rhs_l2_cache_hint": "evict_first",
+                          "rhs_tma_load_slices": null,
+                          "unroll_output_tiles": false,
+                          "unsafe_reuse_smem": false,
+                          "warpgroup_fast_axis": "n",
+                          "warpgroup_m_tile": null,
+                          "warpgroup_n_tile": 72
+                        },
+                        "family_support": 1,
+                        "rank": 1,
+                        "source_configuration_name": "local_m64_n72_wm0_wn72_k128_s5_sl1_b1_c128_mn_llrfdl_o0_u0_t0",
+                        "source_percentage_of_torch": 128.92323300254742,
+                        "source_shape": {
+                          "k": 4096,
+                          "m": 128,
+                          "n": 9216
+                        },
+                        "source_shape_id": "mm-m128-n9216-k4096-50824580fc94"
+                      },
+                      {
+                        "configuration": {
+                          "cluster_m_ctas": 1,
+                          "cluster_n_ctas": 1,
+                          "dst_l2_cache_hint": "evict_first",
+                          "lhs_l2_cache_hint": "evict_first",
+                          "lhs_l2_promotion": null,
+                          "multicast": false,
+                          "name": "heuristic_float16_k128_RLLLLLL_seed2",
+                          "operand_k_tile": 128,
+                          "operand_stages": 6,
+                          "output_cta_count": null,
+                          "output_m_tile": 64,
+                          "output_n_tile": 48,
+                          "output_slices": 1,
+                          "output_store": "stmatrix",
+                          "output_store_buffers": 1,
+                          "output_tile_fast_axis": "n",
+                          "output_tiles_per_cta": 1,
+                          "output_tma_inner_size": 128,
+                          "ptx_optimization_level": null,
+                          "rhs_l2_cache_hint": "evict_first",
+                          "rhs_tma_load_slices": null,
+                          "unroll_output_tiles": true,
+                          "unsafe_reuse_smem": false,
+                          "warpgroup_fast_axis": "n",
+                          "warpgroup_m_tile": null,
+                          "warpgroup_n_tile": 48
+                        },
+                        "family_support": 1,
+                        "rank": 2,
+                        "source_configuration_name": "narrow_m64_n48_k128_s6",
+                        "source_percentage_of_torch": 115.63497489434033,
+                        "source_shape": {
+                          "k": 4096,
+                          "m": 64,
+                          "n": 25088
+                        },
+                        "source_shape_id": "mm-m64-n25088-k4096-40b7c1def830"
+                      },
+                      {
+                        "configuration": {
+                          "cluster_m_ctas": 1,
+                          "cluster_n_ctas": 1,
+                          "dst_l2_cache_hint": "evict_first",
+                          "lhs_l2_cache_hint": "evict_first",
+                          "lhs_l2_promotion": null,
+                          "multicast": false,
+                          "name": "heuristic_float16_k128_RLLLLLL_seed3",
+                          "operand_k_tile": 128,
+                          "operand_stages": 2,
+                          "output_cta_count": null,
+                          "output_m_tile": 64,
+                          "output_n_tile": 64,
+                          "output_slices": 1,
+                          "output_store": "stmatrix",
+                          "output_store_buffers": 1,
+                          "output_tile_fast_axis": "n",
+                          "output_tiles_per_cta": 1,
+                          "output_tma_inner_size": 128,
+                          "ptx_optimization_level": null,
+                          "rhs_l2_cache_hint": "evict_last",
+                          "rhs_tma_load_slices": null,
+                          "unroll_output_tiles": true,
+                          "unsafe_reuse_smem": false,
+                          "warpgroup_fast_axis": "n",
+                          "warpgroup_m_tile": null,
+                          "warpgroup_n_tile": 64
+                        },
+                        "family_support": 1,
+                        "rank": 3,
+                        "source_configuration_name": "local_m64_n64_wm0_wn64_k128_s2_sl1_b1_c0_nn_lfrldf_o0_u0_t128",
+                        "source_percentage_of_torch": 97.47386866465644,
+                        "source_shape": {
+                          "k": 512,
+                          "m": 220,
+                          "n": 2048
+                        },
+                        "source_shape_id": "mm-m220-n2048-k512-dc84d51c1c78"
+                      }
+                    ],
+                    "training_shapes": 6
+                  },
+                  "right": {
+                    "feature": "m",
+                    "information_gain": 0.013333333333333308,
+                    "kind": "split",
+                    "left": {
+                      "id": "float16_k128_RLLLLLRL",
+                      "kind": "leaf",
+                      "ranges": {
+                        "k": [
+                          256,
+                          25088
+                        ],
+                        "m": [
+                          256,
+                          512
+                        ],
+                        "n": [
+                          1024,
+                          6144
+                        ]
+                      },
+                      "seeds": [
+                        {
+                          "configuration": {
+                            "cluster_m_ctas": 1,
+                            "cluster_n_ctas": 1,
+                            "dst_l2_cache_hint": "evict_first",
+                            "lhs_l2_cache_hint": "evict_first",
+                            "lhs_l2_promotion": null,
+                            "multicast": false,
+                            "name": "heuristic_float16_k128_RLLLLLRL_seed1",
+                            "operand_k_tile": 128,
+                            "operand_stages": 6,
+                            "output_cta_count": null,
+                            "output_m_tile": 64,
+                            "output_n_tile": 64,
+                            "output_slices": 1,
+                            "output_store": "stmatrix",
+                            "output_store_buffers": 1,
+                            "output_tile_fast_axis": "n",
+                            "output_tiles_per_cta": 1,
+                            "output_tma_inner_size": 128,
+                            "ptx_optimization_level": null,
+                            "rhs_l2_cache_hint": "evict_first",
+                            "rhs_tma_load_slices": null,
+                            "unroll_output_tiles": true,
+                            "unsafe_reuse_smem": false,
+                            "warpgroup_fast_axis": "n",
+                            "warpgroup_m_tile": null,
+                            "warpgroup_n_tile": 64
+                          },
+                          "family_support": 1,
+                          "rank": 1,
+                          "source_configuration_name": "local_m64_n64_wm0_wn64_k128_s6_sl1_b1_c0_nn_lfrfdf_o0_u0_t128",
+                          "source_percentage_of_torch": 115.86433920929284,
+                          "source_shape": {
+                            "k": 256,
+                            "m": 512,
+                            "n": 1024
+                          },
+                          "source_shape_id": "mm-m512-n1024-k256-6a86c856c08d"
+                        },
+                        {
+                          "configuration": {
+                            "cluster_m_ctas": 1,
+                            "cluster_n_ctas": 1,
+                            "dst_l2_cache_hint": "evict_last",
+                            "lhs_l2_cache_hint": "evict_last",
+                            "lhs_l2_promotion": null,
+                            "multicast": false,
+                            "name": "heuristic_float16_k128_RLLLLLRL_seed2",
+                            "operand_k_tile": 64,
+                            "operand_stages": 3,
+                            "output_cta_count": null,
+                            "output_m_tile": 128,
+                            "output_n_tile": 192,
+                            "output_slices": 1,
+                            "output_store": "stmatrix",
+                            "output_store_buffers": 1,
+                            "output_tile_fast_axis": "n",
+                            "output_tiles_per_cta": 1,
+                            "output_tma_inner_size": 128,
+                            "ptx_optimization_level": null,
+                            "rhs_l2_cache_hint": "evict_first",
+                            "rhs_tma_load_slices": null,
+                            "unroll_output_tiles": true,
+                            "unsafe_reuse_smem": false,
+                            "warpgroup_fast_axis": "n",
+                            "warpgroup_m_tile": null,
+                            "warpgroup_n_tile": 192
+                          },
+                          "family_support": 1,
+                          "rank": 2,
+                          "source_configuration_name": "local_m128_n192_wm0_wn192_k64_s3_sl1_b1_c0_nn_llrfdl_o0_u0_t128",
+                          "source_percentage_of_torch": 103.20869226588107,
+                          "source_shape": {
+                            "k": 1536,
+                            "m": 512,
+                            "n": 6144
+                          },
+                          "source_shape_id": "mm-m512-n6144-k1536-0e6847f090e9"
+                        },
+                        {
+                          "configuration": {
+                            "cluster_m_ctas": 1,
+                            "cluster_n_ctas": 1,
+                            "dst_l2_cache_hint": "evict_first",
+                            "lhs_l2_cache_hint": "evict_first",
+                            "lhs_l2_promotion": null,
+                            "multicast": false,
+                            "name": "heuristic_float16_k128_RLLLLLRL_seed3",
+                            "operand_k_tile": 64,
+                            "operand_stages": 3,
+                            "output_cta_count": 128,
+                            "output_m_tile": 128,
+                            "output_n_tile": 128,
+                            "output_slices": 1,
+                            "output_store": "stmatrix",
+                            "output_store_buffers": 1,
+                            "output_tile_fast_axis": "m",
+                            "output_tiles_per_cta": 1,
+                            "output_tma_inner_size": 128,
+                            "ptx_optimization_level": 3,
+                            "rhs_l2_cache_hint": "evict_first",
+                            "rhs_tma_load_slices": null,
+                            "unroll_output_tiles": false,
+                            "unsafe_reuse_smem": false,
+                            "warpgroup_fast_axis": "n",
+                            "warpgroup_m_tile": null,
+                            "warpgroup_n_tile": 128
+                          },
+                          "family_support": 1,
+                          "rank": 3,
+                          "source_configuration_name": "local_m128_n128_wm0_wn128_k64_s3_sl1_b1_c128_mn_lfrfdf_o3_u0_t128",
+                          "source_percentage_of_torch": 101.15864367647458,
+                          "source_shape": {
+                            "k": 1024,
+                            "m": 512,
+                            "n": 4096
+                          },
+                          "source_shape_id": "mm-m512-n4096-k1024-c6558034e05b"
+                        }
+                      ],
+                      "training_shapes": 19
+                    },
+                    "right": {
+                      "id": "float16_k128_RLLLLLRR",
+                      "kind": "leaf",
+                      "ranges": {
+                        "k": [
+                          128,
+                          12672
+                        ],
+                        "m": [
+                          768,
+                          1576
+                        ],
+                        "n": [
+                          320,
+                          3072
+                        ]
+                      },
+                      "seeds": [
+                        {
+                          "configuration": {
+                            "cluster_m_ctas": 1,
+                            "cluster_n_ctas": 1,
+                            "dst_l2_cache_hint": "evict_last",
+                            "lhs_l2_cache_hint": "evict_first",
+                            "lhs_l2_promotion": null,
+                            "multicast": false,
+                            "name": "heuristic_float16_k128_RLLLLLRR_seed1",
+                            "operand_k_tile": 128,
+                            "operand_stages": 6,
+                            "output_cta_count": null,
+                            "output_m_tile": 64,
+                            "output_n_tile": 64,
+                            "output_slices": 1,
+                            "output_store": "stmatrix",
+                            "output_store_buffers": 1,
+                            "output_tile_fast_axis": "n",
+                            "output_tiles_per_cta": 1,
+                            "output_tma_inner_size": 128,
+                            "ptx_optimization_level": null,
+                            "rhs_l2_cache_hint": "evict_last",
+                            "rhs_tma_load_slices": null,
+                            "unroll_output_tiles": true,
+                            "unsafe_reuse_smem": false,
+                            "warpgroup_fast_axis": "n",
+                            "warpgroup_m_tile": null,
+                            "warpgroup_n_tile": 64
+                          },
+                          "family_support": 1,
+                          "rank": 1,
+                          "source_configuration_name": "local_m64_n64_wm0_wn64_k128_s6_sl1_b1_c0_nn_lfrldl_o0_u0_t128",
+                          "source_percentage_of_torch": 120.98120615628028,
+                          "source_shape": {
+                            "k": 128,
+                            "m": 1000,
+                            "n": 1408
+                          },
+                          "source_shape_id": "mm-m1000-n1408-k128-77f9a662c4b4"
+                        },
+                        {
+                          "configuration": {
+                            "cluster_m_ctas": 1,
+                            "cluster_n_ctas": 1,
+                            "dst_l2_cache_hint": "evict_first",
+                            "lhs_l2_cache_hint": "evict_first",
+                            "lhs_l2_promotion": null,
+                            "multicast": false,
+                            "name": "heuristic_float16_k128_RLLLLLRR_seed2",
+                            "operand_k_tile": 128,
+                            "operand_stages": 4,
+                            "output_cta_count": null,
+                            "output_m_tile": 64,
+                            "output_n_tile": 80,
+                            "output_slices": 1,
+                            "output_store": "stmatrix",
+                            "output_store_buffers": 1,
+                            "output_tile_fast_axis": "n",
+                            "output_tiles_per_cta": 1,
+                            "output_tma_inner_size": 128,
+                            "ptx_optimization_level": null,
+                            "rhs_l2_cache_hint": "evict_first",
+                            "rhs_tma_load_slices": null,
+                            "unroll_output_tiles": true,
+                            "unsafe_reuse_smem": false,
+                            "warpgroup_fast_axis": "n",
+                            "warpgroup_m_tile": null,
+                            "warpgroup_n_tile": 80
+                          },
+                          "family_support": 1,
+                          "rank": 2,
+                          "source_configuration_name": "pipe_m64_n80_k128_s4",
+                          "source_percentage_of_torch": 112.01923147556911,
+                          "source_shape": {
+                            "k": 128,
+                            "m": 1000,
+                            "n": 512
+                          },
+                          "source_shape_id": "mm-m1000-n512-k128-d6c5485b233c"
+                        },
+                        {
+                          "configuration": {
+                            "cluster_m_ctas": 1,
+                            "cluster_n_ctas": 1,
+                            "dst_l2_cache_hint": "evict_last",
+                            "lhs_l2_cache_hint": "evict_first",
+                            "lhs_l2_promotion": null,
+                            "multicast": false,
+                            "name": "heuristic_float16_k128_RLLLLLRR_seed3",
+                            "operand_k_tile": 64,
+                            "operand_stages": 3,
+                            "output_cta_count": null,
+                            "output_m_tile": 192,
+                            "output_n_tile": 96,
+                            "output_slices": 2,
+                            "output_store": "stmatrix",
+                            "output_store_buffers": 2,
+                            "output_tile_fast_axis": "n",
+                            "output_tiles_per_cta": 1,
+                            "output_tma_inner_size": 128,
+                            "ptx_optimization_level": 3,
+                            "rhs_l2_cache_hint": "evict_last",
+                            "rhs_tma_load_slices": null,
+                            "unroll_output_tiles": true,
+                            "unsafe_reuse_smem": false,
+                            "warpgroup_fast_axis": "n",
+                            "warpgroup_m_tile": null,
+                            "warpgroup_n_tile": 96
+                          },
+                          "family_support": 1,
+                          "rank": 3,
+                          "source_configuration_name": "local_m192_n96_wm0_wn96_k64_s3_sl2_b2_c0_nn_lfrldl_o3_u0_t0",
+                          "source_percentage_of_torch": 111.56531827446823,
+                          "source_shape": {
+                            "k": 4096,
+                            "m": 768,
+                            "n": 3072
+                          },
+                          "source_shape_id": "mm-m768-n3072-k4096-8bd6a8f007c1"
+                        }
+                      ],
+                      "training_shapes": 56
+                    },
+                    "threshold": 640.0,
+                    "training_shapes": 75
+                  },
+                  "threshold": 238.0,
+                  "training_shapes": 81
+                },
+                "right": {
+                  "id": "float16_k128_RLLLLR",
+                  "kind": "leaf",
+                  "ranges": {
+                    "k": [
+                      128,
+                      32000
+                    ],
+                    "m": [
+                      2040,
+                      2304
+                    ],
+                    "n": [
+                      256,
+                      1024
+                    ]
+                  },
+                  "seeds": [
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_first",
+                        "lhs_l2_cache_hint": "evict_first",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RLLLLR_seed1",
+                        "operand_k_tile": 64,
+                        "operand_stages": 3,
+                        "output_cta_count": 96,
+                        "output_m_tile": 128,
+                        "output_n_tile": 128,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": null,
+                        "rhs_l2_cache_hint": "evict_first",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": false,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 128
+                      },
+                      "family_support": 3,
+                      "rank": 1,
+                      "source_configuration_name": "local_m128_n128_wm0_wn128_k64_s3_sl1_b1_c96_nn_lfrfdf_o0_u0_t128",
+                      "source_percentage_of_torch": 89.25184203630883,
+                      "source_shape": {
+                        "k": 768,
+                        "m": 2048,
+                        "n": 768
+                      },
+                      "source_shape_id": "mm-m2048-n768-k768-e3c453518ca2"
+                    },
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_last",
+                        "lhs_l2_cache_hint": "evict_first",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RLLLLR_seed2",
+                        "operand_k_tile": 64,
+                        "operand_stages": 3,
+                        "output_cta_count": null,
+                        "output_m_tile": 64,
+                        "output_n_tile": 128,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": 2,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 64
+                      },
+                      "family_support": 2,
+                      "rank": 2,
+                      "source_configuration_name": "local_m64_n128_wm0_wn64_k64_s3_sl1_b1_c0_nn_lfrldl_o2_u0_t128",
+                      "source_percentage_of_torch": 97.59036060084684,
+                      "source_shape": {
+                        "k": 512,
+                        "m": 2048,
+                        "n": 512
+                      },
+                      "source_shape_id": "mm-m2048-n512-k512-1877dd7785de"
+                    },
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_first",
+                        "lhs_l2_cache_hint": "evict_first",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RLLLLR_seed3",
+                        "operand_k_tile": 64,
+                        "operand_stages": 3,
+                        "output_cta_count": null,
+                        "output_m_tile": 64,
+                        "output_n_tile": 128,
+                        "output_slices": 2,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 2,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": null,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 64
+                      },
+                      "family_support": 2,
+                      "rank": 3,
+                      "source_configuration_name": "local_m64_n128_wm0_wn64_k64_s3_sl2_b2_c0_nn_lfrldf_o0_u0_t128",
+                      "source_percentage_of_torch": 95.73529586740158,
+                      "source_shape": {
+                        "k": 512,
+                        "m": 2040,
+                        "n": 512
+                      },
+                      "source_shape_id": "mm-m2040-n512-k512-42b341795fec"
+                    }
+                  ],
+                  "training_shapes": 27
+                },
+                "threshold": 1808.0,
+                "training_shapes": 108
+              },
+              "right": {
+                "id": "float16_k128_RLLLR",
+                "kind": "leaf",
+                "ranges": {
+                  "k": [
+                    128,
+                    12672
+                  ],
+                  "m": [
+                    2856,
+                    16384
+                  ],
+                  "n": [
+                    128,
+                    768
+                  ]
+                },
+                "seeds": [
+                  {
+                    "configuration": {
+                      "cluster_m_ctas": 1,
+                      "cluster_n_ctas": 1,
+                      "dst_l2_cache_hint": "evict_first",
+                      "lhs_l2_cache_hint": "evict_first",
+                      "lhs_l2_promotion": null,
+                      "multicast": false,
+                      "name": "heuristic_float16_k128_RLLLR_seed1",
+                      "operand_k_tile": 64,
+                      "operand_stages": 2,
+                      "output_cta_count": 132,
+                      "output_m_tile": 128,
+                      "output_n_tile": 128,
+                      "output_slices": 1,
+                      "output_store": "stmatrix",
+                      "output_store_buffers": 1,
+                      "output_tile_fast_axis": "n",
+                      "output_tiles_per_cta": 1,
+                      "output_tma_inner_size": 128,
+                      "ptx_optimization_level": null,
+                      "rhs_l2_cache_hint": "evict_first",
+                      "rhs_tma_load_slices": null,
+                      "unroll_output_tiles": false,
+                      "unsafe_reuse_smem": false,
+                      "warpgroup_fast_axis": "n",
+                      "warpgroup_m_tile": null,
+                      "warpgroup_n_tile": 128
+                    },
+                    "family_support": 2,
+                    "rank": 1,
+                    "source_configuration_name": "staticloop132_m128_n128_k64_s2_nfast",
+                    "source_percentage_of_torch": 104.50581442077878,
+                    "source_shape": {
+                      "k": 256,
+                      "m": 8192,
+                      "n": 256
+                    },
+                    "source_shape_id": "mm-m8192-n256-k256-c8cff6a1b213"
+                  },
+                  {
+                    "configuration": {
+                      "cluster_m_ctas": 1,
+                      "cluster_n_ctas": 1,
+                      "dst_l2_cache_hint": "evict_first",
+                      "lhs_l2_cache_hint": "evict_first",
+                      "lhs_l2_promotion": null,
+                      "multicast": false,
+                      "name": "heuristic_float16_k128_RLLLR_seed2",
+                      "operand_k_tile": 64,
+                      "operand_stages": 4,
+                      "output_cta_count": null,
+                      "output_m_tile": 192,
+                      "output_n_tile": 96,
+                      "output_slices": 2,
+                      "output_store": "stmatrix",
+                      "output_store_buffers": 2,
+                      "output_tile_fast_axis": "n",
+                      "output_tiles_per_cta": 1,
+                      "output_tma_inner_size": 128,
+                      "ptx_optimization_level": null,
+                      "rhs_l2_cache_hint": "evict_last",
+                      "rhs_tma_load_slices": null,
+                      "unroll_output_tiles": true,
+                      "unsafe_reuse_smem": false,
+                      "warpgroup_fast_axis": "n",
+                      "warpgroup_m_tile": null,
+                      "warpgroup_n_tile": 96
+                    },
+                    "family_support": 2,
+                    "rank": 2,
+                    "source_configuration_name": "local_m192_n96_wm0_wn96_k64_s4_sl2_b2_c0_nn_lfrldf_o0_u0_t0",
+                    "source_percentage_of_torch": 102.68978534628923,
+                    "source_shape": {
+                      "k": 12544,
+                      "m": 3072,
+                      "n": 768
+                    },
+                    "source_shape_id": "mm-m3072-n768-k12544-858653525f1c"
+                  },
+                  {
+                    "configuration": {
+                      "cluster_m_ctas": 1,
+                      "cluster_n_ctas": 1,
+                      "dst_l2_cache_hint": "evict_first",
+                      "lhs_l2_cache_hint": "evict_last",
+                      "lhs_l2_promotion": null,
+                      "multicast": false,
+                      "name": "heuristic_float16_k128_RLLLR_seed3",
+                      "operand_k_tile": 64,
+                      "operand_stages": 4,
+                      "output_cta_count": null,
+                      "output_m_tile": 192,
+                      "output_n_tile": 96,
+                      "output_slices": 2,
+                      "output_store": "stmatrix",
+                      "output_store_buffers": 2,
+                      "output_tile_fast_axis": "n",
+                      "output_tiles_per_cta": 1,
+                      "output_tma_inner_size": 128,
+                      "ptx_optimization_level": null,
+                      "rhs_l2_cache_hint": "evict_first",
+                      "rhs_tma_load_slices": null,
+                      "unroll_output_tiles": true,
+                      "unsafe_reuse_smem": false,
+                      "warpgroup_fast_axis": "n",
+                      "warpgroup_m_tile": null,
+                      "warpgroup_n_tile": 96
+                    },
+                    "family_support": 2,
+                    "rank": 3,
+                    "source_configuration_name": "local_m192_n96_wm0_wn96_k64_s4_sl2_b2_c0_nn_llrfdf_o0_u0_t0",
+                    "source_percentage_of_torch": 97.87634664678177,
+                    "source_shape": {
+                      "k": 4096,
+                      "m": 3072,
+                      "n": 768
+                    },
+                    "source_shape_id": "mm-m3072-n768-k4096-cd19457e0f45"
+                  }
+                ],
+                "training_shapes": 31
+              },
+              "threshold": 2580.0,
+              "training_shapes": 139
+            },
+            "right": {
+              "id": "float16_k128_RLLR",
+              "kind": "leaf",
+              "ranges": {
+                "k": [
+                  128,
+                  4096
+                ],
+                "m": [
+                  3136,
+                  25088
+                ],
+                "n": [
+                  128,
+                  1024
+                ]
+              },
+              "seeds": [
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_first",
+                    "lhs_l2_cache_hint": "evict_last",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLLR_seed1",
+                    "operand_k_tile": 64,
+                    "operand_stages": 4,
+                    "output_cta_count": 108,
+                    "output_m_tile": 128,
+                    "output_n_tile": 128,
+                    "output_slices": 1,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": 3,
+                    "rhs_l2_cache_hint": "evict_first",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": false,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 2,
+                  "rank": 1,
+                  "source_configuration_name": "local_m128_n128_wm0_wn128_k64_s4_sl1_b1_c108_nn_llrfdf_o3_u0_t128",
+                  "source_percentage_of_torch": 84.6606890428049,
+                  "source_shape": {
+                    "k": 4096,
+                    "m": 3136,
+                    "n": 1024
+                  },
+                  "source_shape_id": "mm-m3136-n1024-k4096-7cee169d3ae9"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_first",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLLR_seed2",
+                    "operand_k_tile": 64,
+                    "operand_stages": 3,
+                    "output_cta_count": 128,
+                    "output_m_tile": 128,
+                    "output_n_tile": 256,
+                    "output_slices": 2,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": null,
+                    "rhs_l2_cache_hint": "evict_first",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": false,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 256
+                  },
+                  "family_support": 2,
+                  "rank": 2,
+                  "source_configuration_name": "staticloop128_m128_n256_k64_s3_nfast",
+                  "source_percentage_of_torch": 83.30595041847158,
+                  "source_shape": {
+                    "k": 2048,
+                    "m": 3136,
+                    "n": 1024
+                  },
+                  "source_shape_id": "mm-m3136-n1024-k2048-4a25c74a45c9"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLLR_seed3",
+                    "operand_k_tile": 64,
+                    "operand_stages": 4,
+                    "output_cta_count": 132,
+                    "output_m_tile": 64,
+                    "output_n_tile": 128,
+                    "output_slices": 1,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": null,
+                    "rhs_l2_cache_hint": "evict_last",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": false,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 1,
+                  "rank": 3,
+                  "source_configuration_name": "local_m64_n128_wm0_wn128_k64_s4_sl1_b1_c132_nn_lfrldl_o0_u0_t128",
+                  "source_percentage_of_torch": 163.06672550510862,
+                  "source_shape": {
+                    "k": 1024,
+                    "m": 25088,
+                    "n": 128
+                  },
+                  "source_shape_id": "mm-m25088-n128-k1024-94933b4a9f38"
+                }
+              ],
+              "training_shapes": 12
+            },
+            "threshold": 776.0,
+            "training_shapes": 151
+          },
+          "right": {
+            "feature": "k",
+            "information_gain": 0.03676470588235292,
+            "kind": "split",
+            "left": {
+              "id": "float16_k128_RLRL",
+              "kind": "leaf",
+              "ranges": {
+                "k": [
+                  128,
+                  512
+                ],
+                "m": [
+                  1000,
+                  32768
+                ],
+                "n": [
+                  128,
+                  4096
+                ]
+              },
+              "seeds": [
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLRL_seed1",
+                    "operand_k_tile": 64,
+                    "operand_stages": 2,
+                    "output_cta_count": null,
+                    "output_m_tile": 128,
+                    "output_n_tile": 128,
+                    "output_slices": 2,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": null,
+                    "rhs_l2_cache_hint": "evict_first",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": true,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 4,
+                  "rank": 1,
+                  "source_configuration_name": "local_m128_n128_wm0_wn128_k64_s2_sl2_b1_c0_nn_lfrfdl_o0_u0_t128",
+                  "source_percentage_of_torch": 106.50476893881834,
+                  "source_shape": {
+                    "k": 512,
+                    "m": 6400,
+                    "n": 512
+                  },
+                  "source_shape_id": "mm-m6400-n512-k512-f8e77cc19b07"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLRL_seed2",
+                    "operand_k_tile": 64,
+                    "operand_stages": 2,
+                    "output_cta_count": null,
+                    "output_m_tile": 128,
+                    "output_n_tile": 128,
+                    "output_slices": 2,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": 3,
+                    "rhs_l2_cache_hint": "evict_first",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": true,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 2,
+                  "rank": 2,
+                  "source_configuration_name": "local_m128_n128_wm0_wn128_k64_s2_sl2_b1_c0_nn_lfrfdl_o3_u0_t128",
+                  "source_percentage_of_torch": 106.20253987789849,
+                  "source_shape": {
+                    "k": 512,
+                    "m": 1024,
+                    "n": 4096
+                  },
+                  "source_shape_id": "mm-m1024-n4096-k512-f58ad85d34af"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_first",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLRL_seed3",
+                    "operand_k_tile": 128,
+                    "operand_stages": 2,
+                    "output_cta_count": null,
+                    "output_m_tile": 128,
+                    "output_n_tile": 128,
+                    "output_slices": 2,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": 3,
+                    "rhs_l2_cache_hint": "evict_first",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": true,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 1,
+                  "rank": 3,
+                  "source_configuration_name": "local_m128_n128_wm0_wn128_k128_s2_sl2_b1_c0_nn_lfrfdf_o3_u0_t128",
+                  "source_percentage_of_torch": 114.88469594855142,
+                  "source_shape": {
+                    "k": 128,
+                    "m": 1000,
+                    "n": 4096
+                  },
+                  "source_shape_id": "mm-m1000-n4096-k128-4106bd5627c2"
+                }
+              ],
+              "training_shapes": 17
+            },
+            "right": {
+              "id": "float16_k128_RLRR",
+              "kind": "leaf",
+              "ranges": {
+                "k": [
+                  768,
+                  16384
+                ],
+                "m": [
+                  1024,
+                  30000
+                ],
+                "n": [
+                  128,
+                  4096
+                ]
+              },
+              "seeds": [
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLRR_seed1",
+                    "operand_k_tile": 64,
+                    "operand_stages": 3,
+                    "output_cta_count": 128,
+                    "output_m_tile": 128,
+                    "output_n_tile": 128,
+                    "output_slices": 1,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": 1,
+                    "rhs_l2_cache_hint": "evict_last",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": false,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 1,
+                  "rank": 1,
+                  "source_configuration_name": "local_m128_n128_wm0_wn128_k64_s3_sl1_b1_c128_nn_lfrldl_o1_u0_t128",
+                  "source_percentage_of_torch": 163.34673783953178,
+                  "source_shape": {
+                    "k": 1024,
+                    "m": 30000,
+                    "n": 128
+                  },
+                  "source_shape_id": "mm-m30000-n128-k1024-657a2dd62a82"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_first",
+                    "lhs_l2_cache_hint": "evict_last",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLRR_seed2",
+                    "operand_k_tile": 64,
+                    "operand_stages": 3,
+                    "output_cta_count": 128,
+                    "output_m_tile": 128,
+                    "output_n_tile": 256,
+                    "output_slices": 2,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": 3,
+                    "rhs_l2_cache_hint": "evict_last",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": false,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 256
+                  },
+                  "family_support": 1,
+                  "rank": 2,
+                  "source_configuration_name": "local_m128_n256_wm0_wn256_k64_s3_sl2_b1_c128_nn_llrldf_o3_u0_t128",
+                  "source_percentage_of_torch": 116.98616977202644,
+                  "source_shape": {
+                    "k": 2048,
+                    "m": 8192,
+                    "n": 512
+                  },
+                  "source_shape_id": "mm-m8192-n512-k2048-30a424ccefb1"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RLRR_seed3",
+                    "operand_k_tile": 128,
+                    "operand_stages": 2,
+                    "output_cta_count": null,
+                    "output_m_tile": 64,
+                    "output_n_tile": 128,
+                    "output_slices": 1,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": null,
+                    "rhs_l2_cache_hint": "evict_last",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": true,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 1,
+                  "rank": 3,
+                  "source_configuration_name": "local_m64_n128_wm0_wn128_k128_s2_sl1_b1_c0_nn_lfrldl_o0_u0_t128",
+                  "source_percentage_of_torch": 110.49815555298055,
+                  "source_shape": {
+                    "k": 4096,
+                    "m": 30000,
+                    "n": 128
+                  },
+                  "source_shape_id": "mm-m30000-n128-k4096-67da4c2755d9"
+                }
+              ],
+              "training_shapes": 19
+            },
+            "threshold": 640.0,
+            "training_shapes": 36
+          },
+          "threshold": 794.0,
+          "training_shapes": 187
+        },
+        "right": {
+          "feature": "aspect_m_over_n",
+          "information_gain": 0.00980700755353725,
+          "kind": "split",
+          "left": {
+            "feature": "aspect_m_over_n",
+            "information_gain": 0.011344972496341255,
+            "kind": "split",
+            "left": {
+              "feature": "k",
+              "information_gain": 0.018763565077364763,
+              "kind": "split",
+              "left": {
+                "id": "float16_k128_RRLLL",
+                "kind": "leaf",
+                "ranges": {
+                  "k": [
+                    128,
+                    128
+                  ],
+                  "m": [
+                    2048,
+                    50257
+                  ],
+                  "n": [
+                    1024,
+                    9216
+                  ]
+                },
+                "seeds": [
+                  {
+                    "configuration": {
+                      "cluster_m_ctas": 1,
+                      "cluster_n_ctas": 1,
+                      "dst_l2_cache_hint": "evict_first",
+                      "lhs_l2_cache_hint": "evict_last",
+                      "lhs_l2_promotion": null,
+                      "multicast": false,
+                      "name": "heuristic_float16_k128_RRLLL_seed1",
+                      "operand_k_tile": 64,
+                      "operand_stages": 2,
+                      "output_cta_count": 128,
+                      "output_m_tile": 128,
+                      "output_n_tile": 256,
+                      "output_slices": 2,
+                      "output_store": "stmatrix",
+                      "output_store_buffers": 2,
+                      "output_tile_fast_axis": "m",
+                      "output_tiles_per_cta": 1,
+                      "output_tma_inner_size": 128,
+                      "ptx_optimization_level": 1,
+                      "rhs_l2_cache_hint": "evict_last",
+                      "rhs_tma_load_slices": null,
+                      "unroll_output_tiles": false,
+                      "unsafe_reuse_smem": false,
+                      "warpgroup_fast_axis": "n",
+                      "warpgroup_m_tile": null,
+                      "warpgroup_n_tile": 256
+                    },
+                    "family_support": 2,
+                    "rank": 1,
+                    "source_configuration_name": "local_m128_n256_wm0_wn256_k64_s2_sl2_b2_c128_mn_llrldf_o1_u0_t128",
+                    "source_percentage_of_torch": 95.58887128239999,
+                    "source_shape": {
+                      "k": 128,
+                      "m": 4096,
+                      "n": 4096
+                    },
+                    "source_shape_id": "mm-m4096-n4096-k128-ffb283628a0a"
+                  },
+                  {
+                    "configuration": {
+                      "cluster_m_ctas": 1,
+                      "cluster_n_ctas": 1,
+                      "dst_l2_cache_hint": "evict_first",
+                      "lhs_l2_cache_hint": "evict_last",
+                      "lhs_l2_promotion": null,
+                      "multicast": false,
+                      "name": "heuristic_float16_k128_RRLLL_seed2",
+                      "operand_k_tile": 128,
+                      "operand_stages": 2,
+                      "output_cta_count": null,
+                      "output_m_tile": 64,
+                      "output_n_tile": 128,
+                      "output_slices": 1,
+                      "output_store": "stmatrix",
+                      "output_store_buffers": 1,
+                      "output_tile_fast_axis": "n",
+                      "output_tiles_per_cta": 1,
+                      "output_tma_inner_size": 128,
+                      "ptx_optimization_level": 3,
+                      "rhs_l2_cache_hint": "evict_last",
+                      "rhs_tma_load_slices": null,
+                      "unroll_output_tiles": true,
+                      "unsafe_reuse_smem": false,
+                      "warpgroup_fast_axis": "n",
+                      "warpgroup_m_tile": null,
+                      "warpgroup_n_tile": 64
+                    },
+                    "family_support": 1,
+                    "rank": 2,
+                    "source_configuration_name": "local_m64_n128_wm0_wn64_k128_s2_sl1_b1_c0_nn_llrldf_o3_u0_t128",
+                    "source_percentage_of_torch": 140.3989643378668,
+                    "source_shape": {
+                      "k": 128,
+                      "m": 25088,
+                      "n": 1024
+                    },
+                    "source_shape_id": "mm-m25088-n1024-k128-52ed839ad917"
+                  },
+                  {
+                    "configuration": {
+                      "cluster_m_ctas": 1,
+                      "cluster_n_ctas": 1,
+                      "dst_l2_cache_hint": "evict_first",
+                      "lhs_l2_cache_hint": "evict_last",
+                      "lhs_l2_promotion": null,
+                      "multicast": false,
+                      "name": "heuristic_float16_k128_RRLLL_seed3",
+                      "operand_k_tile": 64,
+                      "operand_stages": 3,
+                      "output_cta_count": 129,
+                      "output_m_tile": 192,
+                      "output_n_tile": 176,
+                      "output_slices": 1,
+                      "output_store": "stmatrix",
+                      "output_store_buffers": 1,
+                      "output_tile_fast_axis": "n",
+                      "output_tiles_per_cta": 1,
+                      "output_tma_inner_size": 128,
+                      "ptx_optimization_level": null,
+                      "rhs_l2_cache_hint": "evict_last",
+                      "rhs_tma_load_slices": null,
+                      "unroll_output_tiles": true,
+                      "unsafe_reuse_smem": false,
+                      "warpgroup_fast_axis": "n",
+                      "warpgroup_m_tile": null,
+                      "warpgroup_n_tile": 176
+                    },
+                    "family_support": 1,
+                    "rank": 3,
+                    "source_configuration_name": "local_m192_n176_wm0_wn176_k64_s3_sl1_b1_c129_nn_llrldf_o0_u0_t0",
+                    "source_percentage_of_torch": 117.35403875738524,
+                    "source_shape": {
+                      "k": 128,
+                      "m": 8192,
+                      "n": 2048
+                    },
+                    "source_shape_id": "mm-m8192-n2048-k128-df6f040a8f0b"
+                  }
+                ],
+                "training_shapes": 6
+              },
+              "right": {
+                "feature": "aspect_m_over_n",
+                "information_gain": 0.019450133697445415,
+                "kind": "split",
+                "left": {
+                  "id": "float16_k128_RRLLRL",
+                  "kind": "leaf",
+                  "ranges": {
+                    "k": [
+                      256,
+                      4096
+                    ],
+                    "m": [
+                      256,
+                      16448
+                    ],
+                    "n": [
+                      1280,
+                      256008
+                    ]
+                  },
+                  "seeds": [
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_last",
+                        "lhs_l2_cache_hint": "evict_last",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RRLLRL_seed1",
+                        "operand_k_tile": 64,
+                        "operand_stages": 4,
+                        "output_cta_count": 129,
+                        "output_m_tile": 192,
+                        "output_n_tile": 128,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": 3,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 128
+                      },
+                      "family_support": 2,
+                      "rank": 1,
+                      "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c129_nn_llrldl_o3_u0_t128",
+                      "source_percentage_of_torch": 106.73731439345,
+                      "source_shape": {
+                        "k": 768,
+                        "m": 8192,
+                        "n": 3072
+                      },
+                      "source_shape_id": "mm-m8192-n3072-k768-a5e5e8d0b3b8"
+                    },
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_first",
+                        "lhs_l2_cache_hint": "evict_last",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RRLLRL_seed2",
+                        "operand_k_tile": 64,
+                        "operand_stages": 2,
+                        "output_cta_count": 132,
+                        "output_m_tile": 192,
+                        "output_n_tile": 192,
+                        "output_slices": 4,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": 1,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": false,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 192
+                      },
+                      "family_support": 2,
+                      "rank": 2,
+                      "source_configuration_name": "local_m192_n192_wm0_wn192_k64_s2_sl4_b1_c132_nn_llrldf_o1_u0_t0",
+                      "source_percentage_of_torch": 84.46539654476555,
+                      "source_shape": {
+                        "k": 256,
+                        "m": 8192,
+                        "n": 10000
+                      },
+                      "source_shape_id": "mm-m8192-n10000-k256-8c8782927bf8"
+                    },
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_first",
+                        "lhs_l2_cache_hint": "evict_last",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RRLLRL_seed3",
+                        "operand_k_tile": 64,
+                        "operand_stages": 3,
+                        "output_cta_count": 128,
+                        "output_m_tile": 128,
+                        "output_n_tile": 256,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "m",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": null,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 256
+                      },
+                      "family_support": 1,
+                      "rank": 3,
+                      "source_configuration_name": "local_m128_n256_wm0_wn256_k64_s3_sl1_b1_c128_mn_llrldf_o0_u0_t128",
+                      "source_percentage_of_torch": 114.52748492338026,
+                      "source_shape": {
+                        "k": 512,
+                        "m": 8192,
+                        "n": 2048
+                      },
+                      "source_shape_id": "mm-m8192-n2048-k512-c2bba8e9f4c8"
+                    }
+                  ],
+                  "training_shapes": 32
+                },
+                "right": {
+                  "id": "float16_k128_RRLLRR",
+                  "kind": "leaf",
+                  "ranges": {
+                    "k": [
+                      256,
+                      7936
+                    ],
+                    "m": [
+                      8192,
+                      32768
+                    ],
+                    "n": [
+                      512,
+                      1536
+                    ]
+                  },
+                  "seeds": [
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_first",
+                        "lhs_l2_cache_hint": "evict_last",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RRLLRR_seed1",
+                        "operand_k_tile": 64,
+                        "operand_stages": 4,
+                        "output_cta_count": 132,
+                        "output_m_tile": 192,
+                        "output_n_tile": 128,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": null,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 128
+                      },
+                      "family_support": 2,
+                      "rank": 1,
+                      "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c132_nn_llrldf_o0_u0_t128",
+                      "source_percentage_of_torch": 121.53891647287169,
+                      "source_shape": {
+                        "k": 384,
+                        "m": 12608,
+                        "n": 1536
+                      },
+                      "source_shape_id": "mm-m12608-n1536-k384-9ab17d1e5f23"
+                    },
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_first",
+                        "lhs_l2_cache_hint": "evict_last",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RRLLRR_seed2",
+                        "operand_k_tile": 64,
+                        "operand_stages": 4,
+                        "output_cta_count": 132,
+                        "output_m_tile": 192,
+                        "output_n_tile": 128,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": null,
+                        "rhs_l2_cache_hint": "evict_first",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 128
+                      },
+                      "family_support": 2,
+                      "rank": 2,
+                      "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c132_nn_llrfdf_o0_u0_t128",
+                      "source_percentage_of_torch": 118.29443152705801,
+                      "source_shape": {
+                        "k": 512,
+                        "m": 12544,
+                        "n": 1024
+                      },
+                      "source_shape_id": "mm-m12544-n1024-k512-ebb20dedd1a2"
+                    },
+                    {
+                      "configuration": {
+                        "cluster_m_ctas": 1,
+                        "cluster_n_ctas": 1,
+                        "dst_l2_cache_hint": "evict_last",
+                        "lhs_l2_cache_hint": "evict_last",
+                        "lhs_l2_promotion": null,
+                        "multicast": false,
+                        "name": "heuristic_float16_k128_RRLLRR_seed3",
+                        "operand_k_tile": 64,
+                        "operand_stages": 4,
+                        "output_cta_count": 132,
+                        "output_m_tile": 192,
+                        "output_n_tile": 128,
+                        "output_slices": 1,
+                        "output_store": "stmatrix",
+                        "output_store_buffers": 1,
+                        "output_tile_fast_axis": "n",
+                        "output_tiles_per_cta": 1,
+                        "output_tma_inner_size": 128,
+                        "ptx_optimization_level": 2,
+                        "rhs_l2_cache_hint": "evict_last",
+                        "rhs_tma_load_slices": null,
+                        "unroll_output_tiles": true,
+                        "unsafe_reuse_smem": false,
+                        "warpgroup_fast_axis": "n",
+                        "warpgroup_m_tile": null,
+                        "warpgroup_n_tile": 128
+                      },
+                      "family_support": 2,
+                      "rank": 3,
+                      "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c132_nn_llrldl_o2_u0_t128",
+                      "source_percentage_of_torch": 114.04728955501983,
+                      "source_shape": {
+                        "k": 256,
+                        "m": 12608,
+                        "n": 768
+                      },
+                      "source_shape_id": "mm-m12608-n768-k256-2799acec4c6b"
+                    }
+                  ],
+                  "training_shapes": 31
+                },
+                "threshold": 8.098958333333332,
+                "training_shapes": 63
+              },
+              "threshold": 192.0,
+              "training_shapes": 69
+            },
+            "right": {
+              "id": "float16_k128_RRLR",
+              "kind": "leaf",
+              "ranges": {
+                "k": [
+                  128,
+                  8192
+                ],
+                "m": [
+                  12544,
+                  128112
+                ],
+                "n": [
+                  256,
+                  1536
+                ]
+              },
+              "seeds": [
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_first",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RRLR_seed1",
+                    "operand_k_tile": 64,
+                    "operand_stages": 4,
+                    "output_cta_count": 131,
+                    "output_m_tile": 192,
+                    "output_n_tile": 128,
+                    "output_slices": 1,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": null,
+                    "rhs_l2_cache_hint": "evict_first",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": true,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 2,
+                  "rank": 1,
+                  "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c131_nn_lfrfdl_o0_u0_t128",
+                  "source_percentage_of_torch": 122.23626118980728,
+                  "source_shape": {
+                    "k": 1024,
+                    "m": 25088,
+                    "n": 256
+                  },
+                  "source_shape_id": "mm-m25088-n256-k1024-1b1665db2663"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_last",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RRLR_seed2",
+                    "operand_k_tile": 64,
+                    "operand_stages": 4,
+                    "output_cta_count": 262,
+                    "output_m_tile": 192,
+                    "output_n_tile": 128,
+                    "output_slices": 1,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": null,
+                    "rhs_l2_cache_hint": "evict_last",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": true,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 128
+                  },
+                  "family_support": 2,
+                  "rank": 2,
+                  "source_configuration_name": "xfer_m192_n128_k64_s4_c262_3531e8cac1",
+                  "source_percentage_of_torch": 97.13316599066866,
+                  "source_shape": {
+                    "k": 2048,
+                    "m": 50265,
+                    "n": 768
+                  },
+                  "source_shape_id": "mm-m50265-n768-k2048-2e75ac677025"
+                },
+                {
+                  "configuration": {
+                    "cluster_m_ctas": 1,
+                    "cluster_n_ctas": 1,
+                    "dst_l2_cache_hint": "evict_last",
+                    "lhs_l2_cache_hint": "evict_last",
+                    "lhs_l2_promotion": null,
+                    "multicast": false,
+                    "name": "heuristic_float16_k128_RRLR_seed3",
+                    "operand_k_tile": 64,
+                    "operand_stages": 3,
+                    "output_cta_count": 128,
+                    "output_m_tile": 128,
+                    "output_n_tile": 256,
+                    "output_slices": 2,
+                    "output_store": "stmatrix",
+                    "output_store_buffers": 1,
+                    "output_tile_fast_axis": "n",
+                    "output_tiles_per_cta": 1,
+                    "output_tma_inner_size": 128,
+                    "ptx_optimization_level": 1,
+                    "rhs_l2_cache_hint": "evict_last",
+                    "rhs_tma_load_slices": null,
+                    "unroll_output_tiles": false,
+                    "unsafe_reuse_smem": false,
+                    "warpgroup_fast_axis": "n",
+                    "warpgroup_m_tile": null,
+                    "warpgroup_n_tile": 256
+                  },
+                  "family_support": 2,
+                  "rank": 3,
+                  "source_configuration_name": "local_m128_n256_wm0_wn256_k64_s3_sl2_b1_c128_nn_llrldl_o1_u0_t128",
+                  "source_percentage_of_torch": 86.51539972592109,
+                  "source_shape": {
+                    "k": 512,
+                    "m": 32000,
+                    "n": 768
+                  },
+                  "source_shape_id": "mm-m32000-n768-k512-b5f4e62ce31a"
+                }
+              ],
+              "training_shapes": 39
+            },
+            "threshold": 32.39583333333333,
+            "training_shapes": 108
+          },
+          "right": {
+            "id": "float16_k128_RRR",
+            "kind": "leaf",
+            "ranges": {
+              "k": [
+                128,
+                1024
+              ],
+              "m": [
+                50176,
+                401536
+              ],
+              "n": [
+                64,
+                1024
+              ]
+            },
+            "seeds": [
+              {
+                "configuration": {
+                  "cluster_m_ctas": 1,
+                  "cluster_n_ctas": 1,
+                  "dst_l2_cache_hint": "evict_first",
+                  "lhs_l2_cache_hint": "evict_first",
+                  "lhs_l2_promotion": null,
+                  "multicast": false,
+                  "name": "heuristic_float16_k128_RRR_seed1",
+                  "operand_k_tile": 64,
+                  "operand_stages": 4,
+                  "output_cta_count": 132,
+                  "output_m_tile": 192,
+                  "output_n_tile": 128,
+                  "output_slices": 1,
+                  "output_store": "stmatrix",
+                  "output_store_buffers": 1,
+                  "output_tile_fast_axis": "n",
+                  "output_tiles_per_cta": 1,
+                  "output_tma_inner_size": 128,
+                  "ptx_optimization_level": 1,
+                  "rhs_l2_cache_hint": "evict_last",
+                  "rhs_tma_load_slices": null,
+                  "unroll_output_tiles": false,
+                  "unsafe_reuse_smem": false,
+                  "warpgroup_fast_axis": "n",
+                  "warpgroup_m_tile": null,
+                  "warpgroup_n_tile": 128
+                },
+                "family_support": 3,
+                "rank": 1,
+                "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c132_nn_lfrldf_o1_u0_t128",
+                "source_percentage_of_torch": 102.73350818177937,
+                "source_shape": {
+                  "k": 768,
+                  "m": 61568,
+                  "n": 256
+                },
+                "source_shape_id": "mm-m61568-n256-k768-f107bbf60a82"
+              },
+              {
+                "configuration": {
+                  "cluster_m_ctas": 1,
+                  "cluster_n_ctas": 1,
+                  "dst_l2_cache_hint": "evict_last",
+                  "lhs_l2_cache_hint": "evict_last",
+                  "lhs_l2_promotion": null,
+                  "multicast": false,
+                  "name": "heuristic_float16_k128_RRR_seed2",
+                  "operand_k_tile": 64,
+                  "operand_stages": 2,
+                  "output_cta_count": 132,
+                  "output_m_tile": 192,
+                  "output_n_tile": 256,
+                  "output_slices": 2,
+                  "output_store": "stmatrix",
+                  "output_store_buffers": 1,
+                  "output_tile_fast_axis": "n",
+                  "output_tiles_per_cta": 1,
+                  "output_tma_inner_size": 128,
+                  "ptx_optimization_level": null,
+                  "rhs_l2_cache_hint": "evict_last",
+                  "rhs_tma_load_slices": null,
+                  "unroll_output_tiles": false,
+                  "unsafe_reuse_smem": false,
+                  "warpgroup_fast_axis": "n",
+                  "warpgroup_m_tile": null,
+                  "warpgroup_n_tile": 256
+                },
+                "family_support": 2,
+                "rank": 2,
+                "source_configuration_name": "local_m192_n256_wm0_wn256_k64_s2_sl2_b1_c132_nn_llrldl_o0_u0_t128",
+                "source_percentage_of_torch": 96.49923887059772,
+                "source_shape": {
+                  "k": 256,
+                  "m": 197951,
+                  "n": 512
+                },
+                "source_shape_id": "mm-m197951-n512-k256-ad2f14a6ac3f"
+              },
+              {
+                "configuration": {
+                  "cluster_m_ctas": 1,
+                  "cluster_n_ctas": 1,
+                  "dst_l2_cache_hint": "evict_first",
+                  "lhs_l2_cache_hint": "evict_last",
+                  "lhs_l2_promotion": null,
+                  "multicast": false,
+                  "name": "heuristic_float16_k128_RRR_seed3",
+                  "operand_k_tile": 128,
+                  "operand_stages": 3,
+                  "output_cta_count": null,
+                  "output_m_tile": 64,
+                  "output_n_tile": 128,
+                  "output_slices": 2,
+                  "output_store": "stmatrix",
+                  "output_store_buffers": 2,
+                  "output_tile_fast_axis": "n",
+                  "output_tiles_per_cta": 1,
+                  "output_tma_inner_size": 128,
+                  "ptx_optimization_level": 1,
+                  "rhs_l2_cache_hint": "evict_last",
+                  "rhs_tma_load_slices": null,
+                  "unroll_output_tiles": true,
+                  "unsafe_reuse_smem": true,
+                  "warpgroup_fast_axis": "n",
+                  "warpgroup_m_tile": null,
+                  "warpgroup_n_tile": 64
+                },
+                "family_support": 1,
+                "rank": 3,
+                "source_configuration_name": "local_m64_n128_wm0_wn64_k128_s3_sl2_b2_c0_nn_llrldf_o1_u1_t128",
+                "source_percentage_of_torch": 175.6976780624862,
+                "source_shape": {
+                  "k": 128,
+                  "m": 100480,
+                  "n": 128
+                },
+                "source_shape_id": "mm-m100480-n128-k128-a3815e257f0a"
+              }
+            ],
+            "training_shapes": 21
+          },
+          "threshold": 162.0,
+          "training_shapes": 129
+        },
+        "threshold": 1164.0,
+        "training_shapes": 316
+      },
+      "threshold": 98.0,
+      "training_shapes": 350
+    },
+    "float16/k64": {
+      "feature": "m",
+      "information_gain": 0.02122667248717669,
+      "kind": "split",
+      "left": {
+        "id": "float16_k64_L",
+        "kind": "leaf",
+        "ranges": {
+          "k": [
+            64,
+            16448
+          ],
+          "m": [
+            128,
+            1000
+          ],
+          "n": [
+            128,
+            4096
+          ]
+        },
+        "seeds": [
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_first",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k64_L_seed1",
+              "operand_k_tile": 64,
+              "operand_stages": 6,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 48,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": null,
+              "rhs_l2_cache_hint": "evict_first",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 48
+            },
+            "family_support": 2,
+            "rank": 1,
+            "source_configuration_name": "gap_m64_n48_k64_s6",
+            "source_percentage_of_torch": 129.6610217565938,
+            "source_shape": {
+              "k": 64,
+              "m": 1000,
+              "n": 256
+            },
+            "source_shape_id": "mm-m1000-n256-k64-0e4e4c8bd174"
+          },
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_first",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k64_L_seed2",
+              "operand_k_tile": 64,
+              "operand_stages": 7,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 64,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": null,
+              "rhs_l2_cache_hint": "evict_last",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 64
+            },
+            "family_support": 2,
+            "rank": 2,
+            "source_configuration_name": "local_m64_n64_wm0_wn64_k64_s7_sl1_b1_c0_nn_lfrldf_o0_u0_t128",
+            "source_percentage_of_torch": 124.19752834461579,
+            "source_shape": {
+              "k": 64,
+              "m": 1000,
+              "n": 1024
+            },
+            "source_shape_id": "mm-m1000-n1024-k64-f4897ca9728a"
+          },
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_first",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k64_L_seed3",
+              "operand_k_tile": 64,
+              "operand_stages": 7,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 48,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": null,
+              "rhs_l2_cache_hint": "evict_first",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 48
+            },
+            "family_support": 2,
+            "rank": 3,
+            "source_configuration_name": "narrow_m64_n48_k64_s7",
+            "source_percentage_of_torch": 124.10468238941648,
+            "source_shape": {
+              "k": 64,
+              "m": 1000,
+              "n": 384
+            },
+            "source_shape_id": "mm-m1000-n384-k64-635b63796af7"
+          }
+        ],
+        "training_shapes": 22
+      },
+      "right": {
+        "id": "float16_k64_R",
+        "kind": "leaf",
+        "ranges": {
+          "k": [
+            64,
+            16448
+          ],
+          "m": [
+            1024,
+            401536
+          ],
+          "n": [
+            64,
+            25088
+          ]
+        },
+        "seeds": [
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_first",
+              "lhs_l2_cache_hint": "evict_last",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k64_R_seed1",
+              "operand_k_tile": 64,
+              "operand_stages": 4,
+              "output_cta_count": 131,
+              "output_m_tile": 192,
+              "output_n_tile": 128,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": 2,
+              "rhs_l2_cache_hint": "evict_last",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 128
+            },
+            "family_support": 2,
+            "rank": 1,
+            "source_configuration_name": "local_m192_n128_wm0_wn128_k64_s4_sl1_b1_c131_nn_llrldf_o2_u0_t128",
+            "source_percentage_of_torch": 137.55640719961565,
+            "source_shape": {
+              "k": 192,
+              "m": 50176,
+              "n": 192
+            },
+            "source_shape_id": "mm-m50176-n192-k192-ce9b6df69b5b"
+          },
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_first",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k64_R_seed2",
+              "operand_k_tile": 64,
+              "operand_stages": 2,
+              "output_cta_count": null,
+              "output_m_tile": 64,
+              "output_n_tile": 128,
+              "output_slices": 2,
+              "output_store": "stmatrix",
+              "output_store_buffers": 2,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": 1,
+              "rhs_l2_cache_hint": "evict_last",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 128
+            },
+            "family_support": 1,
+            "rank": 2,
+            "source_configuration_name": "local_m64_n128_wm0_wn128_k64_s2_sl2_b2_c0_nn_lfrldf_o1_u0_t128",
+            "source_percentage_of_torch": 125.08417376440816,
+            "source_shape": {
+              "k": 64,
+              "m": 4096,
+              "n": 4096
+            },
+            "source_shape_id": "mm-m4096-n4096-k64-6bd58d8981ea"
+          },
+          {
+            "configuration": {
+              "cluster_m_ctas": 1,
+              "cluster_n_ctas": 1,
+              "dst_l2_cache_hint": "evict_last",
+              "lhs_l2_cache_hint": "evict_first",
+              "lhs_l2_promotion": null,
+              "multicast": false,
+              "name": "heuristic_float16_k64_R_seed3",
+              "operand_k_tile": 64,
+              "operand_stages": 4,
+              "output_cta_count": 132,
+              "output_m_tile": 192,
+              "output_n_tile": 112,
+              "output_slices": 1,
+              "output_store": "stmatrix",
+              "output_store_buffers": 1,
+              "output_tile_fast_axis": "n",
+              "output_tiles_per_cta": 1,
+              "output_tma_inner_size": 128,
+              "ptx_optimization_level": null,
+              "rhs_l2_cache_hint": "evict_last",
+              "rhs_tma_load_slices": null,
+              "unroll_output_tiles": true,
+              "unsafe_reuse_smem": false,
+              "warpgroup_fast_axis": "n",
+              "warpgroup_m_tile": null,
+              "warpgroup_n_tile": 112
+            },
+            "family_support": 1,
+            "rank": 3,
+            "source_configuration_name": "local_m192_n112_wm0_wn112_k64_s4_sl1_b1_c132_nn_lfrldl_o0_u0_t0",
+            "source_percentage_of_torch": 125.05986144625551,
+            "source_shape": {
+              "k": 960,
+              "m": 25216,
+              "n": 320
+            },
+            "source_shape_id": "mm-m25216-n320-k960-302f25d7af77"
+          }
+        ],
+        "training_shapes": 34
+      },
+      "threshold": 1012.0,
+      "training_shapes": 56
+    }
+  },
+  "layout": "canonical_nt",
+  "max_leaves": 16,
+  "purpose": "initial search seeds, not final production dispatch",
+  "seeds_per_leaf": 3,
+  "source_artifact": "/home/arseniivanov/ayla/.benchmarks/oss_gemm/shape_improvements.json",
+  "source_shape_count": 406,
+  "stored_seed_count": 49,
+  "training_legal_seed_coverage_pct": 100.0,
+  "training_winner_family_recall_pct": 18.7192118226601,
+  "version": 1
+}
