@@ -255,6 +255,8 @@ def main() -> int:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+    if not args.validate_only:
+        benchmark_common.require_consolidated_benchmarks()
     if args.max_timing_rounds < 3 or args.config_timeout_seconds < 0:
         parser.error("rounds must be at least three and timeout must be nonnegative")
     if args.max_shapes is not None and args.max_shapes < 1:

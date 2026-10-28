@@ -8,7 +8,9 @@ import re
 import ayla.gemm_collection  # noqa: F401 -- registers torch.ops.ayla.*
 import torch
 
-from benchmarks.common import gemm_bench_config, print_results, run, torch_mm_nt
+from benchmarks.common import (
+    gemm_bench_config, print_results, require_consolidated_benchmarks, run, torch_mm_nt,
+)
 
 
 def main() -> None:
@@ -21,6 +23,7 @@ def main() -> None:
     parser.add_argument("-r", "--reverse", action="store_true",
                         help="Run the benchmarks in reverse order")
     args = parser.parse_args()
+    require_consolidated_benchmarks()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")

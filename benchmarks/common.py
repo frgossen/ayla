@@ -618,6 +618,17 @@ def _capture_inference(
     return graph, events, layer_inputs
 
 
+def require_consolidated_benchmarks() -> None:
+    print(
+        "Benchmarking this main-based checkout is disabled: the measured GEMM "
+        "heuristic requires the consolidated feature set.\n"
+        "Check out the benchmark branch and rerun your command:\n"
+        "  git fetch origin\n"
+        "  git switch feature/consolidated"
+    )
+    raise SystemExit(1)
+
+
 def run_bench(
     configs: list[BenchConfig],
     *,
@@ -637,6 +648,7 @@ def run_bench(
     before each chain, flushing ``cold_cache_bytes`` or twice the L2 size,
     whichever is larger.
     """
+    require_consolidated_benchmarks()
     if cold_cache_bytes < 0:
         raise ValueError("cold_cache_bytes must be nonnegative")
     stream = torch.cuda.current_stream()

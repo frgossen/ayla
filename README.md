@@ -48,12 +48,15 @@ print(measured_gemm_configs("mm", "bfloat16", m=8192, n=768, k=768))
 measured seed or an unmeasured fallback. `measured_gemm_configs` returns the
 exact-shape saved configurations, winner first, including feature-only records.
 For the **full feature space, performance search, and feature-enabled numbers**,
-check out `feature/consolidated`. Main's configurations can be suboptimal.
+check out `feature/consolidated`. Benchmark commands on this main-based checkout
+print checkout instructions and exit; the heuristic requires the full feature set.
 
-Validate, then run a small correctness-checked benchmark against Torch:
+Validation works on this checkout. Switch branches before benchmarking:
 
 ```bash
 pixi run bench-oss-validate
+git fetch origin
+git switch feature/consolidated
 CUDA_VISIBLE_DEVICES=0 pixi run bench-oss --workload all --max-shapes 3 \
   --output-json .benchmarks/oss-smoke/raw.json \
   --output-csv .benchmarks/oss-smoke/raw.csv
