@@ -6,6 +6,7 @@ import itertools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import total_ordering
 from typing import ClassVar, Iterator, Literal, cast
 
 from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor_of_type
@@ -299,16 +300,53 @@ class KernelOp(GpuOp):
         )
 
 
-class CollectiveLevel(enum.IntEnum):
-    # TODO: Evaluate whether WARP and WG should remain named levels or be
-    # represented generically as fixed-size thread collectives such as 32t
-    # and 128t.
-    THREAD = 0
-    WARP = 1
-    WG = 2
-    BLOCK = 3
-    CLUSTER = 4
-    GRID = 5
+@total_ordering
+class CollectiveLevel(enum.Enum):
+    """A hardware hierarchy level and its granularity within that level."""
+
+    THREAD = (0, 1)
+    THREAD_32 = (0, 32)
+    WG = (1, 1)
+    BLOCK = (2, 1)
+    CLUSTER = (3, 1)
+    GRID = (4, 1)
+
+    def __init__(self, hierarchy: int, granularity: int) -> None:
+        self.hierarchy = hierarchy
+        self.granularity = granularity
+
+    def __lt__(self, other: CollectiveLevel) -> bool:
+        if not isinstance(other, CollectiveLevel):
+            return NotImplemented
+        return self.value < other.value
+
+    @property
+    def syntax(self) -> str:
+        if self.hierarchy == CollectiveLevel.THREAD.hierarchy:
+            return (
+                "thread"
+                if self.granularity == 1
+                else f"{self.granularity}t"
+            )
+        return self.name.lower()
+
+    @classmethod
+    def from_syntax(cls, syntax: str) -> CollectiveLevel:
+        if syntax.endswith("t") and syntax[:-1].isdigit():
+            granularity = int(syntax[:-1])
+            levels = [
+                level for level in cls
+                if level.hierarchy == cls.THREAD.hierarchy
+                and level.granularity == granularity
+            ]
+            if len(levels) == 1:
+                return levels[0]
+        try:
+            return cls[syntax.upper()]
+        except KeyError as error:
+            raise ValueError(
+                f"unknown collective level {syntax!r}"
+            ) from error
 
     # TODO: Replace uses of join with max; collective levels form a total
     # order, and max may be easier to read.
@@ -357,7 +395,7 @@ def _print_collective(
     for i, (level, dims) in enumerate(levels.items()):
         if i:
             p.write(", ")
-        p.write(f"{dims}.{level.name.lower()}")
+        p.write(f"{dims}.{level.syntax}")
     if bracketed:
         p.write("]")
 
@@ -376,10 +414,10 @@ def _parse_collective(p) -> dict[CollectiveAxis, CollectiveLevel]:
     while True:
         dims = p.read_identifier()
         p.read_literal(".")
-        level = p.read_identifier()
+        level = p.read_identifier(allow_leading_digits=True)
         for dim in dims:
             collective[CollectiveAxis[dim.upper()]] = (
-                CollectiveLevel[level.upper()]
+                CollectiveLevel.from_syntax(level)
             )
         if not bracketed or not p.can_read_literal(","):
             break
@@ -2505,7 +2543,7 @@ class HardwareLevelId:
 HW_LEVEL_IDS: dict[CollectiveLevel, HardwareLevelId] = {
     CollectiveLevel.BLOCK: HardwareLevelId(BlockIdOp, 1, CollectiveLevel.BLOCK),
     CollectiveLevel.WG: HardwareLevelId(WarpGroupIdOp, 128, CollectiveLevel.WG),
-    CollectiveLevel.WARP: HardwareLevelId(ThreadIdOp, 32, CollectiveLevel.THREAD),
+    CollectiveLevel.THREAD_32: HardwareLevelId(ThreadIdOp, 32, CollectiveLevel.THREAD),
     CollectiveLevel.THREAD: HardwareLevelId(ThreadIdOp, 1, CollectiveLevel.THREAD),
 }
 

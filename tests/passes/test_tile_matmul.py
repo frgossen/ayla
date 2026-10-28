@@ -547,7 +547,7 @@ def test_splitting_k_of_an_overwriting_matmul_zeroes_dst_and_accumulates():
     assert matmul.accumulate
 
 
-@pytest.mark.parametrize("level", [CollectiveLevel.WARP, CollectiveLevel.CLUSTER])
+@pytest.mark.parametrize("level", [CollectiveLevel.THREAD_32, CollectiveLevel.CLUSTER])
 def test_rejects_hardware_levels_without_matmul_tiling(level):
     with pytest.raises(ValueError, match="unsupported iteration binding"):
         TileMatmul(

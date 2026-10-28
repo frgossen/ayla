@@ -274,7 +274,7 @@ class TileReduce(LoweringPass):
         kernel = find_ancestor_of_type(hero, KernelOp)
         assert kernel is not None
         level, axis = self.parallel_iteration_space
-        if level == CollectiveLevel.WARP:
+        if level == CollectiveLevel.THREAD_32:
             assert axis == CollectiveAxis.X
             launch_dim *= 32
         elif level == CollectiveLevel.WG:

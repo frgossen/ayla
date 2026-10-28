@@ -345,7 +345,11 @@ def test_matmul_tensor_initializer_roundtrips():
     assert matmul.init is None
     assert matmul.init_value is not None
     assert list(matmul.init_value.type.strides) == [0, 1]
-    assert CollectiveLevel.WARP.join(CollectiveLevel.WG) == CollectiveLevel.WG
+    assert CollectiveLevel.THREAD_32.granularity == 32
+    assert (
+        CollectiveLevel.THREAD_32.join(CollectiveLevel.WG)
+        == CollectiveLevel.WG
+    )
     assert is_grid_collective(matmul.collective)
     matmul.narrow_collective_level(CollectiveAxis.X, CollectiveLevel.WG)
     assert not is_grid_collective(matmul.collective, (CollectiveAxis.X,))
@@ -912,7 +916,7 @@ def test_launch_dimensions_reject_growing_shrinking_and_clearing_known_axes(
     [
         (CollectiveLevel.BLOCK, 3, 3),
         (CollectiveLevel.THREAD, 64, 64),
-        (CollectiveLevel.WARP, 2, 64),
+        (CollectiveLevel.THREAD_32, 2, 64),
         (CollectiveLevel.WG, 2, 2),
     ],
 )
@@ -926,7 +930,7 @@ def test_constructed_hardware_ids_preserve_raw_operation_bounds(level, count, ra
     raw_level = HW_ID_LEVELS[type(raw_op)]
     assert launch_extent(kernel, raw_level, CollectiveAxis.X) == raw_count
     assert launch_extent(kernel, level, CollectiveAxis.X) == count
-    if level == CollectiveLevel.WARP:
+    if level == CollectiveLevel.THREAD_32:
         quotient = value.definition
         assert isinstance(quotient, IndexDivOp)
         assert quotient.lhs is raw_op.result()

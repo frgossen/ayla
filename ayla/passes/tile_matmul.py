@@ -195,7 +195,7 @@ class TileMatmul(LoweringPass):
         for binding in parallel_bindings:
             level, axis = binding
             if (
-                level not in HW_LEVEL_IDS or level == CollectiveLevel.WARP
+                level not in HW_LEVEL_IDS or level == CollectiveLevel.THREAD_32
                 or level == CollectiveLevel.WG and axis != CollectiveAxis.X
             ):
                 raise ValueError(

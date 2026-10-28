@@ -325,7 +325,7 @@ def test_tile_reduce_maps_parallel_dimension_to_block_and_reduction_to_warp():
         module,
         tile_sizes={1: 32},
         parallel_iteration_space=(
-            CollectiveLevel.WARP, CollectiveAxis.X,
+            CollectiveLevel.THREAD_32, CollectiveAxis.X,
         ),
         hero_label_filter="mean",
     )
@@ -353,7 +353,7 @@ def test_tile_reduce_maps_parallel_dimension_to_block_and_reduction_to_warp():
             %9: index = index_mod(%8: index, %c2_1: index)
             %10: gmem<4x1xf32 strides=[2, 1]> = tile(%6: gmem<4x2xf32>, 0, %9: index)
             %11: gmem<4x32xf32 strides=[64, 1]> = tile(%2: gmem<4x64xf32>, 0, %9: index)
-            reduce sum(%10: gmem<4x1xf32 strides=[2, 1]>, %11: gmem<4x32xf32 strides=[64, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
+            reduce sum(%10: gmem<4x1xf32 strides=[2, 1]>, %11: gmem<4x32xf32 strides=[64, 1]>) collective=[x.32t, yz.grid] attrs={label: "mean_partial"}
             reduce sum(%3: gmem<4x1xf32>, %6: gmem<4x2xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
@@ -379,7 +379,7 @@ def test_tile_reduce_composes_block_and_warp_tiling():
         module,
         tile_sizes={0: 16},
         parallel_iteration_space=(
-            CollectiveLevel.WARP, CollectiveAxis.X,
+            CollectiveLevel.THREAD_32, CollectiveAxis.X,
         ),
         hero_label_filter="mean",
     )
@@ -411,9 +411,9 @@ def test_tile_reduce_composes_block_and_warp_tiling():
             for (%11: index = 0 to 2) attrs={label: "d1"} {
               %12: gmem<16x1xf32 strides=[2, 1]> = tile(%10: gmem<16x2xf32>, 0, %11: index)
               %13: gmem<16x32xf32 strides=[64, 1]> = tile(%5: gmem<16x64xf32>, 0, %11: index)
-              reduce sum(%12: gmem<16x1xf32 strides=[2, 1]>, %13: gmem<16x32xf32 strides=[64, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
+              reduce sum(%12: gmem<16x1xf32 strides=[2, 1]>, %13: gmem<16x32xf32 strides=[64, 1]>) collective=[x.32t, yz.grid] attrs={label: "mean_partial"}
             }
-            reduce sum(%6: gmem<16x1xf32>, %10: gmem<16x2xf32>) collective=[x.warp, yz.grid] attrs={init: 0.0, label: "mean"}
+            reduce sum(%6: gmem<16x1xf32>, %10: gmem<16x2xf32>) collective=[x.32t, yz.grid] attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -461,7 +461,7 @@ def test_tile_reduce_rejects_dependent_levels_across_invocations():
         module,
         tile_sizes={0: 32},
         parallel_iteration_space=(
-            CollectiveLevel.WARP, CollectiveAxis.X,
+            CollectiveLevel.THREAD_32, CollectiveAxis.X,
         ),
         hero_label_filter="mean",
     )
@@ -496,7 +496,7 @@ def test_tile_reduce_rejects_intra_block_tiling_before_block_tiling():
             module,
             tile_sizes={0: 32},
             parallel_iteration_space=(
-                CollectiveLevel.WARP, CollectiveAxis.X,
+                CollectiveLevel.THREAD_32, CollectiveAxis.X,
             ),
             hero_label_filter="mean",
         )
@@ -858,7 +858,7 @@ def test_tile_reduce_assigns_one_mean_row_per_warp():
         module,
         tile_sizes={0: 1},
         parallel_iteration_space=(
-            CollectiveLevel.WARP, CollectiveAxis.X,
+            CollectiveLevel.THREAD_32, CollectiveAxis.X,
         ),
         hero_label_filter="mean",
         epilogue_label_filter="mean_epilogue",
@@ -889,9 +889,9 @@ def test_tile_reduce_assigns_one_mean_row_per_warp():
             for (%7: index = 0 to 52) attrs={label: "d1"} {
               %8: gmem<1x1xf32 strides=[52, 1]> = tile(%6: gmem<1x52xf32>, 0, %7: index)
               %9: gmem<1x128xf32 strides=[6656, 1]> = tile(%2: gmem<1x6656xf32>, 0, %7: index)
-              reduce sum(%8: gmem<1x1xf32 strides=[52, 1]>, %9: gmem<1x128xf32 strides=[6656, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
+              reduce sum(%8: gmem<1x1xf32 strides=[52, 1]>, %9: gmem<1x128xf32 strides=[6656, 1]>) collective=[x.32t, yz.grid] attrs={label: "mean_partial"}
             }
-            reduce sum(%3: gmem<1x1xf32>, %6: gmem<1x52xf32>) collective=[x.warp, yz.grid] attrs={init: 0.0, label: "mean"}
+            reduce sum(%3: gmem<1x1xf32>, %6: gmem<1x52xf32>) collective=[x.32t, yz.grid] attrs={init: 0.0, label: "mean"}
             elementwise div(%3: gmem<1x1xf32>, %3: gmem<1x1xf32>) attrs={divisor: 6656, label: "mean_epilogue"}
           }
         }""")  # noqa: E501
