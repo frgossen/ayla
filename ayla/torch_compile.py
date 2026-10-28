@@ -33,9 +33,9 @@ the dump; code generation will follow separately.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TypeGuard, cast
+from typing import Any, TypeGuard, cast
 
 import torch
 from torch._inductor import ir
@@ -721,7 +721,7 @@ _LOWERINGS = {
     torch.ops.aten.addmm.default: _lower_addmm,
     torch.ops.aten.bmm.default: _lower_bmm,
 }
-_displaced_user_lowerings: dict[object, object] = {}
+_displaced_user_lowerings: dict[object, Callable[..., Any]] = {}
 _displaced_backend = None
 
 

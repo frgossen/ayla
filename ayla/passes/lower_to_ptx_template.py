@@ -1696,6 +1696,7 @@ class LowerToPtxTemplate(LoweringPass):
         m_dim, n_dim = cast(tuple[int, int], wgrmem_type.sizes)
         root = root_buffer(fragment)
         assert root is not None
+        assert isinstance(root.type, WgrmemTensorType)
         root_n = cast(int, root.type.sizes[1])
         if isinstance(fragment.definition, TileOp):
             assert list(memory_type.sizes) == [m_dim, n_dim], (
@@ -1706,7 +1707,7 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             # Keep accepting the legacy producer until PromoteBuffers switches
             # from an attribute-based slice to an explicit WGRMEM view.
-            col_start = int(op.attrs.get("wgmma_col_start", 0))
+            col_start = int(cast(int, op.attrs.get("wgmma_col_start", 0)))
             memory_m, memory_n = cast(tuple[int, int], memory_type.sizes)
             assert memory_m == m_dim and 0 <= col_start < n_dim
             assert col_start + memory_n <= n_dim
@@ -1721,6 +1722,7 @@ class LowerToPtxTemplate(LoweringPass):
         assert root_n % 8 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
         )
+        assert isinstance(memory_type.dtype, (BF16Type, F16Type, F32Type, F64Type))
         dtype_bytes = memory_type.dtype.byte_size
         row_stride_bytes = cast(int, memory_type.strides[0]) * dtype_bytes
         column_stride_bytes = cast(int, memory_type.strides[1]) * dtype_bytes
@@ -1795,7 +1797,8 @@ class LowerToPtxTemplate(LoweringPass):
 
         new_op = PTXTemplateOp.build(
             operands=[
-                self.value_map[memory], self.value_map[fragment], byte_offset,
+                cast(Value, self.value_map[memory]),
+                cast(Value, self.value_map[fragment]), byte_offset,
             ],
             result_types=[], template=template,
             operand_names=["memory", "fragment", "offset"], result_names=[],

@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import textwrap
 from functools import cache
+from typing import cast
 
 import torch
 
@@ -60,10 +61,10 @@ def _seed(
     unroll = None
     if fixed_grid and captured["unroll_output_tiles"]:
         tiles = (
-            math.ceil(builder_m / int(captured["output_m_tile"]))
-            * math.ceil(builder_n / int(captured["output_n_tile"]))
+            math.ceil(builder_m / int(cast(int, captured["output_m_tile"])))
+            * math.ceil(builder_n / int(cast(int, captured["output_n_tile"])))
         )
-        unroll = math.ceil(tiles / int(captured["output_cta_count"]))
+        unroll = math.ceil(tiles / int(cast(int, captured["output_cta_count"])))
     if not exact and (
         not _legal(
             builder, builder_m, builder_n, k,
@@ -226,6 +227,9 @@ def gemm_jit_compiler(
             typ.sizes for typ in kernel.signature
             if isinstance(typ, GmemTensorType)
         )
+        assert all(size is not None for size in (*a, *bt))
+        a = cast(tuple[int, ...], a)
+        bt = cast(tuple[int, ...], bt)
         *batch, m, k = a
         n = bt[-2]
         schedule = select_gemm_schedule(operation, dtype, m, n, k, *batch)

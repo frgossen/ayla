@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable

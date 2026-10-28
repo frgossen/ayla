@@ -8,7 +8,7 @@ from ayla.gemm_collection.gemm import (
     schedule_register_matmul,
     schedule_tiled_matmul,
 )
-from ayla.gpu_dialect import AsyncOp, AwaitOp, ModuleOp, MoveOp, gpu_dialect
+from ayla.gpu_dialect import AsyncOp, AwaitOp, KernelOp, ModuleOp, MoveOp, gpu_dialect
 from ayla.passes.tile_matmul import TileMatmul
 from ayla.ptx_codegen import make_ptx_kernel
 
@@ -30,7 +30,7 @@ def test_tiled_schedule_maps_two_output_dimensions_to_warp_groups():
 
 
 def test_schedule_matmul_initializes_accumulator_from_broadcast_memory():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @addmm(%bias: gmem<128x64xbf16 strides=[0, 1]>, %a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>) {
             matmul(%a: gmem<128x64xbf16>, %b: gmem<64x64xbf16>, %c: gmem<128x64xbf16>, %bias: gmem<128x64xbf16 strides=[0, 1]>) collective=xyz.grid attrs={label: "mm"}
@@ -137,7 +137,7 @@ def test_register_matmul_fuses_multicast_and_local_load_completion():
 
 
 def test_second_hero_ignores_an_already_pipelined_singleton():
-    module = gpu_dialect.parse(textwrap.dedent("""\
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
         module {
           kernel @second_hero(%prior: gmem<64x16xbf16>, %lhs: gmem<64x16xbf16>, %rhs: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %prior_smem: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0}
@@ -161,6 +161,7 @@ def test_second_hero_ignores_an_already_pipelined_singleton():
         if op.lock is prior.lock
     ]
     kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
     assert kernel.body.ops.index(prior_await) < kernel.body.ops.index(prior)
     assert any(
         len(op.body.ops) == 2

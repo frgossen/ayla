@@ -297,7 +297,7 @@ def schedule_matmul(
     if output_grid_size is not None:
         kernel.grid_dim = (output_grid_size, 1, 1)
     block_x = (CollectiveLevel.BLOCK, CollectiveAxis.X)
-    output_bindings = (
+    output_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None] = (
         [block_x, block_x]
         if output_grid_size is not None
         else [

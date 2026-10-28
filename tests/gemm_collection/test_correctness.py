@@ -22,6 +22,7 @@ from ayla.gpu_dialect import (
     CollectiveAxis,
     ElementwiseOp,
     ForOp,
+    KernelOp,
     ModuleOp,
     TileOp,
     TmaDescType,
@@ -145,6 +146,7 @@ def test_fixed_output_grid_uses_a_persistent_tile_loop():
         output_tma_inner_size=None,
     )
     [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
     outer_loops = [
         loop for loop in find_ops_of_type(module, ForOp)
         if find_ancestor_of_type(loop, ForOp) is None

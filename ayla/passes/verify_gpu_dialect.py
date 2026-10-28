@@ -545,8 +545,15 @@ class VerifyGpuDialect(VerificationPass):
                 or dst_type.sizes != src_type.sizes
                 or dst_type.dtype != src_type.dtype
                 or not (
-                    (src_type.strides[0] % 2 == 0 and src_type.strides[1] == 1)
-                    or (src_type.strides[1] == 0 and src_type.dtype.byte_size in (2, 4))
+                    (
+                        src_type.strides[0] is not None
+                        and src_type.strides[0] % 2 == 0
+                        and src_type.strides[1] == 1
+                    )
+                    or (
+                        src_type.strides[1] == 0
+                        and isinstance(src_type.dtype, (BF16Type, F16Type, F32Type))
+                    )
                 )
             )
         ):
