@@ -6,6 +6,8 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
+    ElementwiseOp,
     ForOp,
     IfOp,
     IndexAddOp,
@@ -20,6 +22,7 @@ from ..gpu_dialect import (
     MemoryEffect,
     MemTensorType,
     ModuleOp,
+    RmemTensorType,
     ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
@@ -364,6 +367,14 @@ class TileMatmul(LoweringPass):
         tiling_schemes = _refine_tiling_schemes(hero, self.op_dims, ubs)
 
         new_ops: list[Op] = []
+        # Only the first K step of an overwriting matmul overwrites: zero dst
+        # ahead of the K loop instead and let every step accumulate.
+        split_overwrite = not hero.accumulate and "K" in self.op_dims
+        if split_overwrite:
+            dst_type = cast(MemTensorType, dst.type)
+            zero = ConstantOp.build(0.0, RmemTensorType.build([], dst_type.dtype))
+            fill = ElementwiseOp.build(dst, srcs=[zero.result()], fn="fill")
+            new_ops.extend([zero, fill])
         parallel_ids: dict[
             tuple[CollectiveLevel, CollectiveAxis], Value
         ] = {}
@@ -521,6 +532,8 @@ class TileMatmul(LoweringPass):
                     level,
                 )
         attrs = hero.extra_attrs
+        if split_overwrite:
+            del attrs["accumulate"]
         for name in _OPERAND_DIMS:
             attrs.pop(f"{name}_tiling_scheme", None)
         for name, scheme_id in tiling_schemes.items():

@@ -10,6 +10,7 @@ from ayla.gpu_dialect import (
     BarrierOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
     F32Type,
     ForOp,
@@ -22,6 +23,7 @@ from ayla.gpu_dialect import (
     MoveOp,
     PTXTemplateOp,
     ReinterpretOp,
+    RmemTensorType,
     SelectOp,
     SmemTensorType,
     gpu_dialect,
@@ -69,20 +71,23 @@ def test_buffer_is_live_from_first_to_last_access():
     assert analysis.live_in(after).buffers == frozenset()
 
 
-def test_initialized_allocation_is_the_first_access():
-    alloc = AllocOp.build(smem_type(), id=0, init=0)
+def test_fill_not_allocation_is_the_first_access():
+    alloc = AllocOp.build(smem_type(), id=0)
+    zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
     between = BarrierOp.build()
+    fill = ElementwiseOp.build(alloc.result(), srcs=[zero.result()], fn="fill")
     access = MoveOp.build(
         alloc.result(), alloc.result(), collective=THREAD_COLLECTIVE,
     )
-    module = ModuleOp.build(Block(ops=[alloc, between, access]))
+    module = ModuleOp.build(Block(ops=[alloc, zero, between, fill, access]))
 
     analysis = BufferLifetimeAnalysis()
     analysis.analyze(module)
 
-    assert analysis.live_in(alloc).buffers == frozenset()
-    assert analysis.live_out(alloc).buffers == frozenset({alloc.result()})
-    assert analysis.live_in(between).buffers == frozenset({alloc.result()})
+    assert analysis.live_out(alloc).buffers == frozenset()
+    assert analysis.live_in(between).buffers == frozenset()
+    assert analysis.live_in(fill).buffers == frozenset()
+    assert analysis.live_out(fill).buffers == frozenset({alloc.result()})
 
 
 def test_kernel_arguments_extend_to_their_abi_boundaries():

@@ -32,12 +32,18 @@ def test_reuses_output_buffer_between_matmuls():
         module {
           kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
             %tmp: gmem<16x16xf32> = alloc() attrs={id: 0}
-            %first_acc: smem<16x16xf32> = alloc() attrs={id: 1, init: 0.0}
+            %first_acc: smem<16x16xf32> = alloc() attrs={id: 1}
+            %first_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%first_acc: smem<16x16xf32>, %first_acc_init: rmem<f32>)
             matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) collective=xyz.grid
             move(%tmp: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) attrs={tma: True}
-            %second_lhs: smem<16x16xf32> = alloc() attrs={id: 2, init: 0.0}
+            %second_lhs: smem<16x16xf32> = alloc() attrs={id: 2}
+            %second_lhs_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%second_lhs: smem<16x16xf32>, %second_lhs_init: rmem<f32>)
             move(%second_lhs: smem<16x16xf32>, %tmp: gmem<16x16xf32>) attrs={tma: True}
-            %second_acc: smem<16x16xf32> = alloc() attrs={id: 3, init: 0.0}
+            %second_acc: smem<16x16xf32> = alloc() attrs={id: 3}
+            %second_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%second_acc: smem<16x16xf32>, %second_acc_init: rmem<f32>)
             matmul(%second_lhs: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
             move(%output: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) attrs={tma: True}
           }
@@ -48,13 +54,18 @@ def test_reuses_output_buffer_between_matmuls():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @two_matmuls(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %output: gmem<16x16xf32>) {
-            %first_acc: smem<16x16xf32> = alloc() attrs={id: 1, init: 0.0}
+            %first_acc: smem<16x16xf32> = alloc() attrs={id: 1}
+            %first_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%first_acc: smem<16x16xf32>, %first_acc_init: rmem<f32>)
             matmul(%lhs: gmem<16x16xf32>, %rhs: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) collective=xyz.grid
             move(%output: gmem<16x16xf32>, %first_acc: smem<16x16xf32>) attrs={tma: True}
-            %second_lhs: smem<16x16xf32> = alloc() attrs={id: 2, init: 0.0}
-            move(%second_lhs: smem<16x16xf32>, %output: gmem<16x16xf32>) attrs={tma: True}
-            %second_acc: smem<16x16xf32> = alloc() attrs={id: 3, init: 0.0}
-            matmul(%second_lhs: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
+            %second_lhs_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%first_acc: smem<16x16xf32>, %second_lhs_init: rmem<f32>)
+            move(%first_acc: smem<16x16xf32>, %output: gmem<16x16xf32>) attrs={tma: True}
+            %second_acc: smem<16x16xf32> = alloc() attrs={id: 3}
+            %second_acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%second_acc: smem<16x16xf32>, %second_acc_init: rmem<f32>)
+            matmul(%first_acc: smem<16x16xf32>, %rhs: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) collective=xyz.grid
             move(%output: gmem<16x16xf32>, %second_acc: smem<16x16xf32>) attrs={tma: True}
           }
         }""")

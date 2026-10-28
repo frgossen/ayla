@@ -3,6 +3,7 @@
 import textwrap
 
 import ayla.gemm_collection  # noqa: F401  (registers torch.ayla.ayla.*)
+import re
 import pytest
 import torch
 
@@ -81,6 +82,18 @@ def test_two_tile_tma_store_ptx_overlaps_next_tile_compute():
         for line in lines[stores[0]:second_tile_mmas[0]]
     )
     assert waits[0] < gathers[len(gathers) // 2] < stores[1] < waits[1]
+
+
+def test_scheduled_gemm_overwrites_its_accumulator_instead_of_zeroing_it():
+    ptx = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        output_m_tiles_per_cta=2,
+    )).ptx
+    assert "elementwise fill" not in ptx
+    scale_d = re.findall(r"^\s+(\S+), 1, 1, 0, 0;$", ptx, re.MULTILINE)
+    assert len(scale_d) == ptx.count("wgmma.mma_async")
+    # The peeled first WGMMA of each of the two tiles overwrites.
+    assert sorted(set(scale_d)) == ["0", "1"]
+    assert scale_d.count("0") == 2
 
 
 def test_configurable_tma_gemm_supports_rectangular_shapes():

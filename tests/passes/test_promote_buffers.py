@@ -59,8 +59,9 @@ def test_tensor_initializer_converts_into_promoted_accumulator():
     assert isinstance(matmul.dst.type, WgrmemTensorType)
     assert isinstance(matmul.dst.type.dtype, F32Type)
     assert matmul.init is None
-    assert matmul.init_value is None
-    assert matmul.dst.definition.init is None
+    assert not [
+        op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "fill"
+    ]
     [init_convert] = [
         op for op in find_ops_of_type(module, ElementwiseOp)
         if op.fn == "convert" and op.dst is matmul.dst
@@ -96,7 +97,8 @@ def test_wgrmem_tma_writeback_inherits_only_disjoint_destination_scheme():
             %zero: rmem<f32> = constant 0.0
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c_wg: gmem<64x256xbf16> = tile(%c: gmem<128x256xbf16>, %wgx: index, 0)
-            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, label: "mm_dst_wgrmem"}
+            elementwise fill(%0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %zero: rmem<f32>)
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, y.block, z.thread] attrs={label: "mm", lhs_tiling_scheme: 6}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             elementwise convert(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
@@ -170,8 +172,9 @@ def test_wgrmem_tma_writeback_can_use_one_arena_per_slice():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
-            %zero: rmem<f32> = constant 0.0
-            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, label: "mm_dst_wgrmem"}
+            elementwise fill(%0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %zero: rmem<f32>)
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             elementwise convert(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "mm_dst_convert"}
@@ -372,8 +375,8 @@ def test_promote_lhs_rhs_preserves_init_on_matmul():
     assert text == expected
 
 
-def test_nonconstant_scalar_initializer_stays_on_the_matmul():
-    """Only a constant can become the promoted allocation's init."""
+def test_nonconstant_scalar_initializer_fills_the_promoted_accumulator():
+    """Any scalar value, not only a constant, initializes the accumulator."""
     module = gpu_dialect.parse(textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: gmem<64x64xbf16>, %scale: rmem<f32>) {
@@ -387,8 +390,12 @@ def test_nonconstant_scalar_initializer_stays_on_the_matmul():
     )
 
     [matmul] = find_ops_of_type(module, MatmulOp)
-    assert matmul.init is not None and matmul.init.name == "scale"
-    assert matmul.dst.definition.init is None
+    [fill] = [
+        op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "fill"
+    ]
+    assert matmul.init is None
+    assert fill.dst is matmul.dst
+    assert fill.src(0).name == "scale"
 
 
 def test_promote_smem_with_warp_group_dependent_lhs():
@@ -413,7 +420,9 @@ def test_promote_smem_with_warp_group_dependent_lhs():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %3: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
             %4: gmem<64x256xbf16 strides=[4096, 1]> = tile(%2: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0}
+            %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %5_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %5_init: rmem<f32>)
             for (%k: index = 0 to 64) attrs={label: "k"} {
               %6: gmem<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem<64x4096xbf16>, 0, %k: index)
               %7: gmem<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem<256x4096xbf16>, 0, %k: index)
@@ -453,7 +462,9 @@ def test_promote_smem_with_warp_group_dependent_lhs():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %3: gmem<64x4096xbf16> = tile(%0: gmem<128x4096xbf16>, %wgx: index, 0)
             %4: gmem<64x256xbf16 strides=[4096, 1]> = tile(%2: gmem<128x256xbf16 strides=[4096, 1]>, %wgx: index, 0)
-            %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0}
+            %5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0}
+            %5_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%5: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %5_init: rmem<f32>)
             for (%k: index = 0 to 64) attrs={label: "k"} {
               %6: gmem<64x64xbf16 strides=[4096, 1]> = tile(%3: gmem<64x4096xbf16>, 0, %k: index)
               %7: gmem<256x64xbf16 strides=[4096, 1]> = tile(%1: gmem<256x4096xbf16>, 0, %k: index)
@@ -499,8 +510,9 @@ def test_epilogue_runs_on_the_promoted_accumulator():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mm(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %c: gmem<64x256xbf16>) grid_dim=[1, 1, 1] block_dim=[256, 1, 1] {
-            %zero: rmem<f32> = constant 0.0
-            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, init: 0.0, label: "mm_dst_wgrmem"}
+            %zero: rmem<f32> = constant() attrs={value: 0.0}
+            %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 0, label: "mm_dst_wgrmem"}
+            elementwise fill(%0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">, %zero: rmem<f32>)
             matmul(%a: smem<64x16xbf16>, %b: smem<256x16xbf16>, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread] attrs={label: "mm"}
             %1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 1}
             elementwise sigmoid(%1: wgrmem<64x256xbf16 warps=4 layout="wgmma_layout_0">, %0: wgrmem<64x256xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "epilogue"}

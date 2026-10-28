@@ -11,7 +11,15 @@ from ayla.gpu_dialect import (
     SmemTensorType,
     gpu_dialect,
 )
+
+
+import torch
+
+from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.licm import licm
+from ayla.ptx_codegen import make_ptx_kernel
+from ayla.ptx_runtime import make_ptx_launcher
+from tests.testing_utils import requires_cuda
 
 
 
@@ -34,14 +42,16 @@ def test_no_hoist_k_dependent_ops():
     assert before == after
 
 
-def test_hoist_alloc_without_init():
-    """Static allocs (no init) are hoisted; allocs with init stay."""
+def test_hoist_alloc_and_retain_fill():
+    """Storage is hoisted while its fill remains in the loop."""
     module_str = textwrap.dedent("""\
         module {
           kernel @test(%a: gmem<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             for (%k: index = 0 to 64) {
               %s: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
-              %r: rmem<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
+              %r: rmem<128x64xbf16> = alloc() attrs={id: 1}
+              %zero: rmem<bf16> = constant() attrs={value: 0.0}
+              elementwise fill(%r: rmem<128x64xbf16>, %zero: rmem<bf16>)
               move(%s: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) attrs={tma: True}
             }
           }
@@ -55,8 +65,10 @@ def test_hoist_alloc_without_init():
         module {
           kernel @test(%a: gmem<128x64xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %s: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id: 0}
+            %r: rmem<128x64xbf16> = alloc() attrs={id: 1}
+            %zero: rmem<bf16> = constant() attrs={value: 0.0}
             for (%k: index = 0 to 64) {
-              %r: rmem<128x64xbf16> = alloc() attrs={id: 1, init: 0.0}
+              elementwise fill(%r: rmem<128x64xbf16>, %zero: rmem<bf16>)
               move(%s: smem<128x64xbf16 swizzle="128B">, %a: gmem<128x64xbf16>) attrs={tma: True}
             }
           }
@@ -126,3 +138,27 @@ def test_hoist_uninitialized_smem_through_loop_guard():
     assert smem.parent_block is kernel.body
     assert rmem.parent_block is guard.body
     assert lock.parent_block is guard.body
+
+
+@requires_cuda
+def test_hoisted_accumulator_refills_each_iteration_on_gpu():
+    module = gpu_dialect.parse_module(textwrap.dedent("""\
+        module {
+          kernel @refill(%out: gmem<3xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
+            %overwrite: rmem<f32> = constant() attrs={value: 99.0}
+            for (%i: index = 0 to 3) {
+              %acc: rmem<1xf32> = alloc() attrs={id: 7}
+              %value: rmem<f32> = constant() attrs={value: 2.5}
+              elementwise fill(%acc: rmem<1xf32>, %value: rmem<f32>)
+              %tile: gmem<1xf32 strides=[1]> = tile(%out: gmem<3xf32>, %i: index)
+              move(%tile: gmem<1xf32 strides=[1]>, %acc: rmem<1xf32>) attrs={dst_tiling_scheme: 0}
+              elementwise fill(%acc: rmem<1xf32>, %overwrite: rmem<f32>)
+            }
+          }
+        }"""))
+    licm(module)
+    [loop] = [op for op in module.body.ops[0].body.ops if op.op_id == "for"]
+    assert [op.op_id for op in loop.body.ops].count("alloc") == 0
+    out = torch.full((3,), -1.0, device="cuda")
+    make_ptx_launcher(make_ptx_kernel(module))(out)
+    torch.testing.assert_close(out, torch.full((3,), 2.5, device="cuda"))

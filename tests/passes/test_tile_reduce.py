@@ -48,11 +48,13 @@ def test_tile_reduce_tiles_reduction_dimension():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) {
-            %0: gmem<8x2xf32> = alloc() attrs={id: 0, init: 0.0}
-            for (%1: index = 0 to 2) attrs={label: "d1"} {
-              %2: gmem<8x1xf32 strides=[2, 1]> = tile(%0: gmem<8x2xf32>, 0, %1: index)
-              %3: gmem<8x32xf32 strides=[64, 1]> = tile(%src: gmem<8x64xf32>, 0, %1: index)
-              reduce sum(%2: gmem<8x1xf32 strides=[2, 1]>, %3: gmem<8x32xf32 strides=[64, 1]>) collective=xyz.grid attrs={label: "mean_partial"}
+            %0: gmem<8x2xf32> = alloc() attrs={id: 0}
+            %1: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%0: gmem<8x2xf32>, %1: rmem<f32>)
+            for (%2: index = 0 to 2) attrs={label: "d1"} {
+              %3: gmem<8x1xf32 strides=[2, 1]> = tile(%0: gmem<8x2xf32>, 0, %2: index)
+              %4: gmem<8x32xf32 strides=[64, 1]> = tile(%src: gmem<8x64xf32>, 0, %2: index)
+              reduce sum(%3: gmem<8x1xf32 strides=[2, 1]>, %4: gmem<8x32xf32 strides=[64, 1]>) collective=xyz.grid attrs={label: "mean_partial"}
             }
             reduce sum(%output: gmem<8x1xf32>, %0: gmem<8x2xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
           }
@@ -77,11 +79,13 @@ def test_tile_reduce_reduction_dimension_accumulates_into_output():
     assert repr(module) == textwrap.dedent("""\
         module {
           kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) {
-            %0: gmem<8x2xf32> = alloc() attrs={id: 0, init: 0.0}
-            for (%1: index = 0 to 2) attrs={label: "d1"} {
-              %2: gmem<8x1xf32 strides=[2, 1]> = tile(%0: gmem<8x2xf32>, 0, %1: index)
-              %3: gmem<8x32xf32 strides=[64, 1]> = tile(%src: gmem<8x64xf32>, 0, %1: index)
-              reduce sum(%2: gmem<8x1xf32 strides=[2, 1]>, %3: gmem<8x32xf32 strides=[64, 1]>) collective=xyz.grid attrs={label: "mean_partial"}
+            %0: gmem<8x2xf32> = alloc() attrs={id: 0}
+            %1: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%0: gmem<8x2xf32>, %1: rmem<f32>)
+            for (%2: index = 0 to 2) attrs={label: "d1"} {
+              %3: gmem<8x1xf32 strides=[2, 1]> = tile(%0: gmem<8x2xf32>, 0, %2: index)
+              %4: gmem<8x32xf32 strides=[64, 1]> = tile(%src: gmem<8x64xf32>, 0, %2: index)
+              reduce sum(%3: gmem<8x1xf32 strides=[2, 1]>, %4: gmem<8x32xf32 strides=[64, 1]>) collective=xyz.grid attrs={label: "mean_partial"}
             }
             reduce sum(%output: gmem<8x1xf32>, %0: gmem<8x2xf32>) collective=xyz.grid attrs={label: "mean"}
           }
@@ -147,14 +151,16 @@ def test_tile_reduce_combines_parallel_and_reduction_dimensions():
             %1: index = index_mod(%0: index, %c2: index)
             %2: gmem<4x64xf32> = tile(%src: gmem<8x64xf32>, %1: index, 0)
             %3: gmem<4x1xf32> = tile(%output: gmem<8x1xf32>, %1: index, 0)
-            %4: gmem<8x2xf32> = alloc() attrs={id: 0, init: 0.0}
-            %5: gmem<4x2xf32> = tile(%4: gmem<8x2xf32>, %1: index, 0)
-            for (%6: index = 0 to 2) attrs={label: "d1"} {
-              %7: gmem<4x1xf32 strides=[2, 1]> = tile(%5: gmem<4x2xf32>, 0, %6: index)
-              %8: gmem<4x32xf32 strides=[64, 1]> = tile(%2: gmem<4x64xf32>, 0, %6: index)
-              reduce sum(%7: gmem<4x1xf32 strides=[2, 1]>, %8: gmem<4x32xf32 strides=[64, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
+            %4: gmem<8x2xf32> = alloc() attrs={id: 0}
+            %5: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%4: gmem<8x2xf32>, %5: rmem<f32>)
+            %6: gmem<4x2xf32> = tile(%4: gmem<8x2xf32>, %1: index, 0)
+            for (%7: index = 0 to 2) attrs={label: "d1"} {
+              %8: gmem<4x1xf32 strides=[2, 1]> = tile(%6: gmem<4x2xf32>, 0, %7: index)
+              %9: gmem<4x32xf32 strides=[64, 1]> = tile(%2: gmem<4x64xf32>, 0, %7: index)
+              reduce sum(%8: gmem<4x1xf32 strides=[2, 1]>, %9: gmem<4x32xf32 strides=[64, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
             }
-            reduce sum(%3: gmem<4x1xf32>, %5: gmem<4x2xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
+            reduce sum(%3: gmem<4x1xf32>, %6: gmem<4x2xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -167,7 +173,9 @@ def test_tile_reduce_vector_accumulation_into_block_tiled_wrmem():
             %c8: index = index_constant() attrs={value: 8}
             %0: index = index_mod(%bx: index, %c8: index)
             %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
-            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
+            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1}
+            %2_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%2: wrmem<1x1xf32 layout="blocked">, %2_init: rmem<f32>)
             reduce sum(%2: wrmem<1x1xf32 layout="blocked">, %1: gmem<1x1024xf32>) collective=[x.block, yz.grid] attrs={label: "mean"}
           }
         }"""))
@@ -187,11 +195,15 @@ def test_tile_reduce_vector_accumulation_into_block_tiled_wrmem():
             %c8: index = index_constant() attrs={value: 8}
             %0: index = index_mod(%bx: index, %c8: index)
             %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
-            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1, init: 0.0}
-            %3: wrmem<1x128xf32 layout="blocked"> = alloc() attrs={id: 0, init: 0.0}
-            for (%4: index = 0 to 8) attrs={label: "d1"} {
-              %5: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %4: index)
-              reduce sum(%3: wrmem<1x128xf32 layout="blocked">, %5: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
+            %2: wrmem<1x1xf32 layout="blocked"> = alloc() attrs={id: 1}
+            %2_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%2: wrmem<1x1xf32 layout="blocked">, %2_init: rmem<f32>)
+            %3: wrmem<1x128xf32 layout="blocked"> = alloc() attrs={id: 0}
+            %4: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%3: wrmem<1x128xf32 layout="blocked">, %4: rmem<f32>)
+            for (%5: index = 0 to 8) attrs={label: "d1"} {
+              %6: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %5: index)
+              reduce sum(%3: wrmem<1x128xf32 layout="blocked">, %6: gmem<1x128xf32 strides=[1024, 1]>) collective=[x.block, yz.grid] attrs={label: "mean_partial"}
             }
             reduce sum(%2: wrmem<1x1xf32 layout="blocked">, %3: wrmem<1x128xf32 layout="blocked">) collective=[x.block, yz.grid] attrs={label: "mean"}
           }
@@ -234,14 +246,16 @@ def test_tile_reduce_across_block_dimensions():
             %0: index = index_mod(%bx: index, %c8: index)
             %1: gmem<1x1024xf32> = tile(%src: gmem<8x1024xf32>, %0: index, 0)
             %2: gmem<1x1xf32> = tile(%output: gmem<8x1xf32>, %0: index, 0)
-            %3: gmem<8x8xf32> = alloc() attrs={id: 0, init: 0.0}
-            %4: gmem<1x8xf32> = tile(%3: gmem<8x8xf32>, %0: index, 0)
+            %3: gmem<8x8xf32> = alloc() attrs={id: 0}
+            %4: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%3: gmem<8x8xf32>, %4: rmem<f32>)
+            %5: gmem<1x8xf32> = tile(%3: gmem<8x8xf32>, %0: index, 0)
             %by: index = block_id.y
-            %5: index = index_mod(%by: index, %c8: index)
-            %6: gmem<1x1xf32 strides=[8, 1]> = tile(%4: gmem<1x8xf32>, 0, %5: index)
-            %7: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %5: index)
-            reduce sum(%6: gmem<1x1xf32 strides=[8, 1]>, %7: gmem<1x128xf32 strides=[1024, 1]>) collective=[xy.block, z.grid] attrs={label: "mean_partial"}
-            reduce sum(%2: gmem<1x1xf32>, %4: gmem<1x8xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
+            %6: index = index_mod(%by: index, %c8: index)
+            %7: gmem<1x1xf32 strides=[8, 1]> = tile(%5: gmem<1x8xf32>, 0, %6: index)
+            %8: gmem<1x128xf32 strides=[1024, 1]> = tile(%1: gmem<1x1024xf32>, 0, %6: index)
+            reduce sum(%7: gmem<1x1xf32 strides=[8, 1]>, %8: gmem<1x128xf32 strides=[1024, 1]>) collective=[xy.block, z.grid] attrs={label: "mean_partial"}
+            reduce sum(%2: gmem<1x1xf32>, %5: gmem<1x8xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -326,19 +340,21 @@ def test_tile_reduce_maps_parallel_dimension_to_block_and_reduction_to_warp():
             %1: index = index_mod(%0: index, %c2: index)
             %2: gmem<4x64xf32> = tile(%src: gmem<8x64xf32>, %1: index, 0)
             %3: gmem<4x1xf32> = tile(%output: gmem<8x1xf32>, %1: index, 0)
-            %4: gmem<8x2xf32> = alloc() attrs={id: 0, init: 0.0}
-            %5: gmem<4x2xf32> = tile(%4: gmem<8x2xf32>, %1: index, 0)
+            %4: gmem<8x2xf32> = alloc() attrs={id: 0}
+            %5: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%4: gmem<8x2xf32>, %5: rmem<f32>)
+            %6: gmem<4x2xf32> = tile(%4: gmem<8x2xf32>, %1: index, 0)
             %tx: index = thread_id.x
             %c32: index = index_constant() attrs={value: 32}
-            %6: index = index_div(%tx: index, %c32: index)
+            %7: index = index_div(%tx: index, %c32: index)
             %c1_1: index = index_constant() attrs={value: 1}
-            %7: index = index_div(%6: index, %c1_1: index)
+            %8: index = index_div(%7: index, %c1_1: index)
             %c2_1: index = index_constant() attrs={value: 2}
-            %8: index = index_mod(%7: index, %c2_1: index)
-            %9: gmem<4x1xf32 strides=[2, 1]> = tile(%5: gmem<4x2xf32>, 0, %8: index)
-            %10: gmem<4x32xf32 strides=[64, 1]> = tile(%2: gmem<4x64xf32>, 0, %8: index)
-            reduce sum(%9: gmem<4x1xf32 strides=[2, 1]>, %10: gmem<4x32xf32 strides=[64, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
-            reduce sum(%3: gmem<4x1xf32>, %5: gmem<4x2xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
+            %9: index = index_mod(%8: index, %c2_1: index)
+            %10: gmem<4x1xf32 strides=[2, 1]> = tile(%6: gmem<4x2xf32>, 0, %9: index)
+            %11: gmem<4x32xf32 strides=[64, 1]> = tile(%2: gmem<4x64xf32>, 0, %9: index)
+            reduce sum(%10: gmem<4x1xf32 strides=[2, 1]>, %11: gmem<4x32xf32 strides=[64, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
+            reduce sum(%3: gmem<4x1xf32>, %6: gmem<4x2xf32>) collective=[x.block, yz.grid] attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -389,15 +405,17 @@ def test_tile_reduce_composes_block_and_warp_tiling():
             %4: index = index_mod(%3: index, %c2: index)
             %5: gmem<16x64xf32> = tile(%1: gmem<32x64xf32>, %4: index, 0)
             %6: gmem<16x1xf32> = tile(%2: gmem<32x1xf32>, %4: index, 0)
-            %7: gmem<64x2xf32> = alloc() attrs={id: 0, init: 0.0}
-            %8: gmem<32x2xf32> = tile(%7: gmem<64x2xf32>, %0: index, 0)
-            %9: gmem<16x2xf32> = tile(%8: gmem<32x2xf32>, %4: index, 0)
-            for (%10: index = 0 to 2) attrs={label: "d1"} {
-              %11: gmem<16x1xf32 strides=[2, 1]> = tile(%9: gmem<16x2xf32>, 0, %10: index)
-              %12: gmem<16x32xf32 strides=[64, 1]> = tile(%5: gmem<16x64xf32>, 0, %10: index)
-              reduce sum(%11: gmem<16x1xf32 strides=[2, 1]>, %12: gmem<16x32xf32 strides=[64, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
+            %7: gmem<64x2xf32> = alloc() attrs={id: 0}
+            %8: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%7: gmem<64x2xf32>, %8: rmem<f32>)
+            %9: gmem<32x2xf32> = tile(%7: gmem<64x2xf32>, %0: index, 0)
+            %10: gmem<16x2xf32> = tile(%9: gmem<32x2xf32>, %4: index, 0)
+            for (%11: index = 0 to 2) attrs={label: "d1"} {
+              %12: gmem<16x1xf32 strides=[2, 1]> = tile(%10: gmem<16x2xf32>, 0, %11: index)
+              %13: gmem<16x32xf32 strides=[64, 1]> = tile(%5: gmem<16x64xf32>, 0, %11: index)
+              reduce sum(%12: gmem<16x1xf32 strides=[2, 1]>, %13: gmem<16x32xf32 strides=[64, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
             }
-            reduce sum(%6: gmem<16x1xf32>, %9: gmem<16x2xf32>) collective=[x.warp, yz.grid] attrs={init: 0.0, label: "mean"}
+            reduce sum(%6: gmem<16x1xf32>, %10: gmem<16x2xf32>) collective=[x.warp, yz.grid] attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -659,14 +677,16 @@ def test_tile_reduce_replays_tiled_destination_for_reduction_tiling():
           kernel @mean(%src: gmem<8x64xf32>, %output: gmem<8x1xf32>) {
             %0: gmem<4x64xf32> = tile(%src: gmem<8x64xf32>, 0, 0)
             %1: gmem<4x1xf32> = tile(%output: gmem<8x1xf32>, 0, 0)
-            %2: gmem<8x2xf32> = alloc() attrs={id: 0, init: 0.0}
-            %3: gmem<4x2xf32> = tile(%2: gmem<8x2xf32>, 0, 0)
-            for (%4: index = 0 to 2) attrs={label: "d1"} {
-              %5: gmem<4x1xf32 strides=[2, 1]> = tile(%3: gmem<4x2xf32>, 0, %4: index)
-              %6: gmem<4x32xf32 strides=[64, 1]> = tile(%0: gmem<4x64xf32>, 0, %4: index)
-              reduce sum(%5: gmem<4x1xf32 strides=[2, 1]>, %6: gmem<4x32xf32 strides=[64, 1]>) collective=xyz.grid attrs={label: "mean_partial"}
+            %2: gmem<8x2xf32> = alloc() attrs={id: 0}
+            %3: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%2: gmem<8x2xf32>, %3: rmem<f32>)
+            %4: gmem<4x2xf32> = tile(%2: gmem<8x2xf32>, 0, 0)
+            for (%5: index = 0 to 2) attrs={label: "d1"} {
+              %6: gmem<4x1xf32 strides=[2, 1]> = tile(%4: gmem<4x2xf32>, 0, %5: index)
+              %7: gmem<4x32xf32 strides=[64, 1]> = tile(%0: gmem<4x64xf32>, 0, %5: index)
+              reduce sum(%6: gmem<4x1xf32 strides=[2, 1]>, %7: gmem<4x32xf32 strides=[64, 1]>) collective=xyz.grid attrs={label: "mean_partial"}
             }
-            reduce sum(%1: gmem<4x1xf32>, %3: gmem<4x2xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
+            reduce sum(%1: gmem<4x1xf32>, %4: gmem<4x2xf32>) collective=xyz.grid attrs={init: 0.0, label: "mean"}
           }
         }""")  # noqa: E501
 
@@ -687,7 +707,8 @@ def test_tile_reduce_uses_reduction_neutral_element_for_partials():
     )
 
     text = repr(module)
-    assert "alloc() attrs={id: 0, init: -inf}" in text
+    assert "constant() attrs={value: -inf}" in text
+    assert text.count("elementwise fill(") == 1
     assert text.count("reduce max(") == 2
     assert repr(gpu_dialect.parse_module(text)) == text
 
@@ -868,14 +889,16 @@ def test_tile_reduce_assigns_one_mean_row_per_warp():
             %1: index = index_mod(%0: index, %c8: index)
             %2: gmem<1x6656xf32> = tile(%src: gmem<8x6656xf32>, %1: index, 0)
             %3: gmem<1x1xf32> = tile(%output: gmem<8x1xf32>, %1: index, 0)
-            %4: gmem<8x52xf32> = alloc() attrs={id: 0, init: 0.0}
-            %5: gmem<1x52xf32> = tile(%4: gmem<8x52xf32>, %1: index, 0)
-            for (%6: index = 0 to 52) attrs={label: "d1"} {
-              %7: gmem<1x1xf32 strides=[52, 1]> = tile(%5: gmem<1x52xf32>, 0, %6: index)
-              %8: gmem<1x128xf32 strides=[6656, 1]> = tile(%2: gmem<1x6656xf32>, 0, %6: index)
-              reduce sum(%7: gmem<1x1xf32 strides=[52, 1]>, %8: gmem<1x128xf32 strides=[6656, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
+            %4: gmem<8x52xf32> = alloc() attrs={id: 0}
+            %5: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%4: gmem<8x52xf32>, %5: rmem<f32>)
+            %6: gmem<1x52xf32> = tile(%4: gmem<8x52xf32>, %1: index, 0)
+            for (%7: index = 0 to 52) attrs={label: "d1"} {
+              %8: gmem<1x1xf32 strides=[52, 1]> = tile(%6: gmem<1x52xf32>, 0, %7: index)
+              %9: gmem<1x128xf32 strides=[6656, 1]> = tile(%2: gmem<1x6656xf32>, 0, %7: index)
+              reduce sum(%8: gmem<1x1xf32 strides=[52, 1]>, %9: gmem<1x128xf32 strides=[6656, 1]>) collective=[x.warp, yz.grid] attrs={label: "mean_partial"}
             }
-            reduce sum(%3: gmem<1x1xf32>, %5: gmem<1x52xf32>) collective=[x.warp, yz.grid] attrs={init: 0.0, label: "mean"}
+            reduce sum(%3: gmem<1x1xf32>, %6: gmem<1x52xf32>) collective=[x.warp, yz.grid] attrs={init: 0.0, label: "mean"}
             elementwise div(%3: gmem<1x1xf32>, %3: gmem<1x1xf32>) attrs={divisor: 6656, label: "mean_epilogue"}
           }
         }""")  # noqa: E501

@@ -415,17 +415,17 @@ class MatmulOp(GpuOp):
         tensor. Without one, the matmul accumulates into ``dst``.
 
         TODO: Drop the initializer so a matmul always accumulates. A scalar
-        becomes an elementwise fill of ``dst`` ahead of the matmul and a tensor
-        a ``move`` into it; PromoteBuffers carries that prologue onto the
-        promoted accumulator, as it already does the epilogue. The same fill
-        replaces ``AllocOp.init``.
+        becomes an ``elementwise fill`` of ``dst`` ahead of the matmul and a
+        tensor a ``move`` into it; PromoteBuffers carries that prologue onto
+        the promoted accumulator, as it already does the epilogue.
         """
         return self.operands[3] if len(self.operands) == 4 else None
 
     @property
-    def init_value(self) -> Value | None:
-        """Tensor used to initialize the accumulator, if present."""
-        return self.operands[3] if len(self.operands) == 4 else None
+    def accumulate(self) -> bool:
+        """Whether the matmul adds into ``dst``; ``accumulate: false`` overwrites
+        it with ``lhs @ rhs``, WGMMA's ``scale-d``."""
+        return cast(bool, self.attrs.get("accumulate", True))
 
     @property
     def collective(self) -> dict[CollectiveAxis, CollectiveLevel]:
@@ -746,11 +746,14 @@ class ElementwiseOp(GpuOp):
     instead. A source is only overwritten when it is also the destination;
     the backend remains responsible for register reuse between distinct values.
 
+    ``fill`` broadcasts a rank-0 source into every destination element.
+
     TODO: generalize to several destinations.
     """
 
     ARITIES: ClassVar[dict[str, int]] = {
         "convert": 1,
+        "fill": 1,
         "mul": 2,
         "sigmoid": 1,
         "silu": 1,
@@ -838,8 +841,7 @@ class ElementwiseOp(GpuOp):
 class AllocOp(GpuOp):
     """Allocate a register- or shared-memory tensor.
 
-    Optional `init` attr fills the allocation with a constant value.
-    TODO: Consider replacing `init` with an explicit elementwise fill op.
+    An allocation only provides storage; ``elementwise fill`` initializes it.
 
     The `id` attr names the buffer: two allocations are the same one only if
     they carry the same id, which is what lets CSE treat an allocation like any
@@ -861,13 +863,12 @@ class AllocOp(GpuOp):
         cls,
         type: Type,
         id: int,
-        init: float | int | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "AllocOp":
         a: dict[str, object] = dict(attrs or {})
+        if "init" in a:
+            raise ValueError("alloc does not initialize; use elementwise fill")
         a["id"] = id
-        if init is not None:
-            a["init"] = init
         result = Value(name=None, type=type)
         return cls(operands=[], results=[result], attrs=a)
 
@@ -875,21 +876,15 @@ class AllocOp(GpuOp):
     def build_with_fresh_id(
         cls,
         type: Type,
-        init: float | int | None = None,
         attrs: dict[str, object] | None = None,
     ) -> "AllocOp":
         """Build an allocation that is nobody else's buffer."""
-        return cls.build(type, id=cls.fresh_id(), init=init, attrs=attrs)
-
-    @property
-    def init(self) -> float | int | None:
-        return self.attrs.get("init")  # type: ignore[return-value]
+        return cls.build(type, id=cls.fresh_id(), attrs=attrs)
 
     @property
     def extra_attrs(self) -> dict[str, object]:
         return {
-            key: value for key, value in self.attrs.items()
-            if key not in ("id", "init")
+            key: value for key, value in self.attrs.items() if key != "id"
         }
 
 
@@ -2959,16 +2954,6 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
                 return None
             effects.extend(peer_effects)
         return effects
-    if isinstance(op, AllocOp):
-        # Only an initialized alloc writes (fills the buffer); an uninitialized
-        # one is side-effect-free, handled above. A wgrmem accumulator is per-thread.
-        buf = op.result()
-        scope = (
-            CollectiveScope.THREAD
-            if isinstance(buf.type, WgrmemTensorType)
-            else _type_collective_scope(buf.type)
-        )
-        return _memory_effect("W", buf, scope)
     if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
         effects: list[MemoryEffect] = []
         for block in op.blocks:
@@ -3006,11 +2991,8 @@ def is_side_effect_free(op: Op) -> bool:
     Same operands and attrs always produce the same result, and nothing is read
     or written along the way.
     """
-    if isinstance(op, AllocOp):
-        # The initialiser writes the buffer, so such an allocation neither
-        # moves freely nor stands in for another.
-        return op.init is None
     return isinstance(op, (
+        AllocOp,
         BlockIdOp,
         ClusterBlockIdsOp,
         IndexAddOp,

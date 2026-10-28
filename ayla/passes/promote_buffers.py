@@ -30,7 +30,6 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
-    ConstantOp,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -399,7 +398,7 @@ class PromoteBuffers(LoweringPass):
         operand_name: str,
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
-        init: float | int | None = None,
+        init: Value | None = None,
     ) -> tuple[list[Op], list[Value]]:
         """Promote an operand to the target memory, handling any collective level.
 
@@ -449,14 +448,14 @@ class PromoteBuffers(LoweringPass):
         # labelled ones.
         buffer_attrs = self._build_buffer_attrs(matmul_label, operand_name)
         if init is not None:
-            # SMEM initialization has no lowering. Keep the initialization on
-            # the matmul so a subsequent register promotion can materialize it.
-            alloc = AllocOp.build_with_fresh_id(
-                target_type,
-                init=None if self.target_type == "smem" else init,
-                attrs=buffer_attrs,
-            )
+            # SMEM fill has no lowering. Keep the initialization on the matmul
+            # so a subsequent register promotion can materialize it.
+            alloc = AllocOp.build_with_fresh_id(target_type, attrs=buffer_attrs)
             new_ops.append(alloc)
+            if self.target_type != "smem":
+                new_ops.append(ElementwiseOp.build(
+                    alloc.result(), srcs=[init], fn="fill",
+                ))
         else:
             attrs = self._build_move_attrs(matmul_label, operand_name)
             chain_root_type = chain_root.type
@@ -752,24 +751,25 @@ class PromoteBuffers(LoweringPass):
             pre_ops.extend(ops)
         init = op.init
         if "dst" in self.operand_names:
-            # A scalar constant initializes the promoted allocation; registers
+            # A scalar initializer fills the promoted allocation; registers
             # load a tensor initializer in place of the destination. The
             # writeback below still targets the destination.
-            scalar_init = None if init is None else ConstantOp.splat_value(init)
-            fill = (
+            scalar_init = (
                 init if init is not None
-                and cast(MemTensorType, init.type).rank != 0
-                and self.target_type == "wgrmem"
+                and cast(MemTensorType, init.type).rank == 0 else None
+            )
+            tensor_init = (
+                init if scalar_init is None and self.target_type == "wgrmem"
                 else None
             )
             ops, [new_dst] = self._build_operand_promotion(
-                dst if fill is None else fill, "dst", op.collective, label,
-                init=scalar_init,
+                dst if tensor_init is None else tensor_init, "dst",
+                op.collective, label, init=scalar_init,
             )
             pre_ops.extend(ops)
             # A staged SMEM destination is intermediate IR; its matmul still
             # owns initialization until the destination reaches registers.
-            if fill is not None or (
+            if tensor_init is not None or (
                 scalar_init is not None and self.target_type != "smem"
             ):
                 init = None

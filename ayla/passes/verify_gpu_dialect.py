@@ -10,6 +10,7 @@ from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancest
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     AddrMemTensorType,
+    AllocOp,
     AsyncOp,
     AwaitOp,
     BF16Type,
@@ -535,6 +536,11 @@ class VerifyGpuDialect(VerificationPass):
                 f"a {lock_type.kind} lock; got {pending!r}"
             )
 
+    @verifies(AllocOp)
+    def _verify_alloc(self, op: AllocOp) -> None:
+        if "init" in op.attrs:
+            raise ValueError("alloc does not initialize; use elementwise fill")
+
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
@@ -591,18 +597,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
-        if op.init is not None and op.init_value is not None:
-            raise ValueError("matmul accepts a scalar or tensor init, not both")
-        _verify_collective_attr(op)
-        for operand_name in ("lhs", "rhs", "dst"):
-            attr_name = f"{operand_name}_tiling_scheme"
-            scheme_id = op.attrs.get(attr_name)
-            if scheme_id is not None and (
-                type(scheme_id) is not int or scheme_id < 0
-            ):
-                raise ValueError(
-                    f"matmul {attr_name} must be a non-negative integer"
-                )
+
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if (
@@ -687,6 +682,13 @@ class VerifyGpuDialect(VerificationPass):
             )
         if type(op.ilp) is not bool:
             raise ValueError(f"elementwise ilp must be a bool; got {op.ilp!r}")
+        if op.fn == "fill":
+            dst, src = op.dst.type, op.src(0).type
+            assert isinstance(dst, MemTensorType)
+            if not isinstance(src, MemTensorType) or src.rank != 0:
+                raise ValueError("elementwise fill requires a rank-0 source")
+            if src.dtype != dst.dtype:
+                raise ValueError("elementwise fill requires matching dtypes")
 
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:

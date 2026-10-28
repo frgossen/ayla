@@ -18,7 +18,9 @@ def test_pipeline_reorders_across_inner_loop():
           kernel @test(%a: gmem<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
             %buf0: smem<4x1xf32> = alloc() attrs={id: 0}
             %buf1: smem<4x1xf32> = alloc() attrs={id: 1}
-            %acc: smem<4x1xf32> = alloc() attrs={id: 2, init: 0.0}
+            %acc: smem<4x1xf32> = alloc() attrs={id: 2}
+            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%acc: smem<4x1xf32>, %acc_init: rmem<f32>)
             for (%k: index = 0 to 4) attrs={label: "k"} {
               for (%l: index = 0 to 2) {
                 matmul(%buf0: smem<4x1xf32>, %buf0: smem<4x1xf32>, %acc: smem<4x1xf32>)
@@ -37,7 +39,9 @@ def test_pipeline_reorders_across_inner_loop():
           kernel @test(%a: gmem<4x4xf32>) grid_dim=[1, 1, 1] block_dim=[1, 1, 1] {
             %buf0: smem<4x1xf32> = alloc() attrs={id: 0}
             %buf1: smem<4x1xf32> = alloc() attrs={id: 1}
-            %acc: smem<4x1xf32> = alloc() attrs={id: 2, init: 0.0}
+            %acc: smem<4x1xf32> = alloc() attrs={id: 2}
+            %acc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%acc: smem<4x1xf32>, %acc_init: rmem<f32>)
             %c0: index = index_constant() attrs={value: 0}
             %a_k: gmem<4x1xf32 strides=[4, 1]> = tile(%a: gmem<4x4xf32>, 0, %c0: index)
             move(%buf1: smem<4x1xf32>, %a_k: gmem<4x1xf32 strides=[4, 1]>) attrs={label: "load"}
@@ -97,7 +101,9 @@ def test_pipeline_matmul_smem_skeleton():
             %sb: smem<8x1xf32> = alloc() attrs={id: 1}
             %sa2: smem<8x1xf32> = alloc() attrs={id: 2}
             %sb2: smem<8x1xf32> = alloc() attrs={id: 3}
-            %sc: smem<8x1xf32> = alloc() attrs={id: 4, init: 0.0}
+            %sc: smem<8x1xf32> = alloc() attrs={id: 4}
+            %sc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%sc: smem<8x1xf32>, %sc_init: rmem<f32>)
             for (%k: index = 0 to 4 step 2) {
               %a_k: gmem<8x1xf32 strides=[8, 1]> = tile(%a: gmem<8x8xf32>, 0, %k: index)
               %b_k: gmem<8x1xf32 strides=[8, 1]> = tile(%b: gmem<8x8xf32>, 0, %k: index)
@@ -125,7 +131,9 @@ def test_pipeline_matmul_smem_skeleton():
             %sb: smem<8x1xf32> = alloc() attrs={id: 1}
             %sa2: smem<8x1xf32> = alloc() attrs={id: 2}
             %sb2: smem<8x1xf32> = alloc() attrs={id: 3}
-            %sc: smem<8x1xf32> = alloc() attrs={id: 4, init: 0.0}
+            %sc: smem<8x1xf32> = alloc() attrs={id: 4}
+            %sc_init: rmem<f32> = constant() attrs={value: 0.0}
+            elementwise fill(%sc: smem<8x1xf32>, %sc_init: rmem<f32>)
             %c0: index = index_constant() attrs={value: 0}
             %a_k: gmem<8x1xf32 strides=[8, 1]> = tile(%a: gmem<8x8xf32>, 0, %c0: index)
             %b_k: gmem<8x1xf32 strides=[8, 1]> = tile(%b: gmem<8x8xf32>, 0, %c0: index)
