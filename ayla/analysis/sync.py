@@ -57,6 +57,9 @@ class BarrierScope(enum.IntEnum):
         WARPGROUP -> WARP
         {WARP, BLOCK_TO_LEADER, LEADER_TO_BLOCK, LEADER_TO_CLUSTER} -> THREAD
 
+    A cluster-to-leader barrier gathers every warp of the cluster at the
+    leaders, so it includes a block-to-leader gather but no block barrier.
+
     ``CLUSTER_TO_LEADER -> BLOCK_TO_LEADER`` is a choice: we define the
     cluster gather as two-level, because one cluster mbarrier arrival per CTA
     is what the hardware offers. Each CTA first gathers its threads at its
@@ -126,14 +129,15 @@ _BARRIER_SCOPE_IMMEDIATE_UPPER_BOUNDS = {
         BarrierScope.WARP,
         BarrierScope.BLOCK_TO_LEADER,
         BarrierScope.LEADER_TO_BLOCK,
-        BarrierScope.CLUSTER_TO_LEADER,
         BarrierScope.LEADER_TO_CLUSTER,
     ),
     BarrierScope.WARP: (BarrierScope.WARPGROUP,),
     BarrierScope.WARPGROUP: (BarrierScope.BLOCK,),
-    BarrierScope.BLOCK_TO_LEADER: (BarrierScope.BLOCK,),
+    BarrierScope.BLOCK_TO_LEADER: (
+        BarrierScope.BLOCK, BarrierScope.CLUSTER_TO_LEADER,
+    ),
     BarrierScope.LEADER_TO_BLOCK: (BarrierScope.BLOCK,),
-    BarrierScope.BLOCK: (BarrierScope.CLUSTER_TO_LEADER,),
+    BarrierScope.BLOCK: (BarrierScope.CLUSTER,),
     BarrierScope.CLUSTER_TO_LEADER: (BarrierScope.CLUSTER,),
     BarrierScope.LEADER_TO_CLUSTER: (BarrierScope.CLUSTER,),
     BarrierScope.CLUSTER: (BarrierScope.GRID,),
@@ -198,9 +202,8 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
         # broadcast: t0's own (BLOCK_LEADER) work only, not all-thread BLOCK
         return scope in (CollectiveScope.THREAD, CollectiveScope.BLOCK_LEADER)
     if barrier == BarrierScope.CLUSTER_TO_LEADER:
-        # Lowering first executes a local ``bar.sync 0`` in every CTA, then
-        # has each CTA leader arrive at rank 0's cluster mbarrier.
-        return _barrier_covers(BarrierScope.BLOCK, scope)
+        # gather: every warp of the cluster arrives, and only the leaders wait
+        return scope == CollectiveScope.THREAD
     if barrier == BarrierScope.LEADER_TO_CLUSTER:
         # broadcast: the single cluster leader's work, not every block leader
         return scope in (
@@ -220,6 +223,10 @@ def _barrier_covers(barrier: BarrierScope, scope: CollectiveScope) -> bool:
     raise NotImplementedError(f"_barrier_covers: unhandled barrier {barrier!r}")
 
 
+# A gather's barrier resource: its scope and its id among that scope's ids.
+BarrierId = tuple[BarrierScope, int]
+
+
 @dataclasses.dataclass(frozen=True)
 class ConcurrentMemoryEffect:
     """One outstanding concurrent memory effect on a buffer: an "R"/"W" ``kind``
@@ -230,18 +237,27 @@ class ConcurrentMemoryEffect:
     scope: CollectiveScope
     tiling_scheme: int | None
     pending_await: Value | None
+    # The async lock whose await completes the access (``None`` for a
+    # synchronous access), and the op after which the access is complete,
+    # once known.
+    lock: Value | None = None
+    completed_after: "Op | None" = None
 
 
 @dataclasses.dataclass
 class SyncState(DataflowState):
     """The forward analysis state: outstanding concurrent memory effects keyed by
-    root buffer, named-barrier ids in use until a full-block sync, and ids in use
-    until an await on a particular lock."""
+    root buffer, gather barrier ids in use until a rendezvous that includes the
+    gather, ids in use until an await on a particular lock, and where each
+    released id's last handoff ended."""
     concurrent_memory_effects: dict[object, set[ConcurrentMemoryEffect]] = (
         dataclasses.field(default_factory=dict)
     )
-    named_barrier_ids: set[int] = dataclasses.field(default_factory=set)
-    named_barrier_ids_pending_await: dict[Value, set[int]] = (
+    named_barrier_ids: set[BarrierId] = dataclasses.field(default_factory=set)
+    named_barrier_ids_pending_await: dict[Value, set[BarrierId]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    named_barrier_ids_released_after: dict[BarrierId, set[Op]] = (
         dataclasses.field(default_factory=dict)
     )
 
@@ -260,24 +276,42 @@ class SyncState(DataflowState):
             self.named_barrier_ids_pending_await,
             other.named_barrier_ids_pending_await,
         )
+        r, t = (
+            self.named_barrier_ids_released_after,
+            other.named_barrier_ids_released_after,
+        )
         return SyncState(
             {buf: a.get(buf, set()) | b.get(buf, set()) for buf in a.keys() | b.keys()},
             self.named_barrier_ids | other.named_barrier_ids,
             {lock: p.get(lock, set()) | q.get(lock, set())
              for lock in p.keys() | q.keys()},
+            {key: r.get(key, set()) | t.get(key, set())
+             for key in r.keys() | t.keys()},
         )
 
 
+# The barriers at which every participating thread waits for every other.
+_RENDEZVOUS = (BarrierScope.BLOCK, BarrierScope.CLUSTER, BarrierScope.GRID)
+
+
 def _after_barrier(
-    live: SyncState, barrier: BarrierScope,
+    live: SyncState, barrier: BarrierScope, at: Op,
 ) -> SyncState:
-    """Discharge the settled effects ordered by ``barrier``."""
+    """Discharge the settled effects ordered by ``barrier`` before ``at``."""
     live = live.clone()
-    if barrier in (
-        BarrierScope.BLOCK, BarrierScope.CLUSTER, BarrierScope.GRID,
-    ):
-        live.named_barrier_ids.clear()
-        live.named_barrier_ids_pending_await.clear()
+    if barrier in _RENDEZVOUS:
+        # A rendezvous ends every handoff through a gather it includes.
+        ended = {
+            key for key in live.named_barrier_ids.union(
+                *live.named_barrier_ids_pending_await.values(),
+            )
+            if key[0].leq(barrier)
+        }
+        live.named_barrier_ids -= ended
+        for ids in live.named_barrier_ids_pending_await.values():
+            ids -= ended
+        for key in ended:
+            live.named_barrier_ids_released_after[key] = {at}
     for buf, effects in live.concurrent_memory_effects.items():
         live.concurrent_memory_effects[buf] = {
             effect for effect in effects
@@ -289,10 +323,16 @@ def _after_barrier(
 
 @dataclasses.dataclass(frozen=True)
 class BarrierTarget:
-    """The barrier before an op: its ``scope`` and, for a block-leader barrier,
-    the named-barrier ``named_id`` to lower to (``None`` otherwise)."""
+    """The barrier before an op: its ``scope`` and, for a gather, the
+    ``named_id`` of the barrier resource to lower to (``None`` otherwise): a
+    named barrier for a block-leader gather, a cluster mbarrier for a
+    cluster-to-leader gather."""
     scope: BarrierScope
     named_id: int | None = None
+    # For a cluster-to-leader barrier: where each access it orders is
+    # complete (``None`` where that is unknown). Its arrival may move up to
+    # the last of them; only its wait must stay before the op.
+    release_after: frozenset["Op | None"] = frozenset()
 
 
 # The analysis result: each effect-bearing op mapped to the barrier before it.
@@ -302,6 +342,13 @@ BarrierTargetsType = dict["Op", "BarrierTarget"]
 # PTX exposes 16 barrier resources per CTA. ID 0 is reserved for the full-block
 # ``bar.sync 0`` emitted by the lowering, leaving IDs 1..15 for named barriers.
 _MAX_BARRIER_IDS = 16
+
+# The ids each gather draws its barrier resource from. Cluster mbarriers are
+# allocated in shared memory, so they have no fixed limit.
+_GATHER_BARRIER_IDS: dict[BarrierScope, range | None] = {
+    BarrierScope.BLOCK_TO_LEADER: range(1, _MAX_BARRIER_IDS),
+    BarrierScope.CLUSTER_TO_LEADER: None,
+}
 
 
 def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
@@ -344,6 +391,7 @@ def _transfer_memory_effects(
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
+    release_after: set[Op | None] = set()
     for current in effects:
         for root in current.roots:
             for prior in live.concurrent_memory_effects.get(root, ()):
@@ -355,33 +403,40 @@ def _transfer_memory_effects(
                     continue
                 # A hazard needs a write (RAR is safe).
                 if prior.kind == "W" or current.kind == "W":
-                    barrier_scope = barrier_scope.join(
-                        _barrier_scope(prior.scope, current.scope)
-                    )
+                    scope = _barrier_scope(prior.scope, current.scope)
+                    barrier_scope = barrier_scope.join(scope)
+                    if scope == BarrierScope.CLUSTER_TO_LEADER:
+                        release_after.add(prior.completed_after)
     recorded = targets.get(op)
     if recorded is not None:
         barrier_scope = barrier_scope.join(recorded.scope)
-    # A block-leader barrier is named. Its id remains in use until either a
-    # full-block sync, or (for an mbar async) the await where everyone waits for
-    # t0. Reuse any id whose prior lifetime has ended.
+    # A gather's barrier resource remains in use until either a rendezvous
+    # that includes the gather, or (for an mbar async) the await where everyone
+    # waits for the leaders' work. Reuse any id whose prior lifetime has ended.
     named_id = None
-    if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
-        pending_await_ids = {
+    if barrier_scope in _GATHER_BARRIER_IDS:
+        used_ids = {
             barrier_id
-            for ids in live.named_barrier_ids_pending_await.values()
-            for barrier_id in ids
+            for scope, barrier_id in live.named_barrier_ids.union(
+                *live.named_barrier_ids_pending_await.values(),
+            )
+            if scope == barrier_scope
         }
-        used_ids = live.named_barrier_ids | pending_await_ids
-        if recorded is not None and recorded.named_id is not None:
+        if (
+            recorded is not None and recorded.named_id is not None
+            and recorded.scope == barrier_scope
+        ):
             named_id = recorded.named_id
             if named_id in used_ids:
                 # The same static site has reached us through a loop backedge
-                # before its named barrier was released. Upgrade the site to a
-                # full-block sync, which both performs the gather and releases
-                # every named barrier for the next iteration.
-                barrier_scope = BarrierScope.BLOCK
+                # before its barrier was released. Upgrade the site to the
+                # least rendezvous including the gather, which both performs
+                # the gather and releases its barriers for the next iteration.
+                barrier_scope = next(
+                    scope for scope in _RENDEZVOUS if barrier_scope.leq(scope)
+                )
                 named_id = None
-        if barrier_scope == BarrierScope.BLOCK_TO_LEADER and named_id is None:
+        if barrier_scope in _GATHER_BARRIER_IDS and named_id is None:
             # A barrier can first become necessary on a later loop-fixpoint
             # iteration. Do not let it steal an id already assigned to another
             # static barrier site that has not been revisited yet.
@@ -390,12 +445,14 @@ def _transfer_memory_effects(
                     target.named_id
                     for target_op, target in targets.items()
                     if target_op is not op and target.named_id is not None
+                    and target.scope == barrier_scope
                 }
                 if recorded is not None else set()
             )
-            available_ids = (
-                set(range(1, _MAX_BARRIER_IDS)) - used_ids - reserved_ids
+            ids = _GATHER_BARRIER_IDS[barrier_scope] or range(
+                len(used_ids) + len(reserved_ids) + 1,
             )
+            available_ids = set(ids) - used_ids - reserved_ids
             if not available_ids:
                 raise ValueError(
                     "exhausted named barrier IDs: PTX provides 16 IDs and ID 0 "
@@ -404,8 +461,8 @@ def _transfer_memory_effects(
             named_id = min(available_ids)
         # BLOCK_TO_LEADER also applies to leader-issued bulk TMA stores. Only
         # an mbar await is an all-thread rendezvous that ends this handoff.
-        if barrier_scope == BarrierScope.BLOCK_TO_LEADER:
-            assert named_id is not None
+        if named_id is not None:
+            key = (barrier_scope, named_id)
             assert async_lock is None or isinstance(async_lock.type, LockType)
             if (
                 async_lock is not None
@@ -413,13 +470,26 @@ def _transfer_memory_effects(
             ):
                 live.named_barrier_ids_pending_await.setdefault(
                     async_lock, set(),
-                ).add(named_id)
+                ).add(key)
             else:
-                live.named_barrier_ids.add(named_id)
-    targets[op] = BarrierTarget(barrier_scope, named_id)
+                live.named_barrier_ids.add(key)
+            # A cluster release arrives early: never before the end of the
+            # id's previous handoff.
+            release_after |= live.named_barrier_ids_released_after.pop(
+                key, set(),
+            )
+    if barrier_scope == BarrierScope.CLUSTER_TO_LEADER:
+        recorded = targets.get(op)
+        if recorded is not None:
+            release_after |= recorded.release_after
+    else:
+        release_after = set()
+    targets[op] = BarrierTarget(
+        barrier_scope, named_id, frozenset(release_after),
+    )
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
-    live = _after_barrier(live, barrier_scope)
+    live = _after_barrier(live, barrier_scope, op)
     # An async op's effects that its await fully orders wait pending on the lock
     # (the await will clear them). A coarser effect the await only partially
     # orders -- and every synchronous op's effect -- is live immediately, left for
@@ -439,6 +509,8 @@ def _transfer_memory_effects(
         effect = ConcurrentMemoryEffect(
             memory_effect.kind, memory_effect.scope,
             memory_effect.tiling_scheme, pending,
+            lock=async_lock,
+            completed_after=None if async_lock is not None else op,
         )
         for root in memory_effect.roots:
             live.concurrent_memory_effects.setdefault(root, set()).add(effect)
@@ -495,7 +567,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             scope = BarrierScope[op.scope.upper()]
         except KeyError as error:
             raise ValueError(f"unknown barrier scope {op.scope!r}") from error
-        return _after_barrier(state, scope)
+        return _after_barrier(state, scope, op)
 
     @transfers(AwaitOp)
     def transfer_await(self, op: AwaitOp, state: SyncState) -> SyncState:
@@ -503,16 +575,24 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         # fully orders were made pending on it. Effects it only partially orders
         # were never pending and stay live for a barrier.
         settle = cast(LockType, op.lock.type).kind == "bulk"
+        # A bulk await settles effects without becoming a block rendezvous.
+        # Keep them live, and record completion for a later gather arrival.
         for buffer, effects in state.concurrent_memory_effects.items():
             state.concurrent_memory_effects[buffer] = {
-                dataclasses.replace(effect, pending_await=None)
-                if settle and effect.pending_await == op.lock else effect
+                dataclasses.replace(
+                    effect,
+                    pending_await=(None if settle and effect.pending_await == op.lock
+                                   else effect.pending_await),
+                    completed_after=(op if effect.lock == op.lock and effect.completed_after is None
+                                     else effect.completed_after),
+                )
                 for effect in effects
                 if settle or effect.pending_await != op.lock
             }
-        # An mbar await also completes a block-leader handoff: all threads wait
-        # for t0's async work, so no arriving warp can lap the named barrier.
-        state.named_barrier_ids_pending_await.pop(op.lock, None)
+        # An mbar await also completes a gather's handoff: all threads wait
+        # for the leaders' async work, so no arriving warp can lap the barrier.
+        for key in state.named_barrier_ids_pending_await.pop(op.lock, set()):
+            state.named_barrier_ids_released_after[key] = {op}
         return state
 
     @transfers(AsyncOp)

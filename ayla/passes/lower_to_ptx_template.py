@@ -425,6 +425,14 @@ _CLUSTER_RELEASE_LEADER_WAIT = _leader_warp("cl") + textwrap.dedent("""\
     """)
 
 
+def _split_release(lock: Value) -> bool:
+    """Whether a cluster mbarrier releases stages with split arrive/wait."""
+    return any(
+        isinstance(user, BarrierOp) and "phase" in user.attrs
+        for user in lock.users()
+    )
+
+
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -762,6 +770,33 @@ class LowerToPtxTemplate(LoweringPass):
         kernel = find_ancestor_of_type(op, KernelOp)
         assert kernel is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+        if _split_release(op.result()):
+            # Every CTA's leader waits for one arrival per warp of the
+            # cluster: any CTA may write the released stage.
+            assert kernel.num_threads is not None
+            arrivals = kernel.num_threads // 32 * cluster_size
+            template = textwrap.dedent(f"""\
+                .shared .align 8 .b64 ${{smem:bar}}[1];
+                mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
+                mov.u32 ${{b32:result.dst.parity}}, 0;
+                mov.u32 ${{b32:tid_x}}, %tid.x;
+                mov.u32 ${{b32:tid_y}}, %tid.y;
+                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+                mov.u32 ${{b32:tid_z}}, %tid.z;
+                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+                setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
+                @${{pred:not_t0}} bra ${{label:after_init}};
+                mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrivals};
+                fence.mbarrier_init.release.cluster;
+                ${{label:after_init}}:
+            """)
+            new_op = PTXTemplateOp.build(
+                operands=[], result_types=[lock_type], template=template,
+                operand_names=[], result_names=["dst"],
+                description=str(op),
+            )
+            return [new_op], [new_op.result()]
+        # InsertSyncs represents publication explicitly with BarrierOps.
         assert kernel.num_threads is not None
         warps = kernel.num_threads // 32
         # Every warp of the CTA arrives, and at the cluster leader every warp
@@ -1354,6 +1389,42 @@ class LowerToPtxTemplate(LoweringPass):
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
             template = "bar.sync 0;\n"
+        elif scope == "cluster_to_leader" and op.attrs.get("phase") == "arrive":
+            # Each warp arrives once at every cluster CTA's mbarrier and
+            # continues.
+            assert op.sync is not None
+            kernel = find_ancestor_of_type(op, KernelOp)
+            assert kernel is not None
+            cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+            template = (
+                "bar.warp.sync 0xffffffff;\n"
+                "elect.sync _|${pred:release}, 0xffffffff;\n"
+                + "".join(
+                    textwrap.dedent(f"""\
+                        mov.u32 ${{b32:rank}}, {rank};
+                        mapa.shared::cluster.u32 ${{b32:remote}}, ${{b32:operand.sync.val}}, ${{b32:rank}};
+                        @${{pred:release}} mbarrier.arrive.shared::cluster.b64 _, [${{b32:remote}}];
+                        """)
+                    for rank in range(cluster_size)
+                )
+            )
+            operands = [cast(Value, self.value_map[op.sync])]
+            operand_names = ["sync"]
+        elif scope == "cluster_to_leader" and op.attrs.get("phase") == "wait":
+            # Only the leader's warp, which issues the next write, waits for
+            # every warp of the cluster.
+            assert op.sync is not None
+            template = _leader_warp("cl") + textwrap.dedent("""\
+                @${pred:cl_other_warp} bra ${label:cl_done};
+                mov.u32 ${b32:ticks}, 0x989680;
+                ${label:cl_wait}:
+                mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
+                @!${pred:ready} bra ${label:cl_wait};
+                xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
+                ${label:cl_done}:
+                """)
+            operands = [cast(Value, self.value_map[op.sync])]
+            operand_names = ["sync"]
         elif scope == "cluster_to_leader":
             # Every warp releases; only the leaders wait, so the other warps
             # are not held back by the slowest CTA.
@@ -2224,6 +2295,7 @@ class LowerToPtxTemplate(LoweringPass):
         operands: list[Value] = [lock_value]
         operand_names: list[str] = ["lock"]
         multicast_mask: int | None = None
+        cluster_size = 1
         if op.is_tma_multicast:
             kernel = find_ancestor_of_type(op, KernelOp)
             assert kernel is not None
@@ -2232,6 +2304,8 @@ class LowerToPtxTemplate(LoweringPass):
             multicast_mask = (1 << cluster_size) - 1
         total_bytes = 0
         load_lines: list[str] = []
+        multicast_count = sum(tma.multicast is True for tma in tmas)
+        multicasts = 0
         for i, tma in enumerate(tmas):
             dst_value = cast(Value, self.value_map[tma.dst])
             desc_value = cast(Value, self.value_map[tma.src])
@@ -2275,6 +2349,17 @@ class LowerToPtxTemplate(LoweringPass):
                 opcode = f"{opcode}.multicast::cluster"
                 arguments = f"{arguments}, {multicast_mask}"
                 issue = "multicast_issue"
+                if multicast_count > 1:
+                    # Cluster CTAs share a group's multicast slices: rank r
+                    # issues every slice j with j % cluster_size == r.
+                    issue = f"multicast_issue{i}"
+                    load_lines += [
+                        f"setp.eq.u32 ${{pred:issuer{i}}}, "
+                        f"${{b32:cluster_rank}}, {multicasts % cluster_size};",
+                        f"and.pred ${{pred:{issue}}}, ${{pred:ld_leader}}, "
+                        f"${{pred:issuer{i}}};",
+                    ]
+                multicasts += 1
             load_lines.append(f"@${{pred:{issue}}} " + self._tma_instruction(
                 tma,
                 opcode,

@@ -1,6 +1,7 @@
 """Tests for the lower_to_ptx_template pass."""
 
 import textwrap
+import re
 
 import pytest
 import torch
@@ -937,3 +938,40 @@ def test_lower_elementwise_convert_bf16_to_f32():
         cvt.f32.bf16 ${f32:operand.dst.r2}, ${b16:convert_lo1};
         cvt.f32.bf16 ${f32:operand.dst.r3}, ${b16:convert_hi1};
         """)
+
+
+def test_split_cluster_release_arrives_from_every_warp_and_waits_in_warp_0():
+    from ayla.passes.lower_to_async import lower_to_async
+    from ayla.ptx_codegen import make_ptx_kernel
+
+    # A multicast stage is read, then refilled. Each 64-row slice of the
+    # 128-row tile is issued by its own cluster rank.
+    module = gpu_dialect.parse(textwrap.dedent("""\
+        module {
+          kernel @release(%a: gmem<256x32xf32>) grid_dim=[2, 1, 1] block_dim=[128, 1, 1] cluster_dim=[2, 1, 1] {
+            %s: smem<128x32xf32 swizzle="128B"> = alloc() attrs={id: 0}
+            %t0: gmem<128x32xf32 strides=[32, 1]> = tile(%a: gmem<256x32xf32>, 0, 0)
+            move(%s: smem<128x32xf32 swizzle="128B">, %t0: gmem<128x32xf32 strides=[32, 1]>) collective=xyz.cluster attrs={multicast: True, tma: True}
+            %r: rmem<128x32xf32> = alloc()
+            move(%r: rmem<128x32xf32>, %s: smem<128x32xf32 swizzle="128B">)
+            %t1: gmem<128x32xf32 strides=[32, 1]> = tile(%a: gmem<256x32xf32>, 1, 0)
+            move(%s: smem<128x32xf32 swizzle="128B">, %t1: gmem<128x32xf32 strides=[32, 1]>) collective=xyz.cluster attrs={multicast: True, tma: True}
+          }
+        }"""))
+    lower_to_async(module)
+
+    ptx = make_ptx_kernel(module).ptx
+
+    # One arrival per warp of the two CTAs: 4 warps x 2.
+    assert re.search(r"mbarrier\.init\.shared::cta\.b64 \[%r\d+\], 8;", ptx)
+    assert "bar.sync 0;\n" in ptx  # Initialization publication remains explicit.
+    release = ptx.index("mbarrier.arrive.shared::cluster.b64")
+    assert ptx.count("mbarrier.arrive.shared::cluster.b64") == 2
+    wait = ptx.index("mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64", release)
+    assert release < wait
+    assert "bar.sync 0;" not in ptx[release:wait]
+    lines = [line.strip() for line in ptx.splitlines()]
+    issues = [i for i, line in enumerate(lines) if "multicast::cluster [" in line]
+    assert len(issues) == 4
+    for slice_index, line in enumerate(issues):
+        assert lines[line - 2].endswith(f", {slice_index % 2};")

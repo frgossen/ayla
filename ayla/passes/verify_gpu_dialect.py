@@ -241,7 +241,7 @@ def _verify_cluster_shares_multicast_tile(
             return True
         definition = value.definition
         if isinstance(definition, (BlockIdOp, ClusterBlockIdsOp)):
-            return cluster[definition.axis] == 1
+            return cluster[definition.axis if isinstance(definition, BlockIdOp) else value.result_index] == 1
         if isinstance(definition, IndexConstantOp):
             return True
         if isinstance(definition, (
@@ -274,7 +274,7 @@ def _verify_cluster_shares_multicast_tile(
         for value in block_ids:
             env[value] = block[value.definition.axis]
         for value in cluster_ids:
-            env[value] = block[value.result_index] % cluster[definition.axis]
+            env[value] = block[value.result_index] % cluster[value.result_index]
         for loop, iv in zip(loops, ivs, strict=True):
             env[loop.body.arguments[0]] = iv
         if not all(_static_index(guard, env) for guard in guards):
