@@ -33,7 +33,6 @@ __all__ = [
     "Block",
     "GmemTensorType",
     "KernelOp",
-    "JITCompiler",
     "MatmulOp",
     "ModuleOp",
     "Op",

@@ -6,6 +6,14 @@ async scheduling, and lowering to NVIDIA hardware primitives — using **deep pi
 specialization**. The aim is a compact toolbox that agents can use to generate SOTA GEMM kernels,
 and aspirationally to fuse GEMM epilogues.
 
+## Branches
+
+- `feature/consolidated`: single-GEMM performance work, measured MM/ADDMM/BMM
+  schedules, OSS search, and better-benchmark tooling. Use this branch for
+  benchmark numbers with the full performance feature set.
+- `feature/gemm-chains`: development branch based on consolidated, adding
+  generic FX graph capture, workspaces, SwiGLU, and GEMM-to-GEMM kernels.
+
 ## Getting started
 
 ```bash
@@ -155,16 +163,3 @@ time, else the default compiled time). `--models-root repros/models/hf/infer`
 narrows the run, `--output-dir` keeps each arm's raw JSON, and `--bench-root`
 points at another better-benchmark checkout (for example from a git worktree).
 Workers import this checkout's ayla, even when another one is installed.
-
-## Models to try
-
-Candidate test subjects, once ayla is ready to serve real GEMM shapes:
-
-- **Muse Glimmer 30B** — the best first target. A Meta model, open weights (Apache 2.0),
-  and it serves on a single H100 at TP=1 in bf16, which is exactly what ayla emits. Its
-  weight dimensions are all multiples of 256, so the existing tiling divides evenly.
-- **Gemma 4 31B** and **Qwen 3.5/3.6 27B** — the two models Glimmer is benchmarked
-  against, so they are the natural second and third subjects. Dense, single GPU, fp8.
-- **DeepSeek V4**, **Kimi K2.7**, **GLM 5.2** — the frontier, and the furthest away.
-  All mixture of experts, mostly fp8 with block scaling, so they need grouped GEMM and a
-  narrower operand type before ayla has anything to say about them.

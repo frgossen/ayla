@@ -19,7 +19,7 @@ def reset_fresh_ids():
 
 @pytest.fixture
 def ayla_installed():
-    """Install Ayla's post-grad FX rewrites for the duration of a test."""
+    """Install Ayla's GEMM routing for the duration of a test."""
     from ayla import torch_compile
 
     torch_compile.install()
