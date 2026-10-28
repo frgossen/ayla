@@ -190,6 +190,45 @@ def test_fixed_output_grid_matches_torch():
     rhs = torch.randn((n, k), dtype=BF16, device="cuda")
     actual = torch.empty((m, n), dtype=BF16, device="cuda")
 
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "n_tile,slices,block_width,swizzle",
+    [
+        (256, 1, 64, "128B"),
+        (224, 1, 32, "64B"),
+        (144, 1, 16, "32B"),
+        (192, 4, 16, "32B"),
+        (168, 1, 8, None),
+    ],
+)
+def test_blocked_output_staging_narrows_to_the_slice_width(
+    n_tile, slices, block_width, swizzle,
+):
+    # A partial last tile, with a row width only the narrow block divides.
+    m, k = 256, 128
+    n = 3 * n_tile - block_width
+    kernel = make_ptx_kernel(auto_matmul_4096_wgmma256_wg_tma_store_module(
+        m=m,
+        n=n,
+        k=k,
+        output_n_tile=n_tile,
+        warpgroup_n_tile=n_tile,
+        output_slices=slices,
+        operand_stages=2,
+    ))
+    [store] = [
+        typ for typ in kernel.signature
+        if isinstance(typ, TmaDescType) and physical_layout(typ) is not None
+    ]
+    assert physical_layout(store) == (block_width, "block_major")
+    assert store.swizzle == swizzle
+    launcher = make_ptx_launcher(kernel)
+    torch.manual_seed(11)
+    lhs = torch.randn((m, k), dtype=BF16, device="cuda")
+    rhs = torch.randn((n, k), dtype=BF16, device="cuda")
+    actual = torch.full((m, n), float("nan"), dtype=BF16, device="cuda")
+
     launcher(lhs, rhs, actual)
     torch.cuda.synchronize()
 

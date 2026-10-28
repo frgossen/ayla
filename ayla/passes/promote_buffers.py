@@ -19,6 +19,7 @@ Example — promote lhs/rhs to smem::
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import cast
 
@@ -337,6 +338,17 @@ class PromoteBuffers(LoweringPass):
         layout = dict(self.physical_layout or {})
         swizzle = layout.pop("swizzle", self.swizzle)
         assert swizzle is None or isinstance(swizzle, str)
+        if "block_width" in layout:
+            # Blocks tile the contiguous dimension; a narrower one gets the
+            # widest block that divides it, swizzled across one block row.
+            requested = cast(int, layout["block_width"])
+            block_width = math.gcd(sizes[-1], requested)
+            if block_width != requested:
+                layout["block_width"] = block_width
+                row_bytes = block_width * cast(
+                    BF16Type | F16Type | F32Type | F64Type, dtype,
+                ).byte_size
+                swizzle = f"{row_bytes}B" if row_bytes >= 32 else None
         attrs: dict[str, object] | None = (
             {"physical_layout": layout} if layout else None
         )
