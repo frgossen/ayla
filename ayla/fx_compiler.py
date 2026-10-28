@@ -26,12 +26,15 @@ from .gpu_dialect import (
     AllocOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     ElementwiseOp,
+    F32Type,
     GmemTensorType,
     KernelOp,
     MatmulOp,
     ModuleOp,
     ReshapeOp,
+    RmemTensorType,
     Type,
 )
 from .passes._utils import build_slice_tile
@@ -58,11 +61,14 @@ class FxRegionMatch:
     inputs: tuple[Node, ...]
 
 
+_MATMUL_OPS = {torch.ops.aten.mm.default: (None, 0, 1), torch.ops.aten.addmm.default: (0, 1, 2)}
+
 # TODO: Derive discovery support from the Ayla importer once primitive math
 # operations have complete import and lowering support. Today add, div, exp,
 # and neg are included only so discovery can traverse the hardcoded
 # decomposed-SiLU pattern; they are not independently importable.
 _SUPPORTED_FX_TARGETS = {
+    *_MATMUL_OPS,
     operator.getitem,
     torch.ops.aten.add.Tensor,
     torch.ops.aten.cat.default,
@@ -130,11 +136,14 @@ def discover_supported_fx_region(
     return FxRegionMatch(output=output, inputs=tuple(boundaries))
 
 
-def _node_type(node: Node) -> GmemTensorType:
+def _node_tensor(node: Node) -> torch.Tensor:
     tensor = node.meta.get("val")
     if not isinstance(tensor, torch.Tensor):
         raise ValueError(f"{node.name}: missing tensor metadata")
+    return tensor
 
+
+def _tensor_type(tensor: torch.Tensor) -> GmemTensorType:
     def static(value: object) -> int | None:
         return value if isinstance(value, int) else None
 
@@ -143,6 +152,10 @@ def _node_type(node: Node) -> GmemTensorType:
         from_torch_dtype(tensor.dtype),
         strides=[static(stride) for stride in tensor.stride()],
     )
+
+
+def _node_type(node: Node) -> GmemTensorType:
+    return _tensor_type(_node_tensor(node))
 
 
 def _region_nodes(match: FxRegionMatch) -> list[Node]:
@@ -271,6 +284,7 @@ def fx_region_to_module(
     if match.output in match.inputs:
         raise ValueError("FX region output cannot also be an input")
     nodes = _region_nodes(match)
+    region = set(nodes)
     values = {
         node: Value(node.name, _node_type(node)) for node in match.inputs
     }
@@ -405,19 +419,39 @@ def fx_region_to_module(
             values[node] = values[transpose_source]
             continue
 
-        if node.target is torch.ops.aten.mm.default:
-            lhs_node = _node_argument(node.args[0], owner=node)
-            rhs_node = _node_argument(node.args[1], owner=node)
+        matmul = _MATMUL_OPS.get(node.target)
+        if matmul is not None:
+            init_index, lhs_index, rhs_index = matmul
+            if any(node.kwargs.get(scale, 1) != 1 for scale in ("alpha", "beta")):
+                raise ValueError(f"{node.name}: scaled matmuls are unsupported")
+            lhs_node = _node_argument(node.args[lhs_index], owner=node)
+            rhs_node = _node_argument(node.args[rhs_index], owner=node)
             rhs_source = _transpose_source(rhs_node)
             if rhs_source is None:
                 raise ValueError(
                     f"{node.name}: matmul RHS must be a 2D transpose"
                 )
-            dst = _allocate(
-                node, match.output, output_value, ops, destinations,
-            )
+            dst = _allocate(node, match.output, output_value, ops, destinations)
             label = "mm" if matmul_index == 0 else f"mm_{matmul_index}"
             matmul_index += 1
+            if init_index is None:
+                zero = ConstantOp.build(
+                    0.0, RmemTensorType.build([], F32Type()),
+                )
+                ops.append(zero)
+                init = zero.result()
+            else:
+                bias = _node_argument(node.args[init_index], owner=node)
+                region_users = set(bias.users) & region
+                if bias not in match.inputs or region_users != {node}:
+                    raise ValueError(
+                        f"{node.name}: matmul bias must be a region input"
+                    )
+                # Torch broadcasts the bias to the output; Ayla reads the same
+                # memory through the zero strides of that broadcast view.
+                init = values[bias] = Value(bias.name, _tensor_type(
+                    _node_tensor(bias).expand(_node_tensor(node).shape),
+                ))
             ops.append(MatmulOp.build(
                 values[lhs_node],
                 values[rhs_source],
@@ -425,7 +459,7 @@ def fx_region_to_module(
                 collective={
                     axis: CollectiveLevel.GRID for axis in CollectiveAxis
                 },
-                init=0.0,
+                init=init,
                 attrs={"label": label},
             ))
             values[node] = dst
@@ -537,6 +571,7 @@ def make_fx_to_ayla_rewrite(
         signature=signature,
         compile_fn=compile_region,
     )
+
     def region(torch_match: Match) -> FxRegionMatch | None:
         candidate = discover_supported_fx_region(
             torch_match.output_node(), require_maximal=require_maximal,
@@ -573,6 +608,7 @@ def make_fx_to_ayla_rewrite(
         infer_result_shapes=infer_result_shapes,
         prepare=prepare,
     )
+
 
 def _matches_signature(
     match: FxRegionMatch,

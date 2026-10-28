@@ -111,6 +111,50 @@ def test_swiglu_fx_region_imports_to_high_level_gpu_ir():
     match = _swiglu_region()
     module = fx_region_to_module(match, name="swiglu")
 
+
+def _gemm_region(
+    *, m: int = 128, n: int = 64, k: int = 64, sigmoid: bool = False,
+) -> FxRegionMatch:
+    graph = Graph()
+    lhs = _meta(graph.placeholder("lhs"), (m, k))
+    weight = _meta(graph.placeholder("weight"), (n, k))
+    weight_t = _meta(graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, [1, 0]),
+    ), (k, n), strides=(1, k))
+    output = _meta(graph.call_function(
+        torch.ops.aten.mm.default, args=(lhs, weight_t),
+    ), (m, n))
+    if sigmoid:
+        output = _meta(graph.call_function(
+            torch.ops.aten.sigmoid.default, args=(output,),
+        ), (m, n))
+    graph.output(output)
+    return FxRegionMatch(output, (lhs, weight))
+
+
+def _addmm_region(
+    *, m: int = 128, n: int = 64, k: int = 64, beta: int = 1,
+) -> FxRegionMatch:
+    graph = Graph()
+    bias = _meta(graph.placeholder("bias"), (n,))
+    lhs = _meta(graph.placeholder("lhs"), (m, k))
+    weight = _meta(graph.placeholder("weight"), (n, k))
+    weight_t = _meta(graph.call_function(
+        torch.ops.aten.permute.default, args=(weight, [1, 0]),
+    ), (k, n), strides=(1, k))
+    output = _meta(graph.call_function(
+        torch.ops.aten.addmm.default,
+        args=(bias, lhs, weight_t),
+        kwargs={} if beta == 1 else {"beta": beta},
+    ), (m, n))
+    graph.output(output)
+    return FxRegionMatch(output, (bias, lhs, weight))
+
+
+def test_gemm_fx_region_imports_to_high_level_gpu_ir():
+    match = _gemm_region()
+    module = fx_region_to_module(match, name="gemm")
+
     verify_gpu_dialect(module)
     [kernel] = module.body.ops
     assert isinstance(kernel, KernelOp)

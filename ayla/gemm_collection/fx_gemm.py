@@ -12,6 +12,7 @@ from ..fx_compiler import (
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
+    ConstantOp,
     ElementwiseOp,
     GmemTensorType,
     KernelOp,
@@ -40,6 +41,11 @@ _GEMM_SIGMOID_4096_SIGNATURE: list[Type] = [
     GmemTensorType.build([4096, 4096], BF16Type()),
 ]
 _GEMM_OPERANDS = [OperandKind.R, OperandKind.R, OperandKind.RESULT]
+_ADDMM_SIGNATURE: list[Type] = [
+    GmemTensorType.build([None], BF16Type()),
+    *_GEMM_SIGNATURE,
+]
+_ADDMM_OPERANDS = [OperandKind.R, *_GEMM_OPERANDS]
 
 
 def _static_gemm_shape(op: MatmulOp) -> tuple[int, int, int] | None:
@@ -68,31 +74,39 @@ def _static_gemm_shape(op: MatmulOp) -> tuple[int, int, int] | None:
     return m, n, k
 
 
+def _gemm(module: ModuleOp) -> MatmulOp | None:
+    """The matmul of a kernel that is one GEMM writing its output."""
+    [kernel] = module.body.ops
+    assert isinstance(kernel, KernelOp)
+    *initializers, matmul = kernel.body.ops
+    if not (
+        isinstance(matmul, MatmulOp)
+        and matmul.dst is kernel.body.arguments[-1]
+        and all(isinstance(op, ConstantOp) for op in initializers)
+    ):
+        return None
+    return matmul
+
+
 def _is_gemm_region(match: FxRegionMatch, *, sigmoid: bool) -> bool:
     try:
         module = fx_region_to_module(match, name="gemm_candidate")
     except ValueError:
         return False
+    if not sigmoid:
+        matmul = _gemm(module)
+        shape = None if matmul is None else _static_gemm_shape(matmul)
+        return shape is not None and shape[2] % 64 == 0
     [kernel] = module.body.ops
     if not isinstance(kernel, KernelOp) or len(kernel.body.arguments) != 3:
         return False
     lhs, weight, output = kernel.body.arguments
-    if not sigmoid:
-        if not (
-            len(kernel.body.ops) == 1
-            and isinstance(kernel.body.ops[0], MatmulOp)
-            and kernel.body.ops[0].lhs is lhs
-            and kernel.body.ops[0].rhs is weight
-            and kernel.body.ops[0].dst is output
-        ):
-            return False
-        shape = _static_gemm_shape(kernel.body.ops[0])
-        return shape is not None and shape[2] % 64 == 0
-    if len(kernel.body.ops) != 3:
+    if len(kernel.body.ops) != 4:
         return False
-    allocation, matmul, epilogue = kernel.body.ops
+    allocation, zero, matmul, epilogue = kernel.body.ops
     return (
         isinstance(allocation, AllocOp)
+        and isinstance(zero, ConstantOp)
         and isinstance(matmul, MatmulOp)
         and isinstance(epilogue, ElementwiseOp)
         and epilogue.fn == "sigmoid"
@@ -105,10 +119,8 @@ def _is_gemm_region(match: FxRegionMatch, *, sigmoid: bool) -> bool:
 
 
 def _compile_gemm(module: ModuleOp) -> LauncherPlan:
-    [kernel] = module.body.ops
-    assert isinstance(kernel, KernelOp)
-    [matmul] = kernel.body.ops
-    assert isinstance(matmul, MatmulOp)
+    matmul = _gemm(module)
+    assert matmul is not None
     shape = _static_gemm_shape(matmul)
     assert shape is not None and shape[2] % 64 == 0
     m, n, k = shape
@@ -125,7 +137,7 @@ def _compile_gemm_sigmoid(_module: ModuleOp) -> LauncherPlan:
 
 
 def register_gemm_fx_rules(patterns: PatternMatcherPass) -> None:
-    """Register plain GEMM and fixed-size GEMM-sigmoid FX rewrites."""
+    """Register plain GEMM, addmm, and fixed-size GEMM-sigmoid FX rewrites."""
     make_fx_to_ayla_rewrite(
         patterns,
         root=torch.ops.aten.sigmoid.default,
@@ -146,6 +158,19 @@ def register_gemm_fx_rules(patterns: PatternMatcherPass) -> None:
         accept=lambda match: _is_gemm_region(match, sigmoid=False),
         require_maximal=False,
         infer_result_shapes=lambda lhs, weight: [
+            (lhs.shape[0], weight.shape[0]),
+        ],
+    )
+    make_fx_to_ayla_rewrite(
+        patterns,
+        root=torch.ops.aten.addmm.default,
+        name="addmm",
+        signature=_ADDMM_SIGNATURE,
+        signature_mapping=_ADDMM_OPERANDS,
+        compile_region=_compile_gemm,
+        accept=lambda match: _is_gemm_region(match, sigmoid=False),
+        require_maximal=False,
+        infer_result_shapes=lambda _bias, lhs, weight: [
             (lhs.shape[0], weight.shape[0]),
         ],
     )

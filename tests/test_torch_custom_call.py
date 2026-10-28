@@ -80,6 +80,9 @@ def test_jit_compiler_dispatches_by_tensor_signature(monkeypatch):
         device = torch.device("cuda:0")
 
         def __init__(self, rows, value=1):
+
+
+        def __init__(self, rows, value: int | None = 1):
             self.shape = (rows, 8)
             self.dtype = torch.bfloat16
             self.value = value

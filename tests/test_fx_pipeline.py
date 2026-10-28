@@ -32,6 +32,19 @@ def _side_by_side_swiglu_pattern():
             torch.ops.aten.mm.default,
             lhs,
             KeywordArg("up_weight"),
+
+
+def _fused_gemm_sigmoid(lhs, weight):
+    raise AssertionError("graph rewrite tests do not execute the replacement")
+
+
+def _gemm_sigmoid_pattern():
+    return CallFunction(
+        torch.ops.aten.sigmoid.default,
+        CallFunction(
+            torch.ops.aten.mm.default,
+            KeywordArg("lhs"),
+            KeywordArg("weight"),
         ),
     )
 
@@ -66,6 +79,31 @@ def test_registered_pattern_replaces_side_by_side_swiglu_region():
         pattern=_side_by_side_swiglu_pattern(),
         input_names=("lhs", "gate_weight", "up_weight"),
         replacement=_fused_side_by_side_swiglu,
+
+
+def _gemm_sigmoid_graph() -> tuple[GraphModule, Node, Node]:
+    graph = Graph()
+    lhs = graph.placeholder("lhs")
+    weight = graph.placeholder("weight")
+    product = graph.call_function(
+        torch.ops.aten.mm.default, args=(lhs, weight),
+    )
+    output = graph.call_function(
+        torch.ops.aten.sigmoid.default, args=(product,),
+    )
+    output.meta["val"] = "preserved metadata"
+    graph.output(output)
+    return GraphModule({}, graph), lhs, weight
+
+
+def test_registered_pattern_replaces_gemm_epilogue_region():
+    module, lhs, weight = _gemm_sigmoid_graph()
+    patterns = PatternMatcherPass(pass_name="ayla_test")
+    register_fx_rewrite(
+        patterns,
+        pattern=_gemm_sigmoid_pattern(),
+        input_names=("lhs", "weight"),
+        replacement=_fused_gemm_sigmoid,
     )
 
     assert patterns.apply(module) == 1
