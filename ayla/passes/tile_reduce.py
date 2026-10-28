@@ -14,9 +14,9 @@ from ..base.ir import (
 )
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
+    build_hardware_id,
     AddrMemTensorType,
     AllocOp,
-    BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
     ConstantOp,
@@ -32,7 +32,7 @@ from ..gpu_dialect import (
     RmemTensorType,
     ThreadIdOp,
     TileOp,
-    WarpGroupIdOp,
+    require_launch_extent,
 )
 from ._utils import label_matches
 
@@ -128,28 +128,7 @@ def _materialize_iteration_space(
         return [loop], loop.iv, loop
 
     level, axis = parallel_iteration_space
-    if level in (CollectiveLevel.BLOCK, CollectiveLevel.THREAD):
-        id_op_type = {
-            CollectiveLevel.BLOCK: BlockIdOp,
-            CollectiveLevel.THREAD: ThreadIdOp,
-        }[level]
-        ids = id_op_type.build(axis)
-        id_ops: list[Op] = [ids]
-        parallel_id = ids.value
-    elif level == CollectiveLevel.WARP:
-        assert axis == CollectiveAxis.X
-        ids = ThreadIdOp.build(CollectiveAxis.X)
-        warp_size = IndexConstantOp.build(32)
-        warp_id = IndexDivOp.build(ids.value, warp_size.result())
-        id_ops = [ids, warp_size, warp_id]
-        parallel_id = warp_id.result()
-    else:
-        id_op_type = {
-            CollectiveLevel.WG: WarpGroupIdOp,
-        }[level]
-        ids = id_op_type.build()
-        id_ops = [ids]
-        parallel_id = ids.results[axis]
+    id_ops, parallel_id = build_hardware_id(level, axis)
     cdivisor = IndexConstantOp.build(divisor)
     div = IndexDivOp.build(
         parallel_id, cdivisor.result(),

@@ -326,13 +326,12 @@ def test_two_dimensional_warp_group_tiling_linearizes_coordinates():
             %wgx: index, %wgy: index, %wgz: index = warp_group_id()
             %c2: index = index_constant() attrs={value: 2}
             %0: index = index_div(%wgx: index, %c2: index)
-            %1: index = index_mod(%0: index, %c2: index)
-            %2: index = index_mod(%wgx: index, %c2: index)
-            %3: gmem<64x64xbf16> = tile(%a: gmem<128x64xbf16>, %1: index, 0)
-            %4: gmem<80x64xbf16> = tile(%b: gmem<160x64xbf16>, %2: index, 0)
-            %5: gmem<64x160xf32> = tile(%c: gmem<128x160xf32>, %1: index, 0)
-            %6: gmem<64x80xf32 strides=[160, 1]> = tile(%5: gmem<64x160xf32>, 0, %2: index)
-            matmul(%3: gmem<64x64xbf16>, %4: gmem<80x64xbf16>, %6: gmem<64x80xf32 strides=[160, 1]>) collective=[x.wg, yz.grid] attrs={dst_tiling_scheme: 0}
+            %1: index = index_mod(%wgx: index, %c2: index)
+            %2: gmem<64x64xbf16> = tile(%a: gmem<128x64xbf16>, %0: index, 0)
+            %3: gmem<80x64xbf16> = tile(%b: gmem<160x64xbf16>, %1: index, 0)
+            %4: gmem<64x160xf32> = tile(%c: gmem<128x160xf32>, %0: index, 0)
+            %5: gmem<64x80xf32 strides=[160, 1]> = tile(%4: gmem<64x160xf32>, 0, %1: index)
+            matmul(%2: gmem<64x64xbf16>, %3: gmem<80x64xbf16>, %5: gmem<64x80xf32 strides=[160, 1]>) collective=[x.wg, yz.grid] attrs={dst_tiling_scheme: 0}
           }
         }""")  # noqa: E501
 
@@ -546,3 +545,13 @@ def test_splitting_k_of_an_overwriting_matmul_zeroes_dst_and_accumulates():
     assert fill.fn == "fill" and fill.dst is matmul.dst
     assert body.index(fill) < body.index(loop)
     assert matmul.accumulate
+
+
+@pytest.mark.parametrize("level", [CollectiveLevel.WARP, CollectiveLevel.CLUSTER])
+def test_rejects_hardware_levels_without_matmul_tiling(level):
+    with pytest.raises(ValueError, match="unsupported iteration binding"):
+        TileMatmul(
+            op_dims=["M"], tile_sizes=[64],
+            iteration_bindings=[(level, CollectiveAxis.X)],
+            for_loop_labels=[None],
+        )

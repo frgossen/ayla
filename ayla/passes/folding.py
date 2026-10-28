@@ -10,12 +10,25 @@ congruent to ``lb`` modulo ``step``. That is enough to fold ``(iv + c) % m``
 whenever ``m`` divides the step, even though ``iv`` itself is not a constant --
 which is how a per-iteration buffer choice becomes a static one after
 unrolling multiplies the step.
+
+A second fact bounds hardware IDs by the enclosing kernel's launch
+dimensions, and loop variables by their loop. When x is known to stay below m,
+x % m folds to x and x / m folds to 0. Tiling passes produce this pattern when
+they split one hardware ID into several tile indices and the hardware axis
+already has exactly as many IDs as there are tiles. This relies on launch
+dimensions never changing afterwards, which the kernel launch-dimension
+setters enforce by rejecting changes to known axes.
 """
 from __future__ import annotations
+
+from typing import cast
 
 from ..gpu_dialect import (
     ConstantOp,
     ElementwiseOp,
+    HW_ID_LEVELS,
+    BlockIdOp,
+    CollectiveAxis,
     ForOp,
     IndexAddOp,
     IndexConstantOp,
@@ -23,14 +36,25 @@ from ..gpu_dialect import (
     IndexModOp,
     IndexMulOp,
     MatmulOp,
+    KernelOp,
     MemTensorType,
     ModuleOp,
     PtrAddOp,
     SelectOp,
+    ThreadIdOp,
     TileOp,
     memory_effects,
+    WarpGroupIdOp,
+    launch_extent,
 )
-from ..base.ir import Block, Op, Value, clone_op, clone_type
+from ..base.ir import (
+    Block,
+    Op,
+    Value,
+    clone_op,
+    clone_type,
+    find_ancestor_of_type,
+)
 from ..base.lowering_pass import LoweringPass, lowers
 
 
@@ -119,6 +143,63 @@ class Folding(LoweringPass):
         assert isinstance(mapped, Value)
         if isinstance(mapped.definition, IndexConstantOp):
             return mapped.definition.value
+        return None
+
+    def _range(self, value: Value) -> tuple[int, int] | None:
+        """Inclusive bounds of a non-negative index, if they are known.
+
+        Hardware IDs range over the enclosing kernel's launch, an induction
+        variable over its loop, and arithmetic over its operands' ranges.
+        """
+        # Folding only ever maps values to values.
+        value = cast(Value, self.value_map.get(value, value))
+        definition = value.definition
+        if isinstance(definition, IndexConstantOp):
+            c = definition.value
+            return (c, c) if c >= 0 else None
+        if (loop := _iv_loop(value)) is not None:
+            return (loop.lb, loop.ub - 1) if loop.lb >= 0 else None
+        if isinstance(definition, (BlockIdOp, ThreadIdOp, WarpGroupIdOp)):
+            axis = (
+                definition.axis
+                if isinstance(definition, (BlockIdOp, ThreadIdOp))
+                else CollectiveAxis(definition.results.index(value))
+            )
+            kernel = find_ancestor_of_type(definition, KernelOp)
+            assert kernel is not None
+            level = HW_ID_LEVELS[type(definition)]
+            extent = launch_extent(kernel, level, axis)
+            return None if extent is None else (0, extent - 1)
+        if not isinstance(
+            definition, (IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp),
+        ):
+            return None
+        rhs = self._range(definition.rhs)
+        if rhs is None:
+            return None
+        rhs_min, rhs_max = rhs
+        lhs = self._range(definition.lhs)
+        # A remainder is bounded even when its numerator is unknown.
+        if isinstance(definition, IndexModOp):
+            if rhs_min == 0:
+                return None
+            upper = rhs_max - 1
+            if lhs is not None:
+                _, lhs_max = lhs
+                upper = min(lhs_max, upper)
+            return (0, upper)
+        if lhs is None:
+            return None
+        lhs_min, lhs_max = lhs
+        match definition:
+            case IndexAddOp():
+                return (lhs_min + rhs_min, lhs_max + rhs_max)
+            case IndexMulOp():
+                return (lhs_min * rhs_min, lhs_max * rhs_max)
+            case IndexDivOp():
+                if rhs_min == 0:
+                    return None
+                return (lhs_min // rhs_max, lhs_max // rhs_min)
         return None
 
     def _decompose_add(self, value: Value) -> tuple[Value | None, int]:
@@ -300,6 +381,15 @@ class Folding(LoweringPass):
             return [new_op], [new_op.result()]
         if rhs_val == 1:
             return [], [lhs]
+        if rhs_val is None:
+            return None
+        bounds = self._range(op.lhs)
+        if bounds is None:
+            return None
+        _, upper = bounds
+        if upper < rhs_val:
+            new_op = IndexConstantOp.build(0)
+            return [new_op], [new_op.result()]
         return None
 
     @lowers(IndexModOp)
@@ -323,6 +413,16 @@ class Folding(LoweringPass):
         if loop is not None and rhs_val is not None and loop.step % rhs_val == 0:
             new_op = IndexConstantOp.build((loop.lb + offset) % rhs_val)
             return [new_op], [new_op.result()]
+
+        # A value already below the modulus is its own remainder.
+        if rhs_val is None:
+            return None
+        bounds = self._range(op.lhs)
+        if bounds is None:
+            return None
+        _, upper = bounds
+        if upper < rhs_val:
+            return [], [self.value_map[op.lhs]]
         return None
 
     @lowers(PtrAddOp)

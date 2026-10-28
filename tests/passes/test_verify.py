@@ -27,6 +27,7 @@ from ayla.gpu_dialect import (
     ReshapeOp,
     RmemTensorType,
     SmemTensorType,
+    ThreadIdOp,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -756,3 +757,10 @@ def test_multicast_invariant_tile_with_varying_guard_is_rejected():
     with pytest.raises(ValueError, match="different tiles within a cluster"):
         verify_gpu_dialect(module)
 
+
+
+def test_hardware_ids_require_an_enclosing_kernel():
+    module = ModuleOp.build(Block(ops=[ThreadIdOp.build(CollectiveAxis.X)]))
+
+    with pytest.raises(ValueError, match="requires an enclosing kernel"):
+        verify_gpu_dialect(module)
