@@ -24,6 +24,15 @@ PR routing is recorded in `pr-consolidation.json`. #351, #356, and #498 split
 across branches: single-GEMM behavior is retained on consolidated, while their
 FX implementation is kept on development.
 
+## Heuristic cleanup
+
+Both branches use `ayla.gemm_jit.select_gemm_schedule` and the single measured
+`ayla/gemm_schedule_table.py`. The legacy decision tree, minimal JSON, seed
+benchmark, mapper, converters, and old search drivers were removed. Archived
+search evidence is preserved in `.git/pr-triage/legacy-heuristic-archive/`.
+All 1,180 measured shapes and 30 additional queries retain identical selections
+and builder configurations. Current checks are in `.git/pr-triage/one-heuristic-*`.
+
 ## Push
 
 ```bash
@@ -38,7 +47,7 @@ held out of the original integration; this split does not add them. Close
 superseded feature PRs only once both branches are safely pushed. Their code
 being stored on feature branches does not mean it was merged into main.
 
-## Verification
+## Initial split verification
 
 The narrowed consolidated branch passed all 777 GPU tests, Ruff, and Pyright.
 FP16/BF16 MM, ADDMM, and BMM routing and CUDA graph replay are covered.

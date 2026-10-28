@@ -17,14 +17,12 @@ from .base.ir import (
 )
 from .ptx_codegen import PtxPrinter, PtxKernel, make_ptx_kernel
 from .jit_compiler import JITCompiler, ShapeSpecializingJITCompiler
-from .gemm_heuristics import (
-    GemmHeuristicSelection,
+from .gemm_jit import (
     GemmScheduleSeed,
     apply_gemm_schedule_seed_post_build,
-    collapse_gemm_heuristic,
-    expand_gemm_heuristic,
-    select_gemm_schedules,
+    select_gemm_schedule,
 )
+
 
 __all__ = [
     "AsyncOp",
@@ -45,10 +43,7 @@ __all__ = [
     "make_ptx_kernel",
     "JITCompiler",
     "ShapeSpecializingJITCompiler",
-    "GemmHeuristicSelection",
+    "select_gemm_schedule",
     "GemmScheduleSeed",
     "apply_gemm_schedule_seed_post_build",
-    "collapse_gemm_heuristic",
-    "expand_gemm_heuristic",
-    "select_gemm_schedules",
 ]

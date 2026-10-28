@@ -27,68 +27,27 @@ python -m benchmarks.bench_gemm_collection  # benchmark
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, % of peak, and
 throughput as a percentage of `torch.mm`) for a bf16 4096×4096 GEMM.
 
-The OSS GEMM seed tool maps an FP16 shape to 2–3 measured neighboring schedules and
-benchmarks them against `torch.mm`:
+### OSS search
+
+Validate the recorded model shapes on CPU, then benchmark or search on a GPU:
 
 ```bash
-pixi run bench-oss-seed -- 8192 768 768
-pixi run bench-oss-seed -- 8192 768 768 --show-only
-pixi run bench-oss-seed -- 8192 768 768 --csv results.csv  # optional output
-python -m benchmarks.convert_oss_gemm_heuristic expand ayla/oss_gemm_heuristic.json /tmp/heuristic.json
-python -m benchmarks.convert_oss_gemm_heuristic collapse /tmp/heuristic.json ayla/oss_gemm_heuristic.json
-python -m benchmarks.convert_oss_gemm_heuristic update ayla/oss_gemm_heuristic.json /tmp/updated.json run-*.json
-python -m benchmarks.convert_oss_gemm_heuristic merge-mapper ayla/oss_gemm_heuristic.json /tmp/updated.json bmm-mapper.json
+pixi run bench-oss-validate
+pixi run bench-oss --jit-heuristic --workload all
+pixi run bench-oss --tune-only --worst-shapes 10
 ```
 
-The converter provides lossless editing and merges any number of result files.
-The benchmark generates contiguous `A`/`BT` inputs; it does not replay captured
-tensor values or source strides.
+The runner checks numerical results, isolates configurations with a watchdog,
+and saves resumable CSV/JSON under `.benchmarks/oss_gemm/`. `--help` lists
+shape filters, search controls, timing protocols, and output paths.
 
-Library callers can select the independent fused-addmm schedule groups with
-`select_gemm_schedules(m, n, k, operation="addmm")`; omitting `operation`
-preserves the existing `mm` routing.
-Canonical batched workloads use
-`select_gemm_schedules(m, n, k, operation="bmm", batch=batch)`.
-
-The recorded OSS model-shape study is split into restartable phases:
+There is one GEMM heuristic: `ayla.gemm_jit.select_gemm_schedule`, backed by
+`ayla/gemm_schedule_table.py`. Measured shapes use their ranked schedules;
+unmeasured shapes borrow a legal schedule from the nearest measured shape.
+Search results can add schedule families to this same table:
 
 ```bash
-pixi run bench-oss-validate  # CPU-only supported/skipped report
-pixi run bench-oss           # GPU measurements; writes after every shape
-pixi run bench-oss-report    # regime-level Markdown from the raw JSON
-pixi run bench-oss-map       # collapse per-shape winners into a small mapper
-```
-
-Focused follow-up searches can use `bench-oss --tune-only --worst-shapes N` or
-`bench-oss --cublas-inspired-only --worst-shapes N`.  `--transfer-only`
-reuses the full knob settings of successful neighboring shapes while adapting
-static CTA counts to the target geometry. Each configuration runs in an
-isolated worker with a 120-second watchdog by default, so pathological
-CPU-side compilation is recorded and skipped instead of stalling a shard;
-`python -m benchmarks.profile_oss_pytorch_gemm --help` provides a one-launch
-CUDA profiler target for comparing a measured Ayla configuration with
-`torch.mm`.
-Repeated focused passes can be merged with `bench-oss-merge --prefer-last`
-when a later run intentionally remeasures the same named configuration.
-
-These write validation CSV/JSON, raw CSV/JSON, per-regime and per-shape
-improvement tables, and machine-readable recommended seeds under
-`.benchmarks/oss_gemm/`; the generated
-heuristic study is kept at `benchmarks/oss_pytorch_gemm_heuristics.md`. The
-benchmark runner's `--help` lists smoke-run filters and output overrides.
-Recorded operand orders are retained in validation output but pooled into
-canonical contiguous A/BT workloads for benchmarking.
-
-The current corpus funnel is: 1,765 source GEMM records → 1,729 pooled
-signatures → 855 unbatched `mm` signatures → 487 signatures after dtype,
-alignment, small-M, and split-K filtering → 406 canonical M/N/K workloads.
-
-The generated mapper is an interpretable decision tree with 2–3 measured seed
-configurations per leaf. Querying it prints the complete branch trace, source
-shapes, and any exact-CTA adaptation, for example:
-
-```bash
-pixi run python -m benchmarks.generate_oss_gemm_mapper --query 8192 768 768
+pixi run python -m benchmarks.select_gemm_schedule_families --update-table .benchmarks/better_benchmark_gemm/*/gpu*.json
 ```
 
 ### JIT-routed GEMMs
