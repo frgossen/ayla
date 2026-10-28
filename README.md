@@ -29,6 +29,24 @@ curl -fsSL https://pixi.sh/install.sh | bash
 
 Then set up the environment with [pixi](https://pixi.sh): `pixi shell` to activate the env, `pixi run install` provisions Python 3.12 with ayla (editable) plus the CUDA 12.8 (cu128) PyTorch build, then `pixi run test` runs the tests and `pixi run bench` runs the benchmark.
 
+### better-benchmark
+
+[better-benchmark](third_party/better-benchmark)'s full model graphs measure ayla
+inside `torch.compile`: every graph runs once with stock Inductor and once with
+`ayla.torch_compile.install()`, each with its own Inductor cache.
+
+```bash
+git submodule update --init third_party/better-benchmark
+python benchmarks/bench_better_benchmark.py --gpus 0,1,2,3,4,5,6,7 --output-dir .benchmarks/bb
+```
+
+It prints each graph's time in both arms and the geomean speedup, comparing
+graphs like better-benchmark's `bench_parallel.py --compare` (coordinate-descent
+time, else the default compiled time). `--models-root repros/models/hf/infer`
+narrows the run, `--output-dir` keeps each arm's raw JSON, and `--bench-root`
+points at another better-benchmark checkout (for example from a git worktree).
+Workers import this checkout's ayla, even when another one is installed.
+
 ## Models to try
 
 Candidate test subjects, once ayla is ready to serve real GEMM shapes:
