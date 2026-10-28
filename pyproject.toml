@@ -21,9 +21,6 @@ dev = ["pyright", "pytest", "ruff"]
 include = ["ayla*"]
 exclude = ["tests*"]
 
-[tool.setuptools.package-data]
-ayla = ["oss_gemm_heuristic.json"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -91,9 +88,7 @@ test = "pytest"
 lint = "ruff check"
 typecheck = "pyright"
 bench = "python -m benchmarks.bench_gemm_collection"
-bench-oss-seed = "python -m benchmarks.benchmark_oss_gemm_seeds"
 bench-oss-validate = "python -m benchmarks.validate_oss_pytorch_gemm_shapes"
 bench-oss = "python -m benchmarks.benchmark_oss_pytorch_gemm_shapes"
 bench-oss-merge = "python -m benchmarks.merge_oss_pytorch_gemm_results"
 bench-oss-report = "python -m benchmarks.report_oss_pytorch_gemm_heuristics"
-bench-oss-map = "python -m benchmarks.generate_oss_gemm_mapper"
