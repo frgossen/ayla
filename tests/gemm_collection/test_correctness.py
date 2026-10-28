@@ -29,6 +29,7 @@ from ayla.gpu_dialect import (
     WgrmemTensorType,
     gpu_dialect,
 )
+from ayla.passes.verify_gpu_dialect import verify_gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
 from tests.testing_utils import requires_cuda

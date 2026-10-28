@@ -252,6 +252,10 @@ class PromoteBuffers(LoweringPass):
         A selected WGRMEM-to-GMEM move is staged the same way.
     nc : bool
         Non-coherent cache hint for scalar gmem→rmem loads.
+    permutation : list[int] or None
+        Dense SMEM dimension permutation: logical dim i maps to physical
+        dim permutation[i]. Defaults to identity; [1, 0] stages rank-2
+        tensors column-major. Also applies to TMA writeback staging buffers.
     physical_layout : dict or None
         Physical layout attrs for promoted shared-memory buffers.
     move_attrs : dict[str, dict[str, object]] or None
@@ -275,6 +279,7 @@ class PromoteBuffers(LoweringPass):
     warps: int | None
     tma: bool
     nc: bool
+    permutation: list[int] | None
     physical_layout: dict[str, object] | None
     move_attrs: dict[str, dict[str, object]]
     writeback_slices: int
@@ -296,6 +301,7 @@ class PromoteBuffers(LoweringPass):
         warps: int | None = None,
         tma: bool = False,
         nc: bool = False,
+        permutation: list[int] | None = None,
         physical_layout: dict[str, object] | None = None,
         move_attrs: dict[str, dict[str, object]] | None = None,
         writeback_slices: int = 1,
@@ -314,6 +320,7 @@ class PromoteBuffers(LoweringPass):
             warps=warps,
             tma=tma,
             nc=nc,
+            permutation=list(permutation) if permutation is not None else None,
             physical_layout=physical_layout,
             move_attrs=dict(move_attrs or {}),
             writeback_slices=writeback_slices,
@@ -370,7 +377,8 @@ class PromoteBuffers(LoweringPass):
         if tensor_cls is GmemTensorType:
             return GmemTensorType.build(sizes, dtype)
         if tensor_cls is SmemTensorType:
-            return self._build_smem_type(sizes, dtype)
+            strides = SmemTensorType.canonical_strides(sizes, self.permutation)
+            return self._build_smem_type(sizes, dtype, cast(list[int], strides))
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WgrmemTensorType:
@@ -861,6 +869,7 @@ def promote_buffers(
     warps: int | None = None,
     tma: bool = False,
     nc: bool = False,
+    permutation: list[int] | None = None,
     physical_layout: dict[str, object] | None = None,
     move_attrs: dict[str, dict[str, object]] | None = None,
     writeback_slices: int = 1,
@@ -880,6 +889,7 @@ def promote_buffers(
         warps=warps,
         tma=tma,
         nc=nc,
+        permutation=permutation,
         physical_layout=physical_layout,
         move_attrs=move_attrs,
         writeback_slices=writeback_slices,

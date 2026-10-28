@@ -2612,7 +2612,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         and isinstance(src_type.dtype, (BF16Type, F16Type))
         and dst_type.dtype == src_type.dtype
         and dst_type.rank == 2
-        and dst_type.strides[-1] == 1
+        and (dst_type.strides[-1] == 1 or is_column_major(dst_type))
         and layout is not None
         and layout[1] == "block_major"
         and dst_type.swizzle == _block_swizzle(layout[0])
@@ -2623,11 +2623,18 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_root = root_buffer(op.dst)
     assert dst_root is not None
     root_type = dst_root.type
+    if not isinstance(root_type, SmemTensorType) or root_type.rank != 2:
+        return None
+    transposed = root_type.is_column_major_2d
+    dense = (
+        root_type.strides == (1, root_type.sizes[0]) if transposed
+        else root_type.is_canonical_strides
+    )
     if (
-        not isinstance(root_type, SmemTensorType)
-        or root_type.rank != 2
-        or not root_type.is_canonical_strides
+        root_type.swizzle != "128B"
+        or physical_layout(root_type) != (64, "block_major")
         or cast(int, root_type.sizes[0]) % 64
+        or not dense
     ):
         return None
 
@@ -2653,16 +2660,39 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         or col_start % 16
         or (not is_view and col_start + dst_n > n_dim)
         or m_dim % 64
-        or dst_n % block_width
+        or dst_n % (8 if transposed else block_width)
         or root_n % 8
         or not (8 <= root_n <= 256)
     ):
         return None
 
+    if transposed:
+        # A trailing 8-column group uses x2; other groups must contain all
+        # four pairs of a 16-column fragment block.
+        if dst_n % 16 and col_start + dst_n != root_n:
+            return None
+        pairs_per_m_tile = root_n // 4
+        return [
+            pair for pair, _, _ in pairs if pair % pairs_per_m_tile % 4 == 0
+        ]
     # Each start opens a 16-column group of one 64-row fragment tile.
     pairs_per_m_tile = root_n // 4
     return [
         pair for pair, _, _ in pairs if pair % pairs_per_m_tile % 4 == 0
+    ]
+
+
+def _stmatrix_pairs(op: MoveOp) -> list[tuple[int, int, int]]:
+    """The WGMMA pairs a fragment store writes, relative to its destination."""
+    if isinstance(op.src.definition, TileOp):
+        return _wgmma_view_pairs(op.src)
+    col_start = op.attrs.get("wgmma_col_start", 0)
+    assert isinstance(col_start, int)
+    dst_n = cast(int, cast(MemTensorType, op.dst.type).sizes[1])
+    return [
+        (pair, row, col - col_start)
+        for pair, row, col in _wgmma_view_pairs(op.src)
+        if col_start <= col < col_start + dst_n
     ]
 
 
