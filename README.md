@@ -19,6 +19,25 @@ python -m benchmarks.bench_gemm_collection  # benchmark
 The benchmark prints a comparison table (median/mean latency, TFLOP/s, % of peak, and
 throughput as a percentage of `torch.mm`) for a bf16 4096×4096 GEMM.
 
+### Which branch to benchmark
+
+The JIT heuristic and benchmark tools let users of `main` query the best known
+configuration for a supported shape and run the OSS and better-benchmark suites.
+For performance measurements using all of the current compiler features,
+**use `feature/consolidated`**:
+
+```bash
+git fetch origin
+git switch feature/consolidated
+```
+
+Run the benchmark commands below from that checkout. The consolidated branch
+includes the newer scheduling, multicast, SwiGLU, and staging features. Some
+configurations on `main` will be suboptimal without those features; a measured
+winner is not a promise of the same performance on every branch or GPU.
+Record the branch, commit (`git rev-parse HEAD`), and GPU with your results so
+comparisons identify the implementation that was actually measured.
+
 The OSS GEMM seed tool maps an FP16 shape to 2–3 measured neighboring schedules and
 benchmarks them against `torch.mm`:
 
@@ -85,7 +104,7 @@ pixi run python -m benchmarks.generate_oss_gemm_mapper --query 8192 768 768
 
 ### JIT-routed GEMMs
 
-`ayla.gemm_jit` compiles FP16/BF16 `mm`, `addmm`, and `bmm` for any shape from
+`ayla.gemm_jit` compiles FP16/BF16 `mm`, `addmm`, and `bmm` for supported shapes from
 the measured winners in `ayla/gemm_schedule_table.py`: a measured shape gets its
 own winner, any other shape the nearest measured shape's first schedule that is
 legal for it. `gemm_op(operation, dtype)` is the torch op
@@ -93,13 +112,44 @@ legal for it. `gemm_op(operation, dtype)` is the torch op
 `ayla.torch_compile.install()` routes native-layout `aten.mm`/`addmm`/`bmm` that
 have a schedule through it.
 
+To inspect the selected configuration without compiling or launching a kernel:
+
+```bash
+pixi run python - <<'PY'
+from pprint import pprint
+from ayla.gemm_jit import select_gemm_schedule
+
+seed = select_gemm_schedule("mm", "bfloat16", m=8192, n=768, k=768)
+if seed is None:
+    print("No legal measured schedule for this shape.")
+else:
+    print("Measured configuration:")
+    pprint(seed.captured_config)
+    print("Builder configuration for this shape:")
+    pprint(seed.builder_config)
+    print("Adaptations:", seed.adaptations)
+PY
+```
+
+Use `"float16"` for FP16, `"addmm"` for bias initialization, or `"bmm"`
+with `batch=...` for batched GEMM. An exact measured shape uses its recorded
+winner; other shapes use a legal configuration transferred from a neighboring
+measured shape. Finding the fastest configuration for a new shape still
+requires benchmarking.
+
 `bench-oss --jit-heuristic` times exactly that routing: for every corpus shape
 it runs the JIT op against Torch, with the usual correctness check, isolated
 workers, and resumable raw rows (configuration `jit_heuristic`):
 
 ```bash
+pixi run bench-oss --jit-heuristic --workload all --max-shapes 3 --output-json .benchmarks/jit/smoke.json --output-csv .benchmarks/jit/smoke.csv
 pixi run bench-oss --jit-heuristic --workload all --output-json .benchmarks/jit/oss.json --output-csv .benchmarks/jit/oss.csv
 ```
+
+The first command is a short smoke run; the second runs the supported corpus.
+Use `CUDA_VISIBLE_DEVICES=0` before either command to select one GPU. Completed
+rows are saved after each shape and reused on subsequent runs; use `--no-resume`
+to replace results when changing branches or configurations.
 
 `--corpus` takes any corpus in the OSS format.
 `benchmarks/better_benchmark_gemm_shapes.json` holds better-benchmark's BF16
@@ -128,6 +178,12 @@ git submodule update --init third_party/better-benchmark
 pixi run python benchmarks/bench_better_benchmark.py --models-root repros/models/hf/infer --gpus 0,1,2,3,4,5,6,7
 ```
 
+Use `--gpus 0` for a single GPU. `--models-root` identifies the captured graph
+directory inside the better-benchmark checkout; it does not download model
+weights. The BF16 corpus command above benchmarks individual GEMMs, while this
+wrapper compares full graphs with stock Inductor and Ayla enabled. For numbers
+that use the complete feature set, run both from `feature/consolidated`.
+
 ### Using pixi
 
 If you don't already have pixi installed, get it with curl:
@@ -137,16 +193,3 @@ curl -fsSL https://pixi.sh/install.sh | bash
 ```
 
 Then set up the environment with [pixi](https://pixi.sh): `pixi shell` to activate the env, `pixi run install` provisions Python 3.12 with ayla (editable) plus the CUDA 12.8 (cu128) PyTorch build, then `pixi run test` runs the tests and `pixi run bench` runs the benchmark.
-
-## Models to try
-
-Candidate test subjects, once ayla is ready to serve real GEMM shapes:
-
-- **Muse Glimmer 30B** — the best first target. A Meta model, open weights (Apache 2.0),
-  and it serves on a single H100 at TP=1 in bf16, which is exactly what ayla emits. Its
-  weight dimensions are all multiples of 256, so the existing tiling divides evenly.
-- **Gemma 4 31B** and **Qwen 3.5/3.6 27B** — the two models Glimmer is benchmarked
-  against, so they are the natural second and third subjects. Dense, single GPU, fp8.
-- **DeepSeek V4**, **Kimi K2.7**, **GLM 5.2** — the frontier, and the furthest away.
-  All mixture of experts, mostly fp8 with block scaling, so they need grouped GEMM and a
-  narrower operand type before ayla has anything to say about them.
