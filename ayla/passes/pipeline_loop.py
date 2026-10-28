@@ -99,23 +99,25 @@ class PipelineLoop(LoweringPass):
     ) -> tuple[set[Op], set[Op]]:
         """Compute the labeled and shared sets of in-body ops.
 
-        An op is **labeled** if its ``attrs["label"]`` matches the
-        ``label_filter_op`` regex OR if any labeled op transitively
-        consumes its result and is not value-identical.
+        An op is **labeled** if it is not value-identical and its
+        ``attrs["label"]`` matches the ``label_filter_op`` regex OR any
+        labeled op transitively consumes its result.
 
-        An op is **shared** if it is pulled in as a dependency of a
-        labeled op but is value-identical (pure). Shared ops get cloned
-        into both the labeled and unlabeled sections.
+        An op is **shared** if it is value-identical (pure) and matches or
+        is pulled in as a dependency of a labeled op. Shared ops get cloned
+        into both the labeled and unlabeled sections, so an unlabeled op may
+        consume a pure op the filter matches.
         """
         in_body_def: dict[Value, Op] = {
             r: body_op for body_op in body_ops for r in body_op.results
         }
-        shared: set[Op] = set()
-        labeled: set[Op] = {
+        matched = [
             body_op for body_op in body_ops
             if label_matches(body_op, self.label_filter_op)
-        }
-        worklist = list(labeled)
+        ]
+        shared: set[Op] = {op for op in matched if is_side_effect_free(op)}
+        labeled: set[Op] = set(matched) - shared
+        worklist = list(matched)
         while worklist:
             cur = worklist.pop()
             for v in effective_operands(cur):

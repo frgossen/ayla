@@ -85,6 +85,7 @@ def _seed(
         transpose_output=transpose,
         fixed_output_unroll_factor=unroll,
         pipeline_output_waves=bool(captured.get("pipeline_output_waves")),
+        pipeline_output_writeback=bool(captured.get("pipeline_output_writeback")),
     )
 
 
