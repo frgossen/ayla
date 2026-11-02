@@ -1,0 +1,1936 @@
+{
+  "version": 1,
+  "fallback": "table",
+  "routes": [
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 250112,
+      "k": 512,
+      "configuration": {
+        "output_n_tiles_per_cta": 4,
+        "ptx_optimization_level": 3,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "cyclic_operand_pipeline": true,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_last",
+        "lhs_l2_promotion": "256B",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_m_tile": 128,
+        "output_n_tile": 256,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 128,
+        "rhs_l2_cache_hint": "evict_last",
+        "rhs_l2_promotion": "256B",
+        "warpgroup_n_tile": 256
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 4096,
+      "k": 1024,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 1024,
+      "k": 1024,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 128112,
+      "k": 1024,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 16384,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 64,
+      "m": 1024,
+      "n": 64,
+      "k": 1024,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "cyclic_operand_pipeline": true,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_first",
+        "operand_k_tile": 128,
+        "operand_stages": 4,
+        "output_m_tile": 64,
+        "output_n_tile": 64,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 128,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_first",
+        "swap_output_grid_axes": true,
+        "warpgroup_n_tile": 64
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 384,
+      "m": 512,
+      "n": 64,
+      "k": 512,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "cyclic_operand_pipeline": true,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_first",
+        "operand_k_tile": 128,
+        "operand_stages": 4,
+        "output_m_tile": 64,
+        "output_n_tile": 64,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 128,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_first",
+        "swap_output_grid_axes": true,
+        "warpgroup_n_tile": 64
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 192,
+      "m": 128,
+      "n": 64,
+      "k": 128,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": 2,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_last",
+        "operand_k_tile": 128,
+        "operand_stages": 6,
+        "output_m_tile": 64,
+        "output_n_tile": 64,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 128,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_n_tile": 64
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 192,
+      "m": 128,
+      "n": 128,
+      "k": 64,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "dst_l2_cache_hint": "evict_last",
+        "lhs_l2_cache_hint": "evict_last",
+        "operand_k_tile": 64,
+        "operand_stages": 2,
+        "output_m_tile": 64,
+        "output_n_tile": 128,
+        "output_slices": 2,
+        "output_store": "stmatrix",
+        "output_store_buffers": 2,
+        "output_tiles_per_cta": 2,
+        "output_tma_inner_size": 128,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_n_tile": 128
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 1,
+      "k": 16,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4,
+      "n": 4096,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4,
+      "n": 4096,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4,
+      "n": 4096,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4,
+      "n": 4096,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4,
+      "n": 4096,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4,
+      "n": 4096,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 64,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 64,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 64,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 64,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 64,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 64,
+      "n": 1000,
+      "k": 4096,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 96,
+      "n": 65,
+      "k": 512,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 96,
+      "n": 65,
+      "k": 512,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 96,
+      "n": 65,
+      "k": 512,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 96,
+      "n": 65,
+      "k": 512,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 96,
+      "n": 65,
+      "k": 512,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 96,
+      "n": 65,
+      "k": 512,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 512,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 512,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 512,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 512,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 512,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 512,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197951,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197951,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197951,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197951,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197951,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197951,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197952,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197952,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197952,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197952,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197952,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 512,
+      "k": 197952,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 1024,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 1024,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 1024,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 1024,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 1024,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 256,
+      "n": 1024,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 384,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 384,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 384,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 384,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 384,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 384,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 128,
+      "k": 401408,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 1024,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 1024,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 1024,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 1024,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 1024,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 1024,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 2048,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 2048,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 512,
+      "n": 2048,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 2048,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 2048,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 512,
+      "n": 2048,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 768,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 768,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 768,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 768,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 768,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 768,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1000,
+      "n": 32,
+      "k": 2880,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1000,
+      "n": 32,
+      "k": 2880,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1000,
+      "n": 32,
+      "k": 2880,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1000,
+      "n": 32,
+      "k": 2880,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1000,
+      "n": 32,
+      "k": 2880,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1000,
+      "n": 32,
+      "k": 2880,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1024,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1024,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1024,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 256,
+      "k": 100352,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1536,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1536,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1536,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1536,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1536,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1536,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 2048,
+      "n": 512,
+      "k": 25088,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 2048,
+      "n": 2560,
+      "k": 2560,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 2048,
+      "n": 2560,
+      "k": 10240,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2560,
+      "k": 2560,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 2560,
+      "k": 10240,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 4096,
+      "k": 16384,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 16384,
+      "n": 3072,
+      "k": 768,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 64,
+      "m": 1024,
+      "n": 1024,
+      "k": 64,
+      "configuration": {
+        "output_m_tile": 128,
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "operand_stages": 2,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tma_inner_size": 128,
+        "output_tiles_per_cta": 1,
+        "output_n_tiles_per_cta": 1,
+        "warpgroup_n_tile": 128,
+        "cyclic_operand_pipeline": false,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "ptx_optimization_level": 3,
+        "lhs_l2_cache_hint": null,
+        "rhs_l2_cache_hint": null,
+        "dst_l2_cache_hint": null
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 384,
+      "m": 512,
+      "n": 512,
+      "k": 64,
+      "configuration": {
+        "output_m_tile": 128,
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "operand_stages": 1,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tma_inner_size": 128,
+        "output_tiles_per_cta": 1,
+        "output_n_tiles_per_cta": 1,
+        "warpgroup_n_tile": 128,
+        "cyclic_operand_pipeline": false,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "ptx_optimization_level": 3,
+        "lhs_l2_cache_hint": null,
+        "rhs_l2_cache_hint": null,
+        "dst_l2_cache_hint": null
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 98304,
+      "m": 64,
+      "n": 1,
+      "k": 9,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 256,
+      "n": 197951,
+      "k": 512,
+      "configuration": {
+        "output_m_tile": 256,
+        "output_n_tile": 128,
+        "operand_k_tile": 128,
+        "operand_stages": 2,
+        "output_slices": 1,
+        "output_store": "global",
+        "output_store_buffers": 1,
+        "output_tma_inner_size": null,
+        "output_tiles_per_cta": 1,
+        "output_n_tiles_per_cta": 1,
+        "warpgroup_n_tile": 128,
+        "cyclic_operand_pipeline": false,
+        "unroll_output_tiles": true,
+        "output_cta_count": null,
+        "ptx_optimization_level": 3,
+        "lhs_l2_cache_hint": null,
+        "rhs_l2_cache_hint": null,
+        "dst_l2_cache_hint": null,
+        "masked_global_store": true
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 175360,
+      "n": 3072,
+      "k": 768,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 16,
+      "k": 16,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 25344,
+      "n": 2304,
+      "k": 768,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": 264,
+        "unroll_output_tiles": true,
+        "dst_l2_cache_hint": "evict_last",
+        "lhs_l2_cache_hint": "evict_first",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_m_tile": 192,
+        "output_n_tile": 192,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": null,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_n_tile": 192
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 2048,
+      "n": 768,
+      "k": 3072,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": 2,
+        "output_cta_count": 128,
+        "unroll_output_tiles": false,
+        "cyclic_operand_pipeline": true,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_last",
+        "operand_k_tile": 64,
+        "operand_stages": 6,
+        "output_m_tile": 128,
+        "output_n_tile": 96,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": null,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_n_tile": 96
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 512,
+      "m": 128,
+      "n": 128,
+      "k": 128,
+      "configuration": {
+        "output_m_tile": 128,
+        "output_n_tile": 128,
+        "operand_k_tile": 128,
+        "operand_stages": 1,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tma_inner_size": 128,
+        "output_tiles_per_cta": 1,
+        "output_n_tiles_per_cta": 1,
+        "warpgroup_n_tile": 128,
+        "cyclic_operand_pipeline": false,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "ptx_optimization_level": 3,
+        "lhs_l2_cache_hint": null,
+        "rhs_l2_cache_hint": null,
+        "dst_l2_cache_hint": null
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 4096,
+      "n": 8192,
+      "k": 2048,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 25216,
+      "n": 2304,
+      "k": 768,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 256,
+      "m": 512,
+      "n": 1024,
+      "k": 64,
+      "configuration": {
+        "output_m_tile": 128,
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "operand_stages": 2,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tma_inner_size": 128,
+        "output_tiles_per_cta": 1,
+        "output_n_tiles_per_cta": 1,
+        "warpgroup_n_tile": 128,
+        "cyclic_operand_pipeline": false,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "ptx_optimization_level": 3,
+        "lhs_l2_cache_hint": null,
+        "rhs_l2_cache_hint": null,
+        "dst_l2_cache_hint": null
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 256,
+      "m": 512,
+      "n": 512,
+      "k": 64,
+      "configuration": {
+        "output_m_tile": 128,
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "operand_stages": 2,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tma_inner_size": 128,
+        "output_tiles_per_cta": 1,
+        "output_n_tiles_per_cta": 1,
+        "warpgroup_n_tile": 128,
+        "cyclic_operand_pipeline": false,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "ptx_optimization_level": 3,
+        "lhs_l2_cache_hint": null,
+        "rhs_l2_cache_hint": null,
+        "dst_l2_cache_hint": null
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1,
+      "n": 384,
+      "k": 384,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 16,
+      "n": 16,
+      "k": 128,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 128,
+      "n": 16,
+      "k": 16,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 5,
+      "n": 5,
+      "k": 64,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 16,
+      "n": 1,
+      "k": 128,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1,
+      "n": 16,
+      "k": 128,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1,
+      "n": 384,
+      "k": 384,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 1,
+      "k": 16,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 98304,
+      "m": 64,
+      "n": 1,
+      "k": 9,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1,
+      "n": 384,
+      "k": 384,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 16,
+      "n": 16,
+      "k": 128,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 128,
+      "n": 16,
+      "k": 16,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 5,
+      "n": 5,
+      "k": 64,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 16,
+      "n": 1,
+      "k": 128,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1,
+      "n": 16,
+      "k": 128,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1,
+      "n": 384,
+      "k": 384,
+      "configuration": null
+    }
+  ],
+  "direct_layout_gemms": [
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 64,
+      "m": 1024,
+      "n": 64,
+      "k": 1024
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 384,
+      "m": 512,
+      "n": 64,
+      "k": 512
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 192,
+      "m": 128,
+      "n": 64,
+      "k": 128
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 192,
+      "m": 128,
+      "n": 128,
+      "k": 64
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 64,
+      "m": 1024,
+      "n": 1024,
+      "k": 64
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 384,
+      "m": 512,
+      "n": 512,
+      "k": 64
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 512,
+      "m": 128,
+      "n": 128,
+      "k": 128
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 256,
+      "m": 512,
+      "n": 1024,
+      "k": 64
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 256,
+      "m": 512,
+      "n": 512,
+      "k": 64
+    }
+  ],
+  "materialize_gemms": []
+}

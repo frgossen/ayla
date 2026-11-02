@@ -21,6 +21,7 @@ from ..gpu_dialect import (
     IndexLtOp,
     IndexModOp,
     IndexMulOp,
+    KernelOp,
     LockType,
     MatmulOp,
     MoveOp,
@@ -37,8 +38,9 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     WarpIdsOp,
     memory_effects,
+    lock_has_tma_multicast,
 )
-from ..base.ir import Op, Value
+from ..base.ir import Op, Value, find_ancestor_of_type
 from .dataflow import DataflowAnalysis, DataflowState, transfers
 
 
@@ -365,27 +367,42 @@ _GATHER_BARRIER_IDS: dict[BarrierScope, range | None] = {
 }
 
 
-def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
-    """Largest memory-effect scope completed by awaiting ``op``."""
-    assert isinstance(op.lock.type, LockType)
-    kind = op.lock.type.kind
+def _lock_completion_scope(lock: Value) -> CollectiveScope:
+    """Baseline completion scope for the work named by this hardware lock."""
+    assert isinstance(lock.type, LockType)
+    kind = lock.type.kind
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
     if kind == "mbar":
-        # A TMA-load mbar await completes the issuing leader's write. Multicast
-        # uses one leader for the cluster; ordinary TMA uses one per block.
         return (
             CollectiveScope.CLUSTER_LEADER
-            if op.is_tma_multicast
+            if lock_has_tma_multicast(lock)
             else CollectiveScope.BLOCK_LEADER
         )
     if kind == "bulk":
-        # Bulk async-groups are per issuing thread, not warp-group-wide. TMA
-        # stores are issued and committed by t0, so t0's wait completes the
-        # leader-owned read of shared memory. This is the completed memory
-        # effect's collective scope, not the execution width of wait_group.
         return CollectiveScope.BLOCK_LEADER
-    raise NotImplementedError(f"_async_completion_scope: unmodeled lock kind {kind!r}")
+    raise NotImplementedError(f"unmodeled completion mechanism: {kind!r}")
+
+
+def _await_completion_scope(op: AwaitOp) -> CollectiveScope:
+    """Completion proven at this wait, rather than predicted at its producer.
+
+    A partial wait completes its listed lock at the mechanism's normal scope,
+    leaving newer groups pending. A full-warpgroup wait covers block memory when the
+    resolved block contains exactly that one group. This does not release
+    resources that require a block rendezvous.
+    """
+    scope = _lock_completion_scope(op.lock)
+    if not op.is_full_wait:
+        return scope
+    if scope != CollectiveScope.WARPGROUP:
+        return scope
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None or kernel.is_clustered:
+        return scope
+    if kernel.resolved_num_warp_groups != 1:
+        return scope
+    return CollectiveScope.BLOCK
 
 
 def _transfer_memory_effects(
@@ -507,11 +524,10 @@ def _transfer_memory_effects(
     # A barrier orders settled accesses it covers; pending async effects survive
     # until their await completes them.
     live = _after_barrier(live, barrier_scope, op)
-    # An async op's effects that its await fully orders wait pending on the lock
-    # (the await will clear them). A coarser effect the await only partially
-    # orders -- and every synchronous op's effect -- is live immediately, left for
-    # a later barrier to order.
-    async_scope = _async_completion_scope(op) if isinstance(op, AsyncOp) else None
+    # Defer accesses covered by the mechanism's baseline scope until its await.
+    # Wider effects remain hazards until the actual wait proves completion at
+    # their scope, or a barrier orders them.
+    async_scope = _lock_completion_scope(async_lock) if async_lock is not None else None
     for memory_effect in effects:
         pending = (
             async_lock
@@ -588,30 +604,24 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(AwaitOp)
     def transfer_await(self, op: AwaitOp, state: SyncState) -> SyncState:
-        # Clear every effect pending on this lock -- only the ones this await
-        # fully orders were made pending on it. Effects it only partially orders
-        # were never pending and stay live for a barrier.
+        scope = _await_completion_scope(op)
+        # Leader-only bulk waits settle reads but do not discharge them from
+        # the hazard set. Other waits discharge only accesses they fully cover.
         settle = cast(LockType, op.lock.type).kind == "bulk"
-        # A bulk await settles effects without becoming a block rendezvous.
-        # Keep them live, and record completion for a later gather arrival.
         for buffer, effects in state.concurrent_memory_effects.items():
-            state.concurrent_memory_effects[buffer] = {
-                dataclasses.replace(
+            remaining = set()
+            for effect in effects:
+                if effect.lock != op.lock:
+                    remaining.add(effect)
+                    continue
+                if not settle and effect.scope.leq(scope):
+                    continue
+                remaining.add(dataclasses.replace(
                     effect,
-                    pending_await=(
-                        None
-                        if settle and effect.pending_await == op.lock
-                        else effect.pending_await
-                    ),
-                    completed_after=(
-                        op
-                        if effect.lock == op.lock and effect.completed_after is None
-                        else effect.completed_after
-                    ),
-                )
-                for effect in effects
-                if settle or effect.pending_await != op.lock
-            }
+                    pending_await=None if settle else effect.pending_await,
+                    completed_after=effect.completed_after or op,
+                ))
+            state.concurrent_memory_effects[buffer] = remaining
         # An mbar await also completes a gather's handoff: all threads wait
         # for the leaders' async work, so no arriving warp can lap the barrier.
         for key in state.named_barrier_ids_pending_await.pop(op.lock, set()):

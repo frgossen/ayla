@@ -32,7 +32,7 @@ def _specialize_argument(
 
     specialized = clone_type(typ, {
         "sizes": list(sizes),
-        "strides": GmemTensorType.canonical_strides(list(sizes)),
+        "strides": GmemTensorType.canonical_strides(list(sizes), typ.attrs.get("permutation")),
     })
     assert isinstance(specialized, GmemTensorType)
     return specialized

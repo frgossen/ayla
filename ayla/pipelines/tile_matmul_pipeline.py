@@ -3,12 +3,17 @@
 from ..base.ir import find_ops_of_type
 from ..base.pipeline import Pipeline
 from ..gpu_dialect import (
+    BF16Type,
+    F16Type,
     CollectiveAxis,
     CollectiveLevel,
     KernelOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
+    ReshapeOp,
+    TileOp,
+    root_buffer,
 )
 from .canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
@@ -24,6 +29,7 @@ from ..passes.unroll_loop import UnrollLoop
 
 
 from typing import cast
+import math
 
 
 def schedule_register_matmul(
@@ -33,6 +39,10 @@ def schedule_register_matmul(
     operand_k_tile: int = 64,
     cyclic_operand_pipeline: bool = False,
     rhs_tma_load_slices: int = 1,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_smem_block_width: int = 64,
+    rhs_smem_block_width: int = 64,
     unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
@@ -60,27 +70,37 @@ def schedule_register_matmul(
             epilogue_label_filter=epilogue_label_filter,
         )
     )
-    pipeline.add_pass(
-        PromoteBuffers(
-            target_type="smem",
-            operands=["lhs", "rhs"],
-            swizzle="128B",
-            layout=None,
-            warps=None,
-            tma=True,
-            physical_layout=(
-                {"block_width": 64, "order": "block_major"}
-                if operand_k_tile > 64
-                else None
-            ),
-            tma_load_slices=(
-                {"rhs": rhs_tma_load_slices} if rhs_tma_load_slices > 1 else None
-            ),
-            move_attrs=operand_move_attrs,
-            unsafe_reuse_smem=unsafe_reuse_smem,
-            label_filter=label,
+    for operand, column_major, width in (
+        ("lhs", lhs_column_major, lhs_smem_block_width),
+        ("rhs", rhs_column_major, rhs_smem_block_width),
+    ):
+        pipeline.add_pass(
+            PromoteBuffers(
+                target_type="smem",
+                operands=[operand],
+                permutation=[1, 0] if column_major else None,
+                swizzle=(f"{width * 2}B" if width >= 16 else None)
+                if column_major
+                else f"{min(operand_k_tile, 64) * 2}B",
+                layout=None,
+                warps=None,
+                tma=True,
+                physical_layout=(
+                    {
+                        "block_width": width if column_major else 64,
+                        "order": "block_major",
+                    }
+                    if operand_k_tile > 64 or column_major
+                    else None
+                ),
+                tma_load_slices=(
+                    {"rhs": rhs_tma_load_slices} if rhs_tma_load_slices > 1 else None
+                ),
+                move_attrs=operand_move_attrs,
+                unsafe_reuse_smem=unsafe_reuse_smem,
+                label_filter=label,
+            )
         )
-    )
     pipeline.add_pass(
         TileMatmul(
             op_dims=["K"],
@@ -152,6 +172,10 @@ def schedule_register_matmul(
 def schedule_tiled_matmul(
     *,
     label: str,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_smem_block_width: int = 64,
+    rhs_smem_block_width: int = 64,
     output_m_tile: int,
     output_n_tile: int,
     operand_stages: int,
@@ -162,6 +186,7 @@ def schedule_tiled_matmul(
     output_slices: int = 1,
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
+    output_store: str = "stmatrix",
     unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
@@ -199,7 +224,7 @@ def schedule_tiled_matmul(
             swizzle=None,
             layout="wgmma_layout_0",
             warps=4,
-            tma=True,
+            tma=output_store != "global",
             physical_layout=(
                 {
                     "swizzle": "128B",
@@ -207,6 +232,10 @@ def schedule_tiled_matmul(
                     "order": "block_major",
                 }
                 if output_tma_inner_size is not None
+                or (
+                    output_store == "stmatrix"
+                    and output_n_tile // output_slices % 16 == 0
+                )
                 else None
             ),
             writeback_slices=output_slices,
@@ -226,6 +255,10 @@ def schedule_tiled_matmul(
             cyclic_operand_pipeline=cyclic_operand_pipeline,
             # Preserve the existing three 128-row RHS loads for the tuned N=384
             # schedule; other supported schedules use one RHS load.
+            lhs_column_major=lhs_column_major,
+            rhs_column_major=rhs_column_major,
+            lhs_smem_block_width=lhs_smem_block_width,
+            rhs_smem_block_width=rhs_smem_block_width,
             rhs_tma_load_slices=(
                 output_n_tile // warpgroup_n_tile if output_n_tile == 384 else 1
             ),
@@ -267,6 +300,7 @@ def _schedule_matmul(
     # for faster TMA reads of the arena.
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
+    masked_global_store: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
 ) -> ModuleOp:
     """Apply the configurable WGMMA schedule to one concrete matmul.
@@ -280,6 +314,10 @@ def _schedule_matmul(
     matmuls = find_ops_of_type(module, MatmulOp)
     if len(matmuls) != 1:
         raise ValueError("schedule_matmul requires exactly one matmul")
+    if masked_global_store:
+        if output_store != "global":
+            raise ValueError("masked_global_store requires global output stores")
+        kernel.attrs["masked_global_store"] = True
     matmul = matmuls[0]
     assert isinstance(matmul, MatmulOp)
     assert isinstance(matmul.lhs.type, MemTensorType)
@@ -291,6 +329,13 @@ def _schedule_matmul(
     if rhs_k != k:
         raise ValueError("matmul reduction dimensions must match")
     m, n, k = cast(tuple[int, int, int], (m, n, k))
+
+    for operand, dimension, tile in (
+        (matmul.lhs, m, output_m_tile),
+        (matmul.rhs, n, output_n_tile),
+    ):
+        if operand.type.strides[0] == 1 and math.gcd(dimension, tile, 64) < 16:
+            raise ValueError("MN-major WGMMA requires at least 32-byte swizzle atoms")
 
     output_groups = (output_m_tiles_per_cta, output_n_tiles_per_cta)
     if any(group not in (1, 2, 3, 4, 5, 6, 8, 16) for group in output_groups):
@@ -307,19 +352,39 @@ def _schedule_matmul(
         raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (64, 128, 192, 256):
         raise ValueError("output_m_tile must be 64, 128, 192, or 256")
-    if not 48 <= output_n_tile <= 384 or output_n_tile % 8:
-        raise ValueError("output_n_tile must be a multiple of 8 between 48 and 384")
-    if operand_k_tile not in (64, 128):
-        raise ValueError("operand_k_tile must be 64 or 128")
+    if not 8 <= output_n_tile <= 384 or output_n_tile % 8:
+        raise ValueError("output_n_tile must be a multiple of 8 between 8 and 384")
+    if operand_k_tile not in (16, 32, 64, 128):
+        raise ValueError("operand_k_tile must be 16, 32, 64 or 128")
     if cyclic_operand_pipeline and operand_stages < 2:
         raise ValueError("cyclic_operand_pipeline requires at least two operand stages")
     if warpgroup_n_tile is None:
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     if output_n_tile % warpgroup_n_tile:
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
-    if output_store not in ("scalar", "stmatrix"):
-        raise ValueError("output_store must be 'scalar' or 'stmatrix'")
-    if output_store == "scalar":
+    if output_store not in ("scalar", "stmatrix", "global"):
+        raise ValueError("output_store must be 'scalar', 'stmatrix', or 'global'")
+    if output_store == "global":
+        backing = root_buffer(matmul.dst)
+        if backing is None or backing.type.strides[-1] != 1:
+            raise ValueError("global output stores require a row-major backing tensor")
+        if kernel.attrs.get("masked_global_store") and (
+            backing.type.rank != 2
+            or not isinstance(backing.type.dtype, (BF16Type, F16Type))
+            or cluster_m_ctas != 1 or cluster_n_ctas != 1
+        ):
+            raise ValueError("masked global output requires unclustered unbatched Half GEMM")
+        m_backing, n_backing = backing.type.sizes[-2:]
+        if (not kernel.attrs.get("masked_global_store")
+                and (m_backing % (output_m_tile * output_m_tiles_per_cta)
+                     or n_backing % (output_n_tile * output_n_tiles_per_cta))):
+            raise ValueError("global output stores require complete backing tiles")
+        view = matmul.dst
+        while isinstance(view.definition, (TileOp, ReshapeOp)):
+            if isinstance(view.definition, TileOp) and any(index != 0 for index in view.definition.indices[-2:]):
+                raise ValueError("global output stores require zero matrix view offsets")
+            view = view.definition.arg
+    if output_store in ("scalar", "global"):
         output_tma_inner_size = None
     m_blocks = (m + output_m_tile - 1) // output_m_tile
     n_blocks = (n + output_n_tile - 1) // output_n_tile
@@ -416,6 +481,10 @@ def _schedule_matmul(
     pipeline.add_pass(
         schedule_tiled_matmul(
             label="mm",
+            lhs_smem_block_width=math.gcd(m, 64),
+            rhs_smem_block_width=math.gcd(n, 64),
+            lhs_column_major=matmul.lhs.type.strides[0] == 1,
+            rhs_column_major=matmul.rhs.type.strides[0] == 1,
             output_m_tile=output_m_tile,
             output_n_tile=output_n_tile,
             operand_stages=operand_stages,
@@ -426,6 +495,7 @@ def _schedule_matmul(
             output_slices=output_slices,
             output_store_buffers=output_store_buffers,
             output_tma_inner_size=output_tma_inner_size,
+            output_store=output_store,
             operand_move_attrs=operand_move_attrs,
         )
     )

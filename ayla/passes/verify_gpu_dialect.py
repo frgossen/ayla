@@ -9,6 +9,7 @@ import math
 
 from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancestors
 from ..base.verification_pass import VerificationPass, verifies
+from ..target import CUDA_LAUNCH_LIMITS
 from ..gpu_dialect import (
     HW_ID_LEVELS,
     AddrMemTensorType,
@@ -328,6 +329,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(KernelOp)
     def _verify_kernel(self, op: KernelOp) -> None:
+        CUDA_LAUNCH_LIMITS.validate(op.grid_dim, op.block_dim)
         cluster_dim = op.cluster_dim
         if len(cluster_dim) != 3 or any(
             dim is not None and (not isinstance(dim, int) or dim <= 0)
@@ -510,7 +512,7 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_await(self, op: AwaitOp) -> None:
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
-        pending = op.attrs.get("pending", 0)
+        pending = op.pending_groups
         limit = 7 if lock_type.supports_partial_await else 0
         if type(pending) is not int or not 0 <= pending <= limit:
             raise ValueError(

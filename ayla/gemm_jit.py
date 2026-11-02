@@ -21,7 +21,7 @@ from functools import cache
 
 import torch
 
-from .gemm_schedule_table import CONFIGS, SCHEDULES
+from .gemm_schedule_table import CONFIGS, SCHEDULES, DEFERRED_GEMM_SHAPES
 from .gpu_dialect import CollectiveAxis, GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from .jit_compiler import ShapeSpecializingJITCompiler
 from .torch_custom_call import DEFAULT_NAMESPACE, OperandKind
@@ -194,6 +194,8 @@ def _builder_config(captured: dict[str, object]) -> dict[str, object] | None:
         },
         "ptx_optimization_level": captured["ptx_optimization_level"],
     }
+    if captured.get("masked_global_store"):
+        builder["masked_global_store"] = True
     if preferred_ctas is not None:
         builder["output_grid_size"] = _as_int(preferred_ctas)
         builder["output_grid_fast_axis"] = captured.get(
@@ -258,6 +260,15 @@ def _seed(
     exact: bool,
 ) -> GemmScheduleSeed | None:
     """Adapt a table entry to this GEMM, or None if it cannot transfer."""
+    if "split_k" in captured:
+        return None
+    # Removed experimental workspace routes must never be silently reinterpreted.
+    if "pad_gemm" in captured or "half_workspace" in captured:
+        return None
+    if any(name == "simt" or name.startswith("simt_") for name in captured):
+        return None
+    if m <= 1 or n <= 1 or (m, n, k) in DEFERRED_GEMM_SHAPES:
+        return None
     transpose = bool(captured.get("transpose_output"))
     fixed_grid = captured["output_cta_count"] is not None
     if not exact and (
@@ -270,6 +281,16 @@ def _seed(
     builder_m, builder_n = (n, m) if transpose else (m, n)
     builder = _builder_config(captured)
     assert builder is not None
+    if captured.get("masked_global_store") and (
+        not exact or operation not in ("mm", "addmm") or source[0] != 1
+        or transpose or captured.get("output_store") != "global"
+        or captured.get("output_tma_inner_size") is not None
+        or captured.get("cluster_m_ctas", 1) != 1
+        or captured.get("cluster_n_ctas", 1) != 1
+        or m % (int(builder["output_m_tile"]) * int(builder["output_m_tiles_per_cta"]))
+        or k % int(builder["operand_k_tile"])
+    ):
+        return None
     unroll = None
     if fixed_grid and captured["unroll_output_tiles"]:
         tiles = math.ceil(
@@ -305,6 +326,39 @@ def _seed(
     )
 
 
+def _supports_operand_layouts(seed, m, n, lhs_column_major=False, rhs_column_major=False,
+                             lhs_batch_interleaved=False, rhs_batch_interleaved=False):
+    if lhs_batch_interleaved or rhs_batch_interleaved:
+        config = seed.captured_config
+        if (lhs_column_major or rhs_column_major or seed.transpose_output
+            or config.get("masked_global_store")
+            or config.get("output_store") == "global"
+            or config.get("cluster_n_ctas", 1) > 1):
+            return False
+    if seed.captured_config.get("masked_global_store"):
+        return not lhs_column_major and not rhs_column_major
+    if seed.transpose_output:
+        m, n = n, m
+        lhs_column_major, rhs_column_major = rhs_column_major, lhs_column_major
+    config = seed.builder_config
+    if seed.captured_config.get("output_store") == "global" and (
+        seed.transpose_output
+        or lhs_column_major or rhs_column_major
+        or seed.captured_config.get("output_tma_inner_size") is not None
+        or m % (int(config["output_m_tile"]) * int(config["output_m_tiles_per_cta"]))
+        or (not seed.captured_config.get("masked_global_store")
+            and n % (int(config["output_n_tile"]) * int(config["output_n_tiles_per_cta"])))
+    ):
+        return False
+    m_cluster = int(seed.captured_config.get("cluster_m_ctas", 1))
+    n_cluster = int(seed.captured_config.get("cluster_n_ctas", 1))
+    m_grid = math.ceil(m / (int(config["output_m_tile"]) * int(config["output_m_tiles_per_cta"])))
+    n_grid = math.ceil(n / (int(config["output_n_tile"]) * int(config["output_n_tiles_per_cta"])))
+    if m_grid % m_cluster or n_grid % n_cluster:
+        return False
+    return (not lhs_column_major or math.gcd(m, int(config["output_m_tile"]), 64) >= 16) and (not rhs_column_major or math.gcd(n, int(config["output_n_tile"]), 64) >= 16)
+
+
 def select_gemm_schedule(
     operation: str,
     dtype: str,
@@ -312,11 +366,39 @@ def select_gemm_schedule(
     n: int,
     k: int,
     batch: int = 1,
+    *,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_batch_interleaved: bool = False,
+    rhs_batch_interleaved: bool = False,
+    graph: bool = False,
 ) -> GemmScheduleSeed | None:
     """Return the nearest measured schedule legal for this GEMM, if any.
 
     A transferred schedule names its source shape in ``adaptations``.
     """
+    if (lhs_batch_interleaved or rhs_batch_interleaved) and operation != "bmm":
+        return None
+    if operation not in ("mm", "addmm", "bmm") or dtype not in _IR_DTYPES:
+        return None
+    # GEMV needs a separate design; these scalar-backed small GEMMs are deferred.
+    if m <= 1 or n <= 1 or (m, n, k) in DEFERRED_GEMM_SHAPES:
+        return None
+    if graph:
+        from . import gemm_schedule_table
+        if (batch, m, n, k) in getattr(gemm_schedule_table, "GRAPH_EXCLUDED_SHAPES", ()):
+            return None
+        routes = getattr(gemm_schedule_table, "GRAPH_SCHEDULES", {})
+        signature = (operation, dtype, batch, m, n, k)
+        key = signature
+        if key in routes:
+            captured = routes[key]
+            if captured is None:
+                return None
+            seed = _seed({**_DEFAULTS, **captured}, operation, m, n, k,
+                         (batch, m, n, k), exact=True)
+            return seed if seed is not None and _supports_operand_layouts(
+                seed, m, n, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved) else None
     table = SCHEDULES.get((operation, dtype), {})
     query = (batch, m, n, k)
 
@@ -336,7 +418,7 @@ def select_gemm_schedule(
                 shape,
                 exact=shape == query,
             )
-            if seed is not None:
+            if seed is not None and _supports_operand_layouts(seed, m, n, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved):
                 return seed
     return None
 
@@ -349,9 +431,17 @@ def _module(
     n: int,
     k: int,
     transpose_output: bool,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_batch_interleaved: bool = False,
+    rhs_batch_interleaved: bool = False,
 ) -> ModuleOp:
     d = _IR_DTYPES[dtype]
     a, bt = f"gmem<{m}x{k}x{d}>", f"gmem<{n}x{k}x{d}>"
+    if lhs_column_major:
+        a = f"gmem<{m}x{k}x{d} strides=[1, {m}]>"
+    if rhs_column_major:
+        bt = f"gmem<{n}x{k}x{d} strides=[1, {n}]>"
     c = f"gmem<{m}x{n}x{d}>"
     ct = f"gmem<{n}x{m}x{d} strides=[1, {n}]>"
     if operation == "addmm":
@@ -370,6 +460,20 @@ def _module(
     elif operation == "bmm":
         a3, bt3 = f"gmem<{batch}x{m}x{k}x{d}>", f"gmem<{batch}x{n}x{k}x{d}>"
         a1, bt1 = f"gmem<1x{m}x{k}x{d}>", f"gmem<1x{n}x{k}x{d}>"
+        if lhs_batch_interleaved:
+            a = f"gmem<{m}x{k}x{d} strides=[{batch*k}, 1]>"
+            a3 = f"gmem<{batch}x{m}x{k}x{d} strides=[{k}, {batch*k}, 1]>"
+            a1 = f"gmem<1x{m}x{k}x{d} strides=[{k}, {batch*k}, 1]>"
+        if rhs_batch_interleaved:
+            bt = f"gmem<{n}x{k}x{d} strides=[{batch*k}, 1]>"
+            bt3 = f"gmem<{batch}x{n}x{k}x{d} strides=[{k}, {batch*k}, 1]>"
+            bt1 = f"gmem<1x{n}x{k}x{d} strides=[{k}, {batch*k}, 1]>"
+        if lhs_column_major:
+            a3 = f"gmem<{batch}x{m}x{k}x{d} strides=[{m*k}, 1, {m}]>"
+            a1 = f"gmem<1x{m}x{k}x{d} strides=[{m*k}, 1, {m}]>"
+        if rhs_column_major:
+            bt3 = f"gmem<{batch}x{n}x{k}x{d} strides=[{n*k}, 1, {n}]>"
+            bt1 = f"gmem<1x{n}x{k}x{d} strides=[{n*k}, 1, {n}]>"
         if transpose_output:
             c3 = f"gmem<{batch}x{n}x{m}x{d} strides=[{m * n}, 1, {n}]>"
             c1 = f"gmem<1x{n}x{m}x{d} strides=[{m * n}, 1, {n}]>"
@@ -416,6 +520,10 @@ def build_gemm_module(
     n: int,
     k: int,
     seed: GemmScheduleSeed,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_batch_interleaved: bool = False,
+    rhs_batch_interleaved: bool = False,
 ) -> ModuleOp:
     """Build and schedule one GEMM exactly as the sweep measured ``seed``."""
     from .gemm_collection.gemm import schedule_matmul
@@ -423,7 +531,7 @@ def build_gemm_module(
     assert seed.builder_config is not None
     kwargs = dict(seed.builder_config)
     ptx_optimization_level = kwargs.pop("ptx_optimization_level")
-    module = _module(operation, dtype, batch, m, n, k, seed.transpose_output)
+    module = _module(operation, dtype, batch, m, n, k, seed.transpose_output, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved)
     [kernel] = module.body.ops
     assert isinstance(kernel, KernelOp)
     if ptx_optimization_level is not None:
@@ -435,6 +543,12 @@ def build_gemm_module(
 def gemm_jit_compiler(
     operation: str,
     dtype: str,
+    *,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_batch_interleaved: bool = False,
+    rhs_batch_interleaved: bool = False,
+    graph: bool = False,
 ) -> ShapeSpecializingJITCompiler:
     """Compile each concrete mm, addmm, or bmm shape from the schedule table.
 
@@ -444,6 +558,10 @@ def gemm_jit_compiler(
     from .ptx_codegen import make_ptx_kernel
     from .ptx_runtime import make_ptx_launcher
 
+    if (lhs_batch_interleaved or rhs_batch_interleaved) and (
+        operation != "bmm" or lhs_column_major or rhs_column_major
+    ):
+        raise ValueError("interleaved batch layouts require BMM with K-contiguous operands")
     if operation not in ("mm", "addmm", "bmm"):
         raise ValueError(f"unsupported GEMM operation {operation}")
     d = _IR_DTYPES[dtype]
@@ -452,12 +570,26 @@ def gemm_jit_compiler(
     template = gpu_dialect.parse(
         textwrap.dedent(f"""\
         module {{
-          kernel @jit_{operation}_{d}({bias}%a: {t}, %bt: {t}, %c: {t}) {{
+          kernel @jit_{operation}_{d}{'_ac' if lhs_column_major else ''}{'_bc' if rhs_column_major else ''}{'_ab' if lhs_batch_interleaved else ''}{'_bb' if rhs_batch_interleaved else ''}{'_graph' if graph else ''}({bias}%a: {t}, %bt: {t}, %c: {t}) {{
             matmul(%a: {t}, %bt: {t}, %c: {t}) collective=xyz.grid
           }}
         }}""")
     )
     assert isinstance(template, ModuleOp)
+    [template_kernel] = template.body.ops
+    offset = 1 if operation == "addmm" else 0
+    for arg_index, column in ((offset, lhs_column_major), (offset + 1, rhs_column_major)):
+        if column:
+            typ = template_kernel.body.arguments[arg_index].type
+            permutation = [*range(typ.rank - 2), typ.rank - 1, typ.rank - 2]
+            typ.attrs["permutation"] = permutation
+            typ.attrs["strides"] = GmemTensorType.canonical_strides(typ.sizes, permutation)
+
+    for arg_index, interleaved in ((offset, lhs_batch_interleaved), (offset + 1, rhs_batch_interleaved)):
+        if interleaved:
+            typ = template_kernel.body.arguments[arg_index].type
+            typ.attrs["permutation"] = [1, 0, 2]
+            typ.attrs["strides"] = GmemTensorType.canonical_strides(typ.sizes, [1, 0, 2])
 
     def compile_specialization(module: ModuleOp):
         [kernel] = module.body.ops
@@ -470,7 +602,7 @@ def gemm_jit_compiler(
         bt = cast(tuple[int, ...], bt)
         *batch, m, k = a
         n = bt[-2]
-        schedule = select_gemm_schedule(operation, dtype, m, n, k, *batch)
+        schedule = select_gemm_schedule(operation, dtype, m, n, k, *batch, lhs_column_major=lhs_column_major, rhs_column_major=rhs_column_major, lhs_batch_interleaved=lhs_batch_interleaved, rhs_batch_interleaved=rhs_batch_interleaved, graph=graph)
         if schedule is None:
             raise ValueError(
                 f"{kernel.name}: no schedule for {operation} {tuple(batch)}x{m}x{n}x{k}"
@@ -483,22 +615,36 @@ def gemm_jit_compiler(
             n,
             k,
             schedule,
+            lhs_column_major=lhs_column_major,
+            rhs_column_major=rhs_column_major,
+            lhs_batch_interleaved=lhs_batch_interleaved,
+            rhs_batch_interleaved=rhs_batch_interleaved,
         )
         return make_ptx_launcher(make_ptx_kernel(scheduled))
 
     return ShapeSpecializingJITCompiler(template, compile_specialization)
 
 
-@cache
 def gemm_op(
     operation: str,
     dtype: str,
     namespace: str = DEFAULT_NAMESPACE,
+    *,
+    lhs_column_major: bool = False,
+    rhs_column_major: bool = False,
+    lhs_batch_interleaved: bool = False,
+    rhs_batch_interleaved: bool = False,
+    graph: bool = False,
 ) -> torch._ops.OpOverload:
     """Torch op ``(bias?, a, bt, out) -> ()`` writing ``out = [bias +] a @ bt^T``."""
+    return _gemm_op(operation, dtype, namespace, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved, graph)
+
+
+@cache
+def _gemm_op(operation, dtype, namespace, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved, graph):
     from .torch_custom_call import make_torch_custom_call
 
-    compiler = gemm_jit_compiler(operation, dtype)
+    compiler = gemm_jit_compiler(operation, dtype, lhs_column_major=lhs_column_major, rhs_column_major=rhs_column_major, lhs_batch_interleaved=lhs_batch_interleaved, rhs_batch_interleaved=rhs_batch_interleaved, graph=graph)
     inputs = 3 if operation == "addmm" else 2
     return make_torch_custom_call(
         compiler,

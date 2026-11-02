@@ -80,7 +80,11 @@ class JITCompiler:
             raise ValueError(f"{self.name}: all tensors must be on one CUDA device")
         for tensor, typ in zip(tensors, self.signature, strict=True):
             assert isinstance(typ, GmemTensorType)
-            if typ.is_canonical_strides:
+            if (permutation := typ.attrs.get("permutation")) is not None:
+                expected = GmemTensorType.canonical_strides(list(tensor.shape), permutation)
+                if tuple(tensor.stride()) != tuple(expected):
+                    raise ValueError(f"{self.name}: expected dense permutation {permutation}, shape={tuple(tensor.shape)}, strides={tuple(tensor.stride())}, expected={tuple(expected)}")
+            elif typ.is_canonical_strides:
                 if not tensor.is_contiguous():
                     raise ValueError(f"{self.name}: expected contiguous tensors")
             elif tuple(tensor.stride()) != tuple(typ.strides):
@@ -169,7 +173,10 @@ class ShapeSpecializingJITCompiler(JITCompiler):
             )
         for typ in kernel.signature:
             assert isinstance(typ, GmemTensorType)
-            if not typ.is_canonical_strides:
+            permutation = typ.attrs.get("permutation")
+            if permutation is not None and sorted(permutation) != list(range(typ.rank)):
+                raise ValueError("invalid dense argument permutation")
+            if not typ.is_canonical_strides and permutation is None:
                 raise ValueError(
                     "ShapeSpecializingJITCompiler requires canonical gmem layouts"
                 )

@@ -1,4 +1,4 @@
-"""Route native-layout FP16/BF16 MM, ADDMM, and BMM through measured JIT schedules."""
+"""Route measured FP16/BF16 GEMMs, including explicitly selected layout copies."""
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -26,6 +26,9 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from . import gemm_collection  # noqa: F401 -- registers collection ops
+
+_materialize_gemms: bool | frozenset[tuple] = frozenset()
+_direct_layout_gemms: bool | frozenset[tuple] = frozenset()
 
 
 class AylaTemplateBuffer(ir.TemplateBuffer):
@@ -135,24 +138,60 @@ def _lower_jit(operation, lhs, rhs, bias=None, *, layout=None):
     ):
         return None
     *batch, m, k, n = sizes
+    signature = (operation, dtype, batch[0] if batch else 1, m, n, k)
+    may_materialize = _materialize_gemms is True or signature in _materialize_gemms
     # A row-major A and a column-major B: ayla's A @ BT^T with contiguous BT.
     contiguous = list(ir.FlexibleLayout.contiguous_strides(lhs.get_size()))
-    if _static(*lhs.get_stride()) != _static(*contiguous):
+    native_lhs = _static(*lhs.get_stride()) == _static(*contiguous)
+    native_rhs = _static(*rhs.get_stride()) == (*([n * k] if batch else []), 1, k)
+    direct = _direct_layout_gemms is True or signature in _direct_layout_gemms
+    lhs_column = (direct and m % 16 == 0
+                  and _static(*lhs.get_stride()) == (*([m * k] if batch else []), 1, m))
+    rhs_column = (direct and n % 16 == 0
+                  and _static(*rhs.get_stride()) == (*([n * k] if batch else []), n, 1))
+    # Dense [M, batch, K] storage keeps K contiguous and interleaves batches.
+    # TMA reads its row stride directly; no operand materialization is needed.
+    lhs_interleaved = (direct and operation == "bmm" and len(batch) == 1
+                       and k % 8 == 0
+                       and _static(*lhs.get_stride()) == (k, batch[0] * k, 1))
+    rhs_interleaved = (direct and operation == "bmm" and len(batch) == 1
+                       and k % 8 == 0
+                       and _static(*rhs.get_stride()) == (k, 1, batch[0] * k))
+    if not native_lhs and not lhs_column and not lhs_interleaved and not may_materialize:
         return None
-    if _static(*rhs.get_stride()) != (*([n * k] if batch else []), 1, k):
+    if not native_rhs and not rhs_column and not rhs_interleaved and not may_materialize:
         return None
-    inputs = [ir.ExternKernel.require_contiguous(lhs), rhs]
     if bias is not None:
         if (
             bias.get_dtype() != lhs.get_dtype()
             or _static(*bias.get_size()) != (n,)
         ):
             return None
-        inputs.insert(0, ir.ExternKernel.require_contiguous(bias))
-    if select_gemm_schedule(operation, dtype, m, n, k, *batch) is None:
+    if select_gemm_schedule(operation, dtype, m, n, k, *batch, lhs_column_major=bool(lhs_column), rhs_column_major=bool(rhs_column), lhs_batch_interleaved=bool(lhs_interleaved), rhs_batch_interleaved=bool(rhs_interleaved), graph=True) is None:
         return None
+    if rhs_interleaved:
+        rhs = ir.ExternKernel.require_exact_strides(rhs, [k, 1, batch[0] * k])
+    elif rhs_column:
+        rhs = ir.ExternKernel.require_contiguous(rhs)
+    elif native_rhs:
+        rhs = ir.ExternKernel.require_exact_strides(rhs, [*([n * k] if batch else []), 1, k])
+    else:
+        dims = [*range(len(batch)), len(batch) + 1, len(batch)]
+        bt = ir.ExternKernel.require_contiguous(ir.PermuteView.create(rhs, dims))
+        rhs = ir.PermuteView.create(bt, dims)
+    if lhs_interleaved:
+        lhs = ir.ExternKernel.require_exact_strides(lhs, [k, batch[0] * k, 1])
+    else:
+        lhs = (ir.ExternKernel.require_exact_strides(lhs, [*([m * k] if batch else []), 1, m])
+           if lhs_column else ir.ExternKernel.require_contiguous(lhs))
+    from . import gemm_schedule_table
+    routes = getattr(gemm_schedule_table, "GRAPH_SCHEDULES", {})
+    graph_schedule = signature in routes
+    inputs = [lhs, rhs]
+    if bias is not None:
+        inputs.insert(0, ir.ExternKernel.require_contiguous(bias))
     return TensorBox.create(AylaTemplateBuffer(
-        layout=layout, inputs=inputs, jit_op=gemm_op(operation, dtype),
+        layout=layout, inputs=inputs, jit_op=gemm_op(operation, dtype, lhs_column_major=bool(lhs_column), rhs_column_major=bool(rhs_column), lhs_batch_interleaved=bool(lhs_interleaved), rhs_batch_interleaved=bool(rhs_interleaved), graph=graph_schedule),
     ))
 
 
@@ -179,9 +218,21 @@ _displaced_user_lowerings: dict[object, Callable[..., Any]] = {}
 _displaced_backend = None
 
 
-def install() -> None:
+def install(
+    *,
+    materialize_gemms: bool | Sequence[tuple] | None = None,
+    direct_layout_gemms: bool | Sequence[tuple] | None = None,
+) -> None:
     """Install measured single-GEMM lowerings for Inductor."""
-    global _displaced_backend
+    global _displaced_backend, _materialize_gemms, _direct_layout_gemms
+    if materialize_gemms is None:
+        from . import gemm_schedule_table
+        materialize_gemms = getattr(gemm_schedule_table, "MATERIALIZE_GEMMS", ())
+    _materialize_gemms = True if materialize_gemms is True else frozenset(materialize_gemms or ())
+    if direct_layout_gemms is None:
+        from . import gemm_schedule_table
+        direct_layout_gemms = getattr(gemm_schedule_table, "DIRECT_LAYOUT_GEMMS", ())
+    _direct_layout_gemms = True if direct_layout_gemms is True else frozenset(direct_layout_gemms or ())
     init_backend_registration()
     if _displaced_backend is None:
         _displaced_backend = device_codegens["cuda"]
@@ -195,7 +246,15 @@ def install() -> None:
 
     for operation in ("mm", "addmm", "bmm"):
         for dtype in ("float16", "bfloat16"):
-            gemm_op(operation, dtype)
+            for ac, bc in ((False,False),(False,True),(True,False),(True,True)):
+                for graph in (False, True):
+                    gemm_op(operation, dtype, lhs_column_major=ac, rhs_column_major=bc, graph=graph)
+
+    for dtype in ("float16", "bfloat16"):
+        for ab, bb in ((True, False), (False, True), (True, True)):
+            for graph in (False, True):
+                gemm_op("bmm", dtype, lhs_batch_interleaved=ab,
+                        rhs_batch_interleaved=bb, graph=graph)
 
     for target, lowering in _LOWERINGS.items():
         current = user_lowerings.get(target)

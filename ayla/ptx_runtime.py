@@ -436,8 +436,12 @@ class PtxLauncher:
                 block_width, block_order = (
                     (0, "row_major") if layout is None else layout
                 )
+                tensor = tensors[self._arg_to_tensor[typ.arg_idx]]
+                if (tensor.ndim >= 2 and tensor.stride(-1) != 1
+                        and tensor.stride(-2) == 1 and typ.gmem_type.is_canonical_strides):
+                    tensor = tensor.transpose(-1, -2)
                 params.append((
-                    tensors[self._arg_to_tensor[typ.arg_idx]],
+                    tensor,
                     list(typ.tile_sizes),
                     typ.swizzle or "",
                     block_width,

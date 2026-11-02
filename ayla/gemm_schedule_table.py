@@ -3072,3 +3072,41 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 401536, 512, 64): (369,),
     },
 }
+
+# Deferred small GEMMs whose measured routes used experimental scalar kernels.
+# GEMV-shaped inputs (M=1 or N=1) are declined generically by admission.
+DEFERRED_GEMM_SHAPES = frozenset({
+    (16, 16, 128),
+    (128, 16, 16),
+    (5, 5, 64),
+})
+
+# Stock profiles use split-K on these geometries, or the competitive schedule
+# needs it. Keep graph capture on Inductor until K partitioning is supported.
+GRAPH_EXCLUDED_SHAPES = frozenset({
+    (1, 4, 1000, 4096),
+    (1, 4, 4096, 25088),
+    (1, 64, 1000, 4096),
+    (1, 96, 65, 512),
+    (1, 128, 128, 401408),
+    (1, 128, 512, 401408),
+    (1, 256, 256, 100352),
+    (1, 256, 512, 100352),
+    (1, 256, 512, 197951),
+    (1, 256, 512, 197952),
+    (1, 256, 1024, 100352),
+    (1, 384, 128, 401408),
+    (1, 512, 128, 401408),
+    (1, 512, 512, 25088),
+    (1, 512, 1024, 25088),
+    (1, 512, 2048, 25088),
+    (1, 768, 256, 100352),
+    (1, 1000, 32, 2880),
+    (1, 1024, 256, 100352),
+    (1, 1536, 512, 25088),
+    (1, 2048, 512, 25088),
+    (1, 4096, 2, 2048),
+})
+
+# Paired full-workload routing decisions for torch.compile integration.
+from .graph_gemm_schedules import GRAPH_SCHEDULES, DIRECT_LAYOUT_GEMMS, MATERIALIZE_GEMMS

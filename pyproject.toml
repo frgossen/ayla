@@ -21,6 +21,9 @@ dev = ["pyright", "pytest", "ruff"]
 include = ["ayla*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+ayla = ["better_benchmark_gemm_router.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

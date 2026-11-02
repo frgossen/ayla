@@ -43,6 +43,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
+    masked_global_store: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     ptx_optimization_level: int | None = None,
     dtype: str = "bf16",
@@ -128,5 +129,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,
         output_store=output_store,
+        masked_global_store=masked_global_store,
         operand_move_attrs=operand_move_attrs,
     ).run(module)

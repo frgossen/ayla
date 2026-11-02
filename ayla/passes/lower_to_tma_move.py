@@ -10,8 +10,8 @@ A move wrapped in ``async { move (tma) }`` is lowered so the coordinate index
 arithmetic lands *before* the enclosing ``async`` op and only the ``tma_move``
 stays in the body, leaving ``index ops…; async { tma_move }``. The index math is
 plain, side-effect-free arithmetic with no reason to sit inside the mbarrier
-block, and keeping it out gives ``lower_async`` (PTX lowering) the single-op
-``tma_move`` body it expects. Non-tma moves and other ops are left untouched.
+block, and keeping it out gives ``lower_async`` (PTX lowering) one or more
+``tma_move`` operations sharing a commit group. Non-tma moves and other ops are left untouched.
 """
 
 from __future__ import annotations
@@ -56,6 +56,37 @@ class LowerToTmaMove(LoweringPass):
     ) -> tuple[list[Op], list[object]] | None:
         if not op.attrs.get("tma"):
             return None
+        # A global column count that is not divisible by the SMEM atom
+        # remains a flat tensor. Store each SMEM atom in one dense box.
+        if isinstance(op.src.type, SmemTensorType) and isinstance(
+            op.dst.type, GmemTensorType
+        ):
+            smem = cast(Value, self.value_map[op.src])
+            layout = smem.type.attrs.get("physical_layout")
+            root = op.dst
+            while isinstance(root.definition, (TileOp, ReshapeOp)):
+                root = root.definition.arg
+            columns = root.type.sizes[-1]
+            width = layout.get("block_width") if layout else None
+            tile_columns = smem.type.sizes[-1]
+            if (
+                not is_column_major(smem.type)
+                and isinstance(width, int)
+                and isinstance(columns, int)
+                and columns % width
+                and tile_columns > width
+            ):
+                assert tile_columns % width == 0
+                new_ops = []
+                for part in range(tile_columns // width):
+                    typ = clone_type(smem.type)
+                    typ.sizes = [*typ.sizes[:-1], width]
+                    tile = TileOp.build(smem, [0, part], typ)
+                    index_ops, move = self._materialize(
+                        op, smem=tile.result(), column_offset=part * width
+                    )
+                    new_ops += [tile, *index_ops, move]
+                return new_ops, []
         slices = _multicast_slices(op, cast(Value, self.value_map[op.dst]))
         if slices == 1:
             index_ops, tma_op = self._materialize(op)
@@ -106,6 +137,7 @@ class LowerToTmaMove(LoweringPass):
         move: MoveOp,
         smem: Value | None = None,
         row_offset: int = 0,
+        column_offset: int = 0,
     ) -> tuple[list[Op], TmaMoveOp]:
         """Build the descriptor + index ops and a sync ``tma_move`` for ``move``.
 
@@ -122,12 +154,14 @@ class LowerToTmaMove(LoweringPass):
             assert isinstance(smem.type, SmemTensorType)
             rows = cast(int, smem.type.sizes[0])
             assert row_offset % rows == 0
+            columns = cast(int, smem.type.sizes[-1])
+            assert column_offset % columns == 0
             view_type = clone_type(gmem_operand.type)
             assert isinstance(view_type, GmemTensorType)
             view_type.sizes = list(smem.type.sizes)
             gmem_operand = TileOp.build(
                 gmem_operand,
-                [row_offset // rows, 0],
+                [row_offset // rows, column_offset // columns],
                 view_type,
             ).result()
         else:
@@ -177,6 +211,18 @@ class LowerToTmaMove(LoweringPass):
                     "lower_to_tma_move: column-major view must be a dense "
                     f"transpose; got {root.type}"
                 )
+        # One SMEM swizzle atom is a dense 2-D box. Describe the original
+        # global tensor when its last dimension cannot be blocked exactly.
+        if layout is not None:
+            width = layout.get("block_width")
+            columns = gmem_type.sizes[-1]
+            if (
+                isinstance(width, int)
+                and isinstance(columns, int)
+                and tile_shape[-1] == width
+                and columns % width
+            ):
+                desc_attrs.pop("physical_layout", None)
         tma_type = TmaDescType.build(
             arg_idx=root.result_index,
             gmem_type=gmem_type,

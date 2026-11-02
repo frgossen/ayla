@@ -200,6 +200,24 @@ class KernelOp(GpuOp):
         return math.prod(self.block_dim)  # type: ignore[arg-type]
 
     @property
+    def resolved_num_warp_groups(self) -> int | None:
+        """Physical warpgroup count, unknown for incomplete/conflicting topology."""
+        threads = self.num_threads
+        if threads is None:
+            return None
+        groups, remainder = divmod(threads, HW_LEVEL_IDS[CollectiveLevel.WG].threads_per_id)
+        if remainder:
+            return None
+        if self.num_warp_groups is not None and self.num_warp_groups != groups:
+            return None
+        return groups
+
+    @property
+    def is_clustered(self) -> bool:
+        """Whether the launch has more than one CTA per cluster."""
+        return math.prod(dim if dim is not None else 1 for dim in self.cluster_dim) > 1
+
+    @property
     def extra_attrs(self) -> dict[str, object]:
         return {
             k: v
@@ -1255,6 +1273,15 @@ class AwaitOp(GpuOp):
     @lock.setter
     def lock(self, value: Value) -> None:
         self.operands[0] = value
+
+    @property
+    def pending_groups(self) -> int:
+        return cast(int, self.attrs.get("pending", 0))
+
+    @property
+    def is_full_wait(self) -> bool:
+        """Whether this wait leaves no newer hardware groups pending."""
+        return self.pending_groups == 0
 
 
 @gpu_dialect.register_op("barrier")
