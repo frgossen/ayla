@@ -46,6 +46,7 @@ from ..gpu_dialect import (
     ConstantOp,
     SelectOp,
     SmemTensorType,
+    TmemTensorType,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -101,9 +102,12 @@ def _non_unit_layout(
 
 
 def _verify_transposed_fragment_store(op: MoveOp) -> None:
-    """A WGMMA fragment reaches column-major smem only through STMatrix.trans."""
+    """An m16n8 fragment reaches column-major smem only through STMatrix.trans."""
     src = op.src.type
-    if not (isinstance(src, WgrmemTensorType) and src.layout == "wgmma_layout_0"):
+    if not (
+        isinstance(src, WgrmemTensorType)
+        and src.layout in ("wgmma_layout_0", "tcgen05_16x256b")
+    ):
         return
     dst_root = root_buffer(op.dst)
     if dst_root is None or not is_column_major(dst_root.type):
@@ -403,12 +407,12 @@ class VerifyGpuDialect(VerificationPass):
         result_type = op.result().type
         if type(arg_type) is not type(result_type):
             raise ValueError("tile must preserve its operand's memory space")
-        if not isinstance(arg_type, (AddrMemTensorType, WgrmemTensorType)):
+        if not isinstance(arg_type, (AddrMemTensorType, WgrmemTensorType, TmemTensorType)):
             raise ValueError(
                 "tile operand and result must be address-backed memory "
-                "tensors or wgrmem"
+                "tensors, wgrmem, or tmem"
             )
-        assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType))
+        assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType, TmemTensorType))
         if not (arg_type.rank == result_type.rank == len(op.indices)):
             raise ValueError(
                 "tile operand rank, result rank, and number of indices must "

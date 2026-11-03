@@ -23,7 +23,10 @@ queue, the loop already represents an unrolled software pipeline.  In that
 case the pass pipelines completion instead: each stage partially awaits the
 preceding stage and a full await after the loop drains the queue.
 """
+
 from __future__ import annotations
+
+from typing import cast
 
 from ..gpu_dialect import (
     AsyncOp,
@@ -38,10 +41,12 @@ from ..gpu_dialect import (
     has_ordering_effect,
     is_side_effect_free,
     memory_effects,
+    ordered_async_roots,
 )
 from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
+from ._loop_utils import clone_loop_iteration
 
 
 class PipelineLoop(LoweringPass):
@@ -64,7 +69,9 @@ class PipelineLoop(LoweringPass):
         )
 
     def _pipeline_queued_async(
-        self, op: ForOp, selected: list[AsyncOp],
+        self,
+        op: ForOp,
+        selected: list[AsyncOp],
     ) -> tuple[list[Op], list[object]]:
         """Pipeline completion of an unrolled hardware async queue.
 
@@ -77,7 +84,8 @@ class PipelineLoop(LoweringPass):
         previous_issues = [selected[-1], *selected[:-1]]
         for previous, issue in zip(previous_issues, selected, strict=True):
             matching = [
-                user for user in issue.lock.users()
+                user
+                for user in issue.lock.users()
                 if isinstance(user, AwaitOp) and user.parent_block is op.body
             ]
             if len(matching) != 1:
@@ -87,15 +95,66 @@ class PipelineLoop(LoweringPass):
                 )
             [wait] = matching
             replacements[wait] = AwaitOp.build(
-                previous.lock, attrs={**wait.attrs, "pending": 1},
+                previous.lock,
+                attrs={**wait.attrs, "pending": 1},
             )
-        op.body.ops = [
-            replacements.get(body_op, body_op) for body_op in op.body.ops
-        ]
+        op.body.ops = [replacements.get(body_op, body_op) for body_op in op.body.ops]
         return [op, AwaitOp.build(selected[-1].lock)], []
 
+    def _pipeline_event_async(
+        self,
+        op: ForOp,
+        selected: list[AsyncOp],
+    ) -> tuple[list[Op], list[object]]:
+        """Carry the final completion event into the next loop iteration.
+
+        Other waits stay with their buffer reuse. ScheduleAsync may issue
+        independent work ahead of them, but must wait before reusing a lock.
+        Peel the first iteration: its final event has not been issued yet.
+        """
+        if not all(ordered_async_roots(issue) for issue in selected):
+            raise ValueError("Pipeline: ordered event queue requires MMA batches")
+        if len({issue.lock for issue in selected}) != len(selected):
+            raise ValueError(
+                "Pipeline: queued batches require distinct completion events"
+            )
+        completions: dict[AsyncOp, AwaitOp] = {}
+        for issue in selected:
+            following = [
+                body_op
+                for body_op in op.body.ops
+                if isinstance(body_op, AwaitOp) and body_op.lock is issue.lock
+            ]
+            if len(following) != 1 or op.body.ops.index(
+                following[0]
+            ) < op.body.ops.index(issue):
+                raise ValueError(
+                    "Pipeline: ordered event issue needs one following await"
+                )
+            completions[issue] = following[0]
+        last = selected[-1]
+        wait = completions[last]
+        if any(
+            not self._can_reorder(wait, trailing)
+            for trailing in op.body.ops[op.body.ops.index(wait) + 1 :]
+        ):
+            raise ValueError(
+                "Pipeline: completion cannot move past a dependent operation"
+            )
+        op.body.ops = [body_op for body_op in op.body.ops if body_op is not wait]
+        iv = IndexConstantOp.build(op.lb)
+        prologue = [iv, *clone_loop_iteration(op, iv.result(), "_front0")]
+        op.body.ops = [wait, *op.body.ops]
+        op.lb += op.step
+        return [
+            *prologue,
+            *([op] if op.trip_count else []),
+            AwaitOp.build(last.lock),
+        ], []
+
     def _compute_labeled_and_shared(
-        self, body_ops: list[Op],
+        self,
+        body_ops: list[Op],
     ) -> tuple[set[Op], set[Op]]:
         """Compute the labeled and shared sets of in-body ops.
 
@@ -112,7 +171,8 @@ class PipelineLoop(LoweringPass):
             r: body_op for body_op in body_ops for r in body_op.results
         }
         matched = [
-            body_op for body_op in body_ops
+            body_op
+            for body_op in body_ops
             if label_matches(body_op, self.label_filter_op)
         ]
         shared: set[Op] = {op for op in matched if is_side_effect_free(op)}
@@ -133,7 +193,10 @@ class PipelineLoop(LoweringPass):
         return labeled, shared
 
     def _check_ssa_closure(
-        self, body_ops: list[Op], labeled_set: set[Op], shared_set: set[Op],
+        self,
+        body_ops: list[Op],
+        labeled_set: set[Op],
+        shared_set: set[Op],
     ) -> None:
         """Labeled and unlabeled in-body ops must be SSA-disjoint:
         neither set may consume an SSA result produced by the other.
@@ -178,7 +241,6 @@ class PipelineLoop(LoweringPass):
                         f"out-of-loop buffers"
                     )
 
-
     def _can_reorder(self, earlier: Op, later: Op) -> bool:
         """Whether `earlier` and `later` may be swapped without
         changing observable semantics.
@@ -205,7 +267,9 @@ class PipelineLoop(LoweringPass):
         return True
 
     def _check_legal_for_offset_one(
-        self, body_ops: list[Op], labeled_set: set[Op],
+        self,
+        body_ops: list[Op],
+        labeled_set: set[Op],
         shared_set: set[Op],
     ) -> None:
         """For ``pipelining_offset == 1`` the transformation moves all
@@ -236,7 +300,9 @@ class PipelineLoop(LoweringPass):
                 unlabeled_seen.append(body_op)
 
     def _check_legal_for_offset_gt_one(
-        self, body_ops: list[Op], labeled_set: set[Op],
+        self,
+        body_ops: list[Op],
+        labeled_set: set[Op],
         shared_set: set[Op],
     ) -> None:
         """For ``pipelining_offset > 1`` every labeled op is hoisted by
@@ -257,7 +323,8 @@ class PipelineLoop(LoweringPass):
         """
         labeled = [body_op for body_op in body_ops if body_op in labeled_set]
         unlabeled = [
-            body_op for body_op in body_ops
+            body_op
+            for body_op in body_ops
             if body_op not in labeled_set and body_op not in shared_set
         ]
         for u in unlabeled:
@@ -272,13 +339,15 @@ class PipelineLoop(LoweringPass):
                     )
 
     def _check_legality(
-        self, body_ops: list[Op], labeled_set: set[Op], shared_set: set[Op],
+        self,
+        body_ops: list[Op],
+        labeled_set: set[Op],
+        shared_set: set[Op],
     ) -> None:
         """Raise ValueError if pipelining `labeled_set` ahead by
         ``self.pipelining_offset`` iterations is not legal."""
         assert self.pipelining_offset > 0, (
-            "Pipeline: _check_legality only meaningful for "
-            "pipelining_offset > 0"
+            "Pipeline: _check_legality only meaningful for pipelining_offset > 0"
         )
         self._check_ssa_closure(body_ops, labeled_set, shared_set)
         if self.pipelining_offset == 1:
@@ -291,7 +360,8 @@ class PipelineLoop(LoweringPass):
 
     @lowers(ForOp)
     def lower_for(
-        self, op: ForOp,
+        self,
+        op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
         if self.pipelining_offset <= 0:
             return None
@@ -313,25 +383,33 @@ class PipelineLoop(LoweringPass):
 
         body_ops = op.body.ops
         selected_async = [
-            body_op for body_op in body_ops
+            body_op
+            for body_op in body_ops
             if isinstance(body_op, AsyncOp)
             and label_matches(body_op, self.label_filter_op)
         ]
         if selected_async and all(
             isinstance(issue.lock.type, LockType)
-            and issue.lock.type.supports_partial_await
+            and issue.lock.type.orders_async_writes
             for issue in selected_async
         ):
             if self.pipelining_offset != 1:
                 raise ValueError(
                     "Pipeline: queued async completion requires offset one"
                 )
-            return self._pipeline_queued_async(op, selected_async)
+            kinds = {cast(LockType, issue.lock.type).kind for issue in selected_async}
+            if len(kinds) != 1:
+                raise ValueError("Pipeline: queued issues must use the same mechanism")
+            if cast(LockType, selected_async[0].lock.type).supports_partial_await:
+                return self._pipeline_queued_async(op, selected_async)
+            return self._pipeline_event_async(op, selected_async)
 
         labeled_set, shared_set = self._compute_labeled_and_shared(body_ops)
         labeled = [o for o in body_ops if o in labeled_set]
         shared = [o for o in body_ops if o in shared_set]
-        unlabeled = [o for o in body_ops if o not in labeled_set and o not in shared_set]
+        unlabeled = [
+            o for o in body_ops if o not in labeled_set and o not in shared_set
+        ]
         if not labeled:
             return [op], []
 
@@ -343,9 +421,7 @@ class PipelineLoop(LoweringPass):
             iv_const = IndexConstantOp.build(value=lb + i * step)
             prologue_ops.append(iv_const)
             vmap: dict[Value, Value] = {op.iv: iv_const.result()}
-            prologue_ops.extend(
-                clone_op(body_op, vmap) for body_op in shared + labeled
-            )
+            prologue_ops.extend(clone_op(body_op, vmap) for body_op in shared + labeled)
 
         # Main loop body: shared + unlabeled at iv, then shared + labeled at iv + n*step.
         new_iv = Value(name=op.iv.name, type=IndexType())
@@ -361,8 +437,9 @@ class PipelineLoop(LoweringPass):
             new_body_ops.append(clone_op(body_op, vmap))
         new_body = Block(arguments=[new_iv], ops=new_body_ops)
         new_ub = ub - n * step
-        new_for = ForOp.build(lb=lb, ub=new_ub, step=step, body=new_body,
-                              attrs=op.extra_attrs)
+        new_for = ForOp.build(
+            lb=lb, ub=new_ub, step=step, body=new_body, attrs=op.extra_attrs
+        )
 
         # Epilogue: shared + unlabeled ops for iv = new_ub, ..., ub-step.
         epilogue_ops: list[Op] = []
@@ -384,4 +461,6 @@ def pipeline_loop(
     pipelining_offset: int,
 ) -> ModuleOp:
     """Convenience entry point."""
-    return PipelineLoop(label_filter_loop, label_filter_op, pipelining_offset).run(module)
+    return PipelineLoop(label_filter_loop, label_filter_op, pipelining_offset).run(
+        module
+    )

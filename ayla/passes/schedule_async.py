@@ -17,6 +17,7 @@ the ops that define its operands.
 from __future__ import annotations
 
 import functools
+from typing import cast
 
 from ..gpu_dialect import (
     AllocOp,
@@ -29,7 +30,9 @@ from ..gpu_dialect import (
     has_ordering_effect,
     is_side_effect_free,
     memory_effects,
+    ordered_async_roots,
     ModuleOp,
+    LockType,
     MoveOp,
 )
 from ..base.ir import Block, Op, Value
@@ -44,9 +47,7 @@ def _is_async_move(op: Op) -> bool:
     """
     if isinstance(op, TmaMoveOp):
         return True
-    return isinstance(op, AsyncOp) and all(
-        isinstance(o, MoveOp) for o in op.body.ops
-    )
+    return isinstance(op, AsyncOp) and all(isinstance(o, MoveOp) for o in op.body.ops)
 
 
 def _is_register_load(op: Op) -> bool:
@@ -67,14 +68,8 @@ def _effect_roots(op: Op) -> tuple[set[Value], set[Value]] | None:
     effects = memory_effects(op)
     if effects is None:
         return None
-    reads = {
-        root for effect in effects if effect.kind == "R"
-        for root in effect.roots
-    }
-    writes = {
-        root for effect in effects if effect.kind == "W"
-        for root in effect.roots
-    }
+    reads = {root for effect in effects if effect.kind == "R" for root in effect.roots}
+    writes = {root for effect in effects if effect.kind == "W" for root in effect.roots}
     return reads, writes
 
 
@@ -96,6 +91,18 @@ def _can_swap(upper: Op, lower: Op, effect_roots=_effect_roots) -> bool:
     # RAW, WAR, or WAW conflict on the same buffer.
     upper_r, upper_w = upper_roots
     lower_r, lower_w = lower_roots
+    # A completion wait may pass another issue to the same ordered engine.
+    # Preserve issue order, and never reuse the event before observing it.
+    wait, issue = (upper, lower) if isinstance(upper, AwaitOp) else (lower, upper)
+    if isinstance(wait, AwaitOp) and isinstance(issue, AsyncOp):
+        if wait.lock is issue.lock:
+            return False
+        if cast(LockType, wait.lock.type).kind == cast(LockType, issue.lock.type).kind:
+            ordered = ordered_async_roots(issue)
+            peers = [peer for peer in wait.lock.users() if isinstance(peer, AsyncOp)]
+            ordered &= set().union(*(ordered_async_roots(peer) for peer in peers))
+            upper_r, upper_w = upper_r - ordered, upper_w - ordered
+            lower_r, lower_w = lower_r - ordered, lower_w - ordered
     if lower_w & upper_r or lower_r & upper_w or lower_w & upper_w:
         return False
 
@@ -171,9 +178,7 @@ def _hoist_async_moves(ops: list[Op]) -> None:
     # An allocation without an initializer has no operands, so move those back
     # to the front, in order: lock initializations then stay together, and one
     # barrier publishes them all.
-    allocations = [
-        op for op in ops if isinstance(op, AllocOp)
-    ]
+    allocations = [op for op in ops if isinstance(op, AllocOp)]
     ops[:] = allocations + [op for op in ops if op not in set(allocations)]
 
 
@@ -184,13 +189,24 @@ def _sink_awaits(ops: list[Op]) -> None:
 
 
 class ScheduleAsync(Pass):
+    def __init__(self, *, pipeline_compute: bool = False) -> None:
+        super().__init__(pipeline_compute=pipeline_compute)
+        self.pipeline_compute = pipeline_compute
 
     def run_block(self, block: Block) -> None:
         # Reorder a plain list: every write to ``block.ops`` re-syncs the whole
         # block, which makes bubbling through it cubic.
         ops = list(block.ops)
-        _hoist_async_moves(ops)
-        _sink_awaits(ops)
+        if self.pipeline_compute:
+            # Queue MMA by delaying completion, preserving issue/readiness
+            # order. Then refill each released bank as early as possible.
+            # Hoisting compute instead can postpone a refill behind a TMA
+            # readiness wait and collapse the operand prefetch window.
+            _sink_awaits(ops)
+            _hoist_async_moves(ops)
+        else:
+            _hoist_async_moves(ops)
+            _sink_awaits(ops)
         block.ops = ops
         super().run_block(block)
 

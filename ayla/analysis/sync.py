@@ -8,6 +8,7 @@ from typing import cast
 
 from ..gpu_dialect import (
     AllocOp,
+    DeallocOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
@@ -38,6 +39,7 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     WarpIdsOp,
     memory_effects,
+    ordered_async_roots,
     lock_has_tma_multicast,
 )
 from ..base.ir import Op, Value, find_ancestor_of_type
@@ -371,6 +373,8 @@ def _lock_completion_scope(lock: Value) -> CollectiveScope:
     """Baseline completion scope for the work named by this hardware lock."""
     assert isinstance(lock.type, LockType)
     kind = lock.type.kind
+    if kind == "tcgen05":
+        return CollectiveScope.BLOCK
     if kind == "wgmma":
         return CollectiveScope.WARPGROUP
     if kind == "mbar":
@@ -419,9 +423,22 @@ def _transfer_memory_effects(
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
     release_after: set[Op | None] = set()
+    ordered = ordered_async_roots(op) if async_lock is not None else set()
     for current in effects:
         for root in current.roots:
             for prior in live.concurrent_memory_effects.get(root, ()):
+                if (
+                    root in ordered
+                    and async_lock is not None
+                    and prior.lock is not None
+                    and cast(LockType, prior.lock.type).kind == cast(LockType, async_lock.type).kind
+                    and any(
+                        root in ordered_async_roots(peer)
+                        for peer in prior.lock.users()
+                        if isinstance(peer, AsyncOp)
+                    )
+                ):
+                    continue  # Same engine orders these accumulator updates.
                 # Matching scheme IDs prove the runtime accesses pairwise disjoint.
                 if (
                     current.tiling_scheme is not None
@@ -637,6 +654,6 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             async_lock=op.lock,
         )
 
-    @transfers(ElementwiseOp, MatmulOp, MoveOp, TmaMoveOp)
+    @transfers(DeallocOp, ElementwiseOp, MatmulOp, MoveOp, TmaMoveOp)
     def transfer_memory_effects(self, op: Op, state: SyncState) -> SyncState:
         return _transfer_memory_effects(op, state, self.targets)

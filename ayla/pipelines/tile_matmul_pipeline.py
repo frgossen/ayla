@@ -145,7 +145,7 @@ def schedule_register_matmul(
     pipeline.add_pass(FuseAsync())
     pipeline.add_pass(LICM())
     pipeline.add_pass(Canonicalize())
-    # A cyclic pipeline leaves the last stage's loads to the queued wgmma ring.
+    # A cyclic pipeline refills the last bank after its carried MMA event.
     stages = "|".join(map(str, range(operand_stages - cyclic_operand_pipeline)))
     pipeline.add_pass(
         PipelineLoop(
@@ -166,6 +166,7 @@ def schedule_register_matmul(
                 pipelining_offset=1,
             )
         )
+        pipeline.add_pass(ScheduleAsync(pipeline_compute=True))
     return pipeline
 
 
@@ -191,39 +192,49 @@ def schedule_tiled_matmul(
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
     loop_label_prefix: str | None = None,
+    accumulator: str = "wgrmem",
+    output_layout: str | None = None,
 ) -> Pipeline:
-    """Build the post-block-tiling GEMM pipeline."""
-    if warpgroup_n_tile is None:
-        warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
-    wg_tiles = (
-        {"M": warpgroup_m_tile, "N": warpgroup_n_tile}
-        if warpgroup_m_tile is not None
-        else {"N": warpgroup_n_tile}
-        if output_m_tile == 64 or output_n_tile > 256
-        else {"M": 64}
-    )
+    """Build the post-block-tiling GEMM pipeline.
 
+    A ``"wgrmem"`` accumulator is split across warp groups, each issuing its
+    own WGMMAs. A ``"tmem"`` accumulator holds the whole output tile in tensor
+    memory for one thread's tcgen05 MMAs, so the tile needs no warp-group
+    split; its writeback picks the register layout it drains through.
+    """
     pipeline = Pipeline()
-    pipeline.add_pass(
-        TileMatmul(
-            op_dims=list(wg_tiles),
-            tile_sizes=list(wg_tiles.values()),
-            iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)] * len(wg_tiles),
-            for_loop_labels=[None] * len(wg_tiles),
-            op_label_filter=label,
-            epilogue_label_filter=epilogue_label_filter,
-            allow_partial_tiles=(
-                list(wg_tiles) == ["M"] and output_m_tile % wg_tiles["M"] != 0
-            ),
+    tensor_memory = accumulator == "tmem"
+    if not tensor_memory:
+        if warpgroup_n_tile is None:
+            warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
+        wg_tiles = (
+            {"M": warpgroup_m_tile, "N": warpgroup_n_tile}
+            if warpgroup_m_tile is not None
+            else {"N": warpgroup_n_tile}
+            if output_m_tile == 64 or output_n_tile > 256
+            else {"M": 64}
         )
-    )
+        pipeline.add_pass(
+            TileMatmul(
+                op_dims=list(wg_tiles),
+                tile_sizes=list(wg_tiles.values()),
+                iteration_bindings=[(CollectiveLevel.WG, CollectiveAxis.X)]
+                * len(wg_tiles),
+                for_loop_labels=[None] * len(wg_tiles),
+                op_label_filter=label,
+                epilogue_label_filter=epilogue_label_filter,
+                allow_partial_tiles=(
+                    list(wg_tiles) == ["M"] and output_m_tile % wg_tiles["M"] != 0
+                ),
+            )
+        )
     pipeline.add_pass(
         PromoteBuffers(
-            target_type="wgrmem",
+            target_type=accumulator,
             operands=["dst"],
             swizzle=None,
-            layout="wgmma_layout_0",
-            warps=4,
+            layout=output_layout or (None if tensor_memory else "wgmma_layout_0"),
+            warps=None if tensor_memory else 4,
             tma=output_store != "global",
             physical_layout=(
                 {
@@ -260,7 +271,9 @@ def schedule_tiled_matmul(
             lhs_smem_block_width=lhs_smem_block_width,
             rhs_smem_block_width=rhs_smem_block_width,
             rhs_tma_load_slices=(
-                output_n_tile // warpgroup_n_tile if output_n_tile == 384 else 1
+                output_n_tile // cast(int, warpgroup_n_tile)
+                if output_n_tile == 384
+                else 1
             ),
             unsafe_reuse_smem=unsafe_reuse_smem,
             operand_move_attrs=operand_move_attrs,
@@ -301,12 +314,14 @@ def _schedule_matmul(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     masked_global_store: bool = False,
+    output_layout: str | None = None,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
 ) -> ModuleOp:
-    """Apply the configurable WGMMA schedule to one concrete matmul.
+    """Apply the configurable GEMM schedule to one concrete matmul.
 
     Keeping scheduling separate from module construction lets the JIT first
     specialize a dynamic template, then reuse the static collection's passes.
+    A Blackwell target accumulates in tensor memory instead of registers.
     """
     [kernel] = module.body.ops
     if not isinstance(kernel, KernelOp):
@@ -314,6 +329,23 @@ def _schedule_matmul(
     matmuls = find_ops_of_type(module, MatmulOp)
     if len(matmuls) != 1:
         raise ValueError("schedule_matmul requires exactly one matmul")
+    tensor_memory = module.target == "sm_100a"
+    if tensor_memory and (
+        output_m_tile != 128
+        or output_n_tile > 256
+        or warpgroup_m_tile is not None
+        or warpgroup_n_tile not in (None, output_n_tile)
+        or cluster_m_ctas * cluster_n_ctas != 1
+        or output_store == "scalar"
+        or masked_global_store
+    ):
+        raise ValueError(
+            "TMEM accumulators support unclustered 128-row tiles of at most 256 "
+            "columns, without warp-group tiles, scalar stores, or masking"
+        )
+    if tensor_memory:
+        # Each warp drains its own 32-lane quarter of the accumulator.
+        kernel.block_dim = (128, 1, 1)
     if masked_global_store:
         if output_store != "global":
             raise ValueError("masked_global_store requires global output stores")
@@ -354,7 +386,9 @@ def _schedule_matmul(
         raise ValueError("output_m_tile must be 64, 128, 192, or 256")
     if not 8 <= output_n_tile <= 384 or output_n_tile % 8:
         raise ValueError("output_n_tile must be a multiple of 8 between 8 and 384")
-    if operand_k_tile not in (16, 32, 64, 128):
+    if operand_k_tile not in (16, 32, 64, 128) and not (
+        tensor_memory and operand_k_tile % 64 == 0
+    ):
         raise ValueError("operand_k_tile must be 16, 32, 64 or 128")
     if cyclic_operand_pipeline and operand_stages < 2:
         raise ValueError("cyclic_operand_pipeline requires at least two operand stages")
@@ -497,6 +531,8 @@ def _schedule_matmul(
             output_tma_inner_size=output_tma_inner_size,
             output_store=output_store,
             operand_move_attrs=operand_move_attrs,
+            accumulator="tmem" if tensor_memory else "wgrmem",
+            output_layout=output_layout,
         )
     )
     if group_size > 1:

@@ -5,7 +5,7 @@ kind is merged into one ``async(lock){ inner; inner; … }`` block followed by a
 single ``await``. The kind is decided by the op *inside* the async (see
 :func:`_fusion_kind`), so what fuses is fixed by what codegen supports:
 
-- **wgmma** matmuls — launch into one wgmma commit group, awaited once. Safe
+- **wgmma/tcgen05** matmuls — launch into one wgmma commit group, awaited once. Safe
   with no buffer-conflict analysis: a wgmma reads smem and writes wgrmem, so one
   matmul's output is never another's input; the only shared buffer is the
   accumulator (read+written by accumulating matmuls), ordered by the hardware
@@ -41,6 +41,7 @@ from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
     MatmulOp,
+    LockType,
     ModuleOp,
     MoveOp,
     SmemTensorType,
@@ -61,7 +62,8 @@ def _fusion_kind(op: Op) -> str | None:
         return None
     inner = body[0]
     if isinstance(inner, MatmulOp):
-        return "wgmma"  # matmuls → one wgmma commit group
+        assert isinstance(op.lock.type, LockType)
+        return op.lock.type.kind  # tensor-core matmuls share one completion
     if (isinstance(inner, MoveOp)
             and inner.attrs.get("tma")
             and isinstance(inner.dst.type, SmemTensorType)):  # dst smem ⇒ load

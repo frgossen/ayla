@@ -4,7 +4,8 @@ Wraps the ops that run asynchronously on the hardware — a TMA bulk transfer
 (``move`` with ``tma=True`` or a lowered ``tma_move``) and a wgmma matmul
 (smem×smem→wgrmem with 4 warps) — in an ``async`` block carrying the lock,
 followed by an ``await``. The lock kind is ``mbar`` for a TMA load, ``bulk``
-for a TMA store, ``wgmma`` for a matmul.
+for a TMA store, ``wgmma`` for a Hopper matmul, and ``tcgen05``
+for a Blackwell matmul.
 
 Other moves/matmuls stay synchronous. Already-``async`` ops pass through, so
 running the pass twice is idempotent. Later passes reorder/batch the awaits to
@@ -23,6 +24,7 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     SmemTensorType,
+    TmemTensorType,
     TmaMoveOp,
     WgrmemTensorType,
 )
@@ -113,7 +115,7 @@ class LowerToAsync(LoweringPass):
         lhs = cast(Value, self.value_map[op.lhs])
         rhs = cast(Value, self.value_map[op.rhs])
         dst = cast(Value, self.value_map[op.dst])
-        # Only wgmma matmuls (smem×smem→wgrmem, 4 warps) are async; plain FMA
+        # Tensor-core matmuls (SMEM to WGRMEM or TMEM) are async; plain FMA
         # matmuls stay synchronous. Same idea as ``lower_move``'s tma gate.
         # TODO: lower *all* matmuls as async (FMA ones too), wrapping every
         # matmul uniformly — the non-async ones get a trivial lock whose await
@@ -121,11 +123,11 @@ class LowerToAsync(LoweringPass):
         # and the sync/async split entirely.
         if not (isinstance(lhs.type, SmemTensorType)
                 and isinstance(rhs.type, SmemTensorType)
-                and isinstance(dst.type, WgrmemTensorType)
-                and dst.type.warps == 4):
+                and (isinstance(dst.type, TmemTensorType)
+                     or (isinstance(dst.type, WgrmemTensorType) and dst.type.warps == 4))):
             return None
         # PromoteBuffers moves any initializer onto the register accumulator.
-        assert op.init is None, "wgmma matmul initializer was not promoted"
+        assert op.init is None, "tensor-core matmul initializer was not promoted"
         matmul = MatmulOp.build(
             lhs=lhs,
             rhs=rhs,
@@ -133,7 +135,7 @@ class LowerToAsync(LoweringPass):
             collective=op.collective,
             attrs=op.extra_attrs,
         )
-        return self._wrap(matmul, "wgmma", op.extra_attrs)
+        return self._wrap(matmul, "tcgen05" if isinstance(dst.type, TmemTensorType) else "wgmma", op.extra_attrs)
 
 
 def lower_to_async(module: ModuleOp) -> ModuleOp:

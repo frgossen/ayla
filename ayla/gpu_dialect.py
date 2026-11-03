@@ -909,7 +909,7 @@ class ElementwiseOp(GpuOp):
 
 @gpu_dialect.register_op("alloc")
 class AllocOp(GpuOp):
-    """Allocate a register- or shared-memory tensor.
+    """Allocate a register, shared, or tensor-memory tensor.
 
     An allocation only provides storage; ``elementwise fill`` initializes it.
 
@@ -954,6 +954,22 @@ class AllocOp(GpuOp):
     @property
     def extra_attrs(self) -> dict[str, object]:
         return {key: value for key, value in self.attrs.items() if key != "id"}
+
+
+@gpu_dialect.register_op("dealloc")
+class DeallocOp(GpuOp):
+    """Release an explicitly managed architecture-specific allocation."""
+
+    @classmethod
+    def build(cls, value: Value) -> "DeallocOp":
+        assert isinstance(value.type, TmemTensorType), (
+            f"DeallocOp: expected tensor memory; got {value.type}"
+        )
+        return cls(operands=[value], results=[])
+
+    @property
+    def value(self) -> Value:
+        return self.operands[0]
 
 
 @gpu_dialect.register_op("reinterpret")
@@ -1210,6 +1226,7 @@ class LockType(Type):
       - ``"cluster_mbar"``: cluster-to-leader rendezvous mbarrier in shared
         memory (lock value = the rank-0 CTA's mbarrier address)
       - ``"wgmma"``: wgmma commit-group counter (lock value unused)
+      - ``"tcgen05"``: Blackwell MMA completion mbarrier (CTA-wide await)
       - ``"bulk"``: bulk async commit-group (TMA stores)
       - ``None``: unspecified (set by lower_to_async before PTX lowering)
     """
@@ -1230,6 +1247,11 @@ class LockType(Type):
     def supports_partial_await(self) -> bool:
         """Whether an await may leave newer hardware groups pending."""
         return self.kind == "wgmma"
+
+    @property
+    def orders_async_writes(self) -> bool:
+        """Whether consecutive MMA issues order their accumulator updates."""
+        return self.kind in ("wgmma", "tcgen05")
 
     def print(self, p: Printer) -> None:
         p.write("lock<")
@@ -2049,6 +2071,78 @@ class RmemTensorType(RegMemTensorType):
     """
 
 
+@gpu_dialect.register_type("tmem")
+class TmemTensorType(MemTensorType):
+    """Blackwell tensor-memory allocation owned by one CTA.
+
+    Tensor memory has 128 lanes of 32-bit cells. Dense f32 accumulators use one
+    tensor-memory column per logical output column; allocation is therefore
+    explicit and constrained to the hardware's power-of-two column granularity.
+    """
+
+    @classmethod
+    def build(  # type: ignore[override]
+        cls,
+        sizes: Sequence[int],
+        dtype: Type,
+        columns: int | None = None,
+        attrs: dict[str, object] | None = None,
+    ):
+        assert len(sizes) == 2, f"TmemTensorType: expected rank 2; got {sizes}"
+        columns = (
+            max(32, 1 << (sizes[1] - 1).bit_length()) if columns is None else columns
+        )
+        assert columns in (32, 64, 128, 256, 512), (
+            "TmemTensorType: columns must be a power of two in [32, 512]; "
+            f"got {columns}"
+        )
+        assert sizes[0] == 128 and 0 < sizes[1] <= columns, (
+            "TMEM requires 128 rows and enough columns"
+        )
+        assert isinstance(dtype, F32Type), "TMEM accumulators require f32"
+        return cls(
+            attrs={
+                "sizes": list(sizes),
+                "dtype": dtype,
+                "columns": columns,
+                **(attrs or {}),
+            }
+        )
+
+    @property
+    def columns(self) -> int:
+        return self.attrs["columns"]  # type: ignore[return-value]
+
+    def print(self, p: Printer) -> None:
+        p.write(self.name)
+        p.write("<")
+        p.write_shape(self.sizes, self.dtype)
+        if self.columns != self.sizes[1]:
+            p.write(f" columns={self.columns}")
+        p.write_extra_attrs(
+            self.attrs,
+            skip_keys=("sizes", "dtype", "columns"),
+        )
+        p.write(">")
+
+    @classmethod
+    def parse(cls, prefix: str, p):  # type: ignore[override]
+        if prefix != cls.TYPE_ID:
+            raise ValueError(
+                f"expected type {cls.TYPE_ID!r}, got {prefix!r} at pos {p.pos}"
+            )
+        p.read_literal("<")
+        sizes, dtype = p.read_shape_with_dtype()
+        columns = sizes[1]
+        if p.can_read_literal("columns"):
+            p.read_literal("columns")
+            p.read_literal("=")
+            columns = p.read_int()
+        attrs = p.read_extra_attrs()
+        p.read_literal(">")
+        return cls.build(sizes, dtype, columns=columns, attrs=attrs)
+
+
 @gpu_dialect.register_type("wrmem")
 class WrmemTensorType(RegMemTensorType):
     """Register-memory tensor collectively owned by one warp.
@@ -2111,6 +2205,12 @@ class WrmemTensorType(RegMemTensorType):
         return cls.build(sizes, dtype, layout, attrs=attrs)
 
 
+WGRMEM_LAYOUTS = (
+    "mma", "wgmma_layout_0", "tcgen05_16x256b", "tcgen05_32x32b",
+    "tcgen05_16x32bx2",
+)
+
+
 @gpu_dialect.register_type("wgrmem")
 class WgrmemTensorType(RegMemTensorType):
     """Warp-group register-memory tensor.
@@ -2118,14 +2218,23 @@ class WgrmemTensorType(RegMemTensorType):
     Logical tensor distributed across multiple warps. Each thread holds
     a fragment in its own registers; the full value is the union of all
     threads' fragments. `warps` specifies how many warps collectively
-    own the value (1 for Volta mma.sync, 4 for Hopper wgmma, 2 for
-    Blackwell tcgen05).
+    own the value (1 for Volta mma.sync, 4 for Hopper wgmma and for
+    Blackwell tensor-memory loads).
 
     The ``layout`` attribute encodes the element-to-thread-register mapping.
     The mapping is determined by the instruction that writes the tensor.
     Supported layouts:
       - ``"mma"``: mma.sync m16n8k16, warps=1
       - ``"wgmma_layout_0"``: warp group MMA m64nNk16, warps=4
+      - ``"tcgen05_16x256b"``: ``tcgen05.ld.16x256b`` from a 128-lane
+        accumulator, warps=4. The m16n8 blocks of ``wgmma_layout_0``, but
+        warp ``w`` owns rows ``32w`` to ``32w + 31``: tensor memory restricts
+        each warp to its own 32-lane quarter.
+      - ``"tcgen05_32x32b"``: ``tcgen05.ld.32x32b``, warps=4. Each thread
+        owns one row, ``32 * warp + lane``, one register per column.
+      - ``"tcgen05_16x32bx2"``: fixed x8 copies, warps=4. Lane ``l``
+        owns row ``32w + l % 16`` and eight columns starting at
+        ``8 * (l // 16)`` in each 16-column atom, then the next 16 rows.
     All lowerings that read from a wgrmem tensor (store, convert, matmul)
     must check the layout to emit correct code.
     """
@@ -2139,8 +2248,8 @@ class WgrmemTensorType(RegMemTensorType):
         warps: int = 1,
         attrs: dict[str, object] | None = None,
     ):
-        assert layout in ("mma", "wgmma_layout_0"), (
-            f"WgrmemTensorType: layout must be 'mma' or 'wgmma_layout_0'; "
+        assert layout in WGRMEM_LAYOUTS, (
+            f"WgrmemTensorType: layout must be one of {WGRMEM_LAYOUTS}; "
             f"got {layout!r}"
         )
         return cls(
@@ -2976,7 +3085,7 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
         return CollectiveScope.WARP
     if isinstance(t, WgrmemTensorType):
         return CollectiveScope.WARPGROUP
-    if isinstance(t, SmemTensorType):
+    if isinstance(t, (SmemTensorType, TmemTensorType)):
         return CollectiveScope.BLOCK
     if isinstance(t, GmemTensorType):
         return CollectiveScope.GRID
@@ -3016,6 +3125,17 @@ def _memory_effect(
     return [MemoryEffect(kind, value, scope, tiling_scheme)]
 
 
+def _tensor_memory_or_thread_scope(value: Value) -> CollectiveScope:
+    """Scope of a compute op's destination access.
+
+    Each thread updates its own registers, but tensor memory is shared by the
+    block: one thread's MMA reads and writes the whole accumulator.
+    """
+    if isinstance(value.type, TmemTensorType):
+        return CollectiveScope.BLOCK
+    return CollectiveScope.THREAD
+
+
 def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
     if not isinstance(value.type, TmaDescType):
         return value
@@ -3040,6 +3160,10 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         # Initializing a lock writes it; every later use reads it.
         scope = _lock_scope(op.result())
         return [] if scope is None else _memory_effect("W", op.result(), scope)
+    if isinstance(op, AllocOp) and isinstance(op.result().type, TmemTensorType):
+        return _memory_effect("W", op.result(), CollectiveScope.BLOCK)
+    if isinstance(op, DeallocOp):
+        return _memory_effect("W", op.value, CollectiveScope.BLOCK)
     if is_side_effect_free(op):
         return []
     if isinstance(op, MoveOp):
@@ -3102,6 +3226,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
+        dst_scope = _tensor_memory_or_thread_scope(op.dst)
         init_effects = (
             []
             if op.init is None
@@ -3128,18 +3253,18 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             + _memory_effect(
                 "R",
                 op.dst,
-                CollectiveScope.THREAD,
+                dst_scope,
                 cast(int | None, op.attrs.get("dst_tiling_scheme")),
             )
             + _memory_effect(
                 "W",
                 op.dst,
-                CollectiveScope.THREAD,
+                dst_scope,
                 cast(int | None, op.attrs.get("dst_tiling_scheme")),
             )
         )
     if isinstance(op, ElementwiseOp):
-        effects = _memory_effect("W", op.dst, CollectiveScope.THREAD)
+        effects = _memory_effect("W", op.dst, _tensor_memory_or_thread_scope(op.dst))
         for i in range(op.num_srcs):
             effects += _memory_effect(
                 "R",
@@ -3206,12 +3331,30 @@ def has_ordering_effect(op: Op) -> bool:
     )
 
 
+def ordered_async_roots(op: Op) -> set[Value]:
+    """Accumulator roots ordered by an MMA engine, without a completion wait.
+
+    This permits overlapping issues, not access by another engine or reuse of
+    their source buffers. An await still completes all effects of its own lock.
+    """
+    if not isinstance(op, AsyncOp) or not cast(LockType, op.lock.type).orders_async_writes:
+        return set()
+    if not op.body.ops or not all(isinstance(inner, MatmulOp) for inner in op.body.ops):
+        return set()
+    return {
+        root
+        for inner in op.body.ops
+        if isinstance(inner, MatmulOp)
+        if (root := root_buffer(inner.dst)) is not None
+    }
+
+
 def _lock_scope(lock: Value) -> CollectiveScope | None:
     """The scope at which a lock's initialization must be visible, if any."""
     assert isinstance(lock.type, LockType)
     if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
         return CollectiveScope.CLUSTER
-    if lock.type.kind == "mbar":
+    if lock.type.kind in ("mbar", "tcgen05"):
         return CollectiveScope.BLOCK
     return None
 
@@ -3229,6 +3372,8 @@ def is_side_effect_free(op: Op) -> bool:
     Same operands and attrs always produce the same result, and nothing is read
     or written along the way.
     """
+    if isinstance(op, AllocOp) and isinstance(op.result().type, TmemTensorType):
+        return False
     return isinstance(
         op,
         (

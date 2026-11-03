@@ -31,6 +31,7 @@ from .gpu_dialect import (
     PTXTemplateOp,
     RmemTensorType,
     SmemTensorType,
+    TmemTensorType,
     ThreadIdOp,
     TmaDescType,
     ToPtrOp,
@@ -181,7 +182,7 @@ def map_type_to_registers(type):
             member_register_types=tuple(ptx_dtype for _ in range(n_regs)),
             member_names=tuple(f"r{i}" for i in range(n_regs)),
         )
-    if isinstance(type, SmemTensorType):
+    if isinstance(type, (SmemTensorType, TmemTensorType)):
         return TypeRegisterMapping(
             member_register_types=PtxType.B32,
             member_names="ptr",
@@ -193,7 +194,7 @@ def map_type_to_registers(type):
             member_names="ptr",
         )
     if isinstance(type, LockType):
-        if type.kind == "mbar":
+        if type.kind in ("mbar", "tcgen05"):
             return TypeRegisterMapping(
                 member_register_types=(PtxType.B32, PtxType.B32),
                 member_names=("val", "parity"),

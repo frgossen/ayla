@@ -20,17 +20,19 @@ Example — promote lhs/rhs to smem::
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import cast
 
 from ..base.ir import Block, Op, Type, Value, clone_type
 from ..base.lowering_pass import LoweringPass, lowers
+from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
+    DeallocOp,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -50,6 +52,7 @@ from ..gpu_dialect import (
     SmemTensorType,
     ThreadIdOp,
     TileOp,
+    TmemTensorType,
     WarpGroupIdOp,
     WgrmemTensorType,
     is_column_major,
@@ -59,7 +62,7 @@ from ._utils import label_matches
 
 
 def _target_level(target_type: str) -> str:
-    if target_type == "smem":
+    if target_type in ("smem", "tmem"):
         return "block"
     if target_type == "wgrmem":
         return "wg"
@@ -101,7 +104,7 @@ def _collective_level(value: Value) -> str:
 
     if isinstance(defn, AllocOp):
         ty = value.type
-        if isinstance(ty, SmemTensorType):
+        if isinstance(ty, (SmemTensorType, TmemTensorType)):
             return "block"
         if isinstance(ty, WgrmemTensorType):
             return "wg"
@@ -141,6 +144,8 @@ def _resolve_type(name: str):
         return F32Type
     if name == "f64":
         return F64Type
+    if name == "tmem":
+        return TmemTensorType
     if name == "smem":
         return SmemTensorType
     if name == "rmem":
@@ -150,6 +155,29 @@ def _resolve_type(name: str):
     if name == "gmem":
         return GmemTensorType
     raise ValueError(f"unsupported type {name!r}")
+
+
+# F32 registers per thread in one TMEM writeback fragment. Draining the
+# accumulator in column slices bounds register pressure independently of the
+# tile width.
+_TMEM_FRAGMENT_COLUMNS = 32
+
+
+def _tmem_fragment_layout(dst: Value) -> str:
+    """The register layout a TMEM accumulator drains through toward ``dst``.
+
+    Column-major half outputs use m16n8 fragments for transposed STMatrix.
+    Row-major half outputs give adjacent lanes halves of a 32-byte sector.
+    Other shapes retain the whole-row layout.
+    """
+    dst_type = dst.type
+    assert isinstance(dst_type, MemTensorType)
+    if is_column_major(dst_type) and isinstance(dst_type.dtype, (BF16Type, F16Type)):
+        return "tcgen05_16x256b"
+    extent = dst_type.sizes[-1]
+    if isinstance(dst_type.dtype, (BF16Type, F16Type)) and extent is not None and extent % 16 == 0:
+        return "tcgen05_16x32bx2"
+    return "tcgen05_32x32b"
 
 
 def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
@@ -245,18 +273,21 @@ class PromoteBuffers(LoweringPass):
     Parameters
     ----------
     target_type : str
-        Memory space to promote into: ``"gmem"``, ``"smem"``, ``"rmem"``, ``"wgrmem"``.
+        Memory space to promote into: ``"gmem"``, ``"smem"``, ``"rmem"``, ``"wgrmem"``, ``"tmem"``.
     operands : list[str]
         Which matmul operands to promote: ``"lhs"``, ``"rhs"``, ``"dst"``.
     swizzle : str or None
         Smem swizzle mode (``"128B"``, ``"64B"``, ``"32B"``).
     layout : str or None
-        Wgrmem layout (``"mma"``, ``"wgmma_layout_0"``).
+        Wgrmem layout (``"mma"``, ``"wgmma_layout_0"``). A TMEM accumulator
+        drains through register fragments of this layout, which selects the
+        ``tcgen05.ld`` shape; by default its output picks one.
     warps : int or None
         Wgrmem warp count (``1``, ``4``).
     tma : bool
-        Use TMA for the move. A WGRMEM destination is written back through a
-        block-wide SMEM staging buffer because TMA cannot read registers.
+        Use TMA for the move. A WGRMEM or TMEM destination is written back
+        through a block-wide SMEM staging buffer because TMA cannot read
+        registers or tensor memory.
     nc : bool
         Non-coherent cache hint for scalar gmem→rmem loads.
     permutation : list[int] or None
@@ -406,6 +437,8 @@ class PromoteBuffers(LoweringPass):
                 column_major=len(strides) == 2 and strides[-2] == 1,
                 strides=cast(list[int], strides),
             )
+        if tensor_cls is TmemTensorType:
+            return TmemTensorType.build(sizes, dtype)
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WgrmemTensorType:
@@ -434,8 +467,9 @@ class PromoteBuffers(LoweringPass):
         attrs: dict[str, object] = {}
         if matmul_label is not None:
             attrs["label"] = f"{matmul_label}_{operand_name}_{self.target_type}"
-        # TMA cannot fill registers; a register target only stages writeback.
-        if self.tma and self.target_type != "wgrmem":
+        # TMA cannot fill registers or tensor memory; for those targets it
+        # only stages writeback.
+        if self.tma and self.target_type not in ("wgrmem", "tmem"):
             attrs["tma"] = True
         if self.nc and allow_nc and not self.tma:
             attrs["nc"] = True
@@ -518,6 +552,10 @@ class PromoteBuffers(LoweringPass):
                     )
                 )
         else:
+            if self.target_type == "tmem":
+                raise NotImplementedError(
+                    "TMEM accumulators cannot yet load an initial value from memory"
+                )
             attrs = self._build_move_attrs(matmul_label, operand_name)
             chain_root_type = chain_root.type
             assert isinstance(chain_root_type, MemTensorType)
@@ -561,10 +599,12 @@ class PromoteBuffers(LoweringPass):
     def _build_tma_writeback(
         self,
         dst: Value,
-        src: Value,
+        src: Value | None,
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None,
         writeback_tiling_scheme: int | None,
+        slices: int | None = None,
+        slice_source: Callable[[int], tuple[list[Op], Value]] | None = None,
     ) -> list[Op]:
         """Stage a narrow distributed value for one block-wide TMA store.
 
@@ -574,9 +614,12 @@ class PromoteBuffers(LoweringPass):
         ``_build_operand_promotion`` replays narrow tiles on a promoted buffer,
         which keeps the warp-group row placement in the IR rather than the
         lowering.
+
+        ``slice_source``, in place of ``src``, builds each slice's value
+        whole rather than gathering a column range of one fragment.
         """
+        slices = self.writeback_slices if slices is None else slices
         block_dst = dst
-        assert isinstance(src.type, MemTensorType)
         narrow_tiles: list[TileOp] = []
         while isinstance(block_dst.definition, TileOp):
             tile = block_dst.definition
@@ -588,9 +631,9 @@ class PromoteBuffers(LoweringPass):
         smem_sizes = list(block_dst.type.sizes)
         output_cols = smem_sizes[-1]
         assert output_cols is not None
-        if output_cols % self.writeback_slices:
+        if output_cols % slices:
             raise ValueError("output columns must divide evenly into writeback_slices")
-        smem_sizes[-1] = output_cols // self.writeback_slices
+        smem_sizes[-1] = output_cols // slices
         static_smem_sizes = [size for size in smem_sizes if size is not None]
         assert len(static_smem_sizes) == len(smem_sizes)
         # Stage in the destination's dimension order so the bulk store copies
@@ -613,7 +656,7 @@ class PromoteBuffers(LoweringPass):
         new_ops: list[Op] = list(smems)
         slice_cols = static_smem_sizes[-1]
         wg_column_tile = None
-        if self.writeback_slices > 1:
+        if slices > 1:
             for tile in narrow_tiles:
                 result_type = tile.result().type
                 arg_type = tile.arg.type
@@ -622,13 +665,16 @@ class PromoteBuffers(LoweringPass):
                 if result_type.sizes[-1] != arg_type.sizes[-1]:
                     wg_column_tile = tile
                     break
-        dst_cols = block_dst.type.sizes[-1]
-        src_cols = src.type.sizes[-1]
-        assert dst_cols is not None and src_cols is not None
-        expected_slices = dst_cols // src_cols
-        if wg_column_tile is not None and self.writeback_slices != expected_slices:
-            raise ValueError("warpgroup-column writeback needs one slice per warpgroup")
-        for slice_idx in range(self.writeback_slices):
+        if wg_column_tile is not None:
+            assert src is not None and isinstance(src.type, MemTensorType)
+            dst_cols = block_dst.type.sizes[-1]
+            src_cols = src.type.sizes[-1]
+            assert dst_cols is not None and src_cols is not None
+            if slices != dst_cols // src_cols:
+                raise ValueError(
+                    "warpgroup-column writeback needs one slice per warpgroup"
+                )
+        for slice_idx in range(slices):
             smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
             gather_dst = smem.result()
             for tile in reversed(narrow_tiles):
@@ -639,21 +685,26 @@ class PromoteBuffers(LoweringPass):
             gather_attrs: dict[str, object] = {
                 "label": f"{matmul_label}_dst_smem",
             }
-            if wg_column_tile is not None:
+            gather_src = src
+            if slice_source is not None:
+                source_ops, gather_src = slice_source(slice_idx)
+                new_ops.extend(source_ops)
+            elif wg_column_tile is not None:
                 gather_attrs["writer_wg"] = slice_idx
-            elif self.writeback_slices > 1:
+            elif slices > 1:
                 # TODO: Express this source slice with a tile op instead of the
                 # wgmma_col_start attribute.
                 gather_attrs["wgmma_col_start"] = slice_idx * slice_cols
+            assert gather_src is not None
             gather = MoveOp.build(
                 dst=gather_dst,
-                src=src,
+                src=gather_src,
                 collective=collective,
                 attrs=gather_attrs,
             )
             store_tiles = (
                 [_slice_tile(block_dst, -1, slice_idx, slice_cols)]
-                if self.writeback_slices > 1
+                if slices > 1
                 else []
             )
             store_dst_value = store_tiles[0].result() if store_tiles else block_dst
@@ -692,43 +743,19 @@ class PromoteBuffers(LoweringPass):
                 f"writeback for {dst_level}-level dst not yet supported "
                 f"when promoting to {self.target_type}"
             )
-        new_ops: list[Op] = []
-        epilogue = list(epilogue or [])
-        if src.type.dtype.name != dst.type.dtype.name:
-            tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
-            tmp_alloc = AllocOp.build_with_fresh_id(tmp_type)
-            new_ops.extend(epilogue[:-1])
-            new_ops.append(tmp_alloc)
-            if epilogue:
-                final = epilogue[-1]
-                # TODO: Generalize this rewrite for multi-source element-wise
-                # epilogues such as SwiGLU. Retarget the final operation's
-                # destination while preserving and remapping all its sources.
-                assert final.dst is src and final.src(0) is src
-                new_ops.append(
-                    ElementwiseOp.build(
-                        dst=tmp_alloc.result(),
-                        srcs=[src],
-                        fn=final.fn,
-                        attrs=final.extra_attrs,
-                    )
-                )
-            else:
-                new_ops.append(
-                    ElementwiseOp.build(
-                        dst=tmp_alloc.result(),
-                        srcs=[src],
-                        fn="convert",
-                        attrs=(
-                            {"label": f"{matmul_label}_{operand_name}_convert"}
-                            if matmul_label is not None
-                            else None
-                        ),
-                    )
-                )
-            src = tmp_alloc.result()
-        else:
-            new_ops.extend(epilogue)
+        if isinstance(src.type, TmemTensorType):
+            return self._build_tmem_writeback(
+                dst,
+                src,
+                operand_name,
+                collective,
+                matmul_label,
+                list(epilogue or []),
+                writeback_tiling_scheme,
+            ), []
+        new_ops, src = self._build_register_epilogue(
+            dst, src, operand_name, matmul_label, list(epilogue or [])
+        )
         if self.tma and self.target_type == "wgrmem":
             new_ops.extend(
                 self._build_tma_writeback(
@@ -740,17 +767,174 @@ class PromoteBuffers(LoweringPass):
                 )
             )
             return new_ops, []
+        new_ops.append(
+            self._build_direct_writeback(
+                dst, src, operand_name, collective, matmul_label,
+                writeback_tiling_scheme,
+            )
+        )
+        return new_ops, []
+
+    def _build_register_epilogue(
+        self,
+        dst: Value,
+        src: Value,
+        operand_name: str,
+        matmul_label: str | None,
+        epilogue: list[ElementwiseOp],
+    ) -> tuple[list[Op], Value]:
+        """Run the epilogue on ``src`` and convert it to ``dst``'s dtype."""
+        assert isinstance(dst.type, MemTensorType)
+        assert isinstance(src.type, MemTensorType)
+        new_ops: list[Op] = []
+        if src.type.dtype.name == dst.type.dtype.name:
+            return list(epilogue), src
+        tmp_alloc = AllocOp.build_with_fresh_id(
+            clone_type(src.type, {"dtype": dst.type.dtype})
+        )
+        new_ops.extend(epilogue[:-1])
+        new_ops.append(tmp_alloc)
+        if epilogue:
+            final = epilogue[-1]
+            # TODO: Generalize this rewrite for multi-source element-wise
+            # epilogues such as SwiGLU. Retarget the final operation's
+            # destination while preserving and remapping all its sources.
+            assert final.dst is src and final.src(0) is src
+            new_ops.append(
+                ElementwiseOp.build(
+                    dst=tmp_alloc.result(),
+                    srcs=[src],
+                    fn=final.fn,
+                    attrs=final.extra_attrs,
+                )
+            )
+        else:
+            new_ops.append(
+                ElementwiseOp.build(
+                    dst=tmp_alloc.result(),
+                    srcs=[src],
+                    fn="convert",
+                    attrs=(
+                        {"label": f"{matmul_label}_{operand_name}_convert"}
+                        if matmul_label is not None
+                        else None
+                    ),
+                )
+            )
+        return new_ops, tmp_alloc.result()
+
+    def _build_direct_writeback(
+        self,
+        dst: Value,
+        src: Value,
+        operand_name: str,
+        collective: dict[CollectiveAxis, CollectiveLevel],
+        matmul_label: str | None,
+        writeback_tiling_scheme: int | None,
+    ) -> MoveOp:
         attrs = self._build_move_attrs(matmul_label, operand_name, allow_nc=False)
         if writeback_tiling_scheme is not None:
             attrs["dst_tiling_scheme"] = writeback_tiling_scheme
-        move = MoveOp.build(
+        return MoveOp.build(
             dst=dst,
             src=src,
             collective=collective,
             attrs=attrs,
         )
-        new_ops.append(move)
-        return new_ops, []
+
+    def _build_tmem_writeback(
+        self,
+        dst: Value,
+        src: Value,
+        operand_name: str,
+        collective: dict[CollectiveAxis, CollectiveLevel],
+        matmul_label: str | None,
+        epilogue: list[ElementwiseOp],
+        writeback_tiling_scheme: int | None,
+    ) -> list[Op]:
+        """Drain a TMEM accumulator through register fragments, then free it.
+
+        Tensor memory reaches memory only through registers, so each column
+        slice loads a fragment and takes the register writeback path: the
+        epilogue, the conversion, and a direct or TMA-staged store.
+        """
+        src_type = src.type
+        assert isinstance(src_type, TmemTensorType)
+        rows, cols = cast(tuple[int, int], src_type.sizes)
+        layout = self.layout or _tmem_fragment_layout(dst)
+        column_alignment = max(8, TMEM_FRAGMENT_LAYOUTS[layout].columns)
+        slices = next(
+            count
+            for count in range(self.writeback_slices, cols + 1)
+            if cols % count == 0
+            and cols // count <= _TMEM_FRAGMENT_COLUMNS
+            and (cols // count) % column_alignment == 0
+        )
+        slice_cols = cols // slices
+
+        def load(slice_idx: int) -> tuple[list[Op], Value]:
+            view = _slice_tile(src, -1, slice_idx, slice_cols) if slices > 1 else None
+            fragment = AllocOp.build_with_fresh_id(
+                WgrmemTensorType.build(
+                    [rows, slice_cols], src_type.dtype, layout=layout, warps=4
+                )
+            )
+            move = MoveOp.build(
+                dst=fragment.result(),
+                src=src if view is None else view.result(),
+                collective=collective,
+                attrs=(
+                    {"label": f"{matmul_label}_{operand_name}_tmem_load"}
+                    if matmul_label is not None
+                    else None
+                ),
+            )
+            ops, value = self._build_register_epilogue(
+                dst,
+                fragment.result(),
+                operand_name,
+                matmul_label,
+                [
+                    type(e)(
+                        operands=[fragment.result(), fragment.result()],
+                        results=[],
+                        attrs=e.attrs,
+                    )
+                    for e in epilogue
+                ],
+            )
+            return [*([view] if view else []), fragment, move, *ops], value
+
+        new_ops: list[Op] = []
+        if self.tma:
+            new_ops.extend(
+                self._build_tma_writeback(
+                    dst,
+                    None,
+                    collective,
+                    matmul_label,
+                    writeback_tiling_scheme,
+                    slices=slices,
+                    slice_source=load,
+                )
+            )
+        else:
+            for slice_idx in range(slices):
+                ops, value = load(slice_idx)
+                store_dst = dst
+                if slices > 1:
+                    store_tile = _slice_tile(dst, -1, slice_idx, slice_cols)
+                    ops.append(store_tile)
+                    store_dst = store_tile.result()
+                new_ops.extend(ops)
+                new_ops.append(
+                    self._build_direct_writeback(
+                        store_dst, value, operand_name, collective,
+                        matmul_label, writeback_tiling_scheme,
+                    )
+                )
+        new_ops.append(DeallocOp.build(src))
+        return new_ops
 
     @lowers(KernelOp)
     def lower_kernel(self, op: KernelOp):

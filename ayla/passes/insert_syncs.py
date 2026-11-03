@@ -165,7 +165,7 @@ def _lock_init_barrier(op: Op) -> BarrierScope:
         return BarrierScope.THREAD
     if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
         return BarrierScope.CLUSTER
-    return BarrierScope.BLOCK if lock.type.kind == "mbar" else BarrierScope.THREAD
+    return BarrierScope.BLOCK if lock.type.kind in ("mbar", "tcgen05") else BarrierScope.THREAD
 
 
 def _publication_barriers(scope: BarrierScope) -> list[Op]:

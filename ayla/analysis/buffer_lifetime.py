@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from ..base.ir import Op, Value, iter_ops
 from ..gpu_dialect import (
     AllocOp,
+    DeallocOp,
     AsyncOp,
     AwaitOp,
     BarrierOp,
@@ -84,6 +85,7 @@ class _BufferAccessAnalysis(DataflowAnalysis[BufferLivenessState]):
 
     @transfers(
         AllocOp,
+        DeallocOp,
         AsyncOp,
         AwaitOp,
         ElementwiseOp,

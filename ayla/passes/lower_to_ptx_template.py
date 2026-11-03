@@ -17,6 +17,7 @@ from typing import cast
 
 from ..base.ir import Op, Type, Value, find_ancestor_of_type, find_ops_of_type
 from ..base.lowering_pass import LoweringPass, lowers
+from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS
 from ..gpu_dialect import (
     AddrMemTensorType,
     AllocOp,
@@ -25,6 +26,7 @@ from ..gpu_dialect import (
     BarrierOp,
     BF16Type,
     CollectiveAxis,
+    DeallocOp,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -54,6 +56,7 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
+    TmemTensorType,
     ToPtrOp,
     WarpIdsOp,
     WgrmemTensorType,
@@ -528,6 +531,244 @@ class LowerToPtxTemplate(LoweringPass):
         self.cache_policy_values: dict[str, Value] = {}
         self.warp_ids: WarpIdsOp | None = None
 
+    def _lower_alloc_tmem(self, op: AllocOp) -> tuple[list[Op], list[object]]:
+        """Allocate tensor memory from warp 0 and share its address."""
+        typ = op.result().type
+        assert isinstance(typ, TmemTensorType)
+        operands, names, warp = self._leader_warp("tmem")
+        template = warp + textwrap.dedent(f"""\
+            .shared .align 4 .b32 ${{smem:tmem_addr}}[1];
+            @!${{pred:tmem_other_warp}} tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {typ.columns};
+            bar.sync 0;
+            ld.shared.b32 ${{b32:result.dst.ptr}}, [${{smem:tmem_addr}}];
+        """)
+        lowered = PTXTemplateOp.build(
+            operands=operands,
+            result_types=[typ],
+            template=template,
+            operand_names=names,
+            result_names=["dst"],
+            description=str(op),
+        )
+        return [lowered], [lowered.result()]
+
+    @lowers(DeallocOp)
+    def lower_dealloc(self, op: DeallocOp) -> tuple[list[Op], list[object]]:
+        typ = op.value.type
+        assert isinstance(typ, TmemTensorType)
+        operands, names, warp = self._leader_warp("tmem_free")
+        template = warp + (
+            "@!${pred:tmem_free_other_warp} tcgen05.dealloc.cta_group::1.sync.aligned.b32 "
+            f"${{b32:operand.src.ptr}}, {typ.columns};\n"
+        )
+        lowered = PTXTemplateOp.build(
+            operands=[cast(Value, self.value_map[op.value]), *operands],
+            result_types=[],
+            template=template,
+            operand_names=["src", *names],
+            description=str(op),
+        )
+        return [lowered], []
+
+    def _lower_fill_tmem(self, op: ElementwiseOp) -> tuple[list[Op], list[object]]:
+        """Broadcast a scalar into tensor memory; each thread stores one row."""
+        typ = op.dst.type
+        assert isinstance(typ, TmemTensorType)
+        if op.fn != "fill" or op.src(0).type != RmemTensorType.build([], F32Type()):
+            raise NotImplementedError(
+                "TMEM elementwise lowering supports scalar f32 fill"
+            )
+        columns = cast(int, typ.sizes[1])
+        assert self.warp_ids is not None, "lower_kernel creates warp_ids"
+        lowered = PTXTemplateOp.build(
+            operands=[
+                cast(Value, self.value_map[op.dst]),
+                cast(Value, self.value_map[op.src(0)]),
+                self.warp_ids.x,
+            ],
+            result_types=[],
+            template=_tmem_warp_address_ptx("operand.dst.ptr")
+            + _tmem_access_ptx(
+                "tcgen05_32x32b",
+                columns,
+                ["${f32:operand.src.r0}"] * columns,
+                is_load=False,
+            ),
+            operand_names=["dst", "src", "warp"],
+            description=str(op),
+        )
+        return [lowered], []
+
+    def _lower_move_tmem_fragment(self, op: MoveOp) -> tuple[list[Op], list[object]]:
+        """Load a register fragment from tensor memory, or store one to it.
+
+        The fragment's layout selects the ``tcgen05.ld``/``tcgen05.st`` shape;
+        each warp addresses its own 32-lane quarter.
+        """
+        is_load = isinstance(op.dst.type, WgrmemTensorType)
+        fragment, memory = (op.dst, op.src) if is_load else (op.src, op.dst)
+        fragment_type, memory_type = fragment.type, memory.type
+        if not (
+            isinstance(fragment_type, WgrmemTensorType)
+            and isinstance(memory_type, TmemTensorType)
+            and fragment_type.layout in TMEM_FRAGMENT_LAYOUTS
+            and fragment_type.warps == 4
+            and fragment_type.sizes == memory_type.sizes
+            and fragment_type.dtype == memory_type.dtype
+            and not isinstance(fragment.definition, TileOp)
+        ):
+            raise NotImplementedError(
+                "TMEM moves need a whole 4-warp tcgen05 fragment of the same shape "
+                f"and dtype; got {op.dst.type} <- {op.src.type}"
+            )
+        assert self.warp_ids is not None, "lower_kernel creates warp_ids"
+        registers = [
+            f"${{f32:operand.fragment.r{i}}}"
+            for i in range(fragment_type.num_elements_per_thread)
+        ]
+        lowered = PTXTemplateOp.build(
+            operands=[
+                cast(Value, self.value_map[memory]),
+                cast(Value, self.value_map[fragment]),
+                self.warp_ids.x,
+            ],
+            result_types=[],
+            template=_tmem_warp_address_ptx("operand.memory.ptr")
+            + _tmem_access_ptx(
+                fragment_type.layout,
+                cast(int, fragment_type.sizes[1]),
+                registers,
+                is_load=is_load,
+            ),
+            operand_names=["memory", "fragment", "warp"],
+            description=str(op),
+        )
+        return [lowered], []
+
+    def _lower_move_row_fragment(self, op: MoveOp) -> tuple[list[Op], list[object]]:
+        """Store row fragments using their declared TMEM copy geometry.
+
+        Each copy atom holds a contiguous row segment in consecutive
+        registers. Adjacent lanes may share a row. The same vector stores
+        handle global memory and blocked, swizzled shared memory.
+        """
+        fragment, memory = op.src, op.dst
+        fragment_type, memory_type = fragment.type, memory.type
+        assert isinstance(fragment_type, WgrmemTensorType)
+        kernel = find_ancestor_of_type(op, KernelOp)
+        if not (
+            isinstance(memory_type, (GmemTensorType, SmemTensorType))
+            and memory_type.rank == 2
+            and memory_type.sizes == fragment_type.sizes
+            and memory_type.dtype == fragment_type.dtype
+            and memory_type.strides[1] == 1
+            and isinstance(memory_type.dtype, (BF16Type, F16Type, F32Type))
+            and not isinstance(fragment.definition, TileOp)
+            and not (kernel is not None and kernel.attrs.get("masked_global_store"))
+        ):
+            raise NotImplementedError(
+                "row fragments store whole to row-major memory of the same shape "
+                f"and dtype; got {memory_type} <- {fragment_type}"
+            )
+        dtype_bytes = memory_type.dtype.byte_size
+        f32 = isinstance(memory_type.dtype, F32Type)
+        packing = 1 if f32 else 2
+        count = fragment_type.num_elements_per_thread // packing
+        geometry = TMEM_FRAGMENT_LAYOUTS[fragment_type.layout]
+        registers = [
+            f"${{{'f32' if f32 else 'b32'}:operand.fragment.r{i}}}" for i in range(count)
+        ]
+        template = textwrap.dedent("""\
+            mov.u32 ${b32:row}, %tid.x;
+            and.b32 ${b32:row}, ${b32:row}, 127;
+        """)
+        if geometry.lanes != 32:
+            template += textwrap.dedent(f"""\
+                shr.u32 ${{b32:warp}}, ${{b32:row}}, 5;
+                shr.u32 ${{b32:column}}, ${{b32:row}}, {geometry.lanes.bit_length() - 1};
+                and.b32 ${{b32:column}}, ${{b32:column}}, {32 // geometry.lanes - 1};
+                mul.lo.u32 ${{b32:column}}, ${{b32:column}}, {geometry.registers};
+                and.b32 ${{b32:row}}, ${{b32:row}}, {geometry.lanes - 1};
+                mad.lo.u32 ${{b32:row}}, ${{b32:warp}}, 32, ${{b32:row}};
+                mul.lo.u32 ${{b32:column_bytes}}, ${{b32:column}}, {dtype_bytes};
+            """)
+        else:
+            template += "mov.u32 ${b32:column_bytes}, 0;\n"
+        global_memory = isinstance(memory_type, GmemTensorType)
+        layout = None if global_memory else physical_layout(memory_type)
+        if layout is None:
+            alignment = cast(int, memory_type.strides[0]) * dtype_bytes
+            if global_memory:
+                template += textwrap.dedent(f"""\
+                    mul.wide.u32 ${{b64:row_offset}}, ${{b32:row}}, {alignment};
+                    add.u64 ${{b64:base}}, ${{b64:operand.memory.ptr}}, ${{b64:row_offset}};
+                    cvt.u64.u32 ${{b64:column_offset}}, ${{b32:column_bytes}};
+                    add.u64 ${{b64:base}}, ${{b64:base}}, ${{b64:column_offset}};
+                """)
+            else:
+                template += (
+                    f"mad.lo.u32 ${{b32:base}}, ${{b32:row}}, {alignment}, "
+                    "${b32:operand.memory.ptr};\n"
+                    "add.u32 ${b32:base}, ${b32:base}, ${b32:column_bytes};\n"
+                )
+            base = f"${{{'b64' if global_memory else 'b32'}:base}}"
+
+            def address(row: int, column: int) -> tuple[str, str]:
+                return "", f"[{base}+{row * alignment + column * dtype_bytes}]"
+
+        else:
+            assert isinstance(memory_type, SmemTensorType)
+            block_width, order = layout
+            root = root_buffer(memory)
+            assert root is not None and isinstance(root.type, SmemTensorType)
+            if order != "block_major" or memory_type.swizzle not in (
+                None,
+                _block_swizzle(block_width),
+            ):
+                raise NotImplementedError(
+                    f"row fragments store to block-major smem; got {memory_type}"
+                )
+            alignment = block_width * dtype_bytes
+            if block_width < geometry.columns:
+                raise NotImplementedError("row fragment copy atoms must fit a shared-memory block")
+            root_rows = cast(int, root.type.sizes[0])
+            template += f"mul.lo.u32 ${{b32:row_offset}}, ${{b32:row}}, {alignment};\n"
+            template += "add.u32 ${b32:row_offset}, ${b32:row_offset}, ${b32:column_bytes};\n"
+
+            def address(row: int, column: int) -> tuple[str, str]:
+                block, inner = divmod(column, block_width)
+                static = (block * root_rows * block_width + row * block_width + inner) * dtype_bytes
+                swizzle = (
+                    _swizzle_ptx("offset", "offset_swizzle", alignment)
+                    if memory_type.swizzle is not None
+                    else ""
+                )
+                return (
+                    f"add.u32 ${{b32:offset}}, ${{b32:row_offset}}, {static};\n"
+                    + swizzle
+                    + "add.u32 ${b32:address}, ${b32:operand.memory.ptr}, "
+                    "${b32:offset};\n"
+                ), "[${b32:address}]"
+
+        space = "global" if global_memory else "shared"
+        for row, column, first, size, _ in geometry.accesses(cast(int, fragment_type.sizes[1])):
+            for start, width in _vector_groups(size // packing, alignment):
+                setup, location = address(row, column + start * packing)
+                begin = first // packing + start
+                vector, regs = _vector_operand(registers[begin : begin + width])
+                template += setup + f"st.{space}{vector}.b32 {location}, {regs};\n"
+        lowered = PTXTemplateOp.build(
+            operands=[
+                cast(Value, self.value_map[memory]),
+                cast(Value, self.value_map[fragment]),
+            ],
+            result_types=[],
+            template=template,
+            operand_names=["memory", "fragment"],
+            description=str(op),
+        )
+        return [lowered], []
+
     @lowers(ConstantOp)
     def lower_constant(
         self,
@@ -588,7 +829,25 @@ class LowerToPtxTemplate(LoweringPass):
         # Compute the warp index once, rather than at every use.
         self.warp_ids = WarpIdsOp.build()
         op.body.ops.insert(0, self.warp_ids)
+        has_tmem = any(
+            isinstance(alloc.result().type, TmemTensorType)
+            for alloc in find_ops_of_type(op, AllocOp)
+        )
         self.lower_block(op.body)
+        if has_tmem:
+            # Keep the permit through every allocation, including sequential
+            # GEMMs or loop iterations. Relinquish once at kernel exit.
+            operands, names, warp = self._leader_warp("tmem_exit")
+            op.body.ops.append(
+                PTXTemplateOp.build(
+                    operands=operands,
+                    result_types=[],
+                    operand_names=names,
+                    template=warp
+                    + "@!${pred:tmem_exit_other_warp} tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n",
+                    description="relinquish TMEM allocation permit",
+                )
+            )
         return [op], []
 
     def _leader_warp(self, prefix: str) -> tuple[list[Value], list[str], str]:
@@ -667,6 +926,25 @@ class LowerToPtxTemplate(LoweringPass):
         """
         arg = cast(Value, self.value_map[op.arg])
         new_ops: list[Op] = []
+
+        if isinstance(op.arg.type, TmemTensorType):
+            # A column view offsets the address's lower 16 bits. Fragments
+            # assign lanes to warps, so a view keeps all 128 lanes.
+            row, column = op.static_indices
+            columns = cast(int, op.result().type.sizes[1])
+            if row != 0 or column is None:
+                raise NotImplementedError("TMEM views need static column offsets")
+            if column == 0:
+                return [], [arg]
+            view = PTXTemplateOp.build(
+                operands=[arg],
+                result_types=[op.result().type],
+                template=f"add.u32 ${{b32:result.dst.ptr}}, ${{b32:operand.src.ptr}}, {column * columns};\n",
+                operand_names=["src"],
+                result_names=["dst"],
+                description=str(op),
+            )
+            return [view], [view.result()]
 
         if isinstance(op.arg.type, WgrmemTensorType):
             _wgmma_view_pairs(op.result())  # Validate the static view.
@@ -773,6 +1051,8 @@ class LowerToPtxTemplate(LoweringPass):
         op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
         result_type = op.result().type
+        if isinstance(result_type, TmemTensorType):
+            return self._lower_alloc_tmem(op)
         if isinstance(result_type, SmemTensorType):
             return self._lower_alloc_smem(op)
         if isinstance(result_type, (RmemTensorType, WgrmemTensorType)):
@@ -821,7 +1101,7 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(lock_type, LockType)
         if lock_type.kind == "cluster_mbar":
             return self._lower_alloc_cluster_mbar(op)
-        if lock_type.kind != "mbar":
+        if lock_type.kind not in ("mbar", "tcgen05"):
             return [], [None]
         # InsertSyncs represents publication explicitly with BarrierOps.
         template = textwrap.dedent("""\
@@ -983,6 +1263,8 @@ class LowerToPtxTemplate(LoweringPass):
         in the source dtype and a supported conversion writes the result to the
         destination dtype.
         """
+        if isinstance(op.dst.type, TmemTensorType):
+            return self._lower_fill_tmem(op)
         sources = [op.src(i) for i in range(op.num_srcs)]
         dst_value = cast(Value, self.value_map[op.dst])
         source_values = [cast(Value, self.value_map[src]) for src in sources]
@@ -1180,36 +1462,44 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(f"lower_async: tma_move with lock kind {kind!r}")
         mms = [body_op for body_op in body_ops if isinstance(body_op, MatmulOp)]
         if body_ops and len(mms) == len(body_ops):
-            return self._lower_async_matmul_wgmma(op, mms)
+            return self._lower_async_matmul(op, mms)
         raise NotImplementedError(
             f"lower_async: unsupported body ops {[type(o).__name__ for o in body_ops]}"
         )
 
-    def _lower_async_matmul_wgmma(
+    def _lower_async_matmul(
         self,
         op: AsyncOp,
         mms: list[MatmulOp],
     ) -> tuple[list[Op], list[object]]:
-        """Lower a group of smem × smem → wgrmem matmuls to wgmma.mma_async.
+        """Lower a group of smem × smem matmuls to wgmma or tcgen05 MMAs.
 
-        The whole group is one wgmma commit group: a single ``wgmma.fence``, all
-        the ``mma_async`` (accumulating into the shared dst), and a single
-        ``wgmma.commit_group``. The hardware serializes same-accumulator mmas, so
-        the await's lone ``wgmma.wait_group`` covers them all (this is the batched
-        form nvcc emits, cf. ``fastcu_5_1``). The group's await op (lock kind
-        ``wgmma``) emits the wait plus a ``bar.sync`` that closes the TMA-reload
-        vs warpgroup-read WAR (see ``_lower_await_wgmma``).
+        Into a WGRMEM accumulator, the whole group is one wgmma commit group: a
+        single ``wgmma.fence``, all the ``mma_async`` (accumulating into the
+        shared dst), and a single ``wgmma.commit_group``. The hardware
+        serializes same-accumulator mmas, so the await's lone
+        ``wgmma.wait_group`` covers them all (this is the batched form nvcc
+        emits, cf. ``fastcu_5_1``). The group's await op (lock kind ``wgmma``)
+        emits the wait plus a ``bar.sync`` that closes the TMA-reload vs
+        warpgroup-read WAR (see ``_lower_await_wgmma``).
+
+        Into a TMEM accumulator, one elected thread issues the group's
+        ``tcgen05.mma`` ops and commits them to the lock's mbarrier. Both
+        families read the same shared-memory matrix descriptors; tcgen05's
+        carry a version field, and one instruction covers all 128 rows.
         """
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
-        assert lock_type.kind == "wgmma", (
-            f"_lower_async_matmul_wgmma: expected lock kind 'wgmma'; got {lock_type.kind!r}"
+        assert lock_type.kind in ("wgmma", "tcgen05"), (
+            f"_lower_async_matmul: unexpected lock kind {lock_type.kind!r}"
         )
+        tcgen05 = lock_type.kind == "tcgen05"
 
         _swizzle_to_bits = {None: 0, "128B": 1, "64B": 2, "32B": 3}
 
         def _build_static_desc(lbo, sbo, swizzle):
-            return (lbo >> 4) << 16 | (sbo >> 4) << 32 | swizzle << 62
+            version = 1 << 46 if tcgen05 else 0
+            return (lbo >> 4) << 16 | (sbo >> 4) << 32 | version | swizzle << 62
 
         # Descriptors are deliberately rematerialized near each WGMMA group:
         # keeping them live across the loop raises register pressure.
@@ -1325,14 +1615,16 @@ class LowerToPtxTemplate(LoweringPass):
             assert (
                 isinstance(lhs_type, SmemTensorType)
                 and isinstance(rhs_type, SmemTensorType)
-                and isinstance(dst_type, WgrmemTensorType)
-                and dst_type.warps == 4
+                and (
+                    isinstance(dst_type, TmemTensorType)
+                    if tcgen05
+                    else isinstance(dst_type, WgrmemTensorType)
+                    and dst_type.warps == 4
+                    and dst_type.layout == "wgmma_layout_0"
+                )
             ), (
-                f"_lower_async_matmul_wgmma: unsupported matmul operand types; "
+                f"_lower_async_matmul: unsupported matmul operand types; "
                 f"got {lhs_type} @ {rhs_type} -> {dst_type}"
-            )
-            assert dst_type.layout == "wgmma_layout_0", (
-                f"_lower_async_matmul_wgmma: dst layout must be 'wgmma'; got {dst_type.layout!r}"
             )
             assert lhs_type.rank == 2 and rhs_type.rank == 2 and dst_type.rank == 2
             lhs_column = is_column_major(lhs_type)
@@ -1342,16 +1634,16 @@ class LowerToPtxTemplate(LoweringPass):
             m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
             n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
             assert k_dim == k_dim2
-            assert k_dim == 16, f"_lower_async_matmul_wgmma: k must be 16; got {k_dim}"
+            assert k_dim == 16, f"_lower_async_matmul: k must be 16; got {k_dim}"
             assert m_dim % 64 == 0, (
-                f"_lower_async_matmul_wgmma: m must be multiple of 64; got {m_dim}"
+                f"_lower_async_matmul: m must be multiple of 64; got {m_dim}"
             )
             assert n_dim % 8 == 0 and 8 <= n_dim <= 256, (
-                f"_lower_async_matmul_wgmma: n must be a multiple of 8 in [8, 256]; got {n_dim}"
+                f"_lower_async_matmul: n must be a multiple of 8 in [8, 256]; got {n_dim}"
             )
+            assert list(dst_type.sizes) == [m_dim, n_dim]
 
-            m_iters = m_dim // 64
-            num_regs_per_wgmma = 64 * n_dim // (dst_type.warps * 32)
+            m_iters = 1 if tcgen05 else m_dim // 64
             lhs_layout = physical_layout(lhs_type)
             rhs_layout = physical_layout(rhs_type)
             lhs_row_stride = (
@@ -1380,10 +1672,10 @@ class LowerToPtxTemplate(LoweringPass):
             )
 
             assert lhs_type.swizzle in _swizzle_to_bits, (
-                f"_lower_async_matmul_wgmma: lhs has unknown swizzle {lhs_type.swizzle!r}"
+                f"_lower_async_matmul: lhs has unknown swizzle {lhs_type.swizzle!r}"
             )
             assert rhs_type.swizzle in _swizzle_to_bits, (
-                f"_lower_async_matmul_wgmma: rhs has unknown swizzle {rhs_type.swizzle!r}"
+                f"_lower_async_matmul: rhs has unknown swizzle {rhs_type.swizzle!r}"
             )
 
             def descriptor(value, typ, column, row_stride_bytes):
@@ -1455,6 +1747,33 @@ class LowerToPtxTemplate(LoweringPass):
                     "wgmma inputs must have the same dtype; got "
                     f"{lhs_type.dtype} and {rhs_type.dtype}"
                 )
+            if tcgen05:
+                if input_dtype not in ("bf16", "f16"):
+                    raise NotImplementedError(
+                        f"tcgen05 matmuls support f16 and bf16 inputs; got {input_dtype}"
+                    )
+                # kind::f16 instruction descriptor: F32 accumulator, input
+                # format (f16 0, bf16 1) for A and B, MN-major operand bits,
+                # then N / 8 and M / 16.
+                input_format = int(input_dtype == "bf16")
+                idesc = (
+                    1 << 4
+                    | input_format << 7
+                    | input_format << 10
+                    | int(lhs_column) << 15
+                    | int(rhs_column) << 16
+                    | n_dim >> 3 << 17
+                    | m_dim >> 4 << 24
+                )
+                mma_template += textwrap.dedent(f"""\
+                    mov.b32 ${{b32:idesc}}, {idesc};
+                    mov.pred ${{pred:accumulate}}, {int(mm.accumulate)};
+                    @${{pred:tcgen05_leader}} tcgen05.mma.cta_group::1.kind::f16
+                      [${{b32:operand.{dst_name}.ptr}}], ${{b64:desc_lhs{j}_0}}, ${{b64:{desc_rhs}}},
+                      ${{b32:idesc}}, ${{pred:accumulate}};
+                """)
+                continue
+            num_regs_per_wgmma = 64 * n_dim // (dst_type.warps * 32)
             reg_offset = 0
             for m_it in range(m_iters):
                 regs = ", ".join(
@@ -1475,12 +1794,25 @@ class LowerToPtxTemplate(LoweringPass):
         # wait_group covers them all. The await also emits an asymmetric named
         # barrier that closes the cross-warp WAR (thread-0 TMA reload vs
         # warpgroup-wide wgmma reads).
-        template = (
-            "wgmma.fence.sync.aligned;\n"
-            + desc_template
-            + mma_template
-            + "wgmma.commit_group.sync.aligned;\n"
-        )
+        if tcgen05:
+            leader_operands, leader_names, leader = self._leader_thread("tcgen05")
+            operands.extend([*leader_operands, cast(Value, self.value_map[op.lock])])
+            operand_names.extend([*leader_names, "lock"])
+            template = (
+                leader
+                + desc_template
+                + mma_template
+                + "@${pred:tcgen05_leader} tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+                ".shared::cluster.b64 [${b32:operand.lock.val}];\n"
+                "${label:tcgen05_done}:\n"
+            )
+        else:
+            template = (
+                "wgmma.fence.sync.aligned;\n"
+                + desc_template
+                + mma_template
+                + "wgmma.commit_group.sync.aligned;\n"
+            )
 
         new_op = PTXTemplateOp.build(
             operands=operands,
@@ -1501,6 +1833,14 @@ class LowerToPtxTemplate(LoweringPass):
         dst_type = op.dst.type
         src_type = op.src.type
 
+        if isinstance(dst_type, TmemTensorType) or isinstance(src_type, TmemTensorType):
+            return self._lower_move_tmem_fragment(op)
+        if (
+            isinstance(src_type, WgrmemTensorType)
+            and src_type.layout in TMEM_FRAGMENT_LAYOUTS
+            and TMEM_FRAGMENT_LAYOUTS[src_type.layout].row_fragment
+        ):
+            return self._lower_move_row_fragment(op)
         if {type(dst_type), type(src_type)} == {RmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_rmem(op)
         if {type(dst_type), type(src_type)} == {RmemTensorType, SmemTensorType}:
@@ -1510,7 +1850,7 @@ class LowerToPtxTemplate(LoweringPass):
         if (
             isinstance(dst_type, WgrmemTensorType)
             and isinstance(src_type, AddrMemTensorType)
-            and dst_type.layout == "wgmma_layout_0"
+            and dst_type.layout in _M16N8_FRAGMENT_ROWS
         ):
             return self._lower_move_wgrmem_wgmma_addrmem(op)
         if (
@@ -1528,7 +1868,7 @@ class LowerToPtxTemplate(LoweringPass):
         if (
             isinstance(dst_type, (SmemTensorType, GmemTensorType))
             and isinstance(src_type, WgrmemTensorType)
-            and src_type.layout == "wgmma_layout_0"
+            and src_type.layout in _M16N8_FRAGMENT_ROWS
         ):
             return self._lower_move_wgrmem_wgmma(op)
         raise NotImplementedError(
@@ -1544,7 +1884,7 @@ class LowerToPtxTemplate(LoweringPass):
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
         kind = lock_type.kind
-        if kind == "mbar":
+        if kind in ("mbar", "tcgen05"):
             lock = cast(Value, self.value_map[op.lock])
             return self._lower_await_mbar(op, lock)
         if kind == "wgmma":
@@ -2039,7 +2379,7 @@ class LowerToPtxTemplate(LoweringPass):
         wgrmem_type = fragment.type
         assert isinstance(memory_type, (GmemTensorType, SmemTensorType))
         assert isinstance(wgrmem_type, WgrmemTensorType)
-        assert wgrmem_type.layout == "wgmma_layout_0"
+        warp_rows, _ = _M16N8_FRAGMENT_ROWS[wgrmem_type.layout]
         assert wgrmem_type.rank == 2 and memory_type.rank == 2
         assert memory_type.dtype == wgrmem_type.dtype, (
             f"wgmma move: dtype mismatch; "
@@ -2071,7 +2411,9 @@ class LowerToPtxTemplate(LoweringPass):
                 for pair, row, col in _wgmma_view_pairs(fragment)
                 if col_start <= col < col_start + memory_n
             ]
-        assert m_dim % 64 == 0, f"wgmma store: m must be a multiple of 64; got {m_dim}"
+        assert m_dim % (4 * warp_rows) == 0, (
+            f"fragment store: m must be a multiple of {4 * warp_rows}; got {m_dim}"
+        )
         assert root_n % 8 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
         )
@@ -2080,7 +2422,9 @@ class LowerToPtxTemplate(LoweringPass):
         if (isinstance(memory_type, GmemTensorType)
                 and isinstance(memory_type.dtype, (BF16Type, F16Type))
                 and kernel is not None and kernel.attrs.get("masked_global_store")):
-            return self._lower_masked_half_fragment_move(op, fragment, memory, pairs)
+            return self._lower_masked_half_fragment_move(
+                op, fragment, memory, pairs, warp_rows
+            )
         dtype_bytes = memory_type.dtype.byte_size
         row_stride_bytes = cast(int, memory_type.strides[0]) * dtype_bytes
         column_stride_bytes = cast(int, memory_type.strides[1]) * dtype_bytes
@@ -2097,6 +2441,7 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops, byte_offset = _build_wgmma_layout_0_dynamic_offset(
             row_stride_bytes,
             column_stride_bytes,
+            warp_rows=warp_rows,
         )
         if isinstance(memory_type, GmemTensorType):
             template = textwrap.dedent(r"""
@@ -2206,7 +2551,7 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops.append(new_op)
         return new_ops, []
 
-    def _lower_masked_half_fragment_move(self, op, fragment, memory, pairs):
+    def _lower_masked_half_fragment_move(self, op, fragment, memory, pairs, warp_rows):
         """Lower fragment addressing, then emit bounded or complete-tile accesses."""
         from .lower_to_tma_move import _build_tile_chain_indices
 
@@ -2219,7 +2564,9 @@ class LowerToPtxTemplate(LoweringPass):
         assert root.type.rank == 2
         row_stride = int(memory_type.strides[0]) * 2
         offset_ops, byte_offset, lane_row, lane_col = (
-            _build_wgmma_layout_0_dynamic_offset(row_stride, 2, coordinates=True)
+            _build_wgmma_layout_0_dynamic_offset(
+                row_stride, 2, coordinates=True, warp_rows=warp_rows
+            )
         )
         is_load = isinstance(op.dst.type, WgrmemTensorType)
         instruction = "ld" if is_load else "st"
@@ -2326,6 +2673,7 @@ class LowerToPtxTemplate(LoweringPass):
         src_root_type = src_root.type
         assert isinstance(src_root_type, WgrmemTensorType)
         n_dim = cast(int, src_root_type.sizes[1])
+        warp_rows, tile_rows = _M16N8_FRAGMENT_ROWS[src_root_type.layout]
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = cast(tuple[int, ...], root_type.sizes)
@@ -2350,21 +2698,21 @@ class LowerToPtxTemplate(LoweringPass):
         # matrices sit side by side along the fragment row. Transposed, they
         # are the 2x2 matrices of a 16x16 fragment block, and a stored row is
         # a fragment column: lane l writes physical row
-        # (l & 7) + 8 * (l >> 4) at column 16 * warp + 8 * ((l >> 3) & 1).
+        # (l & 7) + 8 * (l >> 4) at column warp_rows * warp + 8 * ((l >> 3) & 1).
         lane_coordinates = (
-            textwrap.dedent("""\
-            shr.u32 ${b32:st_hi}, ${b32:st_lane}, 4;
-            mad.lo.u32 ${b32:st_row}, ${b32:st_hi}, 8, ${b32:st_row};
-            shr.u32 ${b32:st_col}, ${b32:st_lane}, 3;
-            and.b32 ${b32:st_col}, ${b32:st_col}, 1;
-            shl.b32 ${b32:st_col}, ${b32:st_col}, 3;
-            mad.lo.u32 ${b32:st_col}, ${b32:st_warp}, 16, ${b32:st_col};
+            textwrap.dedent(f"""\
+            shr.u32 ${{b32:st_hi}}, ${{b32:st_lane}}, 4;
+            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_hi}}, 8, ${{b32:st_row}};
+            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 3;
+            and.b32 ${{b32:st_col}}, ${{b32:st_col}}, 1;
+            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
+            mad.lo.u32 ${{b32:st_col}}, ${{b32:st_warp}}, {warp_rows}, ${{b32:st_col}};
         """)
             if transposed
-            else textwrap.dedent("""\
-            mad.lo.u32 ${b32:st_row}, ${b32:st_warp}, 16, ${b32:st_row};
-            shr.u32 ${b32:st_col}, ${b32:st_lane}, 3;
-            shl.b32 ${b32:st_col}, ${b32:st_col}, 3;
+            else textwrap.dedent(f"""\
+            mad.lo.u32 ${{b32:st_row}}, ${{b32:st_warp}}, {warp_rows}, ${{b32:st_row}};
+            shr.u32 ${{b32:st_col}}, ${{b32:st_lane}}, 3;
+            shl.b32 ${{b32:st_col}}, ${{b32:st_col}}, 3;
         """)
         )
         template = (
@@ -2378,13 +2726,15 @@ class LowerToPtxTemplate(LoweringPass):
         """)
             + lane_coordinates
         )
-        if block_width < 32:
-            # A lane's matrix starts up to 24 columns into the 32 an x4
-            # covers, so narrow blocks put it in a later block.
+        # A lane's matrix starts up to 24 columns into the 32 an x4 covers;
+        # transposed, its column is the warp's fragment row. A block narrower
+        # than that reach puts the matrix in a later block.
+        if block_width <= (3 * warp_rows + 8 if transposed else 24):
+            physical_rows = root_sizes[1] if transposed else root_sizes[0]
             template += textwrap.dedent(f"""\
                 shr.u32 ${{b32:st_block}}, ${{b32:st_col}}, {block_width.bit_length() - 1};
                 and.b32 ${{b32:st_col}}, ${{b32:st_col}}, {block_width - 1};
-                mad.lo.u32 ${{b32:st_row}}, ${{b32:st_block}}, {root_sizes[0]}, ${{b32:st_row}};
+                mad.lo.u32 ${{b32:st_row}}, ${{b32:st_block}}, {physical_rows}, ${{b32:st_row}};
             """)
         template += textwrap.dedent(f"""\
             mad.lo.u32 ${{b32:st_off}}, ${{b32:st_row}}, {block_width}, ${{b32:st_col}};
@@ -2392,7 +2742,7 @@ class LowerToPtxTemplate(LoweringPass):
         """)
         groups = (
             _stmatrix_transposed_groups(
-                register_starts, n_dim, col_start, root_sizes[1]
+                register_starts, n_dim, col_start, root_sizes[1], tile_rows
             )
             if transposed
             else _stmatrix_groups(
@@ -2402,24 +2752,16 @@ class LowerToPtxTemplate(LoweringPass):
                 col_start,
                 root_sizes[0],
                 block_width,
+                tile_rows,
             )
         )
-        # Swizzle<log2(w / 8), 4, 3>: the 16-byte chunk within a 2w-byte row
-        # is XORed with the row bits above it.
-        swizzle_mask = (block_width // 8 - 1) << 7
         for registers, physical_offset in groups:
             regs = ", ".join(f"${{b32:operand.src.r{i}}}" for i in registers)
             template += (
-                textwrap.dedent(f"""\
-                add.u32 ${{b32:st_addr_off}}, ${{b32:st_off}}, {physical_offset};
-                and.b32 ${{b32:st_swizzle_mask}}, ${{b32:st_addr_off}}, {swizzle_mask};
-                shr.u32 ${{b32:st_swizzle_mask}}, ${{b32:st_swizzle_mask}}, 3;
-                xor.b32 ${{b32:st_addr_off}}, ${{b32:st_addr_off}},
-                    ${{b32:st_swizzle_mask}};
-                add.u32 ${{b32:st_addr}}, ${{b32:operand.dst.ptr}},
-                    ${{b32:st_addr_off}};
-            """)
-                if swizzle_mask
+                f"add.u32 ${{b32:st_addr_off}}, ${{b32:st_off}}, {physical_offset};\n"
+                + _swizzle_ptx("st_addr_off", "st_swizzle_mask", 2 * block_width)
+                + "add.u32 ${b32:st_addr}, ${b32:operand.dst.ptr}, ${b32:st_addr_off};\n"
+                if block_width > 8
                 else textwrap.dedent(f"""\
                 add.u32 ${{b32:st_addr}}, ${{b32:operand.dst.ptr}},
                     ${{b32:st_off}};
@@ -2741,16 +3083,112 @@ class LowerToPtxTemplate(LoweringPass):
         return [new_op], []
 
 
+def _swizzle_ptx(offset: str, scratch: str, row_bytes: int) -> str:
+    """XOR the 16-byte chunk of ``${b32:offset}`` with the row bits above it.
+
+    CuTe's ``Swizzle<log2(row_bytes / 16), 4, 3>``, the SMEM swizzle whose
+    span is one ``row_bytes`` row of a blocked buffer.
+    """
+    mask = (row_bytes // 16 - 1) << 7
+    return textwrap.dedent(f"""\
+        and.b32 ${{b32:{scratch}}}, ${{b32:{offset}}}, {mask};
+        shr.u32 ${{b32:{scratch}}}, ${{b32:{scratch}}}, 3;
+        xor.b32 ${{b32:{offset}}}, ${{b32:{offset}}}, ${{b32:{scratch}}};
+    """)
+
+
+def _vector_groups(count: int, alignment_bytes: int) -> list[tuple[int, int]]:
+    """Split ``count`` contiguous 32-bit registers into aligned vectors.
+
+    Each group is ``(first register, width)``; a vector is at most 16 bytes
+    and never straddles a multiple of ``alignment_bytes``.
+    """
+    groups = []
+    first = 0
+    while first < count:
+        width = next(
+            width
+            for width in (4, 2, 1)
+            if first % width == 0
+            and first + width <= count
+            and alignment_bytes % (4 * width) == 0
+        )
+        groups.append((first, width))
+        first += width
+    return groups
+
+
+def _vector_operand(registers: list[str]) -> tuple[str, str]:
+    """The ``.vN`` suffix and operand of a register group."""
+    if len(registers) == 1:
+        return "", registers[0]
+    return f".v{len(registers)}", "{" + ", ".join(registers) + "}"
+
+
+# ``tcgen05.ld``/``tcgen05.st`` shape for each fragment layout: lanes one
+# instruction covers, then the columns and registers of one repetition.
+def _tmem_warp_address_ptx(pointer: str) -> str:
+    """PTX setting ``${b32:taddr}`` to the warp's 32-lane TMEM quarter.
+
+    A tensor-memory address holds the lane in its upper 16 bits, and warp
+    ``w`` of a warp group can only access lanes ``32 * (w % 4)`` onward. The
+    template's ``warp`` operand is the kernel's warp index.
+    """
+    return textwrap.dedent(f"""\
+        and.b32 ${{b32:tmem_lane}}, ${{b32:operand.warp.val}}, 3;
+        shl.b32 ${{b32:tmem_lane}}, ${{b32:tmem_lane}}, 21;
+        add.u32 ${{b32:taddr}}, ${{b32:{pointer}}}, ${{b32:tmem_lane}};
+    """)
+
+
+def _tmem_access_ptx(
+    layout: str,
+    columns: int,
+    registers: list[str],
+    *,
+    is_load: bool,
+) -> str:
+    """Move a fragment between ``${b32:taddr}`` and ``registers``, then wait.
+
+    Each warp covers its 32 lanes in ``32 / lanes`` row tiles. Along the
+    columns, instructions repeat their shape as widely as PTX allows, in
+    powers of two of at most 128 registers.
+    """
+    geometry = TMEM_FRAGMENT_LAYOUTS[layout]
+    assert len(registers) == columns
+    template = ""
+    for row, column, first, size, repetitions in geometry.accesses(columns):
+        regs = ", ".join(registers[first : first + size])
+        address = row << 16 | column
+        template += f"add.u32 ${{b32:tmem_access}}, ${{b32:taddr}}, {address};\n"
+        count = size if geometry.split_offset is not None else repetitions
+        instruction = f"tcgen05.{'ld' if is_load else 'st'}.sync.aligned.{geometry.shape}.x{count}.b32"
+        suffix = f", {geometry.split_offset}" if geometry.split_offset is not None else ""
+        template += (
+            f"{instruction} {{{regs}}}, [${{b32:tmem_access}}]{suffix};\n"
+            if is_load
+            else f"{instruction} [${{b32:tmem_access}}], {{{regs}}}{suffix};\n"
+        )
+    return template + f"tcgen05.wait::{'ld' if is_load else 'st'}.sync.aligned;\n"
+
+
+# Accumulator fragments built from m16n8 blocks differ only in where a
+# thread's rows sit: the row distance between consecutive warps, and between
+# one thread's 16-row tiles. Tensor memory confines each warp to 32 lanes.
+_M16N8_FRAGMENT_ROWS = {"wgmma_layout_0": (16, 64), "tcgen05_16x256b": (32, 16)}
+
+
 def _build_wgmma_layout_0_dynamic_offset(
     row_stride_bytes: int,
     column_stride_bytes: int,
     *, coordinates: bool = False,
+    warp_rows: int = 16,
 ) -> tuple[list[Op], Value] | tuple[list[Op], Value, Value, Value]:
-    """Emit index ops for the wgmma_layout_0 per-thread byte offset.
+    """Emit index ops for an m16n8 fragment's per-thread byte offset.
 
     warp_in_wg = (tid.x % 128) / 32
     lane = tid.x % 32
-    row = warp_in_wg * 16 + lane / 4
+    row = warp_in_wg * warp_rows + lane / 4
     col = (lane % 4) * 2
     byte_offset = row * row_stride_bytes + col * column_stride_bytes
     """
@@ -2772,16 +3210,16 @@ def _build_wgmma_layout_0_dynamic_offset(
     lane = IndexModOp.build(tid_in_wg.result(), c32.result())
     ops.append(lane)
 
-    # row = warp * 16 + lane / 4
-    c16 = IndexConstantOp.build(16)
-    ops.append(c16)
-    warp_times_16 = IndexMulOp.build(warp.result(), c16.result())
-    ops.append(warp_times_16)
+    # row = warp * warp_rows + lane / 4
+    c_warp_rows = IndexConstantOp.build(warp_rows)
+    ops.append(c_warp_rows)
+    warp_row = IndexMulOp.build(warp.result(), c_warp_rows.result())
+    ops.append(warp_row)
     c4 = IndexConstantOp.build(4)
     ops.append(c4)
     lane_div_4 = IndexDivOp.build(lane.result(), c4.result())
     ops.append(lane_div_4)
-    row = IndexAddOp.build(warp_times_16.result(), lane_div_4.result())
+    row = IndexAddOp.build(warp_row.result(), lane_div_4.result())
     ops.append(row)
 
     # col = (lane % 4) * 2
@@ -2809,8 +3247,10 @@ def _build_wgmma_layout_0_dynamic_offset(
     return ops, byte_offset.result()
 
 
-def _wgmma_pair_static_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
-    """Thread-independent root offset of a WGMMA pair's first element.
+def _wgmma_pair_static_offset(
+    pair_index: int, n_dim: int, tile_rows: int = 64
+) -> tuple[int, int]:
+    """Thread-independent root offset of an m16n8 fragment pair's first element.
 
     The runtime warp/lane offset selects the thread's base coordinate. This
     returns the additional logical ``(row, column)`` offset for ``pair_index``
@@ -2821,7 +3261,7 @@ def _wgmma_pair_static_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
     m, pair_in_m_tile = divmod(pair_index, pairs_per_m_tile)
     w, pair_in_16_columns = divmod(pair_in_m_tile, 4)
     di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][pair_in_16_columns]
-    return (m * 64 + di, w * 16 + dj)
+    return (m * tile_rows + di, w * 16 + dj)
 
 
 def _static_view_origin(value: Value) -> tuple[int, ...]:
@@ -2844,7 +3284,7 @@ def _static_view_origin(value: Value) -> tuple[int, ...]:
 
 
 def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
-    """Map a WGMMA WGRMEM value or view to pairs in its root.
+    """Map an m16n8 fragment WGRMEM value or view to pairs in its root.
 
     Each tuple is ``(root_pair_index, view_row_offset, view_column_offset)``.
     Pair ``p`` names F32 registers ``2*p`` and ``2*p + 1``, or the packed
@@ -2857,7 +3297,7 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     view_type, root_type = value.type, root.type
     assert isinstance(view_type, WgrmemTensorType)
     assert isinstance(root_type, WgrmemTensorType)
-    assert view_type.layout == root_type.layout == "wgmma_layout_0"
+    assert view_type.layout == root_type.layout in _M16N8_FRAGMENT_ROWS
     assert view_type.rank == root_type.rank == 2
     assert view_type.warps == root_type.warps == 4
     assert view_type.dtype == root_type.dtype
@@ -2868,10 +3308,11 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     row_start, col_start = _static_view_origin(value)
     view_m, view_n = cast(tuple[int, int], view_type.sizes)
     root_n = cast(int, root_type.sizes[1])
+    _, tile_rows = _M16N8_FRAGMENT_ROWS[root_type.layout]
     pairs = [
         (pair_index, row - row_start, col - col_start)
         for pair_index in range(root_type.num_elements_per_thread // 2)
-        for row, col in [_wgmma_pair_static_offset(pair_index, root_n)]
+        for row, col in [_wgmma_pair_static_offset(pair_index, root_n, tile_rows)]
         if row_start <= row < row_start + view_m
         and col_start <= col < col_start + view_n
     ]
@@ -2882,7 +3323,7 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
 def _view_pair_indices(value: Value) -> list[int]:
     """Return per-thread root pair indices selected by a WGRMEM value or view."""
     assert isinstance(value.type, WgrmemTensorType)
-    if value.type.layout == "wgmma_layout_0":
+    if value.type.layout in _M16N8_FRAGMENT_ROWS:
         return [pair for pair, _, _ in _wgmma_view_pairs(value)]
     if isinstance(value.definition, TileOp):
         raise NotImplementedError(
@@ -2911,6 +3352,7 @@ def _stmatrix_transposed_groups(
     n_dim: int,
     col_start: int,
     dst_rows: int,
+    tile_rows: int,
 ) -> list[tuple[list[int], int]]:
     """Registers and static offsets of each transposed STMatrix.
 
@@ -2926,6 +3368,7 @@ def _stmatrix_transposed_groups(
             n_dim,
             col_start,
             dst_rows,
+            tile_rows=tile_rows,
             transposed=True,
         )
         groups.append((list(range(first, first + count)), offset))
@@ -2939,6 +3382,7 @@ def _stmatrix_groups(
     col_start: int,
     dst_m: int,
     block_width: int,
+    tile_rows: int,
 ) -> list[tuple[list[int], int]]:
     """Registers and static offsets of each STMatrix.
 
@@ -2979,6 +3423,7 @@ def _stmatrix_groups(
                         col_start,
                         dst_m,
                         block_width,
+                        tile_rows,
                     ),
                 )
             )
@@ -2991,10 +3436,11 @@ def _stmatrix_store_static_offset(
     col_start: int,
     dst_rows: int,
     block_width: int = 64,
+    tile_rows: int = 64,
     transposed: bool = False,
 ) -> int:
     """Byte offset for a fragment pair in the destination's blocked layout."""
-    di, dj = _wgmma_pair_static_offset(pair_index, n_dim)
+    di, dj = _wgmma_pair_static_offset(pair_index, n_dim, tile_rows)
     row, col = di, dj - col_start
     if transposed:
         row, col = col, row
@@ -3046,7 +3492,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     if not (
         isinstance(dst_type, SmemTensorType)
         and isinstance(src_type, WgrmemTensorType)
-        and src_type.layout == "wgmma_layout_0"
+        and src_type.layout in _M16N8_FRAGMENT_ROWS
         and isinstance(src_type.dtype, (BF16Type, F16Type))
         and dst_type.dtype == src_type.dtype
         and dst_type.rank == 2
@@ -3099,7 +3545,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         or col_start < 0
         or col_start % 16
         or (not is_view and col_start + dst_n > n_dim)
-        or m_dim % 64
+        or m_dim % (4 * _M16N8_FRAGMENT_ROWS[src_type.layout][0])
         or dst_n % (8 if transposed else block_width)
         or root_n % 8
         or not (8 <= root_n <= 256)
