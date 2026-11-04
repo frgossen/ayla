@@ -127,3 +127,38 @@ def test_register_load_hoists_behind_async_loads():
     register_load = text.index('label: "register_load"')
     compute = text.index('label: "compute"')
     assert shared_load < register_load < compute
+
+
+def _wgmma_steps(second_dtype: str) -> ModuleOp:
+    acc = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+    second = f"smem<64x16x{second_dtype}>"
+    return gpu_dialect.parse_module(
+        textwrap.dedent(f"""\
+        module {{
+          kernel @k(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %c: {second}, %out: rmem<64x64xf32>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {{
+            %acc: {acc} = alloc()
+            matmul(%a: smem<64x16xbf16>, %b: smem<64x16xbf16>, %acc: {acc}) attrs={{label: "first"}}
+            matmul(%c: {second}, %c: {second}, %acc: {acc}) attrs={{label: "second"}}
+            move(%out: rmem<64x64xf32>, %acc: {acc})
+          }}
+        }}""")
+    )
+
+
+def test_wgmma_await_retains_the_next_same_shape_group():
+    module = schedule_async(lower_to_async(_wgmma_steps("bf16")))
+    first_wait, last_wait = find_ops_of_type(module, AwaitOp)
+    [_, second] = find_ops_of_type(module, AsyncOp)
+    ops = list(module.body.ops[0].body.ops)
+    # The queue orders the shared accumulator; the epilogue still waits for both.
+    assert ops.index(second) < ops.index(first_wait) < ops.index(last_wait)
+    assert (first_wait.pending_groups, last_wait.pending_groups) == (1, 0)
+
+
+def test_wgmma_await_drains_before_a_different_shape():
+    module = schedule_async(lower_to_async(_wgmma_steps("f16")))
+    first_wait, _ = find_ops_of_type(module, AwaitOp)
+    [_, second] = find_ops_of_type(module, AsyncOp)
+    ops = list(module.body.ops[0].body.ops)
+    assert ops.index(first_wait) < ops.index(second)
+    assert first_wait.is_full_wait

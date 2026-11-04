@@ -12,6 +12,10 @@ side-effect-free ops (alloc, index arithmetic, tile ops) up with it,
 so the async op rises as far as memory effects and external
 (side-effecting) dependencies allow, rather than getting stuck behind
 the ops that define its operands.
+
+An await on a WGMMA group may also sink below the next group when they only
+share same-shape accumulators. The WGMMA queue orders those accesses, so the
+await waits with that newer group still pending.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from ..gpu_dialect import (
     memory_effects,
     ModuleOp,
     MoveOp,
+    root_buffers,
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
@@ -81,6 +86,15 @@ def _effect_roots(op: Op) -> tuple[set[Value], set[Value]] | None:
 def _can_swap(upper: Op, lower: Op, effect_roots=_effect_roots) -> bool:
 
     if has_ordering_effect(upper) or has_ordering_effect(lower):
+        return False
+
+    # A partial await counts the newer groups on its queue.
+    if (
+        isinstance(upper, AwaitOp)
+        and upper.pending_groups
+        and isinstance(lower, AsyncOp)
+        and lower.lock.type.kind == upper.lock.type.kind
+    ):
         return False
 
     # SSA dependency: lower consumes a result of upper.
@@ -177,10 +191,63 @@ def _hoist_async_moves(ops: list[Op]) -> None:
     ops[:] = allocations + [op for op in ops if op not in set(allocations)]
 
 
+def _retains_group(await_op: AwaitOp, group: Op) -> bool:
+    """Whether a full queue await may sink below ``group``, leaving it pending.
+
+    PTX orders accumulator accesses by WGMMAs of the same shape, so those
+    accesses do not order the await and the newer group; every other hazard
+    still does.
+    """
+    lock_type = await_op.lock.type
+    if not (
+        lock_type.supports_partial_await
+        and await_op.is_full_wait
+        and isinstance(group, AsyncOp)
+        and group.lock is not await_op.lock
+        and group.lock.type.kind == lock_type.kind
+    ):
+        return False
+    issues = [op for op in await_op.lock.users() if isinstance(op, AsyncOp)]
+    matmuls = [mm for issue in (*issues, group) for mm in issue.body.ops]
+    shapes = {
+        (
+            tuple(mm.dst.type.sizes),
+            mm.dst.type.dtype.name,
+            mm.lhs.type.dtype.name,
+            mm.rhs.type.dtype.name,
+        )
+        for mm in matmuls
+    }
+    if len(shapes) != 1:
+        return False
+    accumulators = {root for mm in matmuls for root in root_buffers(mm.dst)}
+
+    def effect_roots(op: Op) -> tuple[set[Value], set[Value]] | None:
+        roots = _effect_roots(op)
+        return roots and (roots[0] - accumulators, roots[1] - accumulators)
+
+    return _can_swap(await_op, group, effect_roots)
+
+
 def _sink_awaits(ops: list[Op]) -> None:
     # Targets: the awaits; then sink each toward its first consumer.
     targets = [op for op in ops if _is_await(op)]
     _bubble(ops, targets, step=+1)
+    # A WGMMA await stopped by the next group can wait for every older one
+    # while that group runs, then keep sinking. An await sunk later may now
+    # separate them, so look past the ops this await can cross.
+    retained = []
+    for op in targets:
+        j = next(i for i, o in enumerate(ops) if o is op)
+        k = next(
+            (i for i in range(j + 1, len(ops)) if not _can_swap(op, ops[i])),
+            len(ops),
+        )
+        if k < len(ops) and _retains_group(op, ops[k]):
+            ops.insert(k, ops.pop(j))
+            op.attrs["pending"] = 1
+            retained.append(op)
+    _bubble(ops, retained, step=+1)
 
 
 class ScheduleAsync(Pass):

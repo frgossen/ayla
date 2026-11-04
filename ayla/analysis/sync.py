@@ -387,14 +387,12 @@ def _lock_completion_scope(lock: Value) -> CollectiveScope:
 def _await_completion_scope(op: AwaitOp) -> CollectiveScope:
     """Completion proven at this wait, rather than predicted at its producer.
 
-    A partial wait completes its listed lock at the mechanism's normal scope,
-    leaving newer groups pending. A full-warpgroup wait covers block memory when the
-    resolved block contains exactly that one group. This does not release
-    resources that require a block rendezvous.
+    A wait completes its listed lock, even when it leaves newer groups pending.
+    A warpgroup wait covers block memory when the resolved block contains exactly
+    that one group. This does not release resources that require a block
+    rendezvous.
     """
     scope = _lock_completion_scope(op.lock)
-    if not op.is_full_wait:
-        return scope
     if scope != CollectiveScope.WARPGROUP:
         return scope
     kernel = find_ancestor_of_type(op, KernelOp)

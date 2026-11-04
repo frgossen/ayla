@@ -2,10 +2,13 @@
 
 import textwrap
 
+import pytest
+
 from ayla.base.ir import find_ops_of_type
 from ayla.gemm_collection.gemm import schedule_register_matmul
 from ayla.gpu_dialect import AsyncOp, MoveOp, gpu_dialect
 from ayla.ptx_codegen import make_ptx_kernel
+from tests.testing_utils import requires_cuda
 
 
 from ayla.pipelines.tile_matmul_pipeline import (
@@ -203,3 +206,76 @@ def test_second_hero_ignores_an_already_pipelined_singleton():
             await(%3: lock<wgmma>)
           }
         }""")  # noqa: E501
+
+
+def _run_scheduled_gemm(module, operation, dtype, m, n, k, launches):
+    import torch
+    from ayla.ptx_runtime import make_ptx_launcher
+
+    torch_dtype = getattr(torch, dtype)
+    a = torch.randn(m, k, device="cuda", dtype=torch_dtype)
+    b = torch.randn(n, k, device="cuda", dtype=torch_dtype)
+    bias = torch.randn(n, device="cuda", dtype=torch_dtype)
+    out = torch.empty(m, n, device="cuda", dtype=torch_dtype)
+    reference = torch.addmm(bias, a, b.T) if operation == "addmm" else a @ b.T
+    launcher = make_ptx_launcher(make_ptx_kernel(module))
+    args = ([bias] if operation == "addmm" else []) + [a, b, out]
+    for _ in range(launches):
+        out.fill_(float("nan"))
+        launcher(*args)
+        torch.testing.assert_close(
+            out,
+            reference,
+            atol=0.125 if dtype == "float16" else 1,
+            rtol=0.002 if dtype == "float16" else 0.02,
+        )
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("operation", ["mm", "addmm"])
+@pytest.mark.parametrize(
+    "m,n,k,store,transpose",
+    [
+        (128, 128, 1024, "stmatrix", False),
+        (128, 128, 1024, "stmatrix", True),
+    ],
+)
+@requires_cuda
+def test_retained_wgmma_groups_preserve_ring_and_output_tails(
+    dtype, operation, m, n, k, store, transpose
+):
+    from ayla.gemm_collection.gemm import schedule_matmul
+    from ayla.gemm_jit import _module
+
+    module = schedule_matmul(
+        _module(operation, dtype, 1, m, n, k, transpose),
+        output_m_tile=64,
+        output_n_tile=64,
+        warpgroup_n_tile=64,
+        operand_k_tile=64,
+        operand_stages=3,
+        output_store=store,
+        masked_global_store=store == "global",
+        output_tma_inner_size=None,
+    )
+    _run_scheduled_gemm(module, operation, dtype, m, n, k, launches=3)
+
+
+@pytest.mark.parametrize("cluster,m_tile", [((1, 1), 128), ((2, 1), 64), ((1, 2), 64)])
+@requires_cuda
+def test_retained_wgmma_groups_preserve_multi_warpgroup_and_multicast(cluster, m_tile):
+    from ayla.gemm_collection.gemm import schedule_matmul
+    from ayla.gemm_jit import _module
+
+    module = schedule_matmul(
+        _module("mm", "float16", 1, 128, 128, 1024, False),
+        output_m_tile=m_tile,
+        output_n_tile=64,
+        warpgroup_n_tile=64,
+        operand_k_tile=64,
+        operand_stages=3,
+        cluster_m_ctas=cluster[0],
+        cluster_n_ctas=cluster[1],
+        output_tma_inner_size=None,
+    )
+    _run_scheduled_gemm(module, "mm", "float16", 128, 128, 1024, launches=10)

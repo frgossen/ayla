@@ -466,25 +466,6 @@ def _leader_warp(prefix: str) -> str:
     """)
 
 
-def _leader_thread(prefix: str, before_branch: str = "") -> str:
-    """PTX that lets one elected thread of warp 0 do leader work.
-
-    Every other warp branches to ``${label:<prefix>_done}``, without diverging
-    inside a warp, and ``elect.sync`` sets ``${pred:<prefix>_leader}`` on one
-    thread of warp 0, so ptxas can keep the work's operands in uniform
-    registers. ``before_branch`` runs in every warp, so ptxas can keep its
-    special-register reads out of loops.
-    """
-    return (
-        _leader_warp(prefix)
-        + before_branch
-        + (
-            f"@${{pred:{prefix}_other_warp}} bra ${{label:{prefix}_done}};\n"
-            f"elect.sync _|${{pred:{prefix}_leader}}, 0xffffffff;\n"
-        )
-    )
-
-
 # A cluster-to-leader release, in every warp: one elected thread arrives at
 # its own CTA's mbarrier, for the CTA leader's next write, and a non-leader
 # CTA's also at the cluster leader's, for the cluster leader's next write.
@@ -2569,7 +2550,7 @@ class LowerToPtxTemplate(LoweringPass):
         self, moves: list[TmaMoveOp]
     ) -> tuple[list[Op], list[object]]:
         """Issue atom stores from one elected thread and commit one group."""
-        leader_operands, leader_names, _ = self._leader_thread("st")
+        leader_operands, leader_names, leader_thread = self._leader_thread("st")
         operands = list(leader_operands)
         operand_names = list(leader_names)
         lines = ["fence.proxy.async.shared::cta;"]
@@ -2599,7 +2580,7 @@ class LowerToPtxTemplate(LoweringPass):
         lowered = PTXTemplateOp.build(
             operands=operands,
             result_types=[],
-            template=_leader_thread("st") + "\n".join(lines) + "\n",
+            template=leader_thread + "\n".join(lines) + "\n",
             operand_names=operand_names,
             result_names=[],
             description="Grouped TMA stores",
@@ -2626,15 +2607,15 @@ class LowerToPtxTemplate(LoweringPass):
             f"_lower_async_tma_loads: expected lock kind 'mbar'; got {lock_type.kind!r}"
         )
 
-        leader_thread = _leader_thread(
+        leader_operands, leader_names, leader_thread = self._leader_thread(
             "ld",
             before_branch=(
                 "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
                 "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;\n"
             ),
         )
-        operands: list[Value] = [lock_value]
-        operand_names: list[str] = ["lock"]
+        operands: list[Value] = [lock_value, *leader_operands]
+        operand_names: list[str] = ["lock", *leader_names]
         multicast_mask: int | None = None
         cluster_size = 1
         if op.is_tma_multicast:
@@ -3027,10 +3008,17 @@ def _tma_coordinates(
     block = f"${{b32:{prefix}_block}}"
     inner = f"${{b32:{prefix}_inner}}"
     block_width, order = layout
-    lines = [
-        f"div.u32 {block}, {col}, {block_width};",
-        f"rem.u32 {inner}, {col}, {block_width};",
-    ]
+    lines = (
+        [
+            f"shr.u32 {block}, {col}, {block_width.bit_length() - 1};",
+            f"and.b32 {inner}, {col}, {block_width - 1};",
+        ]
+        if block_width & (block_width - 1) == 0
+        else [
+            f"div.u32 {block}, {col}, {block_width};",
+            f"rem.u32 {inner}, {col}, {block_width};",
+        ]
+    )
     if order == "row_major":
         coordinates = [inner, block, row, *outer]
     else:

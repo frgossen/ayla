@@ -886,3 +886,73 @@ def test_bulk_await_orders_tma_store_read_only_for_the_leader():
         'barrier() attrs={scope: "block"}',
         "move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)",
     ]
+
+
+def _operand_reuse_module(threads=128, cluster=None):
+    source = textwrap.dedent("""\
+        module { kernel @test(%a: gmem<128x1024xbf16>, %b: gmem<128x1024xbf16>, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) grid_dim=[1,1,1] block_dim=[128,1,1] {
+         %sa: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id:0}
+         %sb: smem<128x64xbf16 swizzle="128B"> = alloc() attrs={id:1}
+         %lm: lock<mbar> = alloc() attrs={id:2}
+         %lw: lock<wgmma> = alloc() attrs={id:3}
+         for (%k: index = 0 to 16) {
+         %ak: gmem<128x64xbf16 strides=[1024,1]> = tile(%a: gmem<128x1024xbf16>,0,%k: index)
+         %bk: gmem<128x64xbf16 strides=[1024,1]> = tile(%b: gmem<128x1024xbf16>,0,%k: index)
+         async(%lm: lock<mbar>) { move(%sa: smem<128x64xbf16 swizzle="128B">,%ak: gmem<128x64xbf16 strides=[1024,1]>) attrs={tma:True} move(%sb: smem<128x64xbf16 swizzle="128B">,%bk: gmem<128x64xbf16 strides=[1024,1]>) attrs={tma:True} }
+         await(%lm: lock<mbar>)
+         async(%lw: lock<wgmma>) matmul(%sa: smem<128x64xbf16 swizzle="128B">,%sb: smem<128x64xbf16 swizzle="128B">,%acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block,z.thread]
+         await(%lw: lock<wgmma>)
+         } } }
+    """)
+    module = gpu_dialect.parse(source.replace("block_dim=[128,1,1]", f"block_dim=[{threads},1,1]"))
+    [kernel] = module.body.ops
+    if cluster:
+        kernel.attrs["cluster_dim"] = [cluster, 1, 1]
+    return module
+
+
+@pytest.mark.parametrize("threads,cluster,needs_gather", [
+    (128, None, False), (256, None, True), (128, 2, True),
+])
+def test_single_group_wait_orders_local_operand_reuse(threads, cluster, needs_gather):
+    module = _operand_reuse_module(threads, cluster)
+    insert_syncs(module)
+    gathers = [op for op in find_ops_of_type(module, BarrierOp) if op.scope == "block_leader"]
+    assert bool(gathers) == needs_gather
+
+
+def test_retained_group_wait_orders_local_operand_reuse():
+    # The partial wait completes its own group while the newer one runs, so
+    # refilling the first group's operand needs no gather.
+    acc = 'wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">'
+    module = gpu_dialect.parse(textwrap.dedent(f"""\
+        module {{ kernel @test(%a: gmem<64x64xbf16>, %acc: {acc}) grid_dim=[1,1,1] block_dim=[128,1,1] {{
+         %sa: smem<64x64xbf16 swizzle="128B"> = alloc() attrs={{id:0}}
+         %sb: smem<64x64xbf16 swizzle="128B"> = alloc() attrs={{id:1}}
+         %lm: lock<mbar> = alloc() attrs={{id:2}}
+         %lw: lock<wgmma> = alloc() attrs={{id:3}}
+         %lw2: lock<wgmma> = alloc() attrs={{id:4}}
+         async(%lm: lock<mbar>) move(%sa: smem<64x64xbf16 swizzle="128B">,%a: gmem<64x64xbf16>) attrs={{tma:True}}
+         await(%lm: lock<mbar>)
+         async(%lw: lock<wgmma>) matmul(%sa: smem<64x64xbf16 swizzle="128B">,%sa: smem<64x64xbf16 swizzle="128B">,%acc: {acc}) collective=[xy.block,z.thread]
+         async(%lw2: lock<wgmma>) matmul(%sb: smem<64x64xbf16 swizzle="128B">,%sb: smem<64x64xbf16 swizzle="128B">,%acc: {acc}) collective=[xy.block,z.thread]
+         await(%lw: lock<wgmma>) attrs={{pending: 1}}
+         async(%lm: lock<mbar>) move(%sa: smem<64x64xbf16 swizzle="128B">,%a: gmem<64x64xbf16>) attrs={{tma:True}}
+         await(%lm: lock<mbar>)
+         await(%lw2: lock<wgmma>)
+        }} }}
+    """))
+    insert_syncs(module)
+    assert not [op for op in find_ops_of_type(module, BarrierOp) if op.scope == "block_leader"]
+
+
+@pytest.mark.parametrize("block,declared", [([None, 1, 1], None), ([128, 1, 1], 2)])
+def test_unresolved_or_conflicting_topology_does_not_promote_completion(block, declared):
+    from ayla.analysis.sync import _await_completion_scope
+    from ayla.gpu_dialect import AwaitOp
+
+    module = _operand_reuse_module(threads=block[0])
+    [kernel] = module.body.ops
+    kernel.num_warp_groups = declared
+    [wait] = [op for op in find_ops_of_type(module, AwaitOp) if op.lock.type.kind == "wgmma"]
+    assert _await_completion_scope(wait) == CollectiveScope.WARPGROUP
