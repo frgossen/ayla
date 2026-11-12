@@ -24,6 +24,23 @@ def test_measured_shape_selects_its_winner():
     )
 
 
+def test_selector_reaches_fifteenth_candidate(monkeypatch):
+    from ayla import gemm_jit
+
+    shape = (1, 128, 128, 256)
+    incumbent = select_gemm_schedule("mm", "bfloat16", *shape[1:])
+    legal = incumbent.captured_config
+    tile = incumbent.builder_config["output_n_tile"] * incumbent.builder_config["output_n_tiles_per_cta"]
+    n_grid = (shape[2] + tile - 1) // tile
+    # A cluster larger than the N grid fails layout admission.
+    configs = [dict(legal, cluster_n_ctas=n_grid + 1) for _ in range(14)] + [legal]
+    monkeypatch.setattr(gemm_jit, "CONFIGS", configs)
+    monkeypatch.setattr(gemm_jit, "SCHEDULES", {("mm", "bfloat16"): {shape: tuple(range(15))}})
+    seed = select_gemm_schedule("mm", "bfloat16", *shape[1:])
+    assert seed is not None
+    assert seed.captured_config.get("cluster_n_ctas", 1) == legal.get("cluster_n_ctas", 1)
+
+
 def test_unmeasured_shape_borrows_a_legal_nearby_schedule():
     assert (1, 4100, 4096, 4096) not in SCHEDULES["mm", "float16"]
     schedule = select_gemm_schedule("mm", "float16", 4100, 4096, 4096)

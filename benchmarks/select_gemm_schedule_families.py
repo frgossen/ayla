@@ -19,6 +19,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import json
 import statistics
@@ -30,6 +31,7 @@ from benchmarks.oss_gemm_corpus import ScheduleConfig, timing_protocol
 
 TABLE = Path(__file__).resolve().parents[1] / "ayla/gemm_schedule_table.py"
 PROTOCOL = "inference-v2"
+DEFAULT_MAX_CANDIDATES = 15
 
 Shape = tuple[str, str, int, int, int, int]
 
@@ -124,13 +126,18 @@ def ranked_candidates(
 def select_families(
     installed: list[dict[str, object]],
     ranked: list[tuple[float, dict[str, object]]],
-    *, families: int, band: float,
+    *, families: int, band: float, candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> list[dict[str, object]]:
     """Installed seeds, then each new family's best variant within the band."""
+    if families < 1 or candidates < 1:
+        raise ValueError("families and candidates must be positive")
+    if len(installed) > candidates:
+        raise ValueError("installed candidate list exceeds the candidate limit")
     seeds = list(installed)
     seen = {family(config) for config in installed}
     for pct, config in ranked:
-        if len(seen) >= families or pct < band * ranked[0][0]:
+        if (len(seeds) >= candidates or len(seen) >= families
+                or pct < band * ranked[0][0]):
             break
         if family(config) not in seen:
             seeds.append(config)
@@ -165,7 +172,7 @@ def _format_table(
 
 def update_table(
     candidates: dict[Shape, list[tuple[float, dict[str, object]]]],
-    *, families: int, band: float,
+    *, families: int, band: float, max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> tuple[int, int]:
     """Widen the measured shapes' table entries; return (shapes, seeds) added."""
     from ayla.gemm_schedule_table import CONFIGS, SCHEDULES
@@ -183,6 +190,7 @@ def update_table(
         seeds = list(table[shape])
         for config in select_families(
             installed, ranked, families=families, band=band,
+            candidates=max_candidates,
         )[len(installed):]:
             key = json.dumps(config)
             if key not in index:
@@ -194,7 +202,14 @@ def update_table(
         table[shape] = tuple(seeds)
     text = TABLE.read_text()
     docstring = text[:text.index("# fmt: off")]
-    TABLE.write_text(_format_table(docstring, configs, schedules))
+    # Keep admission exclusions and full-graph routing below SCHEDULES.
+    schedule_node = next(
+        node for node in ast.parse(text).body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name) and node.target.id == "SCHEDULES"
+    )
+    suffix = "".join(text.splitlines(keepends=True)[schedule_node.end_lineno:])
+    TABLE.write_text(_format_table(docstring, configs, schedules) + suffix)
     return widened, added
 
 
@@ -202,8 +217,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path, nargs="+",
                         help=f"raw benchmark JSON timed under {PROTOCOL}")
-    parser.add_argument("--families", type=int, default=10,
+    parser.add_argument("--families", type=int, default=DEFAULT_MAX_CANDIDATES,
                         help="families per shape, counting the installed seeds'")
+    parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
+                        help="total candidates per shape, including installed variants (default: 15)")
     parser.add_argument("--band", type=float, default=0.95,
                         help="keep families whose best variant reaches this "
                         "fraction of the shape's best inference score")
@@ -214,11 +231,13 @@ def main() -> int:
     if args.update_table:
         widened, added = update_table(
             candidates, families=args.families, band=args.band,
+            max_candidates=args.max_candidates,
         )
         print(f"added {added} seeds to {widened} shapes in {TABLE}")
         return 0
     for shape, ranked in sorted(candidates.items()):
-        seeds = select_families([], ranked, families=args.families, band=args.band)
+        seeds = select_families([], ranked, families=args.families, band=args.band,
+                                candidates=args.max_candidates)
         print(shape, len(seeds), "families")
     return 0
 

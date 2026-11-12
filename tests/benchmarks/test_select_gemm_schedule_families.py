@@ -1,9 +1,11 @@
 import pytest
 
 from benchmarks.select_gemm_schedule_families import (
+    DEFAULT_MAX_CANDIDATES,
     family,
     select_families,
     table_entry,
+    update_table,
 )
 
 
@@ -69,3 +71,32 @@ def test_table_entries_omit_defaults_and_reject_unbuildable_configs() -> None:
     assert table_entry(
         _config(output_cta_count=132, multicast=True, cluster_m_ctas=2),
     ) is None
+
+
+def test_fifteen_candidate_limit_counts_installed_variants() -> None:
+    installed = [_config(operand_stages=2), _config(operand_stages=4)]
+    ranked = [(110.0, _config(output_m_tile=128 + 32 * i)) for i in range(1, 20)]
+    seeds = select_families(installed, ranked, families=15, band=0.95)
+    assert DEFAULT_MAX_CANDIDATES == 15
+    assert seeds == installed + [config for _, config in ranked[:13]]
+    with pytest.raises(ValueError, match="exceeds the candidate limit"):
+        select_families(seeds, ranked, families=15, band=0.95, candidates=14)
+
+
+def test_update_preserves_admission_and_graph_metadata(tmp_path, monkeypatch) -> None:
+    from ayla import gemm_schedule_table
+    from benchmarks import select_gemm_schedule_families as selector
+
+    config = table_entry(_config())
+    shape = (1, 128, 256, 256)
+    group = ("mm", "bfloat16")
+    suffix = '\nDEFERRED_OUTPUT_WIDTHS = frozenset({2})\nfrom .graph_gemm_schedules import GRAPH_SCHEDULES\n'
+    text = selector._format_table('"""test"""\n', [config], {group: {shape: (0,)}})
+    path = tmp_path / "table.py"
+    path.write_text(text + suffix)
+    monkeypatch.setattr(selector, "TABLE", path)
+    monkeypatch.setattr(gemm_schedule_table, "CONFIGS", (config,))
+    monkeypatch.setattr(gemm_schedule_table, "SCHEDULES", {group: {shape: (0,)}})
+    assert update_table({(*group, *shape): [(110.0, table_entry(_config(output_m_tile=192)))]},
+                        families=15, band=0.95) == (1, 1)
+    assert path.read_text().endswith(suffix)
