@@ -360,27 +360,38 @@ def assemble_ptx(kernel: PtxKernel, ptxas: str | Path) -> bytes:
 
 
 
-class PtxLauncher:
-    """Opaque host-side function that launches a PTX kernel.
+class LaunchableKernel(Protocol):
+    """Metadata shared by PTX and native cubin entry points."""
 
-    Constructed from a :class:`PtxKernel`, and optionally the cubin
-    :func:`assemble_ptx` made from it, which is then loaded instead of
-    JIT-compiling the PTX. Calling the instance with tensors performs all
-    required host-side setup and issues the launch on the current torch CUDA
-    stream.
-    """
+    name: str
+    signature: list
+    grid_dim: tuple[int, int, int]
+    block_dim: tuple[int, int, int]
+
+    @property
+    def dynamic_shared_mem_bytes(self) -> int: ...
+
+
+class CudaLauncher:
+    """Load PTX or a cubin and launch it with the shared tensor-map ABI."""
 
     def __init__(
         self,
-        kernel: PtxKernel,
+        kernel: LaunchableKernel,
         image: bytes | None = None,
     ):
         self._ext: _LauncherExtension | None = None
         self._kernel = kernel
-        self._image = image
-        self._optimization_level = kernel.ptx_optimization_level
         self._module: int | None = None
         self._function: int | None = None
+        if image is None:
+            if not isinstance(kernel, PtxKernel):
+                raise ValueError("a native kernel requires a cubin image")
+            self._code = kernel.ptx
+            self._optimization_level = kernel.ptx_optimization_level
+        else:
+            self._code = image
+            self._optimization_level = None
         # Map kernel arg index → user tensor index.
         self._arg_to_tensor: dict[int, int] = {}
         ti = 0
@@ -396,7 +407,7 @@ class PtxLauncher:
             # The driver takes a cubin through the same call; a cubin carries
             # its own code, so the JIT options do not apply to it.
             self._module = self._ext.module_load_data(
-                self._kernel.ptx if self._image is None else self._image,
+                self._code,
                 self._optimization_level
                 if self._optimization_level is not None else -1,
             )
@@ -423,7 +434,7 @@ class PtxLauncher:
             self._kernel.grid_dim,
             self._kernel.block_dim,
             params,
-            self._kernel.shared_mem_bytes,
+            self._kernel.dynamic_shared_mem_bytes,
         )
 
     def _build_params(self, tensors):
@@ -484,6 +495,10 @@ class PtxLauncher:
             self._ext.module_unload(self._module)
         except Exception:
             pass
+
+
+# Preserve the existing public name for PTX callers.
+PtxLauncher = CudaLauncher
 
 
 def make_ptx_launcher(

@@ -4,7 +4,8 @@ import textwrap
 
 import pytest
 
-from ayla.base.ir import find_ops_of_type
+from ayla.base.ir import Block, Value, find_ops_of_type
+from ayla import gpu_dialect as g
 from ayla.gpu_dialect import ElementwiseOp, MatmulOp, TileOp, gpu_dialect
 from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.folding import folding
@@ -254,3 +255,30 @@ def test_zero_fill_folds_into_the_matmul_that_next_writes_the_buffer(
     fills = [op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "fill"]
     assert matmul.accumulate != folds
     assert bool(fills) != folds
+
+
+@pytest.mark.parametrize("limit,fold", [(7, True), (9, True), (10, False), (0, False)])
+def test_remainder_replacement_is_scoped(limit, fold):
+    x = Value(None, g.IndexType())
+    modulus = g.IndexConstantOp.build(9)
+    bound = g.IndexConstantOp.build(limit)
+    remainder = g.IndexModOp.build(x, modulus.result())
+    comparison = g.IndexLtOp.build(x, bound.result())
+    inside = g.IndexAddOp.build(remainder.result(), modulus.result())
+    nested_use = g.IndexMulOp.build(remainder.result(), modulus.result())
+    nested = g.ForOp.build(
+        0, 2, body=Block(arguments=[Value(None, g.IndexType())], ops=[nested_use])
+    )
+    condition = g.IfOp.build(comparison.result(), Block(ops=[inside, nested]))
+    outside = g.IndexAddOp.build(remainder.result(), modulus.result())
+    module = g.ModuleOp.build(
+        Block(arguments=[x], ops=[modulus, bound, remainder, comparison, condition, outside])
+    )
+    from ayla.passes.folding import Folding
+
+    Folding().run(module)
+    expected = x if fold else remainder.result()
+    assert inside.lhs is expected
+    assert nested_use.lhs is expected
+    assert outside.lhs is remainder.result()
+    assert remainder in module.body.ops

@@ -39,6 +39,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     operand_stages: int = 3,
     operand_k_tile: int = 64,
     cyclic_operand_pipeline: bool = False,
+    matrix_refill_pipeline: bool = False,
     output_slices: int = 1,
     output_store_buffers: int = 1,
     output_tma_inner_size: int | None = 128,
@@ -69,6 +70,8 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_ktile{operand_k_tile}"
     if cyclic_operand_pipeline:
         name += "_kring"
+    if matrix_refill_pipeline:
+        name += "_refill"
     if output_m_tile != 128:
         name += f"_m{output_m_tile}"
     if output_n_tile != 256:
@@ -125,6 +128,7 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
         cyclic_operand_pipeline=cyclic_operand_pipeline,
+        matrix_refill_pipeline=matrix_refill_pipeline,
         output_slices=output_slices,
         output_store_buffers=output_store_buffers,
         output_tma_inner_size=output_tma_inner_size,

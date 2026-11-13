@@ -61,6 +61,9 @@ from ..gpu_dialect import (
     physical_layout,
     lock_has_tma_multicast,
     root_buffer,
+    wgmma_pair_offset,
+    wgmma_view_pairs,
+    static_view_origin,
 )
 
 
@@ -669,7 +672,7 @@ class LowerToPtxTemplate(LoweringPass):
         new_ops: list[Op] = []
 
         if isinstance(op.arg.type, WgrmemTensorType):
-            _wgmma_view_pairs(op.result())  # Validate the static view.
+            wgmma_view_pairs(op.result())  # Validate the static view.
             assert isinstance(arg, Value)
             return [], [arg]
 
@@ -683,85 +686,21 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             raise NotImplementedError(f"lower_tile: unexpected arg type {type(arg)}")
 
-        view_root = op.arg
-        while isinstance(view_root.definition, TileOp):
-            view_root = view_root.definition.arg
-        view_root_type = view_root.type
-        assert isinstance(view_root_type, AddrMemTensorType)
-        dtype_bytes = cast(
-            BF16Type | F16Type | F32Type | F64Type,
-            view_root_type.dtype,
-        ).byte_size
-        result_type = op.result().type
-        assert isinstance(result_type, AddrMemTensorType)
-        result_sizes = cast(tuple[int, ...], result_type.sizes)
-        layout = (
-            physical_layout(view_root_type)
-            if isinstance(view_root_type, SmemTensorType)
-            else None
-        )
-        # Blocks split the contiguous dimension; the other one is the row.
-        inner_dim = 0 if is_column_major(view_root_type) else 1
-        outer_rows = view_root_type.sizes[1 - inner_dim]
-
-        # Accumulate byte offset for each dimension.
         zero = IndexConstantOp.build(0)
         new_ops.append(zero)
         byte_offset = zero.result()
-
-        for dim, idx in enumerate(op.indices):
-            if layout is not None and layout[1] == "block_major" and dim == inner_dim:
-                block_width, _ = layout
-                if result_sizes[dim] % block_width:
-                    parent_type = op.arg.type
-                    assert isinstance(parent_type, AddrMemTensorType)
-                    parent_width = parent_type.sizes[dim]
-                    assert isinstance(parent_width, int)
-                    assert parent_width % block_width == 0
-                    assert isinstance(idx, int), (
-                        "block-major sub-block tiles require a static index"
-                    )
-                    block, inner = divmod(
-                        idx * result_sizes[dim],
-                        block_width,
-                    )
-                    byte_delta = (
-                        block * cast(int, outer_rows) * block_width + inner
-                    ) * dtype_bytes
-                    byte_term = IndexConstantOp.build(byte_delta)
-                    new_ops.append(byte_term)
-                    add_op = IndexAddOp.build(byte_offset, byte_term.result())
-                    new_ops.append(add_op)
-                    byte_offset = add_op.result()
-                    continue
-
-            if isinstance(idx, int):
-                const_op = IndexConstantOp.build(idx)
-                new_ops.append(const_op)
-                idx = const_op.result()
+        for index, stride in op.byte_offset_terms():
+            if isinstance(index, int):
+                constant = IndexConstantOp.build(index)
+                new_ops.append(constant)
+                index = constant.result()
             else:
-                idx = cast(Value, self.value_map[idx])
-
-            tile_size_op = IndexConstantOp.build(result_sizes[dim])
-            new_ops.append(tile_size_op)
-            elem_off = IndexMulOp.build(idx, tile_size_op.result())
-            new_ops.append(elem_off)
-
-            stride = view_root_type.strides[dim]
-            if layout is not None and layout[1] == "block_major":
-                block_width, _ = layout
-                assert view_root_type.rank == 2
-                stride = outer_rows if dim == inner_dim else block_width
-
-            assert stride is not None
-            stride_bytes = stride * dtype_bytes
-            stride_op = IndexConstantOp.build(stride_bytes)
-            new_ops.append(stride_op)
-            byte_term = IndexMulOp.build(elem_off.result(), stride_op.result())
-            new_ops.append(byte_term)
-            add_op = IndexAddOp.build(byte_offset, byte_term.result())
-            new_ops.append(add_op)
-            byte_offset = add_op.result()
+                index = cast(Value, self.value_map[index])
+            stride_op = IndexConstantOp.build(stride)
+            term = IndexMulOp.build(index, stride_op.result())
+            add = IndexAddOp.build(byte_offset, term.result())
+            new_ops.extend([stride_op, term, add])
+            byte_offset = add.result()
 
         ptr_add = PtrAddOp.build(ptr, byte_offset)
         new_ops.append(ptr_add)
@@ -2057,7 +1996,7 @@ class LowerToPtxTemplate(LoweringPass):
                 f"wgmma move: memory shape {list(memory_type.sizes)} does "
                 f"not match fragment {[m_dim, n_dim]}"
             )
-            pairs = _wgmma_view_pairs(fragment)
+            pairs = wgmma_view_pairs(fragment)
         else:
             # Keep accepting the legacy producer until PromoteBuffers switches
             # from an attribute-based slice to an explicit WGRMEM view.
@@ -2068,7 +2007,7 @@ class LowerToPtxTemplate(LoweringPass):
             assert col_start + memory_n <= n_dim
             pairs = [
                 (pair, row, col - col_start)
-                for pair, row, col in _wgmma_view_pairs(fragment)
+                for pair, row, col in wgmma_view_pairs(fragment)
                 if col_start <= col < col_start + memory_n
             ]
         assert m_dim % 64 == 0, f"wgmma store: m must be a multiple of 64; got {m_dim}"
@@ -2315,7 +2254,7 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(dst_type, SmemTensorType)
         assert isinstance(src_type, WgrmemTensorType)
         col_start = (
-            _static_view_origin(op.src)[1]
+            static_view_origin(op.src)[1]
             if isinstance(op.src.definition, TileOp)
             else op.attrs.get("wgmma_col_start", 0)
         )
@@ -2809,81 +2748,11 @@ def _build_wgmma_layout_0_dynamic_offset(
     return ops, byte_offset.result()
 
 
-def _wgmma_pair_static_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
-    """Thread-independent root offset of a WGMMA pair's first element.
-
-    The runtime warp/lane offset selects the thread's base coordinate. This
-    returns the additional logical ``(row, column)`` offset for ``pair_index``
-    in that thread's register fragment.
-    """
-    assert n_dim % 8 == 0
-    pairs_per_m_tile = n_dim // 4
-    m, pair_in_m_tile = divmod(pair_index, pairs_per_m_tile)
-    w, pair_in_16_columns = divmod(pair_in_m_tile, 4)
-    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][pair_in_16_columns]
-    return (m * 64 + di, w * 16 + dj)
-
-
-def _static_view_origin(value: Value) -> tuple[int, ...]:
-    """Logical element coordinates of a static view's origin in its root."""
-    value_type = value.type
-    assert isinstance(value_type, WgrmemTensorType)
-    offsets = [0] * value_type.rank
-    while isinstance(value.definition, TileOp):
-        tile = value.definition
-        for dim, index in enumerate(tile.static_indices):
-            if index is None:
-                raise NotImplementedError(
-                    "WGRMEM views currently require static tile indices"
-                )
-            result_type = tile.result().type
-            assert isinstance(result_type, WgrmemTensorType)
-            offsets[dim] += index * cast(int, result_type.sizes[dim])
-        value = tile.arg
-    return tuple(offsets)
-
-
-def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
-    """Map a WGMMA WGRMEM value or view to pairs in its root.
-
-    Each tuple is ``(root_pair_index, view_row_offset, view_column_offset)``.
-    Pair ``p`` names F32 registers ``2*p`` and ``2*p + 1``, or the packed
-    BF16/F16 b32 register ``p``. The offsets are the thread-independent
-    logical coordinates of the pair's first element relative to the view;
-    store lowering adds the runtime warp/lane coordinate separately.
-    """
-    root = root_buffer(value)
-    assert root is not None
-    view_type, root_type = value.type, root.type
-    assert isinstance(view_type, WgrmemTensorType)
-    assert isinstance(root_type, WgrmemTensorType)
-    assert view_type.layout == root_type.layout == "wgmma_layout_0"
-    assert view_type.rank == root_type.rank == 2
-    assert view_type.warps == root_type.warps == 4
-    assert view_type.dtype == root_type.dtype
-    assert isinstance(view_type.dtype, (F32Type, BF16Type, F16Type)), (
-        f"WGMMA views support f32, bf16, and f16; got {view_type.dtype}"
-    )
-    assert root_type.num_elements_per_thread % 2 == 0
-    row_start, col_start = _static_view_origin(value)
-    view_m, view_n = cast(tuple[int, int], view_type.sizes)
-    root_n = cast(int, root_type.sizes[1])
-    pairs = [
-        (pair_index, row - row_start, col - col_start)
-        for pair_index in range(root_type.num_elements_per_thread // 2)
-        for row, col in [_wgmma_pair_static_offset(pair_index, root_n)]
-        if row_start <= row < row_start + view_m
-        and col_start <= col < col_start + view_n
-    ]
-    assert len(pairs) == view_m * view_n // (root_type.warps * 64)
-    return pairs
-
-
 def _view_pair_indices(value: Value) -> list[int]:
     """Return per-thread root pair indices selected by a WGRMEM value or view."""
     assert isinstance(value.type, WgrmemTensorType)
     if value.type.layout == "wgmma_layout_0":
-        return [pair for pair, _, _ in _wgmma_view_pairs(value)]
+        return [pair for pair, _, _ in wgmma_view_pairs(value)]
     if isinstance(value.definition, TileOp):
         raise NotImplementedError(
             f"WGRMEM views are unsupported for layout {value.type.layout!r}"
@@ -2994,7 +2863,7 @@ def _stmatrix_store_static_offset(
     transposed: bool = False,
 ) -> int:
     """Byte offset for a fragment pair in the destination's blocked layout."""
-    di, dj = _wgmma_pair_static_offset(pair_index, n_dim)
+    di, dj = wgmma_pair_offset(pair_index, n_dim)
     row, col = di, dj - col_start
     if transposed:
         row, col = col, row
@@ -3085,7 +2954,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     root_n = cast(int, src_root_type.sizes[1])
     is_view = isinstance(op.src.definition, TileOp)
     row_start, col_start = (
-        _static_view_origin(op.src)
+        static_view_origin(op.src)
         if is_view
         else (0, op.attrs.get("wgmma_col_start", 0))
     )
@@ -3121,13 +2990,13 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
 def _stmatrix_pairs(op: MoveOp) -> list[tuple[int, int, int]]:
     """The WGMMA pairs a fragment store writes, relative to its destination."""
     if isinstance(op.src.definition, TileOp):
-        return _wgmma_view_pairs(op.src)
+        return wgmma_view_pairs(op.src)
     col_start = op.attrs.get("wgmma_col_start", 0)
     assert isinstance(col_start, int)
     dst_n = cast(int, cast(MemTensorType, op.dst.type).sizes[1])
     return [
         (pair, row, col - col_start)
-        for pair, row, col in _wgmma_view_pairs(op.src)
+        for pair, row, col in wgmma_view_pairs(op.src)
         if col_start <= col < col_start + dst_n
     ]
 

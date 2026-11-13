@@ -38,6 +38,20 @@ _DEFAULTS: dict[str, object] = {
 _MAX_TRANSFERRED_WAVES = 8
 
 
+# Accepted source configurations, not a runtime shape heuristic. A changed
+# catalog fingerprint declines stale measurements. Evidence and rejected
+# records remain in docs/matrix_refill_selection_results.json.
+_MATRIX_REFILL_SCHEDULES = frozenset({
+    ('mm', 'bfloat16', 'ptx', (1, 512, 1024, 4096), 'c9018acb665b4f00c6698ac24ba19749d083341d44948bce4cb4f7c1acdd203c'),
+    ('mm', 'bfloat16', 'ptx', (1, 768, 768, 2048), '76b2885aa5a3c9cd14186cf5672cf19ab1c8a64e27f47dd4d747565a3f466e18'),
+    ('mm', 'bfloat16', 'sass', (1, 768, 768, 2048), '76b2885aa5a3c9cd14186cf5672cf19ab1c8a64e27f47dd4d747565a3f466e18'),
+    ('mm', 'float16', 'ptx', (1, 1576, 384, 1536), '6c2379b5ed423f1892a5b899c58f957b7f359541f629d1efe56f7695fff2c579'),
+    ('mm', 'float16', 'sass', (1, 1576, 384, 1536), '6c2379b5ed423f1892a5b899c58f957b7f359541f629d1efe56f7695fff2c579'),
+    ('mm', 'float16', 'ptx', (1, 512, 1536, 1536), '9e4244ae0e6c8b62d372cc5e5f60906e922d9fd74cb77bae26ca0c840998f17e'),
+    ('mm', 'float16', 'sass', (1, 512, 1536, 1536), '9e4244ae0e6c8b62d372cc5e5f60906e922d9fd74cb77bae26ca0c840998f17e'),
+})
+
+
 @dataclass(frozen=True)
 class GemmScheduleSeed:
     captured_config: dict[str, object]
@@ -50,6 +64,7 @@ class GemmScheduleSeed:
     fixed_output_unroll_factor: int | None = None
     pipeline_output_waves: bool = False
     pipeline_output_writeback: bool = False
+    matrix_refill_pipeline: bool = False
 
 
 def apply_gemm_schedule_seed_post_build(
@@ -372,11 +387,17 @@ def select_gemm_schedule(
     lhs_batch_interleaved: bool = False,
     rhs_batch_interleaved: bool = False,
     graph: bool = False,
+    backend: str = "ptx",
+    measured_lowering: bool = False,
 ) -> GemmScheduleSeed | None:
     """Return the nearest measured schedule legal for this GEMM, if any.
 
     A transferred schedule names its source shape in ``adaptations``.
+    ``measured_lowering=True`` enables recorded refill overlap for the selected
+    configuration; it leaves the catalog search unchanged.
     """
+    if backend not in ("ptx", "sass"):
+        raise ValueError(f"unsupported GEMM backend {backend}")
     if (lhs_batch_interleaved or rhs_batch_interleaved) and operation != "bmm":
         return None
     if operation not in ("mm", "addmm", "bmm") or dtype not in _IR_DTYPES:
@@ -419,6 +440,19 @@ def select_gemm_schedule(
                 exact=shape == query,
             )
             if seed is not None and _supports_operand_layouts(seed, m, n, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved):
+                if measured_lowering and not any((
+                    graph, lhs_column_major, rhs_column_major,
+                    lhs_batch_interleaved, rhs_batch_interleaved,
+                )):
+                    from dataclasses import replace
+                    import hashlib
+                    import json
+
+                    fingerprint = hashlib.sha256(json.dumps(
+                        seed.captured_config, sort_keys=True, separators=(",", ":")
+                    ).encode()).hexdigest()
+                    if (operation, dtype, backend, shape, fingerprint) in _MATRIX_REFILL_SCHEDULES:
+                        seed = replace(seed, matrix_refill_pipeline=True)
                 return seed
     return None
 
@@ -537,7 +571,12 @@ def build_gemm_module(
     if ptx_optimization_level is not None:
         kernel.attrs["ptx_optimization_level"] = ptx_optimization_level
     module = schedule_matmul(module, **kwargs)  # type: ignore[arg-type]
-    return apply_gemm_schedule_seed_post_build(module, seed)
+    module = apply_gemm_schedule_seed_post_build(module, seed)
+    if seed.matrix_refill_pipeline:
+        from .passes.pipeline_matrix_refills import pipeline_matrix_refills
+
+        module = pipeline_matrix_refills(module)
+    return module
 
 
 def gemm_jit_compiler(
@@ -549,6 +588,8 @@ def gemm_jit_compiler(
     lhs_batch_interleaved: bool = False,
     rhs_batch_interleaved: bool = False,
     graph: bool = False,
+    backend: str = "ptx",
+    measured_lowering: bool = False,
 ) -> ShapeSpecializingJITCompiler:
     """Compile each concrete mm, addmm, or bmm shape from the schedule table.
 
@@ -557,6 +598,11 @@ def gemm_jit_compiler(
     """
     from .ptx_codegen import make_ptx_kernel
     from .ptx_runtime import make_ptx_launcher
+
+    if backend not in ("ptx", "sass"):
+        raise ValueError(f"unsupported GEMM backend {backend}")
+    if backend == "sass" and any((lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved)):
+        raise ValueError("SASS GEMM currently requires contiguous operands")
 
     if (lhs_batch_interleaved or rhs_batch_interleaved) and (
         operation != "bmm" or lhs_column_major or rhs_column_major
@@ -570,7 +616,7 @@ def gemm_jit_compiler(
     template = gpu_dialect.parse(
         textwrap.dedent(f"""\
         module {{
-          kernel @jit_{operation}_{d}{'_ac' if lhs_column_major else ''}{'_bc' if rhs_column_major else ''}{'_ab' if lhs_batch_interleaved else ''}{'_bb' if rhs_batch_interleaved else ''}{'_graph' if graph else ''}({bias}%a: {t}, %bt: {t}, %c: {t}) {{
+          kernel @jit_{operation}_{d}{'_ac' if lhs_column_major else ''}{'_bc' if rhs_column_major else ''}{'_ab' if lhs_batch_interleaved else ''}{'_bb' if rhs_batch_interleaved else ''}{'_graph' if graph else ''}{'_sass' if backend == 'sass' else ''}{'_measured' if measured_lowering else ''}({bias}%a: {t}, %bt: {t}, %c: {t}) {{
             matmul(%a: {t}, %bt: {t}, %c: {t}) collective=xyz.grid
           }}
         }}""")
@@ -602,7 +648,7 @@ def gemm_jit_compiler(
         bt = cast(tuple[int, ...], bt)
         *batch, m, k = a
         n = bt[-2]
-        schedule = select_gemm_schedule(operation, dtype, m, n, k, *batch, lhs_column_major=lhs_column_major, rhs_column_major=rhs_column_major, lhs_batch_interleaved=lhs_batch_interleaved, rhs_batch_interleaved=rhs_batch_interleaved, graph=graph)
+        schedule = select_gemm_schedule(operation, dtype, m, n, k, *batch, lhs_column_major=lhs_column_major, rhs_column_major=rhs_column_major, lhs_batch_interleaved=lhs_batch_interleaved, rhs_batch_interleaved=rhs_batch_interleaved, graph=graph, backend=backend, measured_lowering=measured_lowering)
         if schedule is None:
             raise ValueError(
                 f"{kernel.name}: no schedule for {operation} {tuple(batch)}x{m}x{n}x{k}"
@@ -620,6 +666,10 @@ def gemm_jit_compiler(
             lhs_batch_interleaved=lhs_batch_interleaved,
             rhs_batch_interleaved=rhs_batch_interleaved,
         )
+        if backend == "sass":
+            from .passes.lower_to_sass import lower_to_sass, make_sass_launcher
+
+            return make_sass_launcher(lower_to_sass(scheduled))
         return make_ptx_launcher(make_ptx_kernel(scheduled))
 
     return ShapeSpecializingJITCompiler(template, compile_specialization)
@@ -635,16 +685,22 @@ def gemm_op(
     lhs_batch_interleaved: bool = False,
     rhs_batch_interleaved: bool = False,
     graph: bool = False,
+    backend: str = "ptx",
+    measured_lowering: bool = False,
 ) -> torch._ops.OpOverload:
-    """Torch op ``(bias?, a, bt, out) -> ()`` writing ``out = [bias +] a @ bt^T``."""
-    return _gemm_op(operation, dtype, namespace, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved, graph)
+    """Torch op writing ``out = [bias +] a @ bt^T``.
+
+    ``measured_lowering=True`` enables recorded implementation variants of
+    the existing schedule catalog. Both backends leave this disabled by default.
+    """
+    return _gemm_op(operation, dtype, namespace, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved, graph, backend, measured_lowering)
 
 
 @cache
-def _gemm_op(operation, dtype, namespace, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved, graph):
+def _gemm_op(operation, dtype, namespace, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved, graph, backend="ptx", measured_lowering=False):
     from .torch_custom_call import make_torch_custom_call
 
-    compiler = gemm_jit_compiler(operation, dtype, lhs_column_major=lhs_column_major, rhs_column_major=rhs_column_major, lhs_batch_interleaved=lhs_batch_interleaved, rhs_batch_interleaved=rhs_batch_interleaved, graph=graph)
+    compiler = gemm_jit_compiler(operation, dtype, lhs_column_major=lhs_column_major, rhs_column_major=rhs_column_major, lhs_batch_interleaved=lhs_batch_interleaved, rhs_batch_interleaved=rhs_batch_interleaved, graph=graph, backend=backend, measured_lowering=measured_lowering)
     inputs = 3 if operation == "addmm" else 2
     return make_torch_custom_call(
         compiler,

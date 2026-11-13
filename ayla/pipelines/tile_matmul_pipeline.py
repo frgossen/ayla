@@ -302,11 +302,14 @@ def _schedule_matmul(
     output_store: str = "stmatrix",
     masked_global_store: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    matrix_refill_pipeline: bool = False,
 ) -> ModuleOp:
     """Apply the configurable WGMMA schedule to one concrete matmul.
 
     Keeping scheduling separate from module construction lets the JIT first
     specialize a dynamic template, then reuse the static collection's passes.
+    ``matrix_refill_pipeline=True`` overlaps independent matrix/refill groups
+    in the library async IR, before descriptor and backend lowering.
     """
     [kernel] = module.body.ops
     if not isinstance(kernel, KernelOp):
@@ -508,6 +511,10 @@ def _schedule_matmul(
         )
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
+    if matrix_refill_pipeline:
+        from ..passes.pipeline_matrix_refills import PipelineMatrixRefills
+
+        pipeline.add_pass(PipelineMatrixRefills())
     return pipeline.run(module)
 
 

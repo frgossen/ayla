@@ -370,3 +370,19 @@ def test_wgmma_fragment_load_column_broadcast(ir_dtype, torch_dtype):
         torch.testing.assert_close(
             actual, source[:, None].expand_as(actual), rtol=0, atol=0
         )
+
+
+def test_native_metadata_requires_an_image_without_ptx_fields():
+    from types import SimpleNamespace
+    from ayla.ptx_runtime import CudaLauncher
+
+    metadata = SimpleNamespace(
+        name="native", signature=[], grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1), dynamic_shared_mem_bytes=0,
+    )
+    with pytest.raises(ValueError, match="requires a cubin image"):
+        CudaLauncher(metadata)
+    launcher = CudaLauncher(metadata, b"native cubin")
+    assert launcher.name == "native"
+    assert launcher._code == b"native cubin"
+    assert launcher._optimization_level is None

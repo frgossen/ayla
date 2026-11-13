@@ -607,6 +607,46 @@ class TileOp(GpuOp):
         dyn = iter(self.operands[1:])
         return [s if s is not None else next(dyn) for s in self.static_indices]
 
+    def byte_offset_terms(self) -> list[tuple[Value | int, int]]:
+        """Byte displacement from the parent as ``sum(index * stride)``.
+
+        Nested views retain their root's physical strides. Block-major tiles
+        smaller than a physical block require a static index; their term is
+        a constant displacement across the block and its inner columns.
+        """
+        root = self.arg
+        while isinstance(root.definition, TileOp):
+            root = root.definition.arg
+        typ, result_type = root.type, self.result().type
+        assert isinstance(typ, AddrMemTensorType)
+        assert isinstance(result_type, AddrMemTensorType)
+        layout = physical_layout(typ) if isinstance(typ, SmemTensorType) else None
+        inner_dim = 0 if is_column_major(typ) else 1
+        terms = []
+        for dim, index in enumerate(self.indices):
+            size = result_type.sizes[dim]
+            assert isinstance(size, int)
+            stride = typ.strides[dim]
+            if layout is not None and layout[1] == "block_major":
+                assert typ.rank == 2
+                width, _ = layout
+                rows = typ.sizes[1 - inner_dim]
+                assert isinstance(rows, int)
+                if dim == inner_dim and size % width:
+                    parent_type = self.arg.type
+                    assert isinstance(parent_type, AddrMemTensorType)
+                    assert cast(int, parent_type.sizes[dim]) % width == 0
+                    assert isinstance(index, int), (
+                        "block-major sub-block tiles require a static index"
+                    )
+                    block, inner = divmod(index * size, width)
+                    terms.append((1, (block * rows * width + inner) * typ.dtype.byte_size))
+                    continue
+                stride = rows if dim == inner_dim else width
+            assert isinstance(stride, int)
+            terms.append((index, size * stride * typ.dtype.byte_size))
+        return terms
+
     @property
     def maybe_partial(self) -> bool:
         return bool(self.attrs.get("maybe_partial", False))
@@ -2802,6 +2842,21 @@ class IndexMulOp(GpuOp):
         return _binop_expr_str(self, "*", 3, prec, val_str)
 
 
+def unsigned_division_magic(divisor: int) -> tuple[int, int, bool]:
+    """Multiply-high constant, shift and add correction for u32 division.
+
+    Powers of two use a shift instead. Other divisors use the exact libdivide
+    construction, including the correction when the multiplier needs 33 bits.
+    """
+    assert 1 < divisor < 2**32 and divisor & (divisor - 1)
+    shift = divisor.bit_length() - 1
+    proposed, remainder = divmod(1 << (32 + shift), divisor)
+    add = divisor - remainder >= 1 << shift
+    if add:
+        proposed = 2 * proposed + (2 * remainder >= divisor)
+    return (proposed + 1) & 0xFFFFFFFF, shift, add
+
+
 @gpu_dialect.register_op("index_div")
 class IndexDivOp(GpuOp):
     """Unsigned integer division: result = lhs / rhs."""
@@ -2895,6 +2950,76 @@ def root_buffer(value: Value) -> Value | None:
     roots = root_buffers(value)
     assert len(roots) <= 1, f"root_buffer: {value} has multiple root buffers: {roots}"
     return next(iter(roots), None)
+
+
+def wgmma_pair_offset(pair_index: int, n_dim: int) -> tuple[int, int]:
+    """Thread-independent root offset of a WGMMA pair's first element.
+
+    The runtime warp/lane offset selects the thread's base coordinate. This
+    returns the additional logical ``(row, column)`` offset for ``pair_index``
+    in that thread's register fragment.
+    """
+    assert n_dim % 8 == 0
+    pairs_per_m_tile = n_dim // 4
+    m, pair_in_m_tile = divmod(pair_index, pairs_per_m_tile)
+    w, pair_in_16_columns = divmod(pair_in_m_tile, 4)
+    di, dj = [(0, 0), (8, 0), (0, 8), (8, 8)][pair_in_16_columns]
+    return (m * 64 + di, w * 16 + dj)
+
+
+def static_view_origin(value: Value) -> tuple[int, ...]:
+    """Logical element coordinates of a static view's origin in its root."""
+    value_type = value.type
+    assert isinstance(value_type, WgrmemTensorType)
+    offsets = [0] * value_type.rank
+    while isinstance(value.definition, TileOp):
+        tile = value.definition
+        for dim, index in enumerate(tile.static_indices):
+            if index is None:
+                raise NotImplementedError(
+                    "WGRMEM views currently require static tile indices"
+                )
+            result_type = tile.result().type
+            assert isinstance(result_type, WgrmemTensorType)
+            offsets[dim] += index * cast(int, result_type.sizes[dim])
+        value = tile.arg
+    return tuple(offsets)
+
+
+def wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
+    """Map a WGMMA WGRMEM value or view to pairs in its root.
+
+    Each tuple is ``(root_pair_index, view_row_offset, view_column_offset)``.
+    Pair ``p`` names F32 registers ``2*p`` and ``2*p + 1``, or the packed
+    BF16/F16 b32 register ``p``. The offsets are the thread-independent
+    logical coordinates of the pair's first element relative to the view;
+    store lowering adds the runtime warp/lane coordinate separately.
+    """
+    root = root_buffer(value)
+    assert root is not None
+    view_type, root_type = value.type, root.type
+    assert isinstance(view_type, WgrmemTensorType)
+    assert isinstance(root_type, WgrmemTensorType)
+    assert view_type.layout == root_type.layout == "wgmma_layout_0"
+    assert view_type.rank == root_type.rank == 2
+    assert view_type.warps == root_type.warps == 4
+    assert view_type.dtype == root_type.dtype
+    assert isinstance(view_type.dtype, (F32Type, BF16Type, F16Type)), (
+        f"WGMMA views support f32, bf16, and f16; got {view_type.dtype}"
+    )
+    assert root_type.num_elements_per_thread % 2 == 0
+    row_start, col_start = static_view_origin(value)
+    view_m, view_n = cast(tuple[int, int], view_type.sizes)
+    root_n = cast(int, root_type.sizes[1])
+    pairs = [
+        (pair_index, row - row_start, col - col_start)
+        for pair_index in range(root_type.num_elements_per_thread // 2)
+        for row, col in [wgmma_pair_offset(pair_index, root_n)]
+        if row_start <= row < row_start + view_m
+        and col_start <= col < col_start + view_n
+    ]
+    assert len(pairs) == view_m * view_n // (root_type.warps * 64)
+    return pairs
 
 
 class CollectiveScope(enum.IntEnum):

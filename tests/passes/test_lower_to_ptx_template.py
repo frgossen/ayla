@@ -732,7 +732,9 @@ def test_move_loads_broadcast_memory_into_wgmma_registers():
     template = "".join(op.template for op in find_ops_of_type(lowered, PTXTemplateOp))
 
     assert template.count("ld.global.b32") == 16
-    assert "ld.global.b16" not in template
+    assert template.count("ld.global.b16") == 32
+    assert "@!${pred:pair_aligned} bra.uni ${label:unaligned_half};" in template
+    assert "bra.uni ${label:half_load_done};" in template
 
 
 def test_move_loads_f32_pairs_into_wgmma_registers_as_vectors():

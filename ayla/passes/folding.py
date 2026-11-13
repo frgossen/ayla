@@ -30,6 +30,8 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     ForOp,
+    IfOp,
+    IndexLtOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
@@ -54,6 +56,7 @@ from ..base.ir import (
     clone_op,
     clone_type,
     find_ancestor_of_type,
+    find_ancestors_of_type,
 )
 from ..base.lowering_pass import LoweringPass, lowers
 
@@ -76,6 +79,30 @@ def _iv_loop(value: Value) -> ForOp | None:
 
 
 class Folding(LoweringPass):
+    def lower_op(self, op: Op) -> tuple[list[Op], list[object]]:
+        # A remainder defined outside a guard can simplify at individual uses.
+        # Keep its producer and all unguarded users intact.
+        for i, operand in enumerate(op.operands):
+            value = cast(Value, self.value_map.get(operand, operand))
+            remainder = value.definition
+            if not isinstance(remainder, IndexModOp):
+                continue
+            modulus = self._const_val(remainder.rhs)
+            if modulus is None or not 0 < modulus < 2**32:
+                continue
+            numerator = cast(Value, self.value_map.get(remainder.lhs, remainder.lhs))
+            for guard in find_ancestors_of_type(op, IfOp):
+                comparison = guard.condition.definition
+                if not isinstance(comparison, IndexLtOp):
+                    continue
+                lhs = self.value_map.get(comparison.lhs, comparison.lhs)
+                limit = self._const_val(comparison.rhs)
+                if lhs is numerator and limit is not None and 0 < limit <= modulus:
+                    op.operands[i] = numerator
+                    self.value_map.setdefault(numerator, numerator)
+                    break
+        return super().lower_op(op)
+
     @lowers(ForOp)
     def lower_for(
         self, op: ForOp,

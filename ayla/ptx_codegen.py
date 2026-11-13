@@ -277,6 +277,10 @@ class PtxKernel:
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
 
+    @property
+    def dynamic_shared_mem_bytes(self) -> int:
+        return self.shared_mem_bytes
+
 
 def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
     """Resolve implicit block axes for PTX emission and launch."""
