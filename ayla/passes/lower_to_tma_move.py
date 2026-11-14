@@ -66,12 +66,15 @@ class LowerToTmaMove(LoweringPass):
             root = op.dst
             while isinstance(root.definition, (TileOp, ReshapeOp)):
                 root = root.definition.arg
-            columns = root.type.sizes[-1]
+            # Split along the physical contiguous axis. A transposed output
+            # has the same tail constraint on rows that a row-major output
+            # has on columns; each swizzle atom remains one dense TMA box.
+            axis = -2 if is_column_major(smem.type) else -1
+            columns = root.type.sizes[axis]
             width = layout.get("block_width") if layout else None
-            tile_columns = smem.type.sizes[-1]
+            tile_columns = smem.type.sizes[axis]
             if (
-                not is_column_major(smem.type)
-                and isinstance(width, int)
+                isinstance(width, int)
                 and isinstance(columns, int)
                 and columns % width
                 and tile_columns > width
@@ -80,10 +83,15 @@ class LowerToTmaMove(LoweringPass):
                 new_ops = []
                 for part in range(tile_columns // width):
                     typ = clone_type(smem.type)
-                    typ.sizes = [*typ.sizes[:-1], width]
-                    tile = TileOp.build(smem, [0, part], typ)
+                    typ.sizes = list(typ.sizes)
+                    typ.sizes[axis] = width
+                    indices = [0] * typ.rank
+                    indices[axis] = part
+                    tile = TileOp.build(smem, indices, typ)
                     index_ops, move = self._materialize(
-                        op, smem=tile.result(), column_offset=part * width
+                        op, smem=tile.result(),
+                        row_offset=part * width if axis == -2 else 0,
+                        column_offset=part * width if axis == -1 else 0,
                     )
                     new_ops += [tile, *index_ops, move]
                 return new_ops, []
@@ -282,6 +290,19 @@ def _multicast_slices(move: MoveOp, smem: Value) -> int:
     kernel = find_ancestor_of_type(move, KernelOp)
     assert kernel is not None
     cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+    masks = move.attrs.get('multicast_cta_masks')
+    if masks is not None:
+        sizes = {mask.bit_count() for mask in masks}
+        if len(sizes) != 1:
+            return 1
+        cluster_size = sizes.pop()
+    requested = move.attrs.get('multicast_slices')
+    if requested is not None:
+        if type(requested) is not int or not 1 <= requested <= cluster_size:
+            raise ValueError('multicast slices must fit the recipient group')
+        if requested == 1:
+            return 1
+        cluster_size = requested
     smem_type = smem.type
     if (
         cluster_size < 2
@@ -300,6 +321,8 @@ def _multicast_slices(move: MoveOp, smem: Value) -> int:
     atom = _SWIZZLE_ATOM_BYTES.get(cast(str, smem_type.swizzle), 0)
     slice_rows, remainder = divmod(rows, cluster_size)
     if remainder or not atom or slice_rows * columns * dtype_bytes % atom:
+        if requested is not None:
+            raise ValueError('multicast slices must cover whole rows and swizzle atoms')
         return 1
     return cluster_size
 

@@ -24,7 +24,7 @@ from ayla.gpu_dialect import (
 )
 from ayla.passes.insert_syncs import (
     _insert_barriers,
-    _materialize_cluster_mbars,
+    _materialize_gather_mbars,
     insert_syncs,
 )
 from tests.testing_utils import assert_contains_in_order
@@ -254,7 +254,7 @@ def test_cluster_mbar_materialization_depends_on_barrier_scope():
     kernel = find_ops_of_type(module, KernelOp)[0]
     target_op = kernel.body.ops[0]
 
-    syncs = _materialize_cluster_mbars(
+    syncs = _materialize_gather_mbars(
         kernel,
         {target_op: BarrierTarget(BarrierScope.CLUSTER_TO_LEADER)},
     )

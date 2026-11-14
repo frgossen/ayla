@@ -120,6 +120,10 @@ class TileMatmul(LoweringPass):
     must use memory operations with defined out-of-bounds behavior, such as
     TMA.
 
+    ``pad_to_cluster`` rounds block-axis tile counts to whole clusters without
+    guarding the padded CTAs. It requires partial tiles and distinct block
+    axes; callers must use loads and stores with defined out-of-bounds behavior.
+
     ``reversed_dims`` names tiled dimensions visited last-to-first. Hardware
     workers keep their launch order but take the mirrored logical tile.
     """
@@ -131,6 +135,7 @@ class TileMatmul(LoweringPass):
     op_label_filter: str | None
     epilogue_label_filter: str | None
     allow_partial_tiles: bool
+    pad_to_cluster: bool
     reversed_dims: list[str]
 
     def __init__(
@@ -143,8 +148,12 @@ class TileMatmul(LoweringPass):
         epilogue_label_filter: str | None = None,
         allow_partial_tiles: bool = False,
         reversed_dims: list[str] | None = None,
+        retain_dst_tiling_scheme: bool = False,
+        pad_to_cluster: bool = False,
+        cluster_layout=None,
     ) -> None:
         super().__init__(
+            retain_dst_tiling_scheme=retain_dst_tiling_scheme,
             op_dims=list(op_dims),
             tile_sizes=list(tile_sizes),
             iteration_bindings=list(iteration_bindings),
@@ -153,7 +162,15 @@ class TileMatmul(LoweringPass):
             epilogue_label_filter=epilogue_label_filter,
             allow_partial_tiles=allow_partial_tiles,
             reversed_dims=list(reversed_dims or []),
+            pad_to_cluster=pad_to_cluster,
+            cluster_layout=cluster_layout,
         )
+        if pad_to_cluster and (not allow_partial_tiles or any(
+                binding is None or binding[0] != CollectiveLevel.BLOCK
+                for binding in iteration_bindings)):
+            raise ValueError("cluster padding requires partial tiles on distinct block axes")
+        if retain_dst_tiling_scheme and (op_dims != ["K"] or iteration_bindings != [None]):
+            raise ValueError("retaining destination partitions requires a sequential K tile")
         unknown = set(self.reversed_dims) - set(op_dims)
         if unknown:
             raise ValueError(
@@ -275,6 +292,7 @@ class TileMatmul(LoweringPass):
             self.op_dims,
             self.tile_sizes,
             self.iteration_bindings,
+            strict=True,
         ):
             if op_dim not in sizes_by_dim:
                 raise ValueError(
@@ -300,6 +318,22 @@ class TileMatmul(LoweringPass):
             ub = (op_dim_size + tile_size - 1) // tile_size
             ubs.append(ub)
             sizes_by_dim[op_dim] = tile_size
+        if self.cluster_layout is not None:
+            if set(self.op_dims) != {'M','N'} or len(set(self.iteration_bindings)) != 1:
+                raise ValueError('cluster work mapping requires two output dimensions sharing one block binding')
+            for i, dim in enumerate(self.op_dims):
+                size = self.cluster_layout.m if dim == 'M' else self.cluster_layout.n
+                ubs[i] = -(-ubs[i] // size) * size
+        elif self.pad_to_cluster:
+            # In a flattened grid, only its fastest tile coordinate must
+            # end on a whole cluster. Padding the product alone could put
+            # the two CTAs on different output columns at a row boundary.
+            for binding in set(self.iteration_bindings):
+                indices = [i for i, b in enumerate(self.iteration_bindings) if b == binding]
+                if binding is not None and len(indices) > 1:
+                    fastest = indices[-1]
+                    cluster = self._kernel.cluster_dim[int(binding[1])] or 1
+                    ubs[fastest] = -(-ubs[fastest] // cluster) * cluster
         return ubs
 
     def _resolve_launch_extents(
@@ -316,6 +350,10 @@ class TileMatmul(LoweringPass):
                 required[binding] = max(required.get(binding, 0), extent)
 
         for binding, extent in required.items():
+            if self.pad_to_cluster:
+                axis = list(CollectiveAxis).index(binding[1])
+                cluster = self._kernel.cluster_dim[axis] or 1
+                extent = -(-extent // cluster) * cluster
             current = launch_extent(self._kernel, *binding)
             if current is not None:
                 if current >= extent:
@@ -388,7 +426,27 @@ class TileMatmul(LoweringPass):
             wave_ops = [stride, offset, advanced]
             linear_ids[binding] = advanced.result()
 
+        worker_linear_ids = dict(linear_ids)
         iteration_ops: list[Op] = []
+        if self.cluster_layout is not None:
+            from ..cluster_layout import logical_tile_coordinates
+            layout = self.cluster_layout
+            binding = self.iteration_bindings[0]
+            size = IndexConstantOp.build(layout.size)
+            rank = IndexModOp.build(linear_ids[binding], size.result())
+            group = IndexDivOp.build(linear_ids[binding], size.result())
+            iteration_ops.extend([size, rank, group])
+            mb, nb = (ubs[self.op_dims.index(dim)] for dim in ('M','N'))
+            fast = self.op_dims[-1].lower()
+            mi, ni = logical_tile_coordinates(rank.result(), group.result(), layout,
+                mb // layout.m, nb // layout.n, iteration_ops, fast)
+            stride = IndexConstantOp.build(mb if fast == 'm' else nb)
+            coarse = IndexMulOp.build(ni if fast == 'm' else mi, stride.result())
+            flat = IndexAddOp.build(coarse.result(), mi if fast == 'm' else ni)
+            iteration_ops.extend([stride, coarse, flat])
+            linear_ids[binding] = flat.result()
+        cluster_index_ops = iteration_ops
+        iteration_ops = []
         ivs: list[Value] = []
         divisors: dict[tuple[CollectiveLevel, CollectiveAxis], int] = {}
         loop_ivs: dict[int, Value] = {}
@@ -441,6 +499,7 @@ class TileMatmul(LoweringPass):
                     iteration_ops.extend(ops)
             ivs.insert(0, iv)
 
+        iteration_ops = [*cluster_index_ops, *iteration_ops]
         # The outermost loop over a dim the epilogue does not have. It belongs
         # after that one, and so outside every loop nested in it.
         outside_of = min(
@@ -476,6 +535,10 @@ class TileMatmul(LoweringPass):
             tile_idxs=ivs,
             tile_sizes=self.tile_sizes,
         )
+        if self.pad_to_cluster:
+            for tile in [*body_ops, *dst_ops]:
+                if isinstance(tile, TileOp):
+                    tile.attrs["maybe_partial"] = True
         if init is not None and cast(MemTensorType, init.type).rank != 0:
             ops, init = _build_tile_op(
                 init,
@@ -506,6 +569,8 @@ class TileMatmul(LoweringPass):
             attrs.pop(f"{name}_tiling_scheme", None)
         for name, scheme_id in tiling_schemes.items():
             attrs[f"{name}_tiling_scheme"] = scheme_id
+        if self.retain_dst_tiling_scheme and "dst_tiling_scheme" in hero.attrs:
+            attrs["dst_tiling_scheme"] = hero.attrs["dst_tiling_scheme"]
         body_ops.append(
             MatmulOp.build(
                 lhs=lhs,
@@ -536,6 +601,10 @@ class TileMatmul(LoweringPass):
                 logical_extent = parallel_extents.pop(binding, None)
                 if logical_extent is None:
                     continue
+                if self.pad_to_cluster:
+                    axis = list(CollectiveAxis).index(binding[1])
+                    cluster = self._kernel.cluster_dim[axis] or 1
+                    logical_extent = -(-logical_extent // cluster) * cluster
                 extent = launch_extent(self._kernel, *binding)
                 if (
                     extent is not None
@@ -543,7 +612,7 @@ class TileMatmul(LoweringPass):
                 ):
                     limit = IndexConstantOp.build(logical_extent)
                     condition = IndexLtOp.build(
-                        linear_ids[binding],
+                        worker_linear_ids[binding],
                         limit.result(),
                     )
                     body_ops = [

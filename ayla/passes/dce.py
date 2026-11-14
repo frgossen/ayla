@@ -5,7 +5,7 @@ groups and their awaits.
 """
 from __future__ import annotations
 
-from ..gpu_dialect import AsyncOp, AwaitOp, ModuleOp, is_side_effect_free
+from ..gpu_dialect import AsyncOp, AwaitOp, LockViewOp, ModuleOp, is_side_effect_free
 from ..base.ir import Block, Op
 from ..base.pipeline import Pass
 
@@ -28,6 +28,8 @@ def _in_empty_async_group(op: Op) -> bool:
     """
     if not isinstance(op, (AsyncOp, AwaitOp)):
         return False
+    if isinstance(op.lock.definition, LockViewOp):
+        return False  # Different views may issue/observe the same physical event.
     return all(
         isinstance(user, AwaitOp)
         or isinstance(user, AsyncOp) and not user.body.ops

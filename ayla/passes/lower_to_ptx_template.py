@@ -7,6 +7,8 @@ other ops (alloc, load, store, matmul) will be added incrementally.
 
 from __future__ import annotations
 
+from ..cluster_layout import rank_table_ptx, pair_mask, multicast_sources
+
 from collections.abc import Callable
 from functools import partial
 import itertools
@@ -15,10 +17,11 @@ import struct
 import textwrap
 from typing import cast
 
-from ..base.ir import Op, Type, Value, find_ancestor_of_type, find_ops_of_type
+from ..base.ir import Block, Op, Type, Value, find_ancestor, find_ancestor_of_type, find_ops_of_type, iter_ops
 from ..base.lowering_pass import LoweringPass, lowers
-from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS
+from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS, TmemWarpLayout
 from ..gpu_dialect import (
+    ForOp,
     AddrMemTensorType,
     AllocOp,
     AsyncOp,
@@ -36,9 +39,13 @@ from ..gpu_dialect import (
     IndexConstantOp,
     IndexDivOp,
     IndexModOp,
+    IndexLtOp,
     IndexMulOp,
+    IndexType,
     KernelOp,
     LockType,
+    LockViewOp,
+    OperandPipelineOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
@@ -46,13 +53,17 @@ from ..gpu_dialect import (
     PtrAddOp,
     PtrType,
     PTXTemplateOp,
+    PredicateType,
     ReinterpretOp,
     RegMemTensorType,
     ReshapeOp,
     RmemTensorType,
+    execution_issuer_warp,
+    execution_warps,
     ConstantOp,
     SmemTensorType,
     ThreadIdOp,
+    IfOp,
     TileOp,
     TmaDescType,
     TmaMoveOp,
@@ -61,8 +72,8 @@ from ..gpu_dialect import (
     WarpIdsOp,
     WgrmemTensorType,
     is_column_major,
+    is_side_effect_free,
     physical_layout,
-    lock_has_tma_multicast,
     root_buffer,
 )
 
@@ -447,13 +458,12 @@ _ELEMENTWISE_LOWERERS = {
 }
 
 
-def _leader_warp(prefix: str) -> str:
-    """PTX setting ``${pred:<prefix>_other_warp}`` outside warp 0.
+def _leader_warp(prefix: str, issuer_warp: int = 0, *others: int) -> str:
+    """PTX setting ``${pred:<prefix>_other_warp}`` outside ``issuer_warp`` and ``others``.
 
-    Warp 0 holds the leader, thread 0. Each warp index is broadcast from the
-    warp's first thread (CUTLASS's canonical_warp_idx_sync), so ptxas proves
-    this predicate warp-uniform. It folds each broadcast of a special register
-    away and merges the repeated reads, but keeps one of a combined value.
+    Each warp index component is broadcast from the warp's first lane
+    (CUTLASS's canonical_warp_idx_sync), so ptxas proves the predicate
+    warp-uniform; a broadcast of a combined value would not fold away.
     """
     return textwrap.dedent(f"""\
         mov.u32 ${{b32:{prefix}_warp}}, %tid.x;
@@ -465,11 +475,46 @@ def _leader_warp(prefix: str) -> str:
         mov.u32 ${{b32:{prefix}_warp_yz}}, %tid.z;
         shfl.sync.idx.b32 ${{b32:{prefix}_warp_yz}}, ${{b32:{prefix}_warp_yz}}, 0, 31, 0xffffffff;
         or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp_yz}};
-        setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, 0;
-    """)
+        setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, {issuer_warp};
+    """) + "".join(
+        f"setp.ne.u32 ${{pred:{prefix}_not_this}}, ${{b32:{prefix}_warp}}, {warp};\n"
+        f"and.pred ${{pred:{prefix}_other_warp}}, ${{pred:{prefix}_other_warp}}, ${{pred:{prefix}_not_this}};\n"
+        for warp in others)
 
 
-def _leader_thread(prefix: str, before_branch: str = "") -> str:
+# Warp guard of an operation inside an issuer region, by _region_guard_mode.
+# Each format takes the template ``prefix``.
+_REGION_GUARDS = {
+    "predicate": "not.pred ${{pred:{prefix}_other_warp}}, ${{pred:operand.region.val}};\n",
+    "constant": "mov.pred ${{pred:{prefix}_other_warp}}, 0;\n",
+}
+
+
+def _region_guard_mode(kernel: KernelOp) -> str:
+    """How operations inside an issuer region spell their (redundant) warp guard.
+
+    TODO(region-guards): a measured ptxas 13.0 workaround, not a semantic
+    choice; the always-false guard's spelling changes K-loop code by up to 40%.
+    "predicate" (``not.pred`` of the region condition) keeps the elected issue
+    code uniform but leaves BRA.U branches in paired kernels; "constant"
+    (``mov.pred 0``) drops them but moves single-CTA multicast descriptor math
+    to the vector datapath (+R2UR). "constant" measured better for paired MMAs
+    and clusters without shared operands (.benchmarks/b200_region_guard_modes_20261112).
+    """
+    paired = any(op.lock.type.kind == "tcgen05" and op.lock.type.attrs.get("cta_group", 1) == 2
+                 for op in find_ops_of_type(kernel, AsyncOp))
+    shared = any(op.multicast for op in find_ops_of_type(kernel, TmaMoveOp))
+    clustered = math.prod(d or 1 for d in kernel.cluster_dim) > 1
+    return "constant" if paired or (clustered and not shared) else "predicate"
+
+
+def _elect_ptx(pred: str, converge: bool = True) -> str:
+    """Set ``${pred:<pred>}`` on one lane, after reconverging the warp if ``converge``."""
+    return ("bar.warp.sync 0xffffffff;\n" if converge else "") + f"elect.sync _|${{pred:{pred}}}, 0xffffffff;\n"
+
+
+def _leader_thread(prefix: str, before_branch: str = "", issuer_warp: int = 0,
+                   guard: str | None = None, converge: bool = False) -> str:
     """PTX that lets one elected thread of warp 0 do leader work.
 
     Every other warp branches to ``${label:<prefix>_done}``, without diverging
@@ -479,21 +524,34 @@ def _leader_thread(prefix: str, before_branch: str = "") -> str:
     special-register reads out of loops.
     """
     return (
-        _leader_warp(prefix)
+        (guard if guard is not None else _leader_warp(prefix, issuer_warp))
         + before_branch
-        + (
-            f"@${{pred:{prefix}_other_warp}} bra ${{label:{prefix}_done}};\n"
-            f"elect.sync _|${{pred:{prefix}_leader}}, 0xffffffff;\n"
-        )
+        + f"@${{pred:{prefix}_other_warp}} bra ${{label:{prefix}_done}};\n"
+        + _elect_ptx(f"{prefix}_leader", converge)
     )
+
+
+def _pair_leader_ptx(rank: str, pred: str, peer: bool = False) -> str:
+    """Read the cluster rank into ``rank``; set ``pred`` on the CTA pair's even leader, or its odd ``peer``."""
+    return (f"mov.u32 ${{b32:{rank}}}, %cluster_ctarank;\nand.b32 ${{b32:{rank}_parity}}, ${{b32:{rank}}}, 1;\n"
+            f"setp.{'ne' if peer else 'eq'}.u32 ${{pred:{pred}}}, ${{b32:{rank}_parity}}, 0;\n")
+
+
+def _try_wait_ptx(lock: str, scope: str = "cta", prefix: str = "") -> str:
+    """Spin until ``operand.<lock>`` completes its current parity.
+
+    A tick hint in a register lets ptxas select the compact fused wait.
+    """
+    return (f"mov.u32 ${{b32:{prefix}ticks}}, 0x989680;\n${{label:{prefix}wait}}:\n"
+            f"mbarrier.try_wait.parity.acquire.{scope}.shared::cta.b64 ${{pred:{prefix}ready}}, "
+            f"[${{b32:operand.{lock}.val}}], ${{b32:operand.{lock}.parity}}, ${{b32:{prefix}ticks}};\n"
+            f"@!${{pred:{prefix}ready}} bra ${{label:{prefix}wait}};\n")
 
 
 # A cluster-to-leader release, in every warp: one elected thread arrives at
 # its own CTA's mbarrier, for the CTA leader's next write, and a non-leader
 # CTA's also at the cluster leader's, for the cluster leader's next write.
-_CLUSTER_RELEASE_ARRIVAL = textwrap.dedent("""\
-    bar.warp.sync 0xffffffff;
-    elect.sync _|${pred:cl_arrive}, 0xffffffff;
+_CLUSTER_RELEASE_ARRIVAL = _elect_ptx("cl_arrive") + textwrap.dedent("""\
     mov.u32 ${b32:cluster_rank}, %cluster_ctarank;
     setp.ne.u32 ${pred:cl_remote}, ${b32:cluster_rank}, 0;
     and.pred ${pred:cl_arrive_remote}, ${pred:cl_arrive}, ${pred:cl_remote};
@@ -505,15 +563,10 @@ _CLUSTER_RELEASE_ARRIVAL = textwrap.dedent("""\
 
 # The rest of the release: the leader's warp waits on its CTA's mbarrier
 # phase, while the other warps go on.
-_CLUSTER_RELEASE_LEADER_WAIT = _leader_warp("cl") + textwrap.dedent("""\
-    @${pred:cl_other_warp} bra ${label:cl_done};
-    mov.u32 ${b32:ticks}, 0x989680;
-    ${label:cl_wait}:
-    mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
-    @!${pred:ready} bra ${label:cl_wait};
-    xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
-    ${label:cl_done}:
-    """)
+_CLUSTER_LEADER_WAIT = (
+    "@${pred:cl_other_warp} bra ${label:cl_done};\n" + _try_wait_ptx("sync", "cluster")
+    + "xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;\n${label:cl_done}:\n")
+_CLUSTER_RELEASE_LEADER_WAIT = _leader_warp("cl") + _CLUSTER_LEADER_WAIT
 
 
 def _split_release(lock: Value) -> bool:
@@ -523,6 +576,209 @@ def _split_release(lock: Value) -> bool:
     )
 
 
+def _sink_tmem_alloc(ops: list[Op], alloc: AllocOp) -> None:
+    """Allocate a kernel-wide TMEM arena just before its first reader or the first wait.
+
+    The allocation's rendezvous (and any retry while a previous CTA owns this
+    SM's TMEM) then overlaps the operand loads instead of delaying them. Its
+    views move with it; their users are the readers.
+    """
+    start = ops.index(alloc)
+    views = [op for op in ops[start + 1:]
+             if isinstance(op, TileOp) and op.operands[0] is alloc.result()]
+    users = [user for user in alloc.result().users() if user not in views]
+    users += [user for view in views for user in view.result().users()]
+    for index in range(start + 1, len(ops)):
+        op = ops[index]
+        if op in views:
+            continue
+        if isinstance(op, AwaitOp) or any(
+            user is op or find_ancestor(user, lambda parent: parent is op) is not None
+            for user in users
+        ):
+            break
+    else:
+        return
+    moved = [alloc, *(view for view in views if ops.index(view) < index)]
+    at = index - len(moved)
+    for op in moved:
+        ops.remove(op)
+    ops[at:at] = moved
+
+
+def _published_wait(op) -> bool:
+    """Whether ``op`` is an all-warp wait directly followed by a CTA barrier."""
+    if not isinstance(op, AwaitOp) or op.waiter_warps is not None:
+        return False
+    ops = op.parent_block.ops
+    index = ops.index(op) + 1
+    return (index < len(ops) and isinstance(ops[index], BarrierOp)
+            and ops[index].attrs.get("scope") == "block"
+            and execution_warps(ops[index]) is None)
+
+
+def _issuer_only(op: Op, issuer: list[int]) -> bool:
+    if isinstance(op, AsyncOp) and 'participant_warps' not in op.attrs:
+        # An elected TMA or tcgen05 issue runs on its issuing warp alone.
+        return (cast(LockType, op.lock.type).kind in ('mbar', 'tcgen05')
+                and [execution_issuer_warp(op)] == issuer)
+    if isinstance(op, AsyncOp | BarrierOp):
+        return op.attrs.get('participant_warps') == issuer
+    if isinstance(op, AwaitOp):
+        # Every thread tracks a lock's phase. Nonparticipants that skip an
+        # await must never observe that lock elsewhere.
+        return all(user.attrs.get('waiter_warps') == issuer
+                   for user in op.lock.users() if isinstance(user, AwaitOp))
+    if isinstance(op, IfOp | ForOp):
+        return 'participant_warps' not in op.attrs and all(
+            _issuer_only(inner, issuer) or is_side_effect_free(inner) for inner in op.body.ops)
+    return False
+
+
+def _group_issuer_runs(block: Block, issuer: list[int], warp_index: Value | None = None) -> None:
+    """Guard each run of the issuing warp's operations once.
+
+    Other warps then branch over a run instead of over each operation in it.
+    Definitions used after the run stay outside it.
+    """
+    ops = list(block.ops)
+    grouped: list[Op] = []
+    index = 0
+    while index < len(ops):
+        end = index
+        while end < len(ops) and (_issuer_only(ops[end], issuer) or is_side_effect_free(ops[end])):
+            end += 1
+        run = ops[index:end]
+        while run and not _issuer_only(run[-1], issuer):
+            run.pop()
+        if sum(_issuer_only(op, issuer) for op in run) < 2:
+            grouped.append(ops[index])
+            index += 1
+            continue
+        later = {v for op in ops[index + len(run):] for nested in iter_ops(op) for v in nested.operands}
+        inside = set(run)
+        outside = set()
+        changed = True
+        while changed:
+            changed = False
+            for op in run:
+                if op in inside and not _issuer_only(op, issuer) and any(r in later for r in op.results):
+                    inside.discard(op)
+                    outside.add(op)
+                    changed = True
+                    later.update(op.operands)
+        if warp_index is None:
+            tid = ThreadIdOp.build(CollectiveAxis.X)
+            source, scale = [tid], 32
+        else:
+            # A warp index broadcast from each warp's first lane keeps the
+            # branch, and the issue code inside it, provably warp-uniform.
+            source, scale = [], 1
+        bound = IndexConstantOp.build(scale * (issuer[0] + 1))
+        condition = IndexLtOp.build(source[0].result() if source else warp_index, bound.result())
+        region = IfOp.build(condition.result(), Block(ops=[op for op in run if op in inside]))
+        region.attrs['participant_warps'] = list(issuer)
+        grouped += [op for op in run if op in outside] + [*source, bound, condition, region]
+        index += len(run)
+    block.ops = grouped
+
+
+
+def _group_issuer_regions(block, warp_index=None) -> None:
+    """Guard each run of warp 0's own issue work once, after barriers are placed.
+
+    TMA/tcgen05 issues and issuer-only awaits already execute on warp 0
+    alone, behind separate guards that every other warp still traverses.
+    One region guard lets the other warps branch over the whole run, such as a
+    K loop whose waits all belong to the issuer. Barriers, which every warp
+    must reach, and values used after the run stay outside it.
+    """
+
+    for wait in block.ops:
+        # A CTA barrier right after a wait already publishes what the wait
+        # observed, so the issuer alone can wait on an mbarrier phase while
+        # the others park at the barrier instead of polling through the issue
+        # run. (Bulk-group waits only cover the waiting thread's own copies.)
+        # Every thread tracks the phase, so all its waits must be published.
+        if (isinstance(wait, AwaitOp) and wait.waiter_warps is None
+                and cast(LockType, wait.lock.type).kind in ("mbar", "tcgen05")
+                and all(_published_wait(user) for user in wait.lock.users()
+                        if not isinstance(user, AsyncOp))):
+            for user in wait.lock.users():
+                if isinstance(user, AwaitOp):
+                    user.attrs["waiter_warps"] = [0]
+    _group_issuer_runs(block, [0], warp_index)
+    for op in block.ops:
+        if isinstance(op, ForOp) and "participant_warps" not in op.attrs:
+            _group_issuer_regions(op.body, warp_index)
+
+
+# An event's mbarrier count and thread-0 initialization: ``init(dst, suffix)``
+# returns the PTX for result ``dst``, suffixing its own placeholders.
+EventInit = tuple[int, Callable[[str, str], str]]
+
+
+def _mbarrier_init(slots: int, arrivals: int | str, setup: Callable[[str], str] = lambda s: "") -> EventInit:
+    """Initialize ``slots`` mbarriers with ``arrivals`` each, a count or a register ``setup`` computes."""
+    def init(dst: str, s: str) -> str:
+        count = f"${{b32:{arrivals}{s}}}" if isinstance(arrivals, str) else arrivals
+        if slots == 1:
+            return setup(s) + f"mbarrier.init.shared::cta.b64 [${{b32:{dst}.val}}], {count};\n"
+        return textwrap.dedent(f"""\
+            mov.u32 ${{b32:init_index{s}}}, 0;
+            ${{label:init_loop{s}}}:
+            .pragma "nounroll";
+            mad.lo.u32 ${{b32:init_addr{s}}}, ${{b32:init_index{s}}}, 8, ${{b32:{dst}.val}};
+            """) + setup(s) + textwrap.dedent(f"""\
+            mbarrier.init.shared::cta.b64 [${{b32:init_addr{s}}}], {count};
+            add.u32 ${{b32:init_index{s}}}, ${{b32:init_index{s}}}, 1;
+            setp.lt.u32 ${{pred:init_more{s}}}, ${{b32:init_index{s}}}, {slots};
+            @${{pred:init_more{s}}} bra ${{label:init_loop{s}}};
+
+            """)
+    return slots, init
+
+
+def _event_inits_ptx(issuer_warp: int, inits: list[EventInit]) -> str:
+    """Declare events, then initialize them all behind one thread-0 branch and fence.
+
+    ptxas fences each such init block against the async proxy once events
+    are addressed through the shared arena (~50 cycles each), so consecutive
+    events share one block.
+    """
+    names = ([("result.dst", "")] if len(inits) == 1
+             else [(f"result.dst{n}", f"_{n}") for n in range(len(inits))])
+    return ("".join(f".shared .align 8 .b64 ${{smem:bar{s}}}[{slots}];\n"
+                    f"mov.u32 ${{b32:{dst}.val}}, ${{smem:bar{s}}};\nmov.u32 ${{b32:{dst}.parity}}, 0;\n"
+                    for (slots, _), (dst, s) in zip(inits, names))
+            + textwrap.dedent(f"""\
+                mov.u32 ${{b32:tid_x}}, %tid.x;
+                mov.u32 ${{b32:tid_y}}, %tid.y;
+                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
+                mov.u32 ${{b32:tid_z}}, %tid.z;
+                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
+                setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, {32 * issuer_warp};
+                @${{pred:not_t0}} bra ${{label:after_init}};
+                """)
+            + "".join(init(dst, s) for (_, init), (dst, s) in zip(inits, names))
+            + "fence.mbarrier_init.release.cluster;\n${label:after_init}:\n")
+
+
+# Probing ahead only pays when operands are usually resident already: rings
+# of at least six banks gained 0.6% geomean on the B200 MM corpus, shallower
+# rings (whose waits genuinely block) were neutral to slightly slower.
+_PROBE_AHEAD_MIN_BANKS = 6
+
+
+def _operand_bank_depth(kernel: KernelOp) -> int:
+    """Largest number of distinct SMEM banks one global operand is loaded into."""
+    banks: dict[object, set[object]] = {}
+    for op in iter_ops(kernel):
+        if isinstance(op, TmaMoveOp) and isinstance(op.dst.type, SmemTensorType):
+            banks.setdefault(root_buffer(op.src), set()).add(root_buffer(op.dst))
+    return max((len(roots) for roots in banks.values()), default=0)
+
+
 class LowerToPtxTemplate(LoweringPass):
     """Pass that rewrites high-level ops to ptx_template ops."""
 
@@ -530,45 +786,184 @@ class LowerToPtxTemplate(LoweringPass):
         super().__init__()
         self.cache_policy_values: dict[str, Value] = {}
         self.warp_ids: WarpIdsOp | None = None
+        self.distinct_issuers = False
+        self._early_tmem_alloc: AllocOp | None = None
+        # Probe-ahead completion observations: awaits probed before the
+        # preceding MMA issue, keyed by that issue, and the probe results.
+        self._probe_sites: dict[int, list[AwaitOp]] = {}
+        self._lowering: list[Op] = []
+        self._probe_results: dict[int, Value] = {}
+        self._region_guard_modes: dict[int, str] = {}
+        self._bank_depths: dict[int, int] = {}
+        # Lowered event allocation -> (issuing warp, initialization).
+        self._event_inits: dict[int, tuple[int, EventInit]] = {}
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        if module.body.ops[0].attrs.get("rolled_shared_ring"):
+            from .pipeline_rolled_shared_ring import PrepareRolledSharedRing
+
+            # Keep expansion private to lowering: participant ownership is
+            # verified at the compact completed-region boundary.
+            module = PrepareRolledSharedRing().run(module)
+        return super().run(module)
+
+    def lower_block(self, block) -> None:
+        self._plan_probe_ahead(block)
+        super().lower_block(block)
+
+    def _plan_probe_ahead(self, block) -> None:
+        """Observe event completion one MMA issue ahead of each wait.
+
+        A single issuing stream otherwise pays the full phase-check latency
+        between consecutive MMA batches. A non-blocking test of the same
+        event and parity is issued before the preceding MMA batch; the wait
+        skips its blocking loop when that test already succeeded.
+
+        Correctness: the probe uses the wait's own parity. No other wait on
+        the same event lies between the probe and this wait, so the event's
+        previous phase was already observed before the probe executes, and
+        a probe cannot alias an older phase. A failed probe keeps the
+        original blocking wait.
+        """
+        owner = block.parent_op
+        kernel = owner if isinstance(owner, KernelOp) else (
+            find_ancestor_of_type(owner, KernelOp) if owner is not None else None)
+        if kernel is None:
+            return
+        # Measure the operand ring once, before lowering replaces its loads.
+        depth = self._bank_depths.setdefault(id(kernel), _operand_bank_depth(kernel))
+        if depth < _PROBE_AHEAD_MIN_BANKS:
+            return
+        ops = block.ops
+        last_issue = None
+        for index, op in enumerate(ops):
+            if isinstance(op, AsyncOp) and any(isinstance(inner, MatmulOp) for inner in op.body.ops):
+                last_issue = index
+                continue
+            if (last_issue is None or not isinstance(op, AwaitOp)
+                    or not isinstance(op.lock.type, LockType)
+                    or op.lock.type.kind not in ("mbar", "tcgen05")
+                    or isinstance(op.lock.definition, LockViewOp)):
+                continue
+            between = ops[last_issue + 1:index]
+            if op.lock.definition in ops[last_issue:index] or any(
+                    isinstance(inner, AwaitOp) and inner.lock is op.lock
+                    for between_op in between for inner in iter_ops(between_op)):
+                continue
+            self._probe_sites.setdefault(id(ops[last_issue]), []).append(op)
+
+    def _probe_ahead_ops(self, op: AsyncOp) -> list[Op]:
+        probes = []
+        for wait in self._probe_sites.pop(id(op), []):
+            probe = PTXTemplateOp.build(
+                operands=[cast(Value, self.value_map[wait.lock])],
+                result_types=[PredicateType()],
+                template=("mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 "
+                          "${pred:result.ready.val}, [${b32:operand.lock.val}], ${b32:operand.lock.parity};\n"),
+                operand_names=["lock"],
+                result_names=["ready"],
+                description=f"probe-ahead {wait}",
+            )
+            self._probe_results[id(wait)] = probe.result()
+            probes.append(probe)
+        return probes
+
+    def _issuer_region(self, warp: int) -> IfOp | None:
+        """The region only ``warp`` executes around the op being lowered.
+
+        The op's own warp guard is then already decided by the region's branch.
+        """
+        if not self._lowering:
+            return None
+        return cast(IfOp | None, find_ancestor(
+            self._lowering[-1], lambda op: isinstance(op, IfOp) and execution_warps(op) == frozenset({warp})))
+
+    def _region_guard(self, prefix: str, warp: int) -> tuple[list[Value], list[str], str] | None:
+        """Operands and PTX of an op's warp guard inside ``warp``'s issuer region."""
+        region = self._issuer_region(warp)
+        if region is None:
+            return None
+        kernel = find_ancestor_of_type(region, KernelOp)
+        if id(kernel) not in self._region_guard_modes:
+            self._region_guard_modes[id(kernel)] = _region_guard_mode(kernel)
+        if self._region_guard_modes[id(kernel)] == "constant":
+            return [], [], _REGION_GUARDS["constant"].format(prefix=prefix)
+        return ([cast(Value, self.value_map.get(region.condition, region.condition))], ["region"],
+                _REGION_GUARDS["predicate"].format(prefix=prefix))
+
+    def lower_op(self, op: Op) -> tuple[list[Op], list[object]]:
+        self._lowering.append(op)
+        try:
+            result = super().lower_op(op)
+        finally:
+            self._lowering.pop()
+        actors = execution_warps(op)
+        if actors is None or isinstance(op, (AsyncOp, AwaitOp, IfOp)) or find_ancestor(
+                op, lambda a: isinstance(a, IfOp) and actors <= (execution_warps(a) or frozenset())):
+            # Engine issuers and awaits already have dedicated guards. Await
+            # parity must advance for nonparticipants too.
+            return result
+        if not isinstance(op, (MoveOp, ElementwiseOp, BarrierOp)):
+            raise ValueError("participant scheduling supports copies, conversion and barriers")
+        first, *rest = warps = sorted(actors)
+        prefix = "mov.u32 ${b32:participant_tid}, %tid.x;\n" + "".join(
+            "shr.u32 ${b32:participant_warp}, ${b32:participant_tid}, 5;\n"
+            f"setp.eq.u32 ${{pred:participant_{warp}}}, ${{b32:participant_warp}}, {warp};\n" for warp in warps)
+        prefix += f"mov.pred ${{pred:participant_active}}, ${{pred:participant_{first}}};\n" + "".join(
+            f"or.pred ${{pred:participant_active}}, ${{pred:participant_active}}, ${{pred:participant_{warp}}};\n"
+            for warp in rest) + "@!${pred:participant_active} bra ${label:participant_done};\n"
+        for generated in result[0]:
+            if isinstance(generated, PTXTemplateOp):
+                generated.attrs['template'] = prefix + generated.template + '${label:participant_done}:\n'
+        return result
+
+    def _warp0_template(self, prefix: str, instructions: list[str], description: str, *,
+                        operands=(), names=(), result_types=(), declaration: str = "",
+                        epilogue: str = "") -> PTXTemplateOp:
+        """Warp-collective TMEM ``instructions``, executed by warp 0 only."""
+        guard_operands, guard_names, guard = self._leader_warp(prefix)
+        return PTXTemplateOp.build(
+            operands=[*operands, *guard_operands], result_types=list(result_types),
+            template=guard + declaration
+            + "".join(f"@!${{pred:{prefix}_other_warp}} {line}\n" for line in instructions) + epilogue,
+            operand_names=[*names, *guard_names], result_names=["dst"] if result_types else [],
+            description=description)
 
     def _lower_alloc_tmem(self, op: AllocOp) -> tuple[list[Op], list[object]]:
         """Allocate tensor memory from warp 0 and share its address."""
         typ = op.result().type
         assert isinstance(typ, TmemTensorType)
-        operands, names, warp = self._leader_warp("tmem")
-        template = warp + textwrap.dedent(f"""\
-            .shared .align 4 .b32 ${{smem:tmem_addr}}[1];
-            @!${{pred:tmem_other_warp}} tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {typ.columns};
-            bar.sync 0;
-            ld.shared.b32 ${{b32:result.dst.ptr}}, [${{smem:tmem_addr}}];
-        """)
-        lowered = PTXTemplateOp.build(
-            operands=operands,
-            result_types=[typ],
-            template=template,
-            operand_names=names,
-            result_names=["dst"],
-            description=str(op),
-        )
+        group = typ.cta_group
+        lowered = self._warp0_template(
+            "tmem",
+            [f"tcgen05.alloc.cta_group::{group}.sync.aligned.shared::cta.b32 [${{smem:tmem_addr}}], {typ.columns};"]
+            + ([f"tcgen05.relinquish_alloc_permit.cta_group::{group}.sync.aligned;"]
+               if op is self._early_tmem_alloc else []),
+            str(op), result_types=[typ],
+            declaration=".shared .align 4 .b32 ${smem:tmem_addr}[1];\n",
+            epilogue="bar.sync 0;\nld.shared.b32 ${b32:result.dst.ptr}, [${smem:tmem_addr}];\n")
         return [lowered], [lowered.result()]
 
     @lowers(DeallocOp)
     def lower_dealloc(self, op: DeallocOp) -> tuple[list[Op], list[object]]:
         typ = op.value.type
+        if isinstance(typ, LockType):
+            operands, names, leader = self._leader_thread('event_free', issuer_warp=execution_issuer_warp(op))
+            template = leader + (
+                '@${pred:event_free_leader} mbarrier.inval.shared::cta.b64 [${b32:operand.lock.val}];\n'
+                '${label:event_free_done}:\n'
+            )
+            lowered = PTXTemplateOp.build(
+                operands=[self.value_map[op.value], *operands], result_types=[],
+                template=template, operand_names=['lock', *names], result_names=[],
+                description=str(op),
+            )
+            return [lowered], []
         assert isinstance(typ, TmemTensorType)
-        operands, names, warp = self._leader_warp("tmem_free")
-        template = warp + (
-            "@!${pred:tmem_free_other_warp} tcgen05.dealloc.cta_group::1.sync.aligned.b32 "
-            f"${{b32:operand.src.ptr}}, {typ.columns};\n"
-        )
-        lowered = PTXTemplateOp.build(
-            operands=[cast(Value, self.value_map[op.value]), *operands],
-            result_types=[],
-            template=template,
-            operand_names=["src", *names],
-            description=str(op),
-        )
-        return [lowered], []
+        return [self._warp0_template(
+            "tmem_free",
+            [f"tcgen05.dealloc.cta_group::{typ.cta_group}.sync.aligned.b32 ${{b32:operand.src.ptr}}, {typ.columns};"],
+            str(op), operands=[cast(Value, self.value_map[op.value])], names=["src"])], []
 
     def _lower_fill_tmem(self, op: ElementwiseOp) -> tuple[list[Op], list[object]]:
         """Broadcast a scalar into tensor memory; each thread stores one row."""
@@ -579,25 +974,18 @@ class LowerToPtxTemplate(LoweringPass):
                 "TMEM elementwise lowering supports scalar f32 fill"
             )
         columns = cast(int, typ.sizes[1])
+        kernel = find_ancestor_of_type(op, KernelOp)
+        assert kernel is not None
+        ownership = TmemWarpLayout(cast(int, typ.sizes[0]), kernel.num_threads // 32, typ.cta_group)
+        rows_per_warp = ownership.rows_per_warp
+        layout = "tcgen05_32x32b" if rows_per_warp == 32 else "tcgen05_16x256b"
         assert self.warp_ids is not None, "lower_kernel creates warp_ids"
-        lowered = PTXTemplateOp.build(
-            operands=[
-                cast(Value, self.value_map[op.dst]),
-                cast(Value, self.value_map[op.src(0)]),
-                self.warp_ids.x,
-            ],
-            result_types=[],
-            template=_tmem_warp_address_ptx("operand.dst.ptr")
-            + _tmem_access_ptx(
-                "tcgen05_32x32b",
-                columns,
-                ["${f32:operand.src.r0}"] * columns,
-                is_load=False,
-            ),
-            operand_names=["dst", "src", "warp"],
-            description=str(op),
-        )
-        return [lowered], []
+        return _lowered(
+            op, _tmem_fragment_ptx("operand.dst.ptr", ownership, layout, columns,
+                                   ["${f32:operand.src.r0}"] * (rows_per_warp * ownership.columns_per_warp(columns) // 32),
+                                   is_load=False),
+            [cast(Value, self.value_map[op.dst]), cast(Value, self.value_map[op.src(0)]), self.warp_ids.x],
+            ["dst", "src", "warp"])
 
     def _lower_move_tmem_fragment(self, op: MoveOp) -> tuple[list[Op], list[object]]:
         """Load a register fragment from tensor memory, or store one to it.
@@ -612,38 +1000,26 @@ class LowerToPtxTemplate(LoweringPass):
             isinstance(fragment_type, WgrmemTensorType)
             and isinstance(memory_type, TmemTensorType)
             and fragment_type.layout in TMEM_FRAGMENT_LAYOUTS
-            and fragment_type.warps == 4
+            and fragment_type.warps in (4, 8)
             and fragment_type.sizes == memory_type.sizes
             and fragment_type.dtype == memory_type.dtype
             and not isinstance(fragment.definition, TileOp)
         ):
             raise NotImplementedError(
-                "TMEM moves need a whole 4-warp tcgen05 fragment of the same shape "
+                "TMEM moves need a whole tcgen05 fragment of the same shape "
                 f"and dtype; got {op.dst.type} <- {op.src.type}"
             )
         assert self.warp_ids is not None, "lower_kernel creates warp_ids"
+        ownership = TmemWarpLayout(cast(int, memory_type.sizes[0]), fragment_type.warps, memory_type.cta_group)
         registers = [
             f"${{f32:operand.fragment.r{i}}}"
             for i in range(fragment_type.num_elements_per_thread)
         ]
-        lowered = PTXTemplateOp.build(
-            operands=[
-                cast(Value, self.value_map[memory]),
-                cast(Value, self.value_map[fragment]),
-                self.warp_ids.x,
-            ],
-            result_types=[],
-            template=_tmem_warp_address_ptx("operand.memory.ptr")
-            + _tmem_access_ptx(
-                fragment_type.layout,
-                cast(int, fragment_type.sizes[1]),
-                registers,
-                is_load=is_load,
-            ),
-            operand_names=["memory", "fragment", "warp"],
-            description=str(op),
-        )
-        return [lowered], []
+        return _lowered(
+            op, _tmem_fragment_ptx("operand.memory.ptr", ownership, fragment_type.layout,
+                                   cast(int, fragment_type.sizes[1]), registers, is_load=is_load),
+            [cast(Value, self.value_map[memory]), cast(Value, self.value_map[fragment]), self.warp_ids.x],
+            ["memory", "fragment", "warp"])
 
     def _lower_move_row_fragment(self, op: MoveOp) -> tuple[list[Op], list[object]]:
         """Store row fragments using their declared TMEM copy geometry.
@@ -664,7 +1040,6 @@ class LowerToPtxTemplate(LoweringPass):
             and memory_type.strides[1] == 1
             and isinstance(memory_type.dtype, (BF16Type, F16Type, F32Type))
             and not isinstance(fragment.definition, TileOp)
-            and not (kernel is not None and kernel.attrs.get("masked_global_store"))
         ):
             raise NotImplementedError(
                 "row fragments store whole to row-major memory of the same shape "
@@ -675,6 +1050,10 @@ class LowerToPtxTemplate(LoweringPass):
         packing = 1 if f32 else 2
         count = fragment_type.num_elements_per_thread // packing
         geometry = TMEM_FRAGMENT_LAYOUTS[fragment_type.layout]
+        ownership = TmemWarpLayout(cast(int, fragment_type.sizes[0]), fragment_type.warps)
+        rows_per_warp = ownership.rows_per_warp
+        # Validate the logical row coverage before emitting any accesses.
+        accesses = list(geometry.accesses(ownership.columns_per_warp(cast(int, fragment_type.sizes[1])), rows_per_warp))
         registers = [
             f"${{{'f32' if f32 else 'b32'}:operand.fragment.r{i}}}" for i in range(count)
         ]
@@ -689,12 +1068,33 @@ class LowerToPtxTemplate(LoweringPass):
                 and.b32 ${{b32:column}}, ${{b32:column}}, {32 // geometry.lanes - 1};
                 mul.lo.u32 ${{b32:column}}, ${{b32:column}}, {geometry.registers};
                 and.b32 ${{b32:row}}, ${{b32:row}}, {geometry.lanes - 1};
-                mad.lo.u32 ${{b32:row}}, ${{b32:warp}}, 32, ${{b32:row}};
+                mad.lo.u32 ${{b32:row}}, ${{b32:warp}}, {ownership.row_stride}, ${{b32:row}};
                 mul.lo.u32 ${{b32:column_bytes}}, ${{b32:column}}, {dtype_bytes};
             """)
         else:
             template += "mov.u32 ${b32:column_bytes}, 0;\n"
+        if ownership.group_row_stride:
+            template += textwrap.dedent(f"""\
+                mov.u32 ${{b32:row_group}}, %tid.x;
+                shr.u32 ${{b32:row_group}}, ${{b32:row_group}}, 7;
+                mad.lo.u32 ${{b32:row}}, ${{b32:row_group}}, {ownership.group_row_stride}, ${{b32:row}};
+            """)
+        group_columns = ownership.group_column_stride(cast(int, fragment_type.sizes[1]))
+        if group_columns:
+            template += "mov.u32 ${b32:column_group}, %tid.x;\nshr.u32 ${b32:column_group}, ${b32:column_group}, 7;\n"
         global_memory = isinstance(memory_type, GmemTensorType)
+        if group_columns and global_memory:
+            template += f"mad.lo.u32 ${{b32:column_bytes}}, ${{b32:column_group}}, {group_columns * dtype_bytes}, ${{b32:column_bytes}};\n"
+        masked = global_memory and kernel is not None and kernel.attrs.get("masked_global_store")
+        index_ops, origins = [], []
+        if masked:
+            if f32:
+                raise NotImplementedError("masked row fragments require Half outputs")
+            from .lower_to_tma_move import _build_tile_chain_indices
+
+            index_ops, root, origins, _ = _build_tile_chain_indices(
+                memory, list(memory_type.sizes)
+            )
         layout = None if global_memory else physical_layout(memory_type)
         if layout is None:
             alignment = cast(int, memory_type.strides[0]) * dtype_bytes
@@ -719,7 +1119,7 @@ class LowerToPtxTemplate(LoweringPass):
         else:
             assert isinstance(memory_type, SmemTensorType)
             block_width, order = layout
-            root = root_buffer(memory)
+            root = _layout_view_root(memory)
             assert root is not None and isinstance(root.type, SmemTensorType)
             if order != "block_major" or memory_type.swizzle not in (
                 None,
@@ -736,8 +1136,11 @@ class LowerToPtxTemplate(LoweringPass):
             template += "add.u32 ${b32:row_offset}, ${b32:row_offset}, ${b32:column_bytes};\n"
 
             def address(row: int, column: int) -> tuple[str, str]:
-                block, inner = divmod(column, block_width)
-                static = (block * root_rows * block_width + row * block_width + inner) * dtype_bytes
+                static = _block_major_offset(row, column, block_width, root_rows) * dtype_bytes
+                group_setup = ""
+                if group_columns:
+                    group_static = _block_major_offset(row, column + group_columns, block_width, root_rows) * dtype_bytes
+                    group_setup = f"mad.lo.u32 ${{b32:offset}}, ${{b32:column_group}}, {group_static - static}, ${{b32:offset}};\n"
                 swizzle = (
                     _swizzle_ptx("offset", "offset_swizzle", alignment)
                     if memory_type.swizzle is not None
@@ -745,29 +1148,48 @@ class LowerToPtxTemplate(LoweringPass):
                 )
                 return (
                     f"add.u32 ${{b32:offset}}, ${{b32:row_offset}}, {static};\n"
-                    + swizzle
+                    + group_setup + swizzle
                     + "add.u32 ${b32:address}, ${b32:operand.memory.ptr}, "
                     "${b32:offset};\n"
                 ), "[${b32:address}]"
 
         space = "global" if global_memory else "shared"
-        for row, column, first, size, _ in geometry.accesses(cast(int, fragment_type.sizes[1])):
+        if masked:
+            template += textwrap.dedent(f"""\
+                add.u32 ${{b32:tile_row_end}}, ${{b32:operand.origin_row.val}}, {memory_type.sizes[0]};
+                add.u32 ${{b32:tile_col_end}}, ${{b32:operand.origin_col.val}}, {memory_type.sizes[1]};
+                setp.le.u32 ${{pred:complete_rows}}, ${{b32:tile_row_end}}, {root.type.sizes[0]};
+                setp.le.u32 ${{pred:complete_cols}}, ${{b32:tile_col_end}}, {root.type.sizes[1]};
+                and.b64 ${{b64:alignment}}, ${{b64:base}}, 3;
+                setp.eq.u64 ${{pred:aligned}}, ${{b64:alignment}}, 0;
+                and.pred ${{pred:complete}}, ${{pred:complete_rows}}, ${{pred:complete_cols}};
+                and.pred ${{pred:complete}}, ${{pred:complete}}, ${{pred:aligned}};
+                @!${{pred:complete}} bra ${{label:fragment_edge}};
+            """)
+        for row, column, first, size, _ in accesses:
             for start, width in _vector_groups(size // packing, alignment):
                 setup, location = address(row, column + start * packing)
                 begin = first // packing + start
                 vector, regs = _vector_operand(registers[begin : begin + width])
                 template += setup + f"st.{space}{vector}.b32 {location}, {regs};\n"
-        lowered = PTXTemplateOp.build(
-            operands=[
-                cast(Value, self.value_map[memory]),
-                cast(Value, self.value_map[fragment]),
-            ],
-            result_types=[],
-            template=template,
-            operand_names=["memory", "fragment"],
-            description=str(op),
-        )
-        return [lowered], []
+        if masked:
+            template += textwrap.dedent("""\
+                bra ${label:fragment_end};
+                ${label:fragment_edge}:
+                add.u32 ${b32:row}, ${b32:row}, ${b32:operand.origin_row.val};
+                shr.u32 ${b32:col}, ${b32:column_bytes}, 1;
+                add.u32 ${b32:col}, ${b32:col}, ${b32:operand.origin_col.val};
+            """)
+            for row, column, first, size, _ in accesses:
+                for start in range(size // packing):
+                    template += _ptx_masked_half_pair(
+                        first // packing + start, row, column + start * packing,
+                        alignment, root.type.sizes, is_load=False, writer=False,
+                    )
+            template += "${label:fragment_end}:\n"
+        lowered, _ = _lowered(op, template, [cast(Value, self.value_map[memory]), cast(Value, self.value_map[fragment]), *origins],
+                              ["memory", "fragment", *(["origin_row", "origin_col"] if masked else [])])
+        return [*index_ops, *lowered], []
 
     @lowers(ConstantOp)
     def lower_constant(
@@ -799,6 +1221,7 @@ class LowerToPtxTemplate(LoweringPass):
         self,
         op: KernelOp,
     ) -> tuple[list[Op], list[object]]:
+        self.distinct_issuers = any(inner.attrs.get('issuer_warp', 0) for inner in iter_ops(op))
         # TODO: Materialize cache policies in an earlier pass, potentially
         # alongside buffer promotion, so this pass only renders their PTX.
         cache_hints = sorted(
@@ -829,28 +1252,38 @@ class LowerToPtxTemplate(LoweringPass):
         # Compute the warp index once, rather than at every use.
         self.warp_ids = WarpIdsOp.build()
         op.body.ops.insert(0, self.warp_ids)
-        has_tmem = any(
-            isinstance(alloc.result().type, TmemTensorType)
-            for alloc in find_ops_of_type(op, AllocOp)
+        tmem_allocs = [alloc for alloc in find_ops_of_type(op, AllocOp)
+            if isinstance(alloc.result().type, TmemTensorType)]
+        # A single unconditional arena is the last allocation for this CTA.
+        # Release its allocation permit immediately so another CTA can make
+        # progress while this one still owns its TMEM and drains output.
+        # Multiple sites, conditional allocation and repeated allocation keep
+        # the permit until exit; counting static sites alone is insufficient.
+        self._early_tmem_alloc = (
+            tmem_allocs[0] if len(tmem_allocs) == 1
+            and tmem_allocs[0].parent_block is op.body
+            and (not op.is_clustered or tmem_allocs[0].result().type.cta_group == 2)
+            else None
         )
+        if len(tmem_allocs) == 1 and tmem_allocs[0].parent_block is op.body:
+            _sink_tmem_alloc(op.body.ops, tmem_allocs[0])
+        module = find_ancestor_of_type(op, ModuleOp)
+        if module is not None and module.target == "sm_100a":
+            # Participant regions are SM100 execution scopes (see the
+            # verifier). A one-dimensional CTA's warp index is its x component.
+            _group_issuer_regions(op.body, self.warp_ids.x if op.block_dim[1:] == (1, 1) else None)
         self.lower_block(op.body)
-        if has_tmem:
+        self._group_event_inits(op.body)
+        if tmem_allocs and self._early_tmem_alloc is None:
             # Keep the permit through every allocation, including sequential
             # GEMMs or loop iterations. Relinquish once at kernel exit.
-            operands, names, warp = self._leader_warp("tmem_exit")
-            op.body.ops.append(
-                PTXTemplateOp.build(
-                    operands=operands,
-                    result_types=[],
-                    operand_names=names,
-                    template=warp
-                    + "@!${pred:tmem_exit_other_warp} tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n",
-                    description="relinquish TMEM allocation permit",
-                )
-            )
+            op.body.ops.append(self._warp0_template(
+                "tmem_exit",
+                [f"tcgen05.relinquish_alloc_permit.cta_group::{tmem_allocs[0].result().type.cta_group}.sync.aligned;"],
+                "relinquish TMEM allocation permit"))
         return [op], []
 
-    def _leader_warp(self, prefix: str) -> tuple[list[Value], list[str], str]:
+    def _leader_warp(self, prefix: str, issuer_warp: int = 0) -> tuple[list[Value], list[str], str]:
         """Operands and PTX setting ``${pred:<prefix>_other_warp}`` outside warp 0.
 
         Warp 0 holds the leader, thread 0. The kernel's warp index is broadcast
@@ -858,6 +1291,9 @@ class LowerToPtxTemplate(LoweringPass):
         warp-uniform.
         """
         assert self.warp_ids is not None, "lower_kernel creates warp_ids"
+        guard = self._region_guard(prefix, issuer_warp)
+        if guard is not None:
+            return guard
         return (
             list(self.warp_ids.results),
             ["warp_x", "warp_y", "warp_z"],
@@ -866,34 +1302,15 @@ class LowerToPtxTemplate(LoweringPass):
                 "${b32:operand.warp_y.val};\n"
                 f"or.b32 ${{b32:{prefix}_warp}}, ${{b32:{prefix}_warp}}, "
                 "${b32:operand.warp_z.val};\n"
-                f"setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, 0;\n"
+                f"setp.ne.u32 ${{pred:{prefix}_other_warp}}, ${{b32:{prefix}_warp}}, {issuer_warp};\n"
             ),
         )
 
-    def _leader_thread(
-        self,
-        prefix: str,
-        before_branch: str = "",
-    ) -> tuple[list[Value], list[str], str]:
-        """Operands and PTX that let one elected thread of warp 0 do leader work.
-
-        Every other warp branches to ``${label:<prefix>_done}``, without
-        diverging inside a warp, and ``elect.sync`` sets
-        ``${pred:<prefix>_leader}`` on one thread of warp 0, so ptxas can keep
-        the work's operands in uniform registers. ``before_branch`` runs in
-        every warp, so ptxas can keep its special-register reads out of loops.
-        """
-        operands, names, leader_warp = self._leader_warp(prefix)
-        return (
-            operands,
-            names,
-            leader_warp
-            + before_branch
-            + (
-                f"@${{pred:{prefix}_other_warp}} bra ${{label:{prefix}_done}};\n"
-                f"elect.sync _|${{pred:{prefix}_leader}}, 0xffffffff;\n"
-            ),
-        )
+    def _leader_thread(self, prefix: str, before_branch: str = "", issuer_warp: int = 0,
+                       converge: bool = False) -> tuple[list[Value], list[str], str]:
+        """Operands and PTX of :func:`_leader_thread` behind :meth:`_leader_warp`."""
+        operands, names, guard = self._leader_warp(prefix, issuer_warp)
+        return operands, names, _leader_thread(prefix, before_branch, guard=guard, converge=converge)
 
     def _tma_instruction(
         self,
@@ -936,15 +1353,8 @@ class LowerToPtxTemplate(LoweringPass):
                 raise NotImplementedError("TMEM views need static column offsets")
             if column == 0:
                 return [], [arg]
-            view = PTXTemplateOp.build(
-                operands=[arg],
-                result_types=[op.result().type],
-                template=f"add.u32 ${{b32:result.dst.ptr}}, ${{b32:operand.src.ptr}}, {column * columns};\n",
-                operand_names=["src"],
-                result_names=["dst"],
-                description=str(op),
-            )
-            return [view], [view.result()]
+            return _lowered(op, f"add.u32 ${{b32:result.dst.ptr}}, ${{b32:operand.src.ptr}}, {column * columns};\n",
+                            [arg], ["src"], [op.result().type])
 
         if isinstance(op.arg.type, WgrmemTensorType):
             _wgmma_view_pairs(op.result())  # Validate the static view.
@@ -988,6 +1398,10 @@ class LowerToPtxTemplate(LoweringPass):
         byte_offset = zero.result()
 
         for dim, idx in enumerate(op.indices):
+            if isinstance(idx, int) and idx == 0:
+                # Changing a view's extent at its origin adds no offset,
+                # including a view of an existing sub-block tile.
+                continue
             if layout is not None and layout[1] == "block_major" and dim == inner_dim:
                 block_width, _ = layout
                 if result_sizes[dim] % block_width:
@@ -999,13 +1413,8 @@ class LowerToPtxTemplate(LoweringPass):
                     assert isinstance(idx, int), (
                         "block-major sub-block tiles require a static index"
                     )
-                    block, inner = divmod(
-                        idx * result_sizes[dim],
-                        block_width,
-                    )
-                    byte_delta = (
-                        block * cast(int, outer_rows) * block_width + inner
-                    ) * dtype_bytes
+                    byte_delta = _block_major_offset(
+                        0, idx * result_sizes[dim], block_width, cast(int, outer_rows)) * dtype_bytes
                     byte_term = IndexConstantOp.build(byte_delta)
                     new_ops.append(byte_term)
                     add_op = IndexAddOp.build(byte_offset, byte_term.result())
@@ -1093,127 +1502,140 @@ class LowerToPtxTemplate(LoweringPass):
     ) -> tuple[list[Op], list[object]]:
         return [], [cast(Value, self.value_map[op.arg])]
 
+    @lowers(OperandPipelineOp)
+    def lower_operand_pipeline(self, op):
+        from .pipeline_rolled_k import LowerRolledK
+        from ..base.ir import Block
+
+        ops, _ = LowerRolledK().lower_pipeline(op)
+        body = Block(ops=ops)
+        op.blocks = [body]
+        # Expand while views are still ordinary IR: otherwise dead pointer
+        # preparation becomes an opaque PTX template and cannot be removed.
+        from .cse import _cse_block
+        from .dce import DCE
+
+        _cse_block(body, {})
+        DCE().run_block(body)
+        # Kernel-level issuer grouping ran before this semantic region was
+        # expanded. Group its new loops now so other warps skip the whole
+        # issuer run instead of traversing every bank's arithmetic and guards.
+        _group_issuer_regions(body, self.warp_ids.x if self.warp_ids is not None else None)
+        self.lower_block(body)
+        return list(body.ops), []
+
+    @lowers(LockViewOp)
+    def lower_lock_view(self, op):
+        arena, index, phase = [self.value_map[v] for v in op.operands]
+        template = "mad.lo.u32 ${b32:result.dst.val}, ${b32:operand.index.val}, 8, ${b32:operand.arena.val};\nmov.b32 ${b32:result.dst.parity}, ${b32:operand.phase.val};\n"
+        lowered = PTXTemplateOp.build(
+            operands=[arena, index, phase],
+            result_types=[op.result().type],
+            template=template,
+            operand_names=["arena", "index", "phase"],
+            result_names=["dst"],
+        )
+        return [lowered], [lowered.result()]
+
     def _lower_alloc_lock(
         self,
         op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
         lock_type = op.result().type
         assert isinstance(lock_type, LockType)
+        issuer = 0
         if lock_type.kind == "cluster_mbar":
-            return self._lower_alloc_cluster_mbar(op)
-        if lock_type.kind not in ("mbar", "tcgen05"):
+            init = self._cluster_mbar_init(op)
+        elif lock_type.kind in ("mbar", "tcgen05"):
+            # InsertSyncs represents publication explicitly with BarrierOps.
+            release_prior = any(isinstance(u, AsyncOp) and u.attrs.get("release_prior")
+                                for u in op.result().users())
+            arrivals = lock_type.attrs.get("arrival_count", lock_type.attrs.get("arrivals", 2 if release_prior else 1))
+            counts = lock_type.attrs.get("arrival_counts")
+            setup = lambda s: ""
+            if counts is not None and len(set(counts)) == 1:
+                arrivals = counts[0]
+            elif counts is not None:
+                arrivals = "init_arrivals"
+                setup = lambda s: (f"mov.u32 ${{b32:init_rank{s}}}, %cluster_ctarank;\n"
+                                   + rank_table_ptx(f"init_arrivals{s}", counts, rank=f"init_rank{s}"))
+            init = _mbarrier_init(lock_type.attrs.get("count", 1), arrivals, setup)
+            issuer = execution_issuer_warp(op)
+        else:
             return [], [None]
-        # InsertSyncs represents publication explicitly with BarrierOps.
-        template = textwrap.dedent("""\
-            .shared .align 8 .b64 ${smem:bar}[1];
-            mov.u32 ${b32:result.dst.val}, ${smem:bar};
-            mov.u32 ${b32:result.dst.parity}, 0;
-            mov.u32 ${b32:tid_x}, %tid.x;
-            mov.u32 ${b32:tid_y}, %tid.y;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_y};
-            mov.u32 ${b32:tid_z}, %tid.z;
-            or.b32 ${b32:tid_x}, ${b32:tid_x}, ${b32:tid_z};
-            setp.ne.s32 ${pred:not_t0}, ${b32:tid_x}, 0;
-            @${pred:not_t0} bra ${label:after_init};
-            mbarrier.init.shared::cta.b64 [${b32:result.dst.val}], 1;
-            fence.mbarrier_init.release.cluster;
-            ${label:after_init}:
-        """)
         new_op = PTXTemplateOp.build(
             operands=[],
             result_types=[lock_type],
-            template=template,
+            template=_event_inits_ptx(issuer, [init]),
             operand_names=[],
             result_names=["dst"],
             description=str(op),
         )
+        self._event_inits[id(new_op)] = (issuer, init)
         return [new_op], [new_op.result()]
 
-    def _lower_alloc_cluster_mbar(
-        self,
-        op: AllocOp,
-    ) -> tuple[list[Op], list[object]]:
+    def _cluster_mbar_init(self, op: AllocOp) -> EventInit:
         lock_type = op.result().type
         kernel = find_ancestor_of_type(op, KernelOp)
-        assert kernel is not None
+        assert kernel is not None and kernel.num_threads is not None
         cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
+        warps = kernel.num_threads // 32
         if _split_release(op.result()):
             # Every CTA's leader waits for one arrival per warp of the
             # cluster: any CTA may write the released stage.
-            assert kernel.num_threads is not None
-            arrivals = kernel.num_threads // 32 * cluster_size
-            template = textwrap.dedent(f"""\
-                .shared .align 8 .b64 ${{smem:bar}}[1];
-                mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
-                mov.u32 ${{b32:result.dst.parity}}, 0;
-                mov.u32 ${{b32:tid_x}}, %tid.x;
-                mov.u32 ${{b32:tid_y}}, %tid.y;
-                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
-                mov.u32 ${{b32:tid_z}}, %tid.z;
-                or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
-                setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
-                @${{pred:not_t0}} bra ${{label:after_init}};
-                mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], {arrivals};
-                fence.mbarrier_init.release.cluster;
-                ${{label:after_init}}:
-            """)
-            new_op = PTXTemplateOp.build(
-                operands=[],
-                result_types=[lock_type],
-                template=template,
-                operand_names=[],
-                result_names=["dst"],
-                description=str(op),
-            )
-            return [new_op], [new_op.result()]
-        # InsertSyncs represents publication explicitly with BarrierOps.
-        assert kernel.num_threads is not None
-        warps = kernel.num_threads // 32
+            masks = lock_type.attrs.get('release_cta_masks')
+            if masks is not None:
+                from ..cluster_layout import arrival_counts
+                counts = arrival_counts(masks)
+                if len(set(counts)) != 1:
+                    raise ValueError('software release currently requires uniform recipient counts')
+                cluster_size = counts[0]
+            return _mbarrier_init(1, len(lock_type.attrs.get("release_warps", range(warps))) * cluster_size)
         # Every warp of the CTA arrives, and at the cluster leader every warp
-        # of the cluster. InsertSyncs represents publication explicitly with
-        # BarrierOps.
-        template = textwrap.dedent(f"""\
-            .shared .align 8 .b64 ${{smem:bar}}[1];
-            mov.u32 ${{b32:result.dst.val}}, ${{smem:bar}};
-            mov.u32 ${{b32:result.dst.parity}}, 0;
-            mov.u32 ${{b32:tid_x}}, %tid.x;
-            mov.u32 ${{b32:tid_y}}, %tid.y;
-            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_y}};
-            mov.u32 ${{b32:tid_z}}, %tid.z;
-            or.b32 ${{b32:tid_x}}, ${{b32:tid_x}}, ${{b32:tid_z}};
-            setp.ne.s32 ${{pred:not_t0}}, ${{b32:tid_x}}, 0;
-            @${{pred:not_t0}} bra ${{label:after_init}};
-            mov.u32 ${{b32:cluster_rank}}, %cluster_ctarank;
-            setp.eq.u32 ${{pred:rank0}}, ${{b32:cluster_rank}}, 0;
-            mov.u32 ${{b32:arrivals}}, {warps};
-            @${{pred:rank0}} mov.u32 ${{b32:arrivals}}, {warps * cluster_size};
-            mbarrier.init.shared::cta.b64 [${{b32:result.dst.val}}], ${{b32:arrivals}};
-            fence.mbarrier_init.release.cluster;
-            ${{label:after_init}}:
-        """)
-        new_op = PTXTemplateOp.build(
-            operands=[],
-            result_types=[lock_type],
-            template=template,
-            operand_names=[],
-            result_names=["dst"],
-            description=str(op),
-        )
-        return [new_op], [new_op.result()]
+        # of the cluster.
+        return _mbarrier_init(1, "arrivals", lambda s: textwrap.dedent(f"""\
+            mov.u32 ${{b32:cluster_rank{s}}}, %cluster_ctarank;
+            setp.eq.u32 ${{pred:rank0{s}}}, ${{b32:cluster_rank{s}}}, 0;
+            mov.u32 ${{b32:arrivals{s}}}, {warps};
+            @${{pred:rank0{s}}} mov.u32 ${{b32:arrivals{s}}}, {warps * cluster_size};
+            """))
+
+    def _group_event_inits(self, block) -> None:
+        """Initialize each run of consecutive event allocations in one block (see _event_inits_ptx)."""
+        def key(op):
+            entry = self._event_inits.get(id(op))
+            return entry and (entry[0], op.extra_attrs)
+
+        ops, out, i = block.ops, [], 0
+        while i < len(ops):
+            first = ops[i]
+            run = list(itertools.takewhile(lambda op: key(op) and key(op) == key(first), ops[i:]))
+            if len(run) < 2:
+                out.append(first)
+                i += 1
+                continue
+            merged = PTXTemplateOp.build(
+                operands=[],
+                result_types=[op.results[0].type for op in run],
+                template=_event_inits_ptx(self._event_inits[id(first)][0],
+                                          [self._event_inits[id(op)][1] for op in run]),
+                operand_names=[],
+                result_names=[f"dst{n}" for n in range(len(run))],
+                description=f"{first.description} (+{len(run) - 1} events initialized together)",
+                attrs=dict(first.extra_attrs),
+            )
+            for op, result in zip(run, merged.results):
+                for user, index in list(op.results[0].uses):
+                    user.operands[index] = result
+            out.append(merged)
+            i += len(run)
+        block.ops = out
 
     def _lower_alloc_registers(
         self,
         op: AllocOp,
     ) -> tuple[list[Op], list[object]]:
-        new_op = PTXTemplateOp.build(
-            operands=[],
-            result_types=[op.result().type],
-            template="",
-            operand_names=[],
-            result_names=["dst"],
-            description=str(op),
-        )
-        return [new_op], [new_op.result()]
+        return _lowered(op, "", result_types=[op.result().type])
 
     def _lower_alloc_smem(
         self,
@@ -1281,15 +1703,7 @@ class LowerToPtxTemplate(LoweringPass):
 
         source_names = _elementwise_source_names(op)
         assert len(source_names) == op.num_srcs
-        new_op = PTXTemplateOp.build(
-            operands=[dst_value, *source_values],
-            result_types=[],
-            template=template,
-            operand_names=["dst", *source_names],
-            result_names=[],
-            description=str(op),
-        )
-        return [new_op], []
+        return _lowered(op, template, [dst_value, *source_values], ["dst", *source_names])
 
     @lowers(MatmulOp)
     def lower_matmul(
@@ -1462,7 +1876,9 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(f"lower_async: tma_move with lock kind {kind!r}")
         mms = [body_op for body_op in body_ops if isinstance(body_op, MatmulOp)]
         if body_ops and len(mms) == len(body_ops):
-            return self._lower_async_matmul(op, mms)
+            probes = self._probe_ahead_ops(op)
+            new_ops, results = self._lower_async_matmul(op, mms)
+            return [*probes, *new_ops], results
         raise NotImplementedError(
             f"lower_async: unsupported body ops {[type(o).__name__ for o in body_ops]}"
         )
@@ -1486,7 +1902,7 @@ class LowerToPtxTemplate(LoweringPass):
         Into a TMEM accumulator, one elected thread issues the group's
         ``tcgen05.mma`` ops and commits them to the lock's mbarrier. Both
         families read the same shared-memory matrix descriptors; tcgen05's
-        carry a version field, and one instruction covers all 128 rows.
+        carry a version field, and one instruction covers the logical M64/M128 tile.
         """
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
@@ -1494,6 +1910,7 @@ class LowerToPtxTemplate(LoweringPass):
             f"_lower_async_matmul: unexpected lock kind {lock_type.kind!r}"
         )
         tcgen05 = lock_type.kind == "tcgen05"
+        cta_group = lock_type.attrs.get("cta_group", 1)
 
         _swizzle_to_bits = {None: 0, "128B": 1, "64B": 2, "32B": 3}
 
@@ -1501,13 +1918,13 @@ class LowerToPtxTemplate(LoweringPass):
             version = 1 << 46 if tcgen05 else 0
             return (lbo >> 4) << 16 | (sbo >> 4) << 32 | version | swizzle << 62
 
-        # Descriptors are deliberately rematerialized near each WGMMA group:
-        # keeping them live across the loop raises register pressure.
+        # Default preparation stays near the MMA to limit register lifetimes.
+        # SM100 can instead expose the variable low half to late LICM.
         kernel = find_ancestor_of_type(op, KernelOp)
         assert kernel is not None
         clustered_addresses = any((dim or 1) > 1 for dim in kernel.cluster_dim)
 
-        def _build_desc(name, ptr_reg, desc_const, offset=None):
+        def _build_desc(name, ptr_reg, desc_const, offset=None, *, low_half=False):
             t = ""
             if offset is not None:
                 t += f"add.u32 ${{b32:{name}_addr}}, ${{b32:{ptr_reg}}}, {offset};\n"
@@ -1519,6 +1936,11 @@ class LowerToPtxTemplate(LoweringPass):
             # bits would corrupt its leading byte offset for MN-major B.
             if clustered_addresses:
                 t += f"and.b32 ${{b32:{name}_addr}}, ${{b32:{name}_addr}}, 16383;\n"
+            if low_half:
+                return t + (
+                    f"or.b32 ${{b32:{name}}}, ${{b32:{name}_addr}}, "
+                    f"{desc_const & 0xffffffff};\n"
+                )
             t += f"cvt.u64.u32 ${{b64:{name}}}, ${{b32:{name}_addr}};\n"
             t += f"or.b64 ${{b64:{name}}}, ${{b64:{name}}}, {desc_const};\n"
             return t
@@ -1557,10 +1979,37 @@ class LowerToPtxTemplate(LoweringPass):
             base_indices = [constant(index) for index in base_tile.indices]
             if any(index is None for index in indices + base_indices):
                 return None
-            # A physical layout is not affine in the logical coordinates, so
-            # rematerialize its descriptors from the already-lowered pointers.
+            # Reuse exact static blocked offsets only in compact SM100 batches.
             if typ.attrs.get("physical_layout") is not None:
-                return None
+                if not compact_mma:
+                    return None
+                layout = physical_layout(typ)
+                if layout is None or layout[1] != 'block_major' or typ.rank != 2:
+                    return None
+                root = _layout_view_root(value)
+                if root is None or not isinstance(root.type, SmemTensorType) or root.type.rank != 2:
+                    return None
+                width = layout[0]
+                inner = 0 if is_column_major(root.type) else 1
+                rows = root.type.sizes[1 - inner]
+                parent = tile.arg.type
+                if (not isinstance(rows, int) or not isinstance(parent, SmemTensorType)
+                        or parent.sizes[inner] % width):
+                    return None
+                # Static siblings share every preceding view and descriptor
+                # field. Evaluate the actual blocked pointer offsets; no
+                # affine assumption about logical coordinates is needed.
+                def offset(coords):
+                    starts = [i * size for i, size in zip(coords, typ.sizes)]
+                    if any(start < 0 or start + size > extent
+                           for start, size, extent in zip(starts, typ.sizes, parent.sizes)):
+                        return None
+                    return _block_major_offset(starts[1 - inner], starts[inner], width, rows)
+                first, origin = offset(indices), offset(base_indices)
+                if first is None or origin is None:
+                    return None
+                byte_delta = (first - origin) * typ.dtype.byte_size
+                return byte_delta if byte_delta >= 0 and byte_delta % 16 == 0 else None
             delta = 0
             for index, base_index, size, stride in zip(
                 indices,
@@ -1595,7 +2044,31 @@ class LowerToPtxTemplate(LoweringPass):
             operand_names.append(name)
             return name
 
+        descriptor_ops: list[Op] = []
+        hoist_descriptors = tcgen05 and kernel.attrs.get("hoist_mma_descriptors", False)
+
         def _desc(name, base, delta, value, hint, const, offset=None):
+            if hoist_descriptors and delta is None:
+                # The high descriptor fields are constant. Keeping their
+                # 64-bit join near the MMA avoids a long-lived 64-bit table.
+                preparation = _build_desc(
+                    "desc", "operand.ptr.ptr", const, offset, low_half=True
+                ).replace("${b32:desc}", "${b32:result.desc.val}")
+                prepared = PTXTemplateOp.build(
+                    operands=[cast(Value, self.value_map[value])],
+                    result_types=[IndexType()],
+                    template=preparation,
+                    operand_names=["ptr"],
+                    result_names=["desc"],
+                    description="pure MMA descriptor low half",
+                    attrs={"pure": True},
+                )
+                descriptor_ops.append(prepared)
+                bound = _operand(prepared.result(), "descriptor_low")
+                return (
+                    f"mov.b64 ${{b64:{name}}}, "
+                    f"{{${{b32:operand.{bound}.val}}, {const >> 32}}};\n"
+                )
             if delta is not None:
                 return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
             operand = _operand(cast(Value, self.value_map[value]), hint)
@@ -1608,7 +2081,26 @@ class LowerToPtxTemplate(LoweringPass):
 
         desc_template = ""
         mma_template = ""
+        kernel = find_ancestor_of_type(op, KernelOp)
+        compact_mma = (tcgen05 and cta_group == 2 and len(mms) >= 8
+                       and all(mm.dst.type.sizes[0] == 64 for mm in mms))
+        # Descriptor lifetime and elected-lane control are independent choices.
+        # Preparing descriptors near their MMA avoids keeping every sibling
+        # live together, without moving that preparation into a lane branch.
+        interleave_descriptors = compact_mma or (
+            tcgen05 and kernel.attrs.get('interleave_mma_descriptors', False)
+        )
+        elected_batch = compact_mma
+
+        def row_stride_bytes(typ: SmemTensorType) -> int:
+            # A blocked buffer's rows are one block wide.
+            layout = physical_layout(typ)
+            stride = layout[0] if layout is not None and layout[1] == "block_major" else typ.strides[0]
+            return cast(int, stride) * typ.dtype.byte_size
+
         for j, mm in enumerate(mms):
+            descriptor_start = len(desc_template)
+            mma_start = len(mma_template)
             lhs_type = mm.lhs.type
             rhs_type = mm.rhs.type
             dst_type = mm.dst.type
@@ -1633,6 +2125,8 @@ class LowerToPtxTemplate(LoweringPass):
             assert rhs_column or rhs_type.strides[-1] == 1
             m_dim, k_dim = cast(tuple[int, int], lhs_type.sizes)
             n_dim, k_dim2 = cast(tuple[int, int], rhs_type.sizes)
+            if tcgen05 and cta_group == 2:
+                n_dim *= 2
             assert k_dim == k_dim2
             assert k_dim == 16, f"_lower_async_matmul: k must be 16; got {k_dim}"
             assert m_dim % 64 == 0, (
@@ -1644,32 +2138,8 @@ class LowerToPtxTemplate(LoweringPass):
             assert list(dst_type.sizes) == [m_dim, n_dim]
 
             m_iters = 1 if tcgen05 else m_dim // 64
-            lhs_layout = physical_layout(lhs_type)
-            rhs_layout = physical_layout(rhs_type)
-            lhs_row_stride = (
-                lhs_layout[0]
-                if lhs_layout is not None and lhs_layout[1] == "block_major"
-                else lhs_type.strides[0]
-            )
-            rhs_row_stride = (
-                rhs_layout[0]
-                if rhs_layout is not None and rhs_layout[1] == "block_major"
-                else rhs_type.strides[0]
-            )
-            lhs_row_stride_bytes = (
-                cast(int, lhs_row_stride)
-                * cast(
-                    BF16Type | F16Type | F32Type | F64Type,
-                    lhs_type.dtype,
-                ).byte_size
-            )
-            rhs_row_stride_bytes = (
-                cast(int, rhs_row_stride)
-                * cast(
-                    BF16Type | F16Type | F32Type | F64Type,
-                    rhs_type.dtype,
-                ).byte_size
-            )
+            lhs_row_stride_bytes = row_stride_bytes(lhs_type)
+            rhs_row_stride_bytes = row_stride_bytes(rhs_type)
 
             assert lhs_type.swizzle in _swizzle_to_bits, (
                 f"_lower_async_matmul: lhs has unknown swizzle {lhs_type.swizzle!r}"
@@ -1688,7 +2158,7 @@ class LowerToPtxTemplate(LoweringPass):
                     "MN-major WGMMA needs compact swizzle atoms"
                 )
                 width = layout[0]
-                root = root_buffer(value)
+                root = _layout_view_root(value)
                 assert root is not None and isinstance(root.type, SmemTensorType)
                 reduction_tile = root.type.sizes[-1]
                 assert isinstance(reduction_tile, int)
@@ -1720,7 +2190,7 @@ class LowerToPtxTemplate(LoweringPass):
             for m_it in range(m_iters):
                 lhs_offset = m_it * 64 * lhs_row_stride_bytes
                 if lhs_column:
-                    lhs_root = root_buffer(mm.lhs)
+                    lhs_root = _layout_view_root(mm.lhs)
                     lhs_width, _ = physical_layout(lhs_type)
                     lhs_offset = (
                         m_it
@@ -1763,15 +2233,19 @@ class LowerToPtxTemplate(LoweringPass):
                     | int(lhs_column) << 15
                     | int(rhs_column) << 16
                     | n_dim >> 3 << 17
-                    | m_dim >> 4 << 24
+                    | (m_dim * cta_group) >> 4 << 24
                 )
                 mma_template += textwrap.dedent(f"""\
                     mov.b32 ${{b32:idesc}}, {idesc};
                     mov.pred ${{pred:accumulate}}, {int(mm.accumulate)};
-                    @${{pred:tcgen05_leader}} tcgen05.mma.cta_group::1.kind::f16
+                    @${{pred:tcgen05_leader}} tcgen05.mma.cta_group::{cta_group}.kind::f16
                       [${{b32:operand.{dst_name}.ptr}}], ${{b64:desc_lhs{j}_0}}, ${{b64:{desc_rhs}}},
                       ${{b32:idesc}}, ${{pred:accumulate}};
                 """)
+                if interleave_descriptors:
+                    mma_template = (mma_template[:mma_start] + desc_template[descriptor_start:]
+                                    + mma_template[mma_start:])
+                    desc_template = desc_template[:descriptor_start]
                 continue
             num_regs_per_wgmma = 64 * n_dim // (dst_type.warps * 32)
             reg_offset = 0
@@ -1795,16 +2269,52 @@ class LowerToPtxTemplate(LoweringPass):
         # barrier that closes the cross-warp WAR (thread-0 TMA reload vs
         # warpgroup-wide wgmma reads).
         if tcgen05:
-            leader_operands, leader_names, leader = self._leader_thread("tcgen05")
+            release_prior = op.attrs.get("release_prior", False)
+            leader_operands, leader_names, leader = self._leader_thread("tcgen05",
+                issuer_warp=execution_issuer_warp(op),
+                converge=release_prior)
             operands.extend([*leader_operands, cast(Value, self.value_map[op.lock])])
             operand_names.extend([*leader_names, "lock"])
+            if cta_group == 2:
+                leader += ("mov.pred ${pred:tcgen05_local_leader}, ${pred:tcgen05_leader};\n"
+                           + _pair_leader_ptx("tcgen05_rank", "tcgen05_rank0")
+                           + "and.pred ${pred:tcgen05_leader}, ${pred:tcgen05_leader}, ${pred:tcgen05_rank0};\n"
+                           "@!${pred:tcgen05_rank0} bra ${label:tcgen05_peer_done};\n")
+            kernel = find_ancestor_of_type(op, KernelOp)
+            size = math.prod(d or 1 for d in kernel.cluster_dim)
+            if cta_group == 1 and any('completion_cta_masks' in event.type.attrs for event in op.completion_locks):
+                leader += "mov.u32 ${b32:tcgen05_rank}, %cluster_ctarank;\n"
+            commit = ""
+            for index, event in enumerate(op.completion_locks):
+                name = "lock" if index == 0 else f"completion{index-1}"
+                if index:
+                    operands.append(cast(Value, self.value_map[event]))
+                    operand_names.append(name)
+                masks = event.type.attrs.get('completion_cta_masks')
+                if masks is None and cta_group == 2:
+                    masks = [pair_mask(rank) for rank in range(size)]
+                if masks is not None:
+                    mask_name = f"tcgen05_mask{index}"
+                    commit += rank_table_ptx(mask_name, masks, bits=16, rank='tcgen05_rank')
+                    suffix = f".shared::cluster.multicast::cluster.b64 [${{b32:operand.{name}.val}}], ${{b16:{mask_name}}};\n"
+                else:
+                    suffix = f".shared::cluster.b64 [${{b32:operand.{name}.val}}];\n"
+                commit += f"@${{pred:tcgen05_leader}} tcgen05.commit.cta_group::{cta_group}.mbarrier::arrive::one" + suffix
+            release_pred = "tcgen05_local_leader" if cta_group == 2 else "tcgen05_leader"
+            if elected_batch:
+                leader += "@!${pred:tcgen05_leader} bra ${label:tcgen05_issue_done};\n"
+                mma_template = mma_template.replace("@${pred:tcgen05_leader} ", "")
+                commit = commit.replace("@${pred:tcgen05_leader} ", "")
             template = (
                 leader
                 + desc_template
                 + mma_template
-                + "@${pred:tcgen05_leader} tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-                ".shared::cluster.b64 [${b32:operand.lock.val}];\n"
-                "${label:tcgen05_done}:\n"
+                + commit
+                + ("${label:tcgen05_issue_done}:\n" if elected_batch else "")
+                + ("${label:tcgen05_peer_done}:\n" if cta_group == 2 else "")
+                + (f"@${{pred:{release_pred}}} mbarrier.arrive.release.cta.shared::cta.b64 "
+                   "_, [${b32:operand.lock.val}];\n" if release_prior else "")
+                + "${label:tcgen05_done}:\n"
             )
         else:
             template = (
@@ -1822,7 +2332,7 @@ class LowerToPtxTemplate(LoweringPass):
             result_names=[],
             description=str(op),
         )
-        return [new_op], []
+        return [*descriptor_ops, new_op], []
 
     @lowers(MoveOp)
     def lower_move(
@@ -1905,7 +2415,8 @@ class LowerToPtxTemplate(LoweringPass):
         if scope == "thread":
             return [], []  # per-thread ordering is implicit in program order
         if scope == "block":
-            template = "bar.sync 0;\n"
+            template = (f"bar.sync {op.attrs.get('id', 15)}, {32 * len(execution_warps(op))};\n"
+                        if execution_warps(op) is not None else "bar.sync 0;\n")
         elif scope == "cluster_to_leader" and op.attrs.get("phase") == "arrive":
             # Each warp arrives once at every cluster CTA's mbarrier and
             # continues.
@@ -1914,8 +2425,7 @@ class LowerToPtxTemplate(LoweringPass):
             assert kernel is not None
             cluster_size = math.prod(dim or 1 for dim in kernel.cluster_dim)
             template = (
-                "bar.warp.sync 0xffffffff;\n"
-                "elect.sync _|${pred:release}, 0xffffffff;\n"
+                _elect_ptx("release")
                 + "".join(
                     textwrap.dedent(f"""\
                         mov.u32 ${{b32:rank}}, {rank};
@@ -1925,21 +2435,27 @@ class LowerToPtxTemplate(LoweringPass):
                     for rank in range(cluster_size)
                 )
             )
+            masks = op.sync.type.attrs.get('release_cta_masks')
+            if masks is not None:
+                prefix = ("mov.u32 ${b32:release_source}, %cluster_ctarank;\n"
+                          + rank_table_ptx('release_mask', masks, rank='release_source'))
+                arrivals = ""
+                for rank in range(cluster_size):
+                    arrivals += (
+                        f"and.b32 ${{b32:release_bit}}, ${{b32:release_mask}}, {1 << rank};\n"
+                        "setp.ne.u32 ${pred:release_target}, ${b32:release_bit}, 0;\n"
+                        "and.pred ${pred:release_target}, ${pred:release_target}, ${pred:release};\n"
+                        f"mov.u32 ${{b32:rank}}, {rank};\n"
+                        "mapa.shared::cluster.u32 ${b32:remote}, ${b32:operand.sync.val}, ${b32:rank};\n"
+                        "@${pred:release_target} mbarrier.arrive.shared::cluster.b64 _, [${b32:remote}];\n")
+                template = _elect_ptx("release") + prefix + arrivals
             operands = [cast(Value, self.value_map[op.sync])]
             operand_names = ["sync"]
         elif scope == "cluster_to_leader" and op.attrs.get("phase") == "wait":
             # Only the leader's warp, which issues the next write, waits for
             # every warp of the cluster.
             assert op.sync is not None
-            template = _leader_warp("cl") + textwrap.dedent("""\
-                @${pred:cl_other_warp} bra ${label:cl_done};
-                mov.u32 ${b32:ticks}, 0x989680;
-                ${label:cl_wait}:
-                mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ${pred:ready}, [${b32:operand.sync.val}], ${b32:operand.sync.parity}, ${b32:ticks};
-                @!${pred:ready} bra ${label:cl_wait};
-                xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;
-                ${label:cl_done}:
-                """)
+            template = _leader_warp("cl", execution_issuer_warp(op)) + _CLUSTER_LEADER_WAIT
             operands = [cast(Value, self.value_map[op.sync])]
             operand_names = ["sync"]
         elif scope == "cluster_to_leader":
@@ -1950,14 +2466,23 @@ class LowerToPtxTemplate(LoweringPass):
             operands = [cast(Value, self.value_map[op.sync])]
             operand_names = ["sync"]
         elif scope in ("leader_to_cluster", "cluster"):
+            # A release arrive waits for every outstanding write, including
+            # the last TMA stores. A barrier that only precedes the kernel's
+            # final deallocations, or that orders only reads before writes
+            # (insert_syncs marks it ``publishes: False``), publishes no data.
+            block = op.parent_block
+            retires = (block is not None and isinstance(block.parent_op, KernelOp)
+                       and all(isinstance(later, DeallocOp)
+                               for later in block.ops[block.ops.index(op) + 1:]))
             arrive = (
-                "relaxed" if op.attrs.get("initialization_publication") else "release"
+                "relaxed" if (op.attrs.get("initialization_publication") or retires
+                              or op.attrs.get("publishes") is False) else "release"
             )
             template = textwrap.dedent(f"""\
                 barrier.cluster.arrive.{arrive};
                 barrier.cluster.wait.acquire;
                 """)
-        elif scope == "block_leader":
+        elif scope == "block_leader" and op.sync is None:
             # Warp 0, which holds the leader t0, waits; the other warps arrive
             # and continue, on the named barrier id chosen by insert_syncs
             # (unique among concurrently-live block-leader barriers). Warps
@@ -1965,10 +2490,24 @@ class LowerToPtxTemplate(LoweringPass):
             # an arrival never waits behind a skipped bar.sync.
             bar_id = op.attrs.get("id", 1)
             num_threads = op.attrs["num_threads"]
-            template = _leader_warp("bl") + textwrap.dedent(f"""\
+            template = _leader_warp("bl", execution_issuer_warp(op)) + textwrap.dedent(f"""\
                 @${{pred:bl_other_warp}} bar.arrive {bar_id}, {num_threads};
                 @!${{pred:bl_other_warp}} bar.sync {bar_id}, {num_threads};
                 """)
+        elif scope == "block_leader":
+            assert op.sync is not None
+            operands = [cast(Value, self.value_map[op.sync])]
+            operand_names = ["sync"]
+            arrival = (_elect_ptx("bl_arrive") + "@${pred:bl_arrive} mbarrier.arrive.release.cta"
+                       ".shared::cta.b64 _, [${b32:operand.sync.val}];\n")
+            wait = ("@${pred:bl_other_warp} bra ${label:bl_done};\n" + _try_wait_ptx("sync", prefix="bl_")
+                    + "${label:bl_done}:\n"
+                    "// All actors advance: a later handoff may elect another warp.\n"
+                    "xor.b32 ${b32:operand.sync.parity}, ${b32:operand.sync.parity}, 1;\n")
+            phase = op.attrs.get('phase')
+            template = arrival if phase == 'arrive' else (
+                _leader_warp("bl", execution_issuer_warp(op))
+                + (arrival if phase is None else '') + wait)
         elif scope == "grid":
             assert op.sync is not None
             ancestor = find_ancestor_of_type(op, KernelOp)
@@ -2003,6 +2542,11 @@ class LowerToPtxTemplate(LoweringPass):
             raise NotImplementedError(
                 f"lower_barrier: unsupported barrier scope {scope!r}"
             )
+        if self.distinct_issuers:
+            # tcgen05 operations require explicit code-motion ordering when
+            # thread synchronization hands an accumulator between warps.
+            template = ('tcgen05.fence::before_thread_sync;\n' + template
+                        + 'tcgen05.fence::after_thread_sync;\n')
         new_op = PTXTemplateOp.build(
             operands=operands,
             result_types=[],
@@ -2018,23 +2562,37 @@ class LowerToPtxTemplate(LoweringPass):
         op: AwaitOp,
         lock: Value,
     ) -> tuple[list[Op], list[object]]:
-        # Materializing the optional hint in a virtual register lets ptxas
-        # select the compact fused wait; an immediate or test_wait expands
-        # into substantially more phase-check, sleep, or yield instructions.
-        multicast_async = lock_has_tma_multicast(op.lock)
-        acquire_scope = "cluster" if multicast_async else "cta"
-        template = textwrap.dedent(rf"""
-            mov.u32 ${{b32:ticks}}, 0x989680;
-            ${{label:wait}}:
-            mbarrier.try_wait.parity.acquire.{acquire_scope}.shared::cta.b64 ${{pred:mbar_done}}, [${{b32:operand.lock.val}}], ${{b32:operand.lock.parity}}, ${{b32:ticks}};
-            @!${{pred:mbar_done}} bra ${{label:wait}};
-            xor.b32 ${{b32:operand.lock.parity}}, ${{b32:operand.lock.parity}}, 1;
-        """)
+        paired_load = op.lock.type.kind == "mbar" and op.lock.type.attrs.get("cta_group", 1) == 2
+        # Completed only by async-proxy transactions or local release.cta
+        # arrivals, so a CTA-scope acquire suffices (as in CUTLASS); .cluster
+        # would make ptxas invalidate L1 after every wait.
+        template = "\n" + _try_wait_ptx("lock")
+        operands, operand_names = [lock], ["lock"]
+        probe = self._probe_results.pop(id(op), None)
+        if probe is not None:
+            template = ("@${pred:operand.probe.val} bra ${label:probe_done};\n" + template
+                        + "${label:probe_done}:\n")
+            operands.append(probe)
+            operand_names.append("probe")
+        if op.waiter_warps is not None:
+            guard = (self._region_guard("await", op.waiter_warps[0]) if len(op.waiter_warps) == 1
+                     else None) or ([], [], _leader_warp("await", *op.waiter_warps))
+            operands.extend(guard[0])
+            operand_names.extend(guard[1])
+            template = guard[2] + "@${pred:await_other_warp} bra ${label:await_done};\n" + template + "${label:await_done}:\n"
+        if paired_load:
+            template = (_pair_leader_ptx("await_rank", "await_peer", peer=True)
+                        + "@${pred:await_peer} bra ${label:paired_await_done};\n"
+                        + template + "${label:paired_await_done}:\n")
+        if not isinstance(op.lock.definition, LockViewOp):
+            template += "xor.b32 ${b32:operand.lock.parity}, ${b32:operand.lock.parity}, 1;\n"
+        if self.distinct_issuers and op.lock.type.kind == 'tcgen05':
+            template += 'tcgen05.fence::after_thread_sync;\n'
         new_op = PTXTemplateOp.build(
-            operands=[lock],
+            operands=operands,
             result_types=[],
             template=template,
-            operand_names=["lock"],
+            operand_names=operand_names,
             result_names=[],
             description=str(op),
         )
@@ -2064,8 +2622,8 @@ class LowerToPtxTemplate(LoweringPass):
         self,
         op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
-        template = textwrap.dedent(r"""
-            cp.async.bulk.wait_group.read 0;
+        template = textwrap.dedent(f"""
+            cp.async.bulk.wait_group.read {op.pending_groups};
         """)
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -2341,15 +2899,7 @@ class LowerToPtxTemplate(LoweringPass):
                         )
                         reg_idx += 1
 
-        new_op = PTXTemplateOp.build(
-            operands=operands,
-            result_types=[],
-            template=template,
-            operand_names=operand_names,
-            result_names=[],
-            description=str(op),
-        )
-        return [new_op], []
+        return _lowered(op, template, operands, operand_names)
 
     def _lower_move_wgrmem_wgmma(
         self,
@@ -2379,7 +2929,6 @@ class LowerToPtxTemplate(LoweringPass):
         wgrmem_type = fragment.type
         assert isinstance(memory_type, (GmemTensorType, SmemTensorType))
         assert isinstance(wgrmem_type, WgrmemTensorType)
-        warp_rows, _ = _M16N8_FRAGMENT_ROWS[wgrmem_type.layout]
         assert wgrmem_type.rank == 2 and memory_type.rank == 2
         assert memory_type.dtype == wgrmem_type.dtype, (
             f"wgmma move: dtype mismatch; "
@@ -2391,7 +2940,8 @@ class LowerToPtxTemplate(LoweringPass):
         assert root is not None
         root_type = root.type
         assert isinstance(root_type, WgrmemTensorType)
-        root_n = cast(int, root_type.sizes[1])
+        warp_rows, _ = _m16n8_fragment_rows(root_type)
+        root_n = _m16n8_fragment_columns(root_type)
         if isinstance(fragment.definition, TileOp):
             assert list(memory_type.sizes) == [m_dim, n_dim], (
                 f"wgmma move: memory shape {list(memory_type.sizes)} does "
@@ -2442,6 +2992,8 @@ class LowerToPtxTemplate(LoweringPass):
             row_stride_bytes,
             column_stride_bytes,
             warp_rows=warp_rows,
+            warp_group_rows=_m16n8_fragment_group_rows(root_type),
+            warp_group_columns=_m16n8_fragment_group_columns(root_type),
         )
         if isinstance(memory_type, GmemTensorType):
             template = textwrap.dedent(r"""
@@ -2536,20 +3088,10 @@ class LowerToPtxTemplate(LoweringPass):
                 template += f"mov.b32 ${{b32:operand.fragment.r{pair}}}, {{{lo}, {hi}}};\n"
             template += "${label:half_load_done}:\n"
 
-        new_op = PTXTemplateOp.build(
-            operands=[
-                cast(Value, self.value_map[memory]),
-                cast(Value, self.value_map[fragment]),
-                byte_offset,
-            ],
-            result_types=[],
-            template=template,
-            operand_names=["memory", "fragment", "offset"],
-            result_names=[],
-            description=str(op),
-        )
-        new_ops.append(new_op)
-        return new_ops, []
+        lowered, _ = _lowered(op, template, [cast(Value, self.value_map[memory]),
+                                             cast(Value, self.value_map[fragment]), byte_offset],
+                              ["memory", "fragment", "offset"])
+        return new_ops + lowered, []
 
     def _lower_masked_half_fragment_move(self, op, fragment, memory, pairs, warp_rows):
         """Lower fragment addressing, then emit bounded or complete-tile accesses."""
@@ -2565,7 +3107,9 @@ class LowerToPtxTemplate(LoweringPass):
         row_stride = int(memory_type.strides[0]) * 2
         offset_ops, byte_offset, lane_row, lane_col = (
             _build_wgmma_layout_0_dynamic_offset(
-                row_stride, 2, coordinates=True, warp_rows=warp_rows
+                row_stride, 2, coordinates=True, warp_rows=warp_rows,
+                warp_group_rows=_m16n8_fragment_group_rows(cast(WgrmemTensorType, fragment.type)),
+                warp_group_columns=_m16n8_fragment_group_columns(cast(WgrmemTensorType, fragment.type)),
             )
         )
         is_load = isinstance(op.dst.type, WgrmemTensorType)
@@ -2638,17 +3182,10 @@ class LowerToPtxTemplate(LoweringPass):
             if next_label:
                 template += f"bra ${{label:fragment_end}};\n${{label:{next_label}}}:\n"
         template += "${label:fragment_end}:\n"
-        new_ops = index_ops + offset_ops
-        new_ops.append(PTXTemplateOp.build(
-            operands=[cast(Value, self.value_map[memory]),
-                      cast(Value, self.value_map[fragment]), byte_offset,
-                      origins[0], origins[1], lane_row, lane_col],
-            result_types=[], template=template,
-            operand_names=["memory", "fragment", "offset", "origin_row",
-                           "origin_col", "lane_row", "lane_col"],
-            result_names=[], description=str(op),
-        ))
-        return new_ops, []
+        lowered, _ = _lowered(op, template, [cast(Value, self.value_map[memory]), cast(Value, self.value_map[fragment]),
+                                             byte_offset, origins[0], origins[1], lane_row, lane_col],
+                              ["memory", "fragment", "offset", "origin_row", "origin_col", "lane_row", "lane_col"])
+        return index_ops + offset_ops + lowered, []
 
     def _lower_move_wgrmem_wgmma_to_stmatrix(
         self,
@@ -2668,12 +3205,13 @@ class LowerToPtxTemplate(LoweringPass):
         )
         assert isinstance(col_start, int)
         src_root = root_buffer(op.src)
-        dst_root = root_buffer(op.dst)
+        dst_root = _layout_view_root(op.dst)
         assert src_root is not None and dst_root is not None
         src_root_type = src_root.type
         assert isinstance(src_root_type, WgrmemTensorType)
-        n_dim = cast(int, src_root_type.sizes[1])
-        warp_rows, tile_rows = _M16N8_FRAGMENT_ROWS[src_root_type.layout]
+        paired_dynamic = _paired_fragment(src_root_type)
+        n_dim = _m16n8_fragment_columns(src_root_type)
+        warp_rows, tile_rows = _m16n8_fragment_rows(src_root_type)
         root_type = dst_root.type
         assert isinstance(root_type, SmemTensorType)
         root_sizes = cast(tuple[int, ...], root_type.sizes)
@@ -2724,12 +3262,21 @@ class LowerToPtxTemplate(LoweringPass):
             shr.u32 ${b32:st_warp}, ${b32:st_tid}, 5;
             and.b32 ${b32:st_row}, ${b32:st_lane}, 7;
         """)
+            + ("shr.u32 ${b32:st_pair_col}, ${b32:st_warp}, 1;\nand.b32 ${b32:st_warp}, ${b32:st_warp}, 1;\n" if paired_dynamic else "")
             + lane_coordinates
         )
+        group_rows = _m16n8_fragment_group_rows(src_root_type)
+        if group_rows:
+            coordinate = "st_col" if transposed else "st_row"
+            template += textwrap.dedent(f"""\
+                mov.u32 ${{b32:st_group}}, %tid.x;
+                shr.u32 ${{b32:st_group}}, ${{b32:st_group}}, 7;
+                mad.lo.u32 ${{b32:{coordinate}}}, ${{b32:st_group}}, {group_rows}, ${{b32:{coordinate}}};
+            """)
         # A lane's matrix starts up to 24 columns into the 32 an x4 covers;
         # transposed, its column is the warp's fragment row. A block narrower
         # than that reach puts the matrix in a later block.
-        if block_width <= (3 * warp_rows + 8 if transposed else 24):
+        if not paired_dynamic and not _m16n8_fragment_group_columns(src_root_type) and block_width <= (3 * warp_rows + 8 if transposed else 24):
             physical_rows = root_sizes[1] if transposed else root_sizes[0]
             template += textwrap.dedent(f"""\
                 shr.u32 ${{b32:st_block}}, ${{b32:st_col}}, {block_width.bit_length() - 1};
@@ -2755,6 +3302,11 @@ class LowerToPtxTemplate(LoweringPass):
                 tile_rows,
             )
         )
+        group_columns = src_root_type.sizes[1] // 2 if paired_dynamic else _m16n8_fragment_group_columns(src_root_type)
+        if paired_dynamic:
+            template += "mov.u32 ${b32:st_column_group}, ${b32:st_pair_col};\n"
+        elif group_columns:
+            template += "mov.u32 ${b32:st_column_group}, %tid.x;\nshr.u32 ${b32:st_column_group}, ${b32:st_column_group}, 7;\n"
         for registers, physical_offset in groups:
             regs = ", ".join(f"${{b32:operand.src.r{i}}}" for i in registers)
             template += (
@@ -2768,20 +3320,31 @@ class LowerToPtxTemplate(LoweringPass):
                 add.u32 ${{b32:st_addr}}, ${{b32:st_addr}}, {physical_offset};
             """)
             )
+            if group_columns:
+                di, dj = _wgmma_pair_static_offset(registers[0], n_dim, tile_rows)
+                dj -= col_start
+                static_row, static_col = (dj, di) if transposed else (di, dj)
+                coordinate = "st_access_row" if transposed else "st_access_col"
+                # Compute the complete blocked address after adding both the
+                # static register offset and the warp's column ownership.
+                template += textwrap.dedent(f"""\
+                    add.u32 ${{b32:st_access_row}}, ${{b32:st_row}}, {static_row};
+                    add.u32 ${{b32:st_access_col}}, ${{b32:st_col}}, {static_col};
+                    mad.lo.u32 ${{b32:{coordinate}}}, ${{b32:st_column_group}}, {group_columns}, ${{b32:{coordinate}}};
+                    div.u32 ${{b32:st_access_block}}, ${{b32:st_access_col}}, {block_width};
+                    rem.u32 ${{b32:st_access_inner}}, ${{b32:st_access_col}}, {block_width};
+                    mad.lo.u32 ${{b32:st_access_row}}, ${{b32:st_access_block}}, {root_sizes[1] if transposed else root_sizes[0]}, ${{b32:st_access_row}};
+                    mad.lo.u32 ${{b32:st_addr_off}}, ${{b32:st_access_row}}, {block_width}, ${{b32:st_access_inner}};
+                    shl.b32 ${{b32:st_addr_off}}, ${{b32:st_addr_off}}, 1;
+                """)
+                template += _swizzle_ptx("st_addr_off", "st_swizzle_mask", 2 * block_width) if block_width > 8 else ""
+                template += "add.u32 ${b32:st_addr}, ${b32:operand.dst.ptr}, ${b32:st_addr_off};\n"
             shape = f"x{len(registers)}" + (".trans" if transposed else "")
             template += (
                 f"{predicate}stmatrix.sync.aligned.m8n8.{shape}.shared::cta.b16 "
                 f"[${{b32:st_addr}}], {{{regs}}};\n"
             )
-        lowered = PTXTemplateOp.build(
-            operands=[dst, src],
-            result_types=[],
-            template=template,
-            operand_names=["dst", "src"],
-            result_names=[],
-            description=str(op),
-        )
-        return [lowered], []
+        return _lowered(op, template, [dst, src], ["dst", "src"])
 
     def _lower_move_smem_to_wgrmem_mma(
         self,
@@ -2841,15 +3404,7 @@ class LowerToPtxTemplate(LoweringPass):
             f" {{{reg_list}}}, [${{b32:lm_addr}}];\n"
         )
 
-        new_op = PTXTemplateOp.build(
-            operands=operands,
-            result_types=[],
-            template=template,
-            operand_names=operand_names,
-            result_names=[],
-            description=str(op),
-        )
-        return [new_op], []
+        return _lowered(op, template, operands, operand_names)
 
     def _lower_move_smem_rmem(
         self,
@@ -2911,7 +3466,10 @@ class LowerToPtxTemplate(LoweringPass):
         self, moves: list[TmaMoveOp]
     ) -> tuple[list[Op], list[object]]:
         """Issue atom stores from one elected thread and commit one group."""
-        leader_operands, leader_names, _ = self._leader_thread("st")
+        issuer = execution_issuer_warp(moves[0])
+        if any(execution_issuer_warp(move) != issuer for move in moves):
+            raise ValueError('TMA store group requires one issuing warp')
+        leader_operands, leader_names, _ = self._leader_thread("st", issuer_warp=issuer)
         operands = list(leader_operands)
         operand_names = list(leader_names)
         lines = ["fence.proxy.async.shared::cta;"]
@@ -2938,15 +3496,8 @@ class LowerToPtxTemplate(LoweringPass):
             )
             lines += [*coordinate_lines, f"@${{pred:st_leader}} {instruction}"]
         lines += ["@${pred:st_leader} cp.async.bulk.commit_group;", "${label:st_done}:"]
-        lowered = PTXTemplateOp.build(
-            operands=operands,
-            result_types=[],
-            template=_leader_thread("st") + "\n".join(lines) + "\n",
-            operand_names=operand_names,
-            result_names=[],
-            description="Grouped TMA stores",
-        )
-        return [lowered], []
+        return _lowered(moves[0], _leader_thread("st", issuer_warp=issuer) + "\n".join(lines) + "\n",
+                        operands, operand_names, description="Grouped TMA stores")
 
     def _lower_async_tma_loads(
         self,
@@ -2967,16 +3518,19 @@ class LowerToPtxTemplate(LoweringPass):
         assert lock_type.kind == "mbar", (
             f"_lower_async_tma_loads: expected lock kind 'mbar'; got {lock_type.kind!r}"
         )
+        cta_group = lock_type.attrs.get("cta_group", 1)
 
         leader_thread = _leader_thread(
             "ld",
             before_branch=(
-                "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
-                "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;\n"
-            ),
+                _pair_leader_ptx("cluster_rank", "cluster_leader") if cta_group == 2
+                else "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
+                "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;\n"),
+            issuer_warp=execution_issuer_warp(op),
+            guard=(guard := self._region_guard("ld", execution_issuer_warp(op)) or ([], [], None))[2],
         )
-        operands: list[Value] = [lock_value]
-        operand_names: list[str] = ["lock"]
+        operands: list[Value] = [lock_value, *guard[0]]
+        operand_names: list[str] = ["lock", *guard[1]]
         multicast_mask: int | None = None
         cluster_size = 1
         if op.is_tma_multicast:
@@ -2989,6 +3543,7 @@ class LowerToPtxTemplate(LoweringPass):
         load_lines: list[str] = []
         multicast_count = sum(tma.multicast is True for tma in tmas)
         multicasts = 0
+        group_ordinals = {}
         for i, tma in enumerate(tmas):
             dst_value = cast(Value, self.value_map[tma.dst])
             desc_value = cast(Value, self.value_map[tma.src])
@@ -3018,7 +3573,9 @@ class LowerToPtxTemplate(LoweringPass):
             indices = ", ".join(coordinates)
             load_lines.extend(coordinate_lines)
             opcode = (
-                f"cp.async.bulk.tensor.{tensor_rank}d.shared::cluster.global."
+                f"cp.async.bulk.tensor.{tensor_rank}d."
+                + ("cta_group::2." if cta_group == 2 else "")
+                + "shared::cluster.global."
                 "mbarrier::complete_tx::bytes"
             )
             arguments = (
@@ -3026,23 +3583,43 @@ class LowerToPtxTemplate(LoweringPass):
                 f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
                 f"[${{b32:operand.lock.val}}]"
             )
+            if cta_group == 2:
+                load_lines.extend([
+                    "and.b32 ${b32:tma_pair_leader_rank}, ${b32:cluster_rank}, 0xfffffffe;",
+                    "mapa.shared::cluster.u32 ${b32:tma_pair_bar}, ${b32:operand.lock.val}, ${b32:tma_pair_leader_rank};",
+                    f"mapa.shared::cluster.u32 ${{b32:tma_pair_dst{i}}}, ${{b32:operand.{dn}.ptr}}, ${{b32:cluster_rank}};",
+                ])
+                arguments = (f"[${{b32:tma_pair_dst{i}}}], "
+                             f"[${{b64:operand.{sn}.ptr}}, {{{indices}}}], "
+                             "[${b32:tma_pair_bar}]")
             issue = "ld_leader"
             if tma.multicast is True:
                 assert multicast_mask is not None
                 opcode = f"{opcode}.multicast::cluster"
-                arguments = f"{arguments}, {multicast_mask}"
-                issue = "multicast_issue"
-                if multicast_count > 1:
-                    # Cluster CTAs share a group's multicast slices: rank r
-                    # issues every slice j with j % cluster_size == r.
+                masks = tma.attrs.get('multicast_cta_masks')
+                if masks is not None:
+                    key = tuple(masks)
+                    ordinal = group_ordinals.get(key, 0)
+                    group_ordinals[key] = ordinal + 1
+                    source_table = multicast_sources(masks, ordinal)
+                    load_lines += rank_table_ptx(f'multicast_mask{i}', masks, bits=16).splitlines()
+                    load_lines += rank_table_ptx(f'multicast_source{i}', source_table).splitlines()
+                    arguments += f", ${{b16:multicast_mask{i}}}"
                     issue = f"multicast_issue{i}"
                     load_lines += [
-                        f"setp.eq.u32 ${{pred:issuer{i}}}, "
-                        f"${{b32:cluster_rank}}, {multicasts % cluster_size};",
-                        f"and.pred ${{pred:{issue}}}, ${{pred:ld_leader}}, "
-                        f"${{pred:issuer{i}}};",
+                        f"setp.eq.u32 ${{pred:issuer{i}}}, ${{b32:cluster_rank}}, ${{b32:multicast_source{i}}};",
+                        f"and.pred ${{pred:{issue}}}, ${{pred:ld_leader}}, ${{pred:issuer{i}}};",
                     ]
-                multicasts += 1
+                else:
+                    arguments = f"{arguments}, {multicast_mask}"
+                    issue = "multicast_issue"
+                    if multicast_count > 1:
+                        issue = f"multicast_issue{i}"
+                        load_lines += [
+                            f"setp.eq.u32 ${{pred:issuer{i}}}, ${{b32:cluster_rank}}, {multicasts % cluster_size};",
+                            f"and.pred ${{pred:{issue}}}, ${{pred:ld_leader}}, ${{pred:issuer{i}}};",
+                        ]
+                    multicasts += 1
             load_lines.append(
                 f"@${{pred:{issue}}} "
                 + self._tma_instruction(
@@ -3065,9 +3642,9 @@ class LowerToPtxTemplate(LoweringPass):
             "and.pred ${pred:multicast_issue}, ${pred:ld_leader}, "
             "${pred:cluster_leader};",
             *load_lines,
-            "@${pred:ld_leader} "
-            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
-            f"[${{b32:operand.lock.val}}], {total_bytes};",
+            ("@${pred:multicast_issue} " if cta_group == 2 else "@${pred:ld_leader} ")
+            + "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, "
+            f"[${{b32:operand.lock.val}}], {total_bytes * cta_group};",
             "${label:ld_done}:",
         ]
         template = leader_thread + "\n".join(lines) + "\n"
@@ -3081,6 +3658,22 @@ class LowerToPtxTemplate(LoweringPass):
             description=str(op),
         )
         return [new_op], []
+
+
+def _lowered(op: Op, template: str, operands=(), names=(), result_types=(),
+             description: str | None = None) -> tuple[list[Op], list[object]]:
+    """``op`` lowered to one PTX template, whose results are named ``dst``."""
+    lowered = PTXTemplateOp.build(
+        operands=list(operands), result_types=list(result_types), template=template,
+        operand_names=list(names), result_names=["dst"] if result_types else [],
+        description=str(op) if description is None else description)
+    return [lowered], list(lowered.results)
+
+
+def _layout_view_root(value: Value) -> Value:
+    while isinstance(value.definition, (TileOp, ReshapeOp)):
+        value = value.definition.arg
+    return value
 
 
 def _swizzle_ptx(offset: str, scratch: str, row_bytes: int) -> str:
@@ -3127,18 +3720,38 @@ def _vector_operand(registers: list[str]) -> tuple[str, str]:
 
 # ``tcgen05.ld``/``tcgen05.st`` shape for each fragment layout: lanes one
 # instruction covers, then the columns and registers of one repetition.
-def _tmem_warp_address_ptx(pointer: str) -> str:
+def _tmem_warp_address_ptx(pointer: str, group_row_stride: int = 0, group_column_stride: int = 0) -> str:
     """PTX setting ``${b32:taddr}`` to the warp's 32-lane TMEM quarter.
 
     A tensor-memory address holds the lane in its upper 16 bits, and warp
     ``w`` of a warp group can only access lanes ``32 * (w % 4)`` onward. The
     template's ``warp`` operand is the kernel's warp index.
     """
-    return textwrap.dedent(f"""\
+    template = textwrap.dedent(f"""\
         and.b32 ${{b32:tmem_lane}}, ${{b32:operand.warp.val}}, 3;
         shl.b32 ${{b32:tmem_lane}}, ${{b32:tmem_lane}}, 21;
         add.u32 ${{b32:taddr}}, ${{b32:{pointer}}}, ${{b32:tmem_lane}};
     """)
+    if group_row_stride:
+        template += textwrap.dedent(f"""\
+            shr.u32 ${{b32:tmem_group}}, ${{b32:operand.warp.val}}, 2;
+            mad.lo.u32 ${{b32:taddr}}, ${{b32:tmem_group}}, {group_row_stride << 16}, ${{b32:taddr}};
+        """)
+    if group_column_stride:
+        template += textwrap.dedent(f"""\
+            shr.u32 ${{b32:tmem_column_group}}, ${{b32:operand.warp.val}}, 2;
+            mad.lo.u32 ${{b32:taddr}}, ${{b32:tmem_column_group}}, {group_column_stride}, ${{b32:taddr}};
+        """)
+    return template
+
+
+def _tmem_fragment_ptx(pointer: str, ownership: TmemWarpLayout, layout: str, columns: int,
+                       registers: list[str], *, is_load: bool) -> str:
+    """Address the warp's TMEM rows and columns, then move ``registers`` to or from them."""
+    return _tmem_warp_address_ptx(
+        pointer, ownership.group_row_stride, 0 if ownership.paired_m64 else ownership.group_column_stride(columns)
+    ) + _tmem_access_ptx(layout, ownership.columns_per_warp(columns), registers, is_load=is_load,
+                         rows_per_warp=ownership.rows_per_warp)
 
 
 def _tmem_access_ptx(
@@ -3147,17 +3760,18 @@ def _tmem_access_ptx(
     registers: list[str],
     *,
     is_load: bool,
+    rows_per_warp: int = 32,
 ) -> str:
     """Move a fragment between ``${b32:taddr}`` and ``registers``, then wait.
 
-    Each warp covers its 32 lanes in ``32 / lanes`` row tiles. Along the
+    Each warp covers 16 or 32 rows in its physical 32-row partition. Along the
     columns, instructions repeat their shape as widely as PTX allows, in
     powers of two of at most 128 registers.
     """
     geometry = TMEM_FRAGMENT_LAYOUTS[layout]
-    assert len(registers) == columns
+    assert len(registers) == rows_per_warp * columns // 32
     template = ""
-    for row, column, first, size, repetitions in geometry.accesses(columns):
+    for row, column, first, size, repetitions in geometry.accesses(columns, rows_per_warp):
         regs = ", ".join(registers[first : first + size])
         address = row << 16 | column
         template += f"add.u32 ${{b32:tmem_access}}, ${{b32:taddr}}, {address};\n"
@@ -3178,11 +3792,46 @@ def _tmem_access_ptx(
 _M16N8_FRAGMENT_ROWS = {"wgmma_layout_0": (16, 64), "tcgen05_16x256b": (32, 16)}
 
 
+def _paired_fragment(typ: WgrmemTensorType) -> bool:
+    """Whether a register fragment holds a paired (cta_group::2) TMEM accumulator."""
+    return typ.attrs.get("tmem_cta_group") == 2
+
+
+def _m16n8_ownership(typ: WgrmemTensorType) -> TmemWarpLayout | None:
+    """Warp ownership of a TMEM-backed m16n8 fragment; None for WGMMA's."""
+    if typ.layout != "tcgen05_16x256b":
+        return None
+    return TmemWarpLayout(cast(int, typ.sizes[0]), typ.warps, typ.attrs.get("tmem_cta_group", 1))
+
+
+def _m16n8_fragment_rows(typ: WgrmemTensorType) -> tuple[int, int]:
+    ownership = _m16n8_ownership(typ)
+    return (ownership.row_stride, 16) if ownership else _M16N8_FRAGMENT_ROWS[typ.layout]
+
+
+def _m16n8_fragment_columns(typ: WgrmemTensorType) -> int:
+    ownership = _m16n8_ownership(typ)
+    columns = cast(int, typ.sizes[1])
+    return ownership.columns_per_warp(columns) if ownership else columns
+
+
+def _m16n8_fragment_group_columns(typ: WgrmemTensorType) -> int:
+    ownership = _m16n8_ownership(typ)
+    return ownership.group_column_stride(cast(int, typ.sizes[1])) if ownership and not _paired_fragment(typ) else 0
+
+
+def _m16n8_fragment_group_rows(typ: WgrmemTensorType) -> int:
+    ownership = _m16n8_ownership(typ)
+    return ownership.group_row_stride if ownership else 0
+
+
 def _build_wgmma_layout_0_dynamic_offset(
     row_stride_bytes: int,
     column_stride_bytes: int,
     *, coordinates: bool = False,
     warp_rows: int = 16,
+    warp_group_rows: int = 0,
+    warp_group_columns: int = 0,
 ) -> tuple[list[Op], Value] | tuple[list[Op], Value, Value, Value]:
     """Emit index ops for an m16n8 fragment's per-thread byte offset.
 
@@ -3221,6 +3870,12 @@ def _build_wgmma_layout_0_dynamic_offset(
     ops.append(lane_div_4)
     row = IndexAddOp.build(warp_row.result(), lane_div_4.result())
     ops.append(row)
+    if warp_group_rows:
+        group = IndexDivOp.build(tid_x, c128.result())
+        stride = IndexConstantOp.build(warp_group_rows)
+        group_row = IndexMulOp.build(group.result(), stride.result())
+        row = IndexAddOp.build(row.result(), group_row.result())
+        ops.extend([group, stride, group_row, row])
 
     # col = (lane % 4) * 2
     lane_mod_4 = IndexModOp.build(lane.result(), c4.result())
@@ -3229,6 +3884,13 @@ def _build_wgmma_layout_0_dynamic_offset(
     ops.append(c2)
     col = IndexMulOp.build(lane_mod_4.result(), c2.result())
     ops.append(col)
+
+    if warp_group_columns:
+        group = IndexDivOp.build(tid_x, c128.result())
+        stride = IndexConstantOp.build(warp_group_columns)
+        group_col = IndexMulOp.build(group.result(), stride.result())
+        col = IndexAddOp.build(col.result(), group_col.result())
+        ops.extend([group, stride, group_col, col])
 
     # byte_offset = row * row_stride_bytes + col * column_stride_bytes
     row_stride = IndexConstantOp.build(row_stride_bytes)
@@ -3299,15 +3961,21 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     assert isinstance(root_type, WgrmemTensorType)
     assert view_type.layout == root_type.layout in _M16N8_FRAGMENT_ROWS
     assert view_type.rank == root_type.rank == 2
-    assert view_type.warps == root_type.warps == 4
+    assert view_type.warps == root_type.warps
+    if root_type.layout == "wgmma_layout_0":
+        assert root_type.warps == 4
+    else:
+        TmemWarpLayout(cast(int, root_type.sizes[0]), root_type.warps)
     assert view_type.dtype == root_type.dtype
     assert isinstance(view_type.dtype, (F32Type, BF16Type, F16Type)), (
         f"WGMMA views support f32, bf16, and f16; got {view_type.dtype}"
     )
     assert root_type.num_elements_per_thread % 2 == 0
+    if _m16n8_fragment_group_columns(root_type) and value is not root:
+        raise NotImplementedError("column-sharing TMEM fragments require whole register values")
     row_start, col_start = _static_view_origin(value)
     view_m, view_n = cast(tuple[int, int], view_type.sizes)
-    root_n = cast(int, root_type.sizes[1])
+    root_n = _m16n8_fragment_columns(root_type)
     _, tile_rows = _M16N8_FRAGMENT_ROWS[root_type.layout]
     pairs = [
         (pair_index, row - row_start, col - col_start)
@@ -3445,11 +4113,13 @@ def _stmatrix_store_static_offset(
     if transposed:
         row, col = col, row
     assert row >= 0 and col >= 0 and col % 8 == 0
-    return (
-        col // block_width * dst_rows * block_width
-        + row * block_width
-        + col % block_width
-    ) * 2
+    return _block_major_offset(row, col, block_width, dst_rows) * 2
+
+
+def _block_major_offset(row: int, column: int, block_width: int, rows: int) -> int:
+    """Element offset of (row, column) in a block-major buffer of ``rows`` rows."""
+    block, inner = divmod(column, block_width)
+    return (block * rows + row) * block_width + inner
 
 
 def _block_swizzle(block_width: int) -> str | None:
@@ -3473,10 +4143,18 @@ def _tma_coordinates(
     block = f"${{b32:{prefix}_block}}"
     inner = f"${{b32:{prefix}_inner}}"
     block_width, order = layout
-    lines = [
-        f"div.u32 {block}, {col}, {block_width};",
-        f"rem.u32 {inner}, {col}, {block_width};",
-    ]
+    # ptxas expands div/rem by an immediate into a reciprocal sequence on the
+    # issuing thread's critical path; a power-of-two width is a shift and mask.
+    if block_width & (block_width - 1) == 0:
+        lines = [
+            f"shr.u32 {block}, {col}, {block_width.bit_length() - 1};",
+            f"and.b32 {inner}, {col}, {block_width - 1};",
+        ]
+    else:
+        lines = [
+            f"div.u32 {block}, {col}, {block_width};",
+            f"rem.u32 {inner}, {col}, {block_width};",
+        ]
     if order == "row_major":
         coordinates = [inner, block, row, *outer]
     else:
@@ -3487,7 +4165,7 @@ def _tma_coordinates(
 def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     dst_type = op.dst.type
     src_type = op.src.type
-    dst_root = root_buffer(op.dst)
+    dst_root = _layout_view_root(op.dst)
     layout = physical_layout(dst_type) if isinstance(dst_type, SmemTensorType) else None
     if not (
         isinstance(dst_type, SmemTensorType)
@@ -3504,7 +4182,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         return None
     block_width = layout[0]
 
-    dst_root = root_buffer(op.dst)
+    dst_root = _layout_view_root(op.dst)
     assert dst_root is not None
     root_type = dst_root.type
     if not isinstance(root_type, SmemTensorType) or root_type.rank != 2:
@@ -3528,7 +4206,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     assert src_root is not None
     src_root_type = src_root.type
     assert isinstance(src_root_type, WgrmemTensorType)
-    root_n = cast(int, src_root_type.sizes[1])
+    root_n = _m16n8_fragment_columns(src_root_type)
     is_view = isinstance(op.src.definition, TileOp)
     row_start, col_start = (
         _static_view_origin(op.src)
@@ -3545,7 +4223,7 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
         or col_start < 0
         or col_start % 16
         or (not is_view and col_start + dst_n > n_dim)
-        or m_dim % (4 * _M16N8_FRAGMENT_ROWS[src_type.layout][0])
+        or m_dim % ((2 if _paired_fragment(src_root_type) else 4) * _m16n8_fragment_rows(src_root_type)[0])
         or dst_n % (8 if transposed else block_width)
         or root_n % 8
         or not (8 <= root_n <= 256)

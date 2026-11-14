@@ -22,7 +22,7 @@ include = ["ayla*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-ayla = ["better_benchmark_gemm_router.json"]
+ayla = ["better_benchmark_gemm_router.json", "better_benchmark_gemm_router_blackwell.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

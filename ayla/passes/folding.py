@@ -4,6 +4,8 @@ Folds index arithmetic where operands are known constants,
 eliminates trivial operations like `x * 1`, `x + 0`, `0 * n`,
 `x * 0`, removes no-op tile ops, resolves a `select` whose index is known,
 inlines a `for` that runs once, and erases one that never runs.
+Index guards are also removed or inlined when non-wrapping unsigned ranges
+prove that their comparison is always false or always true.
 
 One fact beyond plain constants: inside a ``for``, the induction variable is
 congruent to ``lb`` modulo ``step``. That is enough to fold ``(iv + c) % m``
@@ -30,10 +32,12 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     ForOp,
+    IfOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexModOp,
+    IndexLtOp,
     IndexMulOp,
     MatmulOp,
     KernelOp,
@@ -44,6 +48,8 @@ from ..gpu_dialect import (
     ThreadIdOp,
     TileOp,
     memory_effects,
+    root_buffers,
+    static_columns,
     WarpGroupIdOp,
     launch_extent,
 )
@@ -76,6 +82,34 @@ def _iv_loop(value: Value) -> ForOp | None:
 
 
 class Folding(LoweringPass):
+    @lowers(IfOp)
+    def lower_if(self, op: IfOp) -> tuple[list[Op], list[object]] | None:
+        condition = self.value_map.get(op.condition, op.condition)
+        definition = condition.definition
+        if not isinstance(definition, IndexLtOp):
+            return None
+        def unsigned_range(value: Value) -> tuple[int, int] | None:
+            bounds = self._range(value)
+            if bounds is None or not 0 <= bounds[0] <= bounds[1] < (1 << 32):
+                return None
+            source = value.definition
+            if isinstance(source, (IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp)):
+                if any(unsigned_range(arg) is None for arg in source.operands):
+                    return None
+            return bounds
+
+        lhs, rhs = unsigned_range(definition.lhs), unsigned_range(definition.rhs)
+        # Index comparisons lower to unsigned 32-bit PTX. A mathematical
+        # interval spanning negative values or overflow cannot decide it.
+        if lhs is None or rhs is None:
+            return None
+        if lhs[0] >= rhs[1]:
+            return [], []
+        if lhs[1] < rhs[0]:
+            self.lower_block(op.body)
+            return list(op.body.ops), []
+        return None
+
     @lowers(ForOp)
     def lower_for(
         self, op: ForOp,
@@ -123,6 +157,12 @@ class Folding(LoweringPass):
         filled = {root for e in effects if e.kind == "W" for root in e.roots}
         block = op.parent_block
         assert block is not None
+        dst_type = cast(MemTensorType, op.dst.type)
+        width = dst_type.sizes[-1] if dst_type.rank else 1
+        if width is None:
+            return None
+        pending = [(0, width)]
+        overwrite: list[MatmulOp] = []
         for later in block.ops[block.ops.index(op) + 1:]:
             later_effects = memory_effects(later)
             if later_effects is None:
@@ -130,12 +170,33 @@ class Folding(LoweringPass):
             if not any(e.roots & filled for e in later_effects):
                 continue
             if not (
-                isinstance(later, MatmulOp) and later.dst is op.dst
-                and later.init is None and later.accumulate
+                isinstance(later, MatmulOp) and later.init is None
+                and root_buffers(later.lhs).isdisjoint(filled)
+                and root_buffers(later.rhs).isdisjoint(filled)
             ):
                 return None
-            later.attrs["accumulate"] = False
-            return [], []
+            interval = static_columns(later.dst, op.dst)
+            if interval is None:
+                return None
+            start, end = interval
+            if not 0 <= start < end <= width:
+                return None
+            remaining = sum(max(0, min(b, end) - max(a, start)) for a, b in pending)
+            if remaining == 0:
+                continue  # This view has already been initialized.
+            if remaining != end - start:
+                return None  # Overwrite would discard a partial accumulation.
+            if later.accumulate:
+                overwrite.append(later)
+            pending = [(a, min(b, start)) for a, b in pending if a < start] + [
+                (max(a, end), b) for a, b in pending if end < b
+            ]
+            if not pending:
+                # Commit only after all columns are covered and no intervening
+                # read could observe the removed zero fill.
+                for matmul in overwrite:
+                    matmul.attrs["accumulate"] = False
+                return [], []
         return None
 
     def _const_val(self, value: Value) -> int | None:

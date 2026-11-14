@@ -47,6 +47,7 @@ from ..gpu_dialect import (
     SmemTensorType,
     is_side_effect_free,
     join_collectives,
+    execution_issuer_warp,
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
@@ -55,7 +56,7 @@ from ..base.pipeline import Pass
 def _fusion_kind(op: Op) -> str | None:
     """Fusion category of ``op`` if it is a single-op async we can fuse, else
     ``None``. Multi-op (already-fused) asyncs return ``None`` — idempotency."""
-    if not isinstance(op, AsyncOp):
+    if not isinstance(op, AsyncOp) or len(op.completion_locks) != 1:
         return None
     body = op.body.ops
     if len(body) != 1:
@@ -88,6 +89,7 @@ class FuseAsync(Pass):
         # The members and the awaits dropped for them, as found. Fusing takes
         # the members' bodies; a run that cannot fuse is replayed as is.
         group_ops: list[Op] = []
+        group_waiters: tuple[int, ...] | None = None
         # Member locks still awaiting their (to-be-dropped) await. Each fused
         # async adds its lock; its await removes it. Left over at finalize,
         # the run is replayed.
@@ -95,7 +97,7 @@ class FuseAsync(Pass):
 
         def finalize() -> None:
             nonlocal group_lock, group_kind, group_attrs, group_collective
-            nonlocal in_flight_locks, group_ops
+            nonlocal in_flight_locks, group_ops, group_waiters
             if in_flight_locks:
                 # A member's await is not adjacent (e.g. TMA loads seen *after*
                 # pipelining, whose awaits sit at the loop top). Fusing would
@@ -114,16 +116,21 @@ class FuseAsync(Pass):
                     ]),
                     attrs=group_attrs,
                 ))
-                new_ops.append(AwaitOp.build(group_lock))
+                new_ops.append(AwaitOp.build(group_lock,
+                    attrs={"waiter_warps": list(group_waiters)} if group_waiters is not None else None))
             group_lock = None
             group_kind = None
             group_attrs = None
             group_collective = None
             in_flight_locks = set()
             group_ops = []
+            group_waiters = None
 
         for index, op in enumerate(ops):
             kind = _fusion_kind(op)
+            waiters = {u.waiter_warps for u in op.lock.users() if isinstance(u, AwaitOp)} if isinstance(op, AsyncOp) else set()
+            if kind is not None and len(waiters) != 1:
+                kind = None  # Different dynamic phases need their original waits.
             # Scheduling may deliberately move an await away from its
             # singleton async. That pair has already been processed and
             # cannot join a new fusion run. An await that follows a run of
@@ -145,7 +152,12 @@ class FuseAsync(Pass):
                     assert group_lock is not None
                     if (
                         kind != group_kind
+                        or next(iter(waiters)) != group_waiters
+                        or op.attrs.get("release_prior", False) != (group_attrs or {}).get("release_prior", False)
                         or op.lock.type != group_lock.type
+                        or execution_issuer_warp(op) != execution_issuer_warp(
+                            next(member for member in group_ops if isinstance(member, AsyncOp))
+                        )
                         or (
                             kind != "tma_load"
                             and op.collective != group_collective
@@ -156,6 +168,7 @@ class FuseAsync(Pass):
                     group_lock = op.lock
                     group_kind = kind
                     group_attrs = op.extra_attrs or None
+                    group_waiters = next(iter(waiters))
                     group_collective = op.collective
                 elif kind == "tma_load":
                     group_collective = join_collectives(

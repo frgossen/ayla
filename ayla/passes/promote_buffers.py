@@ -23,13 +23,14 @@ import math
 from collections.abc import Callable, Sequence
 from typing import cast
 
-from ..base.ir import Block, Op, Type, Value, clone_type
+from ..base.ir import Block, Op, Type, Value, clone_type, find_ops_of_type, iter_ops
 from ..base.lowering_pass import LoweringPass, lowers
-from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS
+from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS, TmemWarpLayout
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
     BlockIdOp,
+    ClusterBlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
     DeallocOp,
@@ -37,6 +38,11 @@ from ..gpu_dialect import (
     F16Type,
     F32Type,
     F64Type,
+    ForOp,
+    IfOp,
+    memory_effects,
+    root_buffers,
+    is_side_effect_free,
     GmemTensorType,
     IndexAddOp,
     IndexConstantOp,
@@ -56,6 +62,7 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     WgrmemTensorType,
     is_column_major,
+    physical_layout,
     is_elementwise,
 )
 from ._utils import label_matches
@@ -160,7 +167,7 @@ def _resolve_type(name: str):
 # F32 registers per thread in one TMEM writeback fragment. Draining the
 # accumulator in column slices bounds register pressure independently of the
 # tile width.
-_TMEM_FRAGMENT_COLUMNS = 32
+_TMEM_FRAGMENT_REGISTERS = 32
 
 
 def _tmem_fragment_layout(dst: Value) -> str:
@@ -175,8 +182,16 @@ def _tmem_fragment_layout(dst: Value) -> str:
     if is_column_major(dst_type) and isinstance(dst_type.dtype, (BF16Type, F16Type)):
         return "tcgen05_16x256b"
     extent = dst_type.sizes[-1]
-    if isinstance(dst_type.dtype, (BF16Type, F16Type)) and extent is not None and extent % 16 == 0:
+    if (
+        isinstance(dst_type.dtype, (BF16Type, F16Type))
+        and extent is not None
+        and extent % 16 == 0
+    ):
         return "tcgen05_16x32bx2"
+    if dst_type.sizes[0] == 64:
+        # An M64 MMA occupies the first 16 rows in every physical 32-row
+        # warp partition. Whole 32-row copy atoms include unused datapaths.
+        return "tcgen05_16x256b"
     return "tcgen05_32x32b"
 
 
@@ -238,6 +253,27 @@ def _sliced_moves(
         ]
     src_type = src.type
     assert isinstance(src_type, MemTensorType)
+    dst_type = dst.type
+    layout = physical_layout(dst_type) if isinstance(dst_type, SmemTensorType) else None
+    if layout is not None and layout[1] == "block_major":
+        inner_dim = 0 if is_column_major(dst_type) else 1
+        inner_extent = cast(int, dst_type.sizes[inner_dim])
+        width = layout[0]
+        if dim % dst_type.rank != inner_dim and inner_extent > width:
+            # A shorter outer dimension is not dense across physical blocks.
+            # Copy one block at a time, retaining the full allocation's pitch.
+            if inner_extent % width:
+                raise ValueError("blocked TMA slices require complete physical blocks")
+            ops: list[Op] = []
+            for block in range(inner_extent // width):
+                src_block = _slice_tile(src, inner_dim, block, width)
+                dst_block = _slice_tile(dst, inner_dim, block, width)
+                ops.extend([src_block, dst_block])
+                ops.extend(_sliced_moves(
+                    dst_block.result(), src_block.result(), count, dim, collective,
+                    {**attrs, **({"multicast": True} if multicast else {})},
+                ))
+            return ops
     extent = src_type.sizes[dim]
     assert extent is not None
     size, remainder = divmod(extent, count)
@@ -308,6 +344,11 @@ class PromoteBuffers(LoweringPass):
         lifetime analysis and a pass that selects safe storage reuse.
     tma_load_slices : dict[str, int] or None
         Leading-dimension TMA load slices by operand.
+    cta_group : int
+        One CTA or a paired Blackwell MMA. TMEM shapes stay local to each CTA;
+        paired TMA loads jointly complete at the pair leader's mbarrier, and a
+        paired SMEM RHS places one half of its leading dimension in each CTA
+        of the block-X pair.
     """
 
     target_type: str
@@ -322,8 +363,10 @@ class PromoteBuffers(LoweringPass):
     move_attrs: dict[str, dict[str, object]]
     writeback_slices: int
     writeback_buffers: int
+    writeback_register_budget: int
     unsafe_reuse_smem: bool
     tma_load_slices: dict[str, int]
+    cta_group: int
     label_filter: str | None
     epilogue_label_filter: str | None
     operand_names: set[str]
@@ -344,12 +387,20 @@ class PromoteBuffers(LoweringPass):
         move_attrs: dict[str, dict[str, object]] | None = None,
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
+        writeback_register_budget: int = _TMEM_FRAGMENT_REGISTERS,
+        scope_loop_label: str | None = None,
         unsafe_reuse_smem: bool = False,
         tma_load_slices: dict[str, int] | None = None,
         label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
+        cta_group: int = 1,
     ) -> None:
+        if type(cta_group) is not int or cta_group not in (1, 2):
+            raise ValueError("promotion cta_group must be one or two")
+        if cta_group == 2 and target_type not in ("smem", "tmem"):
+            raise ValueError("paired promotion requires SMEM operands or a TMEM accumulator")
         super().__init__(
+            scope_loop_label=scope_loop_label,
             target_type=target_type,
             target_dtype=target_dtype,
             operands=operands,
@@ -363,14 +414,19 @@ class PromoteBuffers(LoweringPass):
             move_attrs=dict(move_attrs or {}),
             writeback_slices=writeback_slices,
             writeback_buffers=writeback_buffers,
+            writeback_register_budget=writeback_register_budget,
             unsafe_reuse_smem=unsafe_reuse_smem,
             tma_load_slices=dict(tma_load_slices or {}),
             label_filter=label_filter,
             epilogue_label_filter=epilogue_label_filter,
+            cta_group=cta_group,
         )
         assert writeback_slices >= 1, "writeback_slices must be positive"
-        assert writeback_buffers in (1, writeback_slices), (
-            "writeback_buffers must be 1 or equal writeback_slices"
+        assert writeback_register_budget > 0, (
+            "writeback_register_budget must be positive"
+        )
+        assert 1 <= writeback_buffers <= writeback_slices, (
+            "writeback_buffers must be between 1 and writeback_slices"
         )
         assert all(n >= 1 for n in self.tma_load_slices.values()), (
             "TMA load slice counts must be positive"
@@ -438,7 +494,7 @@ class PromoteBuffers(LoweringPass):
                 strides=cast(list[int], strides),
             )
         if tensor_cls is TmemTensorType:
-            return TmemTensorType.build(sizes, dtype)
+            return TmemTensorType.build(sizes, dtype, attrs={"cta_group": self.cta_group} if self.cta_group != 1 else None)
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WgrmemTensorType:
@@ -471,6 +527,8 @@ class PromoteBuffers(LoweringPass):
         # only stages writeback.
         if self.tma and self.target_type not in ("wgrmem", "tmem"):
             attrs["tma"] = True
+            if self.cta_group == 2:
+                attrs["cta_group"] = 2
         if self.nc and allow_nc and not self.tma:
             attrs["nc"] = True
         attrs.update(self.move_attrs.get(operand_name, {}))
@@ -528,6 +586,19 @@ class PromoteBuffers(LoweringPass):
                 new_ops.extend(ops)
 
         # Alloc + move at the target level.
+        if self.cta_group == 2 and self.target_type == "smem" and operand_name == "rhs":
+            # A paired MMA reads one contiguous RHS shard from each CTA.
+            # Represent placement with ordinary global TileOps before promotion;
+            # SMEM sizes and TMA transaction bytes are therefore local sizes.
+            extent = chain_root.type.sizes[0]
+            if extent is None or extent % 2:
+                raise ValueError("paired RHS extent must divide by two")
+            ids = ClusterBlockIdsOp.build()
+            shard_type = clone_type(chain_root.type)
+            shard_type.sizes = [extent // 2, *chain_root.type.sizes[1:]]
+            shard = TileOp.build(chain_root, [ids.x, 0], shard_type)
+            new_ops.extend([ids, shard])
+            chain_root = shard.result()
         chain_root_type = chain_root.type
         assert isinstance(chain_root_type, MemTensorType)
         target_type = self._build_target_type(chain_root_type)
@@ -675,7 +746,10 @@ class PromoteBuffers(LoweringPass):
                     "warpgroup-column writeback needs one slice per warpgroup"
                 )
         for slice_idx in range(slices):
-            smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
+            # Register-budget slicing can produce more fragments than the
+            # requested minimum. Reuse the declared staging buffers cyclically;
+            # async hazard analysis orders each store before its buffer refill.
+            smem = smems[slice_idx % len(smems)]
             gather_dst = smem.result()
             for tile in reversed(narrow_tiles):
                 if tile is wg_column_tile:
@@ -769,7 +843,11 @@ class PromoteBuffers(LoweringPass):
             return new_ops, []
         new_ops.append(
             self._build_direct_writeback(
-                dst, src, operand_name, collective, matmul_label,
+                dst,
+                src,
+                operand_name,
+                collective,
+                matmul_label,
                 writeback_tiling_scheme,
             )
         )
@@ -861,22 +939,28 @@ class PromoteBuffers(LoweringPass):
         src_type = src.type
         assert isinstance(src_type, TmemTensorType)
         rows, cols = cast(tuple[int, int], src_type.sizes)
-        layout = self.layout or _tmem_fragment_layout(dst)
-        column_alignment = max(8, TMEM_FRAGMENT_LAYOUTS[layout].columns)
-        slices = next(
-            count
-            for count in range(self.writeback_slices, cols + 1)
-            if cols % count == 0
-            and cols // count <= _TMEM_FRAGMENT_COLUMNS
-            and (cols // count) % column_alignment == 0
+        warps = self.warps or 4
+        ownership = TmemWarpLayout(rows, warps, src_type.cta_group)
+        layout = self.layout or ("tcgen05_16x256b" if ownership.paired_m64 else _tmem_fragment_layout(dst))
+        if ownership.paired_m64 and layout != "tcgen05_16x256b":
+            raise ValueError("paired M64 writeback requires tcgen05_16x256b")
+        if self.layout is None and ownership.rows_per_warp == 16 and layout == "tcgen05_32x32b":
+            layout = "tcgen05_16x256b"
+        if self.layout is None and cols % (TMEM_FRAGMENT_LAYOUTS[layout].columns * ownership.column_groups):
+            layout = "tcgen05_16x256b"
+        slice_cols = TMEM_FRAGMENT_LAYOUTS[layout].writeback_slice_columns(
+            rows, cols, self.writeback_slices, self.writeback_register_budget, warps, src_type.cta_group
         )
-        slice_cols = cols // slices
+        if ownership.paired_m64 and slice_cols != cols:
+            raise ValueError("paired M64 needs one whole writeback fragment within the register budget")
+        slices = cols // slice_cols
 
         def load(slice_idx: int) -> tuple[list[Op], Value]:
             view = _slice_tile(src, -1, slice_idx, slice_cols) if slices > 1 else None
             fragment = AllocOp.build_with_fresh_id(
                 WgrmemTensorType.build(
-                    [rows, slice_cols], src_type.dtype, layout=layout, warps=4
+                    [rows, slice_cols], src_type.dtype, layout=layout, warps=warps,
+                    attrs={"tmem_cta_group": 2} if ownership.paired_m64 else None
                 )
             )
             move = MoveOp.build(
@@ -929,18 +1013,121 @@ class PromoteBuffers(LoweringPass):
                 new_ops.extend(ops)
                 new_ops.append(
                     self._build_direct_writeback(
-                        store_dst, value, operand_name, collective,
-                        matmul_label, writeback_tiling_scheme,
+                        store_dst,
+                        value,
+                        operand_name,
+                        collective,
+                        matmul_label,
+                        writeback_tiling_scheme,
                     )
                 )
-        new_ops.append(DeallocOp.build(src))
+        # The accumulator lifetime ends at its final read. Conversion and
+        # stores consume register/SMEM copies and must not hold TMEM alive.
+        # LICM preserves this same boundary when reusing the allocation.
+        last_read = max(i for i, op in enumerate(new_ops)
+                        if isinstance(op, MoveOp) and isinstance(op.src.type, TmemTensorType))
+        new_ops.insert(last_read + 1, DeallocOp.build(src))
         return new_ops
 
     @lowers(KernelOp)
     def lower_kernel(self, op: KernelOp):
-        for block in op.blocks:
-            self._rewrite_block(block)
+        if self.scope_loop_label is not None:
+            if self.target_type not in ("tmem", "wgrmem", "rmem"):
+                raise ValueError("loop-scoped promotion requires a tensor or register accumulator")
+            if self.operand_names != {"dst"} or self.epilogue_label_filter is not None:
+                raise ValueError("loop-scoped promotion supports only a destination without epilogues")
+            self._rewrite_scoped_block(op.body)
+        else:
+            for block in op.blocks:
+                self._rewrite_block(block)
         return [op], []
+
+    def _rewrite_scoped_block(self, block: Block) -> None:
+        result = []
+        for op in list(block.ops):
+            if isinstance(op, ForOp) and label_matches(op, self.scope_loop_label):
+                before, after = self._promote_reduction_loop(op)
+                result.extend([*before, op, *after])
+            elif self._promotes(op):
+                # A one-step reduction may have been folded to a matmul.
+                result.extend(self._promote(op, []))
+            else:
+                for nested in op.blocks:
+                    self._rewrite_scoped_block(nested)
+                result.append(op)
+        block.ops = result
+
+    def _promote_reduction_loop(self, loop: ForOp) -> tuple[list[Op], list[Op]]:
+        """Keep invariant scalar-initialized destinations across a reduction.
+
+        Each destination gets one allocation/init before the loop and one
+        writeback after it. Only static disjoint tiles of one parent are
+        accepted when several destinations share backing storage.
+        """
+        heroes = [op for op in find_ops_of_type(loop, MatmulOp) if self._promotes(op)]
+        if not heroes:
+            raise ValueError("loop-scoped promotion found no matmul")
+        inside = set(iter_ops(loop))
+        if any(isinstance(op,IfOp) for op in inside):
+            raise ValueError("loop-scoped promotion requires unconditional reduction updates")
+        destination_roots=set().union(*(root_buffers(hero.dst) for hero in heroes))
+        for op in inside:
+            if op in heroes or op.blocks or is_side_effect_free(op):continue
+            effects=memory_effects(op)
+            if effects is None or any(destination_roots.intersection(effect.roots) for effect in effects):
+                raise ValueError("loop-scoped destination has another observer or writer")
+        pre, post = [], []
+        lifted = set()
+        def hoist(value):
+            definition = value.definition
+            if isinstance(definition, Block):
+                if definition.parent_op in inside:
+                    raise ValueError("promotion destination or initializer varies inside the reduction")
+                return
+            if definition not in inside or definition in lifted:
+                return
+            if not is_side_effect_free(definition) or definition.blocks:
+                raise ValueError("promotion dependency is not invariant pure addressing")
+            for operand in definition.operands:
+                hoist(operand)
+            definition.parent_block.ops.remove(definition)
+            pre.append(definition)
+            lifted.add(definition)
+        unique = {}
+        for hero in heroes:
+            init = hero.init
+            if init is None or init.type.rank != 0:
+                raise ValueError("loop-scoped promotion requires a scalar initializer")
+            if hero.dst in unique:
+                if unique[hero.dst][1] is not init:
+                    raise ValueError("loop-scoped destination initializers must agree")
+                continue
+            for other in unique:
+                left, right = hero.dst.definition, other.definition
+                if (not isinstance(left, TileOp) or not isinstance(right, TileOp)
+                        or left.arg is not right.arg or left.result().type.sizes != right.result().type.sizes):
+                    raise ValueError("multiple scoped destinations require disjoint static sibling tiles")
+                from .verify_gpu_dialect import _static_index
+                li,ri=([_static_index(i, {}) for i in t.indices] for t in (left, right))
+                if not any(a is not None and b is not None and a != b for a,b in zip(li,ri)):
+                    raise ValueError("multiple scoped destinations may overlap")
+            hoist(hero.dst);hoist(init)
+            ops,[promoted]=self._build_operand_promotion(hero.dst,"dst",hero.collective,
+                hero.attrs.get("label"),init=init)
+            pre.extend(ops)
+            writes,_=self._build_operand_writeback(hero.dst,promoted,"dst",hero.collective,
+                hero.attrs.get("label"),[],hero.attrs.get("dst_tiling_scheme"))
+            post.extend(writes)
+            unique[hero.dst]=(promoted,init)
+        for hero in heroes:
+            attrs=hero.extra_attrs
+            attrs.pop("dst_tiling_scheme",None)
+            attrs.pop("accumulate",None)
+            replacement=MatmulOp.build(lhs=hero.lhs,rhs=hero.rhs,dst=unique[hero.dst][0],
+                collective=hero.collective,attrs=attrs)
+            block=hero.parent_block
+            block.ops[block.ops.index(hero)]=replacement
+        return pre,post
 
     def _rewrite_block(self, block: Block) -> None:
         """Replace each matmul, and the epilogue behind it, with its promotion.
@@ -1109,6 +1296,7 @@ def promote_buffers(
     move_attrs: dict[str, dict[str, object]] | None = None,
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
+    writeback_register_budget: int = _TMEM_FRAGMENT_REGISTERS,
     unsafe_reuse_smem: bool = False,
     tma_load_slices: dict[str, int] | None = None,
     label_filter: str | None = None,
@@ -1129,6 +1317,7 @@ def promote_buffers(
         move_attrs=move_attrs,
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
+        writeback_register_budget=writeback_register_budget,
         unsafe_reuse_smem=unsafe_reuse_smem,
         tma_load_slices=tma_load_slices,
         label_filter=label_filter,

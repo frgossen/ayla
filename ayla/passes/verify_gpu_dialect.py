@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from ..cluster_layout import cluster_size, validate_masks
+from ..base.ir import find_ops_of_type
+from ..gpu_dialect import PTXTemplateOp
+
 from enum import Enum, auto
 from functools import cache
 import itertools
@@ -11,6 +15,7 @@ from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancest
 from ..base.verification_pass import VerificationPass, verifies
 from ..target import CUDA_LAUNCH_LIMITS
 from ..gpu_dialect import (
+    WarpIdsOp,
     HW_ID_LEVELS,
     AddrMemTensorType,
     AllocOp,
@@ -30,12 +35,15 @@ from ..gpu_dialect import (
     IfOp,
     IndexAddOp,
     IndexConstantOp,
+    IndexType,
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
     IndexMulOp,
     KernelOp,
     LockType,
+    OperandPipelineOp,
+    PersistentPipelineOp,
     MatmulOp,
     MemTensorType,
     ModuleOp,
@@ -50,6 +58,11 @@ from ..gpu_dialect import (
     TileOp,
     TmaDescType,
     TmaMoveOp,
+    execution_issuer_warp,
+    releases_cluster_banks,
+    is_warp_list,
+    execution_warps,
+    ThreadIdOp,
     WgrmemTensorType,
     BlockIdOp,
     join_collectives,
@@ -131,6 +144,8 @@ def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
     if type(multicast) is not bool:
         raise ValueError("multicast must be a bool")
     if not multicast:
+        if 'multicast_cta_masks' in op.attrs or 'multicast_slices' in op.attrs:
+            raise ValueError('recipient masks and slices require multicast movement')
         return
     if isinstance(op, MoveOp) and not op.attrs.get("tma"):
         raise ValueError("multicast requires a TMA move")
@@ -146,6 +161,15 @@ def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
         raise ValueError("TMA multicast requires at least two CTAs per cluster")
     if cluster_size > 16:
         raise ValueError("TMA multicast supports at most 16 CTAs per cluster")
+    if 'multicast_cta_masks' in op.attrs:
+        if not op.multicast:
+            raise ValueError('recipient masks require multicast movement')
+        validate_masks(op.attrs['multicast_cta_masks'],cluster_size,groups=True)
+    if 'multicast_slices' in op.attrs:
+        slices = op.attrs['multicast_slices']
+        masks = op.attrs.get('multicast_cta_masks', [(1 << cluster_size)-1]*cluster_size)
+        if type(slices) is not int or not 1 <= slices <= min(mask.bit_count() for mask in masks):
+            raise ValueError('multicast slices must fit the recipient group')
     if any(dim is not None for dim in kernel.grid_dim):
         _verify_cluster_shares_multicast_tile(kernel, op)
 
@@ -222,9 +246,9 @@ def _verify_cluster_shares_multicast_tile(
 ) -> None:
     """Reject a multicast load whose cluster CTAs select different tiles.
 
-    Every CTA of a cluster receives the issuer's tile, so each must ask for
-    the same one. The check evaluates the static index arithmetic for every
-    CTA and loop iteration, which also covers linearized output grids.
+    CTAs in each recipient group must select the same tile and participate
+    under the same guards. The check evaluates static index arithmetic for
+    every CTA and loop iteration, including linearized output grids.
     """
     grid = tuple(dim or 1 for dim in kernel.grid_dim)
     cluster = tuple(dim or 1 for dim in kernel.cluster_dim)
@@ -310,16 +334,69 @@ def _verify_cluster_shares_multicast_tile(
             tiles = {member: tile(member, ivs) for member in members}
             if any(None in t for t in tiles.values()):
                 return  # Not static: nothing to prove.
-            if len(set(tiles.values())) > 1:
-                (a, ta), (b, tb) = [
-                    (member, t) for member, t in tiles.items() if t != tiles[members[0]]
-                ][:1] + [(members[0], tiles[members[0]])]
-                raise ValueError(
-                    "multicast load selects different tiles within a "
-                    f"cluster: block {a} loads {ta or 'nothing'} but block "
-                    f"{b} loads {tb or 'nothing'}; the cluster must run "
-                    "along an axis on which the multicast tile is shared"
-                )
+            size = math.prod(cluster)
+            masks = op.attrs.get('multicast_cta_masks', [(1 << size) - 1] * size)
+            ordered = sorted(members, key=lambda b: (b[0] - origin[0]) + cluster[0] * (
+                (b[1] - origin[1]) + cluster[1] * (b[2] - origin[2])))
+            for mask in set(masks):
+                recipients = [ordered[q] for q in range(size) if mask & (1 << q)]
+                a = recipients[0]
+                for b in recipients[1:]:
+                    if tiles[a] == tiles[b]:
+                        continue
+                    raise ValueError(
+                        "multicast load selects different tiles within a "
+                        f"cluster: block {a} loads {tiles[a] or 'nothing'} but block "
+                        f"{b} loads {tiles[b] or 'nothing'}; recipients must select "
+                        "the same multicast tile"
+                    )
+
+
+def _verify_issuer_warp(op: Op) -> None:
+    issuer = execution_issuer_warp(op)
+    if not issuer:
+        return
+    kernel = find_ancestor_of_type(op, KernelOp)
+    module = find_ancestor_of_type(op, ModuleOp)
+    if kernel is None or module is None or module.target != 'sm_100a':
+        raise ValueError('nonzero issuer_warp requires a Blackwell kernel')
+    if kernel.block_dim[1:] != (1,1) or kernel.num_threads is None or issuer >= kernel.num_threads//32:
+        raise ValueError('issuer_warp must name a launched warp in a one-dimensional block')
+    if isinstance(op, MoveOp) and not op.attrs.get('tma'):
+        raise ValueError('issuer_warp on a move requires TMA')
+    if isinstance(op, MatmulOp) and not isinstance(op.dst.type, TmemTensorType):
+        raise ValueError('issuer_warp on a matmul requires tcgen05')
+
+
+def _verify_completion_group(op: AsyncOp | AwaitOp) -> None:
+    typ = op.lock.type
+    group = typ.cta_group
+    if typ.attrs.get('completion_role') not in (None,'result') or typ.attrs.get('completion_role') == 'result' and typ.kind != 'tcgen05':
+        raise ValueError('result completion requires a TCGEN event')
+    if type(group) is not int or group not in (1, 2):
+        raise ValueError("completion cta_group must be one or two")
+    for peer in op.lock.users():
+        for inner in peer.body.ops if isinstance(peer, AsyncOp) else ():
+            # A paired event completes the matching paired MMA or SMEM load.
+            mma = isinstance(inner, MatmulOp) and isinstance(inner.dst.type, TmemTensorType)
+            load = isinstance(inner, (MoveOp, TmaMoveOp)) and isinstance(inner.dst.type, SmemTensorType)
+            if ((inner.dst.type.cta_group if mma else inner.attrs.get('cta_group', 1)) != group
+                    or group == 2 and typ.is_event and not (mma if typ.kind == 'tcgen05' else load)):
+                raise ValueError("completion group must match the paired operation")
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if 'completion_cta_masks' in typ.attrs:
+        if kernel is None or typ.kind!='tcgen05':
+            raise ValueError('CTA completion masks require a clustered TCGEN event')
+        masks=validate_masks(typ.attrs['completion_cta_masks'],cluster_size(kernel))
+        if group == 2 and len(masks) % 2:
+            raise ValueError('paired completion requires complete adjacent rank pairs')
+        if group==2 and any(masks[r]!=masks[r^1] for r in range(len(masks))):
+            raise ValueError('paired completion masks must agree within each adjacent rank pair')
+    if group == 2:
+        if kernel is not None and kernel.attrs.get('paired_phase_relay') and kernel.cluster_dim != (2,1,1):
+            raise ValueError('paired completion relay requires its original two-X-CTA mapping')
+        if not typ.is_event or kernel is None or cluster_size(kernel) % 2 or cluster_size(kernel) < 2:
+            raise ValueError("paired completion requires a TMA or tcgen05 lock in complete adjacent rank pairs")
 
 
 class VerifyGpuDialect(VerificationPass):
@@ -331,8 +408,66 @@ class VerifyGpuDialect(VerificationPass):
     ) -> None:
         super().__init__(stage)
 
+    @verifies(Op)
+    def _verify_participants(self, op: Op) -> None:
+        actors = execution_warps(op)
+        if actors is None:
+            return
+        module = find_ancestor_of_type(op, ModuleOp)
+        if module is None or module.target != 'sm_100a':
+            raise ValueError('operation participants require SM100')
+        fragments = [v.type for v in op.operands if isinstance(v.type, WgrmemTensorType)]
+        if isinstance(op, IfOp):
+            # A bound may select a prefix/suffix, or narrow a verified
+            # enclosing participant region to a contiguous interior range.
+            condition = op.condition.definition
+            kernel = find_ancestor_of_type(op, KernelOp)
+            if not isinstance(condition, IndexLtOp):
+                raise ValueError('participant region requires a thread-index bound')
+            low, high = [v.definition for v in condition.operands]
+            nwarps = kernel.num_threads // 32
+            selected = None
+            if (isinstance(low, ThreadIdOp) and low.axis == CollectiveAxis.X
+                    and isinstance(high, IndexConstantOp) and high.value % 32 == 0):
+                selected = frozenset(range(max(0, min(nwarps, high.value // 32))))
+            elif (isinstance(low, IndexConstantOp) and isinstance(high, ThreadIdOp)
+                    and high.axis == CollectiveAxis.X and (low.value + 1) % 32 == 0):
+                selected = frozenset(range(max(0, (low.value + 1) // 32), nwarps))
+            elif (isinstance(low, WarpIdsOp) and condition.lhs is low.x
+                    and kernel.block_dim[1:] == (1, 1) and isinstance(high, IndexConstantOp)):
+                selected = frozenset(range(max(0, min(nwarps, high.value))))
+            elif (isinstance(low, IndexConstantOp) and isinstance(high, WarpIdsOp)
+                    and condition.rhs is high.x and kernel.block_dim[1:] == (1, 1)):
+                selected = frozenset(range(max(0, low.value + 1), nwarps))
+            for enclosing in iter_ancestors(op):
+                if isinstance(enclosing, IfOp) and execution_warps(enclosing) is not None and selected is not None:
+                    selected &= execution_warps(enclosing)
+            if selected != actors:
+                raise ValueError('participant region predicate must match its declared warps')
+        elif isinstance(op, (MoveOp, TmaMoveOp, ElementwiseOp)) and fragments:
+            if actors not in (frozenset(range(4)), frozenset(range(4, 8))) or any(t.warps != 4 for t in fragments):
+                raise ValueError('participant fragments require an aligned group of four warps')
+        elif isinstance(op, (AsyncOp, MatmulOp, MoveOp, TmaMoveOp, ElementwiseOp)):
+            if actors != frozenset({execution_issuer_warp(op)}):
+                raise ValueError('async and engine participants must be the issuing warp')
+        elif not isinstance(op, BarrierOp):
+            raise ValueError(f'unsupported participant operation {op.op_id}')
+        elif op.scope in ('block', 'block_leader') and (
+                type(op.attrs.get('id')) is not int or not 1 <= op.attrs['id'] <= 15):
+            raise ValueError('subset rendezvous requires a dedicated named barrier')
+
     @verifies(KernelOp)
     def _verify_kernel(self, op: KernelOp) -> None:
+        handoffs = op.attrs.get('paired_completion_handoffs', False)
+        banks = releases_cluster_banks(op)
+        if type(handoffs) is not bool or handoffs and (
+                op.cluster_dim != (2, 1, 1) or not op.attrs.get('paired_phase_relay') or banks):
+            raise ValueError('paired completion handoffs require the native two-CTA phase relay')
+        if banks and not find_ops_of_type(op, PTXTemplateOp):
+            from .pipeline_cluster_banks import verify_cluster_bank_pipeline
+            verify_cluster_bank_pipeline(op)
+        if op.attrs.get("block_gather_backend", "named") not in ("named", "mbar"):
+            raise ValueError("block_gather_backend must be named or mbar")
         CUDA_LAUNCH_LIMITS.validate(op.grid_dim, op.block_dim)
         cluster_dim = op.cluster_dim
         if len(cluster_dim) != 3 or any(
@@ -354,6 +489,49 @@ class VerifyGpuDialect(VerificationPass):
             for grid, cluster in zip(grid_dim, cluster_dim, strict=True)
         ):
             raise ValueError("cluster_dim must divide grid_dim")
+
+    @verifies(PersistentPipelineOp)
+    def _verify_persistent_pipeline(self, op):
+        from .pipeline_rolled_shared_ring import _source
+
+        loop, reduction, _, _, _ = _source(op)
+        kernel = find_ancestor_of_type(op, KernelOp)
+        if (kernel is None or not kernel.attrs.get("rolled_shared_ring")
+                or loop.lb != 0 or loop.step != 1
+                or type(op.attrs.get("depth")) is not int
+                or not 2 <= op.attrs["depth"] <= reduction.attrs["ub"]
+                or op.attrs["depth"] != reduction.attrs["depth"]
+                or type(op.attrs.get("mma_queue_depth", 1)) is not int
+                or op.attrs.get("mma_queue_depth", 1) != 1
+                or len(op.operands) != 2
+                or not isinstance(op.operands[0].type, TmemTensorType)
+                or op.operands[0].type.sizes[1] != 2 * op.attrs["slot_columns"]):
+            raise ValueError("invalid compact persistent pipeline")
+
+    @verifies(OperandPipelineOp)
+    def _verify_operand_pipeline(self, op):
+        from .pipeline_rolled_k import _parts
+
+        _, mma = _parts(op)
+        depth = op.attrs.get("depth")
+        lb, ub = op.attrs.get("lb"), op.attrs.get("ub")
+        if (
+            type(depth) is not int
+            or depth < 2
+            or type(lb) is not int
+            or type(ub) is not int
+            or ub - lb < depth - 1
+            or op.attrs.get("step") != 1
+            or len(op.body.arguments) != 1
+        ):
+            raise ValueError("invalid rolled operand pipeline bounds or depth")
+        banks = op.operands
+        if len(banks) != 2 or any(
+            not isinstance(v.type, SmemTensorType) for v in banks
+        ):
+            raise ValueError(
+                "rolled operand pipeline requires two shared operand views"
+            )
 
     @verifies(ForOp)
     def _verify_for(self, op: ForOp) -> None:
@@ -413,6 +591,9 @@ class VerifyGpuDialect(VerificationPass):
                 "tensors, wgrmem, or tmem"
             )
         assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType, TmemTensorType))
+        if (isinstance(arg_type, TmemTensorType) and arg_type.cta_group == 2
+                and arg_type.sizes[0] == 64 and arg_type.sizes != result_type.sizes):
+            raise ValueError("paired M64 TMEM requires whole accumulator views")
         if not (arg_type.rank == result_type.rank == len(op.indices)):
             raise ValueError(
                 "tile operand rank, result rank, and number of indices must "
@@ -421,7 +602,27 @@ class VerifyGpuDialect(VerificationPass):
             )
         if isinstance(arg_type, AddrMemTensorType):
             assert isinstance(result_type, AddrMemTensorType)
-            if arg_type.strides != result_type.strides:
+            # A complete K-bank view of block-major SMEM has its own
+            # canonical logical stride. Its physical block stride is fixed
+            # by the unchanged outer extent and block width, not that logical
+            # stride. Ordinary address-backed views still preserve strides.
+            blocked_bank = (
+                isinstance(arg_type, SmemTensorType)
+                and isinstance(result_type, SmemTensorType)
+                and (layout := physical_layout(arg_type)) is not None
+                and layout[1] == "block_major"
+                and physical_layout(result_type) == layout
+                and arg_type.dtype == result_type.dtype
+                and arg_type.swizzle == result_type.swizzle
+                and arg_type.rank == 2
+                and all(isinstance(size, int) for size in (*arg_type.sizes, *result_type.sizes))
+                and arg_type.strides == (arg_type.sizes[1], 1)
+                and result_type.strides == (result_type.sizes[1], 1)
+                and arg_type.sizes[0] == result_type.sizes[0]
+                and arg_type.sizes[1] % layout[0] == 0
+                and result_type.sizes[1] % layout[0] == 0
+            )
+            if arg_type.strides != result_type.strides and not blocked_bank:
                 raise ValueError(
                     f"tile result strides {result_type.strides} must match "
                     f"operand strides {arg_type.strides}"
@@ -440,6 +641,14 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(BarrierOp)
     def _verify_barrier(self, op: BarrierOp) -> None:
+        _verify_issuer_warp(op)
+        if 'phase' in op.attrs and (op.attrs['phase'] not in ('arrive', 'wait')
+                or op.scope not in ('block_leader', 'cluster_to_leader')
+                or op.sync is None):
+            raise ValueError('split barrier phases require a gather resource')
+        if (op.scope == 'block_leader' and 'phase' in op.attrs
+                and execution_warps(op) is not None):
+            raise ValueError('split block gathers require all warps')
         if op.scope in (
             "cluster_to_leader",
             "leader_to_cluster",
@@ -450,7 +659,8 @@ class VerifyGpuDialect(VerificationPass):
                 raise ValueError(
                     "cluster barrier requires an enclosing clustered kernel"
                 )
-        expected_operands = 1 if op.scope in ("cluster_to_leader", "grid") else 0
+        expected_operands = 1 if op.scope in ("cluster_to_leader", "grid") or (
+            op.scope == "block_leader" and op.sync is not None) else 0
         if len(op.operands) != expected_operands:
             requirement = "one sync operand" if expected_operands else "no operands"
             raise ValueError(f"BarrierOp: {op.scope} scope requires {requirement}")
@@ -481,6 +691,12 @@ class VerifyGpuDialect(VerificationPass):
                     f"launches {grid_size} physical CTAs, but target "
                     f"{module.target!r} permits at most {max_ctas}"
                 )
+        elif op.scope == "block_leader" and op.sync is not None:
+            typ = op.sync.type
+            kernel = find_ancestor_of_type(op, KernelOp)
+            assert kernel is not None
+            if not isinstance(typ, LockType) or typ.kind != "mbar" or typ.attrs.get("arrivals") != kernel.num_threads // 32:
+                raise ValueError("block-leader mbarrier requires one arrival per warp")
         elif op.scope == "cluster_to_leader":
             if not isinstance(op.operands[0].type, LockType) or (
                 op.operands[0].type.kind != "cluster_mbar"
@@ -491,6 +707,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(AsyncOp)
     def _verify_async(self, op: AsyncOp) -> None:
+        _verify_issuer_warp(op)
         _verify_collective_attr(op)
         joined_collective = {axis: CollectiveLevel.THREAD for axis in CollectiveAxis}
         for inner in op.body.ops:
@@ -507,8 +724,41 @@ class VerifyGpuDialect(VerificationPass):
             )
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
+        _verify_completion_group(op)
+        if len(op.completion_locks) > 1:
+            module = find_ancestor_of_type(op, ModuleOp)
+            kernel = find_ancestor_of_type(op, KernelOp)
+            if (module is None or module.target != 'sm_100a' or kernel is None
+                    or op.attrs.get('release_prior')
+                    or any(not isinstance(lock.type, LockType)
+                        or lock.type.kind != 'tcgen05'
+                        or lock.type.cta_group != op.lock.type.cta_group
+                        or 'arrivals' in lock.type.attrs for lock in op.completion_locks)
+                    or len(set(op.completion_locks)) != len(op.completion_locks)
+                    or not op.body.ops or any(not isinstance(inner, MatmulOp) for inner in op.body.ops)):
+                raise ValueError('additional completions require matching tcgen05 CTA groups without release_prior')
+            for lock in op.completion_locks[1:]:
+                if not any(isinstance(user, AwaitOp) for user in lock.users()):
+                    raise ValueError('every completion event requires an await')
+                if any(isinstance(user, AsyncOp) and user.attrs.get('release_prior')
+                       for user in lock.users()):
+                    raise ValueError('additional completion peers cannot use release_prior')
+        if "arrivals" in lock_type.attrs:
+            raise ValueError("a gather mbarrier is not an async completion lock")
         if lock_type.kind == "cluster_mbar":
             raise ValueError("cluster_mbar is a barrier resource, not an async lock")
+        release = op.attrs.get("release_prior", False)
+        if type(release) is not bool:
+            raise ValueError("async release_prior must be a bool")
+        peers = [u for u in op.lock.users() if isinstance(u, AsyncOp)]
+        if any(u.attrs.get("release_prior", False) != release for u in peers):
+            raise ValueError("completion lock peers must agree on release_prior")
+        if release:
+            kernel = find_ancestor_of_type(op, KernelOp)
+            module = find_ancestor_of_type(op, ModuleOp)
+            if (lock_type.kind != "tcgen05" or kernel is None or (kernel.is_clustered and lock_type.cta_group != 2)
+                    or module is None or module.attrs.get("target") != "sm_100a"):
+                raise ValueError("release_prior requires an unclustered SM100 tcgen05 completion")
         if not any(isinstance(user, AwaitOp) for user in op.lock.users()):
             raise ValueError("async lock must have a matching await")
 
@@ -516,6 +766,21 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_await(self, op: AwaitOp) -> None:
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
+        _verify_completion_group(op)
+        if "arrivals" in lock_type.attrs:
+            raise ValueError("a gather mbarrier must be consumed by a barrier")
+        raw_waiters = op.attrs.get("waiter_warps")
+        if raw_waiters is not None:
+            kernel = find_ancestor_of_type(op, KernelOp)
+            module = find_ancestor_of_type(op, ModuleOp)
+            paired_engine = (kernel is not None and cluster_size(kernel)>=2 and cluster_size(kernel)%2==0
+                and lock_type.is_event and lock_type.cta_group == 2)
+            if (kernel is None or kernel.is_clustered and not (paired_engine or releases_cluster_banks(kernel) or kernel.cluster_dim == (2, 1, 1) and kernel.attrs.get('persistent_output_slots') == 2) or kernel.block_dim[1:] != (1, 1)
+                    or module is None or module.attrs.get("target") != "sm_100a"
+                    or not lock_type.is_event):
+                raise ValueError("waiter_warps requires a one-dimensional SM100 block and a supported completion event")
+            if not is_warp_list(raw_waiters, kernel):
+                raise ValueError("waiter_warps must list distinct valid warp indices")
         pending = op.pending_groups
         limit = 7 if lock_type.supports_partial_await else 0
         if type(pending) is not int or not 0 <= pending <= limit:
@@ -526,11 +791,32 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(AllocOp)
     def _verify_alloc(self, op: AllocOp) -> None:
+        _verify_issuer_warp(op)
         if "init" in op.attrs:
             raise ValueError("alloc does not initialize; use elementwise fill")
+        typ = op.result().type
+        if isinstance(typ, TmemTensorType):
+            kernel = find_ancestor_of_type(op, KernelOp)
+            if typ.cta_group == 2 and (typ.sizes[0] not in (64,128) or kernel is None
+                    or cluster_size(kernel) < 2 or cluster_size(kernel) % 2):
+                raise ValueError("paired TMEM requires two clustered CTAs and 64/128 local rows")
+        if isinstance(typ, LockType) and 'release_warps' in typ.attrs:
+            kernel = find_ancestor_of_type(op, KernelOp)
+            warps = typ.attrs['release_warps']
+            if typ.kind != 'cluster_mbar' or kernel is None or not is_warp_list(warps, kernel):
+                raise ValueError('slot release must name distinct launched warp arrivals')
+            for user in op.result().users():
+                expected = frozenset(warps) if user.attrs.get('phase') == 'arrive' else frozenset({0})
+                if not isinstance(user, BarrierOp) or execution_warps(user) != expected:
+                    raise ValueError('slot release participants must match its arrival count and issuer')
+        if isinstance(typ, LockType) and "arrivals" in typ.attrs:
+            count = typ.attrs['arrivals']
+            if typ.kind != 'mbar' or type(count) is not int or count <= 0:
+                raise ValueError('gather arrivals must be a positive integer on an mbar lock')
 
     @verifies(MoveOp)
     def _verify_move(self, op: MoveOp) -> None:
+        _verify_issuer_warp(op)
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
         _verify_transposed_fragment_store(op)
@@ -562,6 +848,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
+        _verify_issuer_warp(op)
         if len(op.operands) < 2:
             raise ValueError(
                 "tma_move expects dst, src, and one index per dimension; "
@@ -589,6 +876,7 @@ class VerifyGpuDialect(VerificationPass):
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:
+        _verify_issuer_warp(op)
 
         lhs, rhs, dst = op.lhs.type, op.rhs.type, op.dst.type
         if (
@@ -606,6 +894,10 @@ class VerifyGpuDialect(VerificationPass):
         m, k = lhs.sizes
         n, rhs_k = rhs.sizes
         dst_m, dst_n = dst.sizes
+        if isinstance(dst, TmemTensorType) and op.attrs.get('cta_group', dst.cta_group) != dst.cta_group:
+            raise ValueError("matmul cta_group must match its TMEM accumulator")
+        if isinstance(dst, TmemTensorType) and dst.cta_group == 2 and isinstance(rhs, SmemTensorType):
+            n *= 2  # Each CTA supplies half of B to the pair's MMA.
         constraints = ((k, rhs_k), (m, dst_m), (n, dst_n))
         if any(a is not None and b is not None and a != b for a, b in constraints):
             raise ValueError(

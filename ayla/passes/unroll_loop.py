@@ -30,10 +30,10 @@ from ._utils import label_matches
 class UnrollLoop(LoweringPass):
     """Unroll all ForOps by `unroll_factor`."""
 
-    unroll_factor: int
+    unroll_factor: int | None
     label_filter: str | None
 
-    def __init__(self, unroll_factor: int, label_filter: str | None = None) -> None:
+    def __init__(self, unroll_factor: int | None, label_filter: str | None = None) -> None:
         super().__init__(
             unroll_factor=unroll_factor,
             label_filter=label_filter,
@@ -43,24 +43,27 @@ class UnrollLoop(LoweringPass):
     def lower_for(
         self, op: ForOp,
     ) -> tuple[list[Op], list[object]] | None:
-        if self.unroll_factor <= 1:
-            return None
         if not label_matches(op, self.label_filter):
+            return None
+        # None fully unrolls this statically bounded loop without requiring
+        # the caller to duplicate its extent in scheduling metadata.
+        factor = op.trip_count if self.unroll_factor is None else self.unroll_factor
+        if factor <= 1:
             return None
 
         # Recursively transform nested ops first.
         self.lower_block(op.body)
 
         lb, step = op.lb, op.step
-        num_tail_iterations = op.trip_count % self.unroll_factor
+        num_tail_iterations = op.trip_count % factor
         main_trip_count = op.trip_count - num_tail_iterations
-        new_step = step * self.unroll_factor
+        new_step = step * factor
         new_ub = lb + main_trip_count * step
         extra_attrs = {k: v for k, v in op.attrs.items() if k not in ("lb", "ub", "step")}
 
         new_iv = Value(name=op.iv.name, type=IndexType())
         main_body_ops: list[Op] = []
-        for i in range(self.unroll_factor):
+        for i in range(factor):
             offset = IndexConstantOp.build(value=i * step)
             iteration_iv = IndexAddOp.build(lhs=new_iv, rhs=offset.result())
             main_body_ops.extend([offset, iteration_iv])

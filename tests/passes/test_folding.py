@@ -254,3 +254,60 @@ def test_zero_fill_folds_into_the_matmul_that_next_writes_the_buffer(
     fills = [op for op in find_ops_of_type(module, ElementwiseOp) if op.fn == "fill"]
     assert matmul.accumulate != folds
     assert bool(fills) != folds
+
+
+@pytest.mark.parametrize("bound, guards, barriers", [(1, 0, 0), (11, 0, 1), (6, 1, 1)])
+def test_loop_bounds_fold_only_proven_index_guards(bound, guards, barriers):
+    from ayla.base.ir import Block, Value
+    from ayla.gpu_dialect import (
+        BarrierOp, ForOp, IfOp, IndexConstantOp, IndexLtOp, IndexType,
+    )
+    from ayla.passes.folding import Folding
+
+    iv = Value(name=None, type=IndexType())
+    limit = IndexConstantOp.build(bound)
+    test = IndexLtOp.build(iv, limit.result())
+    guard = IfOp.build(test.result(), Block(ops=[BarrierOp.build("block")]))
+    loop = ForOp.build(1, 11, 1, Block(arguments=[iv], ops=[limit, test, guard]))
+    block = Block(ops=[loop])
+    Folding().lower_block(block)
+    assert len(find_ops_of_type(loop, IfOp)) == guards
+    assert len(find_ops_of_type(loop, BarrierOp)) == barriers
+
+
+@pytest.mark.parametrize("lhs", [-1, 1 << 32])
+def test_unsigned_index_guard_does_not_use_negative_or_overflow_ranges(lhs):
+    from ayla.base.ir import Block
+    from ayla.gpu_dialect import BarrierOp, IfOp, IndexConstantOp, IndexLtOp
+    from ayla.passes.folding import Folding
+
+    left, right = IndexConstantOp.build(lhs), IndexConstantOp.build(2)
+    test = IndexLtOp.build(left.result(), right.result())
+    guard = IfOp.build(test.result(), Block(ops=[BarrierOp.build("block")]))
+    block = Block(ops=[left, right, test, guard])
+    Folding().lower_block(block)
+    assert guard in block.ops
+
+
+def test_unsigned_index_guard_rejects_overflow_before_division():
+    from ayla.base.ir import Block, Value
+    from ayla.gpu_dialect import (
+        BarrierOp, ForOp, IfOp, IndexAddOp, IndexConstantOp, IndexDivOp, IndexLtOp, IndexType,
+    )
+    from ayla.passes.folding import Folding
+
+    large = IndexConstantOp.build(4_000_000_000)
+    iv = Value(name=None, type=IndexType())
+    dynamic = IndexAddOp.build(large.result(), iv)
+    overflow = IndexAddOp.build(dynamic.result(), large.result())
+    two = IndexConstantOp.build(2)
+    half = IndexDivOp.build(overflow.result(), two.result())
+    limit = IndexConstantOp.build(2_000_000_000)
+    test = IndexLtOp.build(half.result(), limit.result())
+    guard = IfOp.build(test.result(), Block(ops=[BarrierOp.build("block")]))
+    loop = ForOp.build(0, 2, 1, Block(arguments=[iv],
+                      ops=[large, dynamic, overflow, two, half, limit, test, guard]))
+    block = Block(ops=[loop])
+    Folding().lower_block(block)
+    # Infinite-precision arithmetic says false, but PTX's wrapped sum says true.
+    assert guard in loop.body.ops

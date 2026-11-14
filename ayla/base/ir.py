@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -621,6 +621,34 @@ def find_ops_of_type[OpT: Op](root: Op, op_type: type[OpT]) -> list[OpT]:
 
 def find_op(root: Op, predicate: Callable[[Op], bool]) -> Op | None:
     return next(iter_ops(root, predicate), None)
+
+
+def dependency_slice(
+    values: Iterable[Value],
+    include: Callable[[Value], bool],
+    operands: Callable[[Op], Iterable[Value]] = lambda op: op.operands,
+) -> list[Op]:
+    """Return included SSA producers once, in dependency order.
+
+    A rejected value stops traversal at that boundary. Callers supply their
+    own effect and scope proofs; this utility neither moves nor clones IR.
+    ``operands`` can expose dependencies stored in dialect attributes.
+    """
+    ordered: list[Op] = []
+    visited: set[Op] = set()
+
+    def visit(value: Value) -> None:
+        producer = value.definition
+        if not isinstance(producer, Op) or producer in visited or not include(value):
+            return
+        visited.add(producer)
+        for operand in operands(producer):
+            visit(operand)
+        ordered.append(producer)
+
+    for value in values:
+        visit(value)
+    return ordered
 
 
 def clone_type(

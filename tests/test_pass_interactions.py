@@ -269,7 +269,7 @@ def test_local_and_multicast_tma_loads_share_completion():
     local = "mbarrier::complete_tx::bytes ["
     multicast = "mbarrier::complete_tx::bytes.multicast::cluster"
     expect = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
-    cluster_wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+    cluster_wait = "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
     expect_pos = ptx.index(expect)
     assert_contains_in_order(
         ptx,

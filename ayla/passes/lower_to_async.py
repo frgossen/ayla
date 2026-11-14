@@ -50,7 +50,9 @@ class LowerToAsync(LoweringPass):
         passes see it on the top-level ops rather than buried in the block.
         """
         assert isinstance(inner, (MatmulOp, MoveOp, TmaMoveOp))
-        lock = AllocOp.build_with_fresh_id(LockType.build(kind=kind))
+        group = inner.dst.type.cta_group if kind == "tcgen05" and isinstance(inner.dst.type, TmemTensorType) else inner.attrs.get("cta_group", 1)
+        lock = AllocOp.build_with_fresh_id(LockType.build(kind=kind,
+            attrs={"cta_group": group} if group != 1 else None))
         label = attrs.get("label")
         async_op = AsyncOp.build(
             lock.result(),

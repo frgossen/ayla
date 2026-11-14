@@ -7,8 +7,8 @@ from enum import Enum
 from typing import cast
 
 from . import pytree
-from .base.ir import Op, Printer, Value
-from .base.pipeline import Pipeline
+from .base.ir import Op, Printer, Value, find_ancestor_of_type, find_ops_of_type
+from .base.pipeline import Pass, Pipeline
 from .gpu_dialect import (
     BlockIdOp,
     ClusterBlockIdsOp,
@@ -26,6 +26,7 @@ from .gpu_dialect import (
     LockType,
     ModuleOp,
     PredicateType,
+    PredicateOp,
     PtrAddOp,
     PtrType,
     PTXTemplateOp,
@@ -41,11 +42,30 @@ from .gpu_dialect import (
 )
 from .pipelines.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
-from .passes.lower_to_async import LowerToAsync
+from .passes.licm import LICM
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
+from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.pack_smem_allocs import ReuseSmemAllocs
 from .passes.verify_gpu_dialect import VerificationStage, VerifyGpuDialect
+
+
+class HoistMmaDescriptors(Pass):
+    """LICM of MMA descriptor preparation, which becomes SSA only in LowerToPtxTemplate.
+
+    It hoists through nested issuer guards; the outer-first walk needs another
+    round for each enclosing loop.
+    """
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        if module.target != "sm_100a" or not module.body.ops[0].attrs.get("hoist_mma_descriptors", False):
+            return module
+        while True:
+            before = repr(module)
+            LICM(hoist_pure_through_guards=True).run(module)
+            Canonicalize().run(module)
+            if repr(module) == before:
+                return module
 
 
 class PtxLoweringPipeline(Pipeline):
@@ -62,6 +82,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(InsertSyncs())
         self.add_pass(ReuseSmemAllocs())
         self.add_pass(LowerToPtxTemplate())
+        self.add_pass(HoistMmaDescriptors())
         self.add_pass(Canonicalize())
 
 
@@ -217,6 +238,13 @@ class PtxPrinter(Printer):
     def __init__(self, indent_str: str = "  ") -> None:
         super().__init__(indent_str)
         self._ptx_names_by_type: dict[PtxType, set[str]] = defaultdict(set)
+        # Shared-memory arena (see `_layout_shared_arena`): symbol ->
+        # (arena, base register, offset), and the registers known to hold
+        # `base + offset`.
+        self.shared_offsets: dict[str, tuple[str, str, int]] = {}
+        self.pack_shared_declarations = False
+        self.shared_declarations: list[tuple[int, str]] = []
+        self.shared_addresses: dict[str, tuple[str, int]] = {}
 
     def unique_param_names_for_value(self, value: Value):
         mapping = map_type_to_registers(value.type)
@@ -349,6 +377,10 @@ def _emit_op(p: PtxPrinter, op: Op) -> None:
         _emit_index_div(p, op)
     elif isinstance(op, IndexLtOp):
         _emit_index_lt(p, op)
+    elif isinstance(op, PredicateOp):
+        dst = p.unique_ptx_names_for_value(op.result())
+        operands = ", ".join(p.unique_ptx_names_for_value(value) for value in op.operands)
+        _write_with_comment(p, f"{op.attrs['kind']}.pred {dst}, {operands};", op)
     elif isinstance(op, IndexModOp):
         _emit_index_mod(p, op)
     elif isinstance(op, WarpIdsOp):
@@ -377,6 +409,8 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     p.write_line(f"mov.b32 {iv_reg}, {op.lb};")
     p.write_line(f"{label}:")
     p.write_newline_once()
+    if op.attrs.get("unroll") is False:
+        p.write_line('.pragma "nounroll";')
     _emit_block(p, op.body)
     p.write_line(f"// END: `{_op_description(p, op)}`")
     p.write_line(f"add.s32 {iv_reg}, {iv_reg}, {op.step};")
@@ -456,11 +490,22 @@ def _emit_kernel(
                 ).splitlines():
                     p.write_line(line)
         p.write_newline_once()
+        arena = _layout_shared_arena(p, op)
+        p.pack_shared_declarations = bool(op.attrs.get("pack_shared_declarations"))
+        _emit_tma_descriptor_prefetch(p, op, block_dim)
         _emit_block(p, op.body)
         p.write_line("ret;")
     p.write_line("}")
 
     with p.insert_at(decl_mark):
+        if arena:
+            p.write_line(arena)
+        # Small event declarations before swizzled buffers can waste almost
+        # 1 KiB on alignment, enough to lose a resident CTA. These symbols are
+        # statically allocated for the kernel; declaration order need not
+        # follow initialization order. Pack higher alignments first.
+        for _, declaration in sorted(p.shared_declarations, key=lambda item: -item[0]):
+            p.write_line(declaration)
         for ptx_type in PtxType:
             if ptx_type in (PtxType.LABEL, PtxType.SMEM):
                 continue
@@ -469,6 +514,93 @@ def _emit_kernel(
                 prefix = BASENAME_BY_PTX_TYPE[ptx_type]
                 p.write_line(f".reg .{ptx_type:4s} {prefix}<{n}>;")
         p.write_newline_once()
+
+
+_SHARED_DECLARATION_RE = re.compile(
+    r"\.shared\s+\.align\s+(?P<align>\d+)\s+\.b(?P<bits>\d+)\s+"
+    r"\$\{smem:(?P<name>[^}]+)\}\[(?P<count>\d+)\];"
+)
+_MAPA_SOURCE_RE = re.compile(
+    r"mapa\.shared::cluster\.u32\s+[^,]+,\s*\$\{b32:operand\.(?P<operand>\w+)\.\w+\}"
+)
+
+
+def _layout_shared_arena(p: PtxPrinter, kernel: KernelOp) -> str | None:
+    """Place the shared symbols that cluster `mapa`s translate in one arena.
+
+    ptxas keeps one remote address per `mapa` source live in a uniform
+    register; with ~30 per-bank sources it runs out and moves bases to vector
+    registers (+IADD3/R2UR per operand). `mapa` is affine in the shared window,
+    so `mapa(arena + offset)` becomes `mapa(arena) + offset` (immediate
+    offsets): one remote base per rank. Other symbols stay separate, since
+    single-CTA kernels regress when arena addresses get CSEd into TMA regions.
+
+    Writes the arena base register and returns the arena declaration.
+    """
+    templates = find_ops_of_type(kernel, PTXTemplateOp)
+    sources = {
+        source
+        for op in templates
+        for m in _MAPA_SOURCE_RE.finditer(op.template)
+        if op.operand_names and m["operand"] in op.operand_names
+        and isinstance(source := op.operands[op.operand_names.index(m["operand"])].definition,
+                       PTXTemplateOp)
+    }
+    declarations = [
+        (int(m["align"]), int(m["bits"]) // 8 * int(m["count"]),
+         cast(str, p.unique_ptx_names((op, m["name"]), PtxType.SMEM)))
+        for op in templates if op in sources
+        for m in _SHARED_DECLARATION_RE.finditer(op.template)
+    ]
+    if not declarations:
+        return None
+    arena = cast(str, p.unique_ptx_names((kernel, "shared_arena"), PtxType.SMEM))
+    base = cast(str, p.unique_ptx_names((kernel, "shared_arena_base"), PtxType.B32))
+    # Higher alignments first: no padding between events and swizzled buffers.
+    size = 0
+    for alignment, n_bytes, symbol in sorted(declarations, key=lambda d: -d[0]):
+        size = -(-size // alignment) * alignment
+        p.shared_offsets[symbol], size = (arena, base, size), size + n_bytes
+    p.write_line(f"mov.u32 {base}, {arena};")
+    p.write_newline_once()
+    return f".shared .align {max(d[0] for d in declarations)} .b8 {arena}[{size}];"
+
+
+def _emit_tma_descriptor_prefetch(
+    p: PtxPrinter, op: KernelOp, block_dim: tuple[int, int, int]
+) -> None:
+    """Warm immutable tensor-map parameters once per CTA from warp zero.
+
+    The parameter loads have already converted these addresses to generic
+    pointers. This advisory operation needs no new synchronization and stays
+    outside every operand/output loop. Omission emits byte-identical PTX.
+    """
+    enabled = op.attrs.get("prefetch_tma_descriptors", False)
+    if type(enabled) is not bool:
+        raise ValueError("prefetch_tma_descriptors must be a boolean")
+    descriptors = [arg for arg in op.body.arguments if isinstance(arg.type, TmaDescType)]
+    if not enabled or not descriptors:
+        return
+    thread = [p.unique_ptx_names((op, "descriptor_prefetch", axis), PtxType.B32)
+              for axis in "xyz"]
+    elected = p.unique_ptx_names((op, "descriptor_prefetch"), PtxType.PRED)
+    done = p.unique_ptx_names((op, "descriptor_prefetch_done"), PtxType.LABEL)
+    p.write_line("// Advisory TMA descriptor prefetch, once per CTA.")
+    for axis, reg in zip("xyz", thread):
+        p.write_line(f"mov.u32 {reg}, %tid.{axis};")
+    p.write_line(f"mad.lo.u32 {thread[1]}, {thread[2]}, {block_dim[1]}, {thread[1]};")
+    p.write_line(f"mad.lo.u32 {thread[0]}, {thread[1]}, {block_dim[0]}, {thread[0]};")
+    # Warp membership follows the linear thread index, including XYZ blocks.
+    # Every active lane in the first warp has the same descriptor pointer;
+    # the hardware emits one uniform UTMACCTL.PF per descriptor, avoiding a
+    # divergent single-lane region and its reconvergence bookkeeping.
+    p.write_line(f"setp.lt.u32 {elected}, {thread[0]}, 32;")
+    p.write_line(f"@!{elected} bra.uni {done};")
+    for arg in descriptors:
+        pointer = p.unique_ptx_names_for_value(arg)
+        p.write_line(f"prefetch.tensormap [{pointer}];")
+    p.write_line(f"{done}:")
+    p.write_newline_once()
 
 
 def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
@@ -507,8 +639,38 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
     p.write_newline_once()
     p.write_line(f"// PTX template `{_op_description(p, op)}`")
     for line in expanded.splitlines():
-        p.write_line(line.strip())
+        _write_template_line(p, line.strip())
     p.write_newline_once()
+
+
+def _write_template_line(p: PtxPrinter, line: str) -> None:
+    """Write one template line with shared symbols placed in the arena."""
+    declaration = re.fullmatch(r"\.shared\s+\.align\s+\d+\s+\.b\d+\s+(\S+)\[\d+\];", line)
+    if declaration and declaration[1] in p.shared_offsets:
+        return
+    address = re.fullmatch(r"mov\.u32\s+(%\w+),\s*(\w+);", line)
+    remote = re.fullmatch(r"mapa\.shared::cluster\.u32\s+(%\w+),\s*(%\w+),\s*(%\w+);", line)
+    destination = re.match(r"(?:@!?%\w+\s+)?[a-z][\w.:]*\s+(%\w+)\s*,", line)
+    if destination:
+        p.shared_addresses.pop(destination[1], None)
+    if address and address[2] in p.shared_offsets:
+        arena, base, offset = p.shared_offsets[address[2]]
+        p.write_line(f"mov.u32 {address[1]}, {arena}+{offset};")
+        p.shared_addresses[address[1]] = (base, offset)
+    elif remote and remote[2] in p.shared_addresses:
+        dst, source, rank = remote.groups()
+        base, offset = p.shared_addresses[source]
+        p.write_line(f"mapa.shared::cluster.u32 {dst}, {base}, {rank};")
+        p.write_line(f"add.u32 {dst}, {dst}, {offset};")
+    else:
+        for symbol in re.findall(r"\[(\w+)\]", line):
+            if symbol in p.shared_offsets:
+                arena, _, offset = p.shared_offsets[symbol]
+                line = line.replace(f"[{symbol}]", f"[{arena}+{offset}]")
+        if declaration and p.pack_shared_declarations:
+            p.shared_declarations.append((int(line.split()[2]), line))
+        else:
+            p.write_line(line)
 
 
 def _emit_thread_id(p: PtxPrinter, op: ThreadIdOp) -> None:
@@ -636,6 +798,8 @@ def _emit_index_div(p: PtxPrinter, op: IndexDivOp) -> None:
     if rhs_val is not None and _is_power_of_2(rhs_val):
         shift = rhs_val.bit_length() - 1
         _write_with_comment(p, f"shr.b32 {dst}, {lhs}, {shift};", op)
+    elif rhs_val is not None and 1 < rhs_val < (1 << 32) and _integer_index_division(op):
+        _emit_unsigned_constant_divmod(p, op, dst, lhs, rhs_val, remainder=False)
     elif rhs_val is not None:
         _write_with_comment(p, f"div.u32 {dst}, {lhs}, {rhs_val};", op)
     else:
@@ -650,11 +814,37 @@ def _emit_index_mod(p: PtxPrinter, op: IndexModOp) -> None:
     if rhs_val is not None and _is_power_of_2(rhs_val):
         mask = rhs_val - 1
         _write_with_comment(p, f"and.b32 {dst}, {lhs}, {mask};", op)
+    elif rhs_val is not None and 1 < rhs_val < (1 << 32) and _integer_index_division(op):
+        _emit_unsigned_constant_divmod(p, op, dst, lhs, rhs_val, remainder=True)
     elif rhs_val is not None:
         _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs_val};", op)
     else:
         rhs = p.unique_ptx_names_for_value(op.rhs)
         _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs};", op)
+
+
+def _integer_index_division(op: Op) -> bool:
+    kernel = find_ancestor_of_type(op, KernelOp)
+    return kernel is not None and kernel.attrs.get("integer_index_division", False)
+
+
+def _emit_unsigned_constant_divmod(p, op, dst, lhs, divisor, *, remainder):
+    """Exact unsigned division using a floor reciprocal and one correction.
+
+    For every uint32 x, mulhi(x, floor(2**32/d)) is either floor(x/d)
+    or one less: the reciprocal error times x is strictly below one.
+    The tentative remainder therefore fits uint32 and is below 2*d.
+    Correct it once when it reaches d. This avoids ptxas's floating
+    reciprocal setup and two correction chains for div/rem.u32.
+    """
+    quotient = p.unique_ptx_names((op, "quotient"), PtxType.B32) if remainder else dst
+    residual = dst if remainder else p.unique_ptx_names((op, "residual"), PtxType.B32)
+    correction = p.unique_ptx_names((op, "correction"), PtxType.PRED)
+    p.write_line(f"mul.hi.u32 {quotient}, {lhs}, {(1 << 32) // divisor};")
+    p.write_line(f"mad.lo.u32 {residual}, {quotient}, {-divisor}, {lhs};")
+    p.write_line(f"setp.ge.u32 {correction}, {residual}, {divisor};")
+    instruction = (f"@{correction} add.u32 {dst}, {dst}, {-divisor if remainder else 1};")
+    _write_with_comment(p, instruction, op)
 
 
 def _emit_to_ptr(p: PtxPrinter, op: ToPtrOp) -> None:

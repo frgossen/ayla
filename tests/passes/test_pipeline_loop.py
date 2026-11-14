@@ -6,6 +6,47 @@ from ayla.gpu_dialect import gpu_dialect
 from ayla.passes.pipeline_loop import pipeline_loop
 
 
+def test_guarded_tail_keeps_one_consumer_body_and_suppresses_the_extra_producer():
+    from ayla.base.ir import find_ops_of_type
+    from ayla.gpu_dialect import (ForOp, IfOp, IndexAddOp, IndexConstantOp,
+                                 IndexLtOp, MoveOp)
+    module = gpu_dialect.parse_module('''module {kernel @tail(%g:gmem<1xf32>) {
+      %s:smem<1xf32>=alloc()
+      %r:rmem<1xf32>=alloc()
+      for (%i:index=2 to 10 step 2) attrs={label:"jobs"} {
+        move(%s:smem<1xf32>,%g:gmem<1xf32>) attrs={label:"produce"}
+        move(%r:rmem<1xf32>,%s:smem<1xf32>) attrs={label:"consume"}
+      }
+    }}''')
+    pipeline_loop(module, 'jobs', 'produce', 1, guarded_tail=True)
+    loop = find_ops_of_type(module, ForOp)[0]
+    assert (loop.lb, loop.ub, loop.step) == (2, 10, 2)
+    assert len([op for op in find_ops_of_type(module, MoveOp)
+                if op.attrs.get('label') == 'consume']) == 1
+    values, sequence = {}, []
+    def walk(block):
+        for op in block.ops:
+            if isinstance(op, IndexConstantOp): values[op.result()] = op.value
+            elif isinstance(op, IndexAddOp): values[op.result()] = values[op.lhs] + values[op.rhs]
+            elif isinstance(op, IndexLtOp): values[op.result()] = values[op.lhs] < values[op.rhs]
+            elif isinstance(op, ForOp):
+                for i in range(op.lb, op.ub, op.step):
+                    values[op.iv] = i
+                    walk(op.body)
+            elif isinstance(op, IfOp):
+                if values[op.condition]: walk(op.body)
+            elif isinstance(op, MoveOp): sequence.append(op.attrs['label'])
+    walk(module.body.ops[0].body)
+    assert sequence == ['produce', 'consume'] * 4
+
+
+def test_guarded_tail_rejects_an_unsupported_pipeline_distance():
+    import pytest
+    from ayla.passes.pipeline_loop import PipelineLoop
+    with pytest.raises(ValueError, match='offset one'):
+        PipelineLoop('jobs', 'produce', 2, guarded_tail=True)
+
+
 def test_pipeline_reorders_across_inner_loop():
     """Pipelining a labeled load past an unlabeled inner for-loop.
 

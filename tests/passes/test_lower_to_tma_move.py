@@ -96,3 +96,22 @@ def test_multicast_load_without_whole_swizzle_atoms_stays_whole():
     text = repr(module)
     assert text.count("tma_move(") == 1
     assert 'tile=24x64 swizzle="128B">' in text
+
+
+def test_column_major_store_splits_contiguous_row_tail():
+    module = gpu_dialect.parse_module('''module {
+      kernel @tail(%c: gmem<96x1024xf16 strides=[1, 96]>) {
+        %s: smem<128x64xf16 strides=[1, 128] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
+        %t: gmem<128x64xf16 strides=[1, 96]> = tile(%c: gmem<96x1024xf16 strides=[1, 96]>, 0, 0)
+        move(%t: gmem<128x64xf16 strides=[1, 96]>, %s: smem<128x64xf16 strides=[1, 128] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}>) attrs={tma: True}
+      }}''')
+    module = lower_to_tma_move(module)
+    moves = find_ops_of_type(module, TmaMoveOp)
+    assert len(moves) == 2
+    for move in moves:
+        assert move.src.type.sizes == [64, 64]
+        assert move.dst.type.gmem_type.sizes == [1024, 96]
+        assert move.dst.type.tile_sizes == (64, 64)
+        assert move.dst.type.attrs.get('physical_layout') is None
+        assert move.dst.type.swizzle == '128B'
+    assert 'index_constant() attrs={value: 64}' in repr(module)

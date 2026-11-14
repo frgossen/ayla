@@ -6,11 +6,11 @@ import enum
 import itertools
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import total_ordering
 from typing import ClassVar, Iterator, Literal, cast
 
-from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor_of_type
+from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor, find_ancestor_of_type, find_ops_of_type
 from .base.printer import Printer
 
 
@@ -216,6 +216,16 @@ class KernelOp(GpuOp):
     def is_clustered(self) -> bool:
         """Whether the launch has more than one CTA per cluster."""
         return math.prod(dim if dim is not None else 1 for dim in self.cluster_dim) > 1
+
+    @property
+    def has_repeated_tmem_allocation(self) -> bool:
+        """Whether an enclosing loop can execute a TMEM allocation again."""
+        return any(
+            isinstance(alloc.result().type, TmemTensorType)
+            and find_ancestor(alloc, lambda parent: isinstance(parent, ForOp)
+                              and parent.trip_count > 1) is not None
+            for alloc in find_ops_of_type(self, AllocOp)
+        )
 
     @property
     def extra_attrs(self) -> dict[str, object]:
@@ -962,8 +972,10 @@ class DeallocOp(GpuOp):
 
     @classmethod
     def build(cls, value: Value) -> "DeallocOp":
-        assert isinstance(value.type, TmemTensorType), (
-            f"DeallocOp: expected tensor memory; got {value.type}"
+        assert isinstance(value.type, TmemTensorType) or (
+            isinstance(value.type, LockType) and value.type.is_event
+        ), (
+            f"DeallocOp: expected tensor memory or a completion lock; got {value.type}"
         )
         return cls(operands=[value], results=[])
 
@@ -1222,7 +1234,9 @@ class LockType(Type):
     mbarrier (TMA) or the wgmma commit-group counter at the hardware level.
 
     The ``kind`` attribute encodes the hardware mechanism:
-      - ``"mbar"``: mbarrier-based (lock value = mbarrier smem address)
+      - ``"mbar"``: mbarrier-based (lock value = mbarrier smem address).
+        An ``arrivals`` type attribute declares a gather resource with one
+        arrival per warp; it is consumed by BarrierOp, not AsyncOp/AwaitOp.
       - ``"cluster_mbar"``: cluster-to-leader rendezvous mbarrier in shared
         memory (lock value = the rank-0 CTA's mbarrier address)
       - ``"wgmma"``: wgmma commit-group counter (lock value unused)
@@ -1246,12 +1260,21 @@ class LockType(Type):
     @property
     def supports_partial_await(self) -> bool:
         """Whether an await may leave newer hardware groups pending."""
-        return self.kind == "wgmma"
+        return self.kind in ("wgmma", "bulk")
 
     @property
     def orders_async_writes(self) -> bool:
         """Whether consecutive MMA issues order their accumulator updates."""
         return self.kind in ("wgmma", "tcgen05")
+
+    @property
+    def is_event(self) -> bool:
+        """Whether completion is a phase-tracked mbarrier event."""
+        return self.kind in ("mbar", "tcgen05")
+
+    @property
+    def cta_group(self) -> int:
+        return self.attrs.get("cta_group", 1)  # type: ignore[return-value]
 
     def print(self, p: Printer) -> None:
         p.write("lock<")
@@ -1297,6 +1320,16 @@ class AwaitOp(GpuOp):
         self.operands[0] = value
 
     @property
+    def waiter_warps(self) -> tuple[int, ...] | None:
+        """Warps observing completion; None preserves all-CTA participation.
+
+        All actors advance their private event parity, including nonwaiters.
+        Observing completion in one warp does not publish it to other warps.
+        """
+        value = self.attrs.get("waiter_warps")
+        return None if value is None else tuple(value)
+
+    @property
     def pending_groups(self) -> int:
         return cast(int, self.attrs.get("pending", 0))
 
@@ -1311,7 +1344,8 @@ class BarrierOp(GpuOp):
     """A rendezvous / synchronization point across a set of threads.
 
     It only establishes a happens-before across its participating threads.
-    Most hardware-backed scopes need no operand. A ``cluster_to_leader`` barrier
+    Most hardware-backed scopes need no operand. A phase-tracked ``block_leader``
+    barrier carries an ordinary mbarrier with its arrival count. A ``cluster_to_leader`` barrier
     carries its cluster mbarrier, while a software grid barrier carries its
     zero-initialized global-memory
     synchronization buffer. Kernels using a grid barrier must be scheduled so
@@ -1400,12 +1434,13 @@ class IfOp(GpuOp):
 
 @gpu_dialect.register_op("async")
 class AsyncOp(GpuOp):
-    """A group of async work issued together and completed by one ``await``.
+    """A group of async work issued together with explicit completion events.
 
     Wraps a body block of ops that run asynchronously under one ``lock``. The
-    lock is the only operand — what an async op carries beyond the plain op(s)
+    completion locks are the operands — what an async op carries beyond the plain op(s)
     it wraps — while the work ops inside keep their own (matmul/move) operands.
-    Completion is signalled elsewhere by ``await(%lock)``. Its collective
+    Completion is observed by ``await(%lock)``. Additional tcgen05 events
+    signal the same data work while retaining independent phase lifetimes. Its collective
     records the scope of the work it groups.
     """
 
@@ -1416,6 +1451,7 @@ class AsyncOp(GpuOp):
         collective: dict[CollectiveAxis, CollectiveLevel],
         body: Block | None = None,
         attrs: dict[str, object] | None = None,
+        completion_locks: list[Value] | None = None,
     ) -> "AsyncOp":
         assert isinstance(lock.type, LockType), (
             f"AsyncOp: expected LockType; got {lock.type}"
@@ -1428,7 +1464,23 @@ class AsyncOp(GpuOp):
             )
         attrs = dict(attrs or {})
         attrs["collective"] = dict(collective)
-        return cls(operands=[lock], results=[], attrs=attrs, blocks=[body])
+        additional = list(completion_locks or [])
+        if any(not isinstance(value.type, LockType) for value in additional):
+            raise ValueError('additional completions must be locks')
+        if len(set([lock, *additional])) != 1 + len(additional):
+            raise ValueError('completion locks must be distinct')
+        return cls(operands=[lock, *additional], results=[], attrs=attrs, blocks=[body])
+
+    @property
+    def completion_locks(self) -> list[Value]:
+        """Independent events committed after the same group of MMA work.
+
+        Each event has its own phase lifetime. Observing one completes the
+        group's data accesses, but does not observe another event's phase.
+        Additional events currently require single-CTA tcgen05 without a
+        release relay; verification rejects other mechanisms.
+        """
+        return list(self.operands)
 
     @property
     def lock(self) -> Value:
@@ -1459,7 +1511,10 @@ class AsyncOp(GpuOp):
 
     def print(self, p: Printer) -> None:
         p.write(f"{self.op_id}(")
-        self.lock.print(p)
+        for index, lock in enumerate(self.completion_locks):
+            if index:
+                p.write(', ')
+            lock.print(p)
         p.write(")")
         _print_collective(p, self.collective)
         p.write_extra_attrs(self.attrs, skip_keys=("collective",))
@@ -1478,6 +1533,10 @@ class AsyncOp(GpuOp):
             )
         p.read_literal("(")
         lock = Value.parse(p)
+        additional = []
+        while p.can_read_literal(','):
+            p.read_literal(',')
+            additional.append(Value.parse(p))
         p.read_literal(")")
         collective = _parse_collective(p)
         attrs = p.read_extra_attrs()
@@ -1492,11 +1551,19 @@ class AsyncOp(GpuOp):
             collective=collective,
             body=body,
             attrs=attrs,
+            completion_locks=additional,
         )
 
 
 @gpu_dialect.register_op("ptx_template")
 class PTXTemplateOp(GpuOp):
+    """PTX with explicit SSA inputs and outputs.
+
+    ``pure=True`` promises deterministic register computation with no hidden
+    reads, writes, synchronization, or control effects. Such templates can be
+    shared and moved by CSE and LICM; ordinary templates remain effectful.
+    """
+
     @classmethod
     def build(
         cls,
@@ -2073,11 +2140,15 @@ class RmemTensorType(RegMemTensorType):
 
 @gpu_dialect.register_type("tmem")
 class TmemTensorType(MemTensorType):
-    """Blackwell tensor-memory allocation owned by one CTA.
+    """Blackwell tensor-memory allocation owned by one CTA or a CTA pair.
 
     Tensor memory has 128 lanes of 32-bit cells. Dense f32 accumulators use one
     tensor-memory column per logical output column; allocation is therefore
     explicit and constrained to the hardware's power-of-two column granularity.
+    An M64 MMA uses the first 16 rows of each physical 32-row warp partition;
+    an M128 MMA uses the whole partition. Both have four participating warps.
+    With cta_group=2 the shape is the local M64/M128 shard of a paired M128/M256 MMA;
+    both CTAs allocate the same columns and each drains its own output rows.
     """
 
     @classmethod
@@ -2089,6 +2160,8 @@ class TmemTensorType(MemTensorType):
         attrs: dict[str, object] | None = None,
     ):
         assert len(sizes) == 2, f"TmemTensorType: expected rank 2; got {sizes}"
+        cta_group = (attrs or {}).get("cta_group", 1)
+        assert type(cta_group) is int and cta_group in (1, 2), "TMEM supports one or two CTAs"
         columns = (
             max(32, 1 << (sizes[1] - 1).bit_length()) if columns is None else columns
         )
@@ -2096,8 +2169,8 @@ class TmemTensorType(MemTensorType):
             "TmemTensorType: columns must be a power of two in [32, 512]; "
             f"got {columns}"
         )
-        assert sizes[0] == 128 and 0 < sizes[1] <= columns, (
-            "TMEM requires 128 rows and enough columns"
+        assert sizes[0] in (64, 128) and 0 < sizes[1] <= columns, (
+            "TMEM requires 64 or 128 logical rows and enough columns"
         )
         assert isinstance(dtype, F32Type), "TMEM accumulators require f32"
         return cls(
@@ -2112,6 +2185,11 @@ class TmemTensorType(MemTensorType):
     @property
     def columns(self) -> int:
         return self.attrs["columns"]  # type: ignore[return-value]
+
+    @property
+    def cta_group(self) -> int:
+        """CTAs sharing an MMA; sizes describe the local accumulator shard."""
+        return self.attrs.get("cta_group", 1)  # type: ignore[return-value]
 
     def print(self, p: Printer) -> None:
         p.write(self.name)
@@ -2219,7 +2297,7 @@ class WgrmemTensorType(RegMemTensorType):
     a fragment in its own registers; the full value is the union of all
     threads' fragments. `warps` specifies how many warps collectively
     own the value (1 for Volta mma.sync, 4 for Hopper wgmma and for
-    Blackwell tensor-memory loads).
+    Blackwell tensor-memory loads; eight warps can share an M64/M128 TMEM value).
 
     The ``layout`` attribute encodes the element-to-thread-register mapping.
     The mapping is determined by the instruction that writes the tensor.
@@ -2981,6 +3059,88 @@ class SelectOp(GpuOp):
         return self.operands[1:]
 
 
+@gpu_dialect.register_op("predicate")
+class PredicateOp(GpuOp):
+    """Compose scalar scheduling guards without converting them to indices."""
+
+    @classmethod
+    def build(cls, kind: str, *operands: Value) -> "PredicateOp":
+        assert kind in ("and", "or", "not")
+        assert len(operands) == (1 if kind == "not" else 2)
+        assert all(isinstance(value.type, PredicateType) for value in operands)
+        return cls(operands=list(operands), results=[Value(name=None, type=PredicateType())],
+                   attrs={"kind": kind})
+
+
+@gpu_dialect.register_op("operand_pipeline")
+class OperandPipelineOp(GpuOp):
+    """A completed operand pipeline, represented by a serial K iteration.
+
+    The body contains a load/await and MMA/await pair. Execution completes all
+    iterations before returning, including a collective publication. Its late
+    lowering may overlap those iterations using distinct operand/event banks.
+    """
+
+    @classmethod
+    def build(cls, loop: ForOp, depth: int):
+        return cls(
+            operands=[],
+            results=[],
+            blocks=[loop.body],
+            attrs={**loop.attrs, "depth": depth},
+        )
+
+    @property
+    def body(self):
+        return self.blocks[0]
+
+
+@gpu_dialect.register_op("persistent_pipeline")
+class PersistentPipelineOp(GpuOp):
+    """A completed persistent schedule, with private operand/frame events.
+
+    The body is the serial output-job schedule. Like operand_pipeline, its
+    late implementation may overlap work, but leaves no asynchronous tensor
+    access outstanding at the boundary. Operand zero is the TMEM arena; both
+    accumulator slots belong to this completed region.
+    """
+
+    @classmethod
+    def build(cls, loop, arena, depth):
+        return cls(operands=[arena], results=[], blocks=[Block(ops=[loop])],
+                   attrs={"depth": depth})
+
+    @property
+    def body(self):
+        return self.blocks[0]
+
+
+@gpu_dialect.register_op("lock_view")
+class LockViewOp(GpuOp):
+    """One physical event and explicit expected phase in an event allocation."""
+
+    @classmethod
+    def build(cls, arena: Value, index: Value, phase: Value):
+        if (
+            not isinstance(arena.type, LockType)
+            or not arena.type.is_event
+            or type(arena.type.attrs.get("count", 1)) is not int
+            or arena.type.attrs.get("count", 1) < 1
+            or arena.type.attrs.get("count", 1) == 1 and not (
+                isinstance(index.definition, IndexConstantOp) and index.definition.value == 0)
+            or not isinstance(index.type, IndexType)
+            or not isinstance(phase.type, IndexType)
+        ):
+            raise ValueError(
+                "event view requires an event allocation and valid index/phase values"
+            )
+        typ = LockType.build(
+            arena.type.kind,
+            {k: v for k, v in arena.type.attrs.items() if k not in ("kind", "count")},
+        )
+        return cls(operands=[arena, index, phase], results=[Value(name=None, type=typ)])
+
+
 def root_buffers(value: Value) -> set[Value]:
     """Return every physical buffer that may underlie ``value``."""
     definition = value.definition
@@ -3084,7 +3244,7 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, WrmemTensorType):
         return CollectiveScope.WARP
     if isinstance(t, WgrmemTensorType):
-        return CollectiveScope.WARPGROUP
+        return CollectiveScope.BLOCK if t.warps > 4 else CollectiveScope.WARPGROUP
     if isinstance(t, (SmemTensorType, TmemTensorType)):
         return CollectiveScope.BLOCK
     if isinstance(t, GmemTensorType):
@@ -3102,6 +3262,10 @@ class MemoryEffect:
     value: Value
     scope: CollectiveScope
     tiling_scheme: int | None = None
+    # Execution identity is separate from the physical collective extent.
+    # Only leader scopes carry an elected issuer; other scopes remain shared.
+    issuer_warp: int | None = None
+    participant_warps: frozenset[int] | None = None
 
     _tiling_scheme_id_counter: ClassVar[Iterator[int]] = itertools.count()
 
@@ -3116,13 +3280,89 @@ class MemoryEffect:
         return root_buffers(self.value)
 
 
+    @property
+    def memory_region(self) -> tuple[int, int] | None:
+        """A conservative static interval in one physical arena's units."""
+        return static_tmem_columns(self.value)
+
+
+def static_columns(value: Value, whole: Value | None = None) -> tuple[int, int] | None:
+    """Static last-dimension interval of a view that keeps every other extent.
+
+    The interval is relative to ``whole``, or else to the view's sole
+    allocation, which must contain it. Dynamic indices, partial leading
+    extents, casts and other producers remain unknown.
+    """
+    typ = value.type
+    assert isinstance(typ, MemTensorType)
+    if not typ.rank:
+        return (0, 1) if value is whole else None
+    offset, width = 0, typ.sizes[-1]
+    while value is not whole and isinstance(tile := value.definition, TileOp):
+        sizes, indices = value.type.sizes, tile.static_indices
+        if (any(i != 0 for i in indices[:-1]) or list(sizes[:-1]) != list(tile.arg.type.sizes[:-1])
+                or indices[-1] is None or indices[-1] < 0 or sizes[-1] is None):
+            return None
+        offset += indices[-1] * sizes[-1]
+        value = tile.arg
+    if width is None or value is not whole and (
+            whole is not None or not isinstance(value.definition, AllocOp)
+            or offset + width > value.type.sizes[-1]):
+        return None
+    return offset, offset + width
+
+
+def static_tmem_columns(value: Value) -> tuple[int, int] | None:
+    """Proven static columns of a TMEM view within its opt-in arena, or unknown."""
+    root = value.definition
+    while isinstance(root, TileOp):
+        root = root.arg.definition
+    if (not isinstance(value.type, TmemTensorType) or not isinstance(root, AllocOp)
+            or not root.attrs.get('track_column_regions')):
+        return None
+    return static_columns(value)
+
+
+def memory_regions_may_overlap(a: tuple[int, int] | None, b: tuple[int, int] | None) -> bool:
+    return a is None or b is None or not (a[1] <= b[0] or b[1] <= a[0])
+
+
+def memory_effects_may_alias(first: MemoryEffect, second: MemoryEffect) -> bool:
+    return bool(first.roots & second.roots) and memory_regions_may_overlap(
+        first.memory_region, second.memory_region)
+
+
 def _memory_effect(
     kind: Literal["R", "W"],
     value: Value,
     scope: CollectiveScope,
     tiling_scheme: int | None = None,
+    issuer_warp: int = 0,
 ) -> list[MemoryEffect]:
-    return [MemoryEffect(kind, value, scope, tiling_scheme)]
+    leader = scope in (CollectiveScope.BLOCK_LEADER, CollectiveScope.CLUSTER_LEADER)
+    return [MemoryEffect(kind, value, scope, tiling_scheme, issuer_warp if leader else None)]
+
+
+def execution_issuer_warp(op: Op) -> int:
+    """The elected issuing warp of an ordinary TMA/tcgen05 async operation.
+
+    A group inherits its members' identity and cannot combine different
+    issuers. The attribute is ordinary scheduling metadata on move/matmul;
+    memory arenas and completion mechanisms remain unchanged.
+    """
+    explicit = op.attrs.get('issuer_warp')
+    if isinstance(op, AsyncOp):
+        members = {execution_issuer_warp(inner) for inner in op.body.ops}
+        if len(members) != 1:
+            raise ValueError('an async group requires one issuing warp')
+        [inherited] = members
+        if explicit is not None and explicit != inherited:
+            raise ValueError('async issuing warp differs from its members')
+        return inherited
+    issuer = 0 if explicit is None else explicit
+    if not isinstance(issuer, int) or isinstance(issuer, bool) or issuer < 0:
+        raise ValueError('issuer_warp must be a nonnegative integer')
+    return issuer
 
 
 def _tensor_memory_or_thread_scope(value: Value) -> CollectiveScope:
@@ -3145,7 +3385,33 @@ def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
     return kernel.body.arguments[value.type.arg_idx]
 
 
+def execution_warps(op: Op) -> frozenset[int] | None:
+    """Local warp participants; physical memory scope remains independent."""
+    raw = op.attrs.get("participant_warps")
+    if raw is None:
+        return None
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None or kernel.block_dim[1:] != (1, 1) or not is_warp_list(raw, kernel):
+        raise ValueError("participant_warps must list distinct launched warps in a one-dimensional CTA")
+    return frozenset(raw)
+
+
+def is_warp_list(raw: object, kernel: KernelOp) -> bool:
+    """Whether ``raw`` is a nonempty list of distinct launched warps."""
+    return (isinstance(raw, (tuple, list)) and bool(raw)
+            and all(type(w) is int and 0 <= w < kernel.num_threads // 32 for w in raw)
+            and len(set(raw)) == len(raw))
+
+
 def memory_effects(op: Op) -> list[MemoryEffect] | None:
+    effects = _memory_effects(op)
+    actors = execution_warps(op)
+    if actors is not None and effects is not None:
+        return [replace(effect, participant_warps=actors) for effect in effects]
+    return effects
+
+
+def _memory_effects(op: Op) -> list[MemoryEffect] | None:
     """Best-effort memory effect summary for ``op``.
 
     Each effect retains the accessed view so consumers can recover its precise
@@ -3178,7 +3444,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         # levels can express leader-only execution. For now, the destination
         # memory space distinguishes a TMA load from a store, while ``multicast``
         # distinguishes the cluster leader from an ordinary block leader.
-        if op.multicast is True:
+        if op.multicast is True or op.attrs.get("cta_group", 1) == 2:
             dst_scope = CollectiveScope.CLUSTER_LEADER
         elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):
             dst_scope = CollectiveScope.BLOCK_LEADER
@@ -3191,11 +3457,13 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             op.dst,
             dst_scope,
             cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            execution_issuer_warp(op),
         ) + _memory_effect(
             "R",
             op.src,
             src_scope,
             cast(int | None, op.attrs.get("src_tiling_scheme")),
+            execution_issuer_warp(op),
         )
     if isinstance(op, TmaMoveOp):
         # A block leader issues ordinary TMA, while the cluster leader issues
@@ -3203,7 +3471,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         # metadata, so resolve it to the underlying kernel argument.
         dst_scope = (
             CollectiveScope.CLUSTER_LEADER
-            if op.multicast is True
+            if op.multicast is True or op.attrs.get("cta_group", 1) == 2
             else CollectiveScope.BLOCK_LEADER
             if isinstance(op.dst.type, SmemTensorType)
             else CollectiveScope.GRID
@@ -3218,15 +3486,20 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             _resolve_tma_descriptor(op, op.dst),
             dst_scope,
             cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            execution_issuer_warp(op),
         ) + _memory_effect(
             "R",
             _resolve_tma_descriptor(op, op.src),
             src_scope,
             cast(int | None, op.attrs.get("src_tiling_scheme")),
+            execution_issuer_warp(op),
         )
     if isinstance(op, MatmulOp):
         # The wgmma accumulator (dst) is per-thread registers -> THREAD.
         dst_scope = _tensor_memory_or_thread_scope(op.dst)
+        paired = isinstance(op.dst.type, TmemTensorType) and op.dst.type.cta_group == 2
+        if paired:
+            dst_scope = CollectiveScope.CLUSTER
         init_effects = (
             []
             if op.init is None
@@ -3240,13 +3513,13 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             _memory_effect(
                 "R",
                 op.lhs,
-                _type_collective_scope(op.lhs.type),
+                CollectiveScope.CLUSTER_LEADER if paired and isinstance(op.lhs.type, SmemTensorType) else _type_collective_scope(op.lhs.type),
                 cast(int | None, op.attrs.get("lhs_tiling_scheme")),
             )
             + _memory_effect(
                 "R",
                 op.rhs,
-                _type_collective_scope(op.rhs.type),
+                CollectiveScope.CLUSTER_LEADER if paired and isinstance(op.rhs.type, SmemTensorType) else _type_collective_scope(op.rhs.type),
                 cast(int | None, op.attrs.get("rhs_tiling_scheme")),
             )
             + init_effects
@@ -3304,14 +3577,46 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             peer_effects = memory_effects(peer)
             if peer_effects is None:
                 return None
+            if op.lock.type.attrs.get('completion_role') == 'result':
+                peer_effects = [effect for effect in peer_effects
+                    if effect.kind == 'W' and isinstance(effect.value.type, TmemTensorType)]
             effects.extend(peer_effects)
+        return effects
+    if isinstance(op, (OperandPipelineOp, PersistentPipelineOp)):
+        # The serial body defines synchronous boundary effects. Event storage
+        # is private to the implementation, not an outstanding outer effect.
+        effects = []
+        for inner in op.body.ops:
+            summary = memory_effects(inner)
+            if summary is None:
+                return None
+            effects.extend(
+                effect
+                for effect in summary
+                if not isinstance(effect.value.type, LockType)
+            )
+        if isinstance(op, PersistentPipelineOp):
+            effects.extend(_memory_effect("W", op.operands[0], CollectiveScope.BLOCK))
         return effects
     if isinstance(op, (ForOp, IfOp, AsyncOp, KernelOp)):
         effects: list[MemoryEffect] = []
         if isinstance(op, AsyncOp):
-            scope = _lock_scope(op.lock)
-            if scope is not None:
-                effects.extend(_memory_effect("R", op.lock, scope))
+            for lock in op.completion_locks:
+                scope = _lock_scope(lock)
+                if scope is None:
+                    continue
+                # TMA/tcgen05 event access belongs to the elected issuer;
+                # completion observations are modeled separately by awaits.
+                # Issuing a new phase writes the completion event. An await's
+                # per-thread phase observations must reach this issuer before
+                # it can reuse the event; engine completion alone is weaker.
+                issuer = (CollectiveScope.CLUSTER_LEADER
+                          if lock.type.cta_group == 2 or lock_has_tma_multicast(lock)
+                          else CollectiveScope.BLOCK_LEADER)
+                effects.extend(_memory_effect("R", lock, issuer if lock.type.is_event else scope,
+                    issuer_warp=execution_issuer_warp(op)))
+                if lock.type.is_event:
+                    effects.extend(_memory_effect("W", lock, issuer, issuer_warp=execution_issuer_warp(op)))
         for block in op.blocks:
             for body_op in block.ops:
                 body_effects = memory_effects(body_op)
@@ -3324,11 +3629,24 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
 
 def has_ordering_effect(op: Op) -> bool:
     """Whether ``op`` or a nested operation constrains operation ordering."""
-    if isinstance(op, BarrierOp):
+    if isinstance(op, (BarrierOp, PersistentPipelineOp)) or isinstance(op, AsyncOp) and op.attrs.get("release_prior"):
+        return True
+    if isinstance(op, OperandPipelineOp) and releases_cluster_banks(op):
+        # Hardware cluster bank release drains every bank and rendezvouses at
+        # this completed-region boundary (LowerRolledK; modeled the same way
+        # by sync analysis). Other regions keep their effect-based ordering.
         return True
     return any(
         has_ordering_effect(nested) for block in op.blocks for nested in block.ops
     )
+
+
+def releases_cluster_banks(op: Op) -> bool:
+    """Whether hardware cluster bank release completes an MMA issue in ``op``.
+
+    PipelineClusterBanks gives every MMA event of its kernel CTA release masks.
+    """
+    return any("completion_cta_masks" in issue.lock.type.attrs for issue in find_ops_of_type(op, AsyncOp))
 
 
 def ordered_async_roots(op: Op) -> set[Value]:
@@ -3352,11 +3670,16 @@ def ordered_async_roots(op: Op) -> set[Value]:
 def _lock_scope(lock: Value) -> CollectiveScope | None:
     """The scope at which a lock's initialization must be visible, if any."""
     assert isinstance(lock.type, LockType)
-    if lock.type.kind == "cluster_mbar" or lock_has_tma_multicast(lock):
+    if lock_is_cluster_scoped(lock):
         return CollectiveScope.CLUSTER
-    if lock.type.kind in ("mbar", "tcgen05"):
-        return CollectiveScope.BLOCK
-    return None
+    return CollectiveScope.BLOCK if lock.type.is_event else None
+
+
+def lock_is_cluster_scoped(lock: Value) -> bool:
+    """Whether a lock is initialized, issued or completed across the cluster."""
+    typ = cast(LockType, lock.type)
+    return (typ.kind == "cluster_mbar" or typ.cta_group == 2
+            or "completion_cta_masks" in typ.attrs or lock_has_tma_multicast(lock))
 
 
 def lock_has_tma_multicast(lock: Value) -> bool:
@@ -3372,6 +3695,8 @@ def is_side_effect_free(op: Op) -> bool:
     Same operands and attrs always produce the same result, and nothing is read
     or written along the way.
     """
+    if isinstance(op, PTXTemplateOp):
+        return op.attrs.get("pure") is True
     if isinstance(op, AllocOp) and isinstance(op.result().type, TmemTensorType):
         return False
     return isinstance(
@@ -3386,9 +3711,11 @@ def is_side_effect_free(op: Op) -> bool:
             IndexLtOp,
             IndexModOp,
             IndexMulOp,
+            PredicateOp,
             PtrAddOp,
             ConstantOp,
             SelectOp,
+            LockViewOp,
             ReinterpretOp,
             ReshapeOp,
             ThreadIdOp,

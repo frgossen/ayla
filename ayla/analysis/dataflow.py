@@ -87,6 +87,15 @@ class DataflowAnalysis[StateT: DataflowState]:
         """Return the state at a forward entry or backward exit boundary."""
         return self._state_type.empty()
 
+    def branch_state(self, op: IfOp, state: StateT, taken: bool) -> StateT:
+        return state
+
+    def loop_backedge(self, op: ForOp, state: StateT) -> StateT:
+        return state
+
+    def loop_exit(self, op: ForOp, state: StateT) -> StateT:
+        return state
+
     def _transfer_op(self, op: Op, state: StateT) -> StateT:
         """Transfer ``state`` across one operation."""
         assert self._live_in is not None and self._live_out is not None
@@ -101,14 +110,15 @@ class DataflowAnalysis[StateT: DataflowState]:
             header = state
             while True:
                 live_out = self._transfer_block(op.body, header)
-                joined = header.join(live_out)
+                joined = header.join(self.loop_backedge(op, live_out))
                 if joined == header:
-                    result = header
+                    result = self.loop_exit(op, header)
                     break
                 header = joined
         # If ops and their join behavior are hard-coded by the framework.
         elif isinstance(op, IfOp):
-            result = state.join(self._transfer_block(op.body, state))
+            result = self.branch_state(op, state, False).join(
+                self._transfer_block(op.body, self.branch_state(op, state, True)))
         else:
             transfer = self._transfers.get(type(op))
             if transfer is None:

@@ -387,7 +387,8 @@ def test_lower_tma_multicast_uses_one_cluster_issuer_and_cluster_wait():
     leader = "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;"
     multicast = "mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
     arrive = "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64"
-    wait = "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+    # Async-proxy completion: a CTA-scope acquire suffices (no L1 invalidate).
+    wait = "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
     assert_contains_in_order(
         ptx,
         "fence.mbarrier_init.release.cluster;",

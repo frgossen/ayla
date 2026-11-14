@@ -11,6 +11,7 @@ from ayla.passes.pipeline_loop import PipelineLoop
 from ayla.passes.schedule_async import ScheduleAsync
 from ayla.ptx_codegen import make_ptx_kernel
 from ayla.ptx_runtime import make_ptx_launcher
+from tests.testing_utils import check_gemm
 
 
 def _module(body):
@@ -178,13 +179,4 @@ def test_queued_writeback_exact_across_bank_wraps_and_reduction_tails(
     )
     if n_tile % 16 == 0:
         assert "tcgen05.ld.sync.aligned.16x32bx2.x8.b32" in kernel.ptx
-    launch = make_ptx_launcher(kernel)
-    torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
-    for seed in (0, 11, 73):
-        torch.manual_seed(seed)
-        a = torch.randn(m, k, device="cuda", dtype=torch_dtype)
-        b = torch.randn(n, k, device="cuda", dtype=torch_dtype)
-        c = torch.full((m, n), float("nan"), device="cuda", dtype=torch_dtype)
-        for _ in range(10):
-            launch(a, b, c)
-        torch.testing.assert_close(c, a @ b.t(), rtol=0, atol=0)
+    check_gemm(make_ptx_launcher(kernel), m, n, k, dtype, runs=10)
