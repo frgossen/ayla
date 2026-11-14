@@ -56,30 +56,33 @@ def apply_gemm_schedule_seed_post_build(
     module: Any,
     seed: GemmScheduleSeed,
 ) -> Any:
-    """Apply the measured post-builder pass sequence required by ``seed``."""
-    if seed.pipeline_output_waves or seed.pipeline_output_writeback:
-        if (
-            seed.fixed_output_unroll_factor is not None
-            or seed.builder_config is None
-            or seed.builder_config.get("output_grid_size") is None
-        ):
+    """Apply wave pipelining and output unrolling to the labeled output loop."""
+    from .base.ir import find_ops_of_type
+    from .gpu_dialect import ForOp
+
+    def output_loop():
+        loops = [loop for loop in find_ops_of_type(module, ForOp)
+                 if loop.attrs.get("label") == "heuristic_output_grid"]
+        if len(loops) > 1:
+            raise ValueError("fixed output grid requires one labeled tile loop")
+        # Canonicalization removes a single-wave loop. Never select its K loop.
+        return loops[0] if loops else None
+
+    pipeline_output = seed.pipeline_output_waves or seed.pipeline_output_writeback
+    if pipeline_output:
+        if (seed.fixed_output_unroll_factor is not None
+                or seed.builder_config is None
+                or seed.builder_config.get("output_grid_size") is None):
             raise ValueError("wave pipelining requires a rolled fixed grid")
-        from .base.ir import find_ancestor_of_type, find_ops_of_type
-        from .gpu_dialect import AsyncOp, AwaitOp, ForOp
+    if pipeline_output and output_loop() is not None:
+        from .gpu_dialect import AsyncOp, AwaitOp
         from .pipelines.canonicalize import Canonicalize
-        from .passes.pipeline_loop import PipelineLoop
+        from .passes.pipeline_loop import PipelineLoop, guarded_body_ops
         from .passes.schedule_async import ScheduleAsync
 
-        outer_loops = [
-            loop
-            for loop in find_ops_of_type(module, ForOp)
-            if find_ancestor_of_type(loop, ForOp) is None
-        ]
-        if len(outer_loops) != 1:
-            raise ValueError("wave pipelining requires one outer tile loop")
-        outer_loops[0].attrs["label"] = "heuristic_output_grid"
-        if seed.pipeline_output_waves:
-            for body_op in outer_loops[0].body.ops:
+        loop = output_loop()
+        if loop is not None and seed.pipeline_output_waves:
+            for body_op in guarded_body_ops(loop.body):
                 if isinstance(body_op, AwaitOp):
                     break
                 if isinstance(body_op, AsyncOp) and re.fullmatch(
@@ -92,42 +95,34 @@ def apply_gemm_schedule_seed_post_build(
                 label_filter_op=r"heuristic_wave_prologue_async",
                 pipelining_offset=1,
             ).run(module)
-        if seed.pipeline_output_writeback:
-            # Issue everything but the output writeback one tile early, so a
-            # tile's writeback runs while the next tile's work is in flight.
+            # A short loop can disappear before the next overlap pass.
+            module = Canonicalize().run(module)
+        loop = output_loop()
+        if loop is not None and seed.pipeline_output_writeback:
             module = PipelineLoop(
                 label_filter_loop="heuristic_output_grid",
                 label_filter_op=r"(?!mm_dst_(smem|tma)).*",
                 pipelining_offset=1,
             ).run(module)
-        module = ScheduleAsync().run(module)
-        module = Canonicalize().run(module)
-    output_was_unrolled = (
-        seed.fixed_output_unroll_factor is not None
-        and seed.fixed_output_unroll_factor > 1
-    )
-    if output_was_unrolled:
-        from .base.ir import find_ancestor_of_type, find_ops_of_type
-        from .gpu_dialect import ForOp
-        from .pipelines.canonicalize import Canonicalize
-        from .passes.licm import LICM
-        from .passes.unroll_loop import UnrollLoop
+        module = Canonicalize().run(ScheduleAsync().run(module))
 
-        module = LICM().run(module)
-        module = LICM().run(module)
-        outer_loops = [
-            loop
-            for loop in find_ops_of_type(module, ForOp)
-            if find_ancestor_of_type(loop, ForOp) is None
-        ]
-        if len(outer_loops) != 1:
-            raise ValueError("fixed output-grid unrolling requires one outer tile loop")
-        outer_loops[0].attrs["label"] = "heuristic_output_grid"
-        module = UnrollLoop(
-            unroll_factor=cast(int, seed.fixed_output_unroll_factor),
-            label_filter="heuristic_output_grid",
-        ).run(module)
-        module = Canonicalize().run(module)
+    output_was_unrolled = False
+    if seed.fixed_output_unroll_factor is not None:
+        loop = output_loop()
+        if loop is not None:
+            factor = loop.trip_count
+            if factor > 1:
+                from .pipelines.canonicalize import Canonicalize
+                from .passes.licm import LICM
+                from .passes.unroll_loop import UnrollLoop
+
+                module = LICM().run(LICM().run(module))
+                module = UnrollLoop(
+                    unroll_factor=factor,
+                    label_filter="heuristic_output_grid",
+                ).run(module)
+                module = Canonicalize().run(module)
+                output_was_unrolled = True
     expected = ("schedule_async", "canonicalize")
     if seed.post_builder_passes and seed.post_builder_passes != expected:
         raise ValueError(
@@ -135,7 +130,6 @@ def apply_gemm_schedule_seed_post_build(
         )
     if not output_was_unrolled and not seed.post_builder_passes:
         return module
-    # Keep pass imports lazy so selecting a heuristic remains lightweight.
     from .pipelines.canonicalize import Canonicalize
     from .passes.schedule_async import ScheduleAsync
 

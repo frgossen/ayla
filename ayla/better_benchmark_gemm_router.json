@@ -1856,6 +1856,198 @@
       "n": 384,
       "k": 384,
       "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 2,
+      "k": 768,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 8192,
+      "n": 2,
+      "k": 768,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 2304,
+      "k": 768,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": 129,
+        "unroll_output_tiles": true,
+        "dst_l2_cache_hint": "evict_last",
+        "lhs_l2_cache_hint": "evict_first",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_m_tile": 192,
+        "output_n_tile": 192,
+        "output_slices": 4,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": null,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_n_tile": 192
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 3072,
+      "k": 768,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": 2,
+        "output_cta_count": 128,
+        "unroll_output_tiles": false,
+        "dst_l2_cache_hint": "evict_last",
+        "lhs_l2_cache_hint": "evict_first",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_m_tile": 128,
+        "output_n_tile": 256,
+        "output_slices": 4,
+        "output_store": "stmatrix",
+        "output_store_buffers": 4,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 128,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_n_tile": 256,
+        "cyclic_operand_pipeline": true,
+        "pipeline_output_waves": true,
+        "pipeline_output_writeback": true
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 16384,
+      "n": 2304,
+      "k": 768,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": 128,
+        "unroll_output_tiles": false,
+        "cyclic_operand_pipeline": false,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_last",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_m_tile": 256,
+        "output_n_tile": 128,
+        "output_slices": 2,
+        "output_store": "stmatrix",
+        "output_store_buffers": 2,
+        "output_tile_fast_axis": "n",
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 128,
+        "pipeline_output_waves": true,
+        "pipeline_output_writeback": true,
+        "reschedule_async": true,
+        "rhs_l2_cache_hint": "evict_last",
+        "warpgroup_m_tile": 64,
+        "warpgroup_n_tile": 128
+      }
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 64,
+      "m": 1000,
+      "n": 64,
+      "k": 1000,
+      "configuration": {
+        "output_n_tiles_per_cta": 1,
+        "ptx_optimization_level": null,
+        "output_cta_count": null,
+        "unroll_output_tiles": true,
+        "dst_l2_cache_hint": "evict_first",
+        "lhs_l2_cache_hint": "evict_first",
+        "operand_k_tile": 64,
+        "operand_stages": 3,
+        "output_m_tile": 128,
+        "output_n_tile": 64,
+        "output_slices": 1,
+        "output_store": "stmatrix",
+        "output_store_buffers": 1,
+        "output_tiles_per_cta": 1,
+        "output_tma_inner_size": 64,
+        "rhs_l2_cache_hint": "evict_first",
+        "warpgroup_n_tile": 64,
+        "transpose_output": false
+      }
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1000,
+      "n": 4096,
+      "k": 14336,
+      "configuration": null
+    },
+    {
+      "op": "addmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1000,
+      "n": 4096,
+      "k": 14336,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1000,
+      "n": 4096,
+      "k": 14336,
+      "configuration": null
+    },
+    {
+      "op": "bmm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1000,
+      "n": 4096,
+      "k": 14336,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 1000,
+      "n": 4096,
+      "k": 14336,
+      "configuration": null
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1000,
+      "n": 4096,
+      "k": 14336,
+      "configuration": null
     }
   ],
   "direct_layout_gemms": [
@@ -1930,6 +2122,38 @@
       "m": 512,
       "n": 512,
       "k": 64
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 2304,
+      "k": 768
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 8192,
+      "n": 3072,
+      "k": 768
+    },
+    {
+      "op": "addmm",
+      "dtype": "bfloat16",
+      "batch": 1,
+      "m": 16384,
+      "n": 2304,
+      "k": 768
+    },
+    {
+      "op": "bmm",
+      "dtype": "bfloat16",
+      "batch": 64,
+      "m": 1000,
+      "n": 64,
+      "k": 1000
     }
   ],
   "materialize_gemms": []

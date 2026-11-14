@@ -68,6 +68,9 @@ def schedule_register_matmul(
             for_loop_labels=[k_label],
             op_label_filter=label,
             epilogue_label_filter=epilogue_label_filter,
+            # TMA fills out-of-bounds operand elements with zero. The final
+            # K tile can therefore use the same complete WGMMA reduction.
+            allow_partial_tiles=True,
         )
     )
     for operand, column_major, width in (
@@ -401,7 +404,8 @@ def _schedule_matmul(
         group_size = output_m_tiles_per_cta
         group_label = "outm"
     if output_grid_size is not None:
-        kernel.grid_dim = (output_grid_size, 1, 1)
+        # The fixed grid traverses M/N on X; BMM still owns batch on Z.
+        kernel.grid_dim = (output_grid_size, 1, kernel.grid_dim[2] or 1)
     block_x = (CollectiveLevel.BLOCK, CollectiveAxis.X)
     output_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None] = (
         [block_x, block_x]
@@ -451,7 +455,10 @@ def _schedule_matmul(
                     else [output_m_tile, output_n_tile]
                 ),
                 iteration_bindings=output_bindings,
-                for_loop_labels=[None, None],
+                for_loop_labels=[
+                    "heuristic_output_grid" if output_grid_size is not None else None,
+                    None,
+                ],
                 op_label_filter="mm",
                 allow_partial_tiles=(m % output_m_tile != 0 or n % output_n_tile != 0),
                 reversed_dims=list(output_reversed_dims),
@@ -468,7 +475,11 @@ def _schedule_matmul(
                     output_n_tile,
                 ],
                 iteration_bindings=[None, *output_bindings],
-                for_loop_labels=[group_label, None, None],
+                for_loop_labels=[
+                    group_label,
+                    "heuristic_output_grid" if output_grid_size is not None else None,
+                    None,
+                ],
                 op_label_filter="mm",
                 allow_partial_tiles=(
                     m % output_m_tile != 0

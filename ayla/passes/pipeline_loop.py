@@ -18,6 +18,12 @@ source loop. The transformation produces:
 
 Legality: see ``_check_legality``.
 
+A body op that is an ``if`` contributes its region's ops, each still guarded by
+the ``if``'s condition. Every emitted run of ops sharing a guard is wrapped in a
+new ``if`` whose condition is cloned at that run's iv, so a guarded op runs
+exactly when it did in the source loop. Side-effect-free ops cloned into both
+sections run unguarded.
+
 When the selected operations issue work to a partially awaitable hardware
 queue, the loop already represents an unrolled software pipeline.  In that
 case the pass pipelines completion instead: each stage partially awaits the
@@ -26,9 +32,11 @@ preceding stage and a full await after the loop drains the queue.
 from __future__ import annotations
 
 from ..gpu_dialect import (
+    AllocOp,
     AsyncOp,
     AwaitOp,
     ForOp,
+    IfOp,
     IndexAddOp,
     IndexConstantOp,
     IndexType,
@@ -42,6 +50,49 @@ from ..gpu_dialect import (
 from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
+
+
+def guarded_body_ops(block: Block) -> dict[Op, Value | None]:
+    """The ops ``PipelineLoop`` schedules in ``block``, mapped to their guards.
+
+    An ``if`` in ``block`` contributes the ops of its region, guarded by its
+    condition; every other op is unguarded.
+    """
+    guards: dict[Op, Value | None] = {}
+    for body_op in block.ops:
+        if isinstance(body_op, IfOp):
+            guards.update(dict.fromkeys(body_op.body.ops, body_op.condition))
+        else:
+            guards[body_op] = None
+    return guards
+
+
+def _emit(
+    ops: list[Op], vmap: dict[Value, Value], guards: dict[Op, Value | None],
+) -> list[Op]:
+    """Clone ``ops`` through ``vmap``, wrapping each run sharing a guard in an ``if``."""
+    emitted: list[Op] = []
+    run: list[Op] = []
+    run_guard: Value | None = None
+    for body_op in [*ops, None]:
+        guard = guards.get(body_op) if body_op is not None else None
+        if run and (body_op is None or guard is not run_guard):
+            emitted.append(IfOp.build(vmap.get(run_guard, run_guard), Block(ops=run)))
+            run = []
+        if body_op is None:
+            break
+        if guard is None:
+            emitted.append(clone_op(body_op, vmap))
+        else:
+            run_guard = guard
+            run.append(clone_op(body_op, vmap))
+    return emitted
+
+
+def _dependencies(op: Op, guards: dict[Op, Value | None]) -> list[Value]:
+    """The values ``op`` reads, including the condition guarding it."""
+    guard = guards.get(op)
+    return [*effective_operands(op), *([guard] if guard is not None else [])]
 
 
 class PipelineLoop(LoweringPass):
@@ -95,7 +146,7 @@ class PipelineLoop(LoweringPass):
         return [op, AwaitOp.build(selected[-1].lock)], []
 
     def _compute_labeled_and_shared(
-        self, body_ops: list[Op],
+        self, body_ops: list[Op], guards: dict[Op, Value | None],
     ) -> tuple[set[Op], set[Op]]:
         """Compute the labeled and shared sets of in-body ops.
 
@@ -120,7 +171,7 @@ class PipelineLoop(LoweringPass):
         worklist = list(matched)
         while worklist:
             cur = worklist.pop()
-            for v in effective_operands(cur):
+            for v in _dependencies(cur, guards):
                 defining = in_body_def.get(v)
                 if defining is None or defining in labeled or defining in shared:
                     continue
@@ -134,6 +185,7 @@ class PipelineLoop(LoweringPass):
 
     def _check_ssa_closure(
         self, body_ops: list[Op], labeled_set: set[Op], shared_set: set[Op],
+        guards: dict[Op, Value | None],
     ) -> None:
         """Labeled and unlabeled in-body ops must be SSA-disjoint:
         neither set may consume an SSA result produced by the other.
@@ -158,7 +210,7 @@ class PipelineLoop(LoweringPass):
             if body_op in shared_set:
                 continue
             is_labeled = body_op in labeled_set
-            for v in effective_operands(body_op):
+            for v in _dependencies(body_op, guards):
                 defining = in_body_def.get(v)
                 if defining is None or defining in shared_set:
                     continue
@@ -273,6 +325,7 @@ class PipelineLoop(LoweringPass):
 
     def _check_legality(
         self, body_ops: list[Op], labeled_set: set[Op], shared_set: set[Op],
+        guards: dict[Op, Value | None],
     ) -> None:
         """Raise ValueError if pipelining `labeled_set` ahead by
         ``self.pipelining_offset`` iterations is not legal."""
@@ -280,7 +333,7 @@ class PipelineLoop(LoweringPass):
             "Pipeline: _check_legality only meaningful for "
             "pipelining_offset > 0"
         )
-        self._check_ssa_closure(body_ops, labeled_set, shared_set)
+        self._check_ssa_closure(body_ops, labeled_set, shared_set, guards)
         if self.pipelining_offset == 1:
             self._check_legal_for_offset_one(body_ops, labeled_set, shared_set)
         else:
@@ -311,13 +364,14 @@ class PipelineLoop(LoweringPass):
                 f"pipelining_offset ({n})"
             )
 
-        body_ops = op.body.ops
+        guards = guarded_body_ops(op.body)
+        body_ops = list(guards)
         selected_async = [
             body_op for body_op in body_ops
             if isinstance(body_op, AsyncOp)
             and label_matches(body_op, self.label_filter_op)
         ]
-        if selected_async and all(
+        if selected_async and not any(guards.values()) and all(
             isinstance(issue.lock.type, LockType)
             and issue.lock.type.supports_partial_await
             for issue in selected_async
@@ -328,14 +382,21 @@ class PipelineLoop(LoweringPass):
                 )
             return self._pipeline_queued_async(op, selected_async)
 
-        labeled_set, shared_set = self._compute_labeled_and_shared(body_ops)
+        labeled_set, shared_set = self._compute_labeled_and_shared(body_ops, guards)
         labeled = [o for o in body_ops if o in labeled_set]
         shared = [o for o in body_ops if o in shared_set]
         unlabeled = [o for o in body_ops if o not in labeled_set and o not in shared_set]
         if not labeled:
             return [op], []
 
-        self._check_legality(body_ops, labeled_set, shared_set)
+        self._check_legality(body_ops, labeled_set, shared_set, guards)
+        if allocations := [o for o in shared if isinstance(o, AllocOp)]:
+            # Each section would get its own clone: distinct storage.
+            raise ValueError(
+                f"Pipeline: allocation {allocations[0].op_id} is used by both "
+                f"sections; hoist it out of the loop first"
+            )
+        guards.update(dict.fromkeys(shared))
 
         # Prologue: shared + labeled ops for iv = lb, lb+step, ..., lb+(n-1)*step.
         prologue_ops: list[Op] = []
@@ -343,9 +404,7 @@ class PipelineLoop(LoweringPass):
             iv_const = IndexConstantOp.build(value=lb + i * step)
             prologue_ops.append(iv_const)
             vmap: dict[Value, Value] = {op.iv: iv_const.result()}
-            prologue_ops.extend(
-                clone_op(body_op, vmap) for body_op in shared + labeled
-            )
+            prologue_ops.extend(_emit(shared + labeled, vmap, guards))
 
         # Main loop body: shared + unlabeled at iv, then shared + labeled at iv + n*step.
         new_iv = Value(name=op.iv.name, type=IndexType())
@@ -353,12 +412,10 @@ class PipelineLoop(LoweringPass):
         ahead_iv = IndexAddOp.build(lhs=new_iv, rhs=ahead_const.result())
         new_body_ops: list[Op] = []
         vmap = {op.iv: new_iv}
-        for body_op in shared + unlabeled:
-            new_body_ops.append(clone_op(body_op, vmap))
+        new_body_ops.extend(_emit(shared + unlabeled, vmap, guards))
         new_body_ops.extend([ahead_const, ahead_iv])
         vmap = {op.iv: ahead_iv.result()}
-        for body_op in shared + labeled:
-            new_body_ops.append(clone_op(body_op, vmap))
+        new_body_ops.extend(_emit(shared + labeled, vmap, guards))
         new_body = Block(arguments=[new_iv], ops=new_body_ops)
         new_ub = ub - n * step
         new_for = ForOp.build(lb=lb, ub=new_ub, step=step, body=new_body,
@@ -370,9 +427,7 @@ class PipelineLoop(LoweringPass):
             iv_const = IndexConstantOp.build(value=new_ub + i * step)
             epilogue_ops.append(iv_const)
             vmap = {op.iv: iv_const.result()}
-            epilogue_ops.extend(
-                clone_op(body_op, vmap) for body_op in shared + unlabeled
-            )
+            epilogue_ops.extend(_emit(shared + unlabeled, vmap, guards))
 
         return [*prologue_ops, new_for, *epilogue_ops], []
 

@@ -1,9 +1,9 @@
 """Invariant code motion.
 
 Hoists side-effect-free ops out of a ``for`` loop body when all their operands
-are defined outside the loop. Uninitialized shared-memory allocations are also
-hoisted through guards inside loops, letting an enclosing loop reuse one arena
-across guarded iterations.
+are defined outside the loop. Allocations, which only provide storage, are also
+hoisted through guards inside loops, letting an enclosing loop reuse that
+storage across guarded iterations, as it does unguarded.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from ..gpu_dialect import (
     ForOp,
     IfOp,
     ModuleOp,
-    SmemTensorType,
     effective_operands,
     is_side_effect_free,
 )
@@ -35,9 +34,7 @@ class LICM(LoweringPass):
         hoisted: list[Op] = []
         remaining: list[Op] = []
         for body_op in op.body.ops:
-            if isinstance(body_op, AllocOp) and isinstance(
-                body_op.result().type, SmemTensorType
-            ):
+            if isinstance(body_op, AllocOp):
                 hoisted.append(body_op)
             else:
                 remaining.append(body_op)
