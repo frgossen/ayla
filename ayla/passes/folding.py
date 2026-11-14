@@ -62,6 +62,7 @@ from ..base.ir import (
     find_ancestor_of_type,
 )
 from ..base.lowering_pass import LoweringPass, lowers
+from ._utils import label_matches
 
 
 def _iv_loop(value: Value) -> ForOp | None:
@@ -82,6 +83,17 @@ def _iv_loop(value: Value) -> ForOp | None:
 
 
 class Folding(LoweringPass):
+    """Fold constant conditions, empty loops and single-iteration loops.
+
+    ``keep_loops`` names loops a later pass still needs as a template, such as
+    a rolled reduction left with one iteration after its first step is peeled.
+    """
+
+    keep_loops: str | None
+
+    def __init__(self, keep_loops: str | None = None) -> None:
+        super().__init__(keep_loops=keep_loops)
+
     @lowers(IfOp)
     def lower_if(self, op: IfOp) -> tuple[list[Op], list[object]] | None:
         condition = self.value_map.get(op.condition, op.condition)
@@ -119,7 +131,9 @@ class Folding(LoweringPass):
         # referenced from outside and nothing it does is observable.
         if op.trip_count <= 0:
             return [], []
-        if op.trip_count != 1:
+        if op.trip_count != 1 or (
+            self.keep_loops is not None and label_matches(op, self.keep_loops)
+        ):
             return None
         self.lower_block(op.body)
         iv_const = IndexConstantOp.build(value=op.lb)

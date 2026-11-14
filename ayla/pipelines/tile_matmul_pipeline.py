@@ -172,11 +172,14 @@ def schedule_register_matmul(
                 label_filter=k_label,
             )
         )
-    pipeline.add_pass(Canonicalize())
+    # A rolled reduction is the template of its pipeline, even when peeling
+    # leaves it a single iteration.
+    keep = k_label if rolled_operand_pipeline else None
+    pipeline.add_pass(Canonicalize(keep_loops=keep))
     pipeline.add_pass(LowerToAsync())
     pipeline.add_pass(FuseAsync())
     pipeline.add_pass(LICM())
-    pipeline.add_pass(Canonicalize())
+    pipeline.add_pass(Canonicalize(keep_loops=keep))
     if rolled_operand_pipeline:
         from ..passes.pipeline_rolled_k import PipelineRolledK
         pipeline.add_pass(PipelineRolledK(operand_stages, k_label))

@@ -2,9 +2,12 @@
 
 MMA and output operations use the existing lowering. Slot-private staging
 and explicit completion generations bound progress without waiting for stores.
+Each CTA hands issue from one job's actor to the next through its own event,
+so the ring's loads and MMAs are issued in ordinal order.
 """
 
 from ..base.ir import clone_op, iter_ops, find_ancestor_of_type
+from ..pipelines.async_resources import SplitBarrier
 from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
@@ -25,7 +28,6 @@ from ..gpu_dialect import (
     IndexLtOp,
     Block,
     IndexAddOp,
-    IndexDivOp,
     IndexModOp,
     LockViewOp,
 )
@@ -43,15 +45,14 @@ def schedule_job_participants(result, op):
         IndexLtOp.build(coordinate, four.result()),
         IndexLtOp.build(three.result(), coordinate),
     ]
-    additions = [warp, four, three, *active]
+    # The actor of job j-1 releases issue to the actor of job j. The event is
+    # this CTA's own: its next phase needs the waiter's own release, so the
+    # expected parity cannot alias. Waiting instead for the previous job's
+    # MMA completion lets a paired peer, which only loads, fall two phases
+    # behind once its loads run more than one job ahead.
+    handoff = SplitBarrier.build(1, 1, "job_issue_handoff")
+    additions = [warp, four, three, *active, handoff.allocation]
     remaps = {}
-    frame_ready = {
-        int(x.attrs["label"][-1]): x.result()
-        for root in result[0]
-        for x in iter_ops(root)
-        if isinstance(x, AllocOp)
-        and x.attrs.get("label", "").startswith("accumulator_ready_")
-    }
 
     def actor(slot):
         return 4 * slot
@@ -88,18 +89,16 @@ def schedule_job_participants(result, op):
             minus = IndexConstantOp.build(-1)
             two = IndexConstantOp.build(2)
             prev = IndexAddOp.build(job, minus.result())
-            epoch = IndexDivOp.build(prev.result(), two.result())
-            phase = IndexModOp.build(epoch.result(), two.result())
-            ready = frame_ready[1 - compute_slot]
-            # A scalar completion view gives this consumer its own expected
-            # phase; no extra hardware barrier or implicit parity mutation.
-            view = LockViewOp.build(ready, zero.result(), phase.result())
+            phase = IndexModOp.build(prev.result(), two.result())
+            # A scalar view gives this consumer its own expected phase (one per
+            # job); no extra hardware barrier or implicit parity mutation.
+            view = LockViewOp.build(handoff.allocation.result(), zero.result(), phase.result())
             due = IndexLtOp.build(zero.result(), job)
             wait = AwaitOp.build(
                 view.result(),
                 {
                     "waiter_warps": [actor(compute_slot)],
-                    "label": "previous_job_mma_finished",
+                    "label": "previous_job_issued",
                 },
             )
             operation.body.ops = [
@@ -107,7 +106,6 @@ def schedule_job_participants(result, op):
                 minus,
                 two,
                 prev,
-                epoch,
                 phase,
                 view,
                 due,
@@ -192,7 +190,9 @@ def schedule_job_participants(result, op):
                     isinstance(child, ForOp)
                     and child.attrs.get("label") == "shared_ring_rolled_k"
                 ):
-                    region = IfOp.build(issuing[slot].result(), Block(ops=[child]))
+                    release = handoff.barrier("arrive", "job_issue_handoff")
+                    release.attrs["participant_warps"] = [actor(slot)]
+                    region = IfOp.build(issuing[slot].result(), Block(ops=[child, release]))
                     if slot == 0:
                         region.attrs["participant_warps"] = [0]
                     else:

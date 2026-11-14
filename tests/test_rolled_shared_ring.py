@@ -155,7 +155,9 @@ def check_protocol(mod, block_index, steps, queue_samples=None):
 
 @pytest.mark.parametrize("group", [1, 2])
 @pytest.mark.parametrize("overlap", [False, True])
-@pytest.mark.parametrize("k,depth", [(192, 2), (320, 4), (384, 4), (768, 7), (1024, 5)])
+@pytest.mark.parametrize("k,depth", [(192, 2), (320, 4), (384, 4), (768, 7), (1024, 5),
+                                     # Rings deeper than one job's K batches.
+                                     (128, 2), (128, 4), (128, 7), (192, 5), (256, 6)])
 def test_global_epochs_and_bank_contents_with_uneven_jobs(group, overlap, k, depth):
     mod = build(k=k, operand_stages=depth, cta_group=group,
                 persistent_output_overlap=overlap)
@@ -218,7 +220,8 @@ def test_unrelated_effects_and_inconsistent_depth_are_rejected():
 
 @pytest.mark.parametrize("group,k,depth,warps,nt,descriptors,buffers", [
     (1, 320, 4, 4, 128, False, 1), (2, 384, 4, 4, 128, False, 1),
-    (2, 768, 7, 8, 128, False, 1), (2, 784, 5, 4, 192, True, 2)])
+    (2, 768, 7, 8, 128, False, 1), (2, 784, 5, 4, 192, True, 2),
+    (2, 128, 4, 4, 128, True, 1), (1, 128, 3, 4, 128, False, 1), (2, 192, 5, 4, 192, True, 1)])
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 def test_gpu_changed_input_graph_replays(group, k, depth, warps, nt, descriptors, buffers, dtype, queue=1):
     import torch

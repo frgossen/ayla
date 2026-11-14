@@ -499,7 +499,7 @@ class VerifyGpuDialect(VerificationPass):
         if (kernel is None or not kernel.attrs.get("rolled_shared_ring")
                 or loop.lb != 0 or loop.step != 1
                 or type(op.attrs.get("depth")) is not int
-                or not 2 <= op.attrs["depth"] <= reduction.attrs["ub"]
+                or op.attrs["depth"] < 2
                 or op.attrs["depth"] != reduction.attrs["depth"]
                 or type(op.attrs.get("mma_queue_depth", 1)) is not int
                 or op.attrs.get("mma_queue_depth", 1) != 1
@@ -520,7 +520,9 @@ class VerifyGpuDialect(VerificationPass):
             or depth < 2
             or type(lb) is not int
             or type(ub) is not int
-            or ub - lb < depth - 1
+            # A persistent ring carries banks across output jobs.
+            or (ub - lb < depth - 1
+                and find_ancestor_of_type(op, PersistentPipelineOp) is None)
             or op.attrs.get("step") != 1
             or len(op.body.arguments) != 1
         ):
@@ -695,8 +697,11 @@ class VerifyGpuDialect(VerificationPass):
             typ = op.sync.type
             kernel = find_ancestor_of_type(op, KernelOp)
             assert kernel is not None
-            if not isinstance(typ, LockType) or typ.kind != "mbar" or typ.attrs.get("arrivals") != kernel.num_threads // 32:
-                raise ValueError("block-leader mbarrier requires one arrival per warp")
+            # One arrival per arriving warp: every warp, or the op's participants.
+            warps = execution_warps(op)
+            arrivals = kernel.num_threads // 32 if warps is None else len(warps)
+            if not isinstance(typ, LockType) or typ.kind != "mbar" or typ.attrs.get("arrivals") != arrivals:
+                raise ValueError("block-leader mbarrier requires one arrival per arriving warp")
         elif op.scope == "cluster_to_leader":
             if not isinstance(op.operands[0].type, LockType) or (
                 op.operands[0].type.kind != "cluster_mbar"

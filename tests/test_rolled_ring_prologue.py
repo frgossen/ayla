@@ -37,8 +37,10 @@ def test_fill_precedes_tmem_allocation_behind_one_relaxed_rendezvous(k_tile, sta
 def test_k128_stages_are_only_accepted_by_the_rolled_shared_ring():
     with pytest.raises(ValueError, match="must be shared_ring"):
         _ring(persistent_output_schedule="framed")
-    with pytest.raises(ValueError, match="three K stages"):
-        _ring(k=256)
+    # A ring carries banks across jobs, so two K batches suffice; one does not.
+    _ring(k=256)
+    with pytest.raises(ValueError, match="two K batches"):
+        _ring(k=128)
 
 
 def _lock(**attrs):

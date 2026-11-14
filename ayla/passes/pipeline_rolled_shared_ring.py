@@ -128,9 +128,7 @@ def prepare_rolled_ring(module, context, *, operand_stages, overlap, job_regions
                 "job regions require a paired common ring with four-warp fragments"
             )
         kernel.attrs["block_dim"] = (256, 1, 1)
-    _, reduction, _, _, _ = _source(region)
-    if operand_stages > reduction.attrs["ub"]:
-        raise ValueError("rolled shared ring needs one K batch per initial bank")
+    _source(region)
     if allocation.parent_block is not kernel.body:
         allocation.parent_block.ops.remove(allocation)
         kernel.body.ops.insert(kernel.body.ops.index(loop), allocation)
@@ -349,25 +347,43 @@ class LowerRolledSharedRing(LoweringPass):
                             {"waiter_warps": [0], "label": "bank_release"},
                         )
                     ]
-                    future_k = binary(IndexAddOp, iv, const(schedule.prefetch_lead, refill), refill)
-                    future = binary(IndexAddOp, ordinal, const(schedule.prefetch_lead, refill), refill)
-                    current = binary(IndexLtOp, future_k, stage_count, refill)
-                    successor = binary(IndexLtOp, const(steps - 1, refill), future_k, refill)
-                    same = []
-                    issue_load(job, future_k, future, same)
-                    next_ops = []
-                    next_job = binary(IndexAddOp, job, one, next_ops)
-                    next_k = binary(IndexAddOp, future_k, const(-steps, next_ops), next_ops)
-                    next_valid = valid(next_job, next_ops)
-                    next_load = []
-                    issue_load(next_job, next_k, future, next_load)
-                    next_ops.append(IfOp.build(next_valid, Block(ops=next_load)))
-                    refill.extend(
-                        [
-                            IfOp.build(current, Block(ops=same)),
-                            IfOp.build(successor, Block(ops=next_ops)),
-                        ]
-                    )
+                    lead = schedule.prefetch_lead
+                    future_k = binary(IndexAddOp, iv, const(lead, refill), refill)
+                    future = binary(IndexAddOp, ordinal, const(lead, refill), refill)
+                    # The target batch belongs to job + d, where d = future_k // steps.
+                    # A ring deeper than one job's K batches reaches past the successor.
+                    offsets = range((steps - 1 + lead) // steps + 1)
+                    conditions = []
+                    for d in offsets:
+                        below = (
+                            binary(IndexLtOp, future_k,
+                                   stage_count if d == 0 else const((d + 1) * steps, refill),
+                                   refill)
+                            if (d + 1) * steps <= steps - 1 + lead
+                            else None
+                        )
+                        above = (
+                            binary(IndexLtOp, const(d * steps - 1, refill), future_k, refill)
+                            if d
+                            else None
+                        )
+                        conditions.append([c for c in (above, below) if c is not None])
+                    for d, guards in zip(offsets, conditions):
+                        target = []
+                        if not d:
+                            issue_load(job, future_k, future, target)
+                        else:
+                            target_job = binary(
+                                IndexAddOp, job, one if d == 1 else const(d, target), target
+                            )
+                            target_k = binary(IndexAddOp, future_k, const(-d * steps, target), target)
+                            target_valid = valid(target_job, target)
+                            load_ops = []
+                            issue_load(target_job, target_k, future, load_ops)
+                            target.append(IfOp.build(target_valid, Block(ops=load_ops)))
+                        for guard in reversed(guards):
+                            target = [IfOp.build(guard, Block(ops=target))]
+                        refill.extend(target)
                     has_prior = binary(IndexLtOp, zero, ordinal, kbody)
                     kbody.append(IfOp.build(has_prior, Block(ops=refill)))
                 elif action == "writeback":
@@ -428,18 +444,28 @@ class LowerRolledSharedRing(LoweringPass):
                 attrs={"initialization_publication": True},
             )
         )
-        fill_iv = Value(name=None, type=IndexType())
-        fill = []
-        issue_load(zero, fill_iv, fill_iv, fill)
-        ops.append(
-            ForOp.build(
-                0,
-                depth,
-                1,
-                Block(arguments=[fill_iv], ops=fill),
-                {"label": "shared_ring_fill", "unroll": False},
+        # The initial fill covers ordinals 0..depth-1: job d owns K batches
+        # [d*steps, (d+1)*steps). Jobs past the first are guarded like refills.
+        for d in range(math.ceil(depth / steps)):
+            fill_iv = Value(name=None, type=IndexType())
+            fill = []
+            if d:
+                fill_job = const(d, fill)
+                fill_ordinal = binary(IndexAddOp, fill_iv, const(d * steps, fill), fill)
+                load_ops = []
+                issue_load(fill_job, fill_iv, fill_ordinal, load_ops)
+                fill.append(IfOp.build(valid(fill_job, fill), Block(ops=load_ops)))
+            else:
+                issue_load(zero, fill_iv, fill_iv, fill)
+            ops.append(
+                ForOp.build(
+                    0,
+                    min(steps, depth - d * steps),
+                    1,
+                    Block(arguments=[fill_iv], ops=fill),
+                    {"label": "shared_ring_fill", "unroll": False},
+                )
             )
-        )
         job = Value(name=None, type=IndexType())
         jobs = []
         compute(job, 0, jobs)

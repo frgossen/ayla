@@ -15,8 +15,8 @@ class Canonicalize(Pipeline):
     rather than a function, it also adds to another pipeline as a single pass.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, keep_loops: str | None = None) -> None:
         super().__init__()
-        self.add_pass(Folding())
+        self.add_pass(Folding(keep_loops))
         self.add_pass(CSE())
         self.add_pass(DCE())

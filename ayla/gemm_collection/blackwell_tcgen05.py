@@ -172,8 +172,8 @@ def blackwell_tcgen05_gemm_module(
     ):
         raise ValueError("block_gather_backend must be named or mbar")
     m, n, k = (problem_size if dim is None else dim for dim in (m, n, k))
-    if rolled_operand_pipeline and persistent_output_pipeline and k <= 2 * operand_k_tile:
-        raise ValueError("rolled operand pipelines require at least three K stages")
+    if rolled_operand_pipeline and persistent_output_pipeline and k <= operand_k_tile:
+        raise ValueError("rolled operand pipelines require at least two K batches")
     if cta_group == 2 and output_m_tile == 64 and operand_k_tile > 64 and k % 64:
         raise ValueError("paired M64 blocked TMA inputs require K divisible by 64")
     if (
@@ -195,7 +195,13 @@ def blackwell_tcgen05_gemm_module(
         or (not allow_partial_tiles and k % operand_k_tile)
     ):
         raise ValueError("the K tile must divide the reduction")
-    if not 1 <= operand_stages <= (k + operand_k_tile - 1) // operand_k_tile:
+    # A rolled shared ring numbers banks across output jobs, so its stages may
+    # outnumber one job's K batches; other schedules stage within one tile.
+    carried_ring = rolled_operand_pipeline and persistent_output_pipeline
+    if operand_stages < 1 or (
+        not carried_ring
+        and operand_stages > (k + operand_k_tile - 1) // operand_k_tile
+    ):
         raise ValueError("stages must be positive and fit the reduction")
     # B200 permits 227 KiB per CTA. Leave 1 KiB for alignment and barriers.
     operand_bytes = (
