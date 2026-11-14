@@ -23,9 +23,10 @@ import math
 from collections.abc import Sequence
 from typing import cast
 
-from ..base.ir import Block, Op, Type, Value, clone_type
+from ..base.ir import Block, Op, Type, Value, clone_type, clone_op, find_ancestor_of_type
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
+    AddrMemTensorType,
     AllocOp,
     BF16Type,
     BlockIdOp,
@@ -43,7 +44,14 @@ from ..gpu_dialect import (
     IndexMulOp,
     KernelOp,
     MatmulOp,
+    ReduceOp,
+    ReshapeOp,
+    RegMemTensorType,
+    WrmemTensorType,
     MemTensorType,
+    MemoryEffect,
+    root_buffers,
+    has_ordering_effect,
     ModuleOp,
     MoveOp,
     RmemTensorType,
@@ -53,9 +61,33 @@ from ..gpu_dialect import (
     WarpGroupIdOp,
     WgrmemTensorType,
     is_column_major,
-    is_elementwise,
+    memory_effects,
+    root_buffer,
 )
-from ._utils import label_matches
+from ._utils import label_matches, fresh_alloc, select_region
+
+
+def is_region_local(value: Value, members: set[Op]) -> bool:
+    """Whether a logical allocation and all its aliases are private to a region."""
+    root = root_buffer(value)
+    if root is None or not isinstance(root.definition, AllocOp):
+        return False
+    visited: set[Value] = set()
+    kernel = find_ancestor_of_type(next(iter(members)), KernelOp)
+
+    def local(alias: Value) -> bool:
+        if alias in visited:
+            return True
+        visited.add(alias)
+        for user in alias.users():
+            if find_ancestor_of_type(user, KernelOp) is not kernel or user in members:
+                continue
+            if isinstance(user, (TileOp, ReshapeOp)) and local(user.result()):
+                continue
+            return False
+        return True
+
+    return local(root)
 
 
 def _target_level(target_type: str) -> str:
@@ -143,6 +175,8 @@ def _resolve_type(name: str):
         return F64Type
     if name == "smem":
         return SmemTensorType
+    if name == "wrmem":
+        return WrmemTensorType
     if name == "rmem":
         return RmemTensorType
     if name == "wgrmem":
@@ -276,6 +310,10 @@ class PromoteBuffers(LoweringPass):
         no analysis verifies that differently named groups are non-overlapping.
         TODO: Replace this policy flag with independent allocations followed by
         lifetime analysis and a pass that selects safe storage reuse.
+    reuse_operands : bool
+        Retain identical read-only operand promotions within a block. Writes
+        to the source or promoted storage, fences, and unknown effects invalidate
+        the cache. Intended for projections sharing an input K tile.
     tma_load_slices : dict[str, int] or None
         Leading-dimension TMA load slices by operand.
     """
@@ -293,6 +331,7 @@ class PromoteBuffers(LoweringPass):
     writeback_slices: int
     writeback_buffers: int
     unsafe_reuse_smem: bool
+    reuse_operands: bool
     tma_load_slices: dict[str, int]
     label_filter: str | None
     epilogue_label_filter: str | None
@@ -315,6 +354,7 @@ class PromoteBuffers(LoweringPass):
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
         unsafe_reuse_smem: bool = False,
+        reuse_operands: bool = False,
         tma_load_slices: dict[str, int] | None = None,
         label_filter: str | None = None,
         epilogue_label_filter: str | None = None,
@@ -334,6 +374,7 @@ class PromoteBuffers(LoweringPass):
             writeback_slices=writeback_slices,
             writeback_buffers=writeback_buffers,
             unsafe_reuse_smem=unsafe_reuse_smem,
+            reuse_operands=reuse_operands,
             tma_load_slices=dict(tma_load_slices or {}),
             label_filter=label_filter,
             epilogue_label_filter=epilogue_label_filter,
@@ -407,6 +448,8 @@ class PromoteBuffers(LoweringPass):
                 column_major=len(strides) == 2 and strides[-2] == 1,
                 strides=cast(list[int], strides),
             )
+        if tensor_cls is WrmemTensorType:
+            return WrmemTensorType.build(sizes, dtype, layout=self.layout or "default")
         if tensor_cls is RmemTensorType:
             return RmemTensorType.build(sizes, dtype)
         if tensor_cls is WgrmemTensorType:
@@ -629,6 +672,15 @@ class PromoteBuffers(LoweringPass):
         expected_slices = dst_cols // src_cols
         if wg_column_tile is not None and self.writeback_slices != expected_slices:
             raise ValueError("warpgroup-column writeback needs one slice per warpgroup")
+        writer_divisor = 1
+        if wg_column_tile is not None:
+            column = wg_column_tile.indices[-1]
+            if isinstance(column, Value) and isinstance(column.definition, IndexModOp):
+                column = column.definition.lhs
+            if isinstance(column, Value) and isinstance(column.definition, IndexDivOp):
+                divisor = column.definition.rhs.definition
+                if isinstance(divisor, IndexConstantOp):
+                    writer_divisor = divisor.value
         for slice_idx in range(self.writeback_slices):
             smem = smems[slice_idx if self.writeback_buffers > 1 else 0]
             gather_dst = smem.result()
@@ -642,6 +694,11 @@ class PromoteBuffers(LoweringPass):
             }
             if wg_column_tile is not None:
                 gather_attrs["writer_wg"] = slice_idx
+                # Column groups repeat for every row group. Selecting only
+                # the absolute warpgroup ID drops all subsequent row groups.
+                gather_attrs["writer_wg_modulus"] = expected_slices
+                if writer_divisor != 1:
+                    gather_attrs["writer_wg_divisor"] = writer_divisor
             elif self.writeback_slices > 1:
                 # TODO: Express this source slice with a tile op instead of the
                 # wgmma_col_start attribute.
@@ -681,7 +738,7 @@ class PromoteBuffers(LoweringPass):
         operand_name: str,
         collective: dict[CollectiveAxis, CollectiveLevel],
         matmul_label: str | None = None,
-        epilogue: list[ElementwiseOp] | None = None,
+        epilogue: list[Op] | None = None,
         writeback_tiling_scheme: int | None = None,
     ) -> tuple[list[Op], list[Value]]:
         assert isinstance(dst.type, MemTensorType)
@@ -698,33 +755,32 @@ class PromoteBuffers(LoweringPass):
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
             tmp_alloc = AllocOp.build_with_fresh_id(tmp_type)
-            new_ops.extend(epilogue[:-1])
+            final = epilogue[-1] if epilogue else None
+            # A final pointwise write can target the output representation
+            # directly. Preserve every source; the operation is not required
+            # to be unary or in place. Reductions and multi-output regions
+            # retain an explicit conversion after their computation.
+            direct_output = (
+                isinstance(src.type, WgrmemTensorType)
+                and src.type.dtype == F32Type()
+                and isinstance(final, ElementwiseOp)
+                and final.dst is src
+                and all(isinstance(v.type, RegMemTensorType) and v.type.dtype == F32Type()
+                        for v in final.operands[1:])
+                and any(cast(MemTensorType, v.type).rank > 0 for v in final.operands[1:])
+            )
+            new_ops.extend(epilogue[:-1] if direct_output else epilogue)
             new_ops.append(tmp_alloc)
-            if epilogue:
-                final = epilogue[-1]
-                # TODO: Generalize this rewrite for multi-source element-wise
-                # epilogues such as SwiGLU. Retarget the final operation's
-                # destination while preserving and remapping all its sources.
-                assert final.dst is src and final.src(0) is src
-                new_ops.append(
-                    ElementwiseOp.build(
-                        dst=tmp_alloc.result(),
-                        srcs=[src],
-                        fn=final.fn,
-                        attrs=final.extra_attrs,
-                    )
-                )
+            if direct_output:
+                assert isinstance(final, ElementwiseOp)
+                new_ops.append(ElementwiseOp.build(
+                    tmp_alloc.result(), final.operands[1:], final.fn, attrs=final.extra_attrs))
             else:
                 new_ops.append(
                     ElementwiseOp.build(
-                        dst=tmp_alloc.result(),
-                        srcs=[src],
-                        fn="convert",
-                        attrs=(
-                            {"label": f"{matmul_label}_{operand_name}_convert"}
-                            if matmul_label is not None
-                            else None
-                        ),
+                        dst=tmp_alloc.result(), srcs=[src], fn='convert',
+                        attrs=({'label': f'{matmul_label}_{operand_name}_convert'}
+                               if matmul_label is not None else None),
                     )
                 )
             src = tmp_alloc.result()
@@ -771,9 +827,23 @@ class PromoteBuffers(LoweringPass):
 
         ops = list(block.ops)
         new_ops: list[Op] = []
+        reusable: dict[tuple, Value] = {}
         i = 0
         while i < len(ops):
             op = ops[i]
+            if self.reuse_operands:
+                effects = memory_effects(op)
+                if effects is None or has_ordering_effect(op):
+                    reusable.clear()
+                else:
+                    writes = {
+                        root for effect in effects if effect.kind == "W"
+                        for root in effect.roots
+                    }
+                    reusable = {
+                        key: value for key, value in reusable.items()
+                        if not writes & (root_buffers(key[1]) | root_buffers(value))
+                    }
             if not self._promotes(op):
                 new_ops.append(op)
                 i += 1
@@ -794,16 +864,163 @@ class PromoteBuffers(LoweringPass):
                 new_ops.extend(writeback_ops)
                 i += 1
                 continue
+            if isinstance(op, ReduceOp):
+                epilogue = self._epilogue(ops, i)
+                new_ops.extend(self._promote_reduce(op, epilogue))
+                i += 1 + len(epilogue)
+                continue
             epilogue = self._epilogue(ops, i)
             assert isinstance(op, MatmulOp)
-            new_ops.extend(self._promote(op, epilogue))
+            new_ops.extend(self._promote(op, epilogue, reusable))
             i += 1 + len(epilogue)
         block.ops = new_ops
 
     def _promotes(self, op: Op) -> bool:
         if not label_matches(op, self.label_filter):
             return False
-        return isinstance(op, MatmulOp) or self._is_register_writeback(op)
+        return isinstance(op, (MatmulOp, ReduceOp)) or self._is_register_writeback(op)
+
+    def _promote_region(self, ops: list[Op], replacements: dict[Value, Value],
+                         owner: RegMemTensorType,
+                         collective: dict[CollectiveAxis, CollectiveLevel],
+                         label: str | None = None) -> tuple[list[Op], dict[Value, Value]]:
+        """Keep consumer temporaries under the producer's register ownership.
+
+        External compute operands are staged according to memory effects. Writes
+        retain their logical endpoints and use the scheduled output transport;
+        internal allocations remain registers.
+        """
+        mapping = dict(replacements)
+        result: list[Op] = []
+        stores: dict[Value, Value] = {}
+        addresses: dict[Value, Value] = {}
+        initialized: set[Value] = set(replacements)
+
+        for op in ops:
+            if isinstance(op, AllocOp):
+                typ = cast(MemTensorType, op.result().type)
+                alloc = AllocOp.build_with_fresh_id(owner.with_shape(typ.static_shape, typ.dtype), attrs=op.extra_attrs)
+                mapping[op.result()] = alloc.result()
+                result.append(alloc)
+                continue
+            if isinstance(op, (ElementwiseOp, ReduceOp)):
+                effects = memory_effects(op)
+                assert effects is not None
+                for effect in effects:
+                    value = effect.value
+                    if value in replacements or isinstance(value.definition, AllocOp) and value in mapping:
+                        continue
+                    if value in mapping and isinstance(mapping[value].type, RegMemTensorType) and value not in addresses:
+                        continue
+                    if not isinstance(value.type, AddrMemTensorType):
+                        continue
+                    if value not in addresses:
+                        addresses[value] = mapping.get(value, value)
+                    address = addresses[value]
+                    if value not in mapping or isinstance(mapping[value].type, AddrMemTensorType):
+                        alloc = AllocOp.build_with_fresh_id(owner.with_shape(value.type.static_shape, value.type.dtype))
+                        result.append(alloc)
+                        mapping[value] = alloc.result()
+                    if effect.kind == 'R' and value not in initialized:
+                        result.append(MoveOp.build(mapping[value], address, collective=collective))
+                        initialized.add(value)
+                    if effect.kind == 'W':
+                        stores[address] = mapping[value]
+                # Effects list writes before reads; marking initialization here
+                # preserves the old destination when a reduction accumulates.
+                initialized.update(e.value for e in effects if e.kind == 'W')
+            attrs: dict[str, object] = {'collective': dict(collective)} if isinstance(op, (ReduceOp, MoveOp)) else {}
+            cloned = clone_op(op, mapping, attrs)
+            if isinstance(cloned, MoveOp) and all(isinstance(v.type, RegMemTensorType) for v in cloned.operands):
+                if op.operands[0] in replacements:
+                    # A buffer assignment versions the region's logical output.
+                    # Keep the assigned registers as the live-out, avoiding an
+                    # unnecessary round trip through the accumulator's dtype.
+                    mapping[op.operands[0]] = cloned.src
+                    continue
+                if cast(MemTensorType, cloned.dst.type).dtype != cast(MemTensorType, cloned.src.type).dtype:
+                    cloned = ElementwiseOp.build(cloned.dst, [cloned.src], 'convert', attrs=cloned.extra_attrs)
+            if isinstance(cloned, (TileOp, ReshapeOp)) and isinstance(cloned.arg.type, RegMemTensorType):
+                cloned.result().type = cloned.arg.type.with_shape(cast(MemTensorType, op.result().type).static_shape)
+            for original, replacement in zip(op.results, cloned.results, strict=True):
+                mapping[original] = replacement
+            if (self.tma and isinstance(cloned, MoveOp)
+                and isinstance(cloned.dst.type, GmemTensorType)
+                and isinstance(cloned.src.type, WgrmemTensorType)
+                and cloned.src.type.layout != 'wgmma_row'):
+                writeback, _ = self._build_operand_writeback(
+                    cloned.dst, cloned.src, 'dst', collective, label,
+                    writeback_tiling_scheme=cast(int | None, cloned.attrs.get('dst_tiling_scheme')))
+                result.extend(writeback)
+                continue
+            result.append(cloned)
+        for dst, src in stores.items():
+            if isinstance(dst.type, GmemTensorType) and isinstance(src.type, WgrmemTensorType) and src.type.layout != 'wgmma_row':
+                # Consumer live-outs use the same scheduled writeback as the
+                # producer. Row statistics retain their scalar stores: their
+                # ownership and narrow destination are not dense matrix tiles.
+                writeback, _ = self._build_operand_writeback(dst, src, 'dst', collective, label)
+                result.extend(writeback)
+            else:
+                result.append(MoveOp.build(dst, src, collective=collective))
+        return result, mapping
+
+    def _promote_reduce(self, op: ReduceOp, epilogue: list[Op]) -> list[Op]:
+        if self.target_type not in ("wrmem", "rmem") or self.operand_names != {"dst"}:
+            raise NotImplementedError(
+                "reduction promotion currently supports a register destination"
+            )
+        dst_type = cast(MemTensorType, op.dst.type)
+        typ = self._build_target_type(dst_type)
+        alloc = fresh_alloc(typ, op.dst)
+        ops: list[Op] = [alloc]
+        # Load and writeback have identical per-lane ownership.
+        scheme = MemoryEffect.fresh_tiling_scheme_id()
+        if op.init is None:
+            loaded = alloc
+            if dst_type.dtype != typ.dtype:
+                loaded = fresh_alloc(
+                    self._build_target_type(dst_type, dtype=dst_type.dtype), op.dst
+                )
+                ops.append(loaded)
+            ops.append(
+                MoveOp.build(
+                    loaded.result(), op.dst, collective=op.collective,
+                    attrs={"src_tiling_scheme": scheme},
+                )
+            )
+            if loaded is not alloc:
+                ops.append(
+                    ElementwiseOp.build(alloc.result(), [loaded.result()], "convert")
+                )
+        ops.append(
+            ReduceOp.build(
+                alloc.result(), op.src, fn=op.fn,
+                collective=op.collective, init=op.init, attrs=op.extra_attrs,
+            )
+        )
+        assert isinstance(typ, RegMemTensorType)
+        consumer_ops, mapping = self._promote_region(epilogue, {op.dst: alloc.result()}, typ, op.collective)
+        ops.extend(consumer_ops)
+        result = mapping[op.dst]
+        if is_region_local(op.dst, {op, *epilogue}):
+            return ops
+        if dst_type.dtype != typ.dtype:
+            converted = fresh_alloc(
+                self._build_target_type(dst_type, dtype=dst_type.dtype), op.dst
+            )
+            ops.extend([
+                converted,
+                ElementwiseOp.build(converted.result(), [result], "convert"),
+            ])
+            result = converted.result()
+        ops.append(
+            MoveOp.build(
+                op.dst, result, collective=op.collective,
+                attrs={"dst_tiling_scheme": scheme},
+            )
+        )
+        return ops
 
     def _is_register_writeback(self, op: Op) -> bool:
         """Whether ``op`` is the writeback half of a destination promotion.
@@ -821,39 +1038,15 @@ class PromoteBuffers(LoweringPass):
             and isinstance(op.dst.type, GmemTensorType)
         )
 
-    def _epilogue(self, ops: list[Op], hero: int) -> list[ElementwiseOp]:
-        """The ops directly behind ``ops[hero]`` that promote with it.
-
-        Contiguous only, and each has to earn its place: element-wise, selected
-        by ``epilogue_label_filter``, and in place over the destination.
-        Anything else ends the run -- an op left where it is must not be
-        stepped over, or moving what follows past it would reorder the two.
-
-        Element-wise alone would be too weak a test, which is why the filter
-        has to name them: promotion may leave an ``elementwise`` conversion
-        behind an accumulator.
-        """
-        if self.epilogue_label_filter is None:
-            return []
-        found: list[ElementwiseOp] = []
-        hero_op = ops[hero]
-        assert isinstance(hero_op, MatmulOp)
-        dst = hero_op.dst
-        for op in ops[hero + 1 :]:
-            if not is_elementwise(op):
-                break
-            assert isinstance(op, ElementwiseOp)
-            if not label_matches(op, self.epilogue_label_filter):
-                break
-            if len(op.operands) != 2 or not all(v is dst for v in op.operands):
-                break
-            found.append(op)
-        return found
+    def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
+        """Select the explicitly scheduled tensor consumer region."""
+        return select_region(ops, hero + 1, self.epilogue_label_filter)
 
     def _promote(
         self,
         op: MatmulOp,
-        epilogue: list[ElementwiseOp],
+        epilogue: list[Op],
+        reusable: dict[tuple, Value],
     ) -> list[Op]:
         lhs, rhs, dst = op.lhs, op.rhs, op.dst
 
@@ -862,22 +1055,22 @@ class PromoteBuffers(LoweringPass):
         pre_ops: list[Op] = []
         new_lhs, new_rhs, new_dst = lhs, rhs, dst
 
-        if "lhs" in self.operand_names:
-            ops, [new_lhs] = self._build_operand_promotion(
-                lhs,
-                "lhs",
-                op.collective,
-                label,
-            )
-            pre_ops.extend(ops)
-        if "rhs" in self.operand_names:
-            ops, [new_rhs] = self._build_operand_promotion(
-                rhs,
-                "rhs",
-                op.collective,
-                label,
-            )
-            pre_ops.extend(ops)
+        promoted_inputs = {"lhs": lhs, "rhs": rhs}
+        for operand_name, value in list(promoted_inputs.items()):
+            if operand_name not in self.operand_names:
+                continue
+            key = (operand_name, value, tuple(op.collective.items()))
+            if self.reuse_operands and key in reusable:
+                promoted_inputs[operand_name] = reusable[key]
+            else:
+                ops, [promoted] = self._build_operand_promotion(
+                    value, operand_name, op.collective, label,
+                )
+                pre_ops.extend(ops)
+                promoted_inputs[operand_name] = promoted
+                if self.reuse_operands:
+                    reusable[key] = promoted
+        new_lhs, new_rhs = promoted_inputs["lhs"], promoted_inputs["rhs"]
         init = op.init
         if "dst" in self.operand_names:
             # A scalar initializer fills the promoted allocation; registers
@@ -907,6 +1100,11 @@ class PromoteBuffers(LoweringPass):
             ):
                 init = None
 
+        if op.attrs.get("peeled") is True:
+            for setup in pre_ops:
+                if isinstance(setup, AllocOp):
+                    setup.attrs["peeled"] = True
+
         matmul_attrs = op.extra_attrs
         for operand_name in self.operand_names:
             matmul_attrs.pop(f"{operand_name}_tiling_scheme", None)
@@ -922,18 +1120,21 @@ class PromoteBuffers(LoweringPass):
         # The epilogue runs on the promoted buffer, before it is written back:
         # that is the whole point of promoting the destination, and it is only
         # reachable here because the ops behind the matmul came along.
-        promoted_epilogue: list[ElementwiseOp] = [
-            type(e)(operands=[new_dst, new_dst], results=[], attrs=e.attrs)
-            for e in epilogue
-        ]
+        if isinstance(new_dst.type, RegMemTensorType):
+            promoted_epilogue, mapping = self._promote_region(epilogue, {dst: new_dst}, new_dst.type, op.collective, label)
+            output = mapping[dst]
+        else:
+            mapping = {dst: new_dst}
+            promoted_epilogue = [clone_op(e, mapping) for e in epilogue]
+            output = new_dst
         post_ops: list[Op] = list(promoted_epilogue)
-        if "dst" in self.operand_names:
+        if "dst" in self.operand_names and not is_region_local(dst, {op, *epilogue}):
             writeback_tiling_scheme = cast(
                 int | None, op.attrs.get("dst_tiling_scheme")
             )
             post_ops, _ = self._build_operand_writeback(
                 dst,
-                new_dst,
+                output,
                 "dst",
                 op.collective,
                 label,
@@ -961,6 +1162,7 @@ def promote_buffers(
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
     unsafe_reuse_smem: bool = False,
+    reuse_operands: bool = False,
     tma_load_slices: dict[str, int] | None = None,
     label_filter: str | None = None,
     epilogue_label_filter: str | None = None,
@@ -981,6 +1183,7 @@ def promote_buffers(
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
         unsafe_reuse_smem=unsafe_reuse_smem,
+        reuse_operands=reuse_operands,
         tma_load_slices=tma_load_slices,
         label_filter=label_filter,
         epilogue_label_filter=epilogue_label_filter,

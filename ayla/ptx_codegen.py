@@ -37,10 +37,13 @@ from .gpu_dialect import (
     WarpGroupIdOp,
     WarpIdsOp,
     WgrmemTensorType,
+    WrmemTensorType,
+    unsigned_division_magic,
 )
 from .pipelines.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.lower_to_async import LowerToAsync
+from .passes.lower_to_scalar import LowerToScalar
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.pack_smem_allocs import ReuseSmemAllocs
@@ -57,6 +60,8 @@ class PtxLoweringPipeline(Pipeline):
         )
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
+        self.add_pass(Canonicalize())
+        self.add_pass(LowerToScalar())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
         self.add_pass(ReuseSmemAllocs())
@@ -132,6 +137,15 @@ def map_type_to_registers(type):
                 "ld.param.{type} {reg}, [{name}];\n"
                 "cvta.to.global.u64 {reg}, {reg};"
             ),
+        )
+    if isinstance(type, WrmemTensorType):
+        n = type.num_elements_per_thread
+        if type.dtype.name not in ("f32", "bf16", "f16"):
+            raise NotImplementedError("unsupported wrmem dtype")
+        suffix = PtxType.F32 if type.dtype.name == "f32" else PtxType.B16
+        return TypeRegisterMapping(
+            member_register_types=tuple(suffix for _ in range(n)),
+            member_names=tuple(f"r{i}" for i in range(n)),
         )
     if isinstance(type, RmemTensorType):
         n = type.num_elements
@@ -276,6 +290,7 @@ class PtxKernel:
     cluster_dim: tuple[int, int, int] | None = None
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
+    cooperative: bool = False
 
 
 def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
@@ -289,13 +304,14 @@ def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
     )  # type: ignore[return-value]
 
 
-def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
-    """Lower a single-kernel ModuleOp to a PtxKernel."""
+def make_ptx_kernel(module: ModuleOp, *, lowered: bool = False) -> PtxKernel:
+    """Emit a single kernel, optionally from already lowered PTX-template IR."""
     top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    module = PtxLoweringPipeline().run(module)
+    if not lowered:
+        module = PtxLoweringPipeline().run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
@@ -322,6 +338,7 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
         block_dim=block_dim,
         cluster_dim=cluster_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
+        cooperative=kernel.attrs.get("cooperative") is True,
     )
 
 
@@ -387,8 +404,13 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
 def _emit_if(p: PtxPrinter, op: IfOp) -> None:
     condition = p.unique_ptx_names_for_value(op.condition)
     done = p.unique_ptx_names(op, PtxType.LABEL)
-    p.write_line(f"@!{condition} bra {done};")
+    alternative = p.unique_ptx_names((op, "else"), PtxType.LABEL) if op.else_body is not None else done
+    p.write_line(f"@!{condition} bra {alternative};")
     _emit_block(p, op.body)
+    if op.else_body is not None:
+        p.write_line(f"bra {done};")
+        p.write_line(f"{alternative}:")
+        _emit_block(p, op.else_body)
     p.write_line(f"{done}:")
 
 
@@ -404,6 +426,19 @@ def _emit_module(
     p.write_newline_once()
     [kernel] = op.body.ops
     assert isinstance(kernel, KernelOp)
+    tables = kernel.attrs.get("ptx_global_u32_tables", {})
+    assert isinstance(tables, dict)
+    for name, words in tables.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+            raise ValueError("invalid PTX table symbol")
+        if not words or any(type(word) is not int or not 0 <= word < 2**32 for word in words):
+            raise ValueError("PTX tables require nonempty unsigned 32-bit data")
+        p.write_line(f".global .align 4 .u32 {name}[{len(words)}] = {{")
+        for start in range(0, len(words), 16):
+            chunk = ", ".join(str(word) for word in words[start:start + 16])
+            p.write_line(chunk + ("," if start + 16 < len(words) else ""))
+        p.write_line("};")
+        p.write_newline_once()
     _emit_kernel(p, kernel, block_dim, cluster_dim)
 
 
@@ -628,6 +663,18 @@ def _emit_index_mul(p: PtxPrinter, op: IndexMulOp) -> None:
         _write_with_comment(p, f"mul.lo.s32 {dst}, {lhs}, {rhs};", op)
 
 
+def _emit_constant_quotient(p, op, dst, lhs, divisor):
+    """Exact unsigned division using multiply-high and an optional correction."""
+    magic, shift, add = unsigned_division_magic(divisor)
+    _write_with_comment(p, f"mul.hi.u32 {dst}, {lhs}, {magic};", op)
+    if add:
+        temp = p.unique_ptx_names(object(), PtxType.B32)
+        p.write(f"sub.u32 {temp}, {lhs}, {dst};\n")
+        p.write(f"shr.u32 {temp}, {temp}, 1;\n")
+        p.write(f"add.u32 {dst}, {temp}, {dst};\n")
+    p.write(f"shr.u32 {dst}, {dst}, {shift};\n")
+
+
 def _emit_index_div(p: PtxPrinter, op: IndexDivOp) -> None:
     dst = p.unique_ptx_names_for_value(op.result())
     lhs = p.unique_ptx_names_for_value(op.lhs)
@@ -635,6 +682,8 @@ def _emit_index_div(p: PtxPrinter, op: IndexDivOp) -> None:
     if rhs_val is not None and _is_power_of_2(rhs_val):
         shift = rhs_val.bit_length() - 1
         _write_with_comment(p, f"shr.b32 {dst}, {lhs}, {shift};", op)
+    elif rhs_val is not None and 1 < rhs_val < 2**32:
+        _emit_constant_quotient(p, op, dst, lhs, rhs_val)
     elif rhs_val is not None:
         _write_with_comment(p, f"div.u32 {dst}, {lhs}, {rhs_val};", op)
     else:
@@ -649,6 +698,10 @@ def _emit_index_mod(p: PtxPrinter, op: IndexModOp) -> None:
     if rhs_val is not None and _is_power_of_2(rhs_val):
         mask = rhs_val - 1
         _write_with_comment(p, f"and.b32 {dst}, {lhs}, {mask};", op)
+    elif rhs_val is not None and 1 < rhs_val < 2**32:
+        quotient = p.unique_ptx_names(object(), PtxType.B32)
+        _emit_constant_quotient(p, op, quotient, lhs, rhs_val)
+        p.write(f"mad.lo.u32 {dst}, {quotient}, {(-rhs_val) & 0xffffffff}, {lhs};\n")
     elif rhs_val is not None:
         _write_with_comment(p, f"rem.u32 {dst}, {lhs}, {rhs_val};", op)
     else:

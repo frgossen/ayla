@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from enum import Enum, auto
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -20,7 +21,7 @@ from .gpu_dialect import (
 )
 from .passes.specialize_shapes import specialize_shapes
 from .ptx_codegen import PtxKernel, make_ptx_kernel
-from .ptx_runtime import PtxLauncher, make_ptx_launcher
+from .ptx_runtime import PtxLauncher, make_ptx_launcher, current_capture_id, memset_zero
 from .torch_custom_call import to_torch_dtype
 
 
@@ -112,13 +113,28 @@ class ScratchInit(Enum):
     ZERO = auto()
 
 
+@dataclass(eq=False)
+class ScratchBuffer:
+    """One physical allocation shared by arguments in an ordered launch plan."""
+
+    tensor_type: GmemTensorType
+    initialization: ScratchInit = ScratchInit.EMPTY
+    # Readiness counters are monotonic within a launch and must be reset on
+    # every invocation, including CUDA graph replays with reused scratch.
+    reset_each_launch: bool = False
+
+    def __post_init__(self) -> None:
+        if self.reset_each_launch and self.initialization is not ScratchInit.ZERO:
+            raise ValueError("per-launch scratch reset requires zero initialization")
+
+
 class PtxRoutePlan:
     """A PTX kernel and the runtime source of each gmem argument."""
 
     def __init__(
         self,
         kernel: PtxKernel,
-        bindings: Iterable[int | ScratchInit] | None = None,
+        bindings: Iterable[int | ScratchInit | ScratchBuffer] | None = None,
     ) -> None:
         self.kernel = kernel
         gmem_types = [
@@ -134,6 +150,8 @@ class PtxRoutePlan:
             )
 
     def __call__(self) -> Launcher:
+        if any(isinstance(binding, ScratchBuffer) for binding in self.bindings):
+            return PtxSequencePlan([self])()
         launcher = make_ptx_launcher(self.kernel)
         arguments: list[int | torch.Tensor] = []
         gmem_types = (
@@ -150,17 +168,97 @@ class PtxRoutePlan:
                     f"{self.kernel.name}: scratch buffer shape must be static"
                 )
             sizes = cast(tuple[int, ...], typ.sizes)
-            allocate = torch.zeros if binding is ScratchInit.ZERO else torch.empty
-            arguments.append(
-                allocate(
-                    sizes,
-                    dtype=to_torch_dtype(typ.dtype),
-                    device="cuda",
-                )
+            scratch = torch.empty(
+                sizes,
+                dtype=to_torch_dtype(typ.dtype),
+                device="cuda",
             )
+            if binding is ScratchInit.ZERO:
+                memset_zero(scratch)
+            arguments.append(scratch)
 
         def run(*tensors: torch.Tensor) -> None:
             launcher(*(tensors[arg] if type(arg) is int else arg for arg in arguments))
+
+        return run
+
+
+class PtxSequencePlan:
+    """Ordered kernels with private scratch for each invocation or capture.
+
+    Reusing a ScratchBuffer binding shares storage within this sequence. Each
+    invocation allocates its own storage on the launch stream by default.
+    With ``reuse_scratch``, ordered launches on a stream share scratch, while
+    independently captured CUDA graphs receive separate storage. Only use
+    reuse when every invocation fully writes its scratch and either restores
+    synchronization state (a grid counter wraps to zero) or declares
+    ``reset_each_launch`` on its initialized scratch buffers.
+    """
+
+    def __init__(self, routes: Iterable[PtxRoutePlan], *, reuse_scratch: bool = False):
+        self.routes = tuple(routes)
+        self.reuse_scratch = reuse_scratch
+        if not self.routes:
+            raise ValueError('a launch sequence must contain at least one kernel')
+
+    def __call__(self) -> Launcher:
+        launchers = [make_ptx_launcher(route.kernel) for route in self.routes]
+        bindings: list[list[int | ScratchBuffer]] = []
+        for route in self.routes:
+            arguments = []
+            types = [typ for typ in route.kernel.signature if isinstance(typ, GmemTensorType)]
+            for typ, binding in zip(types, route.bindings, strict=True):
+                if type(binding) is int:
+                    if binding < 0:
+                        raise ValueError('runtime tensor index must be non-negative')
+                    arguments.append(binding)
+                elif isinstance(binding, ScratchBuffer):
+                    arguments.append(binding)
+                elif isinstance(binding, ScratchInit):
+                    arguments.append(ScratchBuffer(typ, binding))
+                else:
+                    raise TypeError('launch arguments must bind a tensor or scratch buffer')
+            bindings.append(arguments)
+
+        scratch_by_stream: dict[tuple[torch.device, int], dict[ScratchBuffer, torch.Tensor]] = {}
+        captured_scratch: dict[tuple[torch.device, int], tuple[int, dict[ScratchBuffer, torch.Tensor]]] = {}
+
+        def run(*tensors: torch.Tensor) -> None:
+            device = tensors[0].device if tensors else torch.device('cuda', torch.cuda.current_device())
+            with torch.cuda.device(device):
+                scratch: dict[ScratchBuffer, torch.Tensor] = {}
+                if self.reuse_scratch:
+                    key = (device, torch.cuda.current_stream(device).cuda_stream)
+                    capture = current_capture_id()
+                    if capture:
+                        previous_capture, buffers = captured_scratch.get(key, (0, {}))
+                        if capture != previous_capture:
+                            buffers = {}
+                            captured_scratch[key] = (capture, buffers)
+                        scratch = buffers
+                    else:
+                        scratch = scratch_by_stream.setdefault(key, {})
+                reset: set[ScratchBuffer] = set()
+                for arguments in bindings:
+                    for binding in arguments:
+                        if not isinstance(binding, ScratchBuffer):
+                            continue
+                        if binding in scratch:
+                            if binding.reset_each_launch and binding not in reset:
+                                memset_zero(scratch[binding])
+                                reset.add(binding)
+                            continue
+                        typ = binding.tensor_type
+                        if typ.is_dynamic:
+                            raise ValueError('scratch buffer shape must be static')
+                        buffer = torch.empty(typ.static_shape, dtype=to_torch_dtype(typ.dtype), device=device)
+                        if binding.initialization is ScratchInit.ZERO:
+                            memset_zero(buffer)
+                            reset.add(binding)
+                        scratch[binding] = buffer
+                for launcher, arguments in zip(launchers, bindings, strict=True):
+                    launcher(*(tensors[arg] if type(arg) is int else scratch[cast(ScratchBuffer, arg)]
+                               for arg in arguments))
 
         return run
 
@@ -301,7 +399,7 @@ class ShapeSpecializingJITCompiler(JITCompiler):
     def __init__(
         self,
         module: ModuleOp,
-        compile_fn: Callable[[ModuleOp], PtxLauncher | ModuleOp],
+        compile_fn: Callable[[ModuleOp], Launcher | ModuleOp],
     ) -> None:
         top_ops = module.body.ops
         if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):

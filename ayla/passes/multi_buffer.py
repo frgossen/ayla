@@ -46,7 +46,7 @@ class MultiBuffer(LoweringPass):
         self, op: AllocOp,
     ) -> tuple[list[Op], list[object]] | None:
         loop = find_ancestor_of_type(op, ForOp)
-        if self.depth <= 1 or loop is None:
+        if self.depth <= 1 or loop is None or op.attrs.get("peeled") is True:
             return None
         if not label_matches(op, self.label_filter):
             return None

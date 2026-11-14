@@ -215,7 +215,7 @@ def test_fx_region_import_rejects_unsupported_targets():
     with mm.graph.inserting_before(mm):
         negated = _meta(
             mm.graph.call_function(
-                torch.ops.aten.neg.default,
+                torch.ops.aten.cos.default,
                 args=(lhs,),
             ),
             (128, 64),
@@ -608,8 +608,12 @@ def test_clone_that_changes_layout_is_not_erased():
 
     match = discover_supported_fx_region(output)
     assert match is not None
-    with pytest.raises(ValueError, match="clone changes layout"):
-        fx_region_to_module(match, name="copying_clone")
+    module = fx_region_to_module(match, name="copying_clone")
+    verify_gpu_dialect(module)
+    from ayla.gpu_dialect import MoveOp
+    [copy] = find_ops_of_type(module, MoveOp)
+    assert copy.src is module.body.ops[0].body.arguments[0]
+    assert copy.dst.type.strides == (8, 1)
 
 
 def test_ptx_route_plan_binds_runtime_and_scratch_arguments(monkeypatch):
@@ -638,14 +642,33 @@ def test_ptx_route_plan_binds_runtime_and_scratch_arguments(monkeypatch):
         "make_ptx_launcher",
         lambda _kernel: lambda *args: launched.append(args),
     )
-    monkeypatch.setattr(torch, "empty", lambda *_args, **_kwargs: scratch)
-    monkeypatch.setattr(
-        torch,
-        "zeros",
-        lambda *_args, **_kwargs: zeroed_scratch,
-    )
+    buffers = iter((scratch, zeroed_scratch))
+    cleared = []
+    monkeypatch.setattr(torch, "empty", lambda *_args, **_kwargs: next(buffers))
+    monkeypatch.setattr(jit_compiler, "memset_zero", cleared.append)
 
     route = plan()
     route("input", "output")  # type: ignore[arg-type]
 
     assert launched == [("input", scratch, zeroed_scratch, "output")]
+    assert cleared == [zeroed_scratch]
+
+
+def test_high_level_bf16_silu_conversion_preserves_compound_capture():
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from ayla.base.ir import find_ops_of_type
+    from ayla.gpu_dialect import ElementwiseOp
+    from ayla.fx_compiler import discover_fx_graph, fx_region_to_module
+
+    def projection(x, weight):
+        packed = x @ weight.T
+        gate = packed[:, :128].float()
+        activated = (gate / (1 + torch.exp(-gate))).bfloat16()
+        return activated * packed[:, 128:]
+
+    fx = make_fx(projection)(
+        torch.empty(128, 64, device="meta", dtype=torch.bfloat16),
+        torch.empty(256, 64, device="meta", dtype=torch.bfloat16),
+    )
+    module = fx_region_to_module(discover_fx_graph(fx.graph), name="compound_silu")
+    assert [op.fn for op in find_ops_of_type(module, ElementwiseOp)] == ["convert", "silu", "mul"]

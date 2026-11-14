@@ -17,8 +17,12 @@ single ``await``. The kind is decided by the op *inside* the async (see
   fused (no fused-store codegen, and unvalidated).
 
 Only *consecutive* ops of the *same* kind fuse; a different/unsupported op ends
-the run. An already-fused (multi-op) async, or a singleton whose await has been
-moved away by scheduling, is left untouched, so the pass is idempotent.
+the run. An explicit ``fusion_group`` also separates copies with different
+pipeline issue timing; absent metadata preserves the original behavior.
+By default, already-fused asyncs remain untouched. The optional
+``fuse_wgmma_groups`` mode merges adjacent WGMMA groups only when they share
+an accumulator, keeping independent projection commits separately awaitable.
+A singleton whose await has moved away by scheduling remains untouched.
 Side-effect-free ops between members (lock allocs, tile views) are transparent
 — emitted before the merged block — and the per-member awaits are dropped.
 
@@ -51,12 +55,17 @@ from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
 
 
-def _fusion_kind(op: Op) -> str | None:
-    """Fusion category of ``op`` if it is a single-op async we can fuse, else
-    ``None``. Multi-op (already-fused) asyncs return ``None`` — idempotency."""
+def _fusion_kind(op: Op, fuse_wgmma_groups: bool = False) -> object | None:
+    """Supported fusion category; optional WGMMA groups include accumulator identity."""
     if not isinstance(op, AsyncOp):
         return None
     body = op.body.ops
+    if fuse_wgmma_groups and body and all(isinstance(inner, MatmulOp) for inner in body):
+        first = body[0]
+        assert isinstance(first, MatmulOp)
+        if all(isinstance(inner, MatmulOp) and inner.dst is first.dst for inner in body):
+            return ("wgmma", first.dst)
+        return None
     if len(body) != 1:
         return None
     inner = body[0]
@@ -71,6 +80,11 @@ def _fusion_kind(op: Op) -> str | None:
 
 class FuseAsync(Pass):
 
+    fuse_wgmma_groups: bool
+
+    def __init__(self, fuse_wgmma_groups: bool = False):
+        super().__init__(fuse_wgmma_groups=fuse_wgmma_groups)
+
     def run_block(self, block: Block) -> None:
         super().run_block(block)
 
@@ -80,7 +94,7 @@ class FuseAsync(Pass):
         }
         new_ops: list[Op] = []
         group_lock: Value | None = None
-        group_kind: str | None = None
+        group_kind: object | None = None
         group_attrs: dict[str, object] | None = None
         group_collective: dict[CollectiveAxis, CollectiveLevel] | None = None
         # The members and the awaits dropped for them, as found. Fusing takes
@@ -121,7 +135,7 @@ class FuseAsync(Pass):
             group_ops = []
 
         for index, op in enumerate(ops):
-            kind = _fusion_kind(op)
+            kind = _fusion_kind(op, self.fuse_wgmma_groups)
             # Scheduling may deliberately move an await away from its
             # singleton async. That pair has already been processed and
             # cannot join a new fusion run. An await that follows a run of
@@ -130,7 +144,7 @@ class FuseAsync(Pass):
                 run = takewhile(
                     lambda o: is_side_effect_free(o)
                     or isinstance(o, AwaitOp)
-                    or _fusion_kind(o) == kind,
+                    or _fusion_kind(o, self.fuse_wgmma_groups) == kind,
                     ops[index + 1:],
                 )
                 if not any(
@@ -144,6 +158,7 @@ class FuseAsync(Pass):
                     if (
                         kind != group_kind
                         or op.lock.type != group_lock.type
+                        or op.attrs.get("fusion_group") != (group_attrs or {}).get("fusion_group")
                         or (
                             kind != "tma_load"
                             and op.collective != group_collective
@@ -176,6 +191,6 @@ class FuseAsync(Pass):
         block.ops = new_ops
 
 
-def fuse_async(module: ModuleOp) -> ModuleOp:
+def fuse_async(module: ModuleOp, *, fuse_wgmma_groups: bool = False) -> ModuleOp:
     """Convenience entry point."""
-    return FuseAsync().run(module)
+    return FuseAsync(fuse_wgmma_groups=fuse_wgmma_groups).run(module)

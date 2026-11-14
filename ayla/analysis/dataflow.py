@@ -109,6 +109,8 @@ class DataflowAnalysis[StateT: DataflowState]:
         # If ops and their join behavior are hard-coded by the framework.
         elif isinstance(op, IfOp):
             result = state.join(self._transfer_block(op.body, state))
+            if op.else_body is not None:
+                result = result.join(self._transfer_block(op.else_body, state))
         else:
             transfer = self._transfers.get(type(op))
             if transfer is None:

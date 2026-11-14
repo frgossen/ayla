@@ -46,8 +46,16 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     ptx_optimization_level: int | None = None,
     dtype: str = "bf16",
+    output_dtype: str | None = None,
+    split_k_parts: int = 1,
+    split_k_atomic: bool = False,
 ) -> ModuleOp:
-    """Build and schedule a static BF16 or FP16 GEMM module."""
+    """Build and schedule a static BF16 or FP16 GEMM module.
+
+    Atomic Split-K uses ``split_k_atomic=True``, ``split_k_parts``, and
+    ``output_dtype="f32"``. Initialize C before each overwriting GEMM; this
+    single-launch mode adds into its existing values.
+    """
     m = problem_size if m is None else m
     n = problem_size if n is None else n
     k = problem_size if k is None else k
@@ -55,6 +63,9 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         raise ValueError("problem dimensions must be positive")
     if dtype not in ("bf16", "f16"):
         raise ValueError("dtype must be 'bf16' or 'f16'")
+    output_dtype = dtype if output_dtype is None else output_dtype
+    if output_dtype not in ("bf16", "f16", "f32"):
+        raise ValueError("output_dtype must be 'bf16', 'f16', or 'f32'")
     problem_name = (
         str(problem_size) if m == n == k == problem_size else f"m{m}_n{n}_k{k}"
     )
@@ -64,6 +75,10 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
     name = f"auto_matmul_{problem_name}_wgmma256_wg_tma_store_k{operand_stages}"
     if dtype != "bf16":
         name += f"_{dtype}"
+    if output_dtype != dtype:
+        name += f"_out{output_dtype}"
+    if split_k_atomic:
+        name += f"_splitk{split_k_parts}_atomic"
     if operand_k_tile != 64:
         name += f"_ktile{operand_k_tile}"
     if cyclic_operand_pipeline:
@@ -93,15 +108,17 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         name += f"_dbuf{output_store_buffers}"
     if output_store == "scalar":
         name += "_pre_stsm"
+    elif output_store == "global":
+        name += "_global_store"
     if output_reversed_dims:
         name += "_rev" + "".join(output_reversed_dims).lower()
 
     module = gpu_dialect.parse(
         textwrap.dedent(f"""\
         module {{
-          kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
+          kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{output_dtype}>) attrs={{ptx_optimization_level: {ptx_optimization_level}}} {{
             %zero: rmem<f32> = constant 0.0
-            matmul(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{dtype}>, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
+            matmul(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %c: gmem<{m}x{n}x{output_dtype}>, %zero: rmem<f32>) collective=xyz.grid attrs={{label: "mm"}}
           }}
         }}""")
     )
@@ -129,4 +146,6 @@ def auto_matmul_4096_wgmma256_wg_tma_store_module(
         output_tma_inner_size=output_tma_inner_size,
         output_store=output_store,
         operand_move_attrs=operand_move_attrs,
+        split_k_parts=split_k_parts,
+        split_k_atomic=split_k_atomic,
     ).run(module)

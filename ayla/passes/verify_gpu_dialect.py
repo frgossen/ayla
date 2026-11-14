@@ -26,11 +26,17 @@ from ..gpu_dialect import (
     F64Type,
     ForOp,
     GmemTensorType,
+    GatherOp,
+    LoadIndexOp,
+    I64Type,
     IfOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexLtOp,
+    IndexEqOp,
+    IndexType,
+    PredicateType,
     IndexModOp,
     IndexMulOp,
     KernelOp,
@@ -40,15 +46,20 @@ from ..gpu_dialect import (
     ModuleOp,
     MoveOp,
     ReduceOp,
+    RegisterViewOp,
+    ShuffleOp,
     ReshapeOp,
     RmemTensorType,
+    RegMemTensorType,
     ConstantOp,
     SelectOp,
     SmemTensorType,
     TileOp,
+    TileSyncOp,
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
+    WrmemTensorType,
     BlockIdOp,
     join_collectives,
 )
@@ -74,6 +85,10 @@ class VerificationStage(Enum):
 def _verify_static_shape(typ: Type) -> None:
     if isinstance(typ, MemTensorType) and typ.is_dynamic:
         raise ValueError(f"unresolved dynamic shape {typ}")
+    if isinstance(typ, WrmemTensorType):
+        typ.register_layout()
+    if isinstance(typ, WgrmemTensorType) and typ.layout == "wgmma_row":
+        typ.register_layout()
     if isinstance(typ, TmaDescType):
         _verify_static_shape(typ.gmem_type)
 
@@ -167,6 +182,7 @@ def _static_index(value: Value | int, env: dict[Value, int]) -> int | None:
         IndexDivOp: lambda a, b: a // b,
         IndexModOp: lambda a, b: a % b,
         IndexLtOp: lambda a, b: int(a < b),
+        IndexEqOp: lambda a, b: int(a == b),
     }
     if type(op) in binary:
         lhs, rhs = (_static_index(operand, env) for operand in op.operands)
@@ -257,6 +273,7 @@ def _verify_cluster_shares_multicast_tile(
                 IndexDivOp,
                 IndexModOp,
                 IndexLtOp,
+                IndexEqOp,
                 SelectOp,
             ),
         ):
@@ -432,6 +449,19 @@ class VerifyGpuDialect(VerificationPass):
         if kernel is None or not any(dim is not None for dim in kernel.cluster_dim):
             raise ValueError("cluster_block_ids requires an enclosing clustered kernel")
 
+    @verifies(TileSyncOp)
+    def _verify_tile_sync(self, op: TileSyncOp) -> None:
+        kernel = find_ancestor_of_type(op, KernelOp)
+        if kernel is None or (
+            kernel.attrs.get("tile_scheduler") not in ("static", "dynamic")
+            and not kernel.attrs.get("gemm_normalization_overlap")
+        ) or kernel.attrs.get("cooperative") is not True:
+            raise ValueError("tile synchronization requires a resident tile scheduler")
+        if op.attrs.get("action") not in ("wait", "wait_pair", "publish") or len(op.operands) != 3:
+            raise ValueError("tile synchronization requires an action and three operands")
+        if not isinstance(op.operands[0].type, GmemTensorType) or op.operands[0].type.dtype != F32Type() or any(value.type != IndexType() for value in op.operands[1:]):
+            raise ValueError("tile synchronization requires global u32 storage and index operands")
+
     @verifies(BarrierOp)
     def _verify_barrier(self, op: BarrierOp) -> None:
         if op.scope in (
@@ -462,6 +492,11 @@ class VerifyGpuDialect(VerificationPass):
             kernel = find_ancestor_of_type(op, KernelOp)
             module = find_ancestor_of_type(op, ModuleOp)
             assert kernel is not None and module is not None
+            # Cooperative launches check the loaded function's actual resident
+            # capacity in the runtime, including registers and shared memory.
+            # They can safely admit more than one CTA per SM when it fits.
+            if kernel.attrs.get("cooperative") is True:
+                return
             max_ctas = _RESIDENT_GRID_CTAS_BY_TARGET.get(module.target)
             if max_ctas is None:
                 raise ValueError(
@@ -529,6 +564,16 @@ class VerifyGpuDialect(VerificationPass):
         _verify_tma_multicast(op)
         _verify_transposed_fragment_store(op)
         dst_type, src_type = op.dst.type, op.src.type
+        if op.attrs.get("atomic_add") is not None:
+            if (
+                op.attrs["atomic_add"] is not True
+                or not isinstance(dst_type, GmemTensorType)
+                or not isinstance(src_type, RegMemTensorType)
+                or src_type.dtype != F32Type()
+                or dst_type.dtype != F32Type()
+                or op.attrs.get("tma")
+            ):
+                raise ValueError("atomic_add requires a synchronous F32 register-to-global move")
         if (
             isinstance(dst_type, WgrmemTensorType)
             and isinstance(src_type, AddrMemTensorType)
@@ -537,7 +582,8 @@ class VerifyGpuDialect(VerificationPass):
                 or dst_type.sizes != src_type.sizes
                 or dst_type.dtype != src_type.dtype
                 or not (
-                    (
+                    dst_type.layout == "wgmma_row"
+                    or (
                         src_type.strides[0] is not None
                         and src_type.strides[0] % 2 == 0
                         and src_type.strides[1] == 1
@@ -644,6 +690,8 @@ class VerifyGpuDialect(VerificationPass):
             )
         src_reduction_size = src.sizes[-1]
         dst_reduction_size = dst.sizes[-1]
+        if any(size is not None and size < 1 for size in (src_reduction_size, dst_reduction_size)):
+            raise ValueError("reduce reduction dimensions must be positive")
         if (
             src_reduction_size is not None
             and dst_reduction_size is not None
@@ -653,6 +701,27 @@ class VerifyGpuDialect(VerificationPass):
                 "reduce destination reduction dimension cannot exceed the "
                 f"source; got {src.sizes} and {dst.sizes}"
             )
+
+    @verifies(GatherOp)
+    def _verify_gather(self, op: GatherOp) -> None:
+        dst, src, indices = (value.type for value in op.operands)
+        if (not isinstance(dst, GmemTensorType) or not isinstance(src, GmemTensorType)
+                or not isinstance(indices, GmemTensorType)):
+            raise ValueError("gather operands must be global tensors")
+        if (dst.rank != 2 or src.rank != 2 or indices.rank != 1
+                or indices.dtype != I64Type() or src.dtype != dst.dtype
+                or tuple(dst.sizes) != (indices.sizes[0], src.sizes[1])):
+            raise ValueError("gather requires matching rank-2 tensors and rank-1 I64 indices")
+
+    @verifies(LoadIndexOp)
+    def _verify_load_index(self, op: LoadIndexOp) -> None:
+        typ = op.src.type
+        extent = op.attrs.get("extent")
+        if (not isinstance(typ, GmemTensorType) or typ.dtype != I64Type()
+                or typ.num_elements != 1 or op.result().type != IndexType()
+                or type(extent) is not int
+                or not 0 < extent < 2**32):
+            raise ValueError("load_index requires one I64 element and a positive U32 extent")
 
     @verifies(ElementwiseOp)
     def _verify_elementwise(self, op: ElementwiseOp) -> None:
@@ -673,6 +742,34 @@ class VerifyGpuDialect(VerificationPass):
             if src.dtype != dst.dtype:
                 raise ValueError("elementwise fill requires matching dtypes")
 
+    @verifies(RegisterViewOp)
+    def _verify_register_view(self, op: RegisterViewOp) -> None:
+        typ = op.arg.type
+        if (not isinstance(typ, RegMemTensorType) or type(op.index) is not int
+                or op.index not in typ.register_indices(op.arg)
+                or isinstance(typ, WgrmemTensorType) and typ.dtype in (BF16Type(), F16Type())):
+            raise ValueError('register view must select an existing unpacked scalar register')
+        if op.result().type != RmemTensorType.build([], typ.dtype):
+            raise ValueError('register view must preserve the selected scalar dtype')
+
+    @verifies(ShuffleOp)
+    def _verify_shuffle(self, op: ShuffleOp) -> None:
+        scalar = RmemTensorType.build([], F32Type())
+        offset = op.attrs.get('offset')
+        if (op.src.type != scalar or op.result().type != scalar
+                or op.attrs.get('mode') not in ('idx', 'bfly')
+                or type(offset) is not int or not 0 <= offset < 32):
+            raise ValueError('shuffle requires a scalar F32 register and idx/bfly offset within a warp')
+        kernel = find_ancestor_of_type(op, KernelOp)
+        if kernel is not None and kernel.block_dim[0] is not None and kernel.block_dim[0] % 32:
+            raise ValueError('full-warp shuffle requires block_dim.x divisible by 32')
+
+    @verifies(IndexEqOp)
+    def _verify_index_eq(self, op: IndexEqOp) -> None:
+        if (any(not isinstance(value.type, IndexType) for value in op.operands)
+                or len(op.operands) != 2 or not isinstance(op.result().type, PredicateType)):
+            raise ValueError('index equality requires two indices and a predicate result')
+
     @verifies(ReshapeOp)
     def _verify_reshape(self, op: ReshapeOp) -> None:
         arg = op.arg.type
@@ -688,18 +785,10 @@ class VerifyGpuDialect(VerificationPass):
             raise ValueError("reshape must preserve the element type")
         if isinstance(arg, AddrMemTensorType):
             assert isinstance(result, AddrMemTensorType)
-            preserves_strided_layout = tuple(
-                (size, stride)
-                for size, stride in zip(arg.sizes, arg.strides, strict=True)
-                if size != 1
-            ) == tuple(
-                (size, stride)
-                for size, stride in zip(
-                    result.sizes,
-                    result.strides,
-                    strict=True,
-                )
-                if size != 1
+            computed = arg.reshape_strides(result.static_shape) if not arg.is_dynamic and not result.is_dynamic else None
+            preserves_strided_layout = computed is not None and all(
+                size == 1 or actual == expected
+                for size, actual, expected in zip(result.sizes, result.strides, computed, strict=True)
             )
             if (
                 not (arg.is_canonical_strides and result.is_canonical_strides)
@@ -707,7 +796,7 @@ class VerifyGpuDialect(VerificationPass):
             ):
                 raise ValueError(
                     "reshape operands must have canonical strides or preserve "
-                    "a singleton-only layout change"
+                    "the logical address order"
                 )
         if (
             arg.num_elements is not None
@@ -730,6 +819,12 @@ class VerifyGpuDialect(VerificationPass):
                 _verify_static_shape(argument.type)
         for value in (*op.operands, *op.results):
             _verify_static_shape(value.type)
+            typ = value.type
+            width = 32 if isinstance(typ, WrmemTensorType) else 128 if isinstance(typ, WgrmemTensorType) and typ.layout == "wgmma_row" else None
+            if width is not None:
+                kernel = find_ancestor_of_type(op, KernelOp)
+                if kernel is not None and kernel.block_dim[0] is not None and kernel.block_dim[0] % width:
+                    raise ValueError("register reduction layouts require complete hardware groups along block X")
 
 
 def verify_gpu_dialect(

@@ -2,10 +2,30 @@ import textwrap
 
 import pytest
 
-from ayla.gpu_dialect import CollectiveAxis, CollectiveLevel, gpu_dialect
+from ayla.gpu_dialect import CollectiveAxis, CollectiveLevel, KernelOp, gpu_dialect
 from ayla.pipelines.canonicalize import Canonicalize
 from ayla.passes.tile_reduce import tile_reduce
 
+
+@pytest.mark.parametrize('fn', ['sum', 'max'])
+def test_partition_reduction_keeps_an_uneven_source_tail(fn):
+    from ayla.base.ir import find_ops_of_type
+    from ayla.gpu_dialect import TileOp
+    from ayla.passes.tile_reduce import TileReduce
+    from ayla.passes.verify_gpu_dialect import VerifyGpuDialect
+
+    module = gpu_dialect.parse_module(f'''module {{
+      kernel @tail(%src: gmem<8x67xf32>, %dst: gmem<8x1xf32>) {{
+        reduce {fn}(%dst: gmem<8x1xf32>, %src: gmem<8x67xf32>) collective=xyz.grid attrs={{init: {'0.0' if fn == 'sum' else '-inf'}}}
+      }}
+    }}''')
+    stages = TileReduce({1: 32}, (CollectiveLevel.BLOCK, CollectiveAxis.Z)).split(module)
+    assert stages.workspace_shape == (3, 8, 1)
+    source_tiles = [op for op in find_ops_of_type(stages.partials, TileOp)
+                    if tuple(op.arg.type.sizes) == (8, 67)]
+    assert len(source_tiles) == 1 and source_tiles[0].maybe_partial
+    for phase in (stages.partials, stages.reduction):
+        VerifyGpuDialect().run(gpu_dialect.parse_module(str(phase)))
 
 def test_tile_reduce_without_hero_filter_skips_non_reductions():
     module = gpu_dialect.parse_module(
@@ -503,7 +523,7 @@ def test_tile_reduce_rejects_dependent_levels_across_invocations():
 
     with pytest.raises(
         AssertionError,
-        match="grid-to-block and block-to-intra-block",
+        match="cover every child",
     ):
         tile_reduce(
             module,
@@ -573,7 +593,7 @@ def test_tile_reduce_rejects_unsupported_iteration_space(level, match):
         )
 
 
-def test_tile_reduce_rejects_clustered_kernel():
+def test_tile_reduce_tiles_blocks_in_clustered_kernel():
     module = gpu_dialect.parse_module(
         textwrap.dedent("""\
         module {
@@ -583,22 +603,19 @@ def test_tile_reduce_rejects_clustered_kernel():
         }""")
     )
 
-    with pytest.raises(
-        AssertionError,
-        match="cluster-aware iteration spaces",
-    ):
-        tile_reduce(
-            module,
-            tile_sizes={0: 4},
-            parallel_iteration_space=(
-                CollectiveLevel.BLOCK,
-                CollectiveAxis.X,
-            ),
-            hero_label_filter="mean",
-        )
+    module = tile_reduce(
+        module,
+        tile_sizes={0: 4},
+        parallel_iteration_space=(CollectiveLevel.BLOCK, CollectiveAxis.X),
+        hero_label_filter="mean",
+    )
+    kernel = module.body.ops[0]
+    assert isinstance(kernel, KernelOp)
+    assert kernel.grid_dim == (2, None, None)
+    assert kernel.cluster_dim == (2, 1, 1)
 
 
-def test_tile_reduce_rejects_non_divisible_dimension():
+def test_tile_reduce_keeps_a_non_divisible_memory_dimension():
     module = gpu_dialect.parse_module(
         textwrap.dedent("""\
         module {
@@ -608,19 +625,15 @@ def test_tile_reduce_rejects_non_divisible_dimension():
         }""")
     )
 
-    with pytest.raises(
-        AssertionError,
-        match="dimension 1 size 65 to be divisible by tile size 32",
-    ):
-        tile_reduce(
-            module,
-            tile_sizes={1: 32},
-            parallel_iteration_space=None,
-            hero_label_filter="mean",
-        )
+    from ayla.base.ir import find_ops_of_type
+    from ayla.gpu_dialect import ForOp, TileOp
+    result = tile_reduce(module, tile_sizes={1: 32}, parallel_iteration_space=None,
+                         hero_label_filter='mean')
+    assert find_ops_of_type(result, ForOp)[0].ub == 3
+    assert any(op.maybe_partial for op in find_ops_of_type(result, TileOp))
 
 
-def test_tile_reduce_rejects_tile_larger_than_dimension():
+def test_tile_reduce_keeps_a_tile_larger_than_a_memory_dimension():
     module = gpu_dialect.parse_module(
         textwrap.dedent("""\
         module {
@@ -630,16 +643,12 @@ def test_tile_reduce_rejects_tile_larger_than_dimension():
         }""")
     )
 
-    with pytest.raises(
-        AssertionError,
-        match=r"dimension 0 tile size to be in \[1, 8\]; got 16",
-    ):
-        tile_reduce(
-            module,
-            tile_sizes={0: 16},
-            parallel_iteration_space=None,
-            hero_label_filter="mean",
-        )
+    from ayla.base.ir import find_ops_of_type
+    from ayla.gpu_dialect import ForOp, TileOp
+    result = tile_reduce(module, tile_sizes={0: 16}, parallel_iteration_space=None,
+                         hero_label_filter='mean')
+    assert find_ops_of_type(result, ForOp)[0].ub == 1
+    assert any(op.maybe_partial for op in find_ops_of_type(result, TileOp))
 
 
 @pytest.mark.parametrize("dim", [-1, 2])
@@ -969,3 +978,70 @@ module {
     elementwise div(%2: gmem<1x1xf32>, %2: gmem<1x1xf32>) attrs={divisor: 6656, label: "mean_epilogue"}
   }
 }""")  # noqa: E501
+
+
+@pytest.mark.parametrize('level,group_size', [
+    (CollectiveLevel.THREAD, 1), (CollectiveLevel.THREAD_32, 32),
+    (CollectiveLevel.WG, 128),
+])
+def test_linear_reduction_tiling_covers_batched_outputs_once(level, group_size):
+    """Evaluate generated indices over a whole launch, including the last CTA."""
+    import itertools
+    import math
+    import operator
+    from collections import Counter
+    from ayla.base.ir import Value, find_ops_of_type
+    from ayla.gpu_dialect import (
+        BlockIdOp, ThreadIdOp, WarpGroupIdOp, TileOp, ReduceOp, IfOp,
+        IndexConstantOp, IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp, IndexLtOp,
+    )
+    from ayla.passes.tile_reduce import TileReduce
+    from ayla.passes.verify_gpu_dialect import VerifyGpuDialect
+
+    module = gpu_dialect.parse_module('''module {
+      kernel @batched(%src: gmem<3x5x7x4xf32>, %dst: gmem<3x5x7x1xf32>) grid_dim=[None, None, 3] {
+        %batch: index = block_id.z
+        %s: gmem<1x5x7x4xf32> = tile(%src: gmem<3x5x7x4xf32>, %batch: index, 0, 0, 0)
+        %sv: gmem<5x7x4xf32> = reshape(%s: gmem<1x5x7x4xf32>)
+        %d: gmem<1x5x7x1xf32> = tile(%dst: gmem<3x5x7x1xf32>, %batch: index, 0, 0, 0)
+        %dv: gmem<5x7x1xf32> = reshape(%d: gmem<1x5x7x1xf32>)
+        reduce sum(%dv: gmem<5x7x1xf32>, %sv: gmem<5x7x4xf32>) collective=xyz.grid attrs={init: 0.0}
+      }
+    }''')
+    [hero] = find_ops_of_type(module, ReduceOp)
+    dst = hero.dst
+    module = TileReduce({0: 1, 1: 1}, (level, CollectiveAxis.X), linearize=True,
+                        linearize_grid=(CollectiveAxis.Z,)).run(module)
+    VerifyGpuDialect().run(gpu_dialect.parse_module(str(module)))
+    [kernel] = find_ops_of_type(module, KernelOp)
+    assert kernel.grid_dim == (math.ceil(105 / (128 // group_size)), None, 1)
+    [guard] = find_ops_of_type(module, IfOp)
+    [local_dst] = [op for op in find_ops_of_type(module, TileOp) if op.arg is dst]
+    [batch_dst] = [op for op in find_ops_of_type(module, TileOp)
+                   if op.arg is kernel.body.arguments[1]]
+    arithmetic = {IndexAddOp: operator.add, IndexMulOp: operator.mul,
+                  IndexDivOp: operator.floordiv, IndexModOp: operator.mod,
+                  IndexLtOp: operator.lt}
+
+    def evaluate(value, block, thread):
+        if not isinstance(value, Value):
+            return value
+        op = value.definition
+        if isinstance(op, IndexConstantOp):
+            return op.value
+        if isinstance(op, BlockIdOp):
+            return block if op.axis == CollectiveAxis.X else 0
+        if isinstance(op, ThreadIdOp):
+            return thread
+        if isinstance(op, WarpGroupIdOp):
+            return thread // 128
+        return arithmetic[type(op)](*(evaluate(v, block, thread) for v in op.operands))
+
+    seen = Counter()
+    for block in range(kernel.grid_dim[0]):
+        for thread in range(0, 128, group_size):
+            if evaluate(guard.condition, block, thread):
+                batch = evaluate(batch_dst.indices[0], block, thread)
+                row, col = (evaluate(v, block, thread) for v in local_dst.indices[:2])
+                seen[batch, row, col] += 1
+    assert seen == Counter({coord: 1 for coord in itertools.product(range(3), range(5), range(7))})

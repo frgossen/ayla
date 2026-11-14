@@ -30,6 +30,7 @@ from .ptx_codegen import PtxKernel
 
 _LAUNCHER_CPP = r"""
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -244,7 +245,8 @@ static void launch_kernel(
     std::tuple<int, int, int> grid_dim,
     std::tuple<int, int, int> block_dim,
     py::list params,
-    int64_t shared_mem_bytes
+    int64_t shared_mem_bytes,
+    bool cooperative
 ) {
     auto fn = reinterpret_cast<CUfunction>(function_handle);
 
@@ -279,14 +281,56 @@ static void launch_kernel(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto [gx, gy, gz] = grid_dim;
     auto [bx, by, bz] = block_dim;
-    CU_CHECK(cuLaunchKernel(
-        fn, gx, gy, gz, bx, by, bz,
-        static_cast<unsigned int>(shared_mem_bytes),
-        stream, arg_ptrs.data(), /*extra=*/nullptr
-    ));
+    if (cooperative) {
+        CUdevice device;
+        int supported = 0, sms = 0, blocks_per_sm = 0;
+        CU_CHECK(cuCtxGetDevice(&device));
+        CU_CHECK(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device));
+        TORCH_CHECK(supported, "device does not support cooperative launch");
+        CU_CHECK(cuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+        CU_CHECK(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, fn, bx * by * bz, shared_mem_bytes));
+        TORCH_CHECK(static_cast<int64_t>(gx) * gy * gz <= static_cast<int64_t>(sms) * blocks_per_sm,
+                    "cooperative grid exceeds resident capacity: ", gx * gy * gz,
+                    " CTAs requested, ", sms * blocks_per_sm, " supported");
+        CU_CHECK(cuLaunchCooperativeKernel(
+            fn, gx, gy, gz, bx, by, bz,
+            static_cast<unsigned int>(shared_mem_bytes), stream, arg_ptrs.data()));
+    } else {
+        CU_CHECK(cuLaunchKernel(
+            fn, gx, gy, gz, bx, by, bz,
+            static_cast<unsigned int>(shared_mem_bytes),
+            stream, arg_ptrs.data(), /*extra=*/nullptr
+        ));
+    }
+}
+
+static uint64_t stream_capture_id() {
+    CUstreamCaptureStatus status;
+    cuuint64_t id = 0;
+    CU_CHECK(cuStreamGetCaptureInfo(at::cuda::getCurrentCUDAStream().stream(), &status, &id,
+        nullptr, nullptr,
+#if CUDA_VERSION >= 13000
+        nullptr, // CUDA 13 adds dependency edge data to the capture-info API.
+#endif
+        nullptr));
+    return status == CU_STREAM_CAPTURE_STATUS_ACTIVE ? id : 0;
+}
+
+static void memset_zero(const at::Tensor& tensor) {
+    TORCH_CHECK(tensor.is_cuda(), "scratch initialization requires a CUDA tensor");
+    TORCH_CHECK(tensor.is_contiguous(), "scratch initialization requires contiguous storage");
+    c10::cuda::CUDAGuard guard(tensor.device());
+    if (tensor.numel() == 0) return;
+    CU_CHECK(cuMemsetD8Async(
+        reinterpret_cast<CUdeviceptr>(tensor.data_ptr()), 0,
+        tensor.numel() * tensor.element_size(),
+        at::cuda::getCurrentCUDAStream(tensor.get_device()).stream()));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("memset_zero", &memset_zero);
+    m.def("stream_capture_id", &stream_capture_id);
     m.def("module_load_data", &module_load_data,
           py::arg("ptx"), py::arg("optimization_level") = -1);
     m.def("module_unload", &module_unload);
@@ -296,12 +340,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("grid_dim"),
           py::arg("block_dim"),
           py::arg("params"),
-          py::arg("shared_mem_bytes") = 0);
+          py::arg("shared_mem_bytes") = 0,
+          py::arg("cooperative") = false);
 }
 """
 
 
 class _LauncherExtension(Protocol):
+    def memset_zero(self, tensor: torch.Tensor) -> None: ...
+
+    def stream_capture_id(self) -> int: ...
+
     def module_load_data(
         self, ptx: str | bytes, optimization_level: int,
     ) -> int: ...
@@ -317,6 +366,7 @@ class _LauncherExtension(Protocol):
         block_dim: tuple[int, int, int],
         params: list[object],
         shared_mem_bytes: int,
+        cooperative: bool = False,
     ) -> None: ...
 
 
@@ -333,6 +383,19 @@ def _get_ext() -> _LauncherExtension:
             verbose=False,
         ),
     )
+
+
+def current_capture_id() -> int:
+    """Return the current CUDA capture identity, or zero outside capture."""
+    return _get_ext().stream_capture_id()
+
+
+def memset_zero(tensor: torch.Tensor) -> None:
+    """Initialize contiguous CUDA scratch on its current stream.
+
+    CUDA graph capture records a memset node rather than a zero-fill kernel.
+    """
+    _get_ext().memset_zero(tensor)
 
 
 def assemble_ptx(kernel: PtxKernel, ptxas: str | Path) -> bytes:
@@ -418,13 +481,14 @@ class PtxLauncher:
         assert self._function is not None
         params = self._build_params(tensors)
         self._assert_params(params)
-        self._ext.launch_kernel(
-            self._function,
-            self._kernel.grid_dim,
-            self._kernel.block_dim,
-            params,
-            self._kernel.shared_mem_bytes,
+        launch_args = (
+            self._function, self._kernel.grid_dim, self._kernel.block_dim,
+            params, self._kernel.shared_mem_bytes,
         )
+        if self._kernel.cooperative:
+            self._ext.launch_kernel(*launch_args, cooperative=True)
+        else:
+            self._ext.launch_kernel(*launch_args)
 
     def _build_params(self, tensors):
         params = []

@@ -16,6 +16,8 @@ from ayla import (
 )
 from ayla.gpu_dialect import (
     ClusterBlockIdsOp,
+    CollectiveAxis,
+    ThreadIdOp,
     ConstantOp,
     F32Type,
     IfOp,
@@ -170,8 +172,8 @@ def test_codegen_rejects_cluster_dimension_after_grid_resolution():
 
 
 def test_codegen_if_branches_over_its_body():
-    lhs = IndexConstantOp.build(3)
-    rhs = IndexConstantOp.build(4)
+    lhs = ThreadIdOp.build(CollectiveAxis.X)
+    rhs = IndexConstantOp.build(16)
     condition = IndexLtOp.build(lhs.result(), rhs.result())
     guarded_value = IndexConstantOp.build(1)
     conditional = IfOp.build(condition.result(), Block(ops=[guarded_value]))
@@ -241,8 +243,8 @@ def test_codegen_naive_matmul_4096():
 )
 .reqntid 32, 32, 1
 {
-  .reg .b32  %r<19>;
-  .reg .b64  %rd<22>;
+  .reg .b32  %r<22>;
+  .reg .b64  %rd<16>;
   .reg .f32  %f<9>;
   .reg .pred %p<1>;
 
@@ -264,30 +266,27 @@ def test_codegen_naive_matmul_4096():
   mov.u64 %rd3, %rd0;           // to_ptr(%rd0)
   mov.u32 %r4, 1048576;         // 1048576
   shl.b32 %r5, %r0, 20;         // %r0 * 1048576
-  cvt.u64.u32 %rd5, %r5;
-  add.u64 %rd4, %rd3, %rd5;     // to_ptr(%rd0) + %r0 * 1048576
-  mov.u64 %rd6, %rd1;           // to_ptr(%rd1)
+  mov.u64 %rd4, %rd1;           // to_ptr(%rd1)
   shl.b32 %r6, %r1, 20;         // %r1 * 1048576
-  cvt.u64.u32 %rd8, %r6;
-  add.u64 %rd7, %rd6, %rd8;     // to_ptr(%rd1) + %r1 * 1048576
-  mov.u64 %rd9, %rd2;           // to_ptr(%rd2)
+  mov.u64 %rd5, %rd2;           // to_ptr(%rd2)
   mov.u32 %r7, 256;             // 256
   shl.b32 %r8, %r1, 8;          // %r1 * 256
   add.s32 %r9, %r5, %r8;        // %r0 * 1048576 + %r1 * 256
-  cvt.u64.u32 %rd11, %r9;
-  add.u64 %rd10, %rd9, %rd11;   // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256
   mov.u32 %r10, 32768;          // 32768
   shl.b32 %r11, %r2, 15;        // %r2 * 32768
-  cvt.u64.u32 %rd13, %r11;
-  add.u64 %rd12, %rd4, %rd13;   // to_ptr(%rd0) + %r0 * 1048576 + %r2 * 32768
-  shl.b32 %r12, %r3, 15;        // %r3 * 32768
-  cvt.u64.u32 %rd15, %r12;
-  add.u64 %rd14, %rd7, %rd15;   // to_ptr(%rd1) + %r1 * 1048576 + %r3 * 32768
-  mov.u32 %r13, 8;              // 8
-  shl.b32 %r14, %r3, 3;         // %r3 * 8
-  add.s32 %r15, %r11, %r14;     // %r2 * 32768 + %r3 * 8
-  cvt.u64.u32 %rd17, %r15;
-  add.u64 %rd16, %rd10, %rd17;  // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + %r2 * 32768 + %r3 * 8
+  add.s32 %r12, %r5, %r11;      // %r0 * 1048576 + %r2 * 32768
+  cvt.u64.u32 %rd7, %r12;
+  add.u64 %rd6, %rd3, %rd7;     // to_ptr(%rd0) + %r0 * 1048576 + %r2 * 32768
+  shl.b32 %r13, %r3, 15;        // %r3 * 32768
+  add.s32 %r14, %r6, %r13;      // %r1 * 1048576 + %r3 * 32768
+  cvt.u64.u32 %rd9, %r14;
+  add.u64 %rd8, %rd4, %rd9;     // to_ptr(%rd1) + %r1 * 1048576 + %r3 * 32768
+  mov.u32 %r15, 8;              // 8
+  shl.b32 %r16, %r3, 3;         // %r3 * 8
+  add.s32 %r17, %r11, %r16;     // %r2 * 32768 + %r3 * 8
+  add.s32 %r18, %r9, %r17;      // %r0 * 1048576 + %r1 * 256 + (%r2 * 32768 + %r3 * 8)
+  cvt.u64.u32 %rd11, %r18;
+  add.u64 %rd10, %rd5, %rd11;   // to_ptr(%rd2) + %r0 * 1048576 + %r1 * 256 + (%r2 * 32768 + %r3 * 8)
 
   // PTX template `%c_thread_rmem: rmem<2x2xf32> = alloc() attrs={}`
 
@@ -301,27 +300,27 @@ def test_codegen_naive_matmul_4096():
   mov.f32 %f3, %f4;
 
   // BEGIN: `for (%k: index = 0 to 4096) {...`
-  mov.b32 %r16, 0;
+  mov.b32 %r19, 0;
   $L0:
 
-  mov.u32 %r17, 4;              // 4
-  shl.b32 %r18, %r16, 2;        // %r16 * 4
-  cvt.u64.u32 %rd19, %r18;
-  add.u64 %rd18, %rd12, %rd19;  // to_ptr(%rd0) + %r0 * 1048576 + %r2 * 32768 + %r16 * 4
-  cvt.u64.u32 %rd21, %r18;
-  add.u64 %rd20, %rd14, %rd21;  // to_ptr(%rd1) + %r1 * 1048576 + %r3 * 32768 + %r16 * 4
+  mov.u32 %r20, 4;              // 4
+  shl.b32 %r21, %r19, 2;        // %r19 * 4
+  cvt.u64.u32 %rd13, %r21;
+  add.u64 %rd12, %rd6, %rd13;   // to_ptr(%rd0) + %r0 * 1048576 + %r2 * 32768 + %r19 * 4
+  cvt.u64.u32 %rd15, %r21;
+  add.u64 %rd14, %rd8, %rd15;   // to_ptr(%rd1) + %r1 * 1048576 + %r3 * 32768 + %r19 * 4
 
   // PTX template `%a_k_rmem: rmem<2x1xf32> = alloc() attrs={}`
 
   // PTX template `move(%a_k_rmem: rmem<2x1xf32>, %a_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc:...`
-  ld.global.nc.f32 %f5, [%rd18+0];
-  ld.global.nc.f32 %f6, [%rd18+16384];
+  ld.global.nc.f32 %f5, [%rd12+0];
+  ld.global.nc.f32 %f6, [%rd12+16384];
 
   // PTX template `%b_k_rmem: rmem<2x1xf32> = alloc() attrs={}`
 
   // PTX template `move(%b_k_rmem: rmem<2x1xf32>, %b_k: gmem<2x1xf32 strides=[4096, 1]>) attrs={nc:...`
-  ld.global.nc.f32 %f7, [%rd20+0];
-  ld.global.nc.f32 %f8, [%rd20+16384];
+  ld.global.nc.f32 %f7, [%rd14+0];
+  ld.global.nc.f32 %f8, [%rd14+16384];
 
   // PTX template `matmul(%a_k_rmem: rmem<2x1xf32>, %b_k_rmem: rmem<2x1xf32>, %c_thread_rmem: rmem<...`
   fma.rn.f32 %f0, %f5, %f7, %f0;
@@ -330,15 +329,15 @@ def test_codegen_naive_matmul_4096():
   fma.rn.f32 %f3, %f6, %f8, %f3;
 
   // END: `for (%k: index = 0 to 4096) {...`
-  add.s32 %r16, %r16, 1;
-  setp.lt.s32 %p0, %r16, 4096;
+  add.s32 %r19, %r19, 1;
+  setp.lt.s32 %p0, %r19, 4096;
   @%p0 bra $L0;
 
   // PTX template `move(%c_thread: gmem<2x2xf32 strides=[4096, 1]>, %c_thread_rmem: rmem<2x2xf32>)`
-  st.global.f32 [%rd16+0], %f0;
-  st.global.f32 [%rd16+4], %f1;
-  st.global.f32 [%rd16+16384], %f2;
-  st.global.f32 [%rd16+16388], %f3;
+  st.global.f32 [%rd10+0], %f0;
+  st.global.f32 [%rd10+4], %f1;
+  st.global.f32 [%rd10+16384], %f2;
+  st.global.f32 [%rd10+16388], %f3;
 
   ret;
 }""")
@@ -369,3 +368,13 @@ def test_codegen_tma_load():
     assert "mbarrier.init.shared::cta.b64" in kernel.ptx
     assert "cp.async.bulk.tensor.2d" in kernel.ptx
     assert "mbarrier.try_wait.parity" in kernel.ptx
+
+
+def test_block_barrier_drains_tma_shared_reads_before_arena_reuse():
+    from ayla.gpu_dialect import BarrierOp
+
+    kernel = KernelOp.build("reuse_fence", Block(ops=[
+        BarrierOp.build("block", attrs={"drain_bulk": True})]),
+        grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
+    ptx = make_ptx_kernel(ModuleOp.build(Block(ops=[kernel]))).ptx
+    assert ptx.index("cp.async.bulk.wait_group.read 0;") < ptx.index("bar.sync 0;")

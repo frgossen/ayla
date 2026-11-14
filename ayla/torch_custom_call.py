@@ -11,10 +11,12 @@ from typing import Protocol, cast
 import torch
 
 from .gpu_dialect import (
+    AddrMemTensorType,
     BF16Type,
     F16Type,
     F32Type,
     F64Type,
+    I64Type,
     MemTensorType,
 )
 
@@ -36,6 +38,7 @@ _TORCH_DTYPES = [
     (BF16Type(), torch.bfloat16),
     (F32Type(), torch.float32),
     (F64Type(), torch.float64),
+    (I64Type(), torch.int64),
 ]
 
 
@@ -124,7 +127,16 @@ def make_torch_custom_call(
             )
         device = input_tensors[0].device if input_tensors else torch.device("cuda")
         return [
-            torch.empty(
+            torch.empty_strided(
+                shape,
+                cast(tuple[int, ...], arg_type.strides),
+                dtype=to_torch_dtype(arg_type.dtype),
+                device=device,
+            )
+            if isinstance(arg_type, AddrMemTensorType)
+            and not arg_type.is_canonical_strides
+            and all(stride is not None for stride in arg_type.strides)
+            else torch.empty(
                 shape,
                 dtype=to_torch_dtype(arg_type.dtype),
                 device=device,

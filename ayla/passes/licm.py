@@ -31,17 +31,18 @@ class LICM(LoweringPass):
         # not lengthen lifetimes across unrelated, top-level guards.
         if find_ancestor_of_type(op, ForOp) is None:
             return None
-        self.lower_block(op.body)
         hoisted: list[Op] = []
-        remaining: list[Op] = []
-        for body_op in op.body.ops:
-            if isinstance(body_op, AllocOp) and isinstance(
-                body_op.result().type, SmemTensorType
-            ):
-                hoisted.append(body_op)
-            else:
-                remaining.append(body_op)
-        op.body.ops = remaining
+        for block in op.blocks:
+            self.lower_block(block)
+            remaining: list[Op] = []
+            for body_op in block.ops:
+                if isinstance(body_op, AllocOp) and isinstance(
+                    body_op.result().type, SmemTensorType
+                ):
+                    hoisted.append(body_op)
+                else:
+                    remaining.append(body_op)
+            block.ops = remaining
         return hoisted + [op], []
 
     @lowers(ForOp)

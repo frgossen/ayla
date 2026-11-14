@@ -13,6 +13,91 @@ from typing import ClassVar, Iterator, Literal, cast
 from .base.ir import Block, Dialect, Op, Type, Value, find_ancestor_of_type
 from .base.printer import Printer
 
+@dataclass(frozen=True)
+class ThreadIndex:
+    """A thread contribution: ((source // divisor) % modulus) * scale.
+
+    An absent modulus leaves the quotient unchanged. These integer terms
+    describe ownership; a backend chooses how to evaluate them.
+    """
+
+    source: Literal["lane", "thread_x"]
+    divisor: int = 1
+    modulus: int | None = None
+    scale: int = 1
+
+    def __post_init__(self):
+        if (
+            self.source not in ("lane", "thread_x")
+            or self.divisor <= 0
+            or (self.modulus is not None and self.modulus <= 0)
+            or self.scale <= 0
+        ):
+            raise ValueError(
+                "thread index requires a known source and positive factors"
+            )
+
+    def evaluate(self, thread_x: int) -> int:
+        value = thread_x % 32 if self.source == "lane" else thread_x
+        value //= self.divisor
+        if self.modulus is not None:
+            value %= self.modulus
+        return value * self.scale
+
+
+@dataclass(frozen=True)
+class RegisterElement:
+    register: int
+    coordinates: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RegisterLayout:
+    shape: tuple[int, ...]
+    elements: tuple[RegisterElement, ...]
+    column_lanes: int = 1
+    columns_per_lane: int = 1
+    distributed_rows: bool = False
+    replicas: int = 1
+    thread_bases: tuple[tuple[ThreadIndex, ...], ...] = ()
+
+    @property
+    def column_period(self) -> int:
+        return self.column_lanes * self.columns_per_lane
+
+    def row_elements(self, coordinates: tuple[int, ...]):
+        return tuple(e for e in self.elements if e.coordinates[:-1] == coordinates)
+
+    def coordinates_for_thread(
+        self, element: RegisterElement, thread_x: int
+    ) -> tuple[int, ...]:
+        """Logical coordinates of an element, including its owning thread.
+
+        Tail coordinates can be outside the shape; consumers must predicate
+        those elements. Replicated elements have the same coordinates in
+        several threads.
+        """
+        bases = self.thread_bases or ((),) * len(self.shape)
+        return tuple(
+            c + sum(term.evaluate(thread_x) for term in base)
+            for c, base in zip(element.coordinates, bases, strict=True)
+        )
+
+    def locate(self, coordinates: tuple[int, ...]) -> tuple[int, int | None]:
+        """Locate a logical element of a scalar or cyclic warp layout."""
+        if self.distributed_rows:
+            raise NotImplementedError(
+                "logical gathers require a scalar or cyclic warp layout"
+            )
+        column = coordinates[-1]
+        base = column - column % self.column_period
+        target = (*coordinates[:-1], base if self.column_lanes > 1 else column)
+        element = next(e for e in self.elements if e.coordinates == target)
+        return (
+            element.register,
+            column % self.column_lanes if self.column_lanes > 1 else None,
+        )
+
 
 class GpuDialect(Dialect):
     def __init__(self) -> None:
@@ -662,6 +747,46 @@ class ReshapeOp(GpuOp):
         return self.operands[0]
 
 
+@gpu_dialect.register_op("register_view")
+class RegisterViewOp(GpuOp):
+    """Alias one physical register of a distributed tensor in the current thread."""
+    @classmethod
+    def build(cls, arg: Value, index: int) -> RegisterViewOp:
+        if (not isinstance(arg.type, RegMemTensorType) or type(index) is not int
+                or index not in arg.type.register_indices(arg)
+                or isinstance(arg.type, WgrmemTensorType) and arg.type.dtype in (BF16Type(), F16Type())):
+            raise ValueError('register view must select an existing scalar register')
+        return cls(operands=[arg], results=[Value(name=None, type=RmemTensorType.build([], arg.type.dtype))], attrs={'index': index})
+
+    @property
+    def arg(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def index(self) -> int:
+        return self.attrs['index']  # type: ignore[return-value]
+
+
+@gpu_dialect.register_op("shuffle")
+class ShuffleOp(GpuOp):
+    """Read a scalar from another lane of the active warp.
+
+    All 32 lanes must execute together. Mode idx selects a lane; mode bfly
+    selects lane XOR offset. Scheduling determines the shuffle tree.
+    """
+    @classmethod
+    def build(cls, src: Value, offset: int, mode: Literal['idx', 'bfly'] = 'idx') -> ShuffleOp:
+        if not isinstance(src.type, RmemTensorType) or src.type.static_shape or src.type.dtype != F32Type():
+            raise ValueError('shuffle requires a scalar F32 register')
+        if mode not in ('idx', 'bfly') or type(offset) is not int or not 0 <= offset < 32:
+            raise ValueError('shuffle requires idx/bfly and an offset within a warp')
+        return cls(operands=[src], results=[Value(name=None, type=src.type)], attrs={'mode': mode, 'offset': offset})
+
+    @property
+    def src(self) -> Value:
+        return self.operands[0]
+
+
 @gpu_dialect.register_op("reduce")
 class ReduceOp(GpuOp):
     """Accumulate a reduction into a destination.
@@ -674,9 +799,15 @@ class ReduceOp(GpuOp):
     reduction is executed. Output ownership remains encoded by the destination
     type, for example ``wrmem``.
 
+    With P destination columns, column p combines source columns p + k*P.
+    ``init`` replaces the old destination; without it the old value is
+    accumulated once into the result.
+
     Equal source and destination shapes represent a partial-reduction step;
     a smaller destination combines those partials.
     """
+
+    COMBINATIONS: ClassVar[dict[str, str]] = {"sum": "add", "max": "max"}
 
     NEUTRAL_ELEMENTS: ClassVar[dict[str, float | int | None]] = {
         "max": float("-inf"),
@@ -803,6 +934,14 @@ class ElementwiseOp(GpuOp):
     """
 
     ARITIES: ClassVar[dict[str, int]] = {
+        "add": 2,
+        "sub": 2,
+        "max": 2,
+        "div": 2,
+        "square": 1,
+        "rsqrt": 1,
+        "neg": 1,
+        "exp": 1,
         "convert": 1,
         "fill": 1,
         "mul": 2,
@@ -1301,15 +1440,35 @@ class BarrierOp(GpuOp):
         return self.operands[0] if self.operands else None
 
 
+@gpu_dialect.register_op("tile_sync")
+class TileSyncOp(GpuOp):
+    """A CTA task's readiness acquire or completion publication.
+
+    The scheduler proves dependencies between global accesses before replacing
+    grid barriers with these operations. TMA publication fully drains stores;
+    scalar-only publication retains the CTA join and generic release chain.
+    ``wait_pair`` acquires two single-publication events with one CTA barrier.
+    The counter, offset and count are CTA-uniform. This is a task dependency
+    boundary for synchronization analysis, without a grid rendezvous.
+    """
+
+    @classmethod
+    def build(cls, sync: Value, offset: Value, count: Value, *, action: str) -> "TileSyncOp":
+        if action not in ("wait", "wait_pair", "publish"):
+            raise ValueError("tile synchronization action must be wait, wait_pair or publish")
+        return cls(operands=[sync, offset, count], results=[], attrs={"action": action})
+
+
 @gpu_dialect.register_op("if")
 class IfOp(GpuOp):
-    """Execute a region when its predicate is true."""
+    """Execute a region when its predicate is true, with an optional alternative."""
 
     @classmethod
     def build(
         cls,
         condition: Value,
         body: Block,
+        else_body: Block | None = None,
     ) -> "IfOp":
         assert isinstance(condition.type, PredicateType), (
             f"IfOp: expected PredicateType; got {condition.type}"
@@ -1317,7 +1476,7 @@ class IfOp(GpuOp):
         return cls(
             operands=[condition],
             results=[],
-            blocks=[body],
+            blocks=[body, *([else_body] if else_body is not None else [])],
         )
 
     @property
@@ -1328,11 +1487,18 @@ class IfOp(GpuOp):
     def body(self) -> Block:
         return self.blocks[0]
 
+    @property
+    def else_body(self) -> Block | None:
+        return self.blocks[1] if len(self.blocks) > 1 else None
+
     def print(self, p: Printer) -> None:
         p.write("if(")
         self.condition.print(p)
         p.write(") ")
         self.body.print(p, skip_label=True)
+        if self.else_body is not None:
+            p.write(" else ")
+            self.else_body.print(p, skip_label=True)
 
     @classmethod
     def parse_infix(cls, results, prefix: str, p):  # type: ignore[override]
@@ -1346,7 +1512,11 @@ class IfOp(GpuOp):
         p.read_literal(")")
         brace = p.read_literal("{")
         body = Block.parse(brace, p, arguments=[])
-        return cls.build(condition, body)
+        else_body = None
+        if p.can_read_literal("else"):
+            p.read_literal("else")
+            else_body = Block.parse(p.read_literal("{"), p, arguments=[])
+        return cls.build(condition, body, else_body)
 
 
 @gpu_dialect.register_op("async")
@@ -1548,6 +1718,13 @@ class MemTensorType(Type):
         return any(size is None for size in self.sizes)
 
     @property
+    def static_shape(self) -> tuple[int, ...]:
+        """Positive static extents, required by concrete layout consumers."""
+        if any(size is None or size <= 0 for size in self.sizes):
+            raise ValueError('tensor layout requires positive static shapes')
+        return tuple(cast(int, size) for size in self.sizes)
+
+    @property
     def dtype(self) -> Type:
         return self.attrs["dtype"]  # type: ignore[return-value]
 
@@ -1611,6 +1788,40 @@ class AddrMemTensorType(MemTensorType):
     @property
     def is_canonical_strides(self) -> bool:
         return list(self.strides) == self.canonical_strides(list(self.sizes))
+
+    def reshape_strides(self, sizes: Sequence[int]) -> tuple[int, ...] | None:
+        """Strides for a view with the same logical address order, if possible.
+
+        Contiguous runs may be split or merged. A gap between runs remains a
+        boundary, so reshaping never silently materializes padded storage.
+        Singleton dimensions do not constrain the address order.
+        """
+        shape = self.static_shape
+        if math.prod(sizes) != math.prod(shape) or any(size <= 0 for size in sizes):
+            return None
+        if not shape:
+            return tuple(cast(list[int], self.canonical_strides(sizes)))
+        if None in self.strides:
+            return None
+        strides = cast(tuple[int, ...], self.strides)
+        result = [0] * len(sizes)
+        view_dim = len(sizes) - 1
+        chunk_stride = strides[-1]
+        source_elements = view_elements = 1
+        for dim in reversed(range(len(shape))):
+            source_elements *= shape[dim]
+            if dim and (shape[dim - 1] == 1 or strides[dim - 1] == source_elements * chunk_stride):
+                continue
+            while view_dim >= 0 and (view_elements < source_elements or sizes[view_dim] == 1):
+                result[view_dim] = view_elements * chunk_stride
+                view_elements *= sizes[view_dim]
+                view_dim -= 1
+            if view_elements != source_elements:
+                return None
+            if dim:
+                chunk_stride = strides[dim - 1]
+                source_elements = view_elements = 1
+        return tuple(result) if view_dim == -1 else None
 
     @property
     def is_column_major_2d(self) -> bool:
@@ -1693,6 +1904,30 @@ class RegMemTensorType(MemTensorType):
     (rmem), warp (wrmem), or warp group (wgrmem); no pointer arithmetic,
     no aliasing.
     """
+
+    def register_layout(self, value: Value | None = None) -> RegisterLayout:
+        """Interpret this type's logical ownership, optionally for a view.
+
+        Layout names remain the serialized IR representation. This interface
+        supplies their semantics without depending on a code generator.
+        """
+        from .register_layout import register_layout
+        if value is not None and value.type != self:
+            raise ValueError('register view type does not match the tensor type')
+        return register_layout(value or Value(name=None, type=self))
+
+    def register_indices(self, value: Value | None = None,
+                         elements_per_register: int = 1) -> tuple[int, ...]:
+        """Root storage indices selected by this tensor or its static view."""
+        from .register_layout import register_indices
+        return register_indices(self, value, elements_per_register)
+
+    def with_shape(self, sizes: Sequence[int], dtype: Type | None = None) -> RegMemTensorType:
+        """Preserve ownership while deriving a temporary or reduced tensor."""
+        attrs = {**self.attrs, 'sizes': list(sizes), 'dtype': dtype or self.dtype}
+        if isinstance(self, WgrmemTensorType) and self.layout in ('wgmma_layout_0', 'wgmma_row'):
+            attrs['layout'] = 'wgmma_row' if sizes[-1] == 1 else 'wgmma_layout_0'
+        return type(self)(attrs=attrs)
 
 
 @gpu_dialect.register_type("gmem")
@@ -1807,6 +2042,48 @@ class PtrType(Type):
         attrs = p.read_extra_attrs()
         p.read_literal(">")
         return cls(attrs={"space": space, **attrs})
+
+
+@gpu_dialect.register_op("gather")
+class GatherOp(GpuOp):
+    """Gather rows of a rank-2 tensor using a rank-1 I64 index tensor.
+
+    Negative indices wrap from the end, as in aten.index. Indices must be in
+    [-source_rows, source_rows); out-of-range inputs are not executable.
+    """
+
+    @classmethod
+    def build(cls, dst: Value, src: Value, indices: Value) -> "GatherOp":
+        return cls(operands=[dst, src, indices], results=[])
+
+    @property
+    def dst(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def src(self) -> Value:
+        return self.operands[1]
+
+    @property
+    def indices(self) -> Value:
+        return self.operands[2]
+
+
+@gpu_dialect.register_op("load_index")
+class LoadIndexOp(GpuOp):
+    """Load one signed I64 memory element, wrap negatives, return a U32 index.
+
+    The static extent must fit a U32 index. The caller guarantees the input is
+    in [-extent, extent), so wrapping is exact before narrowing.
+    """
+
+    @classmethod
+    def build(cls, src: Value, extent: int) -> "LoadIndexOp":
+        return cls(operands=[src], results=[Value(None, IndexType())], attrs={"extent": extent})
+
+    @property
+    def src(self) -> Value:
+        return self.operands[0]
 
 
 @gpu_dialect.register_op("to_ptr")
@@ -2028,7 +2305,10 @@ class WrmemTensorType(RegMemTensorType):
 
     Each lane holds the registers assigned to it by the producing operation;
     the logical value is the union of the 32 lane fragments.
-    ``default`` is a placeholder layout whose mapping is not yet specified.
+    Columns are distributed cyclically over lanes: column c is held by
+    lane c % 32 in register c // 32, independently for each parallel row.
+    Short rows occupy lanes [0, columns); other lanes carry no logical value.
+    ``default`` and ``lane`` name this layout; ``lane0`` is its scalar case.
     """
 
     # TODO: Move warp-level MMA support from WgrmemTensorType to WrmemTensorType,
@@ -2056,6 +2336,11 @@ class WrmemTensorType(RegMemTensorType):
     @property
     def layout(self) -> str:
         return self.attrs["layout"]  # type: ignore[return-value]
+
+    @property
+    def num_elements_per_thread(self) -> int:
+        from .register_layout import _warp_register_count
+        return _warp_register_count(self)
 
     def print(self, p: Printer) -> None:
         p.write(self.name)
@@ -2099,6 +2384,8 @@ class WgrmemTensorType(RegMemTensorType):
     Supported layouts:
       - ``"mma"``: mma.sync m16n8k16, warps=1
       - ``"wgmma_layout_0"``: warp group MMA m64nNk16, warps=4
+      - ``"wgmma_row"``: F32 row scalars, replicated across each group of
+        four column lanes. Register 2*b+h holds row 64*b+8*h+16*warp+lane//4.
     All lowerings that read from a wgrmem tensor (store, convert, matmul)
     must check the layout to emit correct code.
     """
@@ -2112,8 +2399,8 @@ class WgrmemTensorType(RegMemTensorType):
         warps: int = 1,
         attrs: dict[str, object] | None = None,
     ):
-        assert layout in ("mma", "wgmma_layout_0"), (
-            f"WgrmemTensorType: layout must be 'mma' or 'wgmma_layout_0'; "
+        assert layout in ("mma", "wgmma_layout_0", "wgmma_row"), (
+            f"WgrmemTensorType: layout must be 'mma', 'wgmma_layout_0', or 'wgmma_row'; "
             f"got {layout!r}"
         )
         return cls(
@@ -2138,6 +2425,9 @@ class WgrmemTensorType(RegMemTensorType):
     def num_elements_per_thread(self) -> int:
         num_elements = self.num_elements
         assert num_elements is not None
+        if self.layout == "wgmma_row":
+            # Each row scalar is replicated across its four column lanes.
+            return len(self.register_layout().elements)
         return num_elements // (self.warps * 32)
 
     def print(self, p: Printer) -> None:
@@ -2316,6 +2606,11 @@ class BF16Type(Type):
 @gpu_dialect.register_type("f32")
 class F32Type(Type):
     byte_size = 4
+
+
+@gpu_dialect.register_type("i64")
+class I64Type(Type):
+    byte_size = 8
 
 
 @gpu_dialect.register_type("f64")
@@ -2712,6 +3007,33 @@ class IndexLtOp(GpuOp):
         return self.operands[1]
 
 
+
+@gpu_dialect.register_op("index_eq")
+class IndexEqOp(GpuOp):
+    """Compare two index values using unsigned equality."""
+
+    @classmethod
+    def build(cls, lhs: Value, rhs: Value) -> "IndexEqOp":
+        assert isinstance(lhs.type, IndexType), (
+            f"IndexEqOp: expected IndexType lhs; got {lhs.type}"
+        )
+        assert isinstance(rhs.type, IndexType), (
+            f"IndexEqOp: expected IndexType rhs; got {rhs.type}"
+        )
+        return cls(
+            operands=[lhs, rhs],
+            results=[Value(name=None, type=PredicateType())],
+        )
+
+    @property
+    def lhs(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def rhs(self) -> Value:
+        return self.operands[1]
+
+
 def _resolve_val_str(v, prec, val_str):
     """Resolve a value to a string. Try val_str first, then expr_str on the definition."""
     if hasattr(v, "definition") and hasattr(v.definition, "expr_str"):
@@ -2773,6 +3095,21 @@ class IndexMulOp(GpuOp):
 
     def expr_str(self, prec=0, val_str=None) -> str:
         return _binop_expr_str(self, "*", 3, prec, val_str)
+
+
+def unsigned_division_magic(divisor: int) -> tuple[int, int, bool]:
+    """Multiply-high constant, shift and add correction for u32 division.
+
+    Powers of two use a shift instead. Other divisors use the exact libdivide
+    construction, including the correction when the multiplier needs 33 bits.
+    """
+    assert 1 < divisor < 2**32 and divisor & (divisor - 1)
+    shift = divisor.bit_length() - 1
+    proposed, remainder = divmod(1 << (32 + shift), divisor)
+    add = divisor - remainder >= 1 << shift
+    if add:
+        proposed = 2 * proposed + (2 * remainder >= divisor)
+    return (proposed + 1) & 0xFFFFFFFF, shift, add
 
 
 @gpu_dialect.register_op("index_div")
@@ -2850,7 +3187,7 @@ def root_buffers(value: Value) -> set[Value]:
     definition = value.definition
     if isinstance(definition, ReinterpretOp):
         return root_buffers(definition.arg)
-    if isinstance(definition, (ReshapeOp, TileOp)):
+    if isinstance(definition, (ReshapeOp, TileOp, RegisterViewOp)):
         return root_buffers(definition.arg)
     if isinstance(definition, SelectOp):
         return {root for case in definition.cases for root in root_buffers(case)}
@@ -2960,12 +3297,17 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
 
 @dataclass(frozen=True)
 class MemoryEffect:
-    """A memory access before its view is resolved to physical roots."""
+    """A memory access before its view is resolved to physical roots.
+
+    Atomic writes include their read-modify-write; overlapping atomic writes
+    serialize without a barrier. Ordinary conflicting accesses still need one.
+    """
 
     kind: Literal["R", "W"]
     value: Value
     scope: CollectiveScope
     tiling_scheme: int | None = None
+    atomic: bool = False
 
     _tiling_scheme_id_counter: ClassVar[Iterator[int]] = itertools.count()
 
@@ -2985,8 +3327,9 @@ def _memory_effect(
     value: Value,
     scope: CollectiveScope,
     tiling_scheme: int | None = None,
+    atomic: bool = False,
 ) -> list[MemoryEffect]:
-    return [MemoryEffect(kind, value, scope, tiling_scheme)]
+    return [MemoryEffect(kind, value, scope, tiling_scheme, atomic)]
 
 
 def _resolve_tma_descriptor(op: TmaMoveOp, value: Value) -> Value:
@@ -3015,12 +3358,18 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
         return [] if scope is None else _memory_effect("W", op.result(), scope)
     if is_side_effect_free(op):
         return []
+    if isinstance(op, LoadIndexOp):
+        return _memory_effect("R", op.src, CollectiveScope.THREAD)
+    if isinstance(op, GatherOp):
+        return (_memory_effect("W", op.dst, _type_collective_scope(op.dst.type))
+                + _memory_effect("R", op.src, _type_collective_scope(op.src.type))
+                + _memory_effect("R", op.indices, _type_collective_scope(op.indices.type)))
     if isinstance(op, MoveOp):
         # A TMA move is issued by t0 of its block, or by t0 of cluster rank 0
         # for multicast. A cooperative move writes at the buffer's own scope.
         src_scope = (
             CollectiveScope.THREAD
-            if isinstance(op.src.type, WgrmemTensorType)
+            if isinstance(op.src.type, RegMemTensorType)
             else _type_collective_scope(op.src.type)
         )
         # TODO: Derive the issuing scope from ``op.collective`` once collective
@@ -3031,7 +3380,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             dst_scope = CollectiveScope.CLUSTER_LEADER
         elif op.attrs.get("tma") and isinstance(op.dst.type, SmemTensorType):
             dst_scope = CollectiveScope.BLOCK_LEADER
-        elif isinstance(op.dst.type, WgrmemTensorType):
+        elif isinstance(op.dst.type, RegMemTensorType):
             dst_scope = CollectiveScope.THREAD
         else:
             dst_scope = _type_collective_scope(op.dst.type)
@@ -3040,6 +3389,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             op.dst,
             dst_scope,
             cast(int | None, op.attrs.get("dst_tiling_scheme")),
+            atomic=op.attrs.get("atomic_add") is True,
         ) + _memory_effect(
             "R",
             op.src,
@@ -3074,27 +3424,32 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             cast(int | None, op.attrs.get("src_tiling_scheme")),
         )
     if isinstance(op, MatmulOp):
-        # The wgmma accumulator (dst) is per-thread registers -> THREAD.
+        # Matrix instructions read each thread's own register fragments.
+        # Collective execution does not access another thread's registers.
+        # Shared/global operands still require their memory communication scope.
         init_effects = (
             []
             if op.init is None
             else _memory_effect(
                 "R",
                 op.init,
-                _type_collective_scope(op.init.type),
+                CollectiveScope.THREAD if isinstance(op.init.type, RegMemTensorType)
+                else _type_collective_scope(op.init.type),
             )
         )
         return (
             _memory_effect(
                 "R",
                 op.lhs,
-                _type_collective_scope(op.lhs.type),
+                CollectiveScope.THREAD if isinstance(op.lhs.type, RegMemTensorType)
+                else _type_collective_scope(op.lhs.type),
                 cast(int | None, op.attrs.get("lhs_tiling_scheme")),
             )
             + _memory_effect(
                 "R",
                 op.rhs,
-                _type_collective_scope(op.rhs.type),
+                CollectiveScope.THREAD if isinstance(op.rhs.type, RegMemTensorType)
+                else _type_collective_scope(op.rhs.type),
                 cast(int | None, op.attrs.get("rhs_tiling_scheme")),
             )
             + init_effects
@@ -3111,6 +3466,12 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
                 cast(int | None, op.attrs.get("dst_tiling_scheme")),
             )
         )
+    if isinstance(op, ShuffleOp):
+        # Each lane reads its own operand. The synchronous shuffle instruction
+        # performs communication and convergence; it does not access another
+        # lane's mutable buffer through a memory address.
+        return (_memory_effect('R', op.src, CollectiveScope.THREAD)
+                + _memory_effect('W', op.result(), CollectiveScope.THREAD))
     if isinstance(op, ElementwiseOp):
         effects = _memory_effect("W", op.dst, CollectiveScope.THREAD)
         for i in range(op.num_srcs):
@@ -3138,7 +3499,8 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             + _memory_effect(
                 "R",
                 op.src,
-                _type_collective_scope(op.src.type),
+                CollectiveScope.WARP if isinstance(op.src.type, (WrmemTensorType, WgrmemTensorType))
+                else _type_collective_scope(op.src.type),
             )
         )
     if isinstance(op, AwaitOp):
@@ -3172,7 +3534,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
 
 def has_ordering_effect(op: Op) -> bool:
     """Whether ``op`` or a nested operation constrains operation ordering."""
-    if isinstance(op, BarrierOp):
+    if isinstance(op, (BarrierOp, TileSyncOp)):
         return True
     return any(
         has_ordering_effect(nested) for block in op.blocks for nested in block.ops
@@ -3202,6 +3564,8 @@ def is_side_effect_free(op: Op) -> bool:
     Same operands and attrs always produce the same result, and nothing is read
     or written along the way.
     """
+    if isinstance(op, PTXTemplateOp) and op.attrs.get("side_effect_free") is True:
+        return True
     return isinstance(
         op,
         (
@@ -3212,11 +3576,13 @@ def is_side_effect_free(op: Op) -> bool:
             IndexConstantOp,
             IndexDivOp,
             IndexLtOp,
+            IndexEqOp,
             IndexModOp,
             IndexMulOp,
             PtrAddOp,
             ConstantOp,
             SelectOp,
+            RegisterViewOp,
             ReinterpretOp,
             ReshapeOp,
             ThreadIdOp,

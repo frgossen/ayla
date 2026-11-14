@@ -27,7 +27,6 @@ from ..gpu_dialect import (
     TileOp,
     launch_extent,
     require_launch_extent,
-    is_elementwise,
     is_grid_collective,
 )
 from ..base.ir import (
@@ -39,7 +38,7 @@ from ..base.ir import (
     find_ops,
 )
 from ..base.lowering_pass import LoweringPass, lowers
-from ._utils import label_matches
+from ._utils import select_region, tile_region, label_matches
 
 
 _OPERAND_DIMS = {
@@ -106,8 +105,10 @@ class TileMatmul(LoweringPass):
 
     The matmul is the hero: the dims name *its* axes, and everything else the
     tiling touches is found from it. ``epilogue_label_filter`` opts
-    element-wise ops that consume its destination into the same tiling, so
-    they are cut to the same tile rather than left reading the whole tensor.
+    tensor consumer graphs into the same tiling. Allocations, constants,
+    moves, reductions, and elementwise operations follow parallel partitions;
+    singleton statistics retain their broadcast dimensions. Reductions must
+    fit the producer tile, or be tiled explicitly first.
     Left ``None``, no op is drawn in and only the matmul is tiled.
 
     An epilogue joins every loop whose dim it shares and stays outside every
@@ -235,31 +236,10 @@ class TileMatmul(LoweringPass):
         )
 
     def _epilogue(self, ops: list[Op], hero: int) -> list[Op]:
-        """The ops directly behind ``ops[hero]`` that its tiling should absorb.
-
-        Contiguous only, and each has to earn its place: element-wise, opted
-        in by ``epilogue_label_filter``, and reading the hero's destination.
-        Anything else ends the run -- an op left where it is must not be
-        stepped over, or absorbing what follows would reorder the two.
-        """
-        found: list[Op] = []
-        hero_op = ops[hero]
-        assert isinstance(hero_op, MatmulOp)
-        dst = hero_op.dst
-        i = hero + 1
-        while i < len(ops):
-            op = ops[i]
-            if self.epilogue_label_filter is None or not is_elementwise(op):
-                break
-            if not label_matches(op, self.epilogue_label_filter):
-                break
-            # In place over the hero's destination is the only shape supported:
-            # one operand pattern, one set of dims, no broadcast to reason about.
-            if len(op.operands) != 2 or not all(v is dst for v in op.operands):
-                break
-            found.append(op)
-            i += 1
-        return found
+        """Select consumers sharing the producer's tiled parallel axes."""
+        if not any(dim in ('M', 'N') for dim in self.op_dims):
+            return []  # Consumers already remain after the producer's K loop.
+        return select_region(ops, hero + 1, self.epilogue_label_filter)
 
     def _iteration_bounds(self, hero: MatmulOp) -> list[int]:
         lhs, rhs = hero.lhs, hero.rhs
@@ -380,7 +360,8 @@ class TileMatmul(LoweringPass):
             grid_stride = ForOp.build(
                 lb=0,
                 ub=waves[binding],
-                attrs={"label": label} if label is not None else None,
+                attrs={"tile_output_loop": True, "tile_task_count": logical_extent,
+                       **({"label": label} if label is not None else {})},
             )
             stride = IndexConstantOp.build(extent)
             offset = IndexMulOp.build(grid_stride.iv, stride.result())
@@ -517,9 +498,12 @@ class TileMatmul(LoweringPass):
             ),
         )
 
-        tiled_epilogue = [
-            type(op)(operands=[dst, dst], results=[], attrs=op.attrs) for op in epilogue
-        ]
+        tiled_epilogue = tile_region(
+            epilogue, hero.dst, {hero.dst: dst},
+            [(0 if dim == 'M' else 1, size, index)
+             for dim, size, index in zip(self.op_dims, self.tile_sizes, ivs, strict=True)
+             if dim in ('M', 'N')], hero.collective,
+        )
         if outside_of is None:
             body_ops.extend(tiled_epilogue)
             tiled_epilogue = []

@@ -406,12 +406,15 @@ def test_preexisting_barrier_updates_dataflow_state():
           }
         }"""
 
-    # A block barrier cannot discharge a grid-scoped global-memory effect.
+    # Multiple CTAs still need a grid barrier for global-memory effects.
     with pytest.raises(NotImplementedError, match="barrier GRID"):
         insert_syncs(
             gpu_dialect.parse(
                 textwrap.dedent(
-                    source.replace("__SCOPE__", "block"),
+                    source.replace("__SCOPE__", "block").replace(
+                        "grid_dim=[1, 1, 1]",
+                        "grid_dim=[2, 1, 1]",
+                    ),
                 )
             )
         )
@@ -886,3 +889,19 @@ def test_bulk_await_orders_tma_store_read_only_for_the_leader():
         'barrier() attrs={scope: "block"}',
         "move(%s0: smem<64x64xf32>, %r0: rmem<64x64xf32>)",
     ]
+
+
+def test_single_cta_block_barrier_orders_global_intermediates():
+    module = gpu_dialect.parse_module("""
+        module {
+          kernel @test(%g: gmem<32xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
+            %r: rmem<32xf32> = alloc()
+            move(%g: gmem<32xf32>, %r: rmem<32xf32>)
+            barrier() attrs={scope: "block"}
+            move(%r: rmem<32xf32>, %g: gmem<32xf32>)
+          }
+        }
+    """)
+    insert_syncs(module)
+    [barrier] = find_ops_of_type(module, BarrierOp)
+    assert barrier.attrs["scope"] == "block"

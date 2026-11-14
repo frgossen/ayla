@@ -3072,3 +3072,123 @@ SCHEDULES: dict[tuple[str, str], dict[tuple[int, int, int, int], tuple[int, ...]
         (1, 401536, 512, 64): (369,),
     },
 }
+
+
+# Shape profiles for resident graph composition.
+PERSISTENT_SCHEDULES: dict[
+    tuple[int, int, int, int], tuple[int, int, bool, int, int | None]
+] = {
+    (132, 512, 4096, 6656): (128, 4, False, 1, None),
+    (132, 512, 6656, 4096): (208, 3, False, 1, None),
+    (132, 512, 6656, 19968): (208, 4, False, 1, None),
+    (132, 512, 4608, 6656): (144, 4, False, 1, None),
+    (132, 2048, 4096, 6656): (256, 3, False, 1, 128),
+    (132, 2048, 6656, 4096): (208, 3, True, 1, None),
+    (132, 2048, 6656, 19968): (208, 4, False, 1, None),
+    # N192 divides the final QKV columns exactly and fills three 128-CTA waves.
+    (132, 2048, 4608, 6656): (192, 4, False, 1, None),
+}
+
+PERSISTENT_SCHEDULE_OVERRIDES: dict[tuple[int, int, int, int], dict[str, object]] = {
+    # N208 distributes the output projection over 128 rather than 104 CTAs.
+    # Preserve its prior cache policy while selecting the measured geometry.
+    (132, 512, 6656, 4096): {
+        "warpgroup_m_tile": 64,
+        "unsafe_reuse_smem": True,
+        "operand_move_attrs": {
+            "lhs": {"l2_cache_hint": "evict_first"},
+            "rhs": {"l2_cache_hint": "evict_first"},
+            "dst": {"l2_cache_hint": "evict_last"},
+        },
+    },
+    # Keep the produced activations in L2 for the following norm/head phases.
+    # Together these store policies save 6.14 us in nine paired body trials.
+    (132, 512, 6656, 19968): {
+        "operand_move_attrs": {
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_last"},
+        },
+    },
+    (132, 512, 4608, 6656): {
+        "operand_move_attrs": {
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_last"},
+        },
+    },
+    # Only these 2048-token regular phases benefit from 128 active CTAs.
+    # The enclosing cooperative graph still launches all 132 resident CTAs.
+    # Their cache choices are selected together with the SwiGLU profile below:
+    # 11.37 us median saving, positive in 10/11 full-body production trials.
+    (132, 2048, 4096, 6656): {"output_grid_size": 128},
+    # Larger rows halve output-projection tasks without sacrificing wave fill.
+    # Three cyclic stages won 9/9 paired body rounds; reuse fits the row tile.
+    (132, 2048, 6656, 4096): {
+        "output_grid_size": 128,
+        "output_m_tile": 256,
+        "warpgroup_m_tile": 128,
+        "unsafe_reuse_smem": True,
+        "operand_move_attrs": {
+            "lhs": {"l2_cache_hint": "evict_last", "l2_promotion": "128B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_first"},
+        },
+    },
+    (132, 2048, 4608, 6656): {
+        "output_grid_size": 128,
+        "operand_move_attrs": {
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_last"},
+        },
+    },
+    (132, 2048, 6656, 19968): {
+        "output_grid_size": 128,
+        "output_m_tile": 256,
+        "warpgroup_m_tile": 128,
+        "operand_stages": 3,
+        "unsafe_reuse_smem": True,
+        "operand_move_attrs": {
+            "lhs": {"l2_promotion": "256B"},
+            "rhs": {"l2_promotion": "256B"},
+            "dst": {"l2_cache_hint": "evict_last"},
+        },
+    },
+}
+
+PERSISTENT_SWIGLU_SCHEDULES: dict[
+    tuple[int, int, int, int], tuple[int, int, bool, int | None, bool]
+] = {
+    (132, 512, 19968, 6656): (208, 3, True, 0, True),
+    (132, 2048, 19968, 6656): (192, 3, False, 0, True),
+}
+
+PERSISTENT_SWIGLU_OPERAND_MOVE_ATTRS: dict[
+    tuple[tuple[int, int, int, int], tuple[int, int, bool, int | None, bool]],
+    dict[str, dict[str, object]],
+] = {
+    ((132, 512, 19968, 6656), (208, 3, True, 0, True)): {
+        "lhs": {"l2_cache_hint": "evict_last", "l2_promotion": "128B"},
+        "rhs": {"l2_cache_hint": None, "l2_promotion": "256B"},
+    },
+    ((132, 2048, 19968, 6656), (192, 3, False, 0, True)): {
+        # Qualified jointly with the regular GEMM cache overrides above.
+        "lhs": {"l2_cache_hint": "evict_last", "l2_promotion": "128B"},
+        "rhs": {"l2_cache_hint": "evict_last", "l2_promotion": "256B"},
+    },
+}
+
+PERSISTENT_SWIGLU_WAVE_TAILS: dict[
+    tuple[tuple[int, int, int, int], tuple[int, int, bool, int | None, bool]], tuple[int, int]
+] = {
+    # Final 80 N192 tasks become 128 N128 tasks after twelve complete waves.
+    # Nine matched 500-replay rounds improve the recorded body by about 0.5%.
+    ((132, 2048, 19968, 6656), (192, 3, False, 0, True)): (128, 3),
+}
+
+PERSISTENT_SWIGLU_OUTPUT_PREFETCH: dict[
+    tuple[tuple[int, int, int, int], tuple[int, int, bool, int | None, bool]], int
+] = {
+    ((132, 2048, 19968, 6656), (192, 3, False, 0, True)): 0,
+}

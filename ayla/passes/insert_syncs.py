@@ -13,10 +13,13 @@ from ..base.ir import Block, Op, Value, find_op
 from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
+    AsyncOp,
     BarrierOp,
     KernelOp,
     LockType,
     ModuleOp,
+    SmemTensorType,
+    TmaMoveOp,
     effective_operands,
     lock_has_tma_multicast,
 )
@@ -24,6 +27,7 @@ from ..gpu_dialect import (
 
 # BarrierScope -> the BarrierOp ``scope`` attr.
 _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
+    BarrierScope.WARP: "warp",
     BarrierScope.BLOCK_TO_LEADER: "block_leader",
     BarrierScope.LEADER_TO_BLOCK: "block",
     BarrierScope.BLOCK: "block",
@@ -148,10 +152,25 @@ def _materialize_cluster_mbars(
         if target.scope != BarrierScope.CLUSTER_TO_LEADER:
             continue
         # A site without an id keeps an mbarrier of its own.
-        key = op if target.named_id is None else target.named_id
+        # PTX distributes multiple multicast slices among CTA issuers. With
+        # exactly one multicast in a pure load group, only rank 0 issues it;
+        # follower issuers then only need their own CTA's local readers.
+        single_issuer = (
+            isinstance(op, AsyncOp)
+            and all(
+                isinstance(load, TmaMoveOp) and isinstance(load.dst.type, SmemTensorType)
+                for load in op.body.ops
+            )
+            and sum(
+                isinstance(load, TmaMoveOp) and load.multicast is True
+                for load in op.body.ops
+            ) == 1
+        )
+        key = (op if target.named_id is None else target.named_id, single_issuer)
         if key not in allocs:
             allocs[key] = AllocOp.build_with_fresh_id(
                 LockType.build(kind="cluster_mbar"),
+                attrs={"single_issuer": True} if single_issuer else None,
             )
         barrier_syncs[op] = allocs[key].result()
     kernel.body.ops[0:0] = list(allocs.values())

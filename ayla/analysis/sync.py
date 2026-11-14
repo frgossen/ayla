@@ -15,14 +15,21 @@ from ..gpu_dialect import (
     ClusterBlockIdsOp,
     CollectiveScope,
     ElementwiseOp,
+    GatherOp,
+    LoadIndexOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
     IndexLtOp,
+    IndexEqOp,
+    RegisterViewOp,
+    ShuffleOp,
     IndexModOp,
     IndexMulOp,
     LockType,
+    KernelOp,
     MatmulOp,
+    ReduceOp,
     MoveOp,
     PTXTemplateOp,
     PtrAddOp,
@@ -32,13 +39,14 @@ from ..gpu_dialect import (
     SelectOp,
     ThreadIdOp,
     TileOp,
+    TileSyncOp,
     TmaMoveOp,
     ToPtrOp,
     WarpGroupIdOp,
     WarpIdsOp,
     memory_effects,
 )
-from ..base.ir import Op, Value
+from ..base.ir import Op, Value, find_ancestor_of_type
 from .dataflow import DataflowAnalysis, DataflowState, transfers
 
 
@@ -244,6 +252,7 @@ class ConcurrentMemoryEffect:
     scope: CollectiveScope
     tiling_scheme: int | None
     pending_await: Value | None
+    atomic: bool = False
     # The async lock whose await completes the access (``None`` for a
     # synchronous access), and the op after which the access is complete,
     # once known.
@@ -301,6 +310,24 @@ class SyncState(DataflowState):
 
 # The barriers at which every participating thread waits for every other.
 _RENDEZVOUS = (BarrierScope.BLOCK, BarrierScope.CLUSTER, BarrierScope.GRID)
+
+
+def _grid_phase(op: Op) -> Op | None:
+    """Identify authored kernel phases whose named barriers cannot overlap."""
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None:
+        return None
+    top = op
+    while top.parent_block is not kernel.body:
+        assert top.parent_block is not None and top.parent_block.parent_op is not None
+        top = top.parent_block.parent_op
+    phase: Op = kernel
+    for sibling in kernel.body.ops:
+        if sibling is top:
+            break
+        if isinstance(sibling, BarrierOp) and sibling.scope == "grid":
+            phase = sibling
+    return phase
 
 
 def _after_barrier(
@@ -398,6 +425,13 @@ def _transfer_memory_effects(
     effects = memory_effects(op)
     if effects is None:
         raise NotImplementedError(f"unmodelled effect-bearing op: {type(op).__name__}")
+    # A statically single-CTA launch makes global communication block-local.
+    # Preserve GRID scope for unresolved or multi-CTA launches.
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is not None and tuple(kernel.grid_dim) == (1, 1, 1):
+        effects = [dataclasses.replace(effect, scope=CollectiveScope.BLOCK)
+                   if effect.scope == CollectiveScope.GRID else effect
+                   for effect in effects]
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
@@ -405,6 +439,10 @@ def _transfer_memory_effects(
     for current in effects:
         for root in current.roots:
             for prior in live.concurrent_memory_effects.get(root, ()):
+                # Atomic RMWs serialize at each address. Their overlap is
+                # intentional; ordinary readers/writers still require sync.
+                if current.atomic and prior.atomic:
+                    continue
                 # Matching scheme IDs prove the runtime accesses pairwise disjoint.
                 if (
                     current.tiling_scheme is not None
@@ -458,6 +496,7 @@ def _transfer_memory_effects(
                     if target_op is not op
                     and target.named_id is not None
                     and target.scope == barrier_scope
+                    and _grid_phase(target_op) is _grid_phase(op)
                 }
                 if recorded is not None
                 else set()
@@ -523,6 +562,7 @@ def _transfer_memory_effects(
             memory_effect.scope,
             memory_effect.tiling_scheme,
             pending,
+            atomic=memory_effect.atomic,
             lock=async_lock,
             completed_after=None if async_lock is not None else op,
         )
@@ -544,6 +584,8 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         IndexConstantOp,
         IndexDivOp,
         IndexLtOp,
+        IndexEqOp,
+        RegisterViewOp,
         IndexModOp,
         IndexMulOp,
         PtrAddOp,
@@ -586,6 +628,13 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             raise ValueError(f"unknown barrier scope {op.scope!r}") from error
         return _after_barrier(state, scope, op)
 
+    @transfers(TileSyncOp)
+    def transfer_tile_sync(self, op: TileSyncOp, state: SyncState) -> SyncState:
+        # Dependencies between global tile accesses were established by the
+        # scheduler. A publication drains all async stores; an acquire gates
+        # the next task. This logical boundary does not rendezvous the grid.
+        return _after_barrier(state, BarrierScope.GRID, op)
+
     @transfers(AwaitOp)
     def transfer_await(self, op: AwaitOp, state: SyncState) -> SyncState:
         # Clear every effect pending on this lock -- only the ones this await
@@ -627,6 +676,6 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             async_lock=op.lock,
         )
 
-    @transfers(ElementwiseOp, MatmulOp, MoveOp, TmaMoveOp)
+    @transfers(ElementwiseOp, MatmulOp, ReduceOp, MoveOp, TmaMoveOp, ShuffleOp, GatherOp, LoadIndexOp)
     def transfer_memory_effects(self, op: Op, state: SyncState) -> SyncState:
         return _transfer_memory_effects(op, state, self.targets)

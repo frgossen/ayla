@@ -32,13 +32,18 @@ from .gpu_dialect import (
     ElementwiseOp,
     F32Type,
     GmemTensorType,
+    GatherOp,
     KernelOp,
     MatmulOp,
     ModuleOp,
+    MoveOp,
+    ReduceOp,
     ReshapeOp,
     RmemTensorType,
     TileOp,
     Type,
+    memory_effects,
+    root_buffer,
 )
 from .passes._utils import build_slice_tile
 from .torch_custom_call import (
@@ -50,18 +55,30 @@ from .torch_custom_call import (
 
 _ELEMENTWISE_OPS: dict[object, tuple[str, int]] = {
     torch.ops.prims.convert_element_type.default: ("convert", 1),
+    torch.ops.aten._to_copy.default: ("convert", 1),
     torch.ops.aten.sigmoid.default: ("sigmoid", 1),
     torch.ops.aten.silu.default: ("silu", 1),
     torch.ops.aten.mul.Tensor: ("mul", 2),
+    torch.ops.aten.add.Tensor: ("add", 2),
+    torch.ops.aten.sub.Tensor: ("sub", 2),
+    torch.ops.aten.div.Tensor: ("div", 2),
+    torch.ops.aten.neg.default: ("neg", 1),
+    torch.ops.aten.exp.default: ("exp", 1),
+    torch.ops.aten.rsqrt.default: ("rsqrt", 1),
 }
 
 
 @dataclass(frozen=True)
 class FxRegionMatch:
-    """The boundary of one single-output FX region."""
+    """Ordered tensor inputs and live outputs of a closed FX region."""
 
     output: Node
     inputs: tuple[Node, ...]
+    additional_outputs: tuple[Node, ...] = ()
+
+    @property
+    def outputs(self) -> tuple[Node, ...]:
+        return (self.output, *self.additional_outputs)
 
 
 _MATMUL_OPS: dict[object, tuple[int | None, int, int]] = {
@@ -70,30 +87,25 @@ _MATMUL_OPS: dict[object, tuple[int | None, int, int]] = {
     torch.ops.aten.bmm.default: (None, 0, 1),
 }
 
-# TODO: Derive discovery support from the Ayla importer once primitive math
-# operations have complete import and lowering support. Today add, div, exp,
-# and neg are included only so discovery can traverse the hardcoded
-# decomposed-SiLU pattern; they are not independently importable.
 _SUPPORTED_FX_TARGETS = {
     *_MATMUL_OPS,
+    *_ELEMENTWISE_OPS,
+    torch.ops.aten.mean.dim,
+    torch.ops.aten.index.Tensor,
+    torch.ops.aten.empty.memory_format,
+    operator.mul,
+    operator.floordiv,
+    torch.ops.aten.pow.Tensor_Scalar,
     operator.getitem,
-    torch.ops.aten.add.Tensor,
     torch.ops.aten.cat.default,
     torch.ops.aten.clone.default,
-    torch.ops.aten.div.Tensor,
-    torch.ops.aten.exp.default,
-    torch.ops.aten.mm.default,
-    torch.ops.aten.mul.Tensor,
-    torch.ops.aten.neg.default,
     torch.ops.aten.permute.default,
-    torch.ops.aten.sigmoid.default,
-    torch.ops.aten.silu.default,
     torch.ops.aten.slice.Tensor,
     torch.ops.aten.split.Tensor,
     torch.ops.aten.split_with_sizes.default,
     torch.ops.aten.unsqueeze.default,
     torch.ops.aten.view.default,
-    torch.ops.prims.convert_element_type.default,
+    torch.ops.aten.reshape.default,
 }
 
 
@@ -139,6 +151,45 @@ def discover_supported_fx_region(
     return FxRegionMatch(output=output, inputs=tuple(boundaries))
 
 
+def discover_fx_graph(graph: torch.fx.Graph) -> FxRegionMatch:
+    """Capture all live tensor computation in a static inference graph.
+
+    Scalar shape arithmetic is specialized from FX metadata. Unsupported live
+    operations are diagnosed rather than silently splitting the forward pass.
+    """
+    output = next(node for node in graph.nodes if node.op == "output")
+    outputs = tuple(dict.fromkeys(output.all_input_nodes))
+    if not outputs or any(
+        not isinstance(node.meta.get("val"), torch.Tensor) for node in outputs
+    ):
+        raise ValueError("full-forward capture requires tensor outputs")
+    boundaries: list[Node] = []
+    seen: set[Node] = set()
+
+    def visit(node: Node) -> None:
+        if node in seen:
+            return
+        seen.add(node)
+        if node.op in ("placeholder", "get_attr"):
+            if isinstance(node.meta.get("val"), torch.Tensor):
+                boundaries.append(node)
+            elif type(node.meta.get("val")) is not int:
+                raise ValueError(f"{node.name}: full-forward shapes must be static")
+            return
+        if not _is_supported_fx_node(node):
+            raise ValueError(
+                f"{node.name}: unsupported full-forward target {node.target}"
+            )
+        for argument in node.all_input_nodes:
+            visit(argument)
+
+    for node in outputs:
+        visit(node)
+    if set(outputs) & set(boundaries):
+        raise ValueError("full-forward outputs must be produced in the graph")
+    return FxRegionMatch(outputs[0], tuple(boundaries), outputs[1:])
+
+
 def _node_tensor(node: Node) -> torch.Tensor:
     tensor = node.meta.get("val")
     if not isinstance(tensor, torch.Tensor):
@@ -174,10 +225,11 @@ def _region_nodes(match: FxRegionMatch) -> list[Node]:
             visit(argument)
         ordered.append(node)
 
-    visit(match.output)
+    for output in match.outputs:
+        visit(output)
     region = set(ordered)
     for node in ordered:
-        if node is match.output:
+        if node in match.outputs:
             continue
         outside_users = set(node.users) - region
         if outside_users:
@@ -207,15 +259,18 @@ def _decomposed_silu(
     node: Node,
 ) -> tuple[Node, set[Node]] | None:
     """Recognize the post-grad ``x * sigmoid(x)`` expansion ending in BF16."""
-    # TODO: Import the primitive math operations into Ayla IR, then recognize
-    # and lower compound expressions there. Keep this targeted FX match only
-    # until neg, exp, add, and div have complete Ayla lowering support.
+    # Retain the compound form expected by the existing packed-SwiGLU
+    # schedules. Other expressions import through primitive arithmetic.
     conversion = _call_node(
         node,
         torch.ops.prims.convert_element_type.default,
         2,
     )
-    if conversion is None or conversion.args[1] is not torch.bfloat16:
+    if conversion is None:
+        conversion = _call_node(node, torch.ops.aten._to_copy.default, 1)
+        if conversion is None or conversion.kwargs.get("dtype") is not torch.bfloat16:
+            return None
+    elif conversion.args[1] is not torch.bfloat16:
         return None
     div = _call_node(conversion.args[0], torch.ops.aten.div.Tensor, 2)
     if div is None:
@@ -311,20 +366,29 @@ def fx_region_to_module(
     *,
     name: str,
 ) -> ModuleOp:
-    """Import one single-output FX region into unscheduled Ayla GPU IR.
+    """Import a closed FX region into unscheduled Ayla GPU IR.
 
-    The importer currently covers the operators needed by the fused GEMM
-    examples: transposed-weight matmul, reshape, slicing, BF16/FP32 conversion,
-    sigmoid/SiLU, and multiplication. Unsupported operations fail explicitly.
+    Tensor arithmetic, last-axis F32 means, transposed-weight matmuls and
+    structural views use ordinary GPU operations. Unsupported operations fail
+    explicitly before PTX scheduling.
     """
-    if match.output in match.inputs:
+    if set(match.outputs) & set(match.inputs):
         raise ValueError("FX region output cannot also be an input")
     nodes = _region_nodes(match)
     region = set(nodes)
     values = {node: Value(node.name, _node_type(node)) for node in match.inputs}
-    output_value = Value(match.output.name, _node_type(match.output))
+    output_values = {node: Value(node.name, _node_type(node)) for node in match.outputs}
+    output_value = output_values[match.output]
     ops: list[Op] = []
-    destinations = {match.output: output_value}
+    # View results need a materialized output, while compute results can write
+    # directly into their output argument.
+    destinations = {
+        node: output_values[node]
+        for node in match.outputs
+        if node.target in _ELEMENTWISE_OPS
+        or node.target in _MATMUL_OPS
+        or node.target in (torch.ops.aten.cat.default, torch.ops.aten.pow.Tensor_Scalar)
+    }
     cat_values: dict[Node, Value] = {}
     # A cat is free when its producers write directly into its result slices.
     for node in reversed(nodes):
@@ -380,8 +444,35 @@ def fx_region_to_module(
     for node in nodes:
         if node in skipped:
             continue
+        if node.op in ("placeholder", "get_attr") and type(node.meta.get("val")) is int:
+            continue
+        if node.target in (operator.mul, operator.floordiv):
+            if type(node.meta.get("val")) is not int:
+                raise ValueError(f"{node.name}: shape arithmetic must be static")
+            continue
         if node.op != "call_function":
             raise ValueError(f"{node.name}: unsupported FX node kind {node.op!r}")
+
+        if node.target is torch.ops.aten.empty.memory_format:
+            dst = _allocate(node, match.output, output_value, ops, destinations)
+            values[node] = dst
+            continue
+
+        if node.target is torch.ops.aten.index.Tensor:
+            source = _node_argument(node.args[0], owner=node)
+            indices = node.args[1]
+            if (
+                not isinstance(indices, (list, tuple))
+                or len(indices) != 1
+                or not isinstance(indices[0], Node)
+            ):
+                raise ValueError(
+                    f"{node.name}: index supports one leading row index tensor"
+                )
+            dst = _allocate(node, match.output, output_value, ops, destinations)
+            ops.append(GatherOp.build(dst, values[source], values[indices[0]]))
+            values[node] = dst
+            continue
 
         if node.target in (
             torch.ops.aten.split.Tensor,
@@ -421,6 +512,7 @@ def fx_region_to_module(
             torch.ops.aten.clone.default,
             torch.ops.aten.unsqueeze.default,
             torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
         ):
             source = _node_argument(node.args[0], owner=node)
             source_type = _node_type(source)
@@ -437,8 +529,40 @@ def fx_region_to_module(
                     )
                 )
             ):
-                raise ValueError(f"{node.name}: clone changes layout")
-            reshape = ReshapeOp.build(values[source], _node_type(node))
+                dst = _allocate(node, match.output, output_value, ops, destinations)
+                ops.append(
+                    MoveOp.build(
+                        dst,
+                        values[source],
+                        collective={
+                            axis: CollectiveLevel.GRID for axis in CollectiveAxis
+                        },
+                    )
+                )
+                values[node] = dst
+                continue
+            source_value = values[source]
+            if (
+                node.target is torch.ops.aten.reshape.default
+                and source_type.reshape_strides(result_type.static_shape) is None
+            ):
+                contiguous = AllocOp.build_with_fresh_id(
+                    GmemTensorType.build(list(source_type.sizes), source_type.dtype)
+                )
+                ops.extend(
+                    [
+                        contiguous,
+                        MoveOp.build(
+                            contiguous.result(),
+                            source_value,
+                            collective={
+                                axis: CollectiveLevel.GRID for axis in CollectiveAxis
+                            },
+                        ),
+                    ]
+                )
+                source_value = contiguous.result()
+            reshape = ReshapeOp.build(source_value, _node_type(node))
             ops.append(reshape)
             values[node] = reshape.result()
             continue
@@ -537,6 +661,64 @@ def fx_region_to_module(
             values[node] = tile.result()
             continue
 
+        if node.target is torch.ops.aten.mean.dim:
+            source = _node_argument(node.args[0], owner=node)
+            typ = _node_type(source)
+            dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+            keepdim = (
+                node.args[2]
+                if len(node.args) > 2
+                else node.kwargs.get("keepdim", False)
+            )
+            if (
+                dims not in ([-1], [typ.rank - 1], (-1,), (typ.rank - 1,))
+                or not keepdim
+            ):
+                raise ValueError(
+                    f"{node.name}: mean requires the final axis and keepdim=True"
+                )
+            if typ.dtype != F32Type() or not isinstance(typ.sizes[-1], int):
+                raise ValueError(f"{node.name}: mean requires a static F32 reduction")
+            dst = _allocate(node, match.output, output_value, ops, destinations)
+            reduction = ReduceOp.build(
+                dst,
+                values[source],
+                "sum",
+                collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
+                init=0.0,
+                attrs={"label": node.name},
+            )
+            denominator = ConstantOp.build(
+                float(typ.sizes[-1]), RmemTensorType.build([], F32Type())
+            )
+            ops.extend(
+                [
+                    reduction,
+                    denominator,
+                    ElementwiseOp.build(
+                        dst,
+                        [dst, denominator.result()],
+                        "div",
+                        attrs={"label": node.name},
+                    ),
+                ]
+            )
+            values[node] = dst
+            continue
+
+        if node.target is torch.ops.aten.pow.Tensor_Scalar:
+            if node.args[1] != 2:
+                raise ValueError(f"{node.name}: only square powers are supported")
+            source = _node_argument(node.args[0], owner=node)
+            dst = _allocate(node, match.output, output_value, ops, destinations)
+            ops.append(
+                ElementwiseOp.build(
+                    dst, [values[source]], "square", attrs={"label": node.name}
+                )
+            )
+            values[node] = dst
+            continue
+
         if node in silu_sources:
             elementwise_fn = "silu"
             source_nodes = [silu_sources[node]]
@@ -547,10 +729,11 @@ def fx_region_to_module(
                 source_nodes = []
             else:
                 elementwise_fn, num_sources = elementwise
-                source_nodes = [
-                    _node_argument(source, owner=node)
-                    for source in node.args[:num_sources]
-                ]
+                source_nodes = list(node.args[:num_sources])
+                if node.kwargs.get("alpha", 1) != 1:
+                    raise ValueError(
+                        f"{node.name}: scaled elementwise operations are unsupported"
+                    )
 
         if elementwise_fn is not None:
             dst = _allocate(
@@ -560,10 +743,24 @@ def fx_region_to_module(
                 ops,
                 destinations,
             )
+            sources = []
+            for source in source_nodes:
+                if isinstance(source, Node):
+                    sources.append(values[source])
+                elif type(source) in (int, float):
+                    scalar = ConstantOp.build(
+                        cast(int | float, source), RmemTensorType.build([], F32Type())
+                    )
+                    ops.append(scalar)
+                    sources.append(scalar.result())
+                else:
+                    raise ValueError(
+                        f"{node.name}: unsupported scalar operand {source!r}"
+                    )
             ops.append(
                 ElementwiseOp.build(
                     dst,
-                    [values[source] for source in source_nodes],
+                    sources,
                     elementwise_fn,
                     attrs={"label": node.name},
                 )
@@ -573,12 +770,41 @@ def fx_region_to_module(
 
         raise ValueError(f"{node.name}: unsupported FX target {node.target}")
 
+    # A fresh, unwritten allocation has no contents to materialize. Returning
+    # an independently allocated output preserves empty/view semantics without
+    # reading and copying uninitialized global memory. Keep initialized views.
+    summaries = [memory_effects(op) for op in ops]
+    written = {
+        root
+        for summary in summaries
+        if summary is not None
+        for effect in summary
+        if effect.kind == "W"
+        for root in effect.roots
+    }
+    for node, result in output_values.items():
+        root = root_buffer(values[node])
+        uninitialized = (
+            all(summary is not None for summary in summaries)
+            and root is not None
+            and isinstance(root.definition, AllocOp)
+            and root not in written
+        )
+        if values[node] is not result and not uninitialized:
+            ops.append(
+                MoveOp.build(
+                    result,
+                    values[node],
+                    collective={axis: CollectiveLevel.GRID for axis in CollectiveAxis},
+                )
+            )
+
     kernel = KernelOp.build(
         name,
         Block(
             arguments=[
                 *(values[node] for node in match.inputs),
-                output_value,
+                *output_values.values(),
             ],
             ops=ops,
         ),

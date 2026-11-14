@@ -14,14 +14,14 @@ from typing import cast
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 import textwrap
 from functools import cache
 
 import torch
 
-from .gemm_schedule_table import CONFIGS, SCHEDULES
+from .gemm_schedule_table import CONFIGS, SCHEDULES, PERSISTENT_SCHEDULES, PERSISTENT_SCHEDULE_OVERRIDES
 from .gpu_dialect import CollectiveAxis, GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from .jit_compiler import ShapeSpecializingJITCompiler
 from .torch_custom_call import DEFAULT_NAMESPACE, OperandKind
@@ -504,4 +504,86 @@ def gemm_op(
         compiler,
         [OperandKind.R] * inputs + [OperandKind.RW],
         namespace=namespace,
+    )
+
+
+def select_persistent_gemm_schedule(
+    m: int, n: int, k: int, *, blocks: int, threads: int = 256
+) -> GemmScheduleSeed | None:
+    """Select a BF16 GEMM for a resident grid with a fixed CTA size.
+
+    Standalone winners can require different CTA ownership or occupancy. Keep
+    those adaptations explicit, and apply measured resident overrides last so
+    their tile, staging and cache choices survive graph composition.
+    """
+    if type(threads) is not int or threads not in (256, 384, 512):
+        raise ValueError("resident GEMM requires two, three or four warpgroups")
+    seed = select_gemm_schedule("mm", "bfloat16", m, n, k)
+    if seed is None or seed.builder_config is None:
+        return None
+    config = dict(seed.builder_config)
+    config.pop("ptx_optimization_level", None)
+    config.update(
+        output_m_tile=threads // 2,
+        output_grid_size=blocks,
+        cluster_m_ctas=1,
+        cluster_n_ctas=1,
+        warpgroup_m_tile=None,
+        output_m_tiles_per_cta=1,
+        output_n_tiles_per_cta=1,
+        output_grid_fast_axis="m",
+    )
+    config["output_n_tile"] = min(cast(int, config["output_n_tile"]), 256)
+    config["warpgroup_n_tile"] = config["output_n_tile"]
+    # H100 resident sweep, validated again in the complete Muse graph. These
+    # are exact shapes: borrowing their results at other token counts is not
+    measured = PERSISTENT_SCHEDULES.get((blocks, m, n, k)) if threads == 256 else None
+    if measured is not None:
+        tile, stages, cyclic, slices, inner = measured
+        config.update(
+            output_n_tile=tile,
+            warpgroup_n_tile=tile,
+            operand_k_tile=64,
+            operand_stages=stages,
+            cyclic_operand_pipeline=cyclic,
+            output_slices=slices,
+            output_tma_inner_size=inner,
+            operand_move_attrs={
+                "lhs": {"l2_promotion": "256B"},
+                "rhs": {"l2_promotion": "256B"},
+                "dst": {"l2_cache_hint": "evict_first"},
+            },
+        )
+        config.update(PERSISTENT_SCHEDULE_OVERRIDES.get((blocks, m, n, k), {}))
+    if threads != 256:
+        config.update(
+            output_n_tile=128,
+            warpgroup_n_tile=128,
+            warpgroup_m_tile=64,
+            operand_k_tile=64,
+            operand_stages=3,
+            cyclic_operand_pipeline=True,
+            output_slices=1,
+            output_tma_inner_size=None,
+            operand_move_attrs={
+                "lhs": {"l2_promotion": "256B"},
+                "rhs": {"l2_promotion": "256B"},
+                "dst": {"l2_cache_hint": "evict_first"},
+            },
+        )
+    return replace(
+        seed,
+        builder_config=config,
+        adaptations=(
+            *seed.adaptations,
+            "resident two-warpgroup grid"
+            if threads == 256
+            else f"resident {threads // 128}-warpgroup grid",
+        ),
+        source_percentage_of_torch=None,
+        post_builder_passes=(),
+        transpose_output=False,
+        fixed_output_unroll_factor=None,
+        pipeline_output_waves=False,
+        pipeline_output_writeback=False,
     )

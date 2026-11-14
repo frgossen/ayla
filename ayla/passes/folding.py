@@ -30,6 +30,9 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     ForOp,
+    IfOp,
+    IndexEqOp,
+    IndexLtOp,
     IndexAddOp,
     IndexConstantOp,
     IndexDivOp,
@@ -92,6 +95,34 @@ class Folding(LoweringPass):
         vmap: dict[Value, Value] = {op.iv: iv_const.result()}
         cloned = [clone_op(body_op, vmap) for body_op in op.body.ops]
         return [iv_const, *cloned], []
+
+    @lowers(IfOp)
+    def lower_if(self, op: IfOp) -> tuple[list[Op], list[object]] | None:
+        """Remove guards whose index ranges prove them always true or false."""
+        condition = cast(Value, self.value_map.get(op.condition, op.condition))
+        comparison = condition.definition
+        if not isinstance(comparison, (IndexLtOp, IndexEqOp)):
+            return None
+        lhs, rhs = self._range(comparison.lhs), self._range(comparison.rhs)
+        if lhs is None or rhs is None:
+            return None
+        known = None
+        if isinstance(comparison, IndexLtOp):
+            if lhs[1] < rhs[0]:
+                known = True
+            elif lhs[0] >= rhs[1]:
+                known = False
+        elif lhs[1] < rhs[0] or rhs[1] < lhs[0]:
+            known = False
+        elif lhs[0] == lhs[1] == rhs[0] == rhs[1]:
+            known = True
+        if known is None:
+            return None
+        branch = op.body if known else op.else_body
+        if branch is None:
+            return [], []
+        self.lower_block(branch)
+        return list(branch.ops), []
 
     @lowers(SelectOp)
     def lower_select(
@@ -158,7 +189,7 @@ class Folding(LoweringPass):
             c = definition.value
             return (c, c) if c >= 0 else None
         if (loop := _iv_loop(value)) is not None:
-            return (loop.lb, loop.ub - 1) if loop.lb >= 0 else None
+            return (loop.lb, loop.lb + (loop.trip_count - 1) * loop.step) if loop.lb >= 0 and loop.step > 0 and loop.trip_count > 0 else None
         if isinstance(definition, (BlockIdOp, ThreadIdOp, WarpGroupIdOp)):
             axis = (
                 definition.axis
@@ -434,6 +465,22 @@ class Folding(LoweringPass):
         offset_val = self._const_val(op.byte_offset)
         if offset_val == 0:
             return [], [ptr]
+        # View chains often add a batch offset and then a tile offset. Merge
+        # those additions in the index IR when their sum cannot wrap its
+        # 32-bit representation. Separate pointer adds extend each offset to
+        # 64 bits, so an unbounded or overflowing sum must remain separate.
+        # Keep constant offsets for instruction immediates and offsets from
+        # different blocks for loop-invariant pointer hoisting.
+        if offset_val is None and isinstance(ptr.definition, PtrAddOp) and ptr.definition.parent_block is op.parent_block:
+            parent = ptr.definition
+            first = self._range(parent.byte_offset)
+            second = self._range(op.byte_offset)
+            if first is not None and second is not None and first[1] + second[1] < 2**32:
+                offset = cast(Value, self.value_map.get(op.byte_offset, op.byte_offset))
+                combined = IndexAddOp.build(parent.byte_offset, offset)
+                result = PtrAddOp.build(parent.ptr, combined.result())
+                result.attrs.update(op.attrs)
+                return [combined, result], [result.result()]
         return None
 
 
@@ -447,8 +494,6 @@ class Folding(LoweringPass):
         arg_type = arg.type
         assert isinstance(result_type, MemTensorType)
         assert isinstance(arg_type, MemTensorType)
-        if list(result_type.sizes) == list(arg_type.sizes):
-            return [], [arg]
         indices: list[int | Value] = []
         changed = False
         for index in op.indices:
@@ -463,6 +508,11 @@ class Folding(LoweringPass):
             else:
                 indices.append(constant)
                 changed = True
+        # A full-size view is an identity only at the original origin. A
+        # nonzero tile can deliberately select an entirely padded region
+        # (for example the last Split-K partition), so its offset matters.
+        if result_type == arg_type and all(index == 0 for index in indices):
+            return [], [arg]
         if changed:
             attrs = {
                 key: value for key, value in op.attrs.items()

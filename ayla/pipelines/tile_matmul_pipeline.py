@@ -1,7 +1,10 @@
 """Configurable GEMM module builders used by collection entries."""
 
-from ..base.ir import find_ops_of_type
-from ..base.pipeline import Pipeline
+import math
+import re
+
+from ..base.ir import Block, find_ops_of_type
+from ..base.pipeline import Pass, Pipeline
 from ..gpu_dialect import (
     CollectiveAxis,
     CollectiveLevel,
@@ -9,9 +12,16 @@ from ..gpu_dialect import (
     MatmulOp,
     MemTensorType,
     ModuleOp,
+    AllocOp,
+    AsyncOp,
+    BarrierOp,
+    MoveOp,
+    SmemTensorType,
+    root_buffers,
 )
 from .canonicalize import Canonicalize
 from ..passes.fuse_async import FuseAsync
+from ..passes.fuse_loops import FuseLoops
 from ..passes.licm import LICM
 from ..passes.lower_to_async import LowerToAsync
 from ..passes.multi_buffer import MultiBuffer
@@ -26,10 +36,53 @@ from ..passes.unroll_loop import UnrollLoop
 from typing import cast
 
 
+class _OperandStagePeriod(Pass):
+    """Use the period of the rings actually promoted in this reduction."""
+
+    def __init__(self, label: str, stages: int, overrides: dict[str, int], unroll: UnrollLoop):
+        super().__init__()
+        self.label, self.stages, self.overrides, self.unroll = label, stages, overrides, unroll
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        labels = {str(op.attrs.get("label", "")) for op in find_ops_of_type(module, AllocOp)
+                  if re.fullmatch(rf"(?:{self.label})_(?:lhs|rhs)_smem", str(op.attrs.get("label", "")))}
+        missing = set(self.overrides) - labels
+        if missing:
+            raise ValueError(f"operand stage overrides have no promoted allocation: {sorted(missing)}")
+        self.unroll.unroll_factor = math.lcm(*(self.overrides.get(name, self.stages) for name in labels))
+        return module
+
+
+class _OperandPrefetchGroups(Pass):
+    """Fuse copies only when the selected pipeline gives them the same timing."""
+
+    def __init__(self, label: str, stages: int, overrides: dict[str, int], cyclic: bool):
+        super().__init__()
+        self.label = label
+        self.stages, self.overrides, self.cyclic = stages, overrides, cyclic
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        for issue in find_ops_of_type(module, AsyncOp):
+            if len(issue.body.ops) != 1 or not isinstance(issue.body.ops[0], MoveOp):
+                continue
+            label = str(issue.body.ops[0].attrs.get("label", ""))
+            if not re.fullmatch(rf"(?:{self.label})_(?:lhs|rhs)_smem(?:_.*)?", label):
+                continue
+            match = re.fullmatch(r"(.+_(?:lhs|rhs)_smem)_iter(\d+)", label)
+            if match is not None:
+                depth = self.overrides.get(match[1], self.stages)
+                ahead = int(match[2]) < depth - int(self.cyclic)
+                issue.attrs["fusion_group"] = "operand_ahead" if ahead else "operand_current"
+            elif re.search(r"_(?:lhs|rhs)_smem", label):
+                issue.attrs["fusion_group"] = "operand_head"
+        return module
+
+
 def schedule_register_matmul(
     *,
     label: str,
     operand_stages: int,
+    operand_stage_overrides: dict[str, int] | None = None,
     operand_k_tile: int = 64,
     cyclic_operand_pipeline: bool = False,
     rhs_tma_load_slices: int = 1,
@@ -37,15 +90,26 @@ def schedule_register_matmul(
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
     loop_label_prefix: str | None = None,
+    k_tail_tiles: int | None = None,
 ) -> Pipeline:
     """Schedule a pre-tiled GEMM with an explicit register accumulator.
 
     The caller owns output tiling, the WGRMEM destination, its epilogue, and
     any live-out moves. This pipeline only schedules the reduction and its
-    operand movement.
+    operand movement. ``k_tail_tiles=None`` preserves independent loops; zero
+    fuses compatible selected loops with retained operands. Positive values
+    peel that many outer K tiles for caller-owned asynchronous epilogues.
+    ``operand_stage_overrides`` maps promoted allocation labels (for example
+    ``up_rhs_smem``) to depths. Other operands keep ``operand_stages``. Copies
+    with different prefetch timing retain independent completion events.
     """
     if rhs_tma_load_slices < 1:
         raise ValueError("rhs_tma_load_slices must be positive")
+    overrides = dict(operand_stage_overrides or {})
+    for name, depth in overrides.items():
+        if (not re.fullmatch(rf"(?:{label})_(?:lhs|rhs)_smem", name)
+                or type(depth) is not int or depth < 2):
+            raise ValueError("operand stage overrides require matching allocation labels and depths >= 2")
     k_label = f"{loop_label_prefix}_k" if loop_label_prefix else "k"
     kk_label = f"{loop_label_prefix}_kk" if loop_label_prefix else "kk"
 
@@ -60,10 +124,17 @@ def schedule_register_matmul(
             epilogue_label_filter=epilogue_label_filter,
         )
     )
+    if k_tail_tiles is not None:
+        pipeline.add_pass(FuseLoops(k_label, label, tail_iterations=k_tail_tiles))
+        if k_tail_tiles:
+            pipeline.add_pass(UnrollLoop(k_tail_tiles + 1, label_filter=rf"{k_label}_(?:first|second)_tail"))
+        pipeline.add_pass(Canonicalize())
+        label = rf"(?:{label})(?:_(?:tail|iter)\d+)?"
     pipeline.add_pass(
         PromoteBuffers(
             target_type="smem",
             operands=["lhs", "rhs"],
+            reuse_operands=k_tail_tiles is not None,
             swizzle="128B",
             layout=None,
             warps=None,
@@ -91,18 +162,25 @@ def schedule_register_matmul(
             epilogue_label_filter=epilogue_label_filter,
         )
     )
+    outer_unroll = UnrollLoop(unroll_factor=operand_stages, label_filter=k_label)
+    if overrides:
+        pipeline.add_pass(_OperandStagePeriod(label, operand_stages, overrides, outer_unroll))
+    excluded = "|".join(re.escape(name) for name in overrides)
+    exclusion = rf"(?!(?:{excluded})$)" if overrides else ""
     pipeline.add_pass(
         MultiBuffer(
             depth=operand_stages,
-            label_filter=f"{label}_lhs_smem",
+            label_filter=rf"{exclusion}(?:{label})_lhs_smem",
         )
     )
     pipeline.add_pass(
         MultiBuffer(
             depth=operand_stages,
-            label_filter=f"{label}_rhs_smem",
+            label_filter=rf"{exclusion}(?:{label})_rhs_smem",
         )
     )
+    for name, depth in overrides.items():
+        pipeline.add_pass(MultiBuffer(depth=depth, label_filter=re.escape(name)))
     pipeline.add_pass(LICM())
     # Unroll kk and peel the first K step, so the reduction's first WGMMA is a
     # single op the zeroed accumulator folds into as an overwrite.
@@ -114,23 +192,27 @@ def schedule_register_matmul(
     )
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(PeelLoop(label_filter=k_label, front_iterations=1))
-    pipeline.add_pass(
-        UnrollLoop(
-            unroll_factor=operand_stages,
-            label_filter=k_label,
-        )
-    )
+    pipeline.add_pass(outer_unroll)
     pipeline.add_pass(Canonicalize())
     pipeline.add_pass(LowerToAsync())
+    if overrides:
+        pipeline.add_pass(_OperandPrefetchGroups(label, operand_stages, overrides, cyclic_operand_pipeline))
     pipeline.add_pass(FuseAsync())
     pipeline.add_pass(LICM())
     pipeline.add_pass(Canonicalize())
     # A cyclic pipeline leaves the last stage's loads to the queued wgmma ring.
     stages = "|".join(map(str, range(operand_stages - cyclic_operand_pipeline)))
+    selected = rf"{label}_(lhs|rhs)_smem_iter(?:{stages})_async"
+    if overrides:
+        selected = rf"(?!(?:{excluded})_iter\d+_async$)(?:{selected})"
+        selected = "|".join([selected, *[
+            rf"{re.escape(name)}_iter(?:{'|'.join(map(str, range(depth - cyclic_operand_pipeline)))})_async"
+            for name, depth in overrides.items()
+        ]])
     pipeline.add_pass(
         PipelineLoop(
             label_filter_loop=k_label,
-            label_filter_op=rf"{label}_(lhs|rhs)_smem_iter(?:{stages})_async",
+            label_filter_op=selected,
             pipelining_offset=1,
         )
     )
@@ -155,6 +237,7 @@ def schedule_tiled_matmul(
     output_m_tile: int,
     output_n_tile: int,
     operand_stages: int,
+    operand_stage_overrides: dict[str, int] | None = None,
     operand_k_tile: int = 64,
     warpgroup_m_tile: int | None = None,
     cyclic_operand_pipeline: bool = False,
@@ -166,6 +249,8 @@ def schedule_tiled_matmul(
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     epilogue_label_filter: str | None = None,
     loop_label_prefix: str | None = None,
+    atomic_add: bool = False,
+    output_tma: bool = True,
 ) -> Pipeline:
     """Build the post-block-tiling GEMM pipeline."""
     if warpgroup_n_tile is None:
@@ -199,7 +284,7 @@ def schedule_tiled_matmul(
             swizzle=None,
             layout="wgmma_layout_0",
             warps=4,
-            tma=True,
+            tma=output_tma and not atomic_add,
             physical_layout=(
                 {
                     "swizzle": "128B",
@@ -211,7 +296,17 @@ def schedule_tiled_matmul(
             ),
             writeback_slices=output_slices,
             writeback_buffers=output_store_buffers,
-            move_attrs=operand_move_attrs,
+            move_attrs=(
+                {
+                    **(operand_move_attrs or {}),
+                    "dst": {
+                        **(operand_move_attrs or {}).get("dst", {}),
+                        "atomic_add": True,
+                    },
+                }
+                if atomic_add
+                else operand_move_attrs
+            ),
             target_dtype="f32",
             label_filter=label,
             epilogue_label_filter=epilogue_label_filter,
@@ -222,12 +317,13 @@ def schedule_tiled_matmul(
         schedule_register_matmul(
             label=label,
             operand_stages=operand_stages,
+            operand_stage_overrides=operand_stage_overrides,
             operand_k_tile=operand_k_tile,
             cyclic_operand_pipeline=cyclic_operand_pipeline,
-            # Preserve the existing three 128-row RHS loads for the tuned N=384
-            # schedule; other supported schedules use one RHS load.
+            # TMA box dimensions cannot exceed 256. Wide column tiles load
+            # each warpgroup's RHS separately, including the tuned N=384 case.
             rhs_tma_load_slices=(
-                output_n_tile // warpgroup_n_tile if output_n_tile == 384 else 1
+                output_n_tile // warpgroup_n_tile if output_n_tile > 256 else 1
             ),
             unsafe_reuse_smem=unsafe_reuse_smem,
             operand_move_attrs=operand_move_attrs,
@@ -241,6 +337,9 @@ def schedule_tiled_matmul(
 def _schedule_matmul(
     module: ModuleOp,
     *,
+    epilogue_label_filter: str | None = None,
+    split_k_parts: int = 1,
+    split_k_atomic: bool = False,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
     output_grid_size: int | None = None,
@@ -257,6 +356,7 @@ def _schedule_matmul(
     cluster_m_ctas: int = 1,
     cluster_n_ctas: int = 1,
     operand_stages: int = 3,
+    operand_stage_overrides: dict[str, int] | None = None,
     operand_k_tile: int = 64,
     cyclic_operand_pipeline: bool = False,
     output_slices: int = 1,
@@ -268,12 +368,30 @@ def _schedule_matmul(
     output_tma_inner_size: int | None = 128,
     output_store: str = "stmatrix",
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    unsafe_reuse_smem: bool = False,
 ) -> ModuleOp:
     """Apply the configurable WGMMA schedule to one concrete matmul.
 
     Keeping scheduling separate from module construction lets the JIT first
     specialize a dynamic template, then reuse the static collection's passes.
+    ``split_k_atomic=True`` partitions K across grid Z and atomically adds F32
+    partials directly into C in one launch. Initialize C before launching.
     """
+    if split_k_atomic:
+        from ..passes.tile_reduce import TileReduce
+
+        heroes = find_ops_of_type(module, MatmulOp)
+        if len(heroes) != 1 or type(split_k_parts) is not int or split_k_parts < 1:
+            raise ValueError("atomic partitioning requires one matmul and positive parts")
+        k = cast(MemTensorType, heroes[0].lhs.type).static_shape[-1]
+        if k % split_k_parts:
+            raise ValueError("partition count must divide the reduction dimension")
+        module = TileReduce({1: k // split_k_parts},
+                            (CollectiveLevel.BLOCK, CollectiveAxis.Z)).split(module, atomic=True)
+    elif split_k_parts != 1:
+        raise ValueError(
+            "split_k_parts requires split_k_atomic; use TileReduce.split for two phases"
+        )
     [kernel] = module.body.ops
     if not isinstance(kernel, KernelOp):
         raise ValueError("schedule_matmul requires exactly one kernel")
@@ -307,8 +425,8 @@ def _schedule_matmul(
         raise ValueError("problem dimensions must be positive")
     if output_m_tile not in (64, 128, 192, 256):
         raise ValueError("output_m_tile must be 64, 128, 192, or 256")
-    if not 48 <= output_n_tile <= 384 or output_n_tile % 8:
-        raise ValueError("output_n_tile must be a multiple of 8 between 48 and 384")
+    if not 8 <= output_n_tile <= 384 or output_n_tile % 8:
+        raise ValueError("output_n_tile must be a multiple of 8 between 8 and 384")
     if operand_k_tile not in (64, 128):
         raise ValueError("operand_k_tile must be 64 or 128")
     if cyclic_operand_pipeline and operand_stages < 2:
@@ -317,9 +435,29 @@ def _schedule_matmul(
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     if output_n_tile % warpgroup_n_tile:
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
-    if output_store not in ("scalar", "stmatrix"):
-        raise ValueError("output_store must be 'scalar' or 'stmatrix'")
-    if output_store == "scalar":
+    if output_store not in ("scalar", "stmatrix", "global"):
+        raise ValueError("output_store must be 'scalar', 'stmatrix', or 'global'")
+    if unsafe_reuse_smem and (
+        warpgroup_m_tile not in (64, 128)
+        or output_m_tile % warpgroup_m_tile
+        or warpgroup_n_tile != output_n_tile
+        or output_store == "global"
+        or output_slices != 1 or output_store_buffers != 1
+        or output_groups != (1, 1)
+        or (cluster_m_ctas, cluster_n_ctas) != (1, 1)
+        or split_k_atomic
+    ):
+        raise ValueError("shared compute/writeback reuse requires complete row warpgroups and one ungrouped TMA output tile")
+    if output_store == "global" and (
+        m % (output_m_tile * output_m_tiles_per_cta)
+        or n % (output_n_tile * output_n_tiles_per_cta)
+    ):
+        raise ValueError("direct global stores require complete output tiles")
+    # STMatrix stores 16-bit elements. F32 partials use affine scalar staging.
+    if (
+        output_store == "scalar"
+        or cast(MemTensorType, matmul.dst.type).dtype.name == "f32"
+    ):
         output_tma_inner_size = None
     m_blocks = (m + output_m_tile - 1) // output_m_tile
     n_blocks = (n + output_n_tile - 1) // output_n_tile
@@ -336,7 +474,7 @@ def _schedule_matmul(
         group_size = output_m_tiles_per_cta
         group_label = "outm"
     if output_grid_size is not None:
-        kernel.grid_dim = (output_grid_size, 1, 1)
+        kernel.grid_dim = (output_grid_size, 1, kernel.grid_dim[2] or 1)
     block_x = (CollectiveLevel.BLOCK, CollectiveAxis.X)
     output_bindings: list[tuple[CollectiveLevel, CollectiveAxis] | None] = (
         [block_x, block_x]
@@ -388,6 +526,7 @@ def _schedule_matmul(
                 iteration_bindings=output_bindings,
                 for_loop_labels=[None, None],
                 op_label_filter="mm",
+                epilogue_label_filter=epilogue_label_filter,
                 allow_partial_tiles=(m % output_m_tile != 0 or n % output_n_tile != 0),
                 reversed_dims=list(output_reversed_dims),
             )
@@ -405,6 +544,7 @@ def _schedule_matmul(
                 iteration_bindings=[None, *output_bindings],
                 for_loop_labels=[group_label, None, None],
                 op_label_filter="mm",
+                epilogue_label_filter=epilogue_label_filter,
                 allow_partial_tiles=(
                     m % output_m_tile != 0
                     or n % output_n_tile != 0
@@ -416,9 +556,11 @@ def _schedule_matmul(
     pipeline.add_pass(
         schedule_tiled_matmul(
             label="mm",
+            epilogue_label_filter=epilogue_label_filter,
             output_m_tile=output_m_tile,
             output_n_tile=output_n_tile,
             operand_stages=operand_stages,
+            operand_stage_overrides=operand_stage_overrides,
             operand_k_tile=operand_k_tile,
             warpgroup_m_tile=warpgroup_m_tile,
             cyclic_operand_pipeline=cyclic_operand_pipeline,
@@ -427,6 +569,9 @@ def _schedule_matmul(
             output_store_buffers=output_store_buffers,
             output_tma_inner_size=output_tma_inner_size,
             operand_move_attrs=operand_move_attrs,
+            atomic_add=matmul.attrs.get("atomic_add") is True,
+            output_tma=output_store != "global",
+            unsafe_reuse_smem=unsafe_reuse_smem,
         )
     )
     if group_size > 1:
@@ -438,7 +583,33 @@ def _schedule_matmul(
         )
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
-    return pipeline.run(module)
+    module = pipeline.run(module)
+    if unsafe_reuse_smem:
+        _fence_shared_writeback(module.body)
+    return module
+
+
+def _fence_shared_writeback(block: Block) -> None:
+    """Retire every warpgroup's operand reads before reusing the compute arena."""
+    writers = [
+        i for i, op in enumerate(block.ops)
+        if isinstance(op, MoveOp) and isinstance(op.dst.type, SmemTensorType)
+        and any(
+            isinstance(root.definition, AllocOp)
+            and str(root.definition.attrs.get("reuse_group", "")).endswith("_writeback")
+            for root in root_buffers(op.dst)
+        )
+    ]
+    if writers:
+        # The validated schedule puts this block inside a CTA-uniform output
+        # tile guard. A faster warpgroup must not overwrite another's operands.
+        block.ops.insert(writers[0], BarrierOp.build("block"))
+        # TMA reads must also retire before the next tile reloads the arena.
+        block.ops.append(BarrierOp.build("block", attrs={"drain_bulk": True}))
+    else:
+        for op in block.ops:
+            for nested in op.blocks:
+                _fence_shared_writeback(nested)
 
 
 class TileMatmulPipeline(Pipeline):
