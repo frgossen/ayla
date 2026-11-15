@@ -78,3 +78,27 @@ def test_inference_gives_every_layer_its_own_weights(monkeypatch) -> None:
     assert torch_result.iters == out_result.iters == layers
     assert len(weight_ptrs) == layers
     assert torch_result.median_ms > 0 and out_result.median_ms > 0
+
+
+def test_inference_cost_is_compute_plus_consumer_penalty(monkeypatch) -> None:
+    # Nanosecond stamps before compute, consumer, second consumer, and after.
+    stamps = torch.tensor([[0, 10_000, 13_000, 15_000], [20_000, 32_000, 34_000, 36_000]])
+    monkeypatch.setattr(benchmark_common, "_time_graph", lambda *args, **kwargs: (0.0, 0.5))
+
+    cost, wall = benchmark_common._time_inference(None, stamps, None, cache_flush=None)
+
+    # (10 + 3 - 2) and (12 + 2 - 2) microseconds, in milliseconds.
+    assert cost == pytest.approx(0.0115)
+    assert wall == 0.5
+
+
+@requires_cuda
+def test_timestamps_follow_stream_order() -> None:
+    stamp = benchmark_common._timestamp_op()
+    times = torch.zeros(2, dtype=torch.int64, device="cuda")
+    stamp(times[0])
+    torch.cuda._sleep(1_000_000)
+    stamp(times[1])
+
+    first, second = times.tolist()
+    assert 0 < first < second

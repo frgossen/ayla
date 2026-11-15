@@ -513,9 +513,40 @@ def _time_graph(
     return elapsed / graph_launches, elapsed
 
 
+@functools.cache
+def _timestamp_op() -> Callable[[torch.Tensor], None]:
+    """``stamp(x)`` writes the GPU's global nanosecond timer into int64 ``x``.
+
+    It is a one-thread kernel, so in a graph it is an ordinary kernel node.
+    An event record node is not: on B200 it rounds the span to the next event
+    up to steps of about 2 us, whatever ran in between.
+    """
+    from torch.utils.cpp_extension import load_inline
+
+    source = r"""
+    #include <torch/extension.h>
+    #include <c10/cuda/CUDAStream.h>
+    __global__ void stamp_kernel(unsigned long long* out) {
+      unsigned long long now;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+      *out = now;
+    }
+    void stamp(torch::Tensor out) {
+      stamp_kernel<<<1, 1, 0, c10::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<unsigned long long*>(out.data_ptr()));
+    }
+    """
+    return load_inline(
+        "benchmark_timestamp",
+        cpp_sources="void stamp(torch::Tensor out);",
+        cuda_sources=source,
+        functions=["stamp"],
+    ).stamp
+
+
 def _time_inference(
     chain: torch.cuda.CUDAGraph,
-    events: list[list[torch.cuda.Event]],
+    stamps: torch.Tensor,
     stream: torch.cuda.Stream,
     *,
     cache_flush: torch.Tensor,
@@ -524,16 +555,13 @@ def _time_inference(
 
     A layer costs its compute, plus how much longer the consumer takes right
     after it than straight after another consumer -- that is, once the output
-    is as resident as it can be.
+    is as resident as it can be. ``stamps[layer]`` holds the nanosecond times
+    before the compute, the consumer, the second consumer, and after it.
     """
     _, wall = _time_graph(chain, stream, graph_launches=1, cache_flush=cache_flush)
-    cost = sum(
-        compute.elapsed_time(consume)
-        + consume.elapsed_time(reconsume)
-        - reconsume.elapsed_time(end)
-        for compute, consume, reconsume, end in events
-    )
-    return cost / len(events), wall
+    compute, consume, reconsume, end = stamps.double().unbind(1)
+    cost = (consume - compute) + (reconsume - consume) - (end - reconsume)
+    return float(cost.mean()) * 1e-6, wall
 
 
 def _consume_output_read_only(result: torch.Tensor) -> torch.Tensor:
@@ -701,8 +729,8 @@ def _capture(
 def _capture_inference(
     config: BenchConfig,
     stream,
-) -> tuple[torch.cuda.CUDAGraph, list[list[torch.cuda.Event]], list[object]]:
-    """Capture a chain of model layers, with events around what is timed.
+) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, list[object]]:
+    """Capture a chain of model layers, with timestamps around what is timed.
 
     Each layer is a producer that rewrites the activations in place, the
     compute on those activations and the layer's own copy of the weights, and
@@ -734,27 +762,24 @@ def _capture_inference(
         for _ in range(layers - 1)
     ]
     activations = [x for i, x in enumerate(inputs) if i not in config.weight_inputs]
-    events = [
-        [torch.cuda.Event(enable_timing=True, external=True) for _ in range(4)]
-        for _ in layer_inputs
-    ]
+    stamps = torch.zeros(len(layer_inputs), 4, dtype=torch.int64, device="cuda")
+    stamp = _timestamp_op()
 
     def chain(timed: bool) -> None:
-        for layer, layer_events in zip(layer_inputs, events, strict=True):
+        for layer, times in zip(layer_inputs, stamps, strict=True):
             for x in activations:
                 x.mul_(1)
-            compute, consume, reconsume, end = layer_events
             if timed:
-                compute.record()
+                stamp(times[0])
             result = config.compute(*layer)
             if timed:
-                consume.record()
+                stamp(times[1])
             _consume_output_read_only(result)
             if timed:
-                reconsume.record()
+                stamp(times[2])
             _consume_output_read_only(result)
             if timed:
-                end.record()
+                stamp(times[3])
 
     with torch.cuda.stream(stream):
         chain(timed=False)
@@ -763,7 +788,7 @@ def _capture_inference(
     with torch.cuda.stream(stream), torch.cuda.graph(graph):
         chain(timed=True)
     stream.synchronize()
-    return graph, events, layer_inputs
+    return graph, stamps, layer_inputs
 
 
 def run_bench(
@@ -812,18 +837,18 @@ def run_bench(
     for i, config in enumerate(configs, 1):
         if inference:
             assert cache_flush is not None
-            chain, events, tensors = _capture_inference(config, stream)
+            chain, stamps, tensors = _capture_inference(config, stream)
             samplers.append(
                 functools.partial(
                     _time_inference,
                     chain,
-                    events,
+                    stamps,
                     stream,
                     cache_flush=cache_flush,
                 )
             )
-            iters.append(len(events))
-            keep_alive.append((chain, events, tensors))
+            iters.append(len(stamps))
+            keep_alive.append((chain, stamps, tensors))
         else:
             graph, inputs = _capture(config, stream, graph_launches)
             samplers.append(
