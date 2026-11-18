@@ -225,3 +225,36 @@ def test_measured_gemm_routes_preserve_results_and_graph_replay(dtype, operation
             replay_result = compiled(lhs, weight, bias)
         graph.replay()
         torch.testing.assert_close(replay_result, expected, atol=2e-3, rtol=2e-2)
+
+
+@requires_cuda
+def test_full_forward_capture_is_one_kernel_and_replays():
+    from ayla import torch_compile
+
+    def forward(x, first, second):
+        projected = (x @ first.T).sigmoid() @ second.T
+        wide = projected.float()
+        return (wide * torch.rsqrt(wide.square().mean(-1, keepdim=True) + 1e-5)).bfloat16()
+
+    inputs = [torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+              for _ in range(3)]
+    torch._dynamo.reset()
+    torch_compile.install(forward_pass=True)
+    try:
+        compiled = torch.compile(forward, fullgraph=True, dynamic=False)
+        actual = compiled(*inputs)
+        torch.testing.assert_close(actual, forward(*inputs), atol=0.03, rtol=0.02)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+            compiled(*inputs)
+        kernels = [event.name for event in profile.events()
+                   if event.device_type == torch.autograd.DeviceType.CUDA]
+        assert len(kernels) == 1 and kernels[0].startswith("forward_")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = compiled(*inputs)
+        inputs[0].normal_(std=0.1)
+        graph.replay()
+        torch.testing.assert_close(replayed, forward(*inputs), atol=0.03, rtol=0.02)
+    finally:
+        torch_compile.uninstall()
+        torch._dynamo.reset()

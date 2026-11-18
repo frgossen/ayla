@@ -90,6 +90,10 @@ class Folding(LoweringPass):
             return [], []
         if op.trip_count != 1:
             return None
+        # This region bounds named barrier lifetimes even with one iteration.
+        # Keep it until synchronization analysis assigns reusable resources.
+        if op.attrs.get('barrier_phase') is True:
+            return None
         self.lower_block(op.body)
         iv_const = IndexConstantOp.build(value=op.lb)
         vmap: dict[Value, Value] = {op.iv: iv_const.result()}

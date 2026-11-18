@@ -11,6 +11,7 @@ from ..pipelines.tile_matmul_pipeline import (
     _schedule_matmul,
     schedule_register_matmul as schedule_register_matmul,
     schedule_tiled_matmul as schedule_tiled_matmul,
+    schedule_stream_k as schedule_stream_k,
 )
 
 schedule_matmul = _schedule_matmul

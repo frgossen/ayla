@@ -16,6 +16,7 @@ from ..gpu_dialect import (
     AsyncOp,
     BarrierOp,
     MoveOp,
+    ForOp,
     SmemTensorType,
     root_buffers,
 )
@@ -33,7 +34,38 @@ from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
 
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..passes.tile_reduce import ReductionModules
+
+
+class _ReductionRange(Pass):
+    """Restrict tiled contractions before peeling and pipelining their K loop."""
+
+    def __init__(self, label: str):
+        super().__init__()
+        self.label = label
+
+    def run(self, module: ModuleOp) -> ModuleOp:
+        for loop in find_ops_of_type(module, ForOp):
+            if loop.attrs.get("label") != self.label:
+                continue
+            heroes = find_ops_of_type(loop, MatmulOp)
+            ranges = {tuple(cast(list[int], op.attrs["reduction_range"])) for op in heroes
+                      if "reduction_range" in op.attrs}
+            if not ranges:
+                continue
+            if len(ranges) != 1:
+                raise ValueError("one K loop cannot contain different reduction ranges")
+            start, end = ranges.pop()
+            if not 0 <= start < end <= loop.ub:
+                raise ValueError("reduction range must be a nonempty subset of K tiles")
+            loop.lb, loop.ub = start, end
+            for hero in heroes:
+                hero.attrs.pop("reduction_range", None)
+        return module
+
 
 
 class _OperandStagePeriod(Pass):
@@ -124,6 +156,7 @@ def schedule_register_matmul(
             epilogue_label_filter=epilogue_label_filter,
         )
     )
+    pipeline.add_pass(_ReductionRange(k_label))
     if k_tail_tiles is not None:
         pipeline.add_pass(FuseLoops(k_label, label, tail_iterations=k_tail_tiles))
         if k_tail_tiles:
@@ -448,11 +481,11 @@ def _schedule_matmul(
         or split_k_atomic
     ):
         raise ValueError("shared compute/writeback reuse requires complete row warpgroups and one ungrouped TMA output tile")
-    if output_store == "global" and (
+    if output_store == "global" and cast(MemTensorType, matmul.dst.type).dtype.name != "f32" and (
         m % (output_m_tile * output_m_tiles_per_cta)
         or n % (output_n_tile * output_n_tiles_per_cta)
     ):
-        raise ValueError("direct global stores require complete output tiles")
+        raise ValueError("packed direct global stores require complete output tiles")
     # STMatrix stores 16-bit elements. F32 partials use affine scalar staging.
     if (
         output_store == "scalar"
@@ -627,3 +660,149 @@ class TileMatmulPipeline(Pipeline):
         if self.register_accumulator:
             return schedule_register_matmul(**self.config).run(module)
         return _schedule_matmul(module, **self.config)
+
+
+
+def schedule_stream_k(
+    module: ModuleOp, *, workers: int, output_m_tile: int = 128,
+    output_n_tile: int = 256, operand_k_tile: int = 64,
+    operand_stages: int = 3, warpgroup_m_tile: int | None = None,
+    warpgroup_n_tile: int | None = None, cyclic_operand_pipeline: bool = False,
+    operand_move_attrs: dict[str, dict[str, object]] | None = None,
+    hero_label_filter: str | None = "mm",
+    schedule_reduction: bool = True,
+    direct_when_balanced: bool = True,
+    output_tma_inner_size: int | None = 128,
+    output_store: str = "stmatrix",
+    unsafe_reuse_smem: bool = False,
+    output_grid_fast_axis: str = "n",
+    partial_output_slices: int | None = None,
+    reduction_n_tile: int = 1,
+) -> "ModuleOp | ReductionModules":
+    """Schedule a balanced Stream-K GEMM and its overwrite finalization.
+
+    Returns a scheduled ``ModuleOp`` when whole tiles balance exactly, or
+    ``ReductionModules`` for the managed two-launch route. The whole-tile
+    path has no scratch or reduction; disable it with ``direct_when_balanced=False``.
+    Inputs, tensor/scalar initialization, strided views, batches on grid Z,
+    and consumer placement follow ``TileReduce.split``. F32 contributions
+    use compact scratch slots; workspace contents need no initialization.
+    Set ``schedule_reduction=False`` to schedule general consumers yourself.
+    Set ``partial_output_slices`` to stage F32 partials through shared memory
+    for sliced TMA writeback. None retains the existing partial-store choice.
+    ``reduction_n_tile`` groups adjacent output columns per finalization thread.
+    """
+    from ..passes.stream_k import partition_stream_k
+    from ..passes.tile_reduce import TileReduce
+    from ..base.ir import clone_op
+    from ..gpu_dialect import is_side_effect_free
+
+    if output_m_tile not in (64, 128, 192, 256):
+        raise ValueError("output_m_tile must be 64, 128, 192, or 256")
+    if not 8 <= output_n_tile <= 384 or output_n_tile % 8:
+        raise ValueError("output_n_tile must be a multiple of 8 between 8 and 384")
+    if operand_k_tile not in (64, 128) or type(operand_stages) is not int or operand_stages < 1:
+        raise ValueError("Stream-K requires K tiles of 64 or 128 and positive operand stages")
+    if cyclic_operand_pipeline and operand_stages < 2:
+        raise ValueError("cyclic_operand_pipeline requires at least two operand stages")
+    if any(attrs.get('multicast') for attrs in (operand_move_attrs or {}).values()):
+        raise ValueError("Stream-K does not support multicast clusters")
+    if type(reduction_n_tile) is not int or reduction_n_tile < 1:
+        raise ValueError("reduction_n_tile must be a positive integer")
+    if partial_output_slices is not None and (
+        type(partial_output_slices) is not int or partial_output_slices < 1
+        or output_n_tile % partial_output_slices
+        or (output_n_tile // partial_output_slices) % 8
+    ):
+        raise ValueError("partial_output_slices must divide output_n_tile into 8-column groups")
+    heroes = find_ops_of_type(module, MatmulOp)
+    if len(heroes) != 1:
+        raise ValueError("Stream-K requires one matmul")
+    hero = heroes[0]
+    m, k = cast(MemTensorType, hero.lhs.type).static_shape
+    n, _ = cast(MemTensorType, hero.rhs.type).static_shape
+    if type(workers) is not int or workers < 1 or k % operand_k_tile:
+        raise ValueError("Stream-K requires positive integer workers and K divisible by operand_k_tile")
+    tiles = math.ceil(m / output_m_tile) * math.ceil(n / output_n_tile)
+    active = min(workers, tiles * (k // operand_k_tile))
+    kernel = cast(KernelOp, module.body.ops[0])
+    if (direct_when_balanced and schedule_reduction and tiles % active == 0
+            and all(op is hero or is_side_effect_free(op) for op in kernel.body.ops)
+            and all((kernel.grid_dim[axis] or 1) == 1 and (kernel.cluster_dim[axis] or 1) == 1
+                    for axis in (CollectiveAxis.X, CollectiveAxis.Y))):
+        direct = cast(ModuleOp, clone_op(module, {}))
+        find_ops_of_type(direct, MatmulOp)[0].attrs['label'] = 'mm'
+        return _schedule_matmul(
+            direct, output_grid_size=active, output_m_tile=output_m_tile,
+            output_n_tile=output_n_tile, operand_k_tile=operand_k_tile,
+            operand_stages=operand_stages, warpgroup_m_tile=warpgroup_m_tile,
+            warpgroup_n_tile=warpgroup_n_tile,
+            cyclic_operand_pipeline=cyclic_operand_pipeline,
+            operand_move_attrs=operand_move_attrs,
+            output_tma_inner_size=output_tma_inner_size if output_n_tile % 64 == 0 else None,
+            output_store=output_store, unsafe_reuse_smem=unsafe_reuse_smem,
+            output_grid_fast_axis=output_grid_fast_axis,
+        )
+    # Match schedule_tiled_matmul's warpgroup grid so zero stores use every
+    # participating thread instead of serializing an entire output tile on one warp.
+    wg_n = warpgroup_n_tile or (output_n_tile if output_n_tile <= 256 else 128)
+    if warpgroup_m_tile is not None:
+        groups = math.ceil(output_m_tile / warpgroup_m_tile) * math.ceil(output_n_tile / wg_n)
+    elif output_m_tile == 64 or output_n_tile > 256:
+        groups = math.ceil(output_n_tile / wg_n)
+    else:
+        groups = math.ceil(output_m_tile / 64)
+    stages = partition_stream_k(module, workers=workers, output_m_tile=output_m_tile,
+                               output_n_tile=output_n_tile, operand_k_tile=operand_k_tile,
+                               hero_label_filter=hero_label_filter,
+                               output_grid_fast_axis=output_grid_fast_axis,
+                               initialization_threads=groups * 128)
+    stages.partials = schedule_tiled_matmul(
+        label=r'mm_s\d+', output_m_tile=output_m_tile, output_n_tile=output_n_tile,
+        operand_k_tile=operand_k_tile, operand_stages=operand_stages,
+        warpgroup_m_tile=warpgroup_m_tile, warpgroup_n_tile=warpgroup_n_tile,
+        cyclic_operand_pipeline=cyclic_operand_pipeline, output_tma_inner_size=None,
+        operand_move_attrs=operand_move_attrs,
+        output_tma=(partial_output_slices is not None
+                    or m % output_m_tile != 0 or n % output_n_tile != 0),
+        output_slices=partial_output_slices or 1,
+    ).run(stages.partials)
+    # Segment schedules execute serially within CTA-uniform guards. Retire
+    # bulk stores before the next segment reuses the shared operand arena.
+    for loop in find_ops_of_type(stages.partials, ForOp):
+        if loop.attrs.get('label') == 'stream_k_tiles':
+            loop.body.ops.append(BarrierOp.build('block', attrs={'drain_bulk': True}))
+    for alloc in find_ops_of_type(stages.partials, AllocOp):
+        if isinstance(alloc.result().type, SmemTensorType):
+            match = re.match(r'(mm_s\d+)_', str(alloc.attrs.get('label', '')))
+            if match:
+                alloc.attrs['reuse_group'] = match[1]
+    # Writeback staging allocations do not carry labels; their writer does.
+    for move in find_ops_of_type(stages.partials, MoveOp):
+        match = re.match(r'(mm_s\d+)_', str(move.attrs.get('label', '')))
+        if match:
+            for root in [*root_buffers(move.dst), *root_buffers(move.src)]:
+                if isinstance(root.definition, AllocOp) and isinstance(root.type, SmemTensorType):
+                    root.definition.attrs['reuse_group'] = match[1]
+    groups = {alloc.attrs['reuse_group'] for alloc in find_ops_of_type(stages.partials, AllocOp)
+              if 'reuse_group' in alloc.attrs}
+    if len(groups) < 2:
+        for alloc in find_ops_of_type(stages.partials, AllocOp):
+            alloc.attrs.pop('reuse_group', None)
+    stages.partials = Canonicalize().run(ScheduleAsync().run(stages.partials))
+    if schedule_reduction:
+        # Caller-owned row reductions and GEMM consumers can instead use their
+        # normal final-phase scheduling pipeline on the returned reduction IR.
+        kernel = cast(KernelOp, stages.reduction.body.ops[0])
+        stages.reduction = TileReduce(
+            {0: 1, 1: reduction_n_tile}, (CollectiveLevel.THREAD, CollectiveAxis.X),
+            hero_label_filter='reduce_final', epilogue_label_filter='reduce_epilogue',
+            linearize=True,
+            linearize_grid=(CollectiveAxis.Z,) if (kernel.grid_dim[2] or 1) > 1 else (),
+        ).run(stages.reduction)
+        stages.reduction = PromoteBuffers(
+            'rmem', target_dtype='f32', operands=['dst'], label_filter='reduce_final',
+            epilogue_label_filter='reduce_epilogue',
+        ).run(stages.reduction)
+        stages.reduction = Canonicalize().run(stages.reduction)
+    return stages

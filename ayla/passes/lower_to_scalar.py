@@ -15,7 +15,7 @@ from ..base.ir import Block, Op, Type, Value, clone_type, find_ancestor_of_type,
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AddrMemTensorType, AllocOp, CollectiveAxis, CollectiveLevel, ConstantOp,
-    ElementwiseOp, F32Type, ForOp, IfOp, IndexAddOp,
+    ElementwiseOp, F32Type, ForOp, GmemTensorType, IfOp, IndexAddOp,
     IndexConstantOp, IndexDivOp, IndexEqOp, IndexLtOp, IndexModOp, IndexMulOp,
     KernelOp, MemTensorType, MemoryEffect, MoveOp, ReduceOp, RegisterViewOp,
     RegMemTensorType, ReshapeOp, RmemTensorType, ShuffleOp, SmemTensorType, ThreadIdOp, TileOp, WgrmemTensorType,
@@ -34,6 +34,32 @@ def _has_partial_view(value: Value) -> bool:
             return True
         value = op.arg
     return False
+
+
+def _paired_row_tail_store(fragment: Value, memory: Value) -> bool:
+    """Keep aligned FP32 row tails in the paired WGMMA store lowerer."""
+    typ = memory.type
+    ft = fragment.type
+    if not (isinstance(typ, GmemTensorType) and isinstance(ft, WgrmemTensorType)
+            and ft.dtype == F32Type() and ft.layout == "wgmma_layout_0"
+            and typ.rank == ft.rank == 2 and typ.strides[1] == 1
+            and cast(int, typ.strides[0]) % 2 == 0):
+        return False
+    row_tail = False
+    while isinstance(memory.definition, TileOp):
+        tile = memory.definition
+        parent = cast(MemTensorType, tile.arg.type)
+        current = cast(MemTensorType, memory.type)
+        if parent.rank != 2 or current.rank != 2:
+            break
+        if parent.static_shape[1] % current.static_shape[1]:
+            return False
+        row_tail |= parent.static_shape[0] % current.static_shape[0] != 0
+        memory = tile.arg
+    # The paired lowerer follows rank-two tiles. Bounds behind a reshape
+    # still need the generic coordinate guards.
+    return row_tail and not _has_partial_view(memory)
+
 
 
 class _ScalarBuilder:
@@ -350,6 +376,8 @@ class LowerToScalar(LoweringPass):
             return None
         load = not isinstance(dst, AddrMemTensorType)
         fragment, memory = (op.dst, op.src) if load else (op.src, op.dst)
+        if not load and _paired_row_tail_store(fragment, memory):
+            return None
         if not (isinstance(fragment.type, RmemTensorType) and _has_partial_view(memory)
                 or isinstance(fragment.type, WrmemTensorType)
                 or isinstance(fragment.type, WgrmemTensorType) and (

@@ -24,6 +24,7 @@ import torch
 from .gemm_schedule_table import CONFIGS, SCHEDULES, PERSISTENT_SCHEDULES, PERSISTENT_SCHEDULE_OVERRIDES
 from .gpu_dialect import CollectiveAxis, GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from .jit_compiler import ShapeSpecializingJITCompiler
+from .passes.tile_reduce import ReductionModules
 from .torch_custom_call import DEFAULT_NAMESPACE, OperandKind
 
 _IR_DTYPES = {"float16": "f16", "bfloat16": "bf16"}
@@ -33,6 +34,8 @@ _DEFAULTS: dict[str, object] = {
     "ptx_optimization_level": None,
     "output_cta_count": None,
     "unroll_output_tiles": True,
+    "split_k_parts": 1,
+    "split_k_reduce_unroll": 1,
 }
 # Unrolling more output waves than this is only trusted on the measured shape.
 _MAX_TRANSFERRED_WAVES = 8
@@ -50,6 +53,9 @@ class GemmScheduleSeed:
     fixed_output_unroll_factor: int | None = None
     pipeline_output_waves: bool = False
     pipeline_output_writeback: bool = False
+    reduction_parts: int = 1
+    reduction_load_unroll: int = 1
+    stream_k_workers: int | None = None
 
 
 def apply_gemm_schedule_seed_post_build(
@@ -258,6 +264,26 @@ def _seed(
     exact: bool,
 ) -> GemmScheduleSeed | None:
     """Adapt a table entry to this GEMM, or None if it cannot transfer."""
+    parts = captured.get("split_k_parts", 1)
+    reduction_unroll = captured.get("split_k_reduce_unroll", 1)
+    workers = captured.get("stream_k_workers")
+    if (type(parts) is not int or parts < 1 or type(reduction_unroll) is not int or reduction_unroll < 1
+            or captured.get("split_k_warp_specialized")
+            or captured.get("mma_kind", "wgmma") != "wgmma"):
+        return None
+    if parts > 1 and (not exact or captured.get("transpose_output") or captured.get("split_k_atomic")):
+        return None
+    if workers is not None and (
+        type(workers) is not int or workers < 1 or not exact
+        or captured.get("transpose_output") or captured.get("split_k_atomic") or parts != 1
+        or captured.get("output_cta_count") is not None
+        or _as_int(captured.get("output_tiles_per_cta", 1)) != 1
+        or _as_int(captured.get("output_n_tiles_per_cta", 1)) != 1
+        or _as_int(captured.get("cluster_m_ctas", 1)) != 1
+        or _as_int(captured.get("cluster_n_ctas", 1)) != 1
+        or captured.get("multicast")
+    ):
+        return None
     transpose = bool(captured.get("transpose_output"))
     fixed_grid = captured["output_cta_count"] is not None
     if not exact and (
@@ -302,6 +328,9 @@ def _seed(
         fixed_output_unroll_factor=unroll,
         pipeline_output_waves=bool(captured.get("pipeline_output_waves")),
         pipeline_output_writeback=bool(captured.get("pipeline_output_writeback")),
+        reduction_parts=parts,
+        reduction_load_unroll=reduction_unroll,
+        stream_k_workers=workers,
     )
 
 
@@ -416,7 +445,7 @@ def build_gemm_module(
     n: int,
     k: int,
     seed: GemmScheduleSeed,
-) -> ModuleOp:
+) -> ModuleOp | ReductionModules:
     """Build and schedule one GEMM exactly as the sweep measured ``seed``."""
     from .gemm_collection.gemm import schedule_matmul
 
@@ -428,6 +457,50 @@ def build_gemm_module(
     assert isinstance(kernel, KernelOp)
     if ptx_optimization_level is not None:
         kernel.attrs["ptx_optimization_level"] = ptx_optimization_level
+    if seed.stream_k_workers is not None:
+        from .gemm_collection.gemm import schedule_stream_k
+
+        if seed.transpose_output or seed.reduction_parts != 1:
+            raise ValueError('Stream-K requires a non-transposed, non-Split-K schedule')
+        stream_options: dict[str, Any] = {key: kwargs[key] for key in (
+            'output_m_tile', 'output_n_tile', 'operand_k_tile', 'operand_stages',
+            'warpgroup_m_tile', 'warpgroup_n_tile', 'cyclic_operand_pipeline',
+            'operand_move_attrs',
+            'output_tma_inner_size', 'output_store', 'unsafe_reuse_smem',
+            'output_grid_fast_axis',
+        ) if key in kwargs}
+        return schedule_stream_k(module, workers=seed.stream_k_workers, **stream_options)
+    if seed.reduction_parts > 1:
+        from .base.ir import find_ops_of_type
+        from .gpu_dialect import CollectiveLevel, ReduceOp
+        from .passes.promote_buffers import PromoteBuffers
+        from .passes.tile_reduce import TileReduce
+
+        if seed.transpose_output or seed.captured_config.get('split_k_atomic'):
+            raise ValueError('this overwrite route requires non-atomic reduction partitions')
+        k_tile = _as_int(kwargs['operand_k_tile'])
+        chunk = math.ceil(k / (seed.reduction_parts * k_tile)) * k_tile
+        stages = TileReduce({1: chunk}, (CollectiveLevel.BLOCK, CollectiveAxis.Z),
+                            hero_label_filter='mm').split(module, num_partials=seed.reduction_parts,
+                                                        workspace_alignment=32)
+        stages.partials = schedule_matmul(stages.partials, **kwargs)  # type: ignore[arg-type]
+        reduction_threads = seed.captured_config.get('split_k_reduce_threads', 128)
+        if type(reduction_threads) is not int or reduction_threads not in (32, 64, 128, 256):
+            raise ValueError('split_k_reduce_threads must be 32, 64, 128, or 256')
+        reduction_kernel = cast(KernelOp, stages.reduction.body.ops[0])
+        reduction_kernel.block_dim = [reduction_threads, 1, 1]
+        for reduction in find_ops_of_type(stages.reduction, ReduceOp):
+            reduction.attrs['load_unroll'] = seed.reduction_load_unroll
+        stages.reduction = TileReduce({0: 1, 1: 1}, (CollectiveLevel.THREAD, CollectiveAxis.X),
+                                       hero_label_filter='reduce_final', epilogue_label_filter='reduce_epilogue',
+                                       linearize=True,
+                                       linearize_grid=(CollectiveAxis.Z,) if operation == 'bmm' else ()).run(stages.reduction)
+        stages.reduction = PromoteBuffers('rmem', target_dtype='f32', operands=['dst'],
+                                           label_filter='reduce_final',
+                                           epilogue_label_filter='reduce_epilogue').run(stages.reduction)
+        stages.partials = apply_gemm_schedule_seed_post_build(stages.partials, seed)
+        stages.reduction = apply_gemm_schedule_seed_post_build(stages.reduction, seed)
+        return stages
     module = schedule_matmul(module, **kwargs)  # type: ignore[arg-type]
     return apply_gemm_schedule_seed_post_build(module, seed)
 
@@ -484,6 +557,8 @@ def gemm_jit_compiler(
             k,
             schedule,
         )
+        if isinstance(scheduled, ReductionModules):
+            return scheduled.launch_plan()()
         return make_ptx_launcher(make_ptx_kernel(scheduled))
 
     return ShapeSpecializingJITCompiler(template, compile_specialization)

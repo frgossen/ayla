@@ -92,3 +92,37 @@ def test_addmm_transpose_can_transfer_when_geometry_is_legal():
         _seed(cfg, "addmm", 16384, 4096, 1024, (1, 16384, 4096, 1024), exact=False)
         is not None
     )
+
+
+@pytest.mark.parametrize('operation', ['mm', 'bmm', 'addmm'])
+@pytest.mark.parametrize('m,n,k,parts', [(5, 5, 264, 3), (64, 128, 512, 4), (5, 5, 64, 3)])
+def test_reduction_schedule_builds_generic_phases_for_tails_and_batches(operation, m, n, k, parts):
+    import math
+    from ayla.gemm_jit import GemmScheduleSeed, build_gemm_module
+    from ayla.passes.tile_reduce import ReductionModules
+    from ayla.gpu_dialect import KernelOp
+    from ayla.passes.verify_gpu_dialect import VerifyGpuDialect
+    from ayla.ptx_codegen import make_ptx_kernel
+
+    kwargs = dict(output_m_tile=64, output_n_tile=8 if n < 8 else 128,
+                  operand_k_tile=64, operand_stages=2, output_store='scalar',
+                  output_tma_inner_size=None, ptx_optimization_level=None)
+    seed = GemmScheduleSeed({}, kwargs, (), None, None, reduction_parts=parts,
+                            reduction_load_unroll=4)
+    stages = build_gemm_module(operation, 'float16', 2 if operation == 'bmm' else 1,
+                               m, n, k, seed)
+    assert isinstance(stages, ReductionModules)
+    assert math.prod(stages.workspace_shape) == parts * (2 if operation == 'bmm' else 1) * m * ((n + 7) // 8) * 8
+    [final_kernel] = find_ops_of_type(stages.reduction, KernelOp)
+    batch = 2 if operation == "bmm" else 1
+    assert final_kernel.grid_dim[0] == math.ceil(batch * m * n / 128)
+    assert final_kernel.grid_dim[2] in (None, 1)
+    for phase in (stages.partials, stages.reduction):
+        VerifyGpuDialect().run(phase)
+        assert make_ptx_kernel(phase).ptx
+
+
+
+def test_reduction_schedule_does_not_transfer_without_measurements():
+    captured = {**_DEFAULTS, **CONFIGS[0], 'split_k_parts': 4}
+    assert _seed(captured, 'mm', 4096, 4096, 4096, (1, 4096, 4096, 4096), exact=False) is None

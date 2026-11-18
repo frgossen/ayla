@@ -313,7 +313,20 @@ _RENDEZVOUS = (BarrierScope.BLOCK, BarrierScope.CLUSTER, BarrierScope.GRID)
 
 
 def _grid_phase(op: Op) -> Op | None:
-    """Identify authored kernel phases whose named barriers cannot overlap."""
+    """Identify authored phases whose named barrier lifetimes cannot overlap.
+
+    A ``barrier_phase`` region asserts that all its named handoffs retire at
+    a block rendezvous before leaving or repeating the region. Sequential
+    Stream-K segments use this alongside explicit completion and block barriers.
+    """
+    ancestor = op
+    while ancestor.parent_block is not None:
+        if ancestor.attrs.get('barrier_phase') is True:
+            return ancestor
+        parent = ancestor.parent_block.parent_op
+        if parent is None:
+            break
+        ancestor = parent
     kernel = find_ancestor_of_type(op, KernelOp)
     if kernel is None:
         return None

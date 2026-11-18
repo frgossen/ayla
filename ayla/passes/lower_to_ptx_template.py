@@ -2292,6 +2292,43 @@ class LowerToPtxTemplate(LoweringPass):
                 wgrmem_type.register_layout(fragment), (0, 1),
             )
             new_ops.extend(column_ops)
+        row_bounds: list[tuple[Value, int]] = []
+        row_offset = None
+        if not is_load and isinstance(memory_type, GmemTensorType):
+            current = memory
+            tiles: list[TileOp] = []
+            while isinstance(current.definition, TileOp):
+                tile = current.definition
+                parent_type = cast(MemTensorType, tile.arg.type)
+                current_type = cast(MemTensorType, current.type)
+                if parent_type.rank != 2 or current_type.rank != 2:
+                    break
+                tiles.append(tile)
+                extent = parent_type.static_shape[0]
+                if extent % current_type.static_shape[0]:
+                    constant = sum(
+                        index * cast(MemTensorType, view.result().type).static_shape[0]
+                        for view in tiles
+                        if isinstance(index := view.indices[0], int)
+                    )
+                    start = IndexConstantOp.build(constant)
+                    new_ops.append(start)
+                    base = start.result()
+                    for view in tiles:
+                        index = view.indices[0]
+                        if isinstance(index, Value):
+                            size = IndexConstantOp.build(cast(MemTensorType, view.result().type).static_shape[0])
+                            scaled = IndexMulOp.build(cast(Value, self.value_map.get(index, index)), size.result())
+                            added = IndexAddOp.build(base, scaled.result())
+                            new_ops.extend([size, scaled, added])
+                            base = added.result()
+                    row_bounds.append((base, extent))
+                current = tile.arg
+            if row_bounds:
+                row_ops, row_offset = _build_register_layout_dynamic_offset(
+                    wgrmem_type.register_layout(fragment), (1, 0),
+                )
+                new_ops.extend(row_ops)
         if isinstance(memory_type, GmemTensorType):
             template = textwrap.dedent(r"""
                 cvt.u64.u32 ${b64:off64}, ${b32:operand.offset.val};
@@ -2330,6 +2367,7 @@ class LowerToPtxTemplate(LoweringPass):
         # This reads the original strided view; it does not materialize a bias.
         loaded_rows: dict[int, str] = {}
         column_predicates: dict[int, str] = {}
+        row_predicates: dict[int, str] = {}
         for pair, di, dj in pairs:
             offset = di * row_stride_bytes + dj * column_stride_bytes
             if column_broadcast:
@@ -2377,12 +2415,28 @@ class LowerToPtxTemplate(LoweringPass):
                         template += f"mov.b32 ${{f32:operand.fragment.r{2 * pair + element}}}, 0;\n"
                 else:
                     template += f"mov.b32 ${{b32:operand.fragment.r{pair}}}, 0;\n"
+            store_predicate = predicate
+            if row_bounds:
+                if di not in row_predicates:
+                    valid = f"${{pred:row_valid{di}}}"
+                    template += f"add.u32 ${{b32:row{di}}}, ${{b32:operand.row.val}}, {di};\n"
+                    for bound, (_, extent) in enumerate(row_bounds):
+                        test = valid if bound == 0 else f"${{pred:row_bound{di}_{bound}}}"
+                        template += (
+                            f"add.u32 ${{b32:row_at{di}_{bound}}}, ${{b32:row{di}}}, ${{b32:operand.row_bound{bound}.val}};\n"
+                            f"setp.lt.u32 {test}, ${{b32:row_at{di}_{bound}}}, {extent};\n"
+                            + ("" if bound == 0 else f"and.pred {valid}, {valid}, {test};\n")
+                        )
+                    if writer_wg is not None:
+                        template += f"and.pred {valid}, {valid}, ${{pred:store_writer}};\n"
+                    row_predicates[di] = valid
+                store_predicate = f"@{row_predicates[di]} "
             if op.attrs.get("atomic_add") is True:
                 if is_load or not isinstance(memory_type, GmemTensorType) or not f32:
                     raise ValueError("atomic writeback requires an F32 register-to-global move")
                 for element in (0, 1):
                     template += (
-                        f"{predicate}red.relaxed.gpu.global.add.f32 "
+                        f"{store_predicate}red.relaxed.gpu.global.add.f32 "
                         f"[{address}+{offset + element * dtype_bytes}], "
                         f"${{f32:operand.fragment.r{2 * pair + element}}};\n"
                     )
@@ -2390,7 +2444,7 @@ class LowerToPtxTemplate(LoweringPass):
             template += (
                 f"{load_predicate}{instruction} {registers}, {location};\n"
                 if is_load
-                else f"{predicate}{instruction} {location}, {registers};\n"
+                else f"{store_predicate}{instruction} {location}, {registers};\n"
             )
 
         new_op = PTXTemplateOp.build(
@@ -2400,11 +2454,15 @@ class LowerToPtxTemplate(LoweringPass):
                 byte_offset,
                 *([] if column_offset is None else [column_offset]),
                 *(base for base, _ in column_bounds),
+                *([] if row_offset is None else [row_offset]),
+                *(base for base, _ in row_bounds),
             ],
             result_types=[],
             template=template,
             operand_names=["memory", "fragment", "offset", *([] if column_offset is None else ["column"]),
-                           *(f"bound{index}" for index in range(len(column_bounds)))],
+                           *(f"bound{index}" for index in range(len(column_bounds))),
+                           *([] if row_offset is None else ["row"]),
+                           *(f"row_bound{index}" for index in range(len(row_bounds)))],
             result_names=[],
             description=str(op),
         )

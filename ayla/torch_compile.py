@@ -13,6 +13,7 @@ register_muse_swiglu(_POST_GRAD_PATTERNS)
 register_gemm_fx_rules(_POST_GRAD_PATTERNS)
 _POST_GRAD_PASS = _POST_GRAD_PATTERNS.apply
 _displaced_post_grad_pass = None
+_installed_post_grad_pass = None
 
 
 def _post_grad_passes(configured) -> tuple:
@@ -23,21 +24,29 @@ def _post_grad_passes(configured) -> tuple:
     return (configured,)
 
 
-def install() -> None:
-    """Install Ayla's post-grad FX rewrites for ``torch.compile``."""
-    global _displaced_post_grad_pass
+def install(*, forward_pass: bool = False) -> None:
+    """Install FX rewrites, or capture a complete static graph with ``forward_pass=True``."""
+    global _displaced_post_grad_pass, _installed_post_grad_pass
+    from .forward_compile import capture_forward_graph
+
+    requested = capture_forward_graph if forward_pass else _POST_GRAD_PASS
+    if _installed_post_grad_pass is not None:
+        if _installed_post_grad_pass is not requested:
+            raise ValueError("uninstall Ayla before switching capture modes")
+        return
     existing = inductor_config.post_grad_custom_post_pass
     existing_passes = _post_grad_passes(existing)
-    if _POST_GRAD_PASS in existing_passes:
-        return
     _displaced_post_grad_pass = existing
+    _installed_post_grad_pass = requested
     inductor_config.post_grad_custom_post_pass = [
-        *existing_passes, _POST_GRAD_PASS,
+        *existing_passes, requested,
     ]
 
 
 def uninstall() -> None:
     """Restore the post-grad passes displaced by :func:`install`."""
+    global _installed_post_grad_pass
     current = inductor_config.post_grad_custom_post_pass
-    if _POST_GRAD_PASS in _post_grad_passes(current):
+    if _installed_post_grad_pass is not None and _installed_post_grad_pass in _post_grad_passes(current):
         inductor_config.post_grad_custom_post_pass = _displaced_post_grad_pass
+    _installed_post_grad_pass = None

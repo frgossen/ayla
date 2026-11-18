@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal, cast, overload
+from typing import TYPE_CHECKING, Literal, cast, overload
+
+if TYPE_CHECKING:
+    from ..jit_compiler import PtxSequencePlan
 
 from ..base.ir import (
     Block,
@@ -193,6 +196,24 @@ class ReductionModules:
     partials: ModuleOp
     reduction: ModuleOp
     workspace_shape: tuple[int, ...]
+
+    def launch_plan(self) -> PtxSequencePlan:
+        """Build ordered launches with one automatically allocated F32 workspace.
+
+        ``launch = stages.launch_plan()()`` accepts the original kernel
+        arguments. Scratch storage is retained and reused by the launcher.
+        """
+        from ..jit_compiler import PtxRoutePlan, PtxSequencePlan, ScratchBuffer
+        from ..ptx_codegen import make_ptx_kernel
+
+        kernel = cast(KernelOp, self.partials.body.ops[0])
+        workspace = ScratchBuffer(GmemTensorType.build(self.workspace_shape, F32Type()))
+        bindings = [*range(len(kernel.signature) - 1), workspace]
+        return PtxSequencePlan(
+            (PtxRoutePlan(make_ptx_kernel(phase), bindings)
+             for phase in (self.partials, self.reduction)),
+            reuse_scratch=True,
+        )
 
 
 def _replay_address_view(value: Value, root: Value, replacement: Value,
