@@ -593,6 +593,27 @@ class VerifyGpuDialect(VerificationPass):
                 "tensors, wgrmem, or tmem"
             )
         assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType, TmemTensorType))
+        native_view = op.attrs.get('native_tmem_view', False)
+        if type(native_view) is not bool:
+            raise ValueError('native_tmem_view must be a boolean')
+        if native_view and (
+            not isinstance(arg_type, TmemTensorType)
+            or not isinstance(result_type, TmemTensorType)
+            or arg_type.sizes[0] != 128 or result_type.sizes[0] not in (64,128)
+            or arg_type.cta_group != result_type.cta_group
+            or len(op.static_indices) != 2
+            or op.static_indices[0] != 0 or op.static_indices[1] is None
+        ):
+            raise ValueError('native TMEM views require a static column region of a 128-row arena with matching CTA group')
+        if isinstance(arg_type, TmemTensorType) and arg_type.sizes[0] != result_type.sizes[0] and not native_view:
+            raise ValueError('TMEM views must preserve logical row ownership')
+        if isinstance(arg_type, TmemTensorType):
+            row, column = op.static_indices
+            if row is not None and row != 0:
+                raise ValueError('TMEM views require a zero row origin')
+            if column is not None and (column < 0
+                    or (column + 1) * result_type.sizes[1] > arg_type.sizes[1]):
+                raise ValueError('TMEM column view exceeds its logical parent extent')
         if (isinstance(arg_type, TmemTensorType) and arg_type.cta_group == 2
                 and arg_type.sizes[0] == 64 and arg_type.sizes != result_type.sizes):
             raise ValueError("paired M64 TMEM requires whole accumulator views")

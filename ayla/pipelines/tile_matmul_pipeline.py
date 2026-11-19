@@ -61,6 +61,7 @@ def schedule_register_matmul(
     allow_partial_k: bool = False,
     mma_n_tile: int | None = None,
     mma_m_tile: int | None = None,
+    compose_m192: bool = False,
     destination_promotion: PromoteBuffers | None = None,
     cta_group: int = 1,
 ) -> Pipeline:
@@ -81,7 +82,7 @@ def schedule_register_matmul(
         TileMatmul(
             op_dims=["K"],
             tile_sizes=[operand_k_tile],
-            retain_dst_tiling_scheme=mma_m_tile is not None,
+            retain_dst_tiling_scheme=mma_m_tile is not None or compose_m192,
             iteration_bindings=[None],
             for_loop_labels=[k_label],
             op_label_filter=label,
@@ -121,7 +122,14 @@ def schedule_register_matmul(
                 cta_group=cta_group,
             )
         )
-    if mma_m_tile is not None:
+    if compose_m192:
+        from ..passes.compose_matmul_rows import ComposeMatmulRows
+
+        if destination_promotion is None:
+            raise ValueError("M192 composition requires loop-scoped destination promotion")
+        pipeline.add_pass(ComposeMatmulRows(label_filter=label))
+        pipeline.add_pass(destination_promotion)
+    elif mma_m_tile is not None:
         if destination_promotion is None:
             raise ValueError("M subtiles require loop-scoped destination promotion")
         _add_unrolled_subtiles(pipeline, label, "M", mma_m_tile, "mma_m")
@@ -250,6 +258,7 @@ def schedule_tiled_matmul(
     """
     pipeline = Pipeline()
     tensor_memory = accumulator == "tmem"
+    compose_m192 = tensor_memory and output_m_tile == 192
     mma_n_tile = (
         max(tile for tile in range(8, 257, 8) if output_n_tile % tile == 0)
         if tensor_memory and output_n_tile > 256 else None
@@ -279,7 +288,7 @@ def schedule_tiled_matmul(
             )
         )
     destination_promotion = PromoteBuffers(
-            scope_loop_label="k" if mma_m_tile is not None else None,
+            scope_loop_label="k" if mma_m_tile is not None or compose_m192 else None,
             target_type=accumulator,
             operands=["dst"],
             swizzle=None,
@@ -309,13 +318,14 @@ def schedule_tiled_matmul(
             unsafe_reuse_smem=unsafe_reuse_smem,
             cta_group=cta_group,
     )
-    if mma_m_tile is None:
+    if mma_m_tile is None and not compose_m192:
         pipeline.add_pass(destination_promotion)
     pipeline.add_pass(
         schedule_register_matmul(
             label=label,
             mma_m_tile=mma_m_tile,
-            destination_promotion=destination_promotion if mma_m_tile is not None else None,
+            compose_m192=compose_m192,
+            destination_promotion=destination_promotion if mma_m_tile is not None or compose_m192 else None,
             lhs_tma_load_slices=(output_m_tile+255)//256 if mma_m_tile is not None else 1,
             operand_stages=operand_stages,
             operand_k_tile=operand_k_tile,
@@ -417,26 +427,27 @@ def _schedule_matmul(
         layout.size > cta_group or layout.physical != (cta_group,1,1))
     if clustered_work and output_grid_size % layout.size:
         raise ValueError('persistent cluster grids require complete CTA rank groups')
-    if paired and (output_m_tile not in (64,128) or output_n_tile > 256 or output_n_tile % 16
+    if paired and (output_m_tile not in (64,128,192) or output_n_tile > 256 or output_n_tile % 16
                    or output_m_tiles_per_cta not in (1, 2)
                    or output_n_tiles_per_cta != 1 or output_store not in ("stmatrix", "global")
                    or output_grid_axes[0] != CollectiveAxis.X):
-        raise ValueError("paired MMA requires M64/M128 local tiles, N16–256, block-X pairs and TMA or global output")
+        raise ValueError("paired MMA requires M64/M128/M192 local tiles, N16–256, block-X pairs and TMA or global output")
     if tensor_memory and (
-        output_m_tile not in (64, 128)
+        output_m_tile not in (64, 128, 192)
         or output_n_tile > 512
         or warpgroup_m_tile is not None
         or warpgroup_n_tile not in (None, output_n_tile)
         or output_store == "scalar"
     ):
         raise ValueError(
-            "TMEM accumulators support 64/128-row tiles of at most 512 "
+            "TMEM accumulators support 64/128/192-row tiles of at most 512 "
             "columns, without warp-group tiles or scalar stores"
         )
     if tensor_memory:
         from ..tmem_layout import TmemWarpLayout
 
-        TmemWarpLayout(output_m_tile, tmem_writeback_warps)
+        for native_rows in ((128, 64) if output_m_tile == 192 else (output_m_tile,)):
+            TmemWarpLayout(native_rows, tmem_writeback_warps)
         kernel.block_dim = (tmem_writeback_warps * 32, 1, 1)
     if masked_global_store:
         if output_store != "global":
@@ -696,6 +707,11 @@ def _schedule_matmul(
         )
     pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
+    if tensor_memory and output_m_tile == 192:
+        from ..passes.pack_tmem_allocs import PackTmemAllocs
+
+        pipeline.add_pass(PackTmemAllocs(compose_rows=True, track_column_regions=True,
+                                       preserve_release_barriers=False))
     if tensor_memory and group_size > 1:
         from ..passes.pack_tmem_allocs import PackTmemAllocs
         pipeline.add_pass(PackTmemAllocs())

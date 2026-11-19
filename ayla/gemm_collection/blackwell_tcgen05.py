@@ -1,10 +1,34 @@
 """Blackwell GEMMs: the configurable GEMM schedule on a tcgen05 target."""
 
 from copy import deepcopy
+import json
+from pathlib import Path
 from typing import Any
 
 from ..gpu_dialect import CollectiveAxis, ModuleOp, gpu_dialect
 from ..pipelines.tile_matmul_pipeline import _schedule_matmul
+
+
+def select_blackwell_gemm_schedule(
+    m: int, n: int, k: int, dtype: str = "f16"
+) -> dict[str, Any] | None:
+    """Select an exact measured MM route, including composed M192 tiles."""
+    dtype = {"f16": "float16", "bf16": "bfloat16"}.get(dtype, dtype)
+    table = (
+        Path(__file__).resolve().parents[1]
+        / "better_benchmark_gemm_router_blackwell.json"
+    )
+    for route in json.loads(table.read_text())["routes"]:
+        if (
+            route.get("op", "mm"),
+            route.get("batch", 1),
+            route["dtype"],
+            route["m"],
+            route["n"],
+            route["k"],
+        ) == ("mm", 1, dtype, m, n, k):
+            return deepcopy(route["configuration"])
+    return None
 
 
 def blackwell_tcgen05_gemm_module(
@@ -64,6 +88,13 @@ def blackwell_tcgen05_gemm_module(
     Native schedules support paired CTAs, multicast clusters, cyclic MMA
     queues and optional descriptor interleaving/hoisting. ``mma_issue_group_size``
     changes native cyclic issue order without changing completion ownership.
+
+    ``output_m_tile=192`` composes native M128 and M64 updates with shared
+    operands and one TMEM arena. It supports native/cyclic/rolled K schedules,
+    multicast and paired CTAs, with at most 256 output columns per tile.
+    Paired composition requires one output slice/buffer and enough writeback
+    registers for the complete M64 component (budget 128 for N192, four warps).
+    Grouped output tiles and persistent output rings are not supported for M192.
 
     ``persistent_output_pipeline`` selects the shared operand/output ring:
     two TMEM slots have independent accumulator readiness, last-read release
@@ -178,7 +209,7 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("paired M64 blocked TMA inputs require K divisible by 64")
     if (
         min(m, n, k, output_n_tile) <= 0
-        or output_m_tile not in (64, 128)
+        or output_m_tile not in (64, 128, 192)
         or (
             m % output_m_tile
             and not (output_store == "stmatrix" and allow_partial_tiles)
@@ -187,7 +218,22 @@ def blackwell_tcgen05_gemm_module(
         or (not allow_partial_tiles and n % output_n_tile)
     ):
         raise ValueError(
-            "GEMM dimensions must be positive and divide the M64/M128 and N tiles"
+            "GEMM dimensions must be positive and divide the M64/M128/M192 and N tiles"
+        )
+    if output_m_tile == 192 and (
+        output_n_tile > 256 or persistent_output_pipeline
+        or batch_output_m_operands or output_m_tiles_per_cta != 1
+    ):
+        raise ValueError(
+            "M192 composition requires a native tile of at most 256 columns"
+        )
+    if output_m_tile == 192 and cta_group == 2 and (
+        output_slices != 1 or output_store_buffers != 1
+        or tmem_writeback_register_budget * tmem_writeback_warps * 32 < 64 * output_n_tile
+    ):
+        raise ValueError(
+            "paired M192 composition requires one output slice/buffer and a register "
+            "budget large enough for the whole M64 writeback fragment"
         )
     if (
         operand_k_tile <= 0

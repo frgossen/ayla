@@ -1072,7 +1072,8 @@ class PromoteBuffers(LoweringPass):
             raise ValueError("loop-scoped promotion requires unconditional reduction updates")
         destination_roots=set().union(*(root_buffers(hero.dst) for hero in heroes))
         for op in inside:
-            if op in heroes or op.blocks or is_side_effect_free(op):continue
+            if op in heroes or op.blocks or is_side_effect_free(op):
+                continue
             effects=memory_effects(op)
             if effects is None or any(destination_roots.intersection(effect.roots) for effect in effects):
                 raise ValueError("loop-scoped destination has another observer or writer")
@@ -1105,13 +1106,19 @@ class PromoteBuffers(LoweringPass):
             for other in unique:
                 left, right = hero.dst.definition, other.definition
                 if (not isinstance(left, TileOp) or not isinstance(right, TileOp)
-                        or left.arg is not right.arg or left.result().type.sizes != right.result().type.sizes):
+                        or left.arg is not right.arg):
                     raise ValueError("multiple scoped destinations require disjoint static sibling tiles")
                 from .verify_gpu_dialect import _static_index
                 li,ri=([_static_index(i, {}) for i in t.indices] for t in (left, right))
-                if not any(a is not None and b is not None and a != b for a,b in zip(li,ri)):
+                left_type = cast(MemTensorType, left.result().type)
+                right_type = cast(MemTensorType, right.result().type)
+                if not any(a is not None and b is not None
+                           and sa is not None and sb is not None
+                           and (a * sa + sa <= b * sb or b * sb + sb <= a * sa)
+                           for a,b,sa,sb in zip(li,ri,left_type.sizes,right_type.sizes)):
                     raise ValueError("multiple scoped destinations may overlap")
-            hoist(hero.dst);hoist(init)
+            hoist(hero.dst)
+            hoist(init)
             ops,[promoted]=self._build_operand_promotion(hero.dst,"dst",hero.collective,
                 hero.attrs.get("label"),init=init)
             pre.extend(ops)

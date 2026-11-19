@@ -572,6 +572,10 @@ class TileOp(GpuOp):
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
     defined out-of-bounds behavior.
+
+    ``native_tmem_view`` explicitly selects a native M64/M128 accumulator
+    layout in a column region of a physical 128-row TMEM arena. It changes
+    row ownership rather than cropping the parent's logical rows.
     """
 
     @classmethod
@@ -3291,7 +3295,8 @@ def static_columns(value: Value, whole: Value | None = None) -> tuple[int, int] 
 
     The interval is relative to ``whole``, or else to the view's sole
     allocation, which must contain it. Dynamic indices, partial leading
-    extents, casts and other producers remain unknown.
+    extents, casts and other producers remain unknown. Explicit native TMEM
+    views also preserve column intervals when selecting M64 from an M128 arena.
     """
     typ = value.type
     assert isinstance(typ, MemTensorType)
@@ -3300,7 +3305,14 @@ def static_columns(value: Value, whole: Value | None = None) -> tuple[int, int] 
     offset, width = 0, typ.sizes[-1]
     while value is not whole and isinstance(tile := value.definition, TileOp):
         sizes, indices = value.type.sizes, tile.static_indices
-        if (any(i != 0 for i in indices[:-1]) or list(sizes[:-1]) != list(tile.arg.type.sizes[:-1])
+        native_rows = (
+            isinstance(value.type, TmemTensorType)
+            and isinstance(tile.arg.type, TmemTensorType)
+            and tile.attrs.get('native_tmem_view') is True
+            and tile.arg.type.sizes[0] == 128 and sizes[0] in (64,128)
+            and value.type.cta_group == tile.arg.type.cta_group
+        )
+        if (any(i != 0 for i in indices[:-1]) or (list(sizes[:-1]) != list(tile.arg.type.sizes[:-1]) and not native_rows)
                 or indices[-1] is None or indices[-1] < 0 or sizes[-1] is None):
             return None
         offset += indices[-1] * sizes[-1]
