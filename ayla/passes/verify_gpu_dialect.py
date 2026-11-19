@@ -11,7 +11,7 @@ from functools import cache
 import itertools
 import math
 
-from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancestors
+from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancestors, iter_ops
 from ..base.verification_pass import VerificationPass, verifies
 from ..target import CUDA_LAUNCH_LIMITS
 from ..gpu_dialect import (
@@ -26,6 +26,7 @@ from ..gpu_dialect import (
     ClusterBlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
+    CollectiveScope,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -52,6 +53,7 @@ from ..gpu_dialect import (
     ReshapeOp,
     RmemTensorType,
     ConstantOp,
+    DeallocOp,
     SelectOp,
     SmemTensorType,
     TmemTensorType,
@@ -126,6 +128,12 @@ def _verify_transposed_fragment_store(op: MoveOp) -> None:
     if dst_root is None or not is_column_major(dst_root.type):
         return
     dst = dst_root.type
+    if isinstance(dst, GmemTensorType) and isinstance(src.dtype, F32Type):
+        # FP32 column-major global partials use two scalar stores per
+        # fragment column pair; no STMatrix staging is needed.
+        if dst.dtype != src.dtype or list(dst.strides) != [1, dst.sizes[0]]:
+            raise ValueError("FP32 transposed fragment stores need dense column-major memory")
+        return
     if not (
         isinstance(dst, SmemTensorType)
         and isinstance(src.dtype, (BF16Type, F16Type))
@@ -179,12 +187,30 @@ def _verify_tma_multicast(op: MoveOp | TmaMoveOp) -> None:
 _MAX_MULTICAST_TILE_EVALUATIONS = 1 << 20
 
 
-def _static_index(value: Value | int, env: dict[Value, int]) -> int | None:
+def _static_index(
+    value: Value | int,
+    env: dict[Value, int],
+    memo: dict[Value, int | None] | None = None,
+) -> int | None:
     """Evaluate static index arithmetic, or ``None`` if it is not static."""
     if isinstance(value, int):
         return value
     if value in env:
         return env[value]
+    if memo is None:
+        memo = {}
+    if value in memo:
+        return memo[value]
+    result = _evaluate_static_index(value, env, memo)
+    memo[value] = result
+    return result
+
+
+def _evaluate_static_index(
+    value: Value,
+    env: dict[Value, int],
+    memo: dict[Value, int | None],
+) -> int | None:
     op = value.definition
     if not isinstance(op, Op):
         return None
@@ -198,15 +224,15 @@ def _static_index(value: Value | int, env: dict[Value, int]) -> int | None:
         IndexLtOp: lambda a, b: int(a < b),
     }
     if type(op) in binary:
-        lhs, rhs = (_static_index(operand, env) for operand in op.operands)
+        lhs, rhs = (_static_index(operand, env, memo) for operand in op.operands)
         if lhs is None or rhs is None:
             return None
         return binary[type(op)](lhs, rhs)
     if isinstance(op, SelectOp):
-        index = _static_index(op.index, env)
+        index = _static_index(op.index, env, memo)
         if index is None or not 0 <= index < len(op.cases):
             return None
-        return _static_index(op.cases[index], env)
+        return _static_index(op.cases[index], env, memo)
     return None
 
 
@@ -318,9 +344,12 @@ def _verify_cluster_shares_multicast_tile(
             env[value] = block[value.result_index] % cluster[value.result_index]
         for loop, iv in zip(loops, ivs, strict=True):
             env[loop.body.arguments[0]] = iv
-        if not all(_static_index(guard, env) for guard in guards):
+        # Each CTA/iteration has a fresh environment. Shared expression DAGs
+        # are evaluated once in that environment; enumeration stays exact.
+        memo: dict[Value, int | None] = {}
+        if not all(_static_index(guard, env, memo) for guard in guards):
             return ()
-        return tuple(_static_index(index, env) for index in indices)
+        return tuple(_static_index(index, env, memo) for index in indices)
 
     origins = itertools.product(
         *(range(0, g, c) for g, c in zip(grid, cluster, strict=True))
@@ -408,6 +437,19 @@ class VerifyGpuDialect(VerificationPass):
     ) -> None:
         super().__init__(stage)
 
+    def run_op(self, op: Op) -> None:
+        self._verify_tmem_types(op)
+        VerificationPass.run_op(self, op)
+
+    def _verify_tmem_types(self, op: Op) -> None:
+        for block in op.blocks:
+            for argument in block.arguments:
+                if isinstance(argument.type, TmemTensorType):
+                    argument.type.validate()
+        for value in (*op.operands, *op.results):
+            if isinstance(value.type, TmemTensorType):
+                value.type.validate()
+
     @verifies(Op)
     def _verify_participants(self, op: Op) -> None:
         actors = execution_warps(op)
@@ -452,12 +494,18 @@ class VerifyGpuDialect(VerificationPass):
                 raise ValueError('async and engine participants must be the issuing warp')
         elif not isinstance(op, BarrierOp):
             raise ValueError(f'unsupported participant operation {op.op_id}')
-        elif op.scope in ('block', 'block_leader') and (
+        elif (op.scope == 'block' or op.scope == 'block_leader' and op.sync is None) and (
                 type(op.attrs.get('id')) is not int or not 1 <= op.attrs['id'] <= 15):
             raise ValueError('subset rendezvous requires a dedicated named barrier')
 
     @verifies(KernelOp)
     def _verify_kernel(self, op: KernelOp) -> None:
+        if type(op.attrs.get("rolled_refill_before_compute", False)) is not bool:
+            raise ValueError("rolled_refill_before_compute must be a boolean")
+        if op.attrs.get("rolled_refill_before_compute"):
+            module = find_ancestor_of_type(op, ModuleOp)
+            if module is None or module.target != "sm_100a":
+                raise ValueError("rolled_refill_before_compute requires SM100")
         handoffs = op.attrs.get('paired_completion_handoffs', False)
         banks = releases_cluster_banks(op)
         if type(handoffs) is not bool or handoffs and (
@@ -489,6 +537,16 @@ class VerifyGpuDialect(VerificationPass):
             for grid, cluster in zip(grid_dim, cluster_dim, strict=True)
         ):
             raise ValueError("cluster_dim must divide grid_dim")
+        module = find_ancestor_of_type(op, ModuleOp)
+        if (module is not None and module.target == "sm_100a"
+                and (cluster_dim[0] or 1) % 2
+                and any(isinstance(value.type, TmemTensorType) and value.type.cta_group == 2
+                        for inner in iter_ops(op)
+                        for value in (*inner.operands, *inner.results))):
+            # Paired TMEM's physical CTA pairing requires adjacent X ranks.
+            # Odd X widths compile but fail the SM100 launch configuration.
+            raise ValueError("paired TMEM on sm_100a requires an even physical cluster X dimension")
+
 
     @verifies(PersistentPipelineOp)
     def _verify_persistent_pipeline(self, op):
@@ -496,17 +554,26 @@ class VerifyGpuDialect(VerificationPass):
 
         loop, reduction, _, _, _ = _source(op)
         kernel = find_ancestor_of_type(op, KernelOp)
+        frames = op.attrs.get("frames", 2)
+        job_regions = op.attrs.get("job_regions", False)
         if (kernel is None or not kernel.attrs.get("rolled_shared_ring")
                 or loop.lb != 0 or loop.step != 1
                 or type(op.attrs.get("depth")) is not int
                 or op.attrs["depth"] < 2
                 or op.attrs["depth"] != reduction.attrs["depth"]
                 or type(op.attrs.get("mma_queue_depth", 1)) is not int
-                or op.attrs.get("mma_queue_depth", 1) != 1
+                or not 1 <= op.attrs.get("mma_queue_depth", 1) < op.attrs["depth"]
                 or len(op.operands) != 2
                 or not isinstance(op.operands[0].type, TmemTensorType)
-                or op.operands[0].type.sizes[1] != 2 * op.attrs["slot_columns"]):
+                or type(frames) is not int or frames not in (1, 2)
+                or frames == 1 and (op.attrs.get("overlap") is not False or op.attrs.get("job_regions", False))
+                or kernel.attrs.get("persistent_output_slots") != frames
+                or op.operands[0].type.sizes[1] != frames * op.attrs["slot_columns"]):
             raise ValueError("invalid compact persistent pipeline")
+        if type(job_regions) is not bool or job_regions and (
+                kernel.block_dim != (256, 1, 1) or frames != 2
+                or not op.attrs.get("overlap")):
+            raise ValueError("job participant regions require a one-dimensional eight-warp overlapping ring")
 
     @verifies(OperandPipelineOp)
     def _verify_operand_pipeline(self, op):
@@ -515,19 +582,31 @@ class VerifyGpuDialect(VerificationPass):
         _, mma = _parts(op)
         depth = op.attrs.get("depth")
         lb, ub = op.attrs.get("lb"), op.attrs.get("ub")
+        carried = op.attrs.get("carried_events", False)
         if (
             type(depth) is not int
             or depth < 2
             or type(lb) is not int
             or type(ub) is not int
             # A persistent ring carries banks across output jobs.
-            or (ub - lb < depth - 1
+            or (ub - lb < (1 if carried else depth - 1)
                 and find_ancestor_of_type(op, PersistentPipelineOp) is None)
             or op.attrs.get("step") != 1
             or len(op.body.arguments) != 1
         ):
             raise ValueError("invalid rolled operand pipeline bounds or depth")
-        banks = op.operands
+        banks = op.operands[:-3] if carried else op.operands
+        if carried:
+            if len(op.operands) != 5:
+                raise ValueError("carried operand pipeline requires job and bank events")
+            job, ready, free = op.operands[-3:]
+            if (not isinstance(job.type, IndexType)
+                    or any(not isinstance(value.type, LockType)
+                           or value.type.kind != kind
+                           or value.type.attrs.get("count") != depth
+                           or value.type.attrs.get("cta_group", 1) != mma.lock.type.attrs.get("cta_group", 1)
+                           for value, kind in ((ready, "mbar"), (free, "tcgen05")))):
+                raise ValueError("invalid carried operand event storage")
         if len(banks) != 2 or any(
             not isinstance(v.type, SmemTensorType) for v in banks
         ):
@@ -593,6 +672,10 @@ class VerifyGpuDialect(VerificationPass):
                 "tensors, wgrmem, or tmem"
             )
         assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType, TmemTensorType))
+        if isinstance(arg_type, WgrmemTensorType):
+            from .lower_to_ptx_template import _M16N8_FRAGMENT_ROWS, _wgmma_view_pairs
+            if arg_type.layout in _M16N8_FRAGMENT_ROWS:
+                _wgmma_view_pairs(op.result())
         native_view = op.attrs.get('native_tmem_view', False)
         if type(native_view) is not bool:
             raise ValueError('native_tmem_view must be a boolean')
@@ -669,9 +752,6 @@ class VerifyGpuDialect(VerificationPass):
                 or op.scope not in ('block_leader', 'cluster_to_leader')
                 or op.sync is None):
             raise ValueError('split barrier phases require a gather resource')
-        if (op.scope == 'block_leader' and 'phase' in op.attrs
-                and execution_warps(op) is not None):
-            raise ValueError('split block gathers require all warps')
         if op.scope in (
             "cluster_to_leader",
             "leader_to_cluster",
@@ -721,8 +801,13 @@ class VerifyGpuDialect(VerificationPass):
             # One arrival per arriving warp: every warp, or the op's participants.
             warps = execution_warps(op)
             arrivals = kernel.num_threads // 32 if warps is None else len(warps)
-            if not isinstance(typ, LockType) or typ.kind != "mbar" or typ.attrs.get("arrivals") != arrivals:
+            if (not isinstance(typ, LockType) or typ.kind != "mbar"
+                    or type(typ.attrs.get("arrivals")) is not int or typ.attrs["arrivals"] <= 0
+                    or op.attrs.get("phase") != "wait" and typ.attrs["arrivals"] != arrivals):
                 raise ValueError("block-leader mbarrier requires one arrival per arriving warp")
+            if (op.attrs.get("phase") != "arrive" and warps is not None
+                    and execution_issuer_warp(op) not in warps):
+                raise ValueError("block-leader wait participants must include its issuing warp")
         elif op.scope == "cluster_to_leader":
             if not isinstance(op.operands[0].type, LockType) or (
                 op.operands[0].type.kind != "cluster_mbar"
@@ -792,6 +877,10 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_await(self, op: AwaitOp) -> None:
         lock_type = op.lock.type
         assert isinstance(lock_type, LockType)
+        if "bulk_read_only" in op.attrs and (
+            lock_type.kind != "bulk" or type(op.attrs["bulk_read_only"]) is not bool
+        ):
+            raise ValueError("bulk_read_only must be a boolean on a bulk await")
         _verify_completion_group(op)
         if "arrivals" in lock_type.attrs:
             raise ValueError("a gather mbarrier must be consumed by a barrier")
@@ -847,6 +936,11 @@ class VerifyGpuDialect(VerificationPass):
         _verify_tma_multicast(op)
         _verify_transposed_fragment_store(op)
         dst_type, src_type = op.dst.type, op.src.type
+        for memory, fragment in ((dst_type, src_type), (src_type, dst_type)):
+            if (isinstance(memory, TmemTensorType) and isinstance(fragment, WgrmemTensorType)
+                    and memory.sizes[0] == 64
+                    and (memory.cta_group == 2) != (fragment.attrs.get("tmem_cta_group", 1) == 2)):
+                raise ValueError("paired M64 TMEM moves require matching fragment cta_group metadata")
         if (
             isinstance(dst_type, WgrmemTensorType)
             and isinstance(src_type, AddrMemTensorType)
@@ -857,7 +951,8 @@ class VerifyGpuDialect(VerificationPass):
                 or not (
                     (
                         src_type.strides[0] is not None
-                        and src_type.strides[0] % 2 == 0
+                        and (src_type.strides[0] % 2 == 0
+                             or dst_type.layout in ("tcgen05_16x256b", "wgmma_layout_0"))
                         and src_type.strides[1] == 1
                     )
                     or (
@@ -869,8 +964,15 @@ class VerifyGpuDialect(VerificationPass):
         ):
             raise ValueError(
                 "address-to-WGRMEM move requires equal rank-2 shapes and dtypes "
-                "with aligned contiguous element pairs or broadcast columns"
+                "with supported contiguous element pairs or broadcast columns"
             )
+
+        from .lower_to_ptx_template import _M16N8_FRAGMENT_ROWS, _m16n8_move_pairs
+        for memory, fragment in ((op.dst, op.src), (op.src, op.dst)):
+            if (isinstance(memory.type, AddrMemTensorType)
+                    and isinstance(fragment.type, WgrmemTensorType)
+                    and fragment.type.layout in _M16N8_FRAGMENT_ROWS):
+                _m16n8_move_pairs(op)
 
     @verifies(TmaMoveOp)
     def _verify_tma_move(self, op: TmaMoveOp) -> None:
@@ -1047,8 +1149,143 @@ class VerifyGpuDialect(VerificationPass):
         if op.init is not None:
             raise ValueError("matmul initializer must be promoted before PTX lowering")
 
+    @verifies(KernelOp, stage=VerificationStage.PTX_LOWERING)
+    def _verify_tmem_allocation_sequence(self, kernel):
+        from ..analysis.warp_guards import cta_uniform_guards, warp_guard_truth
+
+        operations = list(iter_ops(kernel))
+        for inner in operations:
+            self._verify_tmem_types(inner)
+        groups = {v.type.cta_group for op in operations for v in (*op.operands, *op.results)
+                  if isinstance(v.type, TmemTensorType)}
+        if len(groups) > 1:
+            raise ValueError('all tcgen05 operations in a kernel must use the same CTA group')
+
+        def transfer(ops, prior):
+            for op in ops:
+                if isinstance(op, AllocOp) and isinstance(op.result().type, TmemTensorType):
+                    columns = op.result().type.columns
+                    if any(previous is not None and previous < columns for previous in prior):
+                        raise ValueError('TMEM allocation columns must not increase in execution order')
+                    prior = frozenset({columns})
+                elif isinstance(op, IfOp):
+                    uniform = cta_uniform_guards((op.condition,), kernel)
+                    truth = warp_guard_truth(op.condition, kernel, 0) if uniform else None
+                    if truth is not False:
+                        taken = transfer(op.body.ops, prior)
+                        prior = taken if truth is True else prior | taken
+                elif isinstance(op, ForOp):
+                    count = (max(0, (op.ub - op.lb + op.step - 1) // op.step)
+                             if all(type(v) is int for v in (op.lb, op.ub, op.step)) and op.step > 0 else None)
+                    entry = prior
+                    for _ in range(min(count, 6) if count is not None else 6):
+                        next_prior = transfer(op.body.ops, prior)
+                        if count is None:
+                            next_prior |= entry
+                        if next_prior == prior:
+                            break
+                        prior = next_prior
+            return prior
+
+        # Six possible frontiers: no allocation yet, or a power-of-two size
+        # from 32 through 512. Loops stabilize or expose an increase within six.
+        transfer(kernel.body.ops, frozenset({None}))
+
     @verifies(Op, stage=VerificationStage.PTX_LOWERING)
     def _verify_static_shapes(self, op: Op) -> None:
+        # Elected issues, tensor memory moves, waiter selection and gather
+        # election synchronize complete warps.
+        # A guard outside an async group must therefore select whole warps.
+        # Optional store atoms inside a group predicate the transfer after
+        # election and do not narrow participation in the election itself.
+        full_warp = (isinstance(op, AsyncOp) and op.lock.type.kind in ('mbar', 'bulk', 'tcgen05')
+                   or isinstance(op, AwaitOp) and op.lock.type.kind in ('mbar', 'tcgen05') and op.waiter_warps is not None
+                   or isinstance(op, BarrierOp) and op.scope in ('block_leader', 'cluster_to_leader')
+                   or isinstance(op, (TmaMoveOp, WarpIdsOp))
+                   or isinstance(op, MoveOp) and (op.attrs.get('tma')
+                       or isinstance(op.src.type, TmemTensorType) or isinstance(op.dst.type, TmemTensorType))
+                   or isinstance(op, DeallocOp) and isinstance(op.value.type, TmemTensorType)
+                   or isinstance(op, ElementwiseOp) and isinstance(op.dst.type, TmemTensorType)
+                   or isinstance(op, MatmulOp) and isinstance(op.dst.type, TmemTensorType))
+        kernel = find_ancestor_of_type(op, KernelOp)
+        tmem_alloc = isinstance(op, AllocOp) and isinstance(op.result().type, TmemTensorType)
+        tmem_operation = tmem_alloc or any(isinstance(v.type, TmemTensorType) for v in op.operands)
+        if tmem_operation and (kernel is None or kernel.num_threads is None or kernel.num_threads < 32):
+            raise ValueError('TMEM synchronization requires a complete allocating warp')
+        if tmem_alloc:
+            from ..analysis.warp_guards import cta_uniform_guards
+
+            guards = [ancestor.condition for ancestor in reversed(list(iter_ancestors(op)))
+                      if isinstance(ancestor, IfOp)]
+            if not cta_uniform_guards(guards, kernel):
+                raise ValueError('TMEM allocation requires CTA-uniform control for address publication')
+            if op.result().type.cta_group == 2:
+                from ..analysis.index_proofs import uniform_guard_scope
+                from ..analysis.warp_guards import warp_guard_truth
+
+                def grid_uniform(value):
+                    producer = value.definition
+                    if isinstance(producer, Block):
+                        return producer.parent_op is kernel
+                    return isinstance(producer, (IndexConstantOp, IndexAddOp, IndexMulOp,
+                        IndexDivOp, IndexModOp, IndexLtOp, SelectOp)) and all(
+                            grid_uniform(arg) for arg in producer.operands)
+
+                if any(not (grid_uniform(condition)
+                        or warp_guard_truth(condition, kernel, 0) is not None
+                        or (scope := uniform_guard_scope(condition, kernel)) is not None
+                        and CollectiveScope.CLUSTER.leq(scope)) for condition in guards):
+                    raise ValueError('paired TMEM allocation requires a peer-uniform guard')
+        if isinstance(op, DeallocOp) and isinstance(op.value.type, TmemTensorType):
+            value = op.value
+            while isinstance(value.definition, TileOp):
+                if tuple(value.definition.static_indices) != (0, 0):
+                    raise ValueError('TMEM deallocation must use the allocation base')
+                value = value.definition.arg
+            if not isinstance(value.definition, AllocOp):
+                raise ValueError('TMEM deallocation requires a known local allocation base')
+            if value.type.columns != op.value.type.columns:
+                raise ValueError('TMEM deallocation must match the original allocation column capacity')
+        fragment = next((v.type for v in op.operands if isinstance(v.type, WgrmemTensorType)), None)
+        if tmem_operation and isinstance(op, (MoveOp, ElementwiseOp)):
+            required = fragment.warps if fragment is not None else kernel.num_threads // 32
+            actors = execution_warps(op)
+            if actors is None:
+                actors = next((execution_warps(parent) for parent in iter_ancestors(op)
+                               if isinstance(parent, IfOp) and execution_warps(parent) is not None), None)
+            valid = (kernel.num_threads == required * 32 and required in (4, 8)
+                     if actors is None else fragment is not None and required == 4
+                     and actors in (frozenset(range(4)), frozenset(range(4, 8))))
+            # The completed persistent region assigns each whole job to an
+            # aligned four-warp group during expansion. Its serial body has
+            # no participant annotation yet; check the generated groups again
+            # before they become PTX templates.
+            persistent = find_ancestor_of_type(op, PersistentPipelineOp)
+            valid |= (actors is None and fragment is not None and required == 4
+                      and persistent is not None and persistent.attrs.get("job_regions") is True
+                      and kernel.block_dim == (256, 1, 1))
+            if not valid:
+                raise ValueError('TMEM fragment warps must match the CTA or a declared aligned participant group')
+        if full_warp and find_ancestor_of_type(op, AsyncOp) is None:
+            from ..analysis.warp_guards import warp_uniform_guards
+
+            guards = [ancestor.condition for ancestor in reversed(list(iter_ancestors(op)))
+                      if isinstance(ancestor, IfOp)]
+            if not warp_uniform_guards(guards, kernel):
+                raise ValueError('full-warp synchronization requires a warp-uniform guard')
+        if isinstance(op, BarrierOp) and (op.scope in ('block', 'grid', 'cluster', 'leader_to_cluster')
+                or op.scope == 'block_leader' and op.attrs.get('phase') != 'wait'):
+            # Arrival phases must account for every declared participant.
+            # A wait-only gather phase adds no new arrivals.
+            from ..analysis.warp_guards import cta_uniform_guards, participant_uniform_guards
+
+            guards = [ancestor.condition for ancestor in reversed(list(iter_ancestors(op)))
+                      if isinstance(ancestor, IfOp)]
+            actors = execution_warps(op)
+            valid = (cta_uniform_guards(guards, kernel) if actors is None else
+                     participant_uniform_guards(guards, kernel, actors))
+            if not valid:
+                raise ValueError('counted rendezvous requires uniform control across its participants')
         for block in op.blocks:
             for argument in block.arguments:
                 _verify_static_shape(argument.type)
@@ -1062,3 +1299,28 @@ def verify_gpu_dialect(
 ) -> ModuleOp:
     """Verify a GPU dialect module."""
     return VerifyGpuDialect(stage).run(module)
+
+
+def verify_expanded_gpu_hardware(region: Op) -> None:
+    """Check hardware contracts while late-generated operations are still IR.
+
+    Dynamic event views can issue and await through different SSA aliases.
+    Their ownership protocols are verified at the completed-region boundary;
+    ordinary named-lock pairing checks do not apply to those implementations.
+    Guard participation, static shapes, TMEM views and allocator contracts do.
+    """
+    verifier = VerifyGpuDialect(VerificationStage.PTX_LOWERING)
+    for op in iter_ops(region):
+        if isinstance(op, PersistentPipelineOp) or (
+                isinstance(op, OperandPipelineOp) and op is not region):
+            raise ValueError("late hardware verification requires expanded semantic regions")
+        verifier._verify_tmem_types(op)
+        verifier._verify_participants(op)
+        _verify_issuer_warp(op)
+        verifier._verify_static_shapes(op)
+        if isinstance(op, BarrierOp):
+            verifier._verify_barrier(op)
+        if isinstance(op, TileOp):
+            verifier._verify_tile(op)
+        if isinstance(op, KernelOp):
+            verifier._verify_tmem_allocation_sequence(op)

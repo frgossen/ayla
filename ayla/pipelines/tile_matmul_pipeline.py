@@ -23,6 +23,7 @@ from ..passes.multi_buffer import MultiBuffer
 from ..passes.peel_loop import PeelLoop
 from ..passes.pipeline_loop import PipelineLoop
 from ..passes.promote_buffers import PromoteBuffers
+from ..passes.reduction_range import ReductionRange
 from ..passes.schedule_async import ScheduleAsync
 from ..passes.tile_matmul import TileMatmul
 from ..passes.unroll_loop import UnrollLoop
@@ -90,6 +91,7 @@ def schedule_register_matmul(
             allow_partial_tiles=allow_partial_k,
         )
     )
+    pipeline.add_pass(ReductionRange(k_label))
     for operand, column_major, width in (
         ("lhs", lhs_column_major, lhs_smem_block_width),
         ("rhs", rhs_column_major, rhs_smem_block_width),
@@ -362,6 +364,9 @@ def _schedule_matmul(
     output_m_tiles_per_cta: int = 1,
     batch_output_m_operands: bool = False,
     output_n_tiles_per_cta: int = 1,
+    grouped_compute_overlap: bool = False,
+    compute_batches_per_fragment: int = 0,
+    preserve_output_job_order: bool = False,
     output_grid_size: int | None = None,
     output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
         CollectiveAxis.X,
@@ -412,6 +417,12 @@ def _schedule_matmul(
     if len(matmuls) != 1:
         raise ValueError("schedule_matmul requires exactly one matmul")
     tensor_memory = module.target == "sm_100a"
+    if tensor_memory:
+        from ..gemm_collection.common_warp_schedule import validate_common_warp_schedule
+
+        validate_common_warp_schedule({"operand_move_attrs": operand_move_attrs})
+        if matmuls[0].attrs.get("issuer_warp", 0) != 0 or "participant_warps" in matmuls[0].attrs:
+            raise ValueError("Blackwell matmul requires a shared issuer without warp specialization")
     if rolled_operand_pipeline and not tensor_memory:
         raise ValueError("rolled operand pipeline requires the Blackwell target")
     cta_group = (2 if tensor_memory and (cluster_m_ctas,cluster_n_ctas)==(2,1) else 1) if cta_group is None else cta_group
@@ -427,11 +438,12 @@ def _schedule_matmul(
         layout.size > cta_group or layout.physical != (cta_group,1,1))
     if clustered_work and output_grid_size % layout.size:
         raise ValueError('persistent cluster grids require complete CTA rank groups')
-    if paired and (output_m_tile not in (64,128,192) or output_n_tile > 256 or output_n_tile % 16
+    paired_maximum_n = 512 if output_store == "stmatrix" else 256
+    if paired and (output_m_tile not in (64,128,192) or output_n_tile > paired_maximum_n or output_n_tile % 16
                    or output_m_tiles_per_cta not in (1, 2)
                    or output_n_tiles_per_cta != 1 or output_store not in ("stmatrix", "global")
                    or output_grid_axes[0] != CollectiveAxis.X):
-        raise ValueError("paired MMA requires M64/M128/M192 local tiles, N16–256, block-X pairs and TMA or global output")
+        raise ValueError("paired MMA requires M64/M128/M192 local tiles, N16–512 with TMA stores (N16–256 with global stores), block-X pairs")
     if tensor_memory and (
         output_m_tile not in (64, 128, 192)
         or output_n_tile > 512
@@ -464,24 +476,34 @@ def _schedule_matmul(
     if rhs_k != k:
         raise ValueError("matmul reduction dimensions must match")
     m, n, k = cast(tuple[int, int, int], (m, n, k))
-    if paired and output_m_tile == 64 and output_store != "stmatrix":
-        raise ValueError("paired M64 currently requires stmatrix output and a whole register fragment")
     if paired and output_m_tiles_per_cta == 2 and (output_m_tile != 128 or output_grid_size is not None
-            or m % 512 or output_store != 'stmatrix' or output_n_tile > 256):
-        raise ValueError('paired output frames require complete M512 groups and an ordinary TMA grid')
-    if paired and output_store == 'global' and (m % (2*output_m_tile) or n % output_n_tile):
+            or ((m + 127) // 128) % 4 or output_store != 'stmatrix' or output_n_tile > 256):
+        raise ValueError('paired output frames require complete padded M512 groups and an ordinary TMA grid')
+    if paired and output_store == 'global' and (m % (2*output_m_tile) or (n % output_n_tile and not masked_global_store)):
         raise ValueError("paired global stores require complete paired M and N tiles")
-    if layout.size > 1 and output_store == 'global' and (m % (layout.m*output_m_tile) or n % (layout.n*output_n_tile)):
+    if layout.size > 1 and output_store == 'global' and (m % (layout.m*output_m_tile) or (n % (layout.n*output_n_tile) and not masked_global_store)):
         raise ValueError('cluster global stores require complete logical cluster tiles')
     if paired and output_grid_size is not None and (output_grid_size % 2
             or output_grid_fast_axis != "m" or ((m + output_m_tile - 1) // output_m_tile) % 2 and not (persistent_output_pipeline or clustered_work)):
         raise ValueError("paired persistent grids require even CTA and M-tile counts with M-fast traversal")
 
-    for operand, dimension, tile in (
-        (matmul.lhs, m, output_m_tile),
-        (matmul.rhs, n, output_n_tile),
+    # TMA stores permit partial output tiles. Each operand's SMEM atom must
+    # divide its local tile, not the full global matrix dimension; dense TMA
+    # descriptors zero-fill the final input box.
+    partial_tma_outputs = tensor_memory and output_store == "stmatrix"
+    lhs_atom_width = math.gcd(output_m_tile if partial_tma_outputs else m, 64)
+    rhs_mma_columns = (
+        max(width for width in range(8, 257, 8) if output_n_tile % width == 0)
+        if tensor_memory and output_n_tile > 256 else output_n_tile
+    )
+    rhs_atom_width = math.gcd(
+        rhs_mma_columns // cta_group if partial_tma_outputs else n, 64
+    )
+    for operand, atom_width, tile in (
+        (matmul.lhs, lhs_atom_width, output_m_tile),
+        (matmul.rhs, rhs_atom_width, output_n_tile),
     ):
-        if operand.type.strides[0] == 1 and math.gcd(dimension, tile, 64) < 16:
+        if operand.type.strides[0] == 1 and math.gcd(atom_width, tile, 64) < 16:
             raise ValueError("MN-major WGMMA requires at least 32-byte swizzle atoms")
 
     if batch_output_m_operands and (not tensor_memory or output_m_tile != 128
@@ -526,11 +548,9 @@ def _schedule_matmul(
         if kernel.attrs.get("masked_global_store") and (
             backing.type.rank != 2
             or not isinstance(backing.type.dtype, (BF16Type, F16Type))
-            or cluster_m_ctas != 1
-            or cluster_n_ctas != 1
         ):
             raise ValueError(
-                "masked global output requires unclustered unbatched Half GEMM"
+                "masked global output requires unbatched Half GEMM"
             )
         m_backing, n_backing = backing.type.sizes[-2:]
         if not kernel.attrs.get("masked_global_store") and (
@@ -674,8 +694,8 @@ def _schedule_matmul(
         schedule_tiled_matmul(
             label="mm",
             mma_m_tile=output_m_tile if batch_output_m_operands else None,
-            lhs_smem_block_width=math.gcd(m, 64),
-            rhs_smem_block_width=math.gcd(n, 64),
+            lhs_smem_block_width=lhs_atom_width,
+            rhs_smem_block_width=rhs_atom_width,
             lhs_column_major=matmul.lhs.type.strides[0] == 1,
             rhs_column_major=matmul.rhs.type.strides[0] == 1,
             output_m_tile=output_m_tile*(group_size if batch_output_m_operands else 1),
@@ -705,7 +725,8 @@ def _schedule_matmul(
                 label_filter=group_label,
             )
         )
-    pipeline.add_pass(ScheduleAsync())
+    if not preserve_output_job_order:
+        pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     if tensor_memory and output_m_tile == 192:
         from ..passes.pack_tmem_allocs import PackTmemAllocs
@@ -714,7 +735,15 @@ def _schedule_matmul(
                                        preserve_release_barriers=False))
     if tensor_memory and group_size > 1:
         from ..passes.pack_tmem_allocs import PackTmemAllocs
-        pipeline.add_pass(PackTmemAllocs())
+        pipeline.add_pass(PackTmemAllocs(track_column_regions=grouped_compute_overlap,
+                                       preserve_release_barriers=not grouped_compute_overlap))
+        if grouped_compute_overlap:
+            from ..passes.schedule_native_compute import ScheduleNativeCompute
+            if compute_batches_per_fragment:
+                pipeline.add_pass(UnrollLoop(unroll_factor=None, label_filter=r'k(?:_.*)?'))
+                pipeline.add_pass(Canonicalize())
+            pipeline.add_pass(ScheduleNativeCompute(hoist_compute=True,
+                compute_batches_per_fragment=compute_batches_per_fragment))
     if reuse_tmem_allocation or reuse_completion_locks:
         if not tensor_memory:
             raise ValueError("TMEM allocation reuse requires a Blackwell target")

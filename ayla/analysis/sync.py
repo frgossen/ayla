@@ -9,6 +9,10 @@ from typing import cast
 
 from ..gpu_dialect import (
     SmemTensorType,
+    GmemTensorType,
+    TmaDescType,
+    PredicateOp,
+    ForOp,
     AllocOp,
     OperandPipelineOp,
     PersistentPipelineOp,
@@ -52,8 +56,9 @@ from ..gpu_dialect import (
     lock_is_cluster_scoped,
     execution_issuer_warp,
     execution_warps,
+    effective_operands,
 )
-from ..base.ir import Op, Value, find_ancestor_of_type, iter_ops
+from ..base.ir import Block, Op, Value, find_ancestor_of_type, iter_ops
 from .dataflow import DataflowAnalysis, DataflowState, transfers
 from .index_proofs import uniform_guard_scope
 
@@ -263,6 +268,13 @@ class ConcurrentMemoryEffect:
     # Event reads/parity and software handoff leases retain their own lifetimes.
     completed_by: frozenset[Value] = frozenset()
     path_guards: frozenset[tuple[Value, bool, CollectiveScope]] = frozenset()
+    # Saturate at the largest hardware pending count so loop joins converge.
+    bulk_newer_groups: int = 0
+    # Retain per-lock publication unless whole-queue barrier reuse is opted in.
+    bulk_defer_publication: bool = False
+    # A store's static site and the loop clocks crossed since it issued.
+    bulk_origin: Op | None = None
+    bulk_carried_loops: frozenset[ForOp] = frozenset()
 
 
 @dataclasses.dataclass
@@ -287,6 +299,7 @@ class SyncState(DataflowState):
 
     path_guards: frozenset[tuple[Value, bool, CollectiveScope]] = frozenset()
     unreachable: bool = False
+    single_cta: bool = False
 
     @classmethod
     def empty(cls) -> SyncState:
@@ -349,6 +362,7 @@ class SyncState(DataflowState):
             {lock: self.gather_publications.get(lock, set()) | other.gather_publications.get(lock, set())
              for lock in self.gather_publications.keys() | other.gather_publications.keys()},
             self.path_guards & other.path_guards,
+            single_cta=self.single_cta or other.single_cta,
         )
 
 
@@ -384,7 +398,8 @@ def _after_barrier(
             for effect in effects:
                 observers = effect.visible_to or effect.participant_warps
                 if (effect.pending_await is None and observers is not None and observers <= participant_warps
-                        and effect.scope != CollectiveScope.GRID):
+                        and effect.scope != CollectiveScope.GRID
+                        and (not effect.bulk_defer_publication or isinstance(at, BarrierOp))):
                     visible = participant_warps | {issuer_warp} if barrier in (
                         BarrierScope.BLOCK_TO_LEADER, BarrierScope.CLUSTER_TO_LEADER) else participant_warps
                     effect = dataclasses.replace(effect, visible_to=visible)
@@ -425,6 +440,7 @@ def _after_barrier(
             effect
             for effect in effects
             if effect.pending_await is not None
+            or (effect.bulk_defer_publication and not isinstance(at, BarrierOp))
             or not _barrier_covers(barrier, effect.scope)
             or (reads_only and effect.kind == "W")
         }
@@ -503,6 +519,145 @@ def _await_completion_scope(op: AwaitOp) -> CollectiveScope:
     return CollectiveScope.BLOCK
 
 
+def _bulk_store_issuer(op: Op) -> int | None:
+    if (not isinstance(op, AsyncOp) or op.lock.type.kind != "bulk" or not op.body.ops
+            or not all(isinstance(move, (MoveOp, TmaMoveOp))
+                       and isinstance(move.src.type, SmemTensorType)
+                       and (isinstance(move, TmaMoveOp) and isinstance(move.dst.type, TmaDescType)
+                            or isinstance(move, MoveOp) and move.attrs.get("tma")
+                            and isinstance(move.dst.type, GmemTensorType)) for move in op.body.ops)):
+        return None
+    return execution_issuer_warp(op)
+
+
+def _disjoint_bulk_destinations(prior: ConcurrentMemoryEffect, op: Op, root: Value) -> bool:
+    if prior.lock is None or prior.lock.type.kind != "bulk" or _bulk_store_issuer(op) is None:
+        return False
+    from .tma_store_regions import disjoint_tma_store_groups, disjoint_tma_store_iterations
+
+    if prior.bulk_carried_loops:
+        if prior.bulk_origin is None:
+            return False
+        loop = next(iter(prior.bulk_carried_loops)) if len(prior.bulk_carried_loops) == 1 else None
+        return disjoint_tma_store_iterations(prior.bulk_origin, op, root, loop)
+
+    return any(isinstance(wait, AwaitOp)
+               and disjoint_tma_store_groups(wait, op, root, root) for wait in prior.lock.users())
+
+
+def _bulk_wait_is_cta_uniform(wait: AwaitOp) -> bool:
+    kernel = find_ancestor_of_type(wait, KernelOp)
+    if kernel is None or execution_warps(wait) is not None:
+        return False
+    ancestor = wait.parent_block.parent_op
+    while ancestor is not None and ancestor is not kernel:
+        if isinstance(ancestor, IfOp) and uniform_guard_scope(ancestor.condition, kernel) is None:
+            return False
+        ancestor = ancestor.parent_block.parent_op if ancestor.parent_block is not None else None
+    return True
+
+
+def _bulk_wait_covers_source(wait: AwaitOp, effect: ConcurrentMemoryEffect) -> bool:
+    if _bulk_wait_is_cta_uniform(wait):
+        return True
+    actors = execution_warps(wait)
+    if actors is not None and effect.issuer_warp not in actors:
+        return False
+    kernel = find_ancestor_of_type(wait, KernelOp)
+    if kernel is None or effect.lock is None:
+        return False
+
+    def guards(op):
+        result = set()
+        ancestor = op.parent_block.parent_op
+        while ancestor is not None and ancestor is not kernel:
+            if isinstance(ancestor, IfOp) and uniform_guard_scope(ancestor.condition, kernel) is None:
+                result.add(ancestor.condition)
+            ancestor = ancestor.parent_block.parent_op if ancestor.parent_block is not None else None
+        return result
+
+    def stable(value):
+        definition = value.definition
+        if isinstance(definition, Block):
+            return definition.parent_op is kernel
+        if isinstance(definition, (ThreadIdOp, WarpIdsOp, WarpGroupIdOp, BlockIdOp, ClusterBlockIdsOp)):
+            return True
+        return isinstance(definition, (IndexConstantOp, IndexAddOp, IndexMulOp, IndexDivOp,
+                                       IndexModOp, IndexLtOp, SelectOp, PredicateOp)) and all(
+                                           stable(arg) for arg in definition.operands)
+
+    required = guards(wait)
+    peers = [peer for peer in effect.lock.users() if isinstance(peer, AsyncOp)]
+    return bool(peers) and all(stable(condition) for condition in required) and all(
+        _bulk_store_issuer(peer) == effect.issuer_warp and required <= guards(peer) for peer in peers)
+
+
+def _advance_bulk_source_frontier(op: Op, state: SyncState) -> None:
+    issuer = _bulk_store_issuer(op)
+    if issuer is None:
+        return
+    for root, effects in state.concurrent_memory_effects.items():
+        state.concurrent_memory_effects[root] = {
+            dataclasses.replace(effect, bulk_newer_groups=min(7, effect.bulk_newer_groups + 1))
+            if (effect.kind == "R" and effect.pending_await is not None
+                and effect.lock is not None and effect.lock.type.kind == "bulk"
+                and effect.issuer_warp == issuer) else effect for effect in effects
+        }
+
+
+def _bulk_destination_retired_at_wait(wait: AwaitOp) -> bool:
+    if wait.bulk_read_only:
+        return False
+    if wait.is_full_wait:
+        return True
+    block = wait.parent_block
+    if block is None:
+        return False
+    before = list(block.ops[:block.ops.index(wait)])
+    issues = [i for i, op in enumerate(before) if isinstance(op, AsyncOp) and op.lock is wait.lock]
+    if not issues:
+        return False
+    issue = before[issues[-1]]
+    issuer = _bulk_store_issuer(issue)
+    if issuer is None:
+        return False
+    later = before[issues[-1] + 1:]
+    if any(isinstance(inner, AsyncOp) and inner.lock is wait.lock
+           for op in later if op.blocks for inner in iter_ops(op)):
+        return False
+    return sum(_bulk_store_issuer(op) == issuer for op in later) >= wait.pending_groups
+
+
+def _paired_tmem_release_witness(op: DeallocOp) -> bool:
+    """A prior peer release must follow every TMEM access, including loads."""
+    block = op.parent_block
+    if block is None:
+        return False
+    position = block.ops.index(op)
+    if not position:
+        return False
+    wait = block.ops[position - 1]
+    if not isinstance(wait, BarrierOp):
+        return False
+    if wait.scope == 'cluster' and wait.attrs.get('phase') is None:
+        return True
+    if wait.scope != 'cluster_to_leader' or wait.attrs.get('phase') != 'wait' or wait.sync is None:
+        return False
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None:
+        return False
+    from ..cluster_layout import cluster_size, pair_mask
+    if wait.sync.type.attrs.get('release_cta_masks') != [pair_mask(r) for r in range(cluster_size(kernel))]:
+        return False
+    for prior in reversed(block.ops[:position - 1]):
+        if isinstance(prior, BarrierOp) and prior.sync is wait.sync and prior.attrs.get('phase') == 'arrive':
+            return True
+        # A gather whose arrival precedes a load cannot retire that load.
+        if any(isinstance(value.type, TmemTensorType) for value in effective_operands(prior)):
+            return False
+    return False
+
+
 def _transfer_memory_effects(
     op: Op,
     live: SyncState,
@@ -516,6 +671,11 @@ def _transfer_memory_effects(
     effects = memory_effects(op)
     if effects is None:
         raise NotImplementedError(f"unmodelled effect-bearing op: {type(op).__name__}")
+    if live.single_cta:
+        # An exactly one-CTA launch has no other CTA that can access these
+        # global buffers. Completion is still separate from publication.
+        effects = [dataclasses.replace(effect, scope=CollectiveScope.BLOCK)
+                   if effect.scope == CollectiveScope.GRID else effect for effect in effects]
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
@@ -584,6 +744,23 @@ def _transfer_memory_effects(
                     continue
                 # A hazard needs a write (RAR is safe).
                 if prior.kind == "W" or current.kind == "W":
+                    if (live.single_cta and prior.kind == current.kind == "W"
+                            and _disjoint_bulk_destinations(prior, op, root)):
+                        continue
+                    if (live.single_cta and prior.kind == "W"
+                            and prior.pending_await is not None and prior.lock is not None
+                            and prior.lock.type.kind == "bulk"):
+                        raise ValueError(
+                            "bulk destination use requires destination completion; "
+                            "await with bulk_read_only=False before reading or overwriting it"
+                        )
+                    if (prior.kind == "R" and current.kind == "W"
+                            and prior.pending_await is not None and prior.lock is not None
+                            and prior.lock.type.kind == "bulk"):
+                        raise ValueError(
+                            "bulk source reuse requires source-read completion; "
+                            "a partial wait needs enough newer committed groups"
+                        )
                     actors = current.participant_warps
                     observers = prior.visible_to
                     if (actors is not None and prior.pending_await is None
@@ -655,6 +832,11 @@ def _transfer_memory_effects(
                         publishes |= prior.kind == "W"
                     if scope == BarrierScope.CLUSTER_TO_LEADER:
                         release_after.add(prior.completed_after)
+    if (isinstance(op, DeallocOp) and isinstance(op.value.type, TmemTensorType)
+            and op.value.type.cta_group == 2 and not _paired_tmem_release_witness(op)):
+        # This is an intrinsic obligation even if a local barrier discharged
+        # the ordinary read hazards. Both owners must observe completed loads.
+        barrier_scope = barrier_scope.join(BarrierScope.CLUSTER_TO_LEADER)
     recorded = targets.get(op)
     if recorded is not None:
         barrier_scope = barrier_scope.join(recorded.scope)
@@ -777,8 +959,9 @@ def _transfer_memory_effects(
                 updated.add(prior)
             live.concurrent_memory_effects[root] = updated
     # Defer accesses covered by the mechanism's baseline scope until its await.
-    # Wider effects remain hazards until the actual wait proves completion at
-    # their scope, or a barrier orders them.
+    # Bulk destination writes remain pending even at grid scope: their issuing
+    # thread's full wait proves completion, while publication is separate.
+    # A barrier alone cannot complete such an asynchronous write.
     async_scope = _lock_completion_scope(async_lock) if async_lock is not None else None
     for memory_effect in effects:
         event = async_lock
@@ -794,7 +977,8 @@ def _transfer_memory_effects(
                     or isinstance(memory_effect.value.type, TmemTensorType))
         pending = (
             event
-            if (async_scope is not None and memory_effect.scope.leq(async_scope))
+            if (async_scope is not None and (memory_effect.scope.leq(async_scope)
+                                            or async_lock.type.kind == "bulk"))
             else None
         )
         effect = ConcurrentMemoryEffect(
@@ -805,9 +989,13 @@ def _transfer_memory_effects(
             lock=event,
             completed_by=additional,
             completed_after=None if async_lock is not None else op,
-            issuer_warp=memory_effect.issuer_warp,
+            issuer_warp=(execution_issuer_warp(op) if async_lock is not None
+                         and async_lock.type.kind == "bulk" and memory_effect.kind == "R"
+                         else memory_effect.issuer_warp),
             memory_region=memory_effect.memory_region,
             participant_warps=memory_effect.participant_warps,
+            bulk_origin=(op if async_lock is not None and async_lock.type.kind == "bulk"
+                         and memory_effect.kind == "W" and _bulk_store_issuer(op) is not None else None),
             path_guards=frozenset(fact for fact in live.path_guards if memory_effect.scope.leq(fact[2])),
         )
         for root in memory_effect.roots:
@@ -825,7 +1013,10 @@ def _guard_effect_scope(root, scope):
 
 
 class SyncAnalysis(DataflowAnalysis[SyncState]):
-    def __init__(self) -> None:
+    def __init__(self, *, bulk_source_queue_completion: bool = False) -> None:
+        if type(bulk_source_queue_completion) is not bool:
+            raise ValueError("bulk_source_queue_completion must be a boolean")
+        self.bulk_source_queue_completion = bulk_source_queue_completion
         super().__init__(SyncState, direction=self.Direction.FORWARD)
         self.targets: BarrierTargetsType = {}
         self._guard_scopes = {}
@@ -833,10 +1024,12 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         # proof across effects and loop iterations; this changes no ordering.
         self._ordered_peer_cache: dict[tuple[Value, int], bool] = {}
         self._bank_kernels: dict[KernelOp, bool] = {}
+        self._guaranteed_bulk_groups: dict[IfOp, tuple[AsyncOp, ...]] = {}
 
     def boundary_state(self, op: Op) -> SyncState:
         state = SyncState.empty()
         if isinstance(op, KernelOp):
+            state.single_cta = op.grid_dim == (1, 1, 1) and not op.is_clustered
             self._guard_scopes = {}
             if op.attrs.get('correlate_uniform_guards'):
                 counts = Counter(region.condition for region in iter_ops(op)
@@ -853,6 +1046,18 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         return state
 
     def branch_state(self, op, state, taken):
+        if not taken and not state.unreachable:
+            groups = self._guaranteed_bulk_groups.get(op)
+            if groups is None:
+                groups = self._guaranteed_store_groups(op)
+                self._guaranteed_bulk_groups[op] = groups
+            if groups:
+                # Other warps skip this region, but the issuing warp commits
+                # these groups. Both branch states therefore describe the
+                # same physical source-read queue frontier.
+                state = state.clone()
+                for group in groups:
+                    _advance_bulk_source_frontier(group, state)
         scope=self._guard_scopes.get(op.condition)
         if scope is None:
             return state
@@ -869,6 +1074,33 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
                 for effect in effects if all(v not in facts or facts[v][0]==t for v,t,s in effect.path_guards)}
         return state
 
+    @staticmethod
+    def _guaranteed_store_groups(op):
+        kernel = find_ancestor_of_type(op, KernelOp)
+        # Issuer metadata denotes physical warps in a one-dimensional CTA.
+        if (kernel is None or kernel.is_clustered or kernel.block_dim[1:] != (1, 1)
+                or type(kernel.block_dim[0]) is not int or kernel.block_dim[0] % 32):
+            return ()
+        from .warp_guards import warp_guard_truth
+
+        pure = (IndexConstantOp, IndexAddOp, IndexMulOp, IndexDivOp,
+                IndexModOp, IndexLtOp, TileOp, ReinterpretOp, ReshapeOp)
+        groups = []
+        for inner in op.body.ops:
+            issuer = _bulk_store_issuer(inner)
+            if issuer is None:
+                # Await, nested control, opaque PTX, and optional transfers
+                # need separate execution proofs; never credit them here.
+                if not isinstance(inner, pure):
+                    return ()
+                continue
+            actors = execution_warps(inner)
+            if ((actors is not None and issuer not in actors)
+                    or warp_guard_truth(op.condition, kernel, issuer) is not True):
+                return ()
+            groups.append(inner)
+        return tuple(groups)
+
     def _forget_loop_guards(self,op,state):
         state=state.clone()
         local=set(iter_ops(op))
@@ -878,7 +1110,16 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             state.concurrent_memory_effects[root]={dataclasses.replace(effect,path_guards=outside(effect.path_guards)) for effect in effects}
         return state
 
-    loop_backedge=_forget_loop_guards
+    def loop_backedge(self, op, state):
+        state = self._forget_loop_guards(op, state)
+        local = set(iter_ops(op))
+        for root, effects in state.concurrent_memory_effects.items():
+            state.concurrent_memory_effects[root] = {
+                dataclasses.replace(effect, bulk_carried_loops=effect.bulk_carried_loops | {op})
+                if effect.bulk_origin in local else effect for effect in effects
+            }
+        return state
+
     loop_exit=_forget_loop_guards
 
     @transfers(
@@ -991,6 +1232,8 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
                             and scope.leq(CollectiveScope.BLOCK))
         local_observers = frozenset(range(kernel.num_threads // 32)) if local_completion else frozenset()
         settle = cast(LockType, op.lock.type).kind == "bulk"
+        bulk_destination_retired = settle and _bulk_destination_retired_at_wait(op)
+        bulk_all_queues = settle and _bulk_wait_is_cta_uniform(op)
         if local_completion and settle:
             # A bulk group completes only in its issuing thread's queue.
             local_observers = frozenset(execution_issuer_warp(peer) for peer in op.lock.users()
@@ -1045,13 +1288,39 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
                     remaining.add(dataclasses.replace(effect,
                         visible_to=(effect.visible_to or frozenset()) | frozenset(waiters)))
                     continue
-                if effect.lock != op.lock and op.lock not in effect.completed_by:
+                bulk_source = (settle and effect.kind == "R" and effect.lock is not None
+                               and effect.lock.type.kind == "bulk")
+                if (effect.lock != op.lock and op.lock not in effect.completed_by
+                        and not (bulk_all_queues and bulk_source)):
                     remaining.add(effect)
                     continue
+                if bulk_source and effect.pending_await is not None and (
+                        effect.bulk_newer_groups < op.pending_groups
+                        or not _bulk_wait_covers_source(op, effect)):
+                    remaining.add(effect)
+                    continue
+                if settle and not bulk_destination_retired and effect.kind == "W":
+                    # cp.async.bulk.wait_group.read completes tensor-map and
+                    # source reads only. Neither a drained source queue nor
+                    # a later rendezvous proves destination completion.
+                    # A partial destination wait also needs enough newer
+                    # same-issuer groups to retire this logical group.
+                    remaining.add(effect)
+                    continue
+                completed_after = effect.completed_after or op
+                defer_publication = effect.bulk_defer_publication
+                if bulk_source:
+                    defer_publication = (not self.bulk_source_queue_completion and effect.lock is not op.lock)
+                    if (effect.bulk_defer_publication and not self.bulk_source_queue_completion
+                            and effect.lock is op.lock):
+                        completed_after = op
                 if (waiters is not None or local_completion) and effect.scope.leq(scope):
-                    visibility = (effect.visible_to or frozenset()) | (frozenset(waiters) if waiters is not None else local_observers)
+                    observers = (frozenset({effect.issuer_warp}) if local_completion and bulk_source
+                                 else local_observers)
+                    visibility = (effect.visible_to or frozenset()) | (frozenset(waiters) if waiters is not None else observers)
                     remaining.add(dataclasses.replace(effect, pending_await=None,
-                        completed_after=effect.completed_after or op, visible_to=visibility,
+                        completed_after=completed_after, visible_to=visibility,
+                        bulk_newer_groups=0, bulk_defer_publication=defer_publication,
                         # A paired engine completion acquired in both CTAs
                         # already covers the engine effects at cluster scope.
                         # It publishes only effects named by this generation.
@@ -1063,7 +1332,8 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
                     continue
                 remaining.add(dataclasses.replace(effect,
                     pending_await=None if settle else effect.pending_await,
-                    completed_after=effect.completed_after or op))
+                    bulk_newer_groups=0 if settle else effect.bulk_newer_groups,
+                    bulk_defer_publication=defer_publication, completed_after=completed_after))
             state.concurrent_memory_effects[buffer] = remaining
         if cast(LockType, op.lock.type).is_event:
             observations = [None] if waiters is None else [frozenset({warp}) for warp in waiters]
@@ -1094,6 +1364,7 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
 
     @transfers(AsyncOp)
     def transfer_async(self, op: AsyncOp, state: SyncState) -> SyncState:
+        _advance_bulk_source_frontier(op, state)
         kernel = find_ancestor_of_type(op, KernelOp)
         if kernel is not None and kernel.attrs.get('paired_phase_relay'):
             state = self._relay_paired_phases(op, state, kernel)

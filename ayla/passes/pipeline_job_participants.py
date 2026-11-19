@@ -125,7 +125,12 @@ def schedule_job_participants(result, op):
             label = operation.attrs.get("label", "")
             if label.startswith("last_tmem_read_"):
                 slot = int(label[-1])
-                operation.result().type.attrs["release_warps"] = participants(slot)
+                lock_type = operation.result().type
+                if lock_type.kind == "mbar":
+                    # One local arrival from each warp that reads this slot.
+                    lock_type.attrs["arrivals"] = len(participants(slot))
+                else:
+                    lock_type.attrs["release_warps"] = participants(slot)
         if isinstance(operation, AsyncOp):
             if operation.lock.type.kind == "bulk":
                 assert output_slot is not None

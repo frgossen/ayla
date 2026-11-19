@@ -20,16 +20,22 @@ import math
 from typing import cast
 
 from ..gpu_dialect import (
+    AllocOp,
     AsyncOp,
+    AwaitOp,
     BF16Type,
     F16Type,
     F32Type,
     F64Type,
     GmemTensorType,
+    IfOp,
     IndexAddOp,
     IndexConstantOp,
+    IndexLtOp,
     IndexMulOp,
     KernelOp,
+    LockType,
+    MemTensorType,
     ModuleOp,
     MoveOp,
     ReshapeOp,
@@ -48,6 +54,19 @@ from ..base.lowering_pass import LoweringPass, lowers
 _SWIZZLE_ATOM_BYTES = {"128B": 1024, "64B": 512, "32B": 256}
 
 
+def _tile_origin_aligned(value: Value, axis: int, alignment: int) -> bool:
+    """Prove that each address increment preserves the bulk box alignment."""
+    while isinstance(view := value.definition, (TileOp, ReshapeOp)):
+        if isinstance(view, ReshapeOp):
+            return False
+        assert isinstance(value.type, MemTensorType)
+        step = value.type.sizes[axis]
+        if view.static_indices[axis] != 0 and (step is None or step % alignment):
+            return False
+        value = view.arg
+    return True
+
+
 class LowerToTmaMove(LoweringPass):
     @lowers(MoveOp)
     def lower_move(
@@ -57,13 +76,17 @@ class LowerToTmaMove(LoweringPass):
         if not op.attrs.get("tma"):
             return None
         # A global column count that is not divisible by the SMEM atom
-        # remains a flat tensor. Store each SMEM atom in one dense box.
-        if isinstance(op.src.type, SmemTensorType) and isinstance(
+        # remains a flat tensor. Transfer each SMEM atom in one dense box.
+        is_load = isinstance(op.src.type, GmemTensorType) and isinstance(
+            op.dst.type, SmemTensorType
+        )
+        is_store = isinstance(op.src.type, SmemTensorType) and isinstance(
             op.dst.type, GmemTensorType
-        ):
-            smem = cast(Value, self.value_map[op.src])
+        )
+        if is_load or is_store:
+            smem = cast(Value, self.value_map[op.dst if is_load else op.src])
             layout = smem.type.attrs.get("physical_layout")
-            root = op.dst
+            root = op.src if is_load else op.dst
             while isinstance(root.definition, (TileOp, ReshapeOp)):
                 root = root.definition.arg
             # Split along the physical contiguous axis. A transposed output
@@ -73,13 +96,50 @@ class LowerToTmaMove(LoweringPass):
             columns = root.type.sizes[axis]
             width = layout.get("block_width") if layout else None
             tile_columns = smem.type.sizes[axis]
+            smem_root = smem
+            while isinstance(smem_root.definition, (TileOp, ReshapeOp)):
+                smem_root = smem_root.definition.arg
+            outer_axis = -1 if axis == -2 else -2
+            cropped_blocks = (
+                layout is not None and layout.get("order", "row_major") == "block_major"
+                and smem_root.type.sizes[outer_axis] != smem.type.sizes[outer_axis]
+            )
             if (
                 isinstance(width, int)
                 and isinstance(columns, int)
-                and columns % width
+                and (columns % width or cropped_blocks)
                 and tile_columns > width
             ):
+                # Cropping the rows leaves gaps between physical K blocks.
+                # One dense box per block preserves those root-buffer gaps.
                 assert tile_columns % width == 0
+                interior = columns // width * width
+                if (is_store and interior and not cropped_blocks
+                        and _tile_origin_aligned(op.dst, axis, tile_columns)):
+                    # One blocked transfer covers every complete global atom.
+                    # The cropped descriptor discards the incomplete atom;
+                    # only the boundary CTA issues its dense tail transfer.
+                    index_ops, main = self._materialize(
+                        op, interior_extent=interior
+                    )
+                    part = (interior % tile_columns) // width
+                    typ = clone_type(smem.type)
+                    typ.sizes = list(typ.sizes)
+                    typ.sizes[axis] = width
+                    indices = [0] * typ.rank
+                    indices[axis] = part
+                    tile = TileOp.build(smem, indices, typ)
+                    tail_indices, tail = self._materialize(
+                        op, smem=tile.result(),
+                        row_offset=part * width if axis == -2 else 0,
+                        column_offset=part * width if axis == -1 else 0,
+                    )
+                    boundary = IndexConstantOp.build(interior - 1)
+                    condition = IndexLtOp.build(boundary.result(), tail.indices[-1])
+                    return [
+                        *index_ops, main, tile, *tail_indices, boundary, condition,
+                        IfOp.build(condition.result(), Block(ops=[tail])),
+                    ], []
                 new_ops = []
                 for part in range(tile_columns // width):
                     typ = clone_type(smem.type)
@@ -94,6 +154,20 @@ class LowerToTmaMove(LoweringPass):
                         column_offset=part * width if axis == -1 else 0,
                     )
                     new_ops += [tile, *index_ops, move]
+                if cropped_blocks and find_ancestor_of_type(op, AsyncOp) is None:
+                    # The physical pieces retain the authored transfer's one
+                    # completion boundary and one bulk-store commit group.
+                    lock = AllocOp.build_with_fresh_id(LockType.build(
+                        kind="mbar" if is_load else "bulk"))
+                    transfers = [piece for piece in new_ops if isinstance(piece, TmaMoveOp)]
+                    preparation = [piece for piece in new_ops if not isinstance(piece, TmaMoveOp)]
+                    label = op.attrs.get("label")
+                    return [*preparation, lock, AsyncOp.build(
+                        lock.result(), collective=op.collective,
+                        body=Block(ops=transfers),
+                        attrs={"label": f"{label}_async"} if label is not None else None),
+                        AwaitOp.build(lock.result(), attrs={"label": f"{label}_await"}
+                                      if label is not None else None)], []
                 return new_ops, []
         slices = _multicast_slices(op, cast(Value, self.value_map[op.dst]))
         if slices == 1:
@@ -146,6 +220,7 @@ class LowerToTmaMove(LoweringPass):
         smem: Value | None = None,
         row_offset: int = 0,
         column_offset: int = 0,
+        interior_extent: int | None = None,
     ) -> tuple[list[Op], TmaMoveOp]:
         """Build the descriptor + index ops and a sync ``tma_move`` for ``move``.
 
@@ -199,9 +274,9 @@ class LowerToTmaMove(LoweringPass):
             desc_attrs["physical_layout"] = layout
         gmem_type = root.type
         if transpose:
-            # A transposed view of a row-major tensor: describe the tensor
-            # itself, so the box and coordinates use its dimension order.
-            # Rank-N batch views transpose only their two matrix dimensions.
+            # Describe the underlying row-major tensor, preserving its row
+            # pitch and batch strides. Swap only the two matrix dimensions
+            # and their coordinates, including for padded transpose views.
             if not is_column_major(smem.type):
                 raise ValueError(
                     "lower_to_tma_move: a column-major gmem view needs a "
@@ -212,13 +287,13 @@ class LowerToTmaMove(LoweringPass):
             sizes[-2], sizes[-1] = sizes[-1], sizes[-2]
             indices[-2], indices[-1] = indices[-1], indices[-2]
             tile_shape[-2], tile_shape[-1] = tile_shape[-1], tile_shape[-2]
-            gmem_type = GmemTensorType.build(sizes, gmem_type.dtype)
             expected_strides = [strides[i] for i in [*range(len(strides) - 2), -1, -2]]
-            if list(gmem_type.strides) != expected_strides:
-                raise ValueError(
-                    "lower_to_tma_move: column-major view must be a dense "
-                    f"transpose; got {root.type}"
-                )
+            gmem_type = GmemTensorType.build(sizes, gmem_type.dtype,
+                                            strides=expected_strides)
+        if interior_extent is not None:
+            gmem_type = clone_type(gmem_type)
+            gmem_type.sizes = [*gmem_type.sizes[:-1], interior_extent]
+            desc_attrs["global_extent"] = interior_extent
         # One SMEM swizzle atom is a dense 2-D box. Describe the original
         # global tensor when its last dimension cannot be blocked exactly.
         if layout is not None:

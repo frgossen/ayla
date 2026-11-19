@@ -29,7 +29,7 @@ class RingInput:
     tile_count: int
 
     @classmethod
-    def from_module(cls, module):
+    def from_module(cls, module, *, allow_single_job=False):
         kernels = find_ops_of_type(module, KernelOp)
         if module.target != "sm_100a" or len(kernels) != 1:
             raise ValueError("shared ring requires one SM100 kernel")
@@ -62,7 +62,7 @@ class RingInput:
         m, n = kernel.body.arguments[-1].type.sizes
         tiles = math.ceil(m / (m_tile * group)) * group * math.ceil(n / n_tile)
         grid = kernel.grid_dim[0]
-        if grid is None or not 0 < grid <= tiles // 2 or grid % group:
+        if grid is None or not 0 < grid <= (tiles if allow_single_job else tiles // 2) or grid % group:
             raise ValueError("shared ring requires at least two output jobs per CTA")
         return cls(kernel, loop, allocation, group, grid, tiles)
 
@@ -74,10 +74,27 @@ class RingSchedule:
     fragments: int
     overlap: bool
     job_regions: bool = False
+    output_writeback_window: tuple[int, int] | None = None
+    mma_queue_depth: int = 1
+
+    def __post_init__(self):
+        if type(self.mma_queue_depth) is not int or not 1 <= self.mma_queue_depth < self.depth:
+            raise ValueError("MMA queue depth must fit below the operand bank count")
+        window = self.output_writeback_window
+        if window is not None and (
+            not isinstance(window, (tuple, list)) or len(window) != 2
+            or any(type(x) is not int for x in window)
+            or not 0 <= window[0] < window[1] <= self.steps
+        ):
+            raise ValueError('writeback window must bound nonempty K stages within this job')
+
+    @property
+    def writeback_bounds(self):
+        return self.output_writeback_window or (0, self.steps)
 
     @property
     def prefetch_lead(self):
-        return self.depth - 1
+        return self.depth - self.mma_queue_depth
 
     @property
     def period(self):
@@ -92,14 +109,19 @@ class RingSchedule:
         )
 
     def fragments_at(self, k):
+        start, stop = self.writeback_bounds
+        width = stop - start
+        before = min(max(k - start, 0), width)
+        after = min(max(k + 1 - start, 0), width)
         return range(
-            k * self.fragments // self.steps, (k + 1) * self.fragments // self.steps
+            before * self.fragments // width, after * self.fragments // width
         )
 
     @property
     def fragment_steps(self):
+        start, stop = self.writeback_bounds
         return tuple(
-            math.ceil((i + 1) * self.steps / self.fragments) - 1
+            start + math.ceil((i + 1) * (stop - start) / self.fragments) - 1
             for i in range(self.fragments)
         )
 

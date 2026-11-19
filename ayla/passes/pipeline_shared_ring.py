@@ -69,29 +69,34 @@ class PipelineSharedRing(Pass):
     """
 
     def __init__(self, *, operand_stages: int, overlap: bool = True,
-                 rolled_operand_pipeline=False, job_regions=False, mma_queue_depth=1):
+                 rolled_operand_pipeline=False, job_regions=False, mma_queue_depth=1,
+                 output_writeback_window=None, frames=2):
         if type(operand_stages) is not int or operand_stages < 2:
             raise ValueError("shared ring requires at least two operand banks")
-        if rolled_operand_pipeline and (type(mma_queue_depth) is not int or mma_queue_depth != 1):
-            raise ValueError("rolled shared rings support one queued MMA batch")
+        if rolled_operand_pipeline and (type(mma_queue_depth) is not int or not 1 <= mma_queue_depth < operand_stages):
+            raise ValueError("rolled MMA queue depth must fit below the operand bank count")
         if job_regions and not rolled_operand_pipeline:
             raise ValueError("job regions require a rolled shared ring")
+        if type(frames) is not int or frames not in (1, 2) or frames == 1 and (not rolled_operand_pipeline or overlap or job_regions):
+            raise ValueError("one frame requires a serial rolled ring without job regions")
         super().__init__(operand_stages=operand_stages, overlap=overlap,
                          rolled_operand_pipeline=rolled_operand_pipeline,
-                         job_regions=job_regions, mma_queue_depth=mma_queue_depth)
+                         job_regions=job_regions, mma_queue_depth=mma_queue_depth,
+                         output_writeback_window=output_writeback_window, frames=frames)
 
     def run(self, module: ModuleOp) -> ModuleOp:
         if not self.rolled_operand_pipeline:
             module = Canonicalize().run(
                 UnrollLoop(None, label_filter=r"k(?:_.*)?").run(module)
             )
-        context = RingInput.from_module(module)
+        context = RingInput.from_module(module, allow_single_job=self.rolled_operand_pipeline)
         if self.rolled_operand_pipeline:
             from .pipeline_rolled_shared_ring import prepare_rolled_ring
 
             return prepare_rolled_ring(module, context, operand_stages=self.operand_stages,
                                        overlap=self.overlap, job_regions=self.job_regions,
-                                       mma_queue_depth=self.mma_queue_depth)
+                                       mma_queue_depth=self.mma_queue_depth,
+                                       output_writeback_window=self.output_writeback_window, frames=self.frames)
         return self._run_static(module, context)
 
     def _run_static(self, module, context):
@@ -190,7 +195,8 @@ class PipelineSharedRing(Pass):
         if any(len(roots) != len(storage_banks[0]) for roots in storage_banks):
             raise ValueError("shared ring banks must have matching operand roles")
         fragments = tma_writeback_fragments(body, TmemTensorType)
-        schedule = RingSchedule(banks, steps, len(fragments), self.overlap)
+        schedule = RingSchedule(banks, steps, len(fragments), self.overlap,
+                                output_writeback_window=self.output_writeback_window)
         period = schedule.period
         reads = [fragment[0] for fragment in fragments]
         accepted = {

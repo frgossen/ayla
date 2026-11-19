@@ -71,7 +71,10 @@ class HoistMmaDescriptors(Pass):
 class PtxLoweringPipeline(Pipeline):
     """Lowers a high-level ModuleOp down to a PTX-template ModuleOp."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, bulk_source_queue_completion: bool = False,
+                 prefetch_tmem_reads: bool = False) -> None:
+        if type(prefetch_tmem_reads) is not bool:
+            raise ValueError("prefetch_tmem_reads must be a boolean")
         super().__init__()
         self.add_instrumentation_pass(
             VerifyGpuDialect(VerificationStage.PTX_LOWERING)
@@ -79,7 +82,11 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToTmaMove())
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
-        self.add_pass(InsertSyncs())
+        self.add_pass(InsertSyncs(bulk_source_queue_completion=bulk_source_queue_completion))
+        if prefetch_tmem_reads:
+            from .passes.prefetch_tmem_reads import PrefetchTmemReads
+
+            self.add_pass(PrefetchTmemReads())
         self.add_pass(ReuseSmemAllocs())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(HoistMmaDescriptors())
@@ -318,13 +325,47 @@ def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
     )  # type: ignore[return-value]
 
 
-def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
+def _pack_static_shared_declarations(ptx: str) -> str:
+    """Preserve allocations and instructions while reducing alignment padding."""
+    lines = ptx.splitlines()
+    pattern = re.compile(r"^\s*\.shared\s+\.align\s+(\d+)\s+\.b(8|16|32|64)\s+([A-Za-z_$][\w$]*)\[(\d+)\];\s*$")
+    declarations, remaining = [], []
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            alignment, width, name, count = int(match[1]), int(match[2]), match[3], int(match[4])
+            if alignment < 1 or alignment & (alignment - 1) or count < 1:
+                raise ValueError("invalid static shared allocation for packing")
+            declarations.append((alignment, width // 8 * count, name, line.strip()))
+        else:
+            if re.match(r"^\s*(?:\.extern\s+)?\.shared\b", line):
+                raise ValueError("shared packing requires known static array declarations")
+            remaining.append(line)
+    if not declarations:
+        return ptx
+    if len({d[2] for d in declarations}) != len(declarations) or len(re.findall(r"\.entry\s", ptx)) != 1 or re.search(r"\.func\b", ptx):
+        raise ValueError("shared packing requires one kernel and unique shared symbols")
+    packed = sorted(declarations, key=lambda d: -d[0])
+    def footprint(items):
+        end = 0
+        for alignment, size, _, _ in items:
+            end = (end + alignment - 1) // alignment * alignment + size
+        return end
+    if footprint(packed) >= footprint(declarations):
+        return ptx
+    insertion = next(i for i, line in enumerate(remaining) if line.strip() == "{") + 1
+    return "\n".join(remaining[:insertion] + ["  " + d[3] for d in packed] + remaining[insertion:]) + "\n"
+
+
+def make_ptx_kernel(module: ModuleOp, *, bulk_source_queue_completion: bool = False,
+                    prefetch_tmem_reads: bool = False) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
     top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    module = PtxLoweringPipeline().run(module)
+    module = PtxLoweringPipeline(bulk_source_queue_completion=bulk_source_queue_completion,
+                                 prefetch_tmem_reads=prefetch_tmem_reads).run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
@@ -343,8 +384,11 @@ def make_ptx_kernel(module: ModuleOp) -> PtxKernel:
     )
     p = PtxPrinter()
     _emit_module(p, module, block_dim, cluster_dim)
+    ptx = p.render()
+    if kernel.attrs.get("rolled_shared_ring") and kernel.attrs.get("persistent_output_slots") == 1:
+        ptx = _pack_static_shared_declarations(ptx)
     return PtxKernel(
-        ptx=p.render(),
+        ptx=ptx,
         name=kernel.name,
         signature=kernel.signature,
         grid_dim=grid_dim,

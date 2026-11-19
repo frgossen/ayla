@@ -17,15 +17,19 @@ the ops that define its operands.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 from typing import cast
 
 from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
     AwaitOp,
+    DeallocOp,
     GmemTensorType,
     RegMemTensorType,
+    TmaDescType,
     TmaMoveOp,
+    TmemTensorType,
     effective_operands,
     has_ordering_effect,
     is_side_effect_free,
@@ -41,20 +45,24 @@ from ..gpu_dialect import (
     SmemTensorType,
     TileOp,
     ForOp,
+    IfOp,
 )
-from ..base.ir import dependency_slice, Block, Op, Value
+from ..base.ir import dependency_slice, Block, Op, Value, iter_ops
 from ..base.pipeline import Pass
 
 
 def _is_async_move(op: Op) -> bool:
     """The hoistable subset of async starts: data movement, not compute.
 
-    Covers a TMA descriptor move and an ``async`` wrapping only moves; an
+    Covers a TMA descriptor move and an ``async`` wrapping only moves,
+    including descriptor moves produced by ``LowerToTmaMove``; an
     ``async`` wrapping a matmul is tracked as a lock peer but never hoisted.
     """
     if isinstance(op, TmaMoveOp):
         return True
-    return isinstance(op, AsyncOp) and all(isinstance(o, MoveOp) for o in op.body.ops)
+    return isinstance(op, AsyncOp) and all(
+        isinstance(o, (MoveOp, TmaMoveOp)) for o in op.body.ops
+    )
 
 
 def _is_register_load(op: Op) -> bool:
@@ -63,6 +71,14 @@ def _is_register_load(op: Op) -> bool:
         and isinstance(op.src.type, GmemTensorType)
         and isinstance(op.dst.type, RegMemTensorType)
     )
+
+
+def _is_guarded_async_move(op: Op) -> bool:
+    if isinstance(op, IfOp):
+        return any(_is_guarded_async_move(inner) for inner in op.body.ops) and all(
+            _is_guarded_async_move(inner) or is_side_effect_free(inner) for inner in op.body.ops
+        )
+    return _is_async_move(op)
 
 
 def _is_await(op: Op) -> bool:
@@ -112,7 +128,11 @@ def _disjoint_store_views(a: Value, b: Value) -> bool:
         return result
 
     first, second = boxes(a), boxes(b)
+    from ..analysis.memory_regions import has_nonoverlapping_gmem_layout
+
     for ancestor in first.keys() & second.keys():
+        if not has_nonoverlapping_gmem_layout(ancestor.type):
+            continue
         if any(x + xs <= y or y + ys <= x
                for (x, xs), (y, ys) in zip(first[ancestor], second[ancestor])):
             return True
@@ -121,9 +141,12 @@ def _disjoint_store_views(a: Value, b: Value) -> bool:
 
 def _bulk_issue(op: Op) -> bool:
     return (isinstance(op, AsyncOp) and op.lock.type.kind == 'bulk'
-            and bool(op.body.ops) and all(isinstance(m, MoveOp)
-                and m.attrs.get('tma') and isinstance(m.src.type, SmemTensorType)
-                and isinstance(m.dst.type, GmemTensorType) for m in op.body.ops))
+            and bool(op.body.ops) and all(
+                isinstance(m, (MoveOp, TmaMoveOp)) and isinstance(m.src.type, SmemTensorType)
+                and (isinstance(m, MoveOp) and m.attrs.get('tma')
+                     and isinstance(m.dst.type, GmemTensorType)
+                     or isinstance(m, TmaMoveOp) and isinstance(m.dst.type, TmaDescType))
+                for m in op.body.ops))
 
 
 def _can_swap(upper: Op, lower: Op, effect_roots=_effect_roots, effects=memory_effects,
@@ -170,8 +193,12 @@ def _can_swap(upper: Op, lower: Op, effect_roots=_effect_roots, effects=memory_e
             for b in lower_effects:
                 if ((a.kind == 'W' or b.kind == 'W') and a.roots & b.roots & conflicts
                         and memory_effects_may_alias(a, b)):
-                    if bulk_peers and a.kind == b.kind == 'W' and _disjoint_store_views(a.value, b.value):
-                        continue
+                    if bulk_peers and a.kind == b.kind == 'W':
+                        from ..analysis.tma_store_regions import disjoint_tma_store_groups
+
+                        if (_disjoint_store_views(a.value, b.value)
+                                or disjoint_tma_store_groups(wait, issue, a.value, b.value)):
+                            continue
                     return False
 
     return True
@@ -203,6 +230,8 @@ def _bubble(
     targets: list[Op],
     *,
     step: int,
+    preserve_move_order: bool = False,
+    preserve_relative_order: Callable[[Op], bool] | None = None,
 ) -> None:
     """Bubble each target through its neighbours as far as `_can_swap` allows.
 
@@ -222,27 +251,46 @@ def _bubble(
         j = next(i for i, o in enumerate(ops) if o is op)
         while 0 <= j + step < len(ops):
             lo, hi = sorted((j, j + step))
+            if preserve_move_order and _is_async_move(ops[lo]) and _is_async_move(ops[hi]):
+                break
+            if preserve_relative_order is not None and preserve_relative_order(ops[lo]) and preserve_relative_order(ops[hi]):
+                break
             if not _can_swap(ops[lo], ops[hi], effect_roots):
                 break
             ops[j], ops[j + step] = ops[j + step], ops[j]
             j += step
 
 
-def _hoist_async_moves(ops: list[Op]) -> None:
+def _hoist_async_moves(ops: list[Op], *, preserve_issue_order: bool = False,
+                       guarded_moves: bool = False) -> None:
     # Targets: the register loads, then the async moves (matmuls are tracked as
     # lock peers but never moved), each with the side-effect-free dependency
     # cone feeding it. Then hoist each up. The async moves go second, so they
     # issue ahead of any register load they can pass.
-    for is_target in (_is_register_load, _is_async_move):
+    move_target = _is_guarded_async_move if guarded_moves else _is_async_move
+    for is_target in (_is_register_load, move_target):
         targets = _side_effect_free_operand_closure(
             [op for op in ops if is_target(op)], ops
         )
-        _bubble(ops, targets, step=-1)
+        # Independent moves otherwise pass earlier targets and reverse their
+        # issue order. Keeping their incoming order can prioritize the first
+        # K consumer in a fully resident short reduction. This preference may
+        # limit another prefetch, so it is opt-in rather than a legality rule.
+        _bubble(ops, targets, step=-1,
+                preserve_move_order=preserve_issue_order and is_target is move_target)
     # Each move now sits just below its own allocations, between the others'.
-    # An allocation without an initializer has no operands, so move those back
-    # to the front, in order: lock initializations then stay together, and one
-    # barrier publishes them all.
-    allocations = [op for op in ops if isinstance(op, AllocOp)]
+    # Ordinary allocations return to the front so one barrier publishes their
+    # lock initializations. TMEM allocation is a finite hardware resource:
+    # moving a later allocation ahead of an earlier deallocation can deadlock.
+    allocations = []
+    released_tmem = False
+    for op in ops:
+        released_tmem |= any(isinstance(inner, DeallocOp)
+                             and isinstance(inner.value.type, TmemTensorType)
+                             for inner in iter_ops(op))
+        if (isinstance(op, AllocOp)
+                and not (released_tmem and isinstance(op.result().type, TmemTensorType))):
+            allocations.append(op)
     ops[:] = allocations + [op for op in ops if op not in set(allocations)]
 
 
@@ -407,9 +455,21 @@ def _group_async_computes(ops: list[Op], group_size: int) -> None:
 
 
 class ScheduleAsync(Pass):
+    preserve_prefetch_issue_order: bool
+
     def __init__(self, *, pipeline_compute: bool = False,
                  store_pending_groups: int = 0, compute_issue_group_size: int = 1,
-                 mma_queue_depth: int = 1) -> None:
+                 mma_queue_depth: int = 1,
+                 preserve_prefetch_issue_order: bool = False,
+                 guarded_moves: bool = False,
+                 group_scalar_shared_operands: bool = False,
+                 prefetch_with_queues: bool = False) -> None:
+        if type(preserve_prefetch_issue_order) is not bool:
+            raise ValueError('preserve_prefetch_issue_order must be a boolean')
+        if type(group_scalar_shared_operands) is not bool:
+            raise ValueError('group_scalar_shared_operands must be a boolean')
+        if type(prefetch_with_queues) is not bool:
+            raise ValueError('prefetch_with_queues must be a boolean')
         if type(mma_queue_depth) is not int or mma_queue_depth < 1:
             raise ValueError('MMA queue depth must be a positive integer')
         if mma_queue_depth > 1 and not pipeline_compute:
@@ -421,9 +481,16 @@ class ScheduleAsync(Pass):
         super().__init__(pipeline_compute=pipeline_compute,
                          store_pending_groups=store_pending_groups,
                          compute_issue_group_size=compute_issue_group_size,
-                         mma_queue_depth=mma_queue_depth)
+                         mma_queue_depth=mma_queue_depth,
+                         preserve_prefetch_issue_order=preserve_prefetch_issue_order,
+                         guarded_moves=guarded_moves,
+                         group_scalar_shared_operands=group_scalar_shared_operands,
+                         prefetch_with_queues=prefetch_with_queues)
 
     def run_block(self, block: Block) -> None:
+        if self.group_scalar_shared_operands:
+            from .pack_scalar_operands import pack_scalar_operand_block
+            pack_scalar_operand_block(block)
         # Reorder a plain list: every write to ``block.ops`` re-syncs the whole
         # block, which makes bubbling through it cubic.
         ops = list(block.ops)
@@ -431,21 +498,28 @@ class ScheduleAsync(Pass):
         while parent is not None and not isinstance(parent,KernelOp):
             parent = parent.parent_block.parent_op if parent.parent_block is not None else None
         reverse = bool(parent is not None and parent.attrs.get('reverse_await_sinking'))
+        preserve = self.preserve_prefetch_issue_order or bool(
+            parent is not None and parent.attrs.get('preserve_prefetch_issue_order'))
         queue_only = (self.store_pending_groups or self.compute_issue_group_size > 1) and not self.pipeline_compute
         if queue_only:
-            pass  # Preserve the base schedule for an explicit queue preference.
+            # Queue preferences normally preserve the incoming schedule.
+            # Opt-in prefetch can hide TMA latency across rolled compute, but
+            # also changes issue priority and liveness in existing schedules.
+            if self.prefetch_with_queues:
+                _hoist_async_moves(ops, preserve_issue_order=preserve, guarded_moves=self.guarded_moves)
+                _sink_awaits(ops, reverse=reverse)
         elif self.pipeline_compute:
             # Queue MMA by delaying completion, preserving issue/readiness
             # order. Then refill each released bank as early as possible.
             # Hoisting compute instead can postpone a refill behind a TMA
             # readiness wait and collapse the operand prefetch window.
             _sink_awaits(ops, reverse=reverse)
-            _hoist_async_moves(ops)
+            _hoist_async_moves(ops, preserve_issue_order=preserve, guarded_moves=self.guarded_moves)
             if self.mma_queue_depth > 1:
                 _queue_mma_completions(ops, self.mma_queue_depth,
                                        carried=isinstance(block.parent_op, ForOp))
         else:
-            _hoist_async_moves(ops)
+            _hoist_async_moves(ops, preserve_issue_order=preserve, guarded_moves=self.guarded_moves)
             _sink_awaits(ops, reverse=reverse)
         if self.store_pending_groups:
             _queue_bulk_waits(ops, self.store_pending_groups)

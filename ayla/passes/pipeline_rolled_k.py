@@ -20,6 +20,7 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
+    IndexMulOp,
     IndexType,
     LockType,
     LockViewOp,
@@ -98,6 +99,10 @@ class PipelineRolledK(LoweringPass):
         super().__init__(depth=depth, label=label)
 
     def run(self, module):
+        if module.body.ops[0].attrs.get("compact_output_pipeline"):
+            from .peel_loop import PeelLoop
+
+            module = PeelLoop(self.label, back_iterations=1).run(module)
         for loop in list(find_ops_of_type(module, ForOp)):
             if loop.attrs.get("label") != self.label:
                 continue
@@ -157,6 +162,39 @@ class PipelineRolledK(LoweringPass):
             banks.append((root, view.result()))
         region = OperandPipelineOp.build(op, self.depth)
         region.operands = [view for _, view in banks]
+        if op.parent_block is not None:
+            parent = op.parent_block.parent_op
+            while parent is not None and not (
+                isinstance(parent, ForOp) and parent.attrs.get("label") != self.label
+            ):
+                parent = parent.parent_block.parent_op if parent.parent_block else None
+            if parent is not None:
+                kernel = parent
+                while kernel.parent_block and kernel.parent_block.parent_op:
+                    kernel = kernel.parent_block.parent_op
+                    if hasattr(kernel, "num_threads"):
+                        break
+                if kernel.attrs.get("compact_output_pipeline"):
+                    group = mma.lock.type.attrs.get("cta_group", 1)
+                    ready = AllocOp.build_with_fresh_id(
+                        LockType.build(
+                            "mbar", {"count": self.depth, "cta_group": group}
+                        ),
+                        attrs={"label": "operand_bank_ready"},
+                    )
+                    free = AllocOp.build_with_fresh_id(
+                        LockType.build(
+                            "tcgen05", {"count": self.depth, "cta_group": group}
+                        ),
+                        attrs={"label": "operand_bank_release"},
+                    )
+                    kernel.body.ops[0:0] = [
+                        ready,
+                        free,
+                        BarrierOp.build("cluster" if group == 2 else "block"),
+                    ]
+                    region.operands.extend([parent.iv, ready.result(), free.result()])
+                    region.attrs["carried_events"] = True
         return [region], []
 
 
@@ -168,16 +206,21 @@ class LowerRolledK(LoweringPass):
         group = mma.lock.type.attrs.get("cta_group", 1)
         load_issuer = execution_issuer_warp(load)
         mma_issuer = execution_issuer_warp(mma)
-        ready = AllocOp.build_with_fresh_id(
-            LockType.build("mbar", {"count": depth, "cta_group": group})
-        )
-        free = AllocOp.build_with_fresh_id(
-            LockType.build("tcgen05", {
-                **mma.lock.type.attrs, "count": depth, "cta_group": group,
-            })
-        )
-        ready_value, free_value = ready.result(), free.result()
-        banks = op.operands
+        carried = op.attrs.get("carried_events", False)
+        if carried:
+            job, ready_value, free_value = op.operands[-3:]
+            banks = op.operands[:-3]
+        else:
+            ready = AllocOp.build_with_fresh_id(
+                LockType.build("mbar", {"count": depth, "cta_group": group})
+            )
+            free = AllocOp.build_with_fresh_id(
+                LockType.build("tcgen05", {
+                    **mma.lock.type.attrs, "count": depth, "cta_group": group,
+                })
+            )
+            ready_value, free_value = ready.result(), free.result()
+            banks = op.operands
         from ..base.ir import find_ancestor_of_type
         from ..gpu_dialect import KernelOp
         kernel = find_ancestor_of_type(op, KernelOp)
@@ -199,6 +242,39 @@ class LowerRolledK(LoweringPass):
             phase = IndexModOp.build(epoch.result(), two.result())
             bank = IndexModOp.build(logical, span.result())
             ops.extend([span, shift, epoch_index, epoch, two, phase, bank])
+            if carried:
+                # Each bank has its own number of generations per job. K need
+                # not be divisible by depth, so a single job phase is unsound.
+                neg = IndexConstantOp.build(-1)
+                neg_bank = IndexMulOp.build(bank.result(), neg.result())
+                first = IndexConstantOp.build(lb - 1 + depth)
+                last = IndexConstantOp.build(ub - 1 + depth)
+                first_n = IndexAddOp.build(first.result(), neg_bank.result())
+                last_n = IndexAddOp.build(last.result(), neg_bank.result())
+                first_q = IndexDivOp.build(first_n.result(), span.result())
+                last_q = IndexDivOp.build(last_n.result(), span.result())
+                minus_first = IndexMulOp.build(first_q.result(), neg.result())
+                count = IndexAddOp.build(last_q.result(), minus_first.result())
+                offset = IndexMulOp.build(job, count.result())
+                full_epoch = IndexAddOp.build(epoch.result(), offset.result())
+                phase = IndexModOp.build(full_epoch.result(), two.result())
+                ops.extend(
+                    [
+                        neg,
+                        neg_bank,
+                        first,
+                        last,
+                        first_n,
+                        last_n,
+                        first_q,
+                        last_q,
+                        minus_first,
+                        count,
+                        offset,
+                        full_epoch,
+                        phase,
+                    ]
+                )
             view = LockViewOp.build(arena, bank.result(), phase.result())
             ops.append(view)
             return view.result()
@@ -287,6 +363,12 @@ class LowerRolledK(LoweringPass):
         refill.append(IfOp.build(reused.result(), Block(ops=reuse_ops)))
         iteration(future.result(), load, ready_value, refill)
         body.append(IfOp.build(active.result(), Block(ops=refill)))
+        if kernel is not None and kernel.attrs.get("rolled_refill_before_compute", False):
+            # Earlier TMA issue can hide cold operand latency, but observing
+            # the previous bank before MMA limits outstanding compute batches.
+            # Keep this measured ordering choice explicitly opt-in.
+            mma_at = next(i for i, item in enumerate(body) if isinstance(item, AsyncOp))
+            body = body[mma_at + 1 :] + body[: mma_at + 1]
         main = ForOp.build(
             lb=lb,
             ub=ub,
@@ -300,10 +382,12 @@ class LowerRolledK(LoweringPass):
         done = event(free_value, last.result(), tail)
         # Same-issuer TCGEN operations are ordered. The final event covers
         # every preceding batch, and the collective publishes it to readers.
-        if kernel is not None and kernel.attrs.get('cluster_bank_pipeline'):
+        if carried or kernel is not None and kernel.attrs.get('cluster_bank_pipeline'):
             # The final engine completion does not order delivery of every
-            # preceding multicast notification. Drain each bank's final
-            # generation before its counters can be reinitialized or freed.
+            # preceding multicast notification. Carried events additionally
+            # require a successful wait on every phase before another arrival
+            # on that event, even when the final MMA already covers its data.
+            # Observe each bank's final generation before the next job.
             drain_iv = Value(name=None, type=IndexType())
             drain_ops = []
             drain_event = event(free_value, drain_iv, drain_ops)
@@ -319,7 +403,7 @@ class LowerRolledK(LoweringPass):
                 [AwaitOp.build(done, {"waiter_warps": [mma_issuer]}), BarrierOp.build(scope)]
             )
         return [
-            ready, free, BarrierOp.build(scope),
+            *([] if carried else [ready, free, BarrierOp.build(scope)]),
             fill,
             main,
             *tail,

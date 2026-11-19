@@ -942,8 +942,6 @@ class PromoteBuffers(LoweringPass):
         warps = self.warps or 4
         ownership = TmemWarpLayout(rows, warps, src_type.cta_group)
         layout = self.layout or ("tcgen05_16x256b" if ownership.paired_m64 else _tmem_fragment_layout(dst))
-        if ownership.paired_m64 and layout != "tcgen05_16x256b":
-            raise ValueError("paired M64 writeback requires tcgen05_16x256b")
         if self.layout is None and ownership.rows_per_warp == 16 and layout == "tcgen05_32x32b":
             layout = "tcgen05_16x256b"
         if self.layout is None and cols % (TMEM_FRAGMENT_LAYOUTS[layout].columns * ownership.column_groups):

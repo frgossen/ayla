@@ -7,6 +7,7 @@ from typing import cast
 from ..analysis.sync import (
     _RELAXABLE_RENDEZVOUS,
     BarrierScope,
+    BarrierTarget,
     BarrierTargetsType,
     SyncAnalysis,
 )
@@ -20,8 +21,9 @@ from ..gpu_dialect import (
     BarrierOp,
     KernelOp,
     LockType,
-    ModuleOp,
     TmemTensorType,
+    ModuleOp,
+    IfOp,
     effective_operands,
     execution_issuer_warp,
     lock_is_cluster_scoped,
@@ -37,6 +39,27 @@ _BARRIER_OP_SCOPE: dict[BarrierScope, str] = {
     BarrierScope.LEADER_TO_CLUSTER: "leader_to_cluster",
     BarrierScope.CLUSTER: "cluster",
 }
+
+
+def _verify_cta_publication_control(op: Op, target: BarrierTarget) -> None:
+    """A generated whole-CTA rendezvous needs CTA-uniform control."""
+    if (target.scope not in (BarrierScope.BLOCK, BarrierScope.BLOCK_TO_LEADER,
+                            BarrierScope.LEADER_TO_BLOCK)
+            or target.participant_warps is not None):
+        return
+    kernel = find_ancestor_of_type(op, KernelOp)
+    if kernel is None:
+        return
+    from ..analysis.index_proofs import uniform_guard_scope
+
+    ancestor = op.parent_block.parent_op
+    while ancestor is not None and ancestor is not kernel:
+        if isinstance(ancestor, IfOp) and uniform_guard_scope(ancestor.condition, kernel) is None:
+            raise ValueError(
+                "memory handoff requires CTA-uniform publication; "
+                "place a block barrier before the divergent consumer region"
+            )
+        ancestor = ancestor.parent_block.parent_op if ancestor.parent_block is not None else None
 
 
 def _insert_barriers(
@@ -56,6 +79,8 @@ def _insert_barriers(
     published = 0
     for op in block.ops:
         target = targets.get(op)
+        if target is not None and target.scope != BarrierScope.THREAD:
+            _verify_cta_publication_control(op, target)
         if pending_locks and (
             (target is not None and target.scope != BarrierScope.THREAD)
             or not pending_locks.isdisjoint(effective_operands(op))
@@ -170,6 +195,11 @@ def _materialize_gather_mbars(
         if not is_block and isinstance(op, AsyncOp) and op.lock.type.kind == 'tcgen05' and op.lock.type.cta_group == 2:
             from ..cluster_layout import cluster_size, pair_mask
             masks = tuple(pair_mask(r) for r in range(cluster_size(kernel)))
+        if not is_block and isinstance(op, DeallocOp) and isinstance(op.value.type, TmemTensorType) and op.value.type.cta_group == 2:
+            from ..cluster_layout import cluster_size, pair_mask
+            # Each pair retires its own TMEM allocation; unrelated K pairs
+            # must not participate in its release event.
+            masks = tuple(pair_mask(r) for r in range(cluster_size(kernel)))
         if not is_block and isinstance(op, AsyncOp) and op.lock.type.kind == 'mbar':
             from ..cluster_layout import cluster_size
             from ..gpu_dialect import TmaMoveOp, MoveOp
@@ -239,6 +269,10 @@ def drop_vacuous_publications(block: Block) -> None:
 
 
 class InsertSyncs(Pass):
+    def __init__(self, *, bulk_source_queue_completion: bool = False) -> None:
+        if type(bulk_source_queue_completion) is not bool:
+            raise ValueError("bulk_source_queue_completion must be a boolean")
+        super().__init__(bulk_source_queue_completion=bulk_source_queue_completion)
 
     def run(self, module: ModuleOp) -> ModuleOp:
         # Initialize each completion event at its issuing warp. Publication
@@ -260,7 +294,8 @@ class InsertSyncs(Pass):
             raise ValueError('named gathers require a reusable TMEM allocation')
         if backend == 'mbar':
             kernel.attrs['block_gather_backend'] = backend
-        analysis = SyncAnalysis()
+        analysis = (SyncAnalysis(bulk_source_queue_completion=True)
+                    if self.bulk_source_queue_completion else SyncAnalysis())
         analysis.analyze(module)
         barrier_syncs = _materialize_gather_mbars(kernel, analysis.targets)
         # Subset rendezvous must not reuse an ID held by an asynchronous
@@ -277,33 +312,34 @@ class InsertSyncs(Pass):
             module.body, analysis.targets, kernel.num_threads, barrier_syncs, participant_ids,
         )
         allocs = find_ops_of_type(kernel, AllocOp)
-        if (not kernel.is_clustered and any(isinstance(a.result().type, TmemTensorType) for a in allocs)
-                or kernel.attrs.get('block_gather_backend') == 'mbar' or kernel.attrs.get('reuse_completion_locks')
-                or any(a.attrs.get('issuer_warp', 0) for a in allocs)):
-            retirements: dict[Block, list[DeallocOp]] = {}
-            for alloc in allocs:
-                lock = alloc.result()
-                users = lock.users()
-                if (not isinstance(lock.type, LockType) or not lock.type.is_event
-                        or find_ancestor(alloc, lambda parent: isinstance(parent, ForOp)
-                                         and parent.trip_count > 1) is None
-                        or not any(isinstance(user, AsyncOp) for user in users)
-                        or any(isinstance(user, DeallocOp) for user in users)):
-                    continue
-                block = alloc.parent_block
-                assert block is not None and block.parent_op is not None
-                if any(find_ancestor(user, lambda parent: parent is block.parent_op) is None for user in users):
-                    raise ValueError('a repeated completion lock cannot escape its allocation scope')
-                release = DeallocOp.build(lock)
-                if issuer := execution_issuer_warp(alloc):
-                    release.attrs['issuer_warp'] = issuer
-                retirements.setdefault(block, []).append(release)
-            for block, releases in retirements.items():
-                # All observers and asynchronous producers must retire before
-                # an owner invalidates an event that the next iteration resets.
-                if not isinstance(block.ops[-1], BarrierOp) or block.ops[-1].scope != 'block':
-                    block.ops.append(BarrierOp.build(attrs={'completion_lifetime_release': True}))
-                block.ops.extend(releases)
+        retirements: dict[Block, list[DeallocOp]] = {}
+        retirement_scopes: dict[Block, BarrierScope] = {}
+        for alloc in allocs:
+            lock = alloc.result()
+            users = lock.users()
+            if (not isinstance(lock.type, LockType) or not lock.type.is_event
+                    or find_ancestor(alloc, lambda parent: isinstance(parent, ForOp)
+                                     and parent.trip_count > 1) is None
+                    or not any(isinstance(user, AsyncOp) for user in users)
+                    or any(isinstance(user, DeallocOp) for user in users)):
+                continue
+            block = alloc.parent_block
+            assert block is not None and block.parent_op is not None
+            if any(find_ancestor(user, lambda parent: parent is block.parent_op) is None for user in users):
+                raise ValueError('a repeated completion lock cannot escape its allocation scope')
+            release = DeallocOp.build(lock)
+            if issuer := execution_issuer_warp(alloc):
+                release.attrs['issuer_warp'] = issuer
+            retirements.setdefault(block, []).append(release)
+            retirement_scopes[block] = retirement_scopes.get(block, BarrierScope.THREAD).join(_lock_init_barrier(alloc))
+        for block, releases in retirements.items():
+            # All observers and asynchronous producers must retire before
+            # an owner invalidates an event that the next iteration resets.
+            if not isinstance(block.ops[-1], BarrierOp) or block.ops[-1].scope != 'block':
+                block.ops.append(BarrierOp.build(attrs={'completion_lifetime_release': True}))
+            if retirement_scopes[block] == BarrierScope.CLUSTER:
+                block.ops.append(BarrierOp.build("cluster", attrs={"completion_lifetime_release": True}))
+            block.ops.extend(releases)
         return module
 
 

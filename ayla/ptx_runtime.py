@@ -13,6 +13,7 @@ side-effects out.
 """
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import tempfile
@@ -25,6 +26,7 @@ from torch.utils.cpp_extension import load_inline
 
 from .gpu_dialect import GmemTensorType, TmaDescType, physical_layout
 from .ptx_codegen import PtxKernel
+from .torch_custom_call import to_torch_dtype
 
 
 
@@ -89,6 +91,13 @@ static uintptr_t module_get_function(
     CUfunction fn = nullptr;
     CU_CHECK(cuModuleGetFunction(&fn, mod, name.c_str()));
     return reinterpret_cast<uintptr_t>(fn);
+}
+
+static void function_allow_nonportable_cluster(uintptr_t function_handle) {
+    auto fn = reinterpret_cast<CUfunction>(function_handle);
+    CU_CHECK(cuFuncSetAttribute(
+        fn, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1
+    ));
 }
 
 static CUtensorMapL2promotion parse_l2_promotion(
@@ -291,6 +300,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ptx"), py::arg("optimization_level") = -1);
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
+    m.def("function_allow_nonportable_cluster", &function_allow_nonportable_cluster);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -309,6 +319,8 @@ class _LauncherExtension(Protocol):
     def module_unload(self, module: int) -> None: ...
 
     def module_get_function(self, module: int, name: str) -> int: ...
+
+    def function_allow_nonportable_cluster(self, function: int) -> None: ...
 
     def launch_kernel(
         self,
@@ -368,6 +380,11 @@ class PtxLauncher:
     JIT-compiling the PTX. Calling the instance with tensors performs all
     required host-side setup and issues the launch on the current torch CUDA
     stream.
+
+    Tensor arguments must match the declared shape, strides and dtype.
+    Collapsed broadcast/singleton storage and exact transposed coordinate
+    views are normalized without copying. Descriptors are checked again
+    after transpose and interior-extent preparation.
     """
 
     def __init__(
@@ -400,9 +417,23 @@ class PtxLauncher:
                 self._optimization_level
                 if self._optimization_level is not None else -1,
             )
-            self._function = self._ext.module_get_function(
-                self._module, self._kernel.name,
-            )
+            try:
+                function = self._ext.module_get_function(
+                    self._module, self._kernel.name,
+                )
+                cluster = self._kernel.cluster_dim
+                if cluster is not None and math.prod(cluster) > 8:
+                    self._ext.function_allow_nonportable_cluster(function)
+                self._function = function
+            except BaseException:
+                # A failed opt-in must not leave a callable, partially loaded
+                # function behind for the next call.
+                try:
+                    self._ext.module_unload(self._module)
+                finally:
+                    self._module = None
+                    self._function = None
+                raise
 
     @property
     def name(self):
@@ -413,11 +444,11 @@ class PtxLauncher:
         return self._kernel.signature
 
     def __call__(self, *tensors) -> None:
+        params = self._build_params(tensors)
+        self._assert_params(params)
         self.ensure_loaded()
         assert self._ext is not None
         assert self._function is not None
-        params = self._build_params(tensors)
-        self._assert_params(params)
         self._ext.launch_kernel(
             self._function,
             self._kernel.grid_dim,
@@ -426,20 +457,99 @@ class PtxLauncher:
             self._kernel.shared_mem_bytes,
         )
 
+    @staticmethod
+    def _tensor_for_type(tensor, typ, label):
+        """Preserve the declared address map, including collapsed broadcasts.
+
+        A pointer-only broadcast argument may supply just its nonbroadcast
+        storage axes. Exact transposed coordinate representations also share
+        the declared address map. Other shape/stride mismatches cannot be
+        used to build descriptors or satisfy compiler region proofs.
+        """
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{label}: expected Tensor, got {type(tensor)}")
+        expected_dtype = to_torch_dtype(typ.dtype)
+        if tensor.dtype != expected_dtype:
+            raise ValueError(f"{label}: expected dtype {expected_dtype}, got {tensor.dtype}")
+        sizes, strides = tuple(typ.sizes), tuple(typ.strides)
+        if len(sizes) != len(strides):
+            raise ValueError(f"{label}: malformed declared layout {sizes}, {strides}")
+        if tuple(tensor.shape) == sizes and tensor.stride() == strides:
+            return tensor
+
+        def matches(view, expected_sizes, expected_strides):
+            return (view.ndim == len(expected_sizes)
+                    and all(size is None or actual == size for actual, size in zip(view.shape, expected_sizes))
+                    and all(size == 1 or stride is None or actual == stride
+                            for size, actual, stride in zip(view.shape, view.stride(), expected_strides)))
+
+        for transpose in (False, True) if tensor.ndim >= 2 else (False,):
+            view = tensor.transpose(-1, -2) if transpose else tensor
+            if matches(view, sizes, strides):
+                resolved = tuple(actual if expected is None else expected
+                                 for actual, expected in zip(view.stride(), strides))
+                return view if view.stride() == resolved else view.as_strided(view.shape, resolved)
+
+        active = [axis for axis, (size, stride) in enumerate(zip(sizes, strides)) if size != 1 and stride != 0]
+        reduced = tensor
+        if tensor.ndim == len(sizes):
+            for axis in reversed(range(len(sizes))):
+                if axis not in active:
+                    if (tensor.shape[axis] != 1 and not
+                            (strides[axis] == 0 and tensor.stride(axis) == 0
+                             and (sizes[axis] is None or tensor.shape[axis] == sizes[axis]))):
+                        break
+                    reduced = reduced.select(axis, 0)
+        if matches(reduced, [sizes[axis] for axis in active], [strides[axis] for axis in active]):
+            shape = list(sizes)
+            resolved = list(strides)
+            for index, axis in enumerate(active):
+                if shape[axis] is None:
+                    shape[axis] = reduced.shape[index]
+                if resolved[axis] is None:
+                    resolved[axis] = reduced.stride(index)
+            if all(size is not None for size in shape):
+                return tensor.as_strided(shape, [0 if stride is None else stride for stride in resolved])
+        raise ValueError(f"{label}: tensor layout {tuple(tensor.shape)}, {tensor.stride()} "
+                         f"does not match declared layout {sizes}, {strides}")
+
     def _build_params(self, tensors):
+        if len(tensors) != len(self._arg_to_tensor):
+            raise ValueError(f"{self.name}: expected {len(self._arg_to_tensor)} tensors, got {len(tensors)}")
+        arguments = {i: self._tensor_for_type(tensors[index], self._kernel.signature[i], f"arg {i}")
+                     for i, index in self._arg_to_tensor.items()}
         params = []
         for i, typ in enumerate(self._kernel.signature):
             if isinstance(typ, GmemTensorType):
-                params.append(tensors[self._arg_to_tensor[i]])
+                params.append(arguments[i])
             elif isinstance(typ, TmaDescType):
                 layout = physical_layout(typ)
                 block_width, block_order = (
                     (0, "row_major") if layout is None else layout
                 )
-                tensor = tensors[self._arg_to_tensor[typ.arg_idx]]
+                if typ.arg_idx not in arguments:
+                    raise ValueError(f"param {i}: TMA descriptor does not reference a global argument")
+                tensor = arguments[typ.arg_idx]
+                extent = typ.attrs.get("global_extent")
+                if extent is not None and (type(extent) is not int or extent <= 0):
+                    raise ValueError("invalid TMA interior extent")
                 if (tensor.ndim >= 2 and tensor.stride(-1) != 1
-                        and tensor.stride(-2) == 1 and typ.gmem_type.is_canonical_strides):
-                    tensor = tensor.transpose(-1, -2)
+                        and tensor.stride(-2) == 1):
+                    transposed = tensor.transpose(-1, -2)
+                    shape_matches = tuple(transposed.shape) == tuple(typ.gmem_type.sizes)
+                    if extent is not None:
+                        shape_matches = (
+                            tuple(transposed.shape[:-1]) == tuple(typ.gmem_type.sizes[:-1])
+                            and transposed.shape[-1] >= extent
+                        )
+                    if (shape_matches
+                            and tuple(transposed.stride()) == tuple(typ.gmem_type.strides)):
+                        tensor = transposed
+                if extent is not None:
+                    if not tensor.ndim or not extent <= tensor.shape[-1]:
+                        raise ValueError("invalid TMA interior extent")
+                    tensor = tensor.narrow(-1, 0, extent)
+                tensor = self._tensor_for_type(tensor, typ.gmem_type, f"TMA param {i}")
                 params.append((
                     tensor,
                     list(typ.tile_sizes),

@@ -417,6 +417,15 @@ def _lower_mul_register_batches(
     return _lower_mul_registers(dst_regs, lhs_regs, rhs_regs, dtype)
 
 
+def _lower_add_register_batches(op, dst_regs, src_regs):
+    if any(not isinstance(cast(MemTensorType, value.type).dtype, F32Type)
+           for value in op.operands):
+        raise NotImplementedError("elementwise add currently requires FP32 registers")
+    lhs, rhs = src_regs
+    return "".join(f"add.f32 {dst}, {a}, {b};\n"
+                   for dst, a, b in zip(dst_regs, lhs, rhs, strict=True))
+
+
 def _lower_silu_registers(
     op: ElementwiseOp,
     dst_regs: list[str],
@@ -441,6 +450,7 @@ def _lower_silu_registers(
 
 
 _ELEMENTWISE_LOWERERS = {
+    "add": partial(_lower_elementwise_in_batches, lower_registers=_lower_add_register_batches),
     "convert": _lower_convert_elementwise_ptx,
     "fill": _lower_fill_ptx,
     "mul": partial(
@@ -694,6 +704,14 @@ def _group_issuer_regions(block, warp_index=None) -> None:
     must reach, and values used after the run stay outside it.
     """
 
+    owner = block.parent_op
+    kernel = owner if isinstance(owner, KernelOp) else (
+        find_ancestor_of_type(owner, KernelOp) if owner is not None else None)
+    if kernel is not None and kernel.block_dim[1:] != (1, 1):
+        # Participant regions use the x warp index. A tid.x guard alone
+        # cannot select one physical warp in a multidimensional CTA.
+        return
+
     for wait in block.ops:
         # A CTA barrier right after a wait already publishes what the wait
         # observed, so the issuer alone can wait on an mbarrier phase while
@@ -802,9 +820,10 @@ class LowerToPtxTemplate(LoweringPass):
         if module.body.ops[0].attrs.get("rolled_shared_ring"):
             from .pipeline_rolled_shared_ring import PrepareRolledSharedRing
 
-            # Keep expansion private to lowering: participant ownership is
-            # verified at the compact completed-region boundary.
             module = PrepareRolledSharedRing().run(module)
+            from .verify_gpu_dialect import verify_expanded_gpu_hardware
+
+            verify_expanded_gpu_hardware(module)
         return super().run(module)
 
     def lower_block(self, block) -> None:
@@ -898,8 +917,10 @@ class LowerToPtxTemplate(LoweringPass):
         finally:
             self._lowering.pop()
         actors = execution_warps(op)
+        # A larger enclosing region still contains threads outside this
+        # operation's participant set; retain the child's narrower guard.
         if actors is None or isinstance(op, (AsyncOp, AwaitOp, IfOp)) or find_ancestor(
-                op, lambda a: isinstance(a, IfOp) and actors <= (execution_warps(a) or frozenset())):
+                op, lambda a: isinstance(a, IfOp) and actors == execution_warps(a)):
             # Engine issuers and awaits already have dedicated guards. Await
             # parity must advance for nonparticipants too.
             return result
@@ -980,12 +1001,12 @@ class LowerToPtxTemplate(LoweringPass):
         rows_per_warp = ownership.rows_per_warp
         layout = "tcgen05_32x32b" if rows_per_warp == 32 else "tcgen05_16x256b"
         assert self.warp_ids is not None, "lower_kernel creates warp_ids"
-        return _lowered(
+        return self._physical_fragment_coordinates(op, _lowered(
             op, _tmem_fragment_ptx("operand.dst.ptr", ownership, layout, columns,
                                    ["${f32:operand.src.r0}"] * (rows_per_warp * ownership.columns_per_warp(columns) // 32),
                                    is_load=False),
             [cast(Value, self.value_map[op.dst]), cast(Value, self.value_map[op.src(0)]), self.warp_ids.x],
-            ["dst", "src", "warp"])
+            ["dst", "src", "warp"]))
 
     def _lower_move_tmem_fragment(self, op: MoveOp) -> tuple[list[Op], list[object]]:
         """Load a register fragment from tensor memory, or store one to it.
@@ -1028,7 +1049,8 @@ class LowerToPtxTemplate(LoweringPass):
         registers. Adjacent lanes may share a row. The same vector stores
         handle global memory and blocked, swizzled shared memory.
         """
-        fragment, memory = op.src, op.dst
+        is_load = isinstance(op.dst.type, WgrmemTensorType)
+        fragment, memory = (op.dst, op.src) if is_load else (op.src, op.dst)
         fragment_type, memory_type = fragment.type, memory.type
         assert isinstance(fragment_type, WgrmemTensorType)
         kernel = find_ancestor_of_type(op, KernelOp)
@@ -1050,10 +1072,13 @@ class LowerToPtxTemplate(LoweringPass):
         packing = 1 if f32 else 2
         count = fragment_type.num_elements_per_thread // packing
         geometry = TMEM_FRAGMENT_LAYOUTS[fragment_type.layout]
-        ownership = TmemWarpLayout(cast(int, fragment_type.sizes[0]), fragment_type.warps)
+        ownership = TmemWarpLayout(cast(int, fragment_type.sizes[0]), fragment_type.warps,
+                                   fragment_type.attrs.get("tmem_cta_group", 1))
         rows_per_warp = ownership.rows_per_warp
         # Validate the logical row coverage before emitting any accesses.
         accesses = list(geometry.accesses(ownership.columns_per_warp(cast(int, fragment_type.sizes[1])), rows_per_warp))
+        if any(first % packing or size % packing for _, _, first, size, _ in accesses):
+            raise NotImplementedError("row fragment Half copies require complete register pairs")
         registers = [
             f"${{{'f32' if f32 else 'b32'}:operand.fragment.r{i}}}" for i in range(count)
         ]
@@ -1073,6 +1098,10 @@ class LowerToPtxTemplate(LoweringPass):
             """)
         else:
             template += "mov.u32 ${b32:column_bytes}, 0;\n"
+        if ownership.paired_m64:
+            # Partitions 2/3 repeat partitions 0/1's logical rows in the
+            # second column half. Eight warps then add their 16-row half.
+            template += "and.b32 ${b32:row}, ${b32:row}, 63;\n"
         if ownership.group_row_stride:
             template += textwrap.dedent(f"""\
                 mov.u32 ${{b32:row_group}}, %tid.x;
@@ -1081,11 +1110,16 @@ class LowerToPtxTemplate(LoweringPass):
             """)
         group_columns = ownership.group_column_stride(cast(int, fragment_type.sizes[1]))
         if group_columns:
-            template += "mov.u32 ${b32:column_group}, %tid.x;\nshr.u32 ${b32:column_group}, ${b32:column_group}, 7;\n"
+            template += "mov.u32 ${b32:column_group}, %tid.x;\n"
+            template += f"shr.u32 ${{b32:column_group}}, ${{b32:column_group}}, {6 if ownership.paired_m64 else 7};\n"
+            if ownership.paired_m64:
+                template += "and.b32 ${b32:column_group}, ${b32:column_group}, 1;\n"
         global_memory = isinstance(memory_type, GmemTensorType)
         if group_columns and global_memory:
             template += f"mad.lo.u32 ${{b32:column_bytes}}, ${{b32:column_group}}, {group_columns * dtype_bytes}, ${{b32:column_bytes}};\n"
-        masked = global_memory and kernel is not None and kernel.attrs.get("masked_global_store")
+        if is_load and not (global_memory and memory_type.strides[0] == 0):
+            raise NotImplementedError("row fragment loads currently require a broadcast row bias")
+        masked = not is_load and global_memory and kernel is not None and kernel.attrs.get("masked_global_store")
         index_ops, origins = [], []
         if masked:
             if f32:
@@ -1142,15 +1176,15 @@ class LowerToPtxTemplate(LoweringPass):
                     group_static = _block_major_offset(row, column + group_columns, block_width, root_rows) * dtype_bytes
                     group_setup = f"mad.lo.u32 ${{b32:offset}}, ${{b32:column_group}}, {group_static - static}, ${{b32:offset}};\n"
                 swizzle = (
-                    _swizzle_ptx("offset", "offset_swizzle", alignment)
+                    _swizzle_ptx("address", "offset_swizzle", int(memory_type.swizzle[:-1]))
                     if memory_type.swizzle is not None
                     else ""
                 )
                 return (
                     f"add.u32 ${{b32:offset}}, ${{b32:row_offset}}, {static};\n"
-                    + group_setup + swizzle
+                    + group_setup
                     + "add.u32 ${b32:address}, ${b32:operand.memory.ptr}, "
-                    "${b32:offset};\n"
+                    "${b32:offset};\n" + swizzle
                 ), "[${b32:address}]"
 
         space = "global" if global_memory else "shared"
@@ -1166,12 +1200,70 @@ class LowerToPtxTemplate(LoweringPass):
                 and.pred ${{pred:complete}}, ${{pred:complete}}, ${{pred:aligned}};
                 @!${{pred:complete}} bra ${{label:fragment_edge}};
             """)
-        for row, column, first, size, _ in accesses:
-            for start, width in _vector_groups(size // packing, alignment):
-                setup, location = address(row, column + start * packing)
-                begin = first // packing + start
-                vector, regs = _vector_operand(registers[begin : begin + width])
-                template += setup + f"st.{space}{vector}.b32 {location}, {regs};\n"
+        # A row pitch limits vector widths, but does not establish the
+        # alignment of a global pointer or an interior shared-memory view.
+        # Check the actual per-thread base when allocation/view provenance
+        # cannot prove it. Copy atoms and swizzles preserve these low bits.
+        vector_alignment = math.gcd(16, max(4, alignment) if alignment else 16)
+        for row, column, _, _, _ in accesses:
+            offset = (row * alignment + column * dtype_bytes if layout is None else
+                      _block_major_offset(row, column, block_width, root_rows) * dtype_bytes)
+            vector_alignment = math.gcd(vector_alignment, offset)
+
+        def copy_body(bytes_aligned: int) -> str:
+            body = ""
+            for row, column, first, size, _ in accesses:
+                if bytes_aligned >= 4:
+                    for start, width in _vector_groups(size // packing, bytes_aligned):
+                        setup, location = address(row, column + start * packing)
+                        begin = first // packing + start
+                        vector, regs = _vector_operand(registers[begin : begin + width])
+                        body += setup + (f"ld.{space}{vector}.b32 {regs}, {location};\n" if is_load
+                                         else f"st.{space}{vector}.b32 {location}, {regs};\n")
+                else:
+                    assert not f32
+                    for start in range(size // packing):
+                        reg = registers[first // packing + start]
+                        lo, hi = "${b16:copy_lo}", "${b16:copy_hi}"
+                        if not is_load:
+                            body += f"mov.b32 {{{lo}, {hi}}}, {reg};\n"
+                        for half, half_reg in enumerate((lo, hi)):
+                            setup, location = address(row, column + start * packing + half)
+                            body += setup + (f"ld.{space}.b16 {half_reg}, {location};\n" if is_load
+                                             else f"st.{space}.b16 {location}, {half_reg};\n")
+                        if is_load:
+                            body += f"mov.b32 {reg}, {{{lo}, {hi}}};\n"
+            return body
+
+        guaranteed = dtype_bytes if global_memory else _row_fragment_shared_alignment(memory)
+        if not global_memory and guaranteed and guaranteed < dtype_bytes:
+            raise NotImplementedError("row fragment copies require element-aligned shared views")
+        if not global_memory and guaranteed:
+            guaranteed = math.gcd(guaranteed, alignment,
+                geometry.registers * dtype_bytes if geometry.lanes != 32 else 0,
+                group_columns * dtype_bytes)
+        minimum = max(dtype_bytes, guaranteed)
+        if masked:
+            minimum = max(4, minimum)  # The complete-tile path already checked this.
+        maximum = max(4 * width for _, _, _, size, _ in accesses
+                      for _, width in _vector_groups(size // packing, max(4, vector_alignment)))
+        candidates = [width for width in (16, 8, 4) if minimum < width <= min(maximum, vector_alignment)]
+        if not global_memory and guaranteed:
+            candidates = []  # A known interior shared view uses its proven width.
+        for width in candidates:
+            setup, location = address(0, 0)
+            pointer = location[1:-1].removesuffix("+0")
+            bits = 64 if global_memory else 32
+            template += setup + (
+                f"and.b{bits} ${{b{bits}:copy_alignment}}, {pointer}, {width - 1};\n"
+                f"setp.eq.u{bits} ${{pred:copy_aligned}}, ${{b{bits}:copy_alignment}}, 0;\n"
+                f"@!${{pred:copy_aligned}} bra ${{label:copy_below_{width}}};\n"
+                + copy_body(width)
+                + f"bra ${{label:copy_done}};\n${{label:copy_below_{width}}}:\n"
+            )
+        template += copy_body(min(vector_alignment, minimum))
+        if candidates:
+            template += "${label:copy_done}:\n"
         if masked:
             template += textwrap.dedent("""\
                 bra ${label:fragment_end};
@@ -1392,6 +1484,17 @@ class LowerToPtxTemplate(LoweringPass):
         inner_dim = 0 if is_column_major(view_root_type) else 1
         outer_rows = view_root_type.sizes[1 - inner_dim]
 
+        if layout is not None and layout[1] == "block_major":
+            block_width, _ = layout
+            parent_type = op.arg.type
+            assert isinstance(parent_type, SmemTensorType)
+            if (not _block_aligned_view(op.arg, block_width, inner_dim)
+                    or (result_sizes[inner_dim] % block_width
+                        and not isinstance(op.indices[inner_dim], int))):
+                lowered, results = self._lower_block_major_subtile(
+                    op, ptr, view_root, block_width, inner_dim, dtype_bytes)
+                return [*new_ops, *lowered], results
+
         # Accumulate byte offset for each dimension.
         zero = IndexConstantOp.build(0)
         new_ops.append(zero)
@@ -1453,6 +1556,58 @@ class LowerToPtxTemplate(LoweringPass):
         ptr_add = PtrAddOp.build(ptr, byte_offset)
         new_ops.append(ptr_add)
         return new_ops, [ptr_add.result()]
+
+    def _lower_block_major_subtile(
+        self,
+        op: TileOp,
+        parent: Value,
+        root: Value,
+        block_width: int,
+        inner_dim: int,
+        dtype_bytes: int,
+    ) -> tuple[list[Op], list[object]]:
+        """Compose a sub-block view in logical coordinates, then map it back.
+
+        Shared tile pointers carry physical, unswizzled offsets. Adding a
+        logical column offset directly loses the carry between K blocks.
+        """
+        root_type = root.type
+        assert isinstance(root_type, SmemTensorType) and root_type.rank == 2
+        rows = root_type.sizes[1 - inner_dim]
+        operands = [parent, cast(Value, self.value_map[root])]
+        names = ["parent", "root"]
+        template = (
+            "{\n.reg .b32 tile_element, tile_inner, tile_row, tile_column, tile_block;\n"
+            "sub.u32 tile_element, ${b32:operand.parent.ptr}, ${b32:operand.root.ptr};\n"
+            + _constant_divmod_ptx("div", "tile_element", "tile_element", dtype_bytes)
+            + _constant_divmod_ptx("rem", "tile_inner", "tile_element", block_width)
+            + _constant_divmod_ptx("div", "tile_element", "tile_element", block_width)
+            + _constant_divmod_ptx("rem", "tile_row", "tile_element", rows)
+            + _constant_divmod_ptx("div", "tile_block", "tile_element", rows)
+            + f"mad.lo.u32 tile_column, tile_block, {block_width}, tile_inner;\n"
+        )
+        for dim, index in enumerate(op.indices):
+            coordinate = "tile_column" if dim == inner_dim else "tile_row"
+            extent = op.result().type.sizes[dim]
+            if isinstance(index, int):
+                if index:
+                    template += f"add.u32 {coordinate}, {coordinate}, {index * extent};\n"
+            else:
+                name = f"index{dim}"
+                operands.append(cast(Value, self.value_map[index]))
+                names.append(name)
+                template += f"mad.lo.u32 {coordinate}, ${{b32:operand.{name}.val}}, {extent}, {coordinate};\n"
+        template += (
+            _constant_divmod_ptx("div", "tile_block", "tile_column", block_width)
+            + _constant_divmod_ptx("rem", "tile_inner", "tile_column", block_width)
+            + f"mad.lo.u32 tile_element, tile_block, {rows}, tile_row;\n"
+            f"mad.lo.u32 tile_element, tile_element, {block_width}, tile_inner;\n"
+            f"mad.lo.u32 ${{b32:result.dst.ptr}}, tile_element, {dtype_bytes}, ${{b32:operand.root.ptr}};\n"
+            "}\n"
+        )
+        lowered, results = _lowered(op, template, operands, names, [PtrType.build("smem")])
+        lowered[0].attrs["pure"] = True
+        return lowered, results
 
     @lowers(AllocOp)
     def lower_alloc(
@@ -1517,6 +1672,9 @@ class LowerToPtxTemplate(LoweringPass):
 
         _cse_block(body, {})
         DCE().run_block(body)
+        from .verify_gpu_dialect import verify_expanded_gpu_hardware
+
+        verify_expanded_gpu_hardware(op)
         # Kernel-level issuer grouping ran before this semantic region was
         # expanded. Group its new loops now so other warps skip the whole
         # issuer run instead of traversing every bank's arithmetic and guards.
@@ -1863,6 +2021,21 @@ class LowerToPtxTemplate(LoweringPass):
         op: AsyncOp,
     ) -> tuple[list[Op], list[object]]:
         body_ops = op.body.ops
+        if op.lock.type.kind == "bulk" and body_ops:
+            stores = []
+            conditions = []
+            for inner in body_ops:
+                if isinstance(inner, TmaMoveOp):
+                    stores.append(inner)
+                    conditions.append(None)
+                elif (isinstance(inner, IfOp) and len(inner.body.ops) == 1
+                      and isinstance(inner.body.ops[0], TmaMoveOp)):
+                    stores.append(inner.body.ops[0])
+                    conditions.append(inner.condition)
+                else:
+                    break
+            else:
+                return self._lower_async_tma_stores(stores, conditions)
         tmas = [body_op for body_op in body_ops if isinstance(body_op, TmaMoveOp)]
         if body_ops and len(tmas) == len(body_ops):
             lock_type = op.lock.type
@@ -2082,8 +2255,12 @@ class LowerToPtxTemplate(LoweringPass):
         desc_template = ""
         mma_template = ""
         kernel = find_ancestor_of_type(op, KernelOp)
-        compact_mma = (tcgen05 and cta_group == 2 and len(mms) >= 8
-                       and all(mm.dst.type.sizes[0] == 64 for mm in mms))
+        compact_mma = tcgen05 and (
+            (cta_group == 2 and len(mms) >= 8
+             and all(mm.dst.type.sizes[0] == 64 for mm in mms))
+            or (kernel.attrs.get("compact_mma_batch", False) and len(mms) >= 2
+                and all(mm.dst.type.sizes[0] in (64, 128) for mm in mms))
+        )
         # Descriptor lifetime and elected-lane control are independent choices.
         # Preparing descriptors near their MMA avoids keeping every sibling
         # live together, without moving that preparation into a lane branch.
@@ -2097,6 +2274,25 @@ class LowerToPtxTemplate(LoweringPass):
             layout = physical_layout(typ)
             stride = layout[0] if layout is not None and layout[1] == "block_major" else typ.strides[0]
             return cast(int, stride) * typ.dtype.byte_size
+
+        collector_a_modes = [""] * len(mms)
+        if tcgen05 and kernel.attrs.get("reuse_mma_collector_a", False):
+            # Reuse only consecutive reads of exactly the same A view in one
+            # elected instruction batch. End each run before any other A read.
+            start = 0
+            while start < len(mms):
+                end = start + 1
+                while end < len(mms) and mms[end].dst.type.sizes == mms[start].dst.type.sizes and (
+                    mms[end].lhs is mms[start].lhs
+                    or _tile_delta(mms[end].lhs, mms[start].lhs, end) == 0
+                ):
+                    end += 1
+                if end - start > 1:
+                    collector_a_modes[start] = ".collector::a::fill"
+                    for index in range(start + 1, end - 1):
+                        collector_a_modes[index] = ".collector::a::use"
+                    collector_a_modes[end - 1] = ".collector::a::lastuse"
+                start = end
 
         for j, mm in enumerate(mms):
             descriptor_start = len(desc_template)
@@ -2238,7 +2434,7 @@ class LowerToPtxTemplate(LoweringPass):
                 mma_template += textwrap.dedent(f"""\
                     mov.b32 ${{b32:idesc}}, {idesc};
                     mov.pred ${{pred:accumulate}}, {int(mm.accumulate)};
-                    @${{pred:tcgen05_leader}} tcgen05.mma.cta_group::{cta_group}.kind::f16
+                    @${{pred:tcgen05_leader}} tcgen05.mma.cta_group::{cta_group}.kind::f16{collector_a_modes[j]}
                       [${{b32:operand.{dst_name}.ptr}}], ${{b64:desc_lhs{j}_0}}, ${{b64:{desc_rhs}}},
                       ${{b32:idesc}}, ${{pred:accumulate}};
                 """)
@@ -2340,16 +2536,71 @@ class LowerToPtxTemplate(LoweringPass):
         op: MoveOp,
     ) -> tuple[list[Op], list[object]]:
         """Lower synchronous MoveOp to PTX."""
+        return self._physical_fragment_coordinates(op, self._lower_move_impl(op))
+
+    @staticmethod
+    def _physical_fragment_coordinates(op, result):
+        """TMEM copy lanes and warp partitions use CUDA's flattened thread ID.
+
+        Logical x coordinates remain unchanged for ordinary scalar transfers.
+        Keep the existing one-dimensional fragment code byte-for-byte.
+        """
+        if not any(isinstance(v.type, TmemTensorType)
+                   or isinstance(v.type, WgrmemTensorType) and v.type.layout in TMEM_FRAGMENT_LAYOUTS
+                   for v in op.operands):
+            return result
+        kernel = find_ancestor_of_type(op, KernelOp)
+        assert kernel is not None
+        bx, by, bz = kernel.block_dim
+        if (by, bz) == (1, 1):
+            return result
+        for index, generated in enumerate(result[0]):
+            if isinstance(generated, ThreadIdOp) and generated.axis == CollectiveAxis.X:
+                # M16N8 writeback constructs its physical lane arithmetic as
+                # index IR rather than inside the final memory template.
+                linear = PTXTemplateOp.build(
+                    operands=[], result_types=[IndexType()],
+                    template=textwrap.dedent(f"""\
+                        mov.u32 ${{b32:result.dst.val}}, %tid.x;
+                        mov.u32 ${{b32:physical_y}}, %tid.y;
+                        mad.lo.u32 ${{b32:result.dst.val}}, ${{b32:physical_y}}, {bx}, ${{b32:result.dst.val}};
+                        mov.u32 ${{b32:physical_z}}, %tid.z;
+                        mad.lo.u32 ${{b32:result.dst.val}}, ${{b32:physical_z}}, {bx * by}, ${{b32:result.dst.val}};
+                    """), operand_names=[], result_names=['dst'],
+                    description='physical fragment thread index', attrs={'pure': True})
+                for user, operand in list(generated.result().uses):
+                    user.operands[operand] = linear.result()
+                result[0][index] = linear
+                continue
+            if not isinstance(generated, PTXTemplateOp):
+                continue
+            template = generated.template
+            if '%tid.x' not in template and '${b32:operand.warp.val}' not in template:
+                continue
+            prefix = textwrap.dedent(f"""\
+                mov.u32 ${{b32:physical_thread}}, %tid.x;
+                mov.u32 ${{b32:physical_y}}, %tid.y;
+                mad.lo.u32 ${{b32:physical_thread}}, ${{b32:physical_y}}, {bx}, ${{b32:physical_thread}};
+                mov.u32 ${{b32:physical_z}}, %tid.z;
+                mad.lo.u32 ${{b32:physical_thread}}, ${{b32:physical_z}}, {bx * by}, ${{b32:physical_thread}};
+            """)
+            template = template.replace('%tid.x', '${b32:physical_thread}')
+            if '${b32:operand.warp.val}' in template:
+                prefix += 'shr.u32 ${b32:physical_warp}, ${b32:physical_thread}, 5;\n'
+                template = template.replace('${b32:operand.warp.val}', '${b32:physical_warp}')
+            generated.attrs['template'] = prefix + template
+        return result
+
+    def _lower_move_impl(self, op):
         dst_type = op.dst.type
         src_type = op.src.type
 
         if isinstance(dst_type, TmemTensorType) or isinstance(src_type, TmemTensorType):
             return self._lower_move_tmem_fragment(op)
-        if (
-            isinstance(src_type, WgrmemTensorType)
-            and src_type.layout in TMEM_FRAGMENT_LAYOUTS
-            and TMEM_FRAGMENT_LAYOUTS[src_type.layout].row_fragment
-        ):
+        fragment_type = dst_type if isinstance(dst_type, WgrmemTensorType) else src_type
+        if (isinstance(fragment_type, WgrmemTensorType)
+            and fragment_type.layout in TMEM_FRAGMENT_LAYOUTS
+            and TMEM_FRAGMENT_LAYOUTS[fragment_type.layout].row_fragment):
             return self._lower_move_row_fragment(op)
         if {type(dst_type), type(src_type)} == {RmemTensorType, GmemTensorType}:
             return self._lower_move_gmem_rmem(op)
@@ -2536,6 +2787,16 @@ class LowerToPtxTemplate(LoweringPass):
                 ${{label:grid_after_leader}}:
                 bar.sync 0;
                 """)
+            if tuple(d or 1 for d in ancestor.block_dim[1:]) != (1, 1):
+                # A grid ticket belongs to exactly one physical CTA thread.
+                template = template.replace(
+                    "mov.u32 ${b32:grid_tid}, %tid.x;\n",
+                    "mov.u32 ${b32:grid_tid}, %tid.x;\n"
+                    "mov.u32 ${b32:grid_yz}, %tid.y;\n"
+                    "or.b32 ${b32:grid_tid}, ${b32:grid_tid}, ${b32:grid_yz};\n"
+                    "mov.u32 ${b32:grid_yz}, %tid.z;\n"
+                    "or.b32 ${b32:grid_tid}, ${b32:grid_tid}, ${b32:grid_yz};\n",
+                )
             operands = [sync]
             operand_names = ["sync"]
         else:
@@ -2622,8 +2883,9 @@ class LowerToPtxTemplate(LoweringPass):
         self,
         op: AwaitOp,
     ) -> tuple[list[Op], list[object]]:
+        read = ".read" if op.bulk_read_only else ""
         template = textwrap.dedent(f"""
-            cp.async.bulk.wait_group.read {op.pending_groups};
+            cp.async.bulk.wait_group{read} {op.pending_groups};
         """)
         new_op = PTXTemplateOp.build(
             operands=[],
@@ -2942,27 +3204,11 @@ class LowerToPtxTemplate(LoweringPass):
         assert isinstance(root_type, WgrmemTensorType)
         warp_rows, _ = _m16n8_fragment_rows(root_type)
         root_n = _m16n8_fragment_columns(root_type)
-        if isinstance(fragment.definition, TileOp):
-            assert list(memory_type.sizes) == [m_dim, n_dim], (
-                f"wgmma move: memory shape {list(memory_type.sizes)} does "
-                f"not match fragment {[m_dim, n_dim]}"
-            )
-            pairs = _wgmma_view_pairs(fragment)
-        else:
-            # Keep accepting the legacy producer until PromoteBuffers switches
-            # from an attribute-based slice to an explicit WGRMEM view.
-            col_start = op.attrs.get("wgmma_col_start", 0)
-            assert isinstance(col_start, int)
-            memory_m, memory_n = cast(tuple[int, int], memory_type.sizes)
-            assert memory_m == m_dim and 0 <= col_start < n_dim
-            assert col_start + memory_n <= n_dim
-            pairs = [
-                (pair, row, col - col_start)
-                for pair, row, col in _wgmma_view_pairs(fragment)
-                if col_start <= col < col_start + memory_n
-            ]
-        assert m_dim % (4 * warp_rows) == 0, (
-            f"fragment store: m must be a multiple of {4 * warp_rows}; got {m_dim}"
+        pairs = _m16n8_move_pairs(op)
+        paired_fragment = _paired_fragment(root_type)
+        row_partitions = 2 if paired_fragment else 4
+        assert m_dim % (row_partitions * warp_rows) == 0, (
+            f"fragment store: m must be a multiple of {row_partitions * warp_rows}; got {m_dim}"
         )
         assert root_n % 8 == 0 and 8 <= root_n <= 256, (
             f"wgmma store: n must be a multiple of 8 in [8, 256]; got {root_n}"
@@ -2979,10 +3225,10 @@ class LowerToPtxTemplate(LoweringPass):
         row_stride_bytes = cast(int, memory_type.strides[0]) * dtype_bytes
         column_stride_bytes = cast(int, memory_type.strides[1]) * dtype_bytes
         column_broadcast = is_load and column_stride_bytes == 0
-        assert column_broadcast or (
+        strided_f32 = isinstance(memory_type.dtype, F32Type) and row_stride_bytes == dtype_bytes
+        assert column_broadcast or strided_f32 or (
             column_stride_bytes == dtype_bytes
-            and row_stride_bytes % (2 * dtype_bytes) == 0
-        ), "wgmma element pairs must be contiguous and aligned"
+        ), "wgmma element pairs must be contiguous"
         assert not (
             isinstance(memory_type, SmemTensorType)
             and physical_layout(memory_type) is not None
@@ -2994,6 +3240,7 @@ class LowerToPtxTemplate(LoweringPass):
             warp_rows=warp_rows,
             warp_group_rows=_m16n8_fragment_group_rows(root_type),
             warp_group_columns=_m16n8_fragment_group_columns(root_type),
+            paired_columns=root_n if paired_fragment else 0,
         )
         if isinstance(memory_type, GmemTensorType):
             template = textwrap.dedent(r"""
@@ -3023,21 +3270,33 @@ class LowerToPtxTemplate(LoweringPass):
         # A pair is one packed BF16/F16 register or two F32 registers.
         f32 = isinstance(wgrmem_type.dtype, F32Type)
         instruction = f"{'ld' if is_load else 'st'}.{space}{'.v2' if f32 else ''}.b32"
-        unaligned_half_load = (
-            is_load
-            and isinstance(memory_type, GmemTensorType)
-            and isinstance(memory_type.dtype, (BF16Type, F16Type))
-            and not column_broadcast
-        )
-        if unaligned_half_load:
-            # Half views can begin at an odd element offset. All dynamic and
-            # static fragment-pair offsets are multiples of four bytes, so
-            # base alignment is uniform across the warp. Retain packed loads
-            # for aligned views and load two scalars for an unaligned view.
-            template += textwrap.dedent(r"""
-                and.b64 ${b64:alignment}, ${b64:base}, 3;
-                setp.eq.u64 ${pred:pair_aligned}, ${b64:alignment}, 0;
-                @!${pred:pair_aligned} bra.uni ${label:unaligned_half};
+        pair_bytes = 8 if f32 else 4
+        scalar_pairs = strided_f32 and column_stride_bytes != dtype_bytes
+        known_alignment = 0
+        if isinstance(memory_type, SmemTensorType):
+            known_alignment = _row_fragment_shared_alignment(memory)
+            if known_alignment and known_alignment % dtype_bytes:
+                raise ValueError("fragment shared-memory view violates element alignment")
+            if known_alignment:
+                # The dynamic lane address includes an arbitrary row and a
+                # column pair; static fragment offsets use those same strides.
+                known_alignment = math.gcd(known_alignment, row_stride_bytes,
+                                          2 * column_stride_bytes,
+                                          *(di * row_stride_bytes + dj * column_stride_bytes
+                                            for _, di, dj in pairs))
+                scalar_pairs |= known_alignment < pair_bytes
+        guarded_pairs = (not column_broadcast and not scalar_pairs
+                         and dtype_bytes in (2, 4) and not known_alignment)
+        if guarded_pairs:
+            # Typed global pointers promise element alignment, not pair
+            # alignment. Odd row pitches can also differ between lanes, so
+            # these ordinary copies use a potentially divergent branch and
+            # reconverge before subsequent collective work.
+            address_bits = 64 if space == "global" else 32
+            template += textwrap.dedent(f"""\
+                and.b{address_bits} ${{b{address_bits}:alignment}}, {address}, {pair_bytes - 1};
+                setp.eq.u{address_bits} ${{pred:pair_aligned}}, ${{b{address_bits}:alignment}}, 0;
+                @!${{pred:pair_aligned}} bra ${{label:unaligned_pair}};
             """)
 
         # Broadcast columns load one scalar per distinct row and duplicate its
@@ -3065,6 +3324,29 @@ class LowerToPtxTemplate(LoweringPass):
                     second = f"${{f32:operand.fragment.r{2 * pair + 1}}}"
                     template += f"mov.b32 {second}, {first};\n"
                 continue
+            if scalar_pairs and f32:
+                # Column-major FP32 workspaces retain the logical fragment
+                # ownership; a column pair becomes two scalar accesses.
+                for element in range(2):
+                    register = f"${{f32:operand.fragment.r{2 * pair + element}}}"
+                    location = f"[{address}+{offset + element * column_stride_bytes}]"
+                    template += (
+                        f"ld.{space}.b32 {register}, {location};\n" if is_load
+                        else f"{predicate}st.{space}.b32 {location}, {register};\n"
+                    )
+                continue
+            if scalar_pairs and dtype_bytes == 2:
+                register = f"${{b32:operand.fragment.r{pair}}}"
+                lo, hi = f"${{b16:half_lo{pair}}}", f"${{b16:half_hi{pair}}}"
+                if is_load:
+                    template += f"ld.{space}.b16 {lo}, [{address}+{offset}];\n"
+                    template += f"ld.{space}.b16 {hi}, [{address}+{offset + 2}];\n"
+                    template += f"mov.b32 {register}, {{{lo}, {hi}}};\n"
+                else:
+                    template += f"mov.b32 {{{lo}, {hi}}}, {register};\n"
+                    template += f"{predicate}st.{space}.b16 [{address}+{offset}], {lo};\n"
+                    template += f"{predicate}st.{space}.b16 [{address}+{offset + 2}], {hi};\n"
+                continue
             registers = (
                 f"{{${{f32:operand.fragment.r{2 * pair}}}, "
                 f"${{f32:operand.fragment.r{2 * pair + 1}}}}}"
@@ -3078,15 +3360,28 @@ class LowerToPtxTemplate(LoweringPass):
                 else f"{predicate}{instruction} {location}, {registers};\n"
             )
 
-        if unaligned_half_load:
-            template += "bra.uni ${label:half_load_done};\n${label:unaligned_half}:\n"
+        if guarded_pairs:
+            template += "bra ${label:pair_copy_done};\n${label:unaligned_pair}:\n"
             for pair, di, dj in pairs:
                 offset = di * row_stride_bytes + dj * column_stride_bytes
+                if f32:
+                    for element in range(2):
+                        register = f"${{f32:operand.fragment.r{2 * pair + element}}}"
+                        location = f"[{address}+{offset + element * column_stride_bytes}]"
+                        template += (f"ld.{space}.b32 {register}, {location};\n" if is_load
+                                     else f"{predicate}st.{space}.b32 {location}, {register};\n")
+                    continue
                 lo, hi = f"${{b16:half_lo{pair}}}", f"${{b16:half_hi{pair}}}"
-                template += f"ld.global.b16 {lo}, [{address}+{offset}];\n"
-                template += f"ld.global.b16 {hi}, [{address}+{offset + 2}];\n"
-                template += f"mov.b32 ${{b32:operand.fragment.r{pair}}}, {{{lo}, {hi}}};\n"
-            template += "${label:half_load_done}:\n"
+                register = f"${{b32:operand.fragment.r{pair}}}"
+                if is_load:
+                    template += f"ld.{space}.b16 {lo}, [{address}+{offset}];\n"
+                    template += f"ld.{space}.b16 {hi}, [{address}+{offset + 2}];\n"
+                    template += f"mov.b32 {register}, {{{lo}, {hi}}};\n"
+                else:
+                    template += f"mov.b32 {{{lo}, {hi}}}, {register};\n"
+                    template += f"{predicate}st.{space}.b16 [{address}+{offset}], {lo};\n"
+                    template += f"{predicate}st.{space}.b16 [{address}+{offset + 2}], {hi};\n"
+            template += "${label:pair_copy_done}:\n"
 
         lowered, _ = _lowered(op, template, [cast(Value, self.value_map[memory]),
                                              cast(Value, self.value_map[fragment]), byte_offset],
@@ -3110,6 +3405,7 @@ class LowerToPtxTemplate(LoweringPass):
                 row_stride, 2, coordinates=True, warp_rows=warp_rows,
                 warp_group_rows=_m16n8_fragment_group_rows(cast(WgrmemTensorType, fragment.type)),
                 warp_group_columns=_m16n8_fragment_group_columns(cast(WgrmemTensorType, fragment.type)),
+                paired_columns=_m16n8_fragment_columns(cast(WgrmemTensorType, fragment.type)) if _paired_fragment(cast(WgrmemTensorType, fragment.type)) else 0,
             )
         )
         is_load = isinstance(op.dst.type, WgrmemTensorType)
@@ -3438,19 +3734,99 @@ class LowerToPtxTemplate(LoweringPass):
 
         template = ""
         base_reg = f"${{b32:operand.{smem_label}.ptr}}"
-
-        for flat_idx, idx in enumerate(
-            itertools.product(
-                *[range(s) for s in cast(tuple[int, ...], rmem_type.sizes)]
+        vectorize = op.attrs.get("vectorize_scalar_shared_loads", False)
+        if type(vectorize) is not bool:
+            raise ValueError("vectorize_scalar_shared_loads must be a boolean")
+        vectorize = (vectorize and is_load and isinstance(rmem_type.dtype, F32Type)
+                     and _scalar_shared_vector_aligned(op.src))
+        swizzle = smem_ir_type.swizzle
+        shared_view = op.src if is_load else op.dst
+        root = _layout_view_root(shared_view)
+        layout = physical_layout(cast(SmemTensorType, root.type))
+        blocked = layout is not None and layout[1] == "block_major"
+        dynamic_inner = False
+        if blocked:
+            assert isinstance(root.type, SmemTensorType) and root.type.rank == 2
+            block_width = layout[0]
+            inner_dim = 0 if is_column_major(root.type) else 1
+            root_rows = cast(int, root.type.sizes[1 - inner_dim])
+            dynamic_inner = rmem_type.sizes[inner_dim] > 1 and not _block_aligned_view(
+                shared_view, block_width, inner_dim
             )
+        if swizzle is not None or dynamic_inner:
+            template = (
+                "{\n.reg .b32 scalar_addr, scalar_xor, scalar_inner, scalar_blocks;\n"
+            )
+        if swizzle is not None:
+            if swizzle not in ("32B", "64B", "128B"):
+                raise NotImplementedError(f"scalar shared move swizzle: {swizzle}")
+        if dynamic_inner:
+            operands.append(cast(Value, self.value_map[root]))
+            operand_names.append("root")
+            template += (
+                f"sub.u32 scalar_inner, {base_reg}, ${{b32:operand.root.ptr}};\n"
+                + _constant_divmod_ptx(
+                    "rem", "scalar_inner", "scalar_inner", block_width * dtype_bytes
+                )
+            )
+
+        skipped = 0
+        for flat_idx, idx in enumerate(
+            itertools.product(*[range(s) for s in cast(tuple[int, ...], rmem_type.sizes)])
         ):
+            if skipped:
+                skipped -= 1
+                continue
+            width = (4 if vectorize and idx[-1] % 4 == 0
+                     and idx[-1] + 4 <= rmem_type.sizes[-1] else 1)
+            skipped = width - 1
             strides = cast(tuple[int, ...], smem_ir_type.strides)
             offset = sum(c * s for c, s in zip(idx, strides)) * dtype_bytes
+            if blocked:
+                row, column = idx[1 - inner_dim], idx[inner_dim]
+                offset = (
+                    _block_major_offset(row, column, block_width, root_rows) * dtype_bytes
+                )
             reg = f"${{{suffix}:operand.{'dst' if is_load else 'src'}.r{flat_idx}}}"
+            address = f"{base_reg}+{offset}"
+            if dynamic_inner:
+                # Column increments can cross a block from a sub-block origin.
+                # Crossing skips the other rows of the old physical block.
+                offset = (row * block_width + column) * dtype_bytes
+                template += (
+                    f"add.u32 scalar_blocks, scalar_inner, {column * dtype_bytes};\n"
+                    + _constant_divmod_ptx(
+                        "div", "scalar_blocks", "scalar_blocks", block_width * dtype_bytes
+                    )
+                    + f"mad.lo.u32 scalar_addr, scalar_blocks, {(root_rows - 1) * block_width * dtype_bytes}, {base_reg};\n"
+                    f"add.u32 scalar_addr, scalar_addr, {offset};\n"
+                )
+                address = "scalar_addr"
+            if swizzle is not None:
+                # Tile pointers retain unswizzled offsets. TMA's swizzle
+                # uses the shared address bits, including the allocation's
+                # position within its 1 KiB swizzle span.
+                mask = (int(swizzle[:-1]) // 16 - 1) << 7
+                if not dynamic_inner:
+                    template += f"add.u32 scalar_addr, {base_reg}, {offset};\n"
+                template += (
+                    f"and.b32 scalar_xor, scalar_addr, {mask};\n"
+                    "shr.u32 scalar_xor, scalar_xor, 3;\n"
+                    "xor.b32 scalar_addr, scalar_addr, scalar_xor;\n"
+                )
+                address = "scalar_addr"
             if is_load:
-                template += f"ld.shared.{suffix} {reg}, [{base_reg}+{offset}];\n"
+                if width == 4:
+                    registers = ", ".join(
+                        f"${{{suffix}:operand.dst.r{flat_idx + i}}}" for i in range(width))
+                    template += f"ld.shared.v4.{suffix} {{{registers}}}, [{address}];\n"
+                else:
+                    template += f"ld.shared.{suffix} {reg}, [{address}];\n"
             else:
-                template += f"st.shared.{suffix} [{base_reg}+{offset}], {reg};\n"
+                template += f"st.shared.{suffix} [{address}], {reg};\n"
+
+        if swizzle is not None or dynamic_inner:
+            template += "}\n"
 
         new_op = PTXTemplateOp.build(
             operands=operands,
@@ -3463,9 +3839,9 @@ class LowerToPtxTemplate(LoweringPass):
         return [new_op], []
 
     def _lower_async_tma_stores(
-        self, moves: list[TmaMoveOp]
+        self, moves: list[TmaMoveOp], conditions: list[Value | None] | None = None
     ) -> tuple[list[Op], list[object]]:
-        """Issue atom stores from one elected thread and commit one group."""
+        """Issue optional atom stores from one elected thread and commit one group."""
         issuer = execution_issuer_warp(moves[0])
         if any(execution_issuer_warp(move) != issuer for move in moves):
             raise ValueError('TMA store group requires one issuing warp')
@@ -3494,7 +3870,18 @@ class LowerToPtxTemplate(LoweringPass):
                 operand_names,
                 f"cache_policy{i}",
             )
-            lines += [*coordinate_lines, f"@${{pred:st_leader}} {instruction}"]
+            predicate = "${pred:st_leader}"
+            condition = conditions[i] if conditions is not None else None
+            if condition is not None:
+                name = f"condition{i}"
+                operands.append(cast(Value, self.value_map[condition]))
+                operand_names.append(name)
+                lines.append(
+                    f"and.pred ${{pred:store{i}_enabled}}, ${{pred:st_leader}}, "
+                    f"${{pred:operand.{name}.val}};"
+                )
+                predicate = f"${{pred:store{i}_enabled}}"
+            lines += [*coordinate_lines, f"@{predicate} {instruction}"]
         lines += ["@${pred:st_leader} cp.async.bulk.commit_group;", "${label:st_done}:"]
         return _lowered(moves[0], _leader_thread("st", issuer_warp=issuer) + "\n".join(lines) + "\n",
                         operands, operand_names, description="Grouped TMA stores")
@@ -3676,6 +4063,111 @@ def _layout_view_root(value: Value) -> Value:
     return value
 
 
+def _block_aligned_view(value: Value, block_width: int, inner_dim: int) -> bool:
+    """Whether every tile in a view chain starts at a whole physical block."""
+    while isinstance(value.definition, TileOp):
+        tile = value.definition
+        index = tile.indices[inner_dim]
+        extent = tile.result().type.sizes[inner_dim]
+        if isinstance(index, int):
+            if index * extent % block_width:
+                return False
+        elif extent % block_width:
+            return False
+        value = tile.arg
+    return not isinstance(value.definition, ReshapeOp)
+
+
+def _scalar_shared_vector_aligned(value: Value) -> bool:
+    """Prove a row-major FP32 view starts on a 16-byte chunk.
+
+    Shared allocations have at least 128-byte alignment. Every tile offset
+    must preserve four-element alignment, including dynamic indices. A
+    blocked row stride and block boundary must preserve that alignment too.
+    Swizzles permute whole 16-byte chunks, so an aligned vector stays within
+    one chunk. Reshapes, casts, column-major blocks and unknown roots retain
+    scalar lowering rather than inventing an alignment promise.
+    """
+    typ = value.type
+    if (not isinstance(typ, SmemTensorType) or not isinstance(typ.dtype, F32Type)
+            or not typ.rank or typ.strides[-1] != 1
+            or any(s is None or s % 4 for s in typ.strides[:-1])):
+        return False
+    while isinstance(value.definition, TileOp):
+        tile = value.definition
+        parent = tile.arg.type
+        if (not isinstance(parent, SmemTensorType) or parent.rank != typ.rank
+                or parent.dtype != typ.dtype or parent.strides[-1] != 1
+                or any(s is None or s % 4 for s in parent.strides[:-1])):
+            return False
+        for index, extent, stride in zip(tile.indices, value.type.sizes, parent.strides):
+            if extent is None or stride is None:
+                return False
+            coefficient = extent * stride
+            if isinstance(index, int):
+                if index * coefficient % 4:
+                    return False
+            elif coefficient % 4:
+                return False
+        value = tile.arg
+    if not isinstance(value.definition, AllocOp):
+        return False
+    layout = physical_layout(value.type)
+    if layout is not None and (layout[1] != "block_major"
+                               or layout[0] % 4 or is_column_major(value.type)):
+        return False
+    return True
+
+
+def _row_fragment_shared_alignment(value: Value) -> int:
+    """Conservative pointer alignment, capped at the largest copy vector.
+
+    Block-major mapping and swizzling preserve the low four offset bits
+    when a physical block is a multiple of 16 bytes. Unknown provenance
+    leaves alignment to the runtime copy guard.
+    """
+    alignment = 16
+    while True:
+        op = value.definition
+        if isinstance(op, ReinterpretOp):
+            alignment = math.gcd(alignment, op.byte_offset)
+            value = op.arg
+        elif isinstance(op, ReshapeOp):
+            value = op.arg
+        elif isinstance(op, TileOp):
+            parent = op.arg.type
+            if not isinstance(parent, SmemTensorType):
+                return 0
+            layout = physical_layout(parent)
+            if layout is not None and (layout[1] != "block_major" or
+                    is_column_major(parent) or layout[0] * parent.dtype.byte_size % 16):
+                return 0
+            for dim, (index, extent, stride) in enumerate(zip(op.indices, value.type.sizes, parent.strides)):
+                if extent is None or stride is None:
+                    return 0
+                # Only the intra-block column and row offsets affect low bits.
+                stride = (layout[0] if dim == 0 else 1) if layout is not None else stride
+                offset = extent * stride * parent.dtype.byte_size
+                alignment = math.gcd(alignment, offset * index if isinstance(index, int) else offset)
+            value = op.arg
+        elif isinstance(op, AllocOp) and isinstance(value.type, SmemTensorType):
+            return math.gcd(alignment, cast(int, op.attrs.get("allocation_alignment", 128)))
+        else:
+            return 0
+
+
+def _constant_divmod_ptx(kind: str, dst: str, src: str, divisor: int) -> str:
+    """Exact unsigned arithmetic without reciprocal work for powers of two."""
+    assert kind in ("div", "rem") and divisor > 0
+    if divisor & (divisor - 1) == 0:
+        return (
+            f"shr.u32 {dst}, {src}, {divisor.bit_length() - 1};\n"
+            if kind == "div"
+            else f"and.b32 {dst}, {src}, {divisor - 1};\n"
+        )
+    return f"{kind}.u32 {dst}, {src}, {divisor};\n"
+
+
 def _swizzle_ptx(offset: str, scratch: str, row_bytes: int) -> str:
     """XOR the 16-byte chunk of ``${b32:offset}`` with the row bits above it.
 
@@ -3793,8 +4285,8 @@ _M16N8_FRAGMENT_ROWS = {"wgmma_layout_0": (16, 64), "tcgen05_16x256b": (32, 16)}
 
 
 def _paired_fragment(typ: WgrmemTensorType) -> bool:
-    """Whether a register fragment holds a paired (cta_group::2) TMEM accumulator."""
-    return typ.attrs.get("tmem_cta_group") == 2
+    """Whether a local M64 fragment uses the paired column-half mapping."""
+    return typ.attrs.get("tmem_cta_group") == 2 and typ.sizes[0] == 64
 
 
 def _m16n8_ownership(typ: WgrmemTensorType) -> TmemWarpLayout | None:
@@ -3832,6 +4324,7 @@ def _build_wgmma_layout_0_dynamic_offset(
     warp_rows: int = 16,
     warp_group_rows: int = 0,
     warp_group_columns: int = 0,
+    paired_columns: int = 0,
 ) -> tuple[list[Op], Value] | tuple[list[Op], Value, Value, Value]:
     """Emit index ops for an m16n8 fragment's per-thread byte offset.
 
@@ -3856,6 +4349,15 @@ def _build_wgmma_layout_0_dynamic_offset(
     ops.append(c32)
     warp = IndexDivOp.build(tid_in_wg.result(), c32.result())
     ops.append(warp)
+    column_pair = None
+    if paired_columns:
+        # Paired M64 owns two row partitions and two column halves. Warps
+        # 2/3 share the rows of 0/1 and drain the other N half.
+        c2 = IndexConstantOp.build(2)
+        column_pair = IndexDivOp.build(warp.result(), c2.result())
+        row_pair = IndexModOp.build(warp.result(), c2.result())
+        ops.extend([c2, column_pair, row_pair])
+        warp = row_pair
     lane = IndexModOp.build(tid_in_wg.result(), c32.result())
     ops.append(lane)
 
@@ -3884,6 +4386,11 @@ def _build_wgmma_layout_0_dynamic_offset(
     ops.append(c2)
     col = IndexMulOp.build(lane_mod_4.result(), c2.result())
     ops.append(col)
+    if column_pair is not None:
+        pair_stride = IndexConstantOp.build(paired_columns)
+        pair_col = IndexMulOp.build(column_pair.result(), pair_stride.result())
+        col = IndexAddOp.build(col.result(), pair_col.result())
+        ops.extend([pair_stride, pair_col, col])
 
     if warp_group_columns:
         group = IndexDivOp.build(tid_x, c128.result())
@@ -3965,16 +4472,26 @@ def _wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     if root_type.layout == "wgmma_layout_0":
         assert root_type.warps == 4
     else:
-        TmemWarpLayout(cast(int, root_type.sizes[0]), root_type.warps)
+        _m16n8_ownership(root_type)
     assert view_type.dtype == root_type.dtype
     assert isinstance(view_type.dtype, (F32Type, BF16Type, F16Type)), (
         f"WGMMA views support f32, bf16, and f16; got {view_type.dtype}"
     )
     assert root_type.num_elements_per_thread % 2 == 0
-    if _m16n8_fragment_group_columns(root_type) and value is not root:
-        raise NotImplementedError("column-sharing TMEM fragments require whole register values")
+    if root_type.layout != "wgmma_layout_0":
+        if view_type.attrs.get("tmem_cta_group", 1) != root_type.attrs.get("tmem_cta_group", 1):
+            raise ValueError("WGRMEM views must preserve TMEM CTA group metadata")
     row_start, col_start = _static_view_origin(value)
     view_m, view_n = cast(tuple[int, int], view_type.sizes)
+    root_m, logical_n = cast(tuple[int, int], root_type.sizes)
+    if (view_n <= 0 or view_n % 8 or col_start % 8
+            or row_start < 0 or col_start < 0
+            or row_start + view_m > root_m or col_start + view_n > logical_n):
+        raise ValueError("m16n8 views require complete eight-column packets within their root")
+    ownership = _m16n8_ownership(root_type)
+    if (ownership is not None and ownership.column_groups == 2
+            and (row_start != 0 or col_start != 0 or view_type.sizes != root_type.sizes)):
+        raise NotImplementedError("column-sharing TMEM fragments require whole register values")
     root_n = _m16n8_fragment_columns(root_type)
     _, tile_rows = _M16N8_FRAGMENT_ROWS[root_type.layout]
     pairs = [
@@ -4242,18 +4759,43 @@ def _stmatrix_register_starts(op: MoveOp) -> list[int] | None:
     return [pair for pair, _, _ in pairs if pair % pairs_per_m_tile % 4 == 0]
 
 
+def _m16n8_move_pairs(op: MoveOp) -> list[tuple[int, int, int]]:
+    """Validate complete lane packets and select root registers for a move."""
+    fragment, memory = ((op.dst, op.src) if isinstance(op.dst.type, WgrmemTensorType)
+                        else (op.src, op.dst))
+    fragment_type, memory_type = fragment.type, memory.type
+    assert isinstance(fragment_type, WgrmemTensorType)
+    assert isinstance(memory_type, AddrMemTensorType)
+    if (fragment_type.rank != 2 or memory_type.rank != 2
+            or fragment_type.dtype != memory_type.dtype):
+        raise ValueError("m16n8 moves require rank-2 tensors with matching dtypes")
+    memory_m, memory_n = cast(tuple[int, int], memory_type.sizes)
+    col_start = op.attrs.get("wgmma_col_start", 0)
+    if type(col_start) is not int or col_start < 0 or col_start % 8:
+        raise ValueError("wgmma_col_start must be a nonnegative integer multiple of eight")
+    if memory_n <= 0 or memory_n % 8:
+        raise ValueError("m16n8 memory tiles must cover complete eight-column packets")
+    pairs = _wgmma_view_pairs(fragment)
+    if isinstance(fragment.definition, TileOp):
+        if memory_type.sizes != fragment_type.sizes:
+            raise ValueError("m16n8 moves require matching memory and fragment view shapes")
+        if col_start != 0:
+            raise ValueError("explicit WGRMEM views cannot also specify wgmma_col_start")
+        return pairs
+    fragment_m, fragment_n = cast(tuple[int, int], fragment_type.sizes)
+    if memory_m != fragment_m or col_start + memory_n > fragment_n:
+        raise ValueError("m16n8 move slice exceeds its register fragment")
+    ownership = _m16n8_ownership(fragment_type)
+    if (ownership is not None and ownership.column_groups == 2
+            and (col_start != 0 or memory_n != fragment_n)):
+        raise NotImplementedError("column-sharing TMEM fragments require whole register values")
+    return [(pair, row, col - col_start) for pair, row, col in pairs
+            if col_start <= col < col_start + memory_n]
+
+
 def _stmatrix_pairs(op: MoveOp) -> list[tuple[int, int, int]]:
     """The WGMMA pairs a fragment store writes, relative to its destination."""
-    if isinstance(op.src.definition, TileOp):
-        return _wgmma_view_pairs(op.src)
-    col_start = op.attrs.get("wgmma_col_start", 0)
-    assert isinstance(col_start, int)
-    dst_n = cast(int, cast(MemTensorType, op.dst.type).sizes[1])
-    return [
-        (pair, row, col - col_start)
-        for pair, row, col in _wgmma_view_pairs(op.src)
-        if col_start <= col < col_start + dst_n
-    ]
+    return _m16n8_move_pairs(op)
 
 
 def _ptx_suffix(dtype) -> str:

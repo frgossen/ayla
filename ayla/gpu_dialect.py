@@ -838,6 +838,7 @@ class ElementwiseOp(GpuOp):
         "convert": 1,
         "fill": 1,
         "mul": 2,
+        "add": 2,
         "sigmoid": 1,
         "silu": 1,
     }
@@ -1304,8 +1305,13 @@ class LockType(Type):
 class AwaitOp(GpuOp):
     """Wait for async work registered on a lock.
 
-    By default this drains the lock.  Queue-backed locks may use the generic
+    By default this drains the lock. Queue-backed locks may use the generic
     ``pending`` attribute to retain that many newer hardware groups.
+
+    Bulk locks default to source-read completion, permitting reuse of staging
+    memory. Set ``bulk_read_only=False`` to also complete destination writes
+    and make them visible to the executing thread. Other threads still need
+    publication. A source-only drain does not complete destination writes.
     """
 
     @classmethod
@@ -1336,6 +1342,11 @@ class AwaitOp(GpuOp):
     @property
     def pending_groups(self) -> int:
         return cast(int, self.attrs.get("pending", 0))
+
+    @property
+    def bulk_read_only(self) -> bool:
+        """Whether a bulk wait completes source reads only."""
+        return cast(bool, self.attrs.get("bulk_read_only", True))
 
     @property
     def is_full_wait(self) -> bool:
@@ -2177,7 +2188,7 @@ class TmemTensorType(MemTensorType):
             "TMEM requires 64 or 128 logical rows and enough columns"
         )
         assert isinstance(dtype, F32Type), "TMEM accumulators require f32"
-        return cls(
+        result = cls(
             attrs={
                 "sizes": list(sizes),
                 "dtype": dtype,
@@ -2185,6 +2196,26 @@ class TmemTensorType(MemTensorType):
                 **(attrs or {}),
             }
         )
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        """Check effective storage attributes, including after IR mutation."""
+        sizes = self.attrs.get("sizes")
+        if (not isinstance(sizes, (list, tuple)) or len(sizes) != 2
+                or any(type(size) is not int for size in sizes)
+                or sizes[0] not in (64, 128) or sizes[1] <= 0):
+            raise ValueError("TMEM requires two integer dimensions with 64 or 128 rows and positive width")
+        columns = self.attrs.get("columns")
+        if type(columns) is not int or columns not in (32, 64, 128, 256, 512):
+            raise ValueError("TMEM allocation columns must be an integer power of two in [32, 512]")
+        if sizes[1] > columns:
+            raise ValueError("TMEM logical width exceeds its allocation column capacity")
+        group = self.attrs.get("cta_group", 1)
+        if type(group) is not int or group not in (1, 2):
+            raise ValueError("TMEM CTA group must be the integer one or two")
+        if not isinstance(self.attrs.get("dtype"), F32Type):
+            raise ValueError("TMEM accumulators require f32")
 
     @property
     def columns(self) -> int:
@@ -3441,7 +3472,11 @@ def _memory_effects(op: Op) -> list[MemoryEffect] | None:
     if isinstance(op, AllocOp) and isinstance(op.result().type, TmemTensorType):
         return _memory_effect("W", op.result(), CollectiveScope.BLOCK)
     if isinstance(op, DeallocOp):
-        return _memory_effect("W", op.value, CollectiveScope.BLOCK)
+        # Paired TMEM deallocation requires both CTA issuers to observe all
+        # TMEM accesses before collectively freeing the allocation. A local
+        # block rendezvous does not publish the peer CTA's completed loads.
+        paired = isinstance(op.value.type, TmemTensorType) and op.value.type.cta_group == 2
+        return _memory_effect("W", op.value, CollectiveScope.CLUSTER_LEADER if paired else CollectiveScope.BLOCK)
     if is_side_effect_free(op):
         return []
     if isinstance(op, MoveOp):
@@ -3581,6 +3616,10 @@ def _memory_effects(op: Op) -> list[MemoryEffect] | None:
     if isinstance(op, AwaitOp):
         # An await's effects are the union of its async peers' — the async starts
         # sharing its lock — found directly via the lock's use-list, no scan.
+        # These reserve scheduling hazards, rather than assert completion.
+        # In particular, keep destination writes here for source-only bulk
+        # waits: removing them would permit unsafe motion across consumers
+        # or overlapping stores. SyncAnalysis distinguishes their retirement.
         peers = [u for u in op.lock.users() if isinstance(u, (AsyncOp, TmaMoveOp))]
         if not peers:
             return None

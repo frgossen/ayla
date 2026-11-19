@@ -48,6 +48,7 @@ from ..gpu_dialect import (
     execution_issuer_warp,
     is_side_effect_free,
     physical_layout,
+    root_buffers,
 )
 from ..pipelines.async_resources import allocate_event, SplitBarrier, tma_writeback_fragments
 from ..pipelines.ring_schedule import RingSchedule, reject_unaccepted_effects
@@ -103,7 +104,7 @@ def _source(op):
 
 
 def prepare_rolled_ring(module, context, *, operand_stages, overlap, job_regions,
-                        mma_queue_depth):
+                        mma_queue_depth, output_writeback_window=None, frames=2):
     kernel, loop, allocation = context.kernel, context.loop, context.allocation
     arena = allocation.result()
     single = clone_type(arena.type)
@@ -117,17 +118,62 @@ def prepare_rolled_ring(module, context, *, operand_stages, overlap, job_regions
         mma_queue_depth=mma_queue_depth,
         job_regions=job_regions,
     )
+    if frames != 2:
+        if frames != 1 or overlap or job_regions:
+            raise ValueError("single-frame ring must be serial without job regions")
+        region.attrs["frames"] = frames
+    if output_writeback_window is not None:
+        region.attrs['output_writeback_window'] = output_writeback_window
     if job_regions:
         if (
-            group != 2
+            group not in (1, 2)
             or kernel.block_dim != (128, 1, 1)
             or not overlap
-            or mma_queue_depth != 1
+            or not 1 <= mma_queue_depth < operand_stages
         ):
             raise ValueError(
-                "job regions require a paired common ring with four-warp fragments"
+                "job regions require a common ring with four-warp fragments"
             )
         kernel.attrs["block_dim"] = (256, 1, 1)
+    if not find_ops_of_type(region, OperandPipelineOp):
+        # A single peeled K batch has no residual reduction loop. Retain
+        # its source as a zero-iteration compact template, so the common
+        # persistent emitter can still number banks across output jobs.
+        body = region.body.ops[0].body
+        guards = [x for x in body.ops if isinstance(x, IfOp)]
+        if guards:
+            if len(guards) != 1:
+                raise ValueError("single-stage ring requires one output guard")
+            body = guards[0].body
+        issues = [x for x in body.ops if isinstance(x, AsyncOp)
+                  and x.lock.type.kind in ("mbar", "tcgen05")]
+        if len(issues) != 2:
+            raise ValueError("single-stage ring requires one load and MMA batch")
+        load, mma = issues
+        waits = [next(x for x in body.ops if isinstance(x, AwaitOp)
+                      and x.lock is issue.lock) for issue in issues]
+        values = {}
+        template = [clone_op(x, values) for x in (load, waits[0], mma, waits[1])]
+        template[2].body.ops[0].attrs["accumulate"] = True
+        iv = Value(name=None, type=IndexType())
+        dummy = ForOp.build(1, 2, 1, Block(arguments=[iv], ops=template),
+                            {"label": "k"})
+        position = body.ops.index(waits[1]) + 1
+        body.ops.insert(position, dummy)
+        from .pipeline_rolled_k import PipelineRolledK
+        [compact], _ = PipelineRolledK(operand_stages).lower_for(dummy)
+        compact.attrs["ub"] = 1
+        body.ops[position:position + 1] = [compact]
+        # This region is not attached to the kernel until preparation ends;
+        # normal root-use traversal cannot yet see its cloned operations.
+        for view in compact.operands:
+            root = view.definition.arg
+            for operation in iter_ops(region):
+                if operation is view.definition:
+                    continue
+                for index, value in enumerate(list(operation.operands)):
+                    if value is root:
+                        operation.operands[index] = view
     _source(region)
     if allocation.parent_block is not kernel.body:
         allocation.parent_block.ops.remove(allocation)
@@ -138,8 +184,8 @@ def prepare_rolled_ring(module, context, *, operand_stages, overlap, job_regions
     # Preserve the logical tile shape while reserving both accumulators.
     # The late scheduler substitutes these views, never reallocates TMEM.
     arena.type = clone_type(single)
-    arena.type.sizes = [single.sizes[0], single.sizes[1] * 2]
-    arena.type.attrs["columns"] = single.columns * 2
+    arena.type.sizes = [single.sizes[0], single.sizes[1] * frames]
+    arena.type.attrs["columns"] = single.columns * frames
     first = TileOp.build(arena, [0, 0], single)
     for user, index in list(arena.uses):
         if user not in (first, region):
@@ -154,13 +200,15 @@ def prepare_rolled_ring(module, context, *, operand_stages, overlap, job_regions
         kernel.body.ops.insert(kernel.body.ops.index(region), storage)
     kernel.attrs.update(
         rolled_shared_ring=True,
-        persistent_output_slots=2,
+        persistent_output_slots=frames,
         shared_operand_output_ring=True,
         ordered_mma_completion=True,
     )
     kernel.attrs["name"] += "_rolled_shared_ring" + (
         "_overlap" if overlap else "_serial"
     )
+    if frames == 1:
+        kernel.attrs["name"] += "_frame1"
     return module
 
 
@@ -175,7 +223,10 @@ class LowerRolledSharedRing(LoweringPass):
         group = arena.type.attrs.get("cta_group", 1)
         warps = find_ancestor_of_type(op, KernelOp).num_threads // 32
         overlap = op.attrs["overlap"]
-        schedule = RingSchedule(depth, steps, len(fragments), overlap, job_regions)
+        frames = op.attrs.get("frames", 2)
+        schedule = RingSchedule(depth, steps, len(fragments), overlap, job_regions,
+                                op.attrs.get('output_writeback_window'),
+                                mma_queue_depth=op.attrs.get('mma_queue_depth', 1))
         ops = []
 
         def const(n, dst):
@@ -199,19 +250,39 @@ class LowerRolledSharedRing(LoweringPass):
         free = event("tcgen05", depth, "operand_bank_release", {"cta_group": group})
         frame_ready = [
             event("tcgen05", None, f"accumulator_ready_{s}", {"cta_group": group})
-            for s in range(2)
+            for s in range(frames)
         ]
         frame_free = [SplitBarrier.build(group, warps, f"last_tmem_read_{s}")
-                      for s in range(2)]
+                      for s in range(frames)]
         ops.extend(release.allocation for release in frame_free)
         slots = []
-        for s in range(2):
+        for s in range(frames):
             view = TileOp.build(arena, [0, s], first_slot.type)
             ops.append(view)
             slots.append(view.result())
-        # Bulk waits observe the issuing thread's FIFO. This compact schedule
-        # conservatively drains it before staging-buffer reuse.
+        # Bulk waits observe the issuing thread's FIFO and protect staging
+        # reuse; the optional queue retains only newer disjoint-buffer reads.
         store_locks = list(dict.fromkeys(fragment[-1].lock for fragment in fragments))
+        store_limit = find_ancestor_of_type(op, KernelOp).attrs.get(
+            "rolled_output_store_pending_groups", 0
+        )
+        if type(store_limit) is not int or not 0 <= store_limit <= 7:
+            raise ValueError("rolled output store queue must be an integer from zero to seven")
+        # Stores occur in fragment order for every output job. The last
+        # fragment may be carried into the next job, but is issued before
+        # that job's first fragment. Each rotating participant has its own
+        # staging and issuer FIFO and repeats this same fragment sequence.
+        # Wait for the most recent possibly aliasing staging write, while
+        # allowing newer disjoint-buffer groups to remain pending. Distinct
+        # views of a common allocation stay conservatively aliasing.
+        staging_roots = [root_buffers(fragment[2].dst) for fragment in fragments]
+        store_pending = []
+        for index, roots in enumerate(staging_roots):
+            previous = max(
+                position for position in range(index - len(fragments), index)
+                if roots & staging_roots[position % len(fragments)]
+            )
+            store_pending.append(min(store_limit, index - previous - 1))
         span, stage_count, two, one, zero, minus_one = [
             const(v, ops) for v in (depth, steps, 2, 1, 0, -1)
         ]
@@ -278,6 +349,7 @@ class LowerRolledSharedRing(LoweringPass):
             inner.extend(schedule.writeback_fragment(
                 copied, index, frame_ready[slot], frame_free[slot], finish=finish,
                 explicit_barriers=True,
+                wait_attrs={"pending": store_pending[index]} if store_limit else None,
             ))
             predicate = valid(job, dst)
             region = IfOp.build(predicate, Block(ops=inner))
@@ -289,7 +361,7 @@ class LowerRolledSharedRing(LoweringPass):
             body = []
             # First uses have no old reader; subsequent writes acquire only
             # their own slot's last-read release, not the output store queue.
-            reuse = binary(IndexLtOp, one, job, body)
+            reuse = binary(IndexLtOp, one if frames == 2 else zero, job, body)
             body.append(IfOp.build(reuse, Block(ops=[split(slot, "wait")])))
             iv = Value(name=None, type=IndexType())
             kbody = []
@@ -310,6 +382,8 @@ class LowerRolledSharedRing(LoweringPass):
                     not_last = binary(IndexLtOp, iv, const(steps - 1, kbody), kbody)
                     initial = clone_op(batch, {})
                     initial.body.ops[0].attrs["accumulate"] = False
+                    if steps == 1:
+                        initial.operands.append(frame_ready[slot])
                     final = clone_op(batch, {})
                     final.operands.append(frame_ready[slot])
                     kbody.extend(
@@ -338,9 +412,10 @@ class LowerRolledSharedRing(LoweringPass):
                         )
                     )
                 elif action == "refill":
-                    # Refill P-1 batches ahead, observing the previous MMA's
-                    # bank release even across the output-job backedge.
-                    prior = binary(IndexAddOp, ordinal, minus_one, kbody)
+                    # Refill P-Q ahead after the matching ordinal i-Q bank
+                    # release. Q newer MMAs may remain queued; ownership
+                    # and phases continue across the output-job backedge.
+                    prior = binary(IndexAddOp, ordinal, const(-schedule.mma_queue_depth, kbody), kbody)
                     refill = [
                         AwaitOp.build(
                             bank_event(free, prior, kbody)[0],
@@ -384,7 +459,7 @@ class LowerRolledSharedRing(LoweringPass):
                         for guard in reversed(guards):
                             target = [IfOp.build(guard, Block(ops=target))]
                         refill.extend(target)
-                    has_prior = binary(IndexLtOp, zero, ordinal, kbody)
+                    has_prior = binary(IndexLtOp, const(schedule.mma_queue_depth - 1, kbody), ordinal, kbody)
                     kbody.append(IfOp.build(has_prior, Block(ops=refill)))
                 elif action == "writeback":
                     previous = binary(IndexAddOp, job, minus_one, kbody)
@@ -470,7 +545,7 @@ class LowerRolledSharedRing(LoweringPass):
         jobs = []
         compute(job, 0, jobs)
         next_job = binary(IndexAddOp, job, one, jobs)
-        compute(next_job, 1, jobs)
+        compute(next_job, 1 if frames == 2 else 0, jobs)
         count = math.ceil(tiles / grid)
         ops.append(
             ForOp.build(
@@ -497,11 +572,13 @@ class LowerRolledSharedRing(LoweringPass):
                 ),
             ),
         ]:
+            if jobs_count == 0:
+                continue
             tail = []
             last = const(jobs_count - 1, tail)
             if overlap:
                 previous = const(jobs_count - 2, tail)
-                if not job_regions:
+                if not job_regions and jobs_count >= 2:
                     output_fragment(
                         previous,
                         (jobs_count - 2) % 2,
@@ -547,9 +624,36 @@ class PrepareRolledSharedRing(Pass):
         from ..pipelines.canonicalize import Canonicalize
 
         module = LowerRolledSharedRing().run(module)
+        unroll = module.body.ops[0].attrs.get("rolled_k_unroll", 1)
+        if unroll > 1:
+            from .unroll_loop import UnrollLoop
+
+            module = UnrollLoop(unroll, "shared_ring_rolled_k").run(module)
+            # Fully unrolling leaves a one-trip loop. Fold it before peeling,
+            # which otherwise requires at least two remaining iterations.
+            module = Canonicalize().run(module)
+        # A one-batch reduction has the same first/last iteration.
+        # Fold its bounded loop once before the two-edge peeling pass.
+        if any(loop.trip_count == 1 and
+               loop.attrs.get("label") == "shared_ring_rolled_k"
+               for loop in find_ops_of_type(module, ForOp)):
+            module = Canonicalize().run(module)
         module = PeelLoop(
             "shared_ring_rolled_k", front_iterations=1, back_iterations=1
         ).run(module)
+        # Clone only the existing bounded output-pair loop. The induction
+        # variable retains its absolute job ordinal; bank phases, output
+        # ownership, event waits and issue order remain in the cloned body.
+        kernel = module.body.ops[0]
+        if kernel.attrs.get("peel_first_output_pair"):
+            module = PeelLoop(
+                "shared_operand_output_ring", front_iterations=1
+            ).run(module)
+        job_unroll = kernel.attrs.get("rolled_job_unroll", 1)
+        if job_unroll > 1:
+            from .unroll_loop import UnrollLoop
+
+            module = UnrollLoop(job_unroll, "shared_operand_output_ring").run(module)
         # Edge predicates become constant after peeling. Simplify before
         # descriptor hoisting, while memory effects are still visible.
         module = Canonicalize().run(module)
