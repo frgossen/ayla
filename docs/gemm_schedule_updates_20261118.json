@@ -1,0 +1,3265 @@
+{
+  "source_campaign": "docs/implicit_heuristics_20261117",
+  "unique_promoted_shapes": 139,
+  "promotions": [
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1000,
+        512
+      ],
+      "median_speedup": 1.0519480699467103,
+      "before": [
+        41
+      ],
+      "after": [
+        2242,
+        41
+      ],
+      "installed_config_id": 2242
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        96,
+        1000,
+        1280
+      ],
+      "median_speedup": 1.0509307516609927,
+      "before": [
+        238,
+        41
+      ],
+      "after": [
+        2243,
+        238,
+        41
+      ],
+      "installed_config_id": 2243
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        128,
+        1000,
+        384
+      ],
+      "median_speedup": 1.0486811620523837,
+      "before": [
+        1992,
+        41
+      ],
+      "after": [
+        2244,
+        1992,
+        41
+      ],
+      "installed_config_id": 2244
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        128,
+        1000,
+        1408
+      ],
+      "median_speedup": 1.0423600017150139,
+      "before": [
+        238,
+        41
+      ],
+      "after": [
+        2245,
+        238,
+        41
+      ],
+      "installed_config_id": 2245
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        384,
+        384,
+        2048
+      ],
+      "median_speedup": 1.0420033315277704,
+      "before": [
+        1931,
+        43
+      ],
+      "after": [
+        2246,
+        1931,
+        43
+      ],
+      "installed_config_id": 2246
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        256,
+        512,
+        1024
+      ],
+      "median_speedup": 1.038986458905598,
+      "before": [
+        238
+      ],
+      "after": [
+        2247,
+        238
+      ],
+      "installed_config_id": 2247
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        128,
+        1000,
+        1280
+      ],
+      "median_speedup": 1.0378389144380757,
+      "before": [
+        1991,
+        41
+      ],
+      "after": [
+        2248,
+        1991,
+        41
+      ],
+      "installed_config_id": 2248
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        24,
+        64,
+        64,
+        448
+      ],
+      "median_speedup": 1.0359243420915307,
+      "before": [
+        1896,
+        242
+      ],
+      "after": [
+        2249,
+        1896,
+        242
+      ],
+      "installed_config_id": 2249
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        384,
+        2048
+      ],
+      "median_speedup": 1.0337572141326574,
+      "before": [
+        1946,
+        129
+      ],
+      "after": [
+        2250,
+        1946,
+        129
+      ],
+      "installed_config_id": 2250
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        64,
+        512,
+        256
+      ],
+      "median_speedup": 1.033417622802571,
+      "before": [
+        235
+      ],
+      "after": [
+        2251,
+        235
+      ],
+      "installed_config_id": 2251
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1000,
+        384
+      ],
+      "median_speedup": 1.031252469097978,
+      "before": [
+        2044,
+        41
+      ],
+      "after": [
+        2252,
+        2044,
+        41
+      ],
+      "installed_config_id": 2252
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        256,
+        256,
+        64
+      ],
+      "median_speedup": 1.0310079700502732,
+      "before": [
+        2171,
+        341
+      ],
+      "after": [
+        2253,
+        2171,
+        341
+      ],
+      "installed_config_id": 2253
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1000,
+        256
+      ],
+      "median_speedup": 1.0291702084229413,
+      "before": [
+        41
+      ],
+      "after": [
+        2254,
+        41
+      ],
+      "installed_config_id": 2254
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1000,
+        640
+      ],
+      "median_speedup": 1.0288661420644887,
+      "before": [
+        2045,
+        41
+      ],
+      "after": [
+        2255,
+        2045,
+        41
+      ],
+      "installed_config_id": 2255
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        256,
+        1024,
+        1024
+      ],
+      "median_speedup": 1.028709451773854,
+      "before": [
+        238
+      ],
+      "after": [
+        2256,
+        238
+      ],
+      "installed_config_id": 2256
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        512,
+        256,
+        1024
+      ],
+      "median_speedup": 1.0266668012204305,
+      "before": [
+        2037,
+        73
+      ],
+      "after": [
+        2257,
+        2037,
+        73
+      ],
+      "installed_config_id": 2257
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1000,
+        768
+      ],
+      "median_speedup": 1.0259703532822144,
+      "before": [
+        130
+      ],
+      "after": [
+        2247,
+        130
+      ],
+      "installed_config_id": 2247
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        256,
+        512,
+        1024
+      ],
+      "median_speedup": 1.0254366042314993,
+      "before": [
+        238,
+        41
+      ],
+      "after": [
+        2243,
+        238,
+        41
+      ],
+      "installed_config_id": 2243
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1000,
+        128
+      ],
+      "median_speedup": 1.0250455712594,
+      "before": [
+        129
+      ],
+      "after": [
+        2258,
+        129
+      ],
+      "installed_config_id": 2258
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        6,
+        64,
+        512,
+        512
+      ],
+      "median_speedup": 1.0244854362043487,
+      "before": [
+        2099,
+        236
+      ],
+      "after": [
+        2259,
+        2099,
+        236
+      ],
+      "installed_config_id": 2259
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        512,
+        256,
+        128
+      ],
+      "median_speedup": 1.0243902162009948,
+      "before": [
+        120
+      ],
+      "after": [
+        2260,
+        120
+      ],
+      "installed_config_id": 2260
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        256,
+        512,
+        512
+      ],
+      "median_speedup": 1.024336274923535,
+      "before": [
+        80
+      ],
+      "after": [
+        2261,
+        80
+      ],
+      "installed_config_id": 2261
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        4,
+        512,
+        64,
+        512
+      ],
+      "median_speedup": 1.0235757371392906,
+      "before": [
+        2081,
+        209
+      ],
+      "after": [
+        2262,
+        2081,
+        209
+      ],
+      "installed_config_id": 2262
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        512,
+        128,
+        256
+      ],
+      "median_speedup": 1.0225229610710178,
+      "before": [
+        2035,
+        117
+      ],
+      "after": [
+        2263,
+        2035,
+        117
+      ],
+      "installed_config_id": 2263
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        256,
+        128
+      ],
+      "median_speedup": 1.0222549278028827,
+      "before": [
+        152
+      ],
+      "after": [
+        2264,
+        152
+      ],
+      "installed_config_id": 2264
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        1152,
+        384
+      ],
+      "median_speedup": 1.0217391056772713,
+      "before": [
+        41
+      ],
+      "after": [
+        2265,
+        41
+      ],
+      "installed_config_id": 2265
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        1024,
+        256,
+        512
+      ],
+      "median_speedup": 1.021424114310284,
+      "before": [
+        101,
+        73
+      ],
+      "after": [
+        2266,
+        101,
+        73
+      ],
+      "installed_config_id": 2266
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        64,
+        1152,
+        384
+      ],
+      "median_speedup": 1.0210132474099354,
+      "before": [
+        2100,
+        73
+      ],
+      "after": [
+        2267,
+        2100,
+        73
+      ],
+      "installed_config_id": 2267
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        128,
+        256,
+        64
+      ],
+      "median_speedup": 1.0203574275135052,
+      "before": [
+        158
+      ],
+      "after": [
+        2268,
+        158
+      ],
+      "installed_config_id": 2268
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        1000,
+        128,
+        64
+      ],
+      "median_speedup": 1.0198541796287905,
+      "before": [
+        244
+      ],
+      "after": [
+        2269,
+        244
+      ],
+      "installed_config_id": 2269
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        128,
+        128,
+        64
+      ],
+      "median_speedup": 1.019468630929791,
+      "before": [
+        230
+      ],
+      "after": [
+        2270,
+        230
+      ],
+      "installed_config_id": 2270
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        512,
+        2048
+      ],
+      "median_speedup": 1.0191743242149869,
+      "before": [
+        1946,
+        129
+      ],
+      "after": [
+        2271,
+        1946,
+        129
+      ],
+      "installed_config_id": 2271
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        64,
+        256,
+        128
+      ],
+      "median_speedup": 1.0160574721287245,
+      "before": [
+        423
+      ],
+      "after": [
+        2272,
+        423
+      ],
+      "installed_config_id": 2272
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        256,
+        128,
+        64
+      ],
+      "median_speedup": 1.0155217146849214,
+      "before": [
+        339
+      ],
+      "after": [
+        2273,
+        339
+      ]
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        512,
+        256,
+        256
+      ],
+      "median_speedup": 1.0151735171898892,
+      "before": [
+        121
+      ],
+      "after": [
+        2274,
+        121
+      ],
+      "installed_config_id": 2274
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        128,
+        256
+      ],
+      "median_speedup": 1.0143198952763068,
+      "before": [
+        241
+      ],
+      "after": [
+        2275,
+        241
+      ],
+      "installed_config_id": 2275
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        256,
+        256
+      ],
+      "median_speedup": 1.0139547003171394,
+      "before": [
+        2210,
+        241
+      ],
+      "after": [
+        2276,
+        2210,
+        241
+      ],
+      "installed_config_id": 2276
+    },
+    {
+      "search": "low_wave_followup/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        256,
+        1024,
+        512
+      ],
+      "median_speedup": 1.0126316393174282,
+      "before": [
+        41
+      ],
+      "after": [
+        2277,
+        41
+      ],
+      "installed_config_id": 2277
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        128,
+        1000,
+        1024
+      ],
+      "median_speedup": 1.0478835874425267,
+      "before": [
+        1931,
+        41
+      ],
+      "after": [
+        2278,
+        1931,
+        41
+      ],
+      "installed_config_id": 2278
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "bmm",
+        "float16",
+        36,
+        512,
+        64,
+        512
+      ],
+      "median_speedup": 1.0369130096562873,
+      "before": [
+        2082,
+        211
+      ],
+      "after": [
+        2279,
+        2082,
+        211
+      ],
+      "installed_config_id": 2279
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        128,
+        2048,
+        2048
+      ],
+      "median_speedup": 1.0368907021324743,
+      "before": [
+        1908,
+        43
+      ],
+      "after": [
+        238,
+        1908,
+        43
+      ],
+      "installed_config_id": 238
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        256,
+        256,
+        512
+      ],
+      "median_speedup": 1.0341226348762595,
+      "before": [
+        41
+      ],
+      "after": [
+        2280,
+        41
+      ],
+      "installed_config_id": 2280
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        128,
+        1000,
+        1984
+      ],
+      "median_speedup": 1.0338065701308592,
+      "before": [
+        42
+      ],
+      "after": [
+        2281,
+        42
+      ],
+      "installed_config_id": 2281
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        256,
+        1024
+      ],
+      "median_speedup": 1.0314320312893441,
+      "before": [
+        409
+      ],
+      "after": [
+        2282,
+        409
+      ],
+      "installed_config_id": 2282
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        256,
+        128,
+        64
+      ],
+      "median_speedup": 1.0206719800335153,
+      "before": [
+        2273,
+        339
+      ],
+      "after": [
+        2283,
+        2273,
+        339
+      ],
+      "installed_config_id": 2283
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        512,
+        256,
+        64
+      ],
+      "median_speedup": 1.02006033876599,
+      "before": [
+        339
+      ],
+      "after": [
+        2284,
+        339
+      ],
+      "installed_config_id": 2284
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        64,
+        256,
+        128
+      ],
+      "median_speedup": 1.0195609612201122,
+      "before": [
+        2046,
+        131
+      ],
+      "after": [
+        2285,
+        2046,
+        131
+      ],
+      "installed_config_id": 2285
+    },
+    {
+      "search": "low_wave_followup/additional_installation",
+      "shape": [
+        "bmm",
+        "float16",
+        12,
+        64,
+        64,
+        448
+      ],
+      "median_speedup": 1.0135046811529493,
+      "before": [
+        2240,
+        2102,
+        241
+      ],
+      "after": [
+        2286,
+        2240,
+        2102,
+        241
+      ],
+      "installed_config_id": 2286
+    },
+    {
+      "search": "smem_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        8192,
+        256,
+        2048
+      ],
+      "median_speedup": 1.0344508300471875,
+      "before": [
+        2051,
+        139
+      ],
+      "after": [
+        2287,
+        2051,
+        139
+      ],
+      "installed_config_id": 2287
+    },
+    {
+      "search": "smem_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        16448,
+        512,
+        512
+      ],
+      "median_speedup": 1.0329254606183047,
+      "before": [
+        1911,
+        1868,
+        61
+      ],
+      "after": [
+        2148,
+        1911,
+        1868,
+        61
+      ],
+      "installed_config_id": 2148
+    },
+    {
+      "search": "smem_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        512,
+        1024,
+        1024
+      ],
+      "median_speedup": 1.0268013071246016,
+      "before": [
+        2032,
+        115
+      ],
+      "after": [
+        2288,
+        2032,
+        115
+      ],
+      "installed_config_id": 2288
+    },
+    {
+      "search": "smem_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        2048,
+        8192,
+        128
+      ],
+      "median_speedup": 1.0243043049205456,
+      "before": [
+        328
+      ],
+      "after": [
+        2289,
+        328
+      ]
+    },
+    {
+      "search": "smem_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        24,
+        768,
+        64,
+        64
+      ],
+      "median_speedup": 1.0176306547998364,
+      "before": [
+        239
+      ],
+      "after": [
+        2290,
+        239
+      ],
+      "installed_config_id": 2290
+    },
+    {
+      "search": "register_spill_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        12608,
+        2304,
+        768
+      ],
+      "median_speedup": 1.022620350184326,
+      "before": [
+        1987,
+        34
+      ],
+      "after": [
+        2291,
+        1987,
+        34
+      ],
+      "installed_config_id": 2291
+    },
+    {
+      "search": "register_spill_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        12672,
+        2304,
+        768
+      ],
+      "median_speedup": 1.0214148254540585,
+      "before": [
+        1987,
+        34
+      ],
+      "after": [
+        2291,
+        1987,
+        34
+      ],
+      "installed_config_id": 2291
+    },
+    {
+      "search": "register_spill_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        12544,
+        3072,
+        768
+      ],
+      "median_speedup": 1.0155803278373592,
+      "before": [
+        1982,
+        1864,
+        27
+      ],
+      "after": [
+        2292,
+        1982,
+        1864,
+        27
+      ],
+      "installed_config_id": 2292
+    },
+    {
+      "search": "register_spill_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        12672,
+        3072,
+        768
+      ],
+      "median_speedup": 1.0126557217513308,
+      "before": [
+        1982,
+        1864,
+        27
+      ],
+      "after": [
+        2292,
+        1982,
+        1864,
+        27
+      ],
+      "installed_config_id": 2292
+    },
+    {
+      "search": "register_spill_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        25216,
+        1280,
+        320
+      ],
+      "median_speedup": 1.0119552243808552,
+      "before": [
+        2015,
+        1231,
+        0
+      ],
+      "after": [
+        2293,
+        2015,
+        1231,
+        0
+      ],
+      "installed_config_id": 2293
+    },
+    {
+      "search": "register_spill_sweep/tie_installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        12608,
+        3072,
+        768
+      ],
+      "median_speedup": 0.9989255257374405,
+      "before": [
+        1987,
+        36
+      ],
+      "after": [
+        2294,
+        1987,
+        36
+      ],
+      "installed_config_id": 2294
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        12,
+        768,
+        64,
+        64
+      ],
+      "median_speedup": 1.0580357006548946,
+      "before": [
+        214,
+        243
+      ],
+      "after": [
+        2295,
+        214,
+        243
+      ],
+      "installed_config_id": 2295
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        1024,
+        64,
+        144,
+        64
+      ],
+      "median_speedup": 1.0344352834636925,
+      "before": [
+        1895,
+        224
+      ],
+      "after": [
+        2296,
+        1895,
+        224
+      ],
+      "installed_config_id": 2296
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        6,
+        512,
+        64,
+        512
+      ],
+      "median_speedup": 1.0323741387542953,
+      "before": [
+        2080,
+        206
+      ],
+      "after": [
+        2297,
+        2080,
+        206
+      ],
+      "installed_config_id": 2297
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        32,
+        128,
+        64,
+        128
+      ],
+      "median_speedup": 1.0212765720294728,
+      "before": [
+        169
+      ],
+      "after": [
+        2298,
+        169
+      ],
+      "installed_config_id": 2298
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        220,
+        512,
+        512
+      ],
+      "median_speedup": 1.017937226168677,
+      "before": [
+        73
+      ],
+      "after": [
+        2299,
+        73
+      ],
+      "installed_config_id": 2299
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        128,
+        128,
+        32,
+        128
+      ],
+      "median_speedup": 1.0161812590354915,
+      "before": [
+        158,
+        165
+      ],
+      "after": [
+        2300,
+        158,
+        165
+      ],
+      "installed_config_id": 2300
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        512,
+        64,
+        16,
+        64
+      ],
+      "median_speedup": 1.015772899045422,
+      "before": [
+        225
+      ],
+      "after": [
+        2301,
+        225
+      ],
+      "installed_config_id": 2301
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        1000,
+        256,
+        64
+      ],
+      "median_speedup": 1.0150753452825763,
+      "before": [
+        250
+      ],
+      "after": [
+        2302,
+        250
+      ],
+      "installed_config_id": 2302
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        50176,
+        192,
+        192
+      ],
+      "median_speedup": 1.0127340918031145,
+      "before": [
+        2202,
+        391
+      ],
+      "after": [
+        2303,
+        2202,
+        391
+      ]
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        24,
+        64,
+        64,
+        768
+      ],
+      "median_speedup": 1.0101010873073781,
+      "before": [
+        238
+      ],
+      "after": [
+        2304,
+        238
+      ],
+      "installed_config_id": 2304
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        512,
+        256,
+        64,
+        256
+      ],
+      "median_speedup": 1.010005893397141,
+      "before": [
+        2071,
+        1
+      ],
+      "after": [
+        2305,
+        2071,
+        1
+      ],
+      "installed_config_id": 2305
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        12,
+        448,
+        64,
+        64
+      ],
+      "median_speedup": 1.0092165932610817,
+      "before": [
+        2075,
+        194
+      ],
+      "after": [
+        2306,
+        2075,
+        194
+      ],
+      "installed_config_id": 2306
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        64,
+        128,
+        32,
+        128
+      ],
+      "median_speedup": 1.0077519974478872,
+      "before": [
+        165
+      ],
+      "after": [
+        2307,
+        165
+      ],
+      "installed_config_id": 2307
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        512,
+        256,
+        16,
+        256
+      ],
+      "median_speedup": 1.0048984860876364,
+      "before": [
+        2069,
+        186
+      ],
+      "after": [
+        2308,
+        2069,
+        186
+      ],
+      "installed_config_id": 2308
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        24,
+        64,
+        64,
+        1024
+      ],
+      "median_speedup": 1.002993947536252,
+      "before": [
+        238
+      ],
+      "after": [
+        2309,
+        238
+      ],
+      "installed_config_id": 2309
+    },
+    {
+      "search": "padding_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        4096,
+        144,
+        32,
+        64
+      ],
+      "median_speedup": 0.99949160773992,
+      "before": [
+        2064,
+        174
+      ],
+      "after": [
+        2310,
+        2064,
+        174
+      ],
+      "installed_config_id": 2310
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        7936,
+        2048,
+        512
+      ],
+      "median_speedup": 1.0361445022689884,
+      "before": [
+        1130,
+        136
+      ],
+      "after": [
+        2311,
+        1130,
+        136
+      ],
+      "installed_config_id": 2311
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        6272,
+        1280,
+        320
+      ],
+      "median_speedup": 1.0290135366030504,
+      "before": [
+        2042,
+        127
+      ],
+      "after": [
+        2312,
+        2042,
+        127
+      ],
+      "installed_config_id": 2312
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        16448,
+        2048,
+        512
+      ],
+      "median_speedup": 1.0288161770634736,
+      "before": [
+        2004,
+        1231,
+        59
+      ],
+      "after": [
+        2313,
+        2004,
+        1231,
+        59
+      ],
+      "installed_config_id": 2313
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        6272,
+        1280,
+        256
+      ],
+      "median_speedup": 1.0167014667054313,
+      "before": [
+        2042,
+        127
+      ],
+      "after": [
+        2312,
+        2042,
+        127
+      ],
+      "installed_config_id": 2312
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        6272,
+        1280,
+        320
+      ],
+      "median_speedup": 1.0151802708942586,
+      "before": [
+        416
+      ],
+      "after": [
+        2312,
+        416
+      ],
+      "installed_config_id": 2312
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        2048,
+        1024,
+        32000
+      ],
+      "median_speedup": 1.0071929875349674,
+      "before": [
+        310
+      ],
+      "after": [
+        2314,
+        310
+      ],
+      "installed_config_id": 2314
+    },
+    {
+      "search": "output_tail_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        30000,
+        128,
+        4096
+      ],
+      "median_speedup": 1.0051913110065902,
+      "before": [
+        2241,
+        347
+      ],
+      "after": [
+        2315,
+        2241,
+        347
+      ]
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        64,
+        512,
+        1024,
+        64
+      ],
+      "median_speedup": 1.0264912975874245,
+      "before": [
+        1892,
+        195
+      ],
+      "after": [
+        2316,
+        1892,
+        195
+      ],
+      "installed_config_id": 2316
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        48,
+        128,
+        128,
+        64
+      ],
+      "median_speedup": 1.0222103878703805,
+      "before": [
+        2058,
+        156
+      ],
+      "after": [
+        2317,
+        2058,
+        156
+      ],
+      "installed_config_id": 2317
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        48,
+        1024,
+        1024,
+        64
+      ],
+      "median_speedup": 1.0196681950220072,
+      "before": [
+        1887,
+        145
+      ],
+      "after": [
+        2318,
+        1887,
+        145
+      ],
+      "installed_config_id": 2318
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        12,
+        64,
+        448,
+        64
+      ],
+      "median_speedup": 1.0188236055907292,
+      "before": [
+        2095,
+        231
+      ],
+      "after": [
+        2319,
+        2095,
+        231
+      ],
+      "installed_config_id": 2319
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        12,
+        1024,
+        64,
+        64
+      ],
+      "median_speedup": 1.0186722204664656,
+      "before": [
+        150
+      ],
+      "after": [
+        2320,
+        150
+      ],
+      "installed_config_id": 2320
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        144,
+        192,
+        64,
+        64
+      ],
+      "median_speedup": 1.0165293622651612,
+      "before": [
+        155
+      ],
+      "after": [
+        2321,
+        155
+      ],
+      "installed_config_id": 2321
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        32,
+        128,
+        128,
+        64
+      ],
+      "median_speedup": 1.0158998524400076,
+      "before": [
+        154
+      ],
+      "after": [
+        2322,
+        154
+      ],
+      "installed_config_id": 2322
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        1568,
+        128,
+        64
+      ],
+      "median_speedup": 1.0144697586255114,
+      "before": [
+        47
+      ],
+      "after": [
+        2323,
+        47
+      ],
+      "installed_config_id": 2323
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        384,
+        1152,
+        64
+      ],
+      "median_speedup": 1.0144231169489166,
+      "before": [
+        192
+      ],
+      "after": [
+        2324,
+        192
+      ],
+      "installed_config_id": 2324
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        24,
+        64,
+        1024,
+        64
+      ],
+      "median_speedup": 1.0134590469778884,
+      "before": [
+        220
+      ],
+      "after": [
+        2325,
+        220
+      ],
+      "installed_config_id": 2325
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        384,
+        384,
+        64
+      ],
+      "median_speedup": 1.012393201581114,
+      "before": [
+        367
+      ],
+      "after": [
+        2326,
+        367
+      ],
+      "installed_config_id": 2326
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        144,
+        64,
+        192,
+        64
+      ],
+      "median_speedup": 1.0122096560686455,
+      "before": [
+        227
+      ],
+      "after": [
+        2327,
+        227
+      ],
+      "installed_config_id": 2327
+    },
+    {
+      "search": "register_occupancy_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        1000,
+        512,
+        64
+      ],
+      "median_speedup": 1.010595910516185,
+      "before": [
+        155
+      ],
+      "after": [
+        2328,
+        155
+      ],
+      "installed_config_id": 2328
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        50176,
+        512,
+        256
+      ],
+      "median_speedup": 1.172002686117013,
+      "before": [
+        395
+      ],
+      "after": [
+        114,
+        395
+      ],
+      "installed_config_id": 114
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        4096,
+        30000,
+        128
+      ],
+      "median_speedup": 1.1445616019885443,
+      "before": [
+        104
+      ],
+      "after": [
+        2329,
+        104
+      ],
+      "installed_config_id": 2329
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        25088,
+        256,
+        128
+      ],
+      "median_speedup": 1.1234735741758908,
+      "before": [
+        2169,
+        337
+      ],
+      "after": [
+        2330,
+        2169,
+        337
+      ],
+      "installed_config_id": 2330
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        1024,
+        30000,
+        128
+      ],
+      "median_speedup": 1.0908688174741878,
+      "before": [
+        1863,
+        10
+      ],
+      "after": [
+        2331,
+        1863,
+        10
+      ],
+      "installed_config_id": 2331
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        25088,
+        1024,
+        256
+      ],
+      "median_speedup": 1.0871681879985897,
+      "before": [
+        1916,
+        333
+      ],
+      "after": [
+        2332,
+        1916,
+        333
+      ],
+      "installed_config_id": 2332
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        32768,
+        256,
+        256
+      ],
+      "median_speedup": 1.0649573646276307,
+      "before": [
+        365
+      ],
+      "after": [
+        2333,
+        365
+      ],
+      "installed_config_id": 2333
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        4096,
+        4096,
+        64
+      ],
+      "median_speedup": 1.0589284988546084,
+      "before": [
+        328
+      ],
+      "after": [
+        2334,
+        328
+      ],
+      "installed_config_id": 2334
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        50176,
+        192,
+        192
+      ],
+      "median_speedup": 1.0580644882668848,
+      "before": [
+        2303,
+        2202,
+        391
+      ],
+      "after": [
+        2335,
+        2303,
+        2202,
+        391
+      ],
+      "installed_config_id": 2335
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        2048,
+        8192,
+        128
+      ],
+      "median_speedup": 1.046606678984036,
+      "before": [
+        2289,
+        328
+      ],
+      "after": [
+        2336,
+        2289,
+        328
+      ],
+      "installed_config_id": 2336
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        16384,
+        384,
+        192
+      ],
+      "median_speedup": 1.0407673472612493,
+      "before": [
+        2146,
+        1910,
+        305
+      ],
+      "after": [
+        2337,
+        2146,
+        1910,
+        305
+      ],
+      "installed_config_id": 2337
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        25088,
+        1024,
+        128
+      ],
+      "median_speedup": 1.0393479197780007,
+      "before": [
+        592,
+        74
+      ],
+      "after": [
+        2338,
+        592,
+        74
+      ],
+      "installed_config_id": 2338
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        12608,
+        768,
+        256
+      ],
+      "median_speedup": 1.0389863107610533,
+      "before": [
+        1989,
+        40
+      ],
+      "after": [
+        2339,
+        1989,
+        40
+      ],
+      "installed_config_id": 2339
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        25088,
+        1024,
+        128
+      ],
+      "median_speedup": 1.0381166219222453,
+      "before": [
+        592,
+        332
+      ],
+      "after": [
+        2338,
+        592,
+        332
+      ],
+      "installed_config_id": 2338
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        12544,
+        768,
+        256
+      ],
+      "median_speedup": 1.0377734168962378,
+      "before": [
+        2128,
+        31
+      ],
+      "after": [
+        2340,
+        2128,
+        31
+      ],
+      "installed_config_id": 2340
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        2048,
+        512,
+        128
+      ],
+      "median_speedup": 1.029411806066987,
+      "before": [
+        70
+      ],
+      "after": [
+        2341,
+        70
+      ],
+      "installed_config_id": 2341
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        384,
+        64,
+        128,
+        128
+      ],
+      "median_speedup": 1.0293039312876717,
+      "before": [
+        222
+      ],
+      "after": [
+        2342,
+        222
+      ],
+      "installed_config_id": 2342
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        25088,
+        1536,
+        384
+      ],
+      "median_speedup": 1.0272925939011588,
+      "before": [
+        2167,
+        1917,
+        335
+      ],
+      "after": [
+        2343,
+        2167,
+        1917,
+        335
+      ],
+      "installed_config_id": 2343
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        8192,
+        10000,
+        256
+      ],
+      "median_speedup": 1.0267741713313534,
+      "before": [
+        443
+      ],
+      "after": [
+        2344,
+        443
+      ],
+      "installed_config_id": 2344
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        50257,
+        2048,
+        128
+      ],
+      "median_speedup": 1.0208483357898,
+      "before": [
+        2204,
+        1968,
+        396
+      ],
+      "after": [
+        2345,
+        2204,
+        1968,
+        396
+      ],
+      "installed_config_id": 2345
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        1024,
+        4096,
+        256
+      ],
+      "median_speedup": 1.020408149412111,
+      "before": [
+        1900,
+        13
+      ],
+      "after": [
+        2346,
+        1900,
+        13
+      ],
+      "installed_config_id": 2346
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        50176,
+        256,
+        256
+      ],
+      "median_speedup": 1.0196802029664571,
+      "before": [
+        113
+      ],
+      "after": [
+        2347,
+        113
+      ],
+      "installed_config_id": 2347
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        100480,
+        384,
+        128
+      ],
+      "median_speedup": 1.017894420709637,
+      "before": [
+        1972,
+        6
+      ],
+      "after": [
+        2348,
+        1972,
+        6
+      ],
+      "installed_config_id": 2348
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        4096,
+        768,
+        128
+      ],
+      "median_speedup": 1.0171821611724103,
+      "before": [
+        2029,
+        108
+      ],
+      "after": [
+        2349,
+        2029,
+        108
+      ],
+      "installed_config_id": 2349
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        50176,
+        1024,
+        256
+      ],
+      "median_speedup": 1.0169216721839365,
+      "before": [
+        1879,
+        0
+      ],
+      "after": [
+        2350,
+        1879,
+        0
+      ],
+      "installed_config_id": 2350
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        36,
+        512,
+        512,
+        64
+      ],
+      "median_speedup": 1.0161090602387617,
+      "before": [
+        202
+      ],
+      "after": [
+        2351,
+        202
+      ],
+      "installed_config_id": 2351
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        2048,
+        2048,
+        128
+      ],
+      "median_speedup": 1.0160256703256028,
+      "before": [
+        313
+      ],
+      "after": [
+        2352,
+        313
+      ],
+      "installed_config_id": 2352
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        100352,
+        512,
+        64
+      ],
+      "median_speedup": 1.0147259192191316,
+      "before": [
+        1897,
+        0
+      ],
+      "after": [
+        2353,
+        1897,
+        0
+      ],
+      "installed_config_id": 2353
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        4096,
+        768,
+        128
+      ],
+      "median_speedup": 1.0142857187403822,
+      "before": [
+        384
+      ],
+      "after": [
+        2354,
+        384
+      ],
+      "installed_config_id": 2354
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        401536,
+        512,
+        64
+      ],
+      "median_speedup": 1.01313879053843,
+      "before": [
+        2024,
+        95
+      ],
+      "after": [
+        2355,
+        2024,
+        95
+      ],
+      "installed_config_id": 2355
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        192,
+        128,
+        64,
+        128
+      ],
+      "median_speedup": 1.0129533911202706,
+      "before": [
+        166
+      ],
+      "after": [
+        2356,
+        166
+      ],
+      "installed_config_id": 2356
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        6272,
+        128,
+        128
+      ],
+      "median_speedup": 1.0121950959811161,
+      "before": [
+        49
+      ],
+      "after": [
+        2357,
+        49
+      ],
+      "installed_config_id": 2357
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        50176,
+        768,
+        256
+      ],
+      "median_speedup": 1.0116549645299615,
+      "before": [
+        1879,
+        114
+      ],
+      "after": [
+        2358,
+        1879,
+        114
+      ],
+      "installed_config_id": 2358
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        8192,
+        2048,
+        128
+      ],
+      "median_speedup": 1.0108968839336319,
+      "before": [
+        444
+      ],
+      "after": [
+        2359,
+        444
+      ],
+      "installed_config_id": 2359
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        401536,
+        512,
+        64
+      ],
+      "median_speedup": 1.010664836957435,
+      "before": [
+        2191,
+        369
+      ],
+      "after": [
+        2360,
+        2191,
+        369
+      ],
+      "installed_config_id": 2360
+    },
+    {
+      "search": "output_write_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        32,
+        1024,
+        1024,
+        64
+      ],
+      "median_speedup": 1.0104253363227829,
+      "before": [
+        1888,
+        146
+      ],
+      "after": [
+        2361,
+        1888,
+        146
+      ],
+      "installed_config_id": 2361
+    },
+    {
+      "search": "reduction_parallelism_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        8192,
+        256,
+        2048
+      ],
+      "median_speedup": 1.031559430815511,
+      "before": [
+        447
+      ],
+      "after": [
+        2362,
+        447
+      ],
+      "installed_config_id": 2362
+    },
+    {
+      "search": "input_reuse_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        256,
+        256,
+        256,
+        64
+      ],
+      "median_speedup": 1.039735094232037,
+      "before": [
+        192,
+        160
+      ],
+      "after": [
+        2363,
+        192,
+        160
+      ],
+      "installed_config_id": 2363
+    },
+    {
+      "search": "input_reuse_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        4,
+        512,
+        512,
+        64
+      ],
+      "median_speedup": 1.0277777871347191,
+      "before": [
+        2079,
+        1894,
+        201
+      ],
+      "after": [
+        201,
+        2079,
+        1894
+      ],
+      "installed_config_id": 201
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        3136,
+        2048,
+        1024
+      ],
+      "median_speedup": 1.0313845671542308,
+      "before": [
+        362
+      ],
+      "after": [
+        2364,
+        362
+      ],
+      "installed_config_id": 2364
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        16448,
+        512,
+        2048
+      ],
+      "median_speedup": 1.02810018373993,
+      "before": [
+        60
+      ],
+      "after": [
+        2365,
+        60
+      ],
+      "installed_config_id": 2365
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        4160,
+        4096,
+        1024
+      ],
+      "median_speedup": 1.0248537864390173,
+      "before": [
+        1936,
+        388
+      ],
+      "after": [
+        2366,
+        1936,
+        388
+      ],
+      "installed_config_id": 2366
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        8192,
+        2048,
+        512
+      ],
+      "median_speedup": 1.0202117840093528,
+      "before": [
+        2050,
+        138
+      ],
+      "after": [
+        2367,
+        2050,
+        138
+      ],
+      "installed_config_id": 2367
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        8192,
+        2048,
+        256
+      ],
+      "median_speedup": 1.0198675471160186,
+      "before": [
+        138
+      ],
+      "after": [
+        2368,
+        138
+      ],
+      "installed_config_id": 2368
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        64,
+        64,
+        128,
+        128
+      ],
+      "median_speedup": 1.0187266256451621,
+      "before": [
+        2091,
+        221
+      ],
+      "after": [
+        2369,
+        2091,
+        221
+      ],
+      "installed_config_id": 2369
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        64,
+        512,
+        512,
+        64
+      ],
+      "median_speedup": 1.0149960761512413,
+      "before": [
+        2077,
+        160
+      ],
+      "after": [
+        2370,
+        2077,
+        160
+      ],
+      "installed_config_id": 2370
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "addmm",
+        "float16",
+        1,
+        12608,
+        384,
+        384
+      ],
+      "median_speedup": 1.014613768177362,
+      "before": [
+        1958,
+        38
+      ],
+      "after": [
+        2371,
+        1958,
+        38
+      ],
+      "installed_config_id": 2371
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "mm",
+        "float16",
+        1,
+        30000,
+        128,
+        4096
+      ],
+      "median_speedup": 1.0137648992557042,
+      "before": [
+        2315,
+        2241,
+        347
+      ],
+      "after": [
+        2372,
+        2315,
+        2241,
+        347
+      ],
+      "installed_config_id": 2372
+    },
+    {
+      "search": "address_generation_sweep/installation",
+      "shape": [
+        "bmm",
+        "float16",
+        512,
+        128,
+        256,
+        256
+      ],
+      "median_speedup": 1.010978718104418,
+      "before": [
+        163
+      ],
+      "after": [
+        1961,
+        163
+      ],
+      "installed_config_id": 1961
+    }
+  ],
+  "final_geomean": {
+    "protocol": "inference-v5-isolated-gemm",
+    "rounds": 100,
+    "physical_gpus": [
+      5,
+      2,
+      4,
+      0,
+      3
+    ],
+    "weighting": "One equal weight per canonical operator shape, not corpus frequency",
+    "current_mapper": {
+      "shapes": 749,
+      "geomean_speedup": 1.112853653289132,
+      "geomean_pct": 111.2853653289132,
+      "throughput_gain_pct": 11.2853653289132,
+      "equivalent_latency_reduction_pct": 10.140924905586967,
+      "frequency_weighted_geomean_speedup": 1.1019707408904527,
+      "median_pct": 110.55276363536382,
+      "wins": 724,
+      "min_pct": 90.84830964955289,
+      "max_pct": 154.60947280852628
+    },
+    "with_address_recommendations": {
+      "shapes": 749,
+      "geomean_speedup": 1.1130616411301273,
+      "geomean_pct": 111.30616411301273,
+      "throughput_gain_pct": 11.306164113012729,
+      "equivalent_latency_reduction_pct": 10.157716064613654,
+      "frequency_weighted_geomean_speedup": 1.1019761025925419,
+      "median_pct": 110.55276363536382,
+      "wins": 724,
+      "min_pct": 90.84830964955289,
+      "max_pct": 154.60947280852628
+    },
+    "by_operation": {
+      "mm": {
+        "current_mapper": {
+          "shapes": 405,
+          "geomean_speedup": 1.0926109432759676,
+          "geomean_pct": 109.26109432759677,
+          "throughput_gain_pct": 9.261094327596764,
+          "equivalent_latency_reduction_pct": 8.476113464349256,
+          "frequency_weighted_geomean_speedup": 1.0771302041089008,
+          "median_pct": 108.6566062883497,
+          "wins": 384,
+          "min_pct": 90.84830964955289,
+          "max_pct": 144.13326907162406
+        },
+        "with_address_recommendations": {
+          "shapes": 405,
+          "geomean_speedup": 1.0927832019827926,
+          "geomean_pct": 109.27832019827926,
+          "throughput_gain_pct": 9.278320198279255,
+          "equivalent_latency_reduction_pct": 8.490540650189605,
+          "frequency_weighted_geomean_speedup": 1.077142160757962,
+          "median_pct": 108.6566062883497,
+          "wins": 384,
+          "min_pct": 90.84830964955289,
+          "max_pct": 144.13326907162406
+        }
+      },
+      "addmm": {
+        "current_mapper": {
+          "shapes": 205,
+          "geomean_speedup": 1.1272319034306768,
+          "geomean_pct": 112.72319034306769,
+          "throughput_gain_pct": 12.723190343067682,
+          "equivalent_latency_reduction_pct": 11.28710987006778,
+          "frequency_weighted_geomean_speedup": 1.11592536338781,
+          "median_pct": 112.43017316129227,
+          "wins": 201,
+          "min_pct": 93.67999830126759,
+          "max_pct": 154.60947280852628
+        },
+        "with_address_recommendations": {
+          "shapes": 205,
+          "geomean_speedup": 1.1276982040020946,
+          "geomean_pct": 112.76982040020947,
+          "throughput_gain_pct": 12.769820400209465,
+          "equivalent_latency_reduction_pct": 11.32379244277465,
+          "frequency_weighted_geomean_speedup": 1.116102570057669,
+          "median_pct": 112.43017316129227,
+          "wins": 201,
+          "min_pct": 93.67999830126759,
+          "max_pct": 154.60947280852628
+        }
+      },
+      "bmm": {
+        "current_mapper": {
+          "shapes": 139,
+          "geomean_speedup": 1.151979817375168,
+          "geomean_pct": 115.19798173751681,
+          "throughput_gain_pct": 15.197981737516809,
+          "equivalent_latency_reduction_pct": 13.192923615750507,
+          "frequency_weighted_geomean_speedup": 1.1407957980962546,
+          "median_pct": 113.76146580773876,
+          "wins": 139,
+          "min_pct": 103.5242303174606,
+          "max_pct": 133.37941138255468
+        },
+        "with_address_recommendations": {
+          "shapes": 139,
+          "geomean_speedup": 1.1519080573510883,
+          "geomean_pct": 115.19080573510882,
+          "throughput_gain_pct": 15.190805735108825,
+          "equivalent_latency_reduction_pct": 13.187515824866603,
+          "frequency_weighted_geomean_speedup": 1.1406067404432656,
+          "median_pct": 113.76146580773876,
+          "wins": 139,
+          "min_pct": 103.5242303174606,
+          "max_pct": 133.37941138255468
+        }
+      }
+    },
+    "replacements": 10,
+    "replacement_same_run_comparisons": [
+      {
+        "shape_id": "bmm-m512-n512-k64-36c17be3882f",
+        "gpu": 0,
+        "current_us": 20.368000492453575,
+        "proposed_us": 20.896000787615776,
+        "same_run_speedup": 0.9747319929526838
+      },
+      {
+        "shape_id": "bmm-m64-n128-k128-f0f489ca5ae2",
+        "gpu": 0,
+        "current_us": 8.960000239312649,
+        "proposed_us": 8.895999751985073,
+        "same_run_speedup": 1.007194299585417
+      },
+      {
+        "shape_id": "addmm-m12608-n384-k384-190bc0c13686",
+        "gpu": 0,
+        "current_us": 15.728000551462173,
+        "proposed_us": 15.456000342965126,
+        "same_run_speedup": 1.0175983567845124
+      },
+      {
+        "shape_id": "mm-m4160-n4096-k1024-c23537da7fff",
+        "gpu": 0,
+        "current_us": 56.01599998772144,
+        "proposed_us": 54.71999943256378,
+        "same_run_speedup": 1.0236842209173418
+      },
+      {
+        "shape_id": "mm-m30000-n128-k4096-67da4c2755d9",
+        "gpu": 0,
+        "current_us": 130.96000254154205,
+        "proposed_us": 129.7920048236847,
+        "same_run_speedup": 1.0089989958891845
+      },
+      {
+        "shape_id": "addmm-m16448-n512-k2048-a439d88cb69d",
+        "gpu": 3,
+        "current_us": 52.8159998357296,
+        "proposed_us": 51.32799968123436,
+        "same_run_speedup": 1.0289900281276547
+      },
+      {
+        "shape_id": "bmm-m128-n256-k256-b87947071980",
+        "gpu": 3,
+        "current_us": 69.15199756622314,
+        "proposed_us": 68.4799998998642,
+        "same_run_speedup": 1.0098130500487965
+      },
+      {
+        "shape_id": "addmm-m8192-n2048-k512-c6876f1706d2",
+        "gpu": 4,
+        "current_us": 33.56799855828285,
+        "proposed_us": 32.96000137925148,
+        "same_run_speedup": 1.0184465155821902
+      },
+      {
+        "shape_id": "addmm-m8192-n2048-k256-623737ab0d41",
+        "gpu": 4,
+        "current_us": 24.464000016450882,
+        "proposed_us": 23.96799996495247,
+        "same_run_speedup": 1.0206942611909084
+      },
+      {
+        "shape_id": "mm-m3136-n2048-k1024-7f5bb9ab9ec0",
+        "gpu": 5,
+        "current_us": 26.847999542951584,
+        "proposed_us": 26.016000658273697,
+        "same_run_speedup": 1.0319802761233898
+      }
+    ],
+    "mapping_changed": false,
+    "previous_full_run_geomean_pct": 110.65078538117346,
+    "historical_full_runs": [
+      {
+        "label": "Before the November 6 heuristic resweep",
+        "geomean_pct": 106.17691148543507,
+        "source": "docs/gemm_time_20261106/inference_v5_isolated/summary.json"
+      },
+      {
+        "label": "November 6 final installed mapper",
+        "geomean_pct": 110.71350311405901,
+        "source": ".benchmarks/oss_gemm/heuristic_resweep_20261106/jit_update2/summary.json"
+      },
+      {
+        "label": "November 6 final repeat",
+        "geomean_pct": 110.74504623279384,
+        "source": ".benchmarks/oss_gemm/heuristic_resweep_20261106/jit_update2_repeat/summary.json"
+      },
+      {
+        "label": "November 13 current mapper evaluation",
+        "geomean_pct": 110.65078538117346,
+        "source": "docs/partial_unroll_oss_20261113/summary.json"
+      }
+    ],
+    "comparison_correction": "The initial report incorrectly called the pre-resweep 106.177% result the previous full run. The tuned mapper already measured about 110.7%."
+  },
+  "source_measurement_hashes": {
+    "ayla/gemm_schedule_table.py": "86c2aedde5a230884f989f581cb1ea48a25e5aa0145f73844857b3fe090fefcd",
+    "ayla/gemm_jit.py": "40928bed40da1519b16e256cade567c306a29a73828677c2b1cae84a6a180f93"
+  }
+}

@@ -21,9 +21,12 @@ from functools import cache
 
 import torch
 
-from .gemm_schedule_table import CONFIGS, SCHEDULES, DEFERRED_GEMM_SHAPES
+from .gemm_schedule_table import CONFIGS, SCHEDULES, DEFERRED_GEMM_SHAPES, DEFERRED_OUTPUT_WIDTHS
 from .gpu_dialect import CollectiveAxis, GmemTensorType, KernelOp, ModuleOp, gpu_dialect
 from .jit_compiler import ShapeSpecializingJITCompiler
+from .gemm_schedule_metrics import (
+    GemmScheduleRejected, gemm_schedule_metrics, validate_compiled_gemm,
+)
 from .torch_custom_call import DEFAULT_NAMESPACE, OperandKind
 
 _IR_DTYPES = {"float16": "f16", "bfloat16": "bf16"}
@@ -70,10 +73,9 @@ def apply_gemm_schedule_seed_post_build(
 
     pipeline_output = seed.pipeline_output_waves or seed.pipeline_output_writeback
     if pipeline_output:
-        if (seed.fixed_output_unroll_factor is not None
-                or seed.builder_config is None
+        if (seed.builder_config is None
                 or seed.builder_config.get("output_grid_size") is None):
-            raise ValueError("wave pipelining requires a rolled fixed grid")
+            raise ValueError("wave pipelining requires a fixed grid")
     if pipeline_output and output_loop() is not None:
         from .gpu_dialect import AsyncOp, AwaitOp
         from .pipelines.canonicalize import Canonicalize
@@ -261,7 +263,7 @@ def _seed(
         return None
     if any(name == "simt" or name.startswith("simt_") for name in captured):
         return None
-    if m <= 1 or n <= 1 or (m, n, k) in DEFERRED_GEMM_SHAPES:
+    if m <= 1 or n <= 1 or n in DEFERRED_OUTPUT_WIDTHS or (m, n, k) in DEFERRED_GEMM_SHAPES:
         return None
     transpose = bool(captured.get("transpose_output"))
     fixed_grid = captured["output_cta_count"] is not None
@@ -275,6 +277,10 @@ def _seed(
     builder_m, builder_n = (n, m) if transpose else (m, n)
     builder = _builder_config(captured)
     assert builder is not None
+    try:
+        gemm_schedule_metrics(captured, m, n, source[0]).validate()
+    except GemmScheduleRejected:
+        return None
     if captured.get("masked_global_store") and (
         not exact or operation not in ("mm", "addmm") or source[0] != 1
         or transpose or captured.get("output_store") != "global"
@@ -376,7 +382,7 @@ def select_gemm_schedule(
     if operation not in ("mm", "addmm", "bmm") or dtype not in _IR_DTYPES:
         return None
     # GEMV needs a separate design; these scalar-backed small GEMMs are deferred.
-    if m <= 1 or n <= 1 or (m, n, k) in DEFERRED_GEMM_SHAPES:
+    if m <= 1 or n <= 1 or n in DEFERRED_OUTPUT_WIDTHS or (m, n, k) in DEFERRED_GEMM_SHAPES:
         return None
     if graph:
         from . import gemm_schedule_table
@@ -523,6 +529,7 @@ def build_gemm_module(
     from .gemm_collection.gemm import schedule_matmul
 
     assert seed.builder_config is not None
+    gemm_schedule_metrics(seed.captured_config, m, n, batch).validate()
     kwargs = dict(seed.builder_config)
     ptx_optimization_level = kwargs.pop("ptx_optimization_level")
     module = _module(operation, dtype, batch, m, n, k, seed.transpose_output, lhs_column_major, rhs_column_major, lhs_batch_interleaved, rhs_batch_interleaved)
@@ -614,7 +621,9 @@ def gemm_jit_compiler(
             lhs_batch_interleaved=lhs_batch_interleaved,
             rhs_batch_interleaved=rhs_batch_interleaved,
         )
-        return make_ptx_launcher(make_ptx_kernel(scheduled))
+        launcher = make_ptx_launcher(make_ptx_kernel(scheduled))
+        validate_compiled_gemm(launcher.resources())
+        return launcher
 
     return ShapeSpecializingJITCompiler(template, compile_specialization)
 

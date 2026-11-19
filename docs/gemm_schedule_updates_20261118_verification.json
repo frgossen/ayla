@@ -1,0 +1,202 @@
+[
+  {
+    "shape_id": "mm-m3136-n2048-k1024-7f5bb9ab9ec0",
+    "shape": [
+      "mm",
+      "float16",
+      1,
+      3136,
+      2048,
+      1024
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 74,
+      "smem_bytes_per_cta": 184352,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 132
+    },
+    "max_abs_error": 0.0,
+    "relative_rms_error": 0.0
+  },
+  {
+    "shape_id": "addmm-m16448-n512-k2048-a439d88cb69d",
+    "shape": [
+      "addmm",
+      "float16",
+      1,
+      16448,
+      512,
+      2048
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 210,
+      "smem_bytes_per_cta": 230400,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 130
+    },
+    "max_abs_error": 0.125,
+    "relative_rms_error": 7.1059093897929415e-06
+  },
+  {
+    "shape_id": "mm-m4160-n4096-k1024-c23537da7fff",
+    "shape": [
+      "mm",
+      "float16",
+      1,
+      4160,
+      4096,
+      1024
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 172,
+      "smem_bytes_per_cta": 230400,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 132
+    },
+    "max_abs_error": 0.0,
+    "relative_rms_error": 0.0
+  },
+  {
+    "shape_id": "addmm-m8192-n2048-k512-c6876f1706d2",
+    "shape": [
+      "addmm",
+      "float16",
+      1,
+      8192,
+      2048,
+      512
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 176,
+      "smem_bytes_per_cta": 230400,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 128
+    },
+    "max_abs_error": 0.03125,
+    "relative_rms_error": 4.751080723508494e-06
+  },
+  {
+    "shape_id": "addmm-m8192-n2048-k256-623737ab0d41",
+    "shape": [
+      "addmm",
+      "float16",
+      1,
+      8192,
+      2048,
+      256
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 174,
+      "smem_bytes_per_cta": 214016,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 128
+    },
+    "max_abs_error": 0.03125,
+    "relative_rms_error": 4.1105722630163655e-06
+  },
+  {
+    "shape_id": "bmm-m64-n128-k128-f0f489ca5ae2",
+    "shape": [
+      "bmm",
+      "float16",
+      64,
+      64,
+      128,
+      128
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 50,
+      "smem_bytes_per_cta": 35840,
+      "resident_ctas_on_device": 792,
+      "grid_ctas": 192
+    },
+    "max_abs_error": 0.0,
+    "relative_rms_error": 0.0
+  },
+  {
+    "shape_id": "bmm-m512-n512-k64-36c17be3882f",
+    "shape": [
+      "bmm",
+      "float16",
+      64,
+      512,
+      512,
+      64
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 58,
+      "smem_bytes_per_cta": 25600,
+      "resident_ctas_on_device": 1056,
+      "grid_ctas": 4096
+    },
+    "max_abs_error": 0.0,
+    "relative_rms_error": 0.0
+  },
+  {
+    "shape_id": "addmm-m12608-n384-k384-190bc0c13686",
+    "shape": [
+      "addmm",
+      "float16",
+      1,
+      12608,
+      384,
+      384
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 122,
+      "smem_bytes_per_cta": 216064,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 132
+    },
+    "max_abs_error": 0.03125,
+    "relative_rms_error": 4.662520041165408e-06
+  },
+  {
+    "shape_id": "mm-m30000-n128-k4096-67da4c2755d9",
+    "shape": [
+      "mm",
+      "float16",
+      1,
+      30000,
+      128,
+      4096
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 167,
+      "smem_bytes_per_cta": 214016,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 469
+    },
+    "max_abs_error": 0.0,
+    "relative_rms_error": 0.0
+  },
+  {
+    "shape_id": "bmm-m128-n256-k256-b87947071980",
+    "shape": [
+      "bmm",
+      "float16",
+      512,
+      128,
+      256,
+      256
+    ],
+    "resources": {
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 167,
+      "smem_bytes_per_cta": 213120,
+      "resident_ctas_on_device": 132,
+      "grid_ctas": 512
+    },
+    "max_abs_error": 0.0,
+    "relative_rms_error": 0.0
+  }
+]

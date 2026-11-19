@@ -91,6 +91,51 @@ static uintptr_t module_get_function(
     return reinterpret_cast<uintptr_t>(fn);
 }
 
+static py::dict kernel_resources(
+    uintptr_t function_handle,
+    std::tuple<int, int, int> grid_dim,
+    std::tuple<int, int, int> block_dim,
+    std::tuple<int, int, int> cluster_dim,
+    int64_t shared_mem_bytes
+) {
+    auto fn = reinterpret_cast<CUfunction>(function_handle);
+    CUdevice device;
+    CU_CHECK(cuCtxGetDevice(&device));
+    int sms, local, registers, static_smem, blocks;
+    CU_CHECK(cuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    CU_CHECK(cuFuncGetAttribute(&local, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn));
+    CU_CHECK(cuFuncGetAttribute(&registers, CU_FUNC_ATTRIBUTE_NUM_REGS, fn));
+    CU_CHECK(cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn));
+    auto [gx, gy, gz] = grid_dim;
+    auto [bx, by, bz] = block_dim;
+    auto [cx, cy, cz] = cluster_dim;
+    CU_CHECK(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, fn, bx * by * bz, shared_mem_bytes));
+    int capacity = blocks * sms;
+    if (cx * cy * cz > 1) {
+        CUlaunchAttribute attr{};
+        attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attr.value.clusterDim.x = cx;
+        attr.value.clusterDim.y = cy;
+        attr.value.clusterDim.z = cz;
+        CUlaunchConfig config{};
+        config.gridDimX = gx; config.gridDimY = gy; config.gridDimZ = gz;
+        config.blockDimX = bx; config.blockDimY = by; config.blockDimZ = bz;
+        config.sharedMemBytes = shared_mem_bytes;
+        config.attrs = &attr; config.numAttrs = 1;
+        int clusters;
+        CU_CHECK(cuOccupancyMaxActiveClusters(&clusters, fn, &config));
+        capacity = clusters * cx * cy * cz;
+    }
+    py::dict result;
+    result["local_bytes_per_thread"] = local;
+    result["registers_per_thread"] = registers;
+    result["smem_bytes_per_cta"] = static_smem + shared_mem_bytes;
+    result["resident_ctas_on_device"] = capacity;
+    result["grid_ctas"] = static_cast<int64_t>(gx) * gy * gz;
+    return result;
+}
+
 static CUtensorMapL2promotion parse_l2_promotion(
     const std::string& l2_promotion
 ) {
@@ -291,6 +336,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ptx"), py::arg("optimization_level") = -1);
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
+    m.def("kernel_resources", &kernel_resources);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
@@ -309,6 +355,12 @@ class _LauncherExtension(Protocol):
     def module_unload(self, module: int) -> None: ...
 
     def module_get_function(self, module: int, name: str) -> int: ...
+
+    def kernel_resources(
+        self, function: int, grid_dim: tuple[int, int, int],
+        block_dim: tuple[int, int, int], cluster_dim: tuple[int, int, int],
+        shared_mem_bytes: int,
+    ) -> dict[str, int]: ...
 
     def launch_kernel(
         self,
@@ -407,6 +459,15 @@ class PtxLauncher:
     @property
     def name(self):
         return self._kernel.name
+
+    def resources(self) -> dict[str, int]:
+        """Query compiled local memory, registers, SMEM and CUDA residency."""
+        self.ensure_loaded()
+        assert self._ext is not None and self._function is not None
+        return self._ext.kernel_resources(
+            self._function, self._kernel.grid_dim, self._kernel.block_dim,
+            self._kernel.cluster_dim or (1, 1, 1), self._kernel.shared_mem_bytes,
+        )
 
     @property
     def signature(self):
