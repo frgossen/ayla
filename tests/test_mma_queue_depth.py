@@ -53,7 +53,7 @@ def test_each_operand_refill_observes_the_batch_d_batches_back(depth, layout):
 @pytest.mark.parametrize("config", [
     dict(operand_stages=2, cyclic_operand_pipeline=2),
     dict(operand_stages=8, cyclic_operand_pipeline=-1),
-    dict(operand_stages=8, cyclic_operand_pipeline=2, rolled_operand_pipeline=True),
+    dict(operand_stages=8, cyclic_operand_pipeline=8, rolled_operand_pipeline=True),
 ])
 def test_invalid_mma_queue_depth(config):
     with pytest.raises(ValueError):

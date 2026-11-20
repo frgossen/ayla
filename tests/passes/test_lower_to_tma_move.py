@@ -98,7 +98,7 @@ def test_multicast_load_without_whole_swizzle_atoms_stays_whole():
     assert 'tile=24x64 swizzle="128B">' in text
 
 
-def test_column_major_store_splits_contiguous_row_tail():
+def test_column_major_store_preserves_blocked_interior_and_dense_tail():
     module = gpu_dialect.parse_module('''module {
       kernel @tail(%c: gmem<96x1024xf16 strides=[1, 96]>) {
         %s: smem<128x64xf16 strides=[1, 128] swizzle="128B" attrs={physical_layout: {block_width: 64, order: "block_major"}}> = alloc() attrs={id: 0}
@@ -108,10 +108,15 @@ def test_column_major_store_splits_contiguous_row_tail():
     module = lower_to_tma_move(module)
     moves = find_ops_of_type(module, TmaMoveOp)
     assert len(moves) == 2
-    for move in moves:
-        assert move.src.type.sizes == [64, 64]
-        assert move.dst.type.gmem_type.sizes == [1024, 96]
-        assert move.dst.type.tile_sizes == (64, 64)
-        assert move.dst.type.attrs.get('physical_layout') is None
-        assert move.dst.type.swizzle == '128B'
+    interior, tail = moves
+    assert interior.src.type.sizes == [128, 64]
+    assert interior.dst.type.gmem_type.sizes == [1024, 64]
+    assert interior.dst.type.attrs['global_extent'] == 64
+    assert interior.dst.type.attrs['physical_layout']['block_width'] == 64
+    assert tail.src.type.sizes == [64, 64]
+    assert tail.dst.type.gmem_type.sizes == [1024, 96]
+    assert tail.dst.type.tile_sizes == (64, 64)
+    assert tail.dst.type.attrs.get('physical_layout') is None
+    assert all(move.dst.type.swizzle == '128B' for move in moves)
+    assert 'if(' in repr(module)
     assert 'index_constant() attrs={value: 64}' in repr(module)

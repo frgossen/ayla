@@ -41,7 +41,7 @@ def test_repeated_completion_events_are_retired_after_observers():
         m=4096, n=128, k=512, dtype='bf16', output_n_tile=128,
         operand_k_tile=64, operand_stages=3, cyclic_operand_pipeline=True,
         output_grid_size=3, reuse_tmem_allocation=True,
-        operand_move_attrs={'lhs': {'issuer_warp': 1}, 'rhs': {'issuer_warp': 2}},
+        operand_move_attrs={'lhs': {'issuer_warp': 0}, 'rhs': {'issuer_warp': 0}},
     )
     InsertSyncs().run(module)
     releases = [op for op in find_ops_of_type(module, DeallocOp)
@@ -182,7 +182,7 @@ GPU_CASES=[
     dict(n=64,k=1280,output_n_tile=64,output_m_tile=64,operand_stages=10,cyclic_operand_pipeline=True),
     dict(n=512,k=64,output_n_tile=512,output_store='stmatrix',output_slices=2,output_store_buffers=2,tmem_writeback_register_budget=128),
     dict(n=256,k=256,output_n_tile=256,operand_stages=4,cyclic_operand_pipeline=True,output_store='stmatrix',output_slices=2,output_store_buffers=2,tmem_writeback_warps=8,load_warp=5),
-    dict(n=128,k=128,operand_stages=2,cyclic_operand_pipeline=True,hoist_invariant_operand_copies=True),
+    dict(n=128,k=128,operand_stages=2,cyclic_operand_pipeline=True),
     dict(n=144,k=144,output_n_tile=144,operand_stages=3,cyclic_operand_pipeline=True,allow_partial_tiles=True),
     dict(n=16,k=16,output_n_tile=16,operand_k_tile=16,output_m_tile=64,tmem_writeback_warps=8,output_layout='tcgen05_16x256b'),
     dict(n=8,k=16,output_n_tile=16,operand_k_tile=16,output_m_tile=64,tmem_writeback_warps=8,output_layout='tcgen05_16x256b',allow_partial_tiles=True),
@@ -202,6 +202,10 @@ def issuer_gemm(case,dtype,**options):
         output_grid_size=3,output_grid_fast_axis='n',reuse_tmem_allocation=True,
         operand_move_attrs={'lhs':{'issuer_warp':load},'rhs':{'issuer_warp':rhs},**({'dst':{'issuer_warp':store}} if store else {})})
     config.update(c)
+    if load or rhs or store or mma:
+        with pytest.raises(ValueError, match='without warp specialization'):
+            blackwell_tcgen05_gemm_module(dtype=dtype,**options,**config)
+        return
     module=blackwell_tcgen05_gemm_module(dtype=dtype,**options,**config)
     if mma:
         for op in find_ops_of_type(module,MatmulOp):op.attrs['issuer_warp']=mma
@@ -211,5 +215,5 @@ def issuer_gemm(case,dtype,**options):
 
 @pytest.mark.parametrize('case',GPU_CASES)
 @pytest.mark.parametrize('dtype',DTYPES)
-def test_gpu_issuer_schedule(case,dtype):
+def test_historical_separate_warp_schedules_are_rejected(case,dtype):
     issuer_gemm(case,dtype)

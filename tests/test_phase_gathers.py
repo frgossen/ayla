@@ -32,8 +32,10 @@ def test_gather_is_not_an_ordinary_await_event():
 
 
 def test_invalid_backend():
+    m = module('')
+    m.body.ops[0].attrs['block_gather_backend'] = 'unknown'
     with pytest.raises(ValueError,match='block_gather_backend'):
-        blackwell_tcgen05_gemm_module(block_gather_backend='unknown')
+        VerifyGpuDialect().run(m)
 
 
 
@@ -59,16 +61,18 @@ def test_repeated_single_issuer_events_have_explicit_retirement():
 def test_completion_reuse_chooses_a_safe_default_backend():
     m=blackwell_tcgen05_gemm_module(m=4096,n=128,k=512,dtype='f16',
         output_n_tile=128,operand_k_tile=64,operand_stages=3,
-        cyclic_operand_pipeline=True,output_grid_size=3,reuse_completion_locks=True)
+        cyclic_operand_pipeline=True,output_grid_size=3)
     assert m.body.ops[0].attrs['block_gather_backend']=='mbar'
 
 
 def test_named_completion_reuse_rejects_repeated_tmem_allocation():
+    from ayla.ptx_codegen import make_ptx_kernel
+    m = blackwell_tcgen05_gemm_module(m=4096,n=128,k=512,dtype='f16',
+        output_n_tile=128,operand_k_tile=64,operand_stages=3,
+        cyclic_operand_pipeline=True,output_grid_size=3)
+    m.body.ops[0].attrs['block_gather_backend'] = 'named'
     with pytest.raises(ValueError,match='reusable TMEM'):
-        blackwell_tcgen05_gemm_module(m=4096,n=128,k=512,dtype='f16',
-            output_n_tile=128,operand_k_tile=64,operand_stages=3,
-            cyclic_operand_pipeline=True,output_grid_size=3,
-            reuse_completion_locks=True,block_gather_backend='named')
+        make_ptx_kernel(m)
 
 
 

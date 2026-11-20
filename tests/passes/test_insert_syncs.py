@@ -106,6 +106,35 @@ def test_cluster_barrier_scope_is_between_block_and_grid():
     assert not _barrier_covers(BarrierScope.CLUSTER, CollectiveScope.GRID)
 
 
+@pytest.mark.parametrize('local_barrier', [False, True])
+def test_paired_tmem_release_gathers_completed_reads_from_only_its_peer_pair(local_barrier):
+    from ayla.gpu_dialect import DeallocOp
+
+    module = gpu_dialect.parse(textwrap.dedent('''\
+        module attrs={target: "sm_100a"} {
+          kernel @release() grid_dim=[4, 1, 1] block_dim=[256, 1, 1] cluster_dim=[4, 1, 1] {
+            %t: tmem<64x64xf32 attrs={cta_group: 2}> = alloc()
+            %r: wgrmem<64x64xf32 warps=8 layout="tcgen05_16x256b" attrs={tmem_cta_group: 2}> = alloc()
+            move(%r: wgrmem<64x64xf32 warps=8 layout="tcgen05_16x256b" attrs={tmem_cta_group: 2}>, %t: tmem<64x64xf32 attrs={cta_group: 2}>)
+            dealloc(%t: tmem<64x64xf32 attrs={cta_group: 2}>)
+          }
+        }
+    '''))
+    release = find_ops_of_type(module, DeallocOp)[0]
+    if local_barrier:
+        release.parent_block.ops.insert(release.parent_block.ops.index(release), BarrierOp.build(scope='block'))
+    analysis = SyncAnalysis()
+    analysis.analyze(module)
+    assert analysis.targets[release].scope == BarrierScope.CLUSTER_TO_LEADER
+    insert_syncs(module)
+    gathers = [b for b in find_ops_of_type(module, BarrierOp) if b.scope == "cluster_to_leader"]
+    assert [b.attrs['phase'] for b in gathers] == ['arrive', 'wait']
+    assert all(b.sync.type.attrs['release_cta_masks'] == [3, 3, 12, 12] for b in gathers)
+    repeated = SyncAnalysis()
+    repeated.analyze(module)
+    assert release not in repeated.targets or repeated.targets[release].scope == BarrierScope.THREAD
+
+
 def test_barrier_scopes_form_a_lattice():
     scopes = list(BarrierScope)
     assert all(a.join(b) == b.join(a) for a in scopes for b in scopes)
@@ -395,7 +424,8 @@ def test_cluster_gathers_share_an_mbarrier_after_its_handoff_ends():
     assert len(allocs) == 2
 
 
-def test_preexisting_barrier_updates_dataflow_state():
+@pytest.mark.parametrize("ctas", [1, 2])
+def test_preexisting_barrier_updates_dataflow_state(ctas):
     source = """\
         module {
           kernel @test(%g: gmem<1xf32>) grid_dim=[1, 1, 1] block_dim=[32, 1, 1] {
@@ -406,15 +436,16 @@ def test_preexisting_barrier_updates_dataflow_state():
           }
         }"""
 
-    # A block barrier cannot discharge a grid-scoped global-memory effect.
-    with pytest.raises(NotImplementedError, match="barrier GRID"):
-        insert_syncs(
-            gpu_dialect.parse(
-                textwrap.dedent(
-                    source.replace("__SCOPE__", "block"),
-                )
-            )
-        )
+    source = source.replace("grid_dim=[1, 1, 1]", f"grid_dim=[{ctas}, 1, 1]")
+    block_module = gpu_dialect.parse(textwrap.dedent(source.replace("__SCOPE__", "block")))
+    if ctas == 1:
+        # All global accesses belong to the sole CTA, so its barrier suffices.
+        insert_syncs(block_module)
+        assert repr(block_module).count("barrier()") == 1
+    else:
+        # A CTA barrier cannot publish to other CTAs in the grid.
+        with pytest.raises(NotImplementedError, match="barrier GRID"):
+            insert_syncs(block_module)
 
     # Scheduling passes may author structural barriers before InsertSyncs. The
     # grid barrier discharges the effect, so the pass must not insert another.
@@ -477,6 +508,8 @@ def test_war_on_shared_buffer_gets_barrier():
               %lw: lock<wgmma> = alloc() attrs={id: 3}
               async(%lw: lock<wgmma>) matmul(%sa: smem<128x64xbf16 swizzle="128B">, %sb: smem<128x64xbf16 swizzle="128B">, %acc: wgrmem<128x128xf32 warps=4 layout="wgmma_layout_0">) collective=[xy.block, z.thread]
               await(%lw: lock<wgmma>)
+              barrier() attrs={completion_lifetime_release: True, scope: "block"}
+              dealloc(%lm: lock<mbar>)
             }
           }
         }""")  # noqa: E501

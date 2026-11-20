@@ -1,0 +1,1270 @@
+{
+  "version": 1,
+  "target": "sm_100a",
+  "gpu": "NVIDIA B200",
+  "dtype": "f16",
+  "warp_specialization": false,
+  "protocol": "FP16 inference-v2, 256 MiB cache reset; every Ayla and cuBLAS kernel included",
+  "shapes": [
+    {
+      "m": 256,
+      "n": 2048,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 19.984000362455845,
+      "cublas_us": 19.652000395581126,
+      "cublas_div_ayla": 0.9833867113264043
+    },
+    {
+      "m": 384,
+      "n": 1536,
+      "k": 12608,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 24.790857120284013,
+      "cublas_us": 26.153143096183026,
+      "cublas_div_ayla": 1.0549511446614883
+    },
+    {
+      "m": 512,
+      "n": 1024,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32,
+        "transpose_output": true,
+        "transpose_reduction": true
+      },
+      "ayla_us": 22.56290909090909,
+      "cublas_us": 21.306181818181816,
+      "cublas_div_ayla": 0.9443011861784423,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 512,
+      "n": 1536,
+      "k": 6144,
+      "dtype": "f16",
+      "configuration": {
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32,
+        "split_k": 3
+      },
+      "ayla_us": 18.986666666666665,
+      "cublas_us": 16.776533333333337,
+      "cublas_div_ayla": 0.8835955056179777,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 6272,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 64,
+          "cta_group": 2,
+          "cluster_n_ctas": 2,
+          "operand_stages": 10,
+          "cyclic_operand_pipeline": 2,
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 21.204363470050424,
+      "cublas_us": 20.872727036476135,
+      "cublas_div_ayla": 0.984359991091329
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 6400,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_register_budget": 64,
+          "output_m_tile": 64,
+          "output_n_tile": 128,
+          "operand_stages": 12,
+          "cluster_n_ctas": 2,
+          "cluster_dim": [
+            4,
+            1,
+            1
+          ]
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 20.878545262596823,
+      "cublas_us": 21.023999984291464,
+      "cublas_div_ayla": 1.006966707683184
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 7936,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "output_m_tile": 64,
+          "output_n_tile": 128,
+          "operand_stages": 12,
+          "cluster_n_ctas": 2,
+          "cluster_dim": [
+            4,
+            1,
+            1
+          ],
+          "tmem_writeback_warps": 8
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 23.189333577950794,
+      "cublas_us": 23.448889350725548,
+      "cublas_div_ayla": 1.0111928948670412
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 25.05599951837212,
+      "cublas_us": 23.995999712496996,
+      "cublas_div_ayla": 0.9576947706636934
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 8448,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 25.079999584704638,
+      "cublas_us": 24.795999750494957,
+      "cublas_div_ayla": 0.9886762424676083
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "output_n_tile": 256,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 31.402666276941694,
+      "cublas_us": 32.82133350148797,
+      "cublas_div_ayla": 1.0451766487608083
+    },
+    {
+      "m": 512,
+      "n": 2048,
+      "k": 16448,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "output_n_tile": 256,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 37.408000556752086,
+      "cublas_us": 41.96799942292273,
+      "cublas_div_ayla": 1.121899026900746
+    },
+    {
+      "m": 768,
+      "n": 768,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 8,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 19.65236354788596,
+      "cublas_us": 18.52363678203388,
+      "cublas_div_ayla": 0.9425653426824835
+    },
+    {
+      "m": 768,
+      "n": 768,
+      "k": 12608,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 22.838857091431105,
+      "cublas_us": 24.84571441475834,
+      "cublas_div_ayla": 1.0878703043367344
+    },
+    {
+      "m": 768,
+      "n": 768,
+      "k": 12672,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 22.891428787261248,
+      "cublas_us": 24.91199996854578,
+      "cublas_div_ayla": 1.0882675869672649
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 128,
+          "cta_group": 2,
+          "operand_stages": 9,
+          "cyclic_operand_pipeline": 2,
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 33.109333366155624,
+      "cublas_us": 33.16799985865752,
+      "cublas_div_ayla": 1.001771901954446
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          },
+          "output_n_tile": 128,
+          "operand_stages": 9,
+          "tmem_writeback_register_budget": 64
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 45.1520006172359,
+      "cublas_us": 47.152000246569514,
+      "cublas_div_ayla": 1.044294817549461
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 12608,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          },
+          "output_n_tile": 128,
+          "operand_stages": 9,
+          "interleave_mma_descriptors": true,
+          "tmem_writeback_register_budget": 64
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 45.56800075806677,
+      "cublas_us": 47.624001279473305,
+      "cublas_div_ayla": 1.0451193927142517
+    },
+    {
+      "m": 768,
+      "n": 3072,
+      "k": 12672,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          },
+          "output_n_tile": 128,
+          "operand_stages": 9,
+          "interleave_mma_descriptors": true,
+          "tmem_writeback_warps": 8
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 45.56800075806677,
+      "cublas_us": 47.7040009573102,
+      "cublas_div_ayla": 1.0468750035926317
+    },
+    {
+      "m": 1024,
+      "n": 1024,
+      "k": 4160,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "output_m_tile": 64,
+          "output_n_tile": 128,
+          "operand_stages": 12,
+          "cluster_n_ctas": 2,
+          "cluster_dim": [
+            4,
+            1,
+            1
+          ],
+          "tmem_writeback_warps": 8
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 16.460000217193738,
+      "cublas_us": 15.99100005114451,
+      "cublas_div_ayla": 0.9715066731554888
+    },
+    {
+      "m": 1024,
+      "n": 4096,
+      "k": 4160,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "transpose_output": false,
+        "native_schedule": {
+          "cta_group": 2,
+          "output_n_tile": 240,
+          "operand_stages": 6,
+          "cyclic_operand_pipeline": 2,
+          "tmem_writeback_warps": 8,
+          "tmem_writeback_register_budget": 64
+        }
+      },
+      "ayla_us": 32.49199956189841,
+      "cublas_us": 31.323999166488647,
+      "cublas_div_ayla": 0.964052677238756
+    },
+    {
+      "m": 1024,
+      "n": 4096,
+      "k": 16384,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "operand_stages": 6,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_warps": 8
+        },
+        "transpose_output": true
+      },
+      "ayla_us": 116.24000244773924,
+      "cublas_us": 115.20000034943223,
+      "cublas_div_ayla": 0.9910529759428163
+    },
+    {
+      "m": 1280,
+      "n": 320,
+      "k": 6272,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 16.104,
+      "cublas_us": 15.792,
+      "cublas_div_ayla": 0.9806259314456036,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 1536,
+      "n": 384,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 22.820571428571427,
+      "cublas_us": 22.249142857142857,
+      "cublas_div_ayla": 0.974959935897436,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 1536,
+      "n": 384,
+      "k": 12608,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 22.852571428571427,
+      "cublas_us": 22.35885714285714,
+      "cublas_div_ayla": 0.978395679135827,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 1536,
+      "n": 512,
+      "k": 6400,
+      "dtype": "f16",
+      "configuration": {
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 2,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32,
+        "split_k": 3
+      },
+      "ayla_us": 18.690000229980797,
+      "cublas_us": 20.735999889438972,
+      "cublas_div_ayla": 1.1094702854083527
+    },
+    {
+      "m": 1536,
+      "n": 512,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32,
+        "split_k": 3
+      },
+      "ayla_us": 26.30704761904762,
+      "cublas_us": 25.898666666666667,
+      "cublas_div_ayla": 0.9844763670064876,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 1536,
+      "n": 512,
+      "k": 16448,
+      "dtype": "f16",
+      "configuration": {
+        "output_m_tile": 64,
+        "output_n_tile": 256,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "split_k": 3
+      },
+      "ayla_us": 30.848,
+      "cublas_us": 30.216,
+      "cublas_div_ayla": 0.97951244813278,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_under90_common_20261115/promotion_manifest.json"
+    },
+    {
+      "m": 2048,
+      "n": 256,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 17.742000229191035,
+      "cublas_us": 18.490999849746004,
+      "cublas_div_ayla": 1.0422161881907
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 6272,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_m_tile": 64,
+          "output_n_tile": 128,
+          "output_store": "stmatrix",
+          "cyclic_operand_pipeline": 2,
+          "interleave_mma_descriptors": true,
+          "cta_group": 2,
+          "operand_stages": 12,
+          "cluster_n_ctas": 2,
+          "cluster_dim": [
+            4,
+            1,
+            1
+          ],
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 20.456000114791095,
+      "cublas_us": 18.963999929837883,
+      "cublas_div_ayla": 0.9270629557791997
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 6400,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "output_m_tile": 64,
+          "output_n_tile": 128,
+          "operand_stages": 12,
+          "cluster_n_ctas": 2,
+          "cluster_dim": [
+            4,
+            1,
+            1
+          ],
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "lhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 20.445000031031668,
+      "cublas_us": 19.915000011678785,
+      "cublas_div_ayla": 0.9740767904843022
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 7936,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_register_budget": 64,
+          "output_m_tile": 64,
+          "output_n_tile": 128,
+          "operand_stages": 12,
+          "cluster_n_ctas": 2,
+          "cluster_dim": [
+            4,
+            1,
+            1
+          ]
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 22.556000301847234,
+      "cublas_us": 22.537000564625487,
+      "cublas_div_ayla": 0.9991576637272792
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 23.784000048181042,
+      "cublas_us": 22.540000034496188,
+      "cublas_div_ayla": 0.9476959295675753
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 8448,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "cta_group": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 24.424000119324774,
+      "cublas_us": 22.554000053787604,
+      "cublas_div_ayla": 0.9234359623157066
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "operand_stages": 9,
+        "cyclic_operand_pipeline": 2,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 30.700190480621085,
+      "cublas_us": 30.677333429810545,
+      "cublas_div_ayla": 0.9992554752771007
+    },
+    {
+      "m": 2048,
+      "n": 512,
+      "k": 16448,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 4,
+        "output_n_tile": 256,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 36.84400086058304,
+      "cublas_us": 40.78399995341897,
+      "cublas_div_ayla": 1.1069373303877832
+    },
+    {
+      "m": 2048,
+      "n": 1024,
+      "k": 32000,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "output_n_tile": 256,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 119.05280221253633,
+      "cublas_us": 119.66720167547464,
+      "cublas_div_ayla": 1.0051607307977637
+    },
+    {
+      "m": 2304,
+      "n": 768,
+      "k": 12608,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_m_tile": 64,
+          "output_n_tile": 192,
+          "cta_group": 2,
+          "operand_stages": 11,
+          "cyclic_operand_pipeline": 2,
+          "tmem_writeback_warps": 8,
+          "tmem_writeback_register_budget": 64
+        }
+      },
+      "ayla_us": 40.95999923135553,
+      "cublas_us": 37.291429271655424,
+      "cublas_div_ayla": 0.9104353020375118
+    },
+    {
+      "m": 2304,
+      "n": 768,
+      "k": 12672,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_m_tile": 64,
+          "output_n_tile": 192,
+          "cta_group": 2,
+          "operand_stages": 10,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_warps": 8,
+          "tmem_writeback_register_budget": 64,
+          "operand_move_attrs": {
+            "lhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 39.33257077421461,
+      "cublas_us": 37.38742920437029,
+      "cublas_div_ayla": 0.9505462894604515
+    },
+    {
+      "m": 3072,
+      "n": 768,
+      "k": 8192,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 128,
+          "cta_group": 2,
+          "operand_stages": 8,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "lhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": true
+      },
+      "ayla_us": 32.190545462071896,
+      "cublas_us": 30.53672742945227,
+      "cublas_div_ayla": 0.9486241065853259
+    },
+    {
+      "m": 3072,
+      "n": 768,
+      "k": 12544,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": 2,
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          },
+          "output_m_tile": 64,
+          "output_store": "stmatrix",
+          "output_layout": "tcgen05_16x256b",
+          "tmem_writeback_register_budget": 128,
+          "operand_stages": 8
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 47.10628671039428,
+      "cublas_us": 45.101714520049946,
+      "cublas_div_ayla": 0.9574457608457172
+    },
+    {
+      "m": 3072,
+      "n": 768,
+      "k": 12608,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 128,
+          "cta_group": 2,
+          "operand_stages": 9,
+          "cyclic_operand_pipeline": 2,
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "lhs": {
+              "l2_cache_hint": "evict_last"
+            },
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 52.834285157067434,
+      "cublas_us": 49.760000181517434,
+      "cublas_div_ayla": 0.9418126891201296
+    },
+    {
+      "m": 3072,
+      "n": 768,
+      "k": 12672,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 128,
+          "cta_group": 2,
+          "operand_stages": 9,
+          "cyclic_operand_pipeline": 2,
+          "tmem_writeback_warps": 8,
+          "operand_move_attrs": {
+            "lhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          }
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 52.82742749633534,
+      "cublas_us": 51.70971361388053,
+      "cublas_div_ayla": 0.978842167119867
+    },
+    {
+      "m": 3072,
+      "n": 1024,
+      "k": 4160,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "transpose_output": true,
+        "native_schedule": {
+          "cta_group": 2,
+          "output_n_tile": 176,
+          "operand_stages": 7,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_warps": 8,
+          "tmem_writeback_register_budget": 64
+        }
+      },
+      "ayla_us": 24.958999711088836,
+      "cublas_us": 24.756999569945037,
+      "cublas_div_ayla": 0.9919067212836237
+    },
+    {
+      "m": 4096,
+      "n": 1024,
+      "k": 4160,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "transpose_output": true,
+        "native_schedule": {
+          "cta_group": 2,
+          "output_n_tile": 240,
+          "operand_stages": 5,
+          "cyclic_operand_pipeline": 2,
+          "output_store": "stmatrix",
+          "tmem_writeback_register_budget": 64
+        }
+      },
+      "ayla_us": 31.107000104384497,
+      "cublas_us": 31.153999909292907,
+      "cublas_div_ayla": 1.0015109076654996
+    },
+    {
+      "m": 8192,
+      "n": 256,
+      "k": 10000,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 2,
+        "output_n_tile": 256,
+        "operand_stages": 7,
+        "cyclic_operand_pipeline": 1,
+        "tmem_writeback_warps": 8,
+        "tmem_writeback_register_budget": 32
+      },
+      "ayla_us": 51.49099972913973,
+      "cublas_us": 51.31199964671396,
+      "cublas_div_ayla": 0.9965236627106218
+    },
+    {
+      "m": 32000,
+      "n": 768,
+      "k": 512,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "output_grid_size": 148,
+          "operand_stages": 6,
+          "rolled_operand_pipeline": true,
+          "persistent_output_pipeline": true,
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "tmem_writeback_register_budget": 64,
+          "tmem_writeback_warps": 8,
+          "cyclic_operand_pipeline": 1,
+          "rolled_k_unroll": 2
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 26.944,
+      "cublas_us": 22.064,
+      "cublas_div_ayla": 0.8188836104513064,
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_adaptive_progress_20261114/confirmation2/m32000_n768_k512/results/result.json",
+      "matched_incumbent": "/home/arseniivanov/ayla/.benchmarks/b200_mid_k_overlap_20261114/qualification_manifest.json",
+      "timing_timer": "globaltimer",
+      "warp_specialization": false
+    },
+    {
+      "m": 25216,
+      "n": 320,
+      "k": 320,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 160,
+          "operand_stages": 5,
+          "cyclic_operand_pipeline": true,
+          "output_grid_fast_axis": "n",
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "tmem_writeback_register_budget": 64,
+          "output_grid_size": 148,
+          "persistent_output_pipeline": true
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 9.904,
+      "cublas_us": 9.68,
+      "cublas_div_ayla": 0.9773828756058158,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m25216_n320_k320/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 2048,
+      "n": 3072,
+      "k": 768,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 384,
+          "cyclic_operand_pipeline": true,
+          "output_grid_fast_axis": "n",
+          "tmem_writeback_register_budget": 64,
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "output_store_buffers": 2,
+          "reuse_tmem_allocation": true,
+          "output_layout": "tcgen05_16x32bx2",
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          },
+          "interleave_mma_descriptors": true
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 13.32,
+      "cublas_us": 11.776,
+      "cublas_div_ayla": 0.8840840840840841,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m2048_n3072_k768/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 1536,
+      "n": 6144,
+      "k": 512,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "operand_stages": 6,
+          "rolled_operand_pipeline": true,
+          "output_grid_size": 144,
+          "persistent_output_pipeline": true,
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "tmem_writeback_register_budget": 64,
+          "rolled_k_unroll": 8
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 12.088,
+      "cublas_us": 11.032,
+      "cublas_div_ayla": 0.912640635340834,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_adaptive_progress_20261114/confirmation2/m1536_n6144_k512/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 6144,
+      "n": 1536,
+      "k": 512,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "operand_stages": 6,
+          "rolled_operand_pipeline": true,
+          "output_grid_size": 144,
+          "persistent_output_pipeline": true,
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "tmem_writeback_register_budget": 64,
+          "interleave_mma_descriptors": true,
+          "rolled_k_unroll": 8
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 11.96,
+      "cublas_us": 11.056,
+      "cublas_div_ayla": 0.9244147157190635,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_adaptive_progress_20261114/confirmation2/m6144_n1536_k512/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 8192,
+      "n": 768,
+      "k": 768,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 384,
+          "cyclic_operand_pipeline": true,
+          "tmem_writeback_register_budget": 64,
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "output_store_buffers": 2,
+          "output_layout": "tcgen05_16x32bx2",
+          "operand_move_attrs": {
+            "rhs": {
+              "l2_cache_hint": "evict_first"
+            }
+          },
+          "output_store_pending_groups": 1,
+          "reuse_mma_collector_a": true
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 12.936,
+      "cublas_us": 12.112,
+      "cublas_div_ayla": 0.9363017934446506,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m8192_n768_k768/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 12672,
+      "n": 768,
+      "k": 768,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "output_n_tile": 192,
+          "operand_stages": 5,
+          "cyclic_operand_pipeline": true,
+          "output_grid_fast_axis": "n",
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "tmem_writeback_register_budget": 64,
+          "output_grid_size": 148,
+          "persistent_output_pipeline": true
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 15.607999999999999,
+      "cublas_us": 14.575999999999999,
+      "cublas_div_ayla": 0.9338800615069195,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m12672_n768_k768/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 6272,
+      "n": 1280,
+      "k": 256,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "operand_stages": 4,
+          "cyclic_operand_pipeline": true,
+          "output_grid_fast_axis": "n",
+          "tmem_writeback_register_budget": 64,
+          "output_store": "stmatrix",
+          "output_slices": 2,
+          "output_store_buffers": 2,
+          "output_m_tiles_per_cta": 2
+        },
+        "transpose_output": false
+      },
+      "ayla_us": 9.44,
+      "cublas_us": 9.623999999999999,
+      "cublas_div_ayla": 1.019491525423729,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m6272_n1280_k256/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 3072,
+      "n": 1024,
+      "k": 3136,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": true,
+          "output_store": "stmatrix",
+          "tmem_writeback_register_budget": 64,
+          "output_column_major": true,
+          "output_n_tile": 176,
+          "operand_stages": 6
+        },
+        "transpose_output": true
+      },
+      "ayla_us": 17.72,
+      "cublas_us": 17.343999999999998,
+      "cublas_div_ayla": 0.9787810383747177,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m3072_n1024_k3136/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 4096,
+      "n": 1024,
+      "k": 3136,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": true,
+          "output_store": "stmatrix",
+          "tmem_writeback_register_budget": 64,
+          "output_column_major": true,
+          "output_n_tile": 240,
+          "operand_stages": 4
+        },
+        "transpose_output": true
+      },
+      "ayla_us": 21.064,
+      "cublas_us": 21.336,
+      "cublas_div_ayla": 1.0129130269654385,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m4096_n1024_k3136/results/result.json",
+      "warp_specialization": false
+    },
+    {
+      "m": 1152,
+      "n": 3072,
+      "k": 768,
+      "dtype": "f16",
+      "configuration": {
+        "split_k": 1,
+        "native_schedule": {
+          "cta_group": 2,
+          "cyclic_operand_pipeline": true,
+          "output_store": "stmatrix",
+          "tmem_writeback_register_budget": 64,
+          "output_column_major": true,
+          "output_n_tile": 192,
+          "operand_k_tile": 128
+        },
+        "transpose_output": true
+      },
+      "ayla_us": 9.088,
+      "cublas_us": 8.2,
+      "cublas_div_ayla": 0.9022887323943662,
+      "timing_timer": "globaltimer",
+      "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m1152_n3072_k768/results/result.json",
+      "warp_specialization": false
+    }
+  ]
+}

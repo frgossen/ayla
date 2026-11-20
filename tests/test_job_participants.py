@@ -92,7 +92,7 @@ def test_gpu_job_participants_changed_input_replays(
         output_grid_fast_axis="m",
         output_grid_size=4,
         persistent_output_pipeline=True,
-        persistent_output_schedule="shared_ring",
+
         persistent_output_overlap=True,
         output_store="stmatrix",
         output_slices=2,
@@ -117,7 +117,7 @@ def test_issue_handoff_is_cta_local_and_released_by_the_actor():
     whose loads ran more than one job ahead, fall two event phases behind and
     wait forever on an aliased parity.
     """
-    from ayla.base.ir import clone_op, find_ancestor_of_type
+    from ayla.base.ir import clone_op
     from ayla.gemm_collection.blackwell_tcgen05 import blackwell_tcgen05_gemm_module
     from ayla.gpu_dialect import AwaitOp, BarrierOp, ForOp
     from ayla.passes.pipeline_rolled_shared_ring import LowerRolledSharedRing
@@ -127,7 +127,7 @@ def test_issue_handoff_is_cta_local_and_released_by_the_actor():
         output_n_tile=128, operand_k_tile=64, operand_stages=7,
         cyclic_operand_pipeline=False, rolled_operand_pipeline=True,
         output_grid_fast_axis="m", output_grid_size=4,
-        persistent_output_pipeline=True, persistent_output_schedule="shared_ring",
+        persistent_output_pipeline=True,
         persistent_output_overlap=True, persistent_output_job_regions=True,
         output_store="stmatrix", output_slices=2,
         tmem_writeback_register_budget=64, allow_partial_tiles=True,

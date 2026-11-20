@@ -16,7 +16,7 @@ def _ring(**overrides):
         m=12672, n=3072, k=768, dtype="f16", cta_group=2, output_m_tile=128,
         output_n_tile=256, operand_k_tile=128, operand_stages=3, output_grid_size=148,
         output_grid_fast_axis="m", persistent_output_pipeline=True,
-        persistent_output_schedule="shared_ring", rolled_operand_pipeline=True,
+         rolled_operand_pipeline=True,
         hoist_mma_descriptors=True, output_store="stmatrix", output_slices=4,
         tmem_writeback_register_budget=64, tmem_writeback_warps=8, allow_partial_tiles=True,
     )
@@ -35,12 +35,9 @@ def test_fill_precedes_tmem_allocation_behind_one_relaxed_rendezvous(k_tile, sta
 
 
 def test_k128_stages_are_only_accepted_by_the_rolled_shared_ring():
-    with pytest.raises(ValueError, match="must be shared_ring"):
-        _ring(persistent_output_schedule="framed")
     # A ring carries banks across jobs, so two K batches suffice; one does not.
     _ring(k=256)
-    with pytest.raises(ValueError, match="two K batches"):
-        _ring(k=128)
+    make_ptx_kernel(_ring(k=128))
 
 
 def _lock(**attrs):

@@ -14,6 +14,18 @@ from ayla.gpu_dialect import AwaitOp
 from ayla.analysis.sync import SyncAnalysis
 
 
+def test_tmem_allocations_retain_sequential_lifetimes():
+    from ayla.gpu_dialect import DeallocOp, F32Type, TmemTensorType
+    from ayla.passes.schedule_async import _hoist_async_moves
+
+    first = AllocOp.build_with_fresh_id(TmemTensorType.build([128, 256], F32Type()))
+    release = DeallocOp.build(first.result())
+    second = AllocOp.build_with_fresh_id(first.result().type)
+    ops = [first, release, second, DeallocOp.build(second.result())]
+    _hoist_async_moves(ops)
+    assert ops.index(release) < ops.index(second)
+
+
 def test_bulk_await_sinks_until_shared_source_is_overwritten():
     module = gpu_dialect.parse_module(
         textwrap.dedent("""\

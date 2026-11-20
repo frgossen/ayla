@@ -102,7 +102,7 @@ def test_shared_pipeline_drains_collectively_after_scoped_loop_waits(stages):
         operand_k_tile=64,operand_stages=stages,cyclic_operand_pipeline=True,
         output_store='stmatrix',allow_partial_tiles=True)
     plain=blackwell_tcgen05_gemm_module(**args)
-    m=blackwell_tcgen05_gemm_module(**args,consumer_specific_mma_waits=True)
+    m=ScheduleWarpWaits(mma_reuse=True).run(blackwell_tcgen05_gemm_module(**args))
     VerifyGpuDialect().run(m)
     assert [l.trip_count for l in find_ops_of_type(m,ForOp)]==[l.trip_count for l in find_ops_of_type(plain,ForOp)]
     assert m.body.ops[0].block_dim==plain.body.ops[0].block_dim

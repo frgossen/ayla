@@ -46,9 +46,6 @@ def make_blackwell_router_launcher(*, m, n, k, dtype="f16", configuration=None):
     if config is None:
         raise ValueError(f"no measured Blackwell route for {m}x{n}x{k} {dtype}")
     validate_common_warp_schedule(config)
-    prefetch_tmem_reads = config.pop("prefetch_tmem_reads", False)
-    if type(prefetch_tmem_reads) is not bool:
-        raise ValueError("prefetch_tmem_reads must be a boolean")
     backend = config.pop("split_k_backend", "workspace")
     if backend not in ("cluster", "workspace"):
         raise ValueError("Split-K backend must be cluster or workspace")
@@ -65,15 +62,14 @@ def make_blackwell_router_launcher(*, m, n, k, dtype="f16", configuration=None):
             )
         partial = blackwell_split_k_gemm_module(m=m, n=n, k=k, dtype=dtype, **config)
         return BlackwellSplitKLauncher(
-            make_ptx_kernel(partial, prefetch_tmem_reads=prefetch_tmem_reads),
+            make_ptx_kernel(partial),
             None, m=m, n=n, k=k, dtype=dtype
         )
     if "stream_k_workers" in config:
         from .stream_k import make_blackwell_stream_k_launcher
 
         if (
-            prefetch_tmem_reads
-            or config.get("split_k", 1) != 1
+            config.get("split_k", 1) != 1
             or config.get("transpose_output")
             or config.get("transpose_reduction")
             or "native_schedule" in config
@@ -100,7 +96,7 @@ def make_blackwell_router_launcher(*, m, n, k, dtype="f16", configuration=None):
         )
         reduction = None
     return BlackwellSplitKLauncher(
-        make_ptx_kernel(partial, prefetch_tmem_reads=prefetch_tmem_reads),
+        make_ptx_kernel(partial),
         make_ptx_kernel(reduction) if reduction is not None else None,
         m=m,
         n=n,

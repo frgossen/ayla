@@ -598,13 +598,11 @@ def blackwell_split_k_workspace_modules(
     reduction_threads: int = 256,
     partial_store: str = "global",
     output_layout: str | None = None,
-    mma_issue_group_size: int = 1,
     prefetch_tma_descriptors: bool = False,
     transpose_output: bool = False,
     transpose_reduction: bool = False,
     rolled_operand_pipeline: bool = False,
     operand_issuer_warp: int = 0,
-    paired_completion_handoffs: bool = False,
     bias: bool = False,
 ):
     """Split-K GEMM and vector reduction modules, with FP32 global partials.
@@ -636,8 +634,6 @@ def blackwell_split_k_workspace_modules(
             raise ValueError("tiled transpose reduction needs dimensions aligned to 32")
     if cta_group not in (1, 2) or output_m_tile not in (64, 128):
         raise ValueError("CTA group must be one/two and M tile must be 64/128")
-    if type(mma_issue_group_size) is not int or mma_issue_group_size < 1:
-        raise ValueError("MMA issue group must be a positive integer")
     if type(cyclic_operand_pipeline) not in (int, bool) or cyclic_operand_pipeline < 0:
         raise ValueError("cyclic queue depth must be nonnegative")
     if any(
@@ -647,7 +643,6 @@ def blackwell_split_k_workspace_modules(
             hoist_mma_descriptors,
             prefetch_tma_descriptors,
             rolled_operand_pipeline,
-            paired_completion_handoffs,
         )
     ):
         raise ValueError(
@@ -661,15 +656,6 @@ def blackwell_split_k_workspace_modules(
         raise ValueError("long-K requires TMA and MMA to share issuer warp zero")
     if rolled_operand_pipeline and operand_issuer_warp:
         raise ValueError("rolled operands require the shared issuer")
-    if paired_completion_handoffs and (
-        cta_group != 2
-        or not paired_phase_relay
-        or not cyclic_operand_pipeline
-        or rolled_operand_pipeline
-    ):
-        raise ValueError(
-            "completion handoffs require an ordinary paired cyclic pipeline"
-        )
     if (
         reduction_elements_per_thread not in (2, 4, 8, 16, 32)
         or original_n % reduction_elements_per_thread
@@ -798,20 +784,9 @@ def blackwell_split_k_workspace_modules(
 
         module.body.ops[0].attrs["correlate_uniform_guards"] = True
         module.body.ops[0].attrs["paired_phase_relay"] = True
-        module.body.ops[0].attrs["paired_completion_handoffs"] = (
-            paired_completion_handoffs
-        )
         module = PipelineClusterBanks().run(module)
-        if mma_issue_group_size > 1:
-            module = ScheduleAsync(compute_issue_group_size=mma_issue_group_size).run(
-                module
-            )
         if not module.body.ops[0].attrs.get("cluster_bank_pipeline"):
             module = ScheduleWarpWaits().run(module)
-    elif mma_issue_group_size > 1:
-        module = ScheduleAsync(compute_issue_group_size=mma_issue_group_size).run(
-            module
-        )
     workspace_shape = (
         f"{padded_n}x{split_k * padded_m}"
         if transpose_output and not transpose_reduction

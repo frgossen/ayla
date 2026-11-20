@@ -25,6 +25,7 @@ from .gpu_dialect import (
     KernelOp,
     LockType,
     ModuleOp,
+    MmaDescriptorType,
     PredicateType,
     PredicateOp,
     PtrAddOp,
@@ -43,7 +44,6 @@ from .gpu_dialect import (
 from .pipelines.canonicalize import Canonicalize
 from .passes.insert_syncs import InsertSyncs
 from .passes.licm import LICM
-from .passes.lower_to_ptx_template import LowerToPtxTemplate
 from .passes.lower_to_async import LowerToAsync
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.pack_smem_allocs import ReuseSmemAllocs
@@ -71,10 +71,7 @@ class HoistMmaDescriptors(Pass):
 class PtxLoweringPipeline(Pipeline):
     """Lowers a high-level ModuleOp down to a PTX-template ModuleOp."""
 
-    def __init__(self, *, bulk_source_queue_completion: bool = False,
-                 prefetch_tmem_reads: bool = False) -> None:
-        if type(prefetch_tmem_reads) is not bool:
-            raise ValueError("prefetch_tmem_reads must be a boolean")
+    def __init__(self, *, bulk_source_queue_completion: bool = False) -> None:
         super().__init__()
         self.add_instrumentation_pass(
             VerifyGpuDialect(VerificationStage.PTX_LOWERING)
@@ -83,11 +80,8 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToAsync())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs(bulk_source_queue_completion=bulk_source_queue_completion))
-        if prefetch_tmem_reads:
-            from .passes.prefetch_tmem_reads import PrefetchTmemReads
-
-            self.add_pass(PrefetchTmemReads())
         self.add_pass(ReuseSmemAllocs())
+        from .passes.lower_to_ptx_template import LowerToPtxTemplate
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(HoistMmaDescriptors())
         self.add_pass(Canonicalize())
@@ -184,6 +178,8 @@ def map_type_to_registers(type):
             member_register_types=PtxType.PRED,
             member_names="val",
         )
+    if isinstance(type, MmaDescriptorType):
+        return TypeRegisterMapping(member_register_types=PtxType.B64, member_names="val")
     if isinstance(type, TmaDescType):
         return TypeRegisterMapping(
             member_register_types=PtxType.B64,
@@ -252,6 +248,8 @@ class PtxPrinter(Printer):
         self.pack_shared_declarations = False
         self.shared_declarations: list[tuple[int, str]] = []
         self.shared_addresses: dict[str, tuple[str, int]] = {}
+        self.carried_registers: dict[Value, str] = {}
+        self.skipped_recurrences: set[Op] = set()
 
     def unique_param_names_for_value(self, value: Value):
         mapping = map_type_to_registers(value.type)
@@ -267,6 +265,8 @@ class PtxPrinter(Printer):
         )
 
     def unique_ptx_names_for_value(self, value: Value):
+        if value in self.carried_registers:
+            return self.carried_registers[value]
         mapping = map_type_to_registers(value.type)
         return self.unique_ptx_names(value, mapping.member_register_types)
 
@@ -357,15 +357,13 @@ def _pack_static_shared_declarations(ptx: str) -> str:
     return "\n".join(remaining[:insertion] + ["  " + d[3] for d in packed] + remaining[insertion:]) + "\n"
 
 
-def make_ptx_kernel(module: ModuleOp, *, bulk_source_queue_completion: bool = False,
-                    prefetch_tmem_reads: bool = False) -> PtxKernel:
+def make_ptx_kernel(module: ModuleOp, *, bulk_source_queue_completion: bool = False) -> PtxKernel:
     """Lower a single-kernel ModuleOp to a PtxKernel."""
     top_ops = module.body.ops
     if len(top_ops) != 1 or not isinstance(top_ops[0], KernelOp):
         raise ValueError("make_ptx_kernel: module must contain exactly one KernelOp")
     kernel: KernelOp = top_ops[0]
-    module = PtxLoweringPipeline(bulk_source_queue_completion=bulk_source_queue_completion,
-                                 prefetch_tmem_reads=prefetch_tmem_reads).run(module)
+    module = PtxLoweringPipeline(bulk_source_queue_completion=bulk_source_queue_completion).run(module)
 
     if all(d is None for d in kernel.grid_dim):
         raise ValueError(f"make_ptx_kernel: grid_dim is entirely unset: {kernel.grid_dim}")
@@ -399,6 +397,8 @@ def make_ptx_kernel(module: ModuleOp, *, bulk_source_queue_completion: bool = Fa
 
 
 def _emit_op(p: PtxPrinter, op: Op) -> None:
+    if op in p.skipped_recurrences:
+        return
     if isinstance(op, ForOp):
         _emit_for(p, op)
     elif isinstance(op, IfOp):
@@ -451,15 +451,23 @@ def _emit_for(p: PtxPrinter, op: ForOp) -> None:
     p.write_newline_once()
     p.write_line(f"// BEGIN: `{_op_description(p, op)}`")
     p.write_line(f"mov.b32 {iv_reg}, {op.lb};")
+    from .ptx_rolled_loop import RolledLoopRecurrences
+
+    previous_skips, previous_registers = p.skipped_recurrences.copy(), p.carried_registers.copy()
+    recurrence = RolledLoopRecurrences(p, op, PtxType, _emit_op)
+    recurrence.initialize()
+    p.skipped_recurrences |= recurrence.skipped
     p.write_line(f"{label}:")
     p.write_newline_once()
     if op.attrs.get("unroll") is False:
         p.write_line('.pragma "nounroll";')
     _emit_block(p, op.body)
     p.write_line(f"// END: `{_op_description(p, op)}`")
+    recurrence.advance()
     p.write_line(f"add.s32 {iv_reg}, {iv_reg}, {op.step};")
     p.write_line(f"setp.lt.s32 {pred}, {iv_reg}, {op.ub};")
     p.write_line(f"@{pred} bra {label};")
+    p.skipped_recurrences, p.carried_registers = previous_skips, previous_registers
     p.write_newline_once()
 
 

@@ -45,7 +45,7 @@ def test_padded_column_views_lower_to_one_allocation():
     module=blackwell_tcgen05_gemm_module(m=1024,n=192,k=128,dtype='f16',
         output_n_tile=192,operand_stages=1,output_m_tiles_per_cta=2,
         output_grid_fast_axis='n',output_grid_size=3,output_store='stmatrix',
-        reuse_tmem_allocation=True,reuse_completion_locks=True)
+        reuse_tmem_allocation=True)
     ptx=make_ptx_kernel(module).ptx
     assert ptx.count('tcgen05.alloc.cta_group::1')==1
     assert ptx.count('tcgen05.dealloc.cta_group::1')==1

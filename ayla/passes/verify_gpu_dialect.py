@@ -581,11 +581,14 @@ class VerifyGpuDialect(VerificationPass):
 
         _, mma = _parts(op)
         depth = op.attrs.get("depth")
+        queue = op.attrs.get("mma_queue_depth", 1)
         lb, ub = op.attrs.get("lb"), op.attrs.get("ub")
         carried = op.attrs.get("carried_events", False)
         if (
             type(depth) is not int
             or depth < 2
+            or type(queue) is not int
+            or not 1 <= queue < depth
             or type(lb) is not int
             or type(ub) is not int
             # A persistent ring carries banks across output jobs.
@@ -840,18 +843,17 @@ class VerifyGpuDialect(VerificationPass):
             module = find_ancestor_of_type(op, ModuleOp)
             kernel = find_ancestor_of_type(op, KernelOp)
             if (module is None or module.target != 'sm_100a' or kernel is None
-                    or op.attrs.get('release_prior')
                     or any(not isinstance(lock.type, LockType)
                         or lock.type.kind != 'tcgen05'
                         or lock.type.cta_group != op.lock.type.cta_group
                         or 'arrivals' in lock.type.attrs for lock in op.completion_locks)
                     or len(set(op.completion_locks)) != len(op.completion_locks)
                     or not op.body.ops or any(not isinstance(inner, MatmulOp) for inner in op.body.ops)):
-                raise ValueError('additional completions require matching tcgen05 CTA groups without release_prior')
+                raise ValueError('additional completions require matching tcgen05 CTA groups')
             for lock in op.completion_locks[1:]:
                 if not any(isinstance(user, AwaitOp) for user in lock.users()):
                     raise ValueError('every completion event requires an await')
-                if any(isinstance(user, AsyncOp) and user.attrs.get('release_prior')
+                if any(isinstance(user, AsyncOp) and user.lock is lock and user.attrs.get('release_prior')
                        for user in lock.users()):
                     raise ValueError('additional completion peers cannot use release_prior')
         if "arrivals" in lock_type.attrs:
@@ -861,7 +863,7 @@ class VerifyGpuDialect(VerificationPass):
         release = op.attrs.get("release_prior", False)
         if type(release) is not bool:
             raise ValueError("async release_prior must be a bool")
-        peers = [u for u in op.lock.users() if isinstance(u, AsyncOp)]
+        peers = [u for u in op.lock.users() if isinstance(u, AsyncOp) and u.lock is op.lock]
         if any(u.attrs.get("release_prior", False) != release for u in peers):
             raise ValueError("completion lock peers must agree on release_prior")
         if release:

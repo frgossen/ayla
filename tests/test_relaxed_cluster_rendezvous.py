@@ -8,6 +8,7 @@ from ayla.analysis.sync import (
     BarrierTarget,
     ConcurrentMemoryEffect,
     SyncState,
+    SyncAnalysis,
     _after_barrier,
 )
 from ayla.gpu_dialect import AllocOp, BarrierOp, CollectiveScope, LockType
@@ -27,6 +28,14 @@ def test_a_reads_only_rendezvous_publishes_no_write(reads_only):
     )
     kinds = {effect.kind for effect in after.concurrent_memory_effects[root]}
     assert kinds == ({"W"} if reads_only else set())
+
+
+def test_an_authored_relaxed_rendezvous_keeps_unpublished_writes_live():
+    root = AllocOp.build_with_fresh_id(LockType.build(kind='mbar')).result()
+    state = SyncState(concurrent_memory_effects={root: {_settled('R'), _settled('W')}})
+    after = SyncAnalysis().transfer_barrier(
+        BarrierOp.build('cluster', attrs={'publishes': False}), state)
+    assert {effect.kind for effect in after.concurrent_memory_effects[root]} == {'W'}
 
 
 @pytest.mark.parametrize(

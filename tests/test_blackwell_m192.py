@@ -157,6 +157,8 @@ def test_composed_arena_retires_at_its_final_tmem_read():
         dict(output_store="global"),
         dict(dtype="bf16", output_layout="tcgen05_16x256b"),
         dict(output_column_major=True),
+        dict(rhs_column_major=True),
+        dict(bias=True),
         dict(cta_group=2, tmem_writeback_register_budget=128),
         dict(cta_group=2, cluster_m_ctas=4, tmem_writeback_register_budget=128),
     ],
@@ -203,6 +205,8 @@ def test_unsupported_m192_compositions_fail_before_scheduling(options):
         dict(m=576, k=192, output_store="global"),
         dict(m=776, k=192, output_column_major=True),
         dict(m=288, k=144, operand_k_tile=16, output_column_major=True),
+        dict(m=769, k=192, rhs_column_major=True),
+        dict(m=769, k=192, bias=True),
         dict(m=769, k=192, cta_group=2, tmem_writeback_register_budget=128),
         dict(
             m=769,

@@ -56,7 +56,6 @@ from ..gpu_dialect import (
     lock_is_cluster_scoped,
     execution_issuer_warp,
     execution_warps,
-    effective_operands,
 )
 from ..base.ir import Block, Op, Value, find_ancestor_of_type, iter_ops
 from .dataflow import DataflowAnalysis, DataflowState, transfers
@@ -629,31 +628,47 @@ def _bulk_destination_retired_at_wait(wait: AwaitOp) -> bool:
 
 
 def _paired_tmem_release_witness(op: DeallocOp) -> bool:
-    """A prior peer release must follow every TMEM access, including loads."""
+    """Find a completed peer rendezvous after the last access to this arena.
+
+    Pure address calculations and unrelated effects do not invalidate it. A
+    completed pipeline region carries the same witness as its terminal
+    rendezvous, which is expanded only after synchronization analysis.
+    """
     block = op.parent_block
     if block is None:
         return False
     position = block.ops.index(op)
-    if not position:
-        return False
-    wait = block.ops[position - 1]
-    if not isinstance(wait, BarrierOp):
-        return False
-    if wait.scope == 'cluster' and wait.attrs.get('phase') is None:
-        return True
-    if wait.scope != 'cluster_to_leader' or wait.attrs.get('phase') != 'wait' or wait.sync is None:
-        return False
     kernel = find_ancestor_of_type(op, KernelOp)
     if kernel is None:
         return False
     from ..cluster_layout import cluster_size, pair_mask
-    if wait.sync.type.attrs.get('release_cta_masks') != [pair_mask(r) for r in range(cluster_size(kernel))]:
-        return False
-    for prior in reversed(block.ops[:position - 1]):
-        if isinstance(prior, BarrierOp) and prior.sync is wait.sync and prior.attrs.get('phase') == 'arrive':
+
+    roots = root_buffers(op.value)
+    gather = None
+    for prior in reversed(block.ops[:position]):
+        if isinstance(prior, BarrierOp):
+            # A subset barrier cannot retire the other TMEM readers.
+            actors = execution_warps(prior)
+            all_readers = actors is None or actors == frozenset(range(kernel.num_threads // 32))
+            if all_readers and prior.scope == 'cluster' and prior.attrs.get('phase') is None:
+                return True
+            if (prior.scope == 'cluster_to_leader' and prior.sync is not None
+                    and prior.sync.type.attrs.get('release_cta_masks') ==
+                    [pair_mask(r) for r in range(cluster_size(kernel))]):
+                if prior.attrs.get('phase') == 'wait':
+                    gather = prior.sync
+                elif all_readers and prior.attrs.get('phase') == 'arrive' and prior.sync is gather:
+                    return True
+            continue
+        if isinstance(prior, PersistentPipelineOp):
+            # Its implementation drains every reader before returning TMEM.
             return True
-        # A gather whose arrival precedes a load cannot retire that load.
-        if any(isinstance(value.type, TmemTensorType) for value in effective_operands(prior)):
+        if isinstance(prior, OperandPipelineOp):
+            from ..passes.pipeline_rolled_k import _parts
+            if _parts(prior)[1].lock.type.cta_group == 2 or kernel.is_clustered:
+                return True
+        effects = memory_effects(prior)
+        if effects is None or any(effect.roots & roots for effect in effects):
             return False
     return False
 
@@ -1219,7 +1234,8 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
             raw = op.sync.type.attrs.get("release_warps")
             if raw is not None:
                 participants = frozenset(raw)
-        return _after_barrier(state, scope, op, execution_issuer_warp(op), participants)
+        return _after_barrier(state, scope, op, execution_issuer_warp(op), participants,
+            reads_only=not op.attrs.get('publishes', True) and scope in _RELAXABLE_RENDEZVOUS)
 
     @transfers(AwaitOp)
     def transfer_await(self, op: AwaitOp, state: SyncState) -> SyncState:
@@ -1422,12 +1438,11 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
     @transfers(OperandPipelineOp)
     def transfer_operand_pipeline(self, op: OperandPipelineOp, state: SyncState) -> SyncState:
         state = _transfer_memory_effects(op, state, self.targets)
-        if releases_cluster_banks(op):
-            # LowerRolledK drains its hardware events and executes a full
-            # cluster rendezvous at this completed-region boundary. Model
-            # that actual rendezvous instead of inserting another outside it.
-            state = _after_barrier(state, BarrierScope.CLUSTER, op)
-        return state
+        # Every LowerRolledK path drains its hardware events and rendezvouses
+        # at this completed-region boundary, including ordinary CTA pairs.
+        kernel = find_ancestor_of_type(op, KernelOp)
+        scope = BarrierScope.CLUSTER if kernel.is_clustered else BarrierScope.BLOCK
+        return _after_barrier(state, scope, op)
 
     @transfers(PersistentPipelineOp)
     def transfer_persistent_pipeline(self, op, state):

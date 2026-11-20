@@ -49,11 +49,12 @@ def build(**kwargs):
     "depth,k", [(2, 192), (3, 1040), (4, 1040), (5, 784), (8, 8192), (16, 8192)]
 )
 @pytest.mark.parametrize("kt", [64, 128, 256])
-def test_physical_banks_and_event_epochs(depth, k, kt):
+@pytest.mark.parametrize('queue', [1, 2, 4])
+def test_physical_banks_and_event_epochs(depth, k, kt, queue):
     k = max(kt * 3, math.ceil(k / kt) * kt)
-    if depth > math.ceil(k / kt) or (64 + 32) * kt * 2 * depth > 227328:
+    if queue >= depth or depth > math.ceil(k / kt) or (64 + 32) * kt * 2 * depth > 227328:
         pytest.skip("bank capacity or reduction too small for this depth")
-    mod = build(operand_stages=depth, k=k, operand_k_tile=kt)
+    mod = build(operand_stages=depth, k=k, operand_k_tile=kt, cyclic_operand_pipeline=queue)
     assert_dominance(mod.body)
     region = find_ops_of_type(mod, OperandPipelineOp)[0]
     lowered = LowerRolledK().run(clone_op(mod, {}))
@@ -129,7 +130,7 @@ def test_physical_banks_and_event_epochs(depth, k, kt):
                     assert phase == 0  # issue does not consume expected phase
                     loads.append(logical)
                 else:
-                    logical = len(mmas) + 1
+                    logical = len(mmas) + region.attrs['lb']
                     assert bank == logical % depth
                     assert phase == 0  # issue does not consume expected phase
                     for mma in op.body.ops:
@@ -144,7 +145,7 @@ def test_physical_banks_and_event_epochs(depth, k, kt):
                             assert data[(root, actual)] == logical
                     mmas.append(logical)
                 key = (arena, bank)
-                actual_phase = ((logical - 1) // depth) % 2
+                actual_phase = ((logical - region.attrs['lb']) // depth) % 2
                 if key in issued:
                     assert observed.get(key) == issued[key], (
                         "event rearmed before old observation"
@@ -157,7 +158,7 @@ def test_physical_banks_and_event_epochs(depth, k, kt):
                 observed[(arena, bank)] = phase
 
     walk(ops)
-    assert loads == mmas == list(range(1, math.ceil(k / kt)))
+    assert loads == mmas == list(range(region.attrs['lb'], math.ceil(k / kt)))
 
 
 @pytest.mark.parametrize("kt,depths", [(64, (4, 8, 16)), (128, (2, 4, 8))])
@@ -214,9 +215,11 @@ def test_expanded_operand_loops_share_issuer_guard(extra):
         dict(m=129, n=72, k=2304, operand_k_tile=256, operand_stages=3,
              cta_group=1, dtype="bf16"),
         dict(m=129, n=72, k=8192, operand_k_tile=128, operand_stages=6,
-             cta_group=1, operand_move_attrs={"lhs":{"issuer_warp":1},"rhs":{"issuer_warp":1}}),
+             cta_group=1, operand_move_attrs={"lhs":{"issuer_warp":0},"rhs":{"issuer_warp":0}}),
         dict(m=129, n=72, k=2304, operand_k_tile=256, operand_stages=3,
-             cta_group=1, dtype="bf16", operand_move_attrs={"lhs":{"issuer_warp":2},"rhs":{"issuer_warp":2}}),
+             cta_group=1, dtype="bf16", operand_move_attrs={"lhs":{"issuer_warp":0},"rhs":{"issuer_warp":0}}),
+        dict(m=129, n=192, k=8192, operand_stages=15, output_n_tile=96,
+             output_slices=1, cyclic_operand_pipeline=3, tmem_writeback_register_budget=64),
     ],
 )
 def test_gpu_reuse_and_partial_tiles(kwargs):
@@ -246,7 +249,65 @@ def test_cleanup_preserves_distinct_event_observations():
     after = len(
         [op for root in body.ops for op in iter_ops(root) if isinstance(op, AwaitOp)]
     )
-    assert before == after == 3
+    assert before == after == 5
+
+
+@pytest.mark.parametrize('queue', [1, 3, 4])
+def test_non_power_of_two_steady_loop_carries_descriptors_phases_and_lane(queue):
+    import re
+
+    ptx = make_ptx_kernel(build(k=3072, operand_stages=15, output_slices=1,
+        cyclic_operand_pipeline=queue)).ptx
+    [(body, advance)] = re.findall(r'// BEGIN: `for[^\n]*rolled_k_main[^\n]*\n.*?'
+                       r'\.pragma "nounroll";(.*?)// END: `for[^\n]*\n(.*?)\n\n', ptx, re.S)
+    assert 'pure MMA descriptor low half' not in body
+    assert 'mul.hi.u32' not in body and 'rem.u32' not in body and 'div.u32' not in body
+    assert body.count('elect.sync') == 1
+    assert 'add.u64' not in body
+    assert 'rolled MMA constants' not in body and 'rolled CTA pair identity' not in body
+    assert body.count('probe across rolled backedge') == 2
+    assert 'tcgen05.mma' in body
+    assert 'xor.b32' in advance and 'sub.u32' in advance
+
+
+@pytest.mark.parametrize('queue,k,depth', [(1,3072,15), (2,3136,15),
+                                         (1,1024,2), (2,1088,3)])
+def test_gpu_two_step_backedge_probes_and_odd_remainder(queue, k, depth):
+    import torch
+    from ayla.ptx_runtime import make_ptx_launcher
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip('requires Blackwell')
+    kernel = make_ptx_kernel(build(m=256, n=192, k=k, operand_stages=depth,
+        output_n_tile=96, output_slices=1, cyclic_operand_pipeline=queue,
+        rolled_k_unroll=2, tmem_writeback_register_budget=64))
+    assert kernel.ptx.count('probe across rolled backedge') == (4 if depth >= 6 else 0)
+    check_gemm(make_ptx_launcher(kernel),256,192,k,'f16',graph=True,runs=3,
+               atol=math.inf,rms=.002)
+
+
+def test_ring_facts_and_recurrences_do_not_depend_on_labels_or_descriptions():
+    from ayla.analysis.operand_ring import operand_ring
+    from ayla.gpu_dialect import MmaDescriptorOp, MmaDescriptorLowOp
+    from ayla.ptx_codegen import PtxLoweringPipeline, PtxPrinter, PtxType
+    from ayla.ptx_rolled_loop import RolledLoopRecurrences
+    from ayla.passes.lower_to_tma_move import LowerToTmaMove
+
+    mod = LowerRolledK().run(build(k=3072,operand_stages=15))
+    mod = LowerToTmaMove().run(mod)
+    [loop] = [op for op in find_ops_of_type(mod,ForOp) if op.attrs.get('label')=='rolled_k_main']
+    loop.attrs.pop('label')
+    assert operand_ring(loop).depth == 15
+    forbidden = {'rolled_operand_depth','rolled_carried_events','rolled_common_issuer','rolled_backedge_probe'}
+    assert all(not forbidden.intersection(op.attrs) for op in iter_ops(mod))
+    lowered = PtxLoweringPipeline().run(build(k=3072,operand_stages=15))
+    [loop] = [op for op in find_ops_of_type(lowered,ForOp) if op.attrs.get('label')=='rolled_k_main']
+    loop.attrs.pop('label')
+    for op in iter_ops(loop):
+        if isinstance(op,(MmaDescriptorOp,MmaDescriptorLowOp)):
+            op.attrs['description'] = 'unrelated text'
+    recurrence = RolledLoopRecurrences(PtxPrinter(),loop,PtxType,lambda *args:None)
+    assert recurrence.groups and recurrence.full_descriptors
 
 
 def test_rejects_incomplete_iteration():

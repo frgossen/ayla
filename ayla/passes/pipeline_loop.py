@@ -52,7 +52,7 @@ from ..gpu_dialect import (
 from ..base.ir import Block, Op, Value, clone_op
 from ..base.lowering_pass import LoweringPass, lowers
 from ._utils import label_matches
-from ._loop_utils import clone_loop_iteration
+from ._loop_utils import clone_loop_iteration, guard_narrows, loop_guard
 
 
 class PipelineLoop(LoweringPass):
@@ -399,6 +399,10 @@ class PipelineLoop(LoweringPass):
                 return self._pipeline_queued_async(op, selected_async)
             return self._pipeline_event_async(op, selected_async)
 
+        guard = loop_guard(op)
+        prefix = body_ops[:-1] if guard is not None else []
+        if guard is not None:
+            body_ops = guard.body.ops
         labeled_set, shared_set = self._compute_labeled_and_shared(body_ops)
         labeled = [o for o in body_ops if o in labeled_set]
         shared = [o for o in body_ops if o in shared_set]
@@ -408,27 +412,27 @@ class PipelineLoop(LoweringPass):
 
         self._check_legality(body_ops, labeled_set, shared_set)
 
+        def iteration(iv: Value, selected: list[Op]) -> list[Op]:
+            vmap: dict[Value, Value] = {op.iv: iv}
+            definitions = [clone_op(body_op, vmap) for body_op in prefix]
+            cloned = [clone_op(body_op, vmap) for body_op in selected]
+            if guard is None:
+                return definitions + cloned
+            return [*definitions, IfOp.build(vmap[guard.condition], Block(ops=cloned))]
+
         # Prologue: shared + labeled ops for iv = lb, lb+step, ..., lb+(n-1)*step.
         prologue_ops: list[Op] = []
         for i in range(n):
             iv_const = IndexConstantOp.build(value=lb + i * step)
             prologue_ops.append(iv_const)
-            vmap: dict[Value, Value] = {op.iv: iv_const.result()}
-            prologue_ops.extend(
-                clone_op(body_op, vmap) for body_op in shared + labeled
-            )
+            prologue_ops.extend(iteration(iv_const.result(), shared + labeled))
 
         # Main loop body: shared + unlabeled at iv, then shared + labeled at iv + n*step.
         new_iv = Value(name=op.iv.name, type=IndexType())
         ahead_const = IndexConstantOp.build(value=n * step)
         ahead_iv = IndexAddOp.build(lhs=new_iv, rhs=ahead_const.result())
-        new_body_ops: list[Op] = []
-        vmap = {op.iv: new_iv}
-        for body_op in shared + unlabeled:
-            new_body_ops.append(clone_op(body_op, vmap))
-        new_body_ops.extend([ahead_const, ahead_iv])
-        vmap = {op.iv: ahead_iv.result()}
-        future_ops = [clone_op(body_op, vmap) for body_op in shared + labeled]
+        current = iteration(new_iv, shared + unlabeled)
+        future_ops = iteration(ahead_iv.result(), shared + labeled)
         if self.guarded_tail:
             # Keep the drain in the common loop, suppressing only work past
             # the original bound. This avoids a duplicate output epilogue
@@ -437,9 +441,14 @@ class PipelineLoop(LoweringPass):
             active = IndexLtOp.build(ahead_iv.result(), limit.result())
             future = IfOp.build(active.result(), Block(ops=future_ops))
             future.attrs['label'] = self.label_filter_op
-            new_body_ops.extend([limit, active, future])
+            new_body_ops = [*current, ahead_const, ahead_iv, limit, active, future]
+        elif guard is not None and guard_narrows(op, guard):
+            *current_prefix, current_guard = current
+            assert isinstance(current_guard, IfOp)
+            current_guard.body.ops = [*current_guard.body.ops, future_ops[-1]]
+            new_body_ops = [*current_prefix, ahead_const, ahead_iv, *future_ops[:-1], current_guard]
         else:
-            new_body_ops.extend(future_ops)
+            new_body_ops = [*current, ahead_const, ahead_iv, *future_ops]
         new_body = Block(arguments=[new_iv], ops=new_body_ops)
         new_ub = ub if self.guarded_tail else ub - n * step
         new_for = ForOp.build(lb=lb, ub=new_ub, step=step, body=new_body,
@@ -452,10 +461,7 @@ class PipelineLoop(LoweringPass):
         for i in range(n):
             iv_const = IndexConstantOp.build(value=new_ub + i * step)
             epilogue_ops.append(iv_const)
-            vmap = {op.iv: iv_const.result()}
-            epilogue_ops.extend(
-                clone_op(body_op, vmap) for body_op in shared + unlabeled
-            )
+            epilogue_ops.extend(iteration(iv_const.result(), shared + unlabeled))
 
         return [*prologue_ops, new_for, *epilogue_ops], []
 

@@ -205,8 +205,7 @@ def schedule_job_participants(result, op):
                         region = IfOp.build(active[slot].result(), Block(ops=[region]))
                         region.attrs["participant_warps"] = participants(slot)
                     operation.body.ops[i] = region
-    # Cluster barriers do not replace the local rendezvous required before
-    # warp zero can deallocate TMEM used by the other output participants.
-    result[0].insert(len(result[0]) - 1, BarrierOp.build("block"))
+    # The terminal whole-cluster rendezvous includes all output participants
+    # in each CTA before either owner can deallocate the paired TMEM arena.
     kernel.attrs["name"] += "_rotating"
     return [*additions, *result[0]], result[1]

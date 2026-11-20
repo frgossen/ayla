@@ -47,7 +47,7 @@ def test_paired_tail_pads_the_whole_cluster():
 
 
 def test_paired_persistent_grid_keeps_pairs_uniform():
-    kernel = make_ptx_kernel(_module(output_grid_size=2, reuse_completion_locks=True))
+    kernel = make_ptx_kernel(_module(output_grid_size=2))
     assert kernel.grid_dim == (2, 1, 1)
     assert kernel.cluster_dim == (2, 1, 1)
 
@@ -73,5 +73,5 @@ def test_paired_allocation_requires_matching_cluster(cluster):
 @pytest.mark.parametrize('config', [dict(output_m_tile=64), dict(output_n_tile=512),
                                     dict(output_grid_size=147), dict(output_grid_fast_axis='n')])
 def test_paired_rejects_unsupported_schedule(config):
-    with pytest.raises(ValueError, match='paired MMA|shared-memory capacity|paired persistent'):
+    with pytest.raises(ValueError, match='paired MMA|paired M64|shared-memory capacity|paired persistent'):
         _module(**config)

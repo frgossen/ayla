@@ -1,7 +1,7 @@
 """Schedule completion observations at proven consumers in a shared CTA pipeline."""
 from ..base.ir import find_ancestor_of_type, find_ops_of_type, iter_ops
 from ..base.pipeline import Pass
-from ..gpu_dialect import (AsyncOp, AwaitOp, BarrierOp, KernelOp, MatmulOp,
+from ..gpu_dialect import (AllocOp, AsyncOp, AwaitOp, BarrierOp, ForOp, KernelOp, LockType, MatmulOp,
     ModuleOp, MoveOp, TmaMoveOp, SmemTensorType, memory_effects, root_buffers,
     execution_issuer_warp, lock_has_tma_multicast)
 
@@ -58,7 +58,97 @@ class ScheduleWarpWaits(Pass):
                 self._paired = kernel.cluster_dim == (2, 1, 1)
                 self._warps = threads // 32
                 self._schedule_mma_reuse(kernel.body)
+                if self._paired:
+                    self._single_use_accumulator_ready(kernel)
+            self._drop_self_releases(kernel)
         return module
+
+    @staticmethod
+    def _drop_self_releases(kernel):
+        """A release arrival publishes issuer observations to the event's
+        awaiters. When only the issuing warp awaits, it already holds them."""
+        for op in find_ops_of_type(kernel, AsyncOp):
+            if not op.attrs.get("release_prior"):
+                continue
+            users = op.lock.users()
+            issuers = {execution_issuer_warp(u) for u in users if isinstance(u, AsyncOp)}
+            if all(u.waiter_warps is not None and set(u.waiter_warps) <= issuers
+                   for u in users if isinstance(u, AwaitOp)):
+                for peer in users:
+                    if isinstance(peer, AsyncOp):
+                        peer.attrs.pop("release_prior", None)
+
+    def _single_use_accumulator_ready(self, kernel):
+        """Replace a terminal phase handoff by an independent result event.
+
+        A fresh event cannot alias an older bank generation. Repeated job
+        regions retain their rendezvous until they have an explicit epoch
+        protocol; this proof applies only to a once-executed drain.
+        """
+        for handoff in list(find_ops_of_type(kernel, BarrierOp)):
+            if not handoff.attrs.get('mma_wait_handoff'):
+                continue
+            if find_ancestor_of_type(handoff, ForOp) is not None:
+                continue
+            block = handoff.parent_block
+            position = block.ops.index(handoff)
+            batches = [op for root in block.ops for op in iter_ops(root)
+                       if isinstance(op, AsyncOp) and op.lock.type.kind == 'tcgen05']
+            # A drain can start before the last batches (their banks do not
+            # need refilling). Commit at the actual final issue, rather than
+            # requiring all issues to precede the first widened bank wait.
+            def unconditional(batch):
+                owner = batch.parent_block.parent_op
+                while owner is not block.parent_op:
+                    if not isinstance(owner, ForOp) or owner.trip_count < 1:
+                        return False
+                    owner = owner.parent_block.parent_op
+                return True
+
+            if (not batches or not all(unconditional(batch) for batch in batches)
+                    or any(not batch.body.ops
+                    or any(not isinstance(mm, MatmulOp) for mm in batch.body.ops)
+                    for batch in batches)):
+                continue
+            last = batches[-1]
+            # Earlier batches may execute in bounded K loops. The final
+            # direct drain batch executes once and owns the single-use event.
+            if last.parent_block is not block:
+                continue
+            issuers = {execution_issuer_warp(op) for op in batches}
+            if len(issuers) != 1:
+                continue
+            issuer = next(iter(issuers))
+            drains = [op for op in block.ops[position + 1:]
+                      if isinstance(op, AwaitOp) and op.lock.type.kind == 'tcgen05'
+                      and op.waiter_warps is None]
+            if not drains or any(any(peer not in batches for peer in drain.lock.users()
+                    if isinstance(peer, AsyncOp)) for drain in drains):
+                continue
+            at = max(block.ops.index(last), *(block.ops.index(wait) for wait in drains)) + 1
+            roots = set().union(*(root_buffers(mm.dst) for batch in batches
+                                   for mm in batch.body.ops if isinstance(mm, MatmulOp)))
+            # Moving the collective observation may not let a synchronous
+            # accumulator accessor pass it. Unknown effects keep the handoff.
+            accessors = [leaf for root in block.ops[position + 1:at]
+                         if not isinstance(root, (AsyncOp, AwaitOp))
+                         for leaf in iter_ops(root) if not leaf.blocks
+                         and find_ancestor_of_type(leaf, AsyncOp) not in batches]
+            if any(memory_effects(leaf) is None or any(effect.roots & roots
+                    for effect in memory_effects(leaf)) for leaf in accessors):
+                continue
+            ready = AllocOp.build_with_fresh_id(LockType.build('tcgen05', {
+                'cta_group': 2, 'completion_role': 'result'}),
+                attrs={'label': 'accumulator_ready'})
+            kernel.body.ops.insert(0, ready)
+            last.operands.append(ready.result())
+            # Each bank's final generation still needs an observation before
+            # retirement. Only the issuing warp consumes those bank events.
+            for drain in drains:
+                drain.attrs['waiter_warps'] = [issuer]
+            at = max(block.ops.index(last), *(block.ops.index(wait) for wait in drains)) + 1
+            block.ops.insert(at, AwaitOp.build(ready.result(), {'label': 'accumulator_ready'}))
+            block.ops.remove(handoff)
 
     def _accessors(self, roots, kinds="RW"):
         """``(leaf, effects, owner)`` for leaves accessing ``roots``; None if unmodeled."""
@@ -162,7 +252,9 @@ class ScheduleWarpWaits(Pass):
                     narrowed = True
                 elif narrowed:
                     result.append(BarrierOp.build(attrs={
-                        'scope': 'cluster' if self._paired else 'block', 'mma_wait_handoff': True}))
+                        'scope': 'cluster' if self._paired else 'block',
+                        'mma_wait_handoff': True,
+                        **({'publishes': False} if self._paired else {})}))
                     narrowed = False
             elif isinstance(op, BarrierOp) and op.scope == 'block':
                 narrowed = False

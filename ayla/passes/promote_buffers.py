@@ -33,6 +33,7 @@ from ..gpu_dialect import (
     ClusterBlockIdsOp,
     CollectiveAxis,
     CollectiveLevel,
+    ConstantOp,
     DeallocOp,
     ElementwiseOp,
     F16Type,
@@ -347,8 +348,8 @@ class PromoteBuffers(LoweringPass):
     cta_group : int
         One CTA or a paired Blackwell MMA. TMEM shapes stay local to each CTA;
         paired TMA loads jointly complete at the pair leader's mbarrier, and a
-        paired SMEM RHS places one half of its leading dimension in each CTA
-        of the block-X pair.
+        paired SMEM RHS places one half of each MMA instruction's N tile in
+        each CTA of the block-X pair. Wider tiles pack several such halves.
     """
 
     target_type: str
@@ -586,14 +587,24 @@ class PromoteBuffers(LoweringPass):
                 new_ops.extend(ops)
 
         # Alloc + move at the target level.
+        paired_rhs_root = None
+        paired_rhs_parts = 1
+        paired_rhs_rank = None
         if self.cta_group == 2 and self.target_type == "smem" and operand_name == "rhs":
-            # A paired MMA reads one contiguous RHS shard from each CTA.
+            # Each paired MMA instruction reads a contiguous RHS half per CTA.
             # Represent placement with ordinary global TileOps before promotion;
             # SMEM sizes and TMA transaction bytes are therefore local sizes.
             extent = chain_root.type.sizes[0]
             if extent is None or extent % 2:
                 raise ValueError("paired RHS extent must divide by two")
             ids = ClusterBlockIdsOp.build()
+            if extent > 256:
+                mma_columns = max(
+                    width for width in range(8, 257, 8) if extent % width == 0
+                )
+                paired_rhs_root = chain_root
+                paired_rhs_parts = extent // mma_columns
+                paired_rhs_rank = ids.x
             shard_type = clone_type(chain_root.type)
             shard_type.sizes = [extent // 2, *chain_root.type.sizes[1:]]
             shard = TileOp.build(chain_root, [ids.x, 0], shard_type)
@@ -638,16 +649,39 @@ class PromoteBuffers(LoweringPass):
                 attrs=buffer_attrs,
             )
             new_ops.append(alloc)
-            new_ops.extend(
-                _sliced_moves(
-                    alloc.result(),
-                    chain_root,
-                    self.tma_load_slices.get(operand_name, 1),
-                    0,
-                    collective,
-                    attrs,
+            if paired_rhs_root is not None and paired_rhs_parts > 1:
+                # Each MMA subinstruction needs a contiguous logical N tile
+                # assembled from two CTA halves. Pack those halves per
+                # subinstruction, rather than sharding the entire wide tile.
+                logical_rows = paired_rhs_root.type.sizes[0] // paired_rhs_parts
+                local_rows = logical_rows // 2
+                for part in range(paired_rhs_parts):
+                    logical_type = clone_type(paired_rhs_root.type)
+                    logical_type.sizes = [logical_rows, *logical_type.sizes[1:]]
+                    logical = TileOp.build(paired_rhs_root, [part, 0], logical_type)
+                    shard_type = clone_type(logical_type)
+                    shard_type.sizes = [local_rows, *shard_type.sizes[1:]]
+                    shard = TileOp.build(
+                        logical.result(), [paired_rhs_rank, 0], shard_type
+                    )
+                    local_type = clone_type(alloc.result().type)
+                    local_type.sizes = [local_rows, *local_type.sizes[1:]]
+                    local = TileOp.build(alloc.result(), [part, 0], local_type)
+                    new_ops.extend([logical, shard, local])
+                    new_ops.extend(_sliced_moves(
+                        local.result(), shard.result(), 1, 0, collective, attrs,
+                    ))
+            else:
+                new_ops.extend(
+                    _sliced_moves(
+                        alloc.result(),
+                        chain_root,
+                        self.tma_load_slices.get(operand_name, 1),
+                        0,
+                        collective,
+                        attrs,
+                    )
                 )
-            )
             if target_type.dtype != chain_root_type.dtype:
                 cvt_alloc = AllocOp.build_with_fresh_id(target_type)
                 cvt = ElementwiseOp.build(
@@ -807,6 +841,7 @@ class PromoteBuffers(LoweringPass):
         matmul_label: str | None = None,
         epilogue: list[ElementwiseOp] | None = None,
         writeback_tiling_scheme: int | None = None,
+        tensor_initializer: Value | None = None,
     ) -> tuple[list[Op], list[Value]]:
         assert isinstance(dst.type, MemTensorType)
         assert isinstance(src.type, MemTensorType)
@@ -826,6 +861,7 @@ class PromoteBuffers(LoweringPass):
                 matmul_label,
                 list(epilogue or []),
                 writeback_tiling_scheme,
+                tensor_initializer,
             ), []
         new_ops, src = self._build_register_epilogue(
             dst, src, operand_name, matmul_label, list(epilogue or [])
@@ -929,6 +965,7 @@ class PromoteBuffers(LoweringPass):
         matmul_label: str | None,
         epilogue: list[ElementwiseOp],
         writeback_tiling_scheme: int | None,
+        tensor_initializer: Value | None = None,
     ) -> list[Op]:
         """Drain a TMEM accumulator through register fragments, then free it.
 
@@ -971,6 +1008,21 @@ class PromoteBuffers(LoweringPass):
                     else None
                 ),
             )
+            bias_ops: list[Op] = []
+            if tensor_initializer is not None:
+                bias_view = (_slice_tile(tensor_initializer, -1, slice_idx, slice_cols)
+                             if slices > 1 else None)
+                bias_type = cast(MemTensorType, tensor_initializer.type)
+                bias_fragment = AllocOp.build_with_fresh_id(
+                    clone_type(fragment.result().type, {"dtype": bias_type.dtype})
+                )
+                bias_fp32 = AllocOp.build_with_fresh_id(fragment.result().type)
+                bias_ops = [*([bias_view] if bias_view else []), bias_fragment,
+                    MoveOp.build(dst=bias_fragment.result(),
+                        src=tensor_initializer if bias_view is None else bias_view.result(),
+                        collective=collective), bias_fp32,
+                    ElementwiseOp.build(dst=bias_fp32.result(), srcs=[bias_fragment.result()], fn="convert"),
+                    ElementwiseOp.build(dst=fragment.result(), srcs=[fragment.result(), bias_fp32.result()], fn="add")]
             ops, value = self._build_register_epilogue(
                 dst,
                 fragment.result(),
@@ -985,7 +1037,7 @@ class PromoteBuffers(LoweringPass):
                     for e in epilogue
                 ],
             )
-            return [*([view] if view else []), fragment, move, *ops], value
+            return [*([view] if view else []), fragment, move, *bias_ops, *ops], value
 
         new_ops: list[Op] = []
         if self.tma:
@@ -1056,11 +1108,13 @@ class PromoteBuffers(LoweringPass):
         block.ops = result
 
     def _promote_reduction_loop(self, loop: ForOp) -> tuple[list[Op], list[Op]]:
-        """Keep invariant scalar-initialized destinations across a reduction.
+        """Keep invariant initialized destinations across a reduction.
 
         Each destination gets one allocation/init before the loop and one
         writeback after it. Only static disjoint tiles of one parent are
         accepted when several destinations share backing storage.
+        TMEM tensor initializers are added during writeback, like ordinary
+        destination promotion, so their storage does not become an accumulator.
         """
         heroes = [op for op in find_ops_of_type(loop, MatmulOp) if self._promotes(op)]
         if not heroes:
@@ -1095,8 +1149,11 @@ class PromoteBuffers(LoweringPass):
         unique = {}
         for hero in heroes:
             init = hero.init
-            if init is None or init.type.rank != 0:
-                raise ValueError("loop-scoped promotion requires a scalar initializer")
+            if init is None:
+                raise ValueError("loop-scoped promotion requires an initializer")
+            assert isinstance(init.type, MemTensorType)
+            if init.type.rank != 0 and self.target_type != "tmem":
+                raise ValueError("loop-scoped promotion requires a scalar initializer or a TMEM tensor initializer")
             if hero.dst in unique:
                 if unique[hero.dst][1] is not init:
                     raise ValueError("loop-scoped destination initializers must agree")
@@ -1117,11 +1174,19 @@ class PromoteBuffers(LoweringPass):
                     raise ValueError("multiple scoped destinations may overlap")
             hoist(hero.dst)
             hoist(init)
+            scalar_init = init
+            tensor_initializer = None
+            if init.type.rank:
+                tensor_initializer = init
+                zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
+                pre.append(zero)
+                scalar_init = zero.result()
             ops,[promoted]=self._build_operand_promotion(hero.dst,"dst",hero.collective,
-                hero.attrs.get("label"),init=init)
+                hero.attrs.get("label"),init=scalar_init)
             pre.extend(ops)
             writes,_=self._build_operand_writeback(hero.dst,promoted,"dst",hero.collective,
-                hero.attrs.get("label"),[],hero.attrs.get("dst_tiling_scheme"))
+                hero.attrs.get("label"),[],hero.attrs.get("dst_tiling_scheme"),
+                tensor_initializer=tensor_initializer)
             post.extend(writes)
             unique[hero.dst]=(promoted,init)
         for hero in heroes:
@@ -1220,6 +1285,7 @@ class PromoteBuffers(LoweringPass):
             )
             pre_ops.extend(ops)
         init = op.init
+        tmem_initializer = None
         if "dst" in self.operand_names:
             # A scalar initializer fills the promoted allocation; registers
             # load a tensor initializer in place of the destination. The
@@ -1232,6 +1298,11 @@ class PromoteBuffers(LoweringPass):
             tensor_init = (
                 init if scalar_init is None and self.target_type == "wgrmem" else None
             )
+            if init is not None and scalar_init is None and self.target_type == "tmem":
+                tmem_initializer = init
+                zero = ConstantOp.build(0.0, RmemTensorType.build([], F32Type()))
+                pre_ops.append(zero)
+                scalar_init = zero.result()
             ops, [new_dst] = self._build_operand_promotion(
                 dst if tensor_init is None else tensor_init,
                 "dst",
@@ -1280,6 +1351,7 @@ class PromoteBuffers(LoweringPass):
                 label,
                 promoted_epilogue,
                 writeback_tiling_scheme,
+                tensor_initializer=tmem_initializer,
             )
 
         return pre_ops + [matmul] + post_ops

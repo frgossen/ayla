@@ -1625,6 +1625,16 @@ class PTXTemplateOp(GpuOp):
         }
 
 
+@gpu_dialect.register_op("mma_descriptor_low")
+class MmaDescriptorLowOp(PTXTemplateOp):
+    """The low half of a tensor-core descriptor derived from a SMEM pointer."""
+
+
+@gpu_dialect.register_op("mma_descriptor")
+class MmaDescriptorOp(PTXTemplateOp):
+    """A complete tensor-core descriptor derived from its low half."""
+
+
 class MemTensorType(Type):
     """Common base for all tensor-typed memory: shape + dtype.
 
@@ -2550,6 +2560,11 @@ class IndexType(Type):
 @gpu_dialect.register_type("pred")
 class PredicateType(Type):
     pass
+
+
+@gpu_dialect.register_type("mma_desc")
+class MmaDescriptorType(Type):
+    """A 64-bit tensor-core shared-memory descriptor in registers."""
 
 
 @gpu_dialect.register_type("f16")

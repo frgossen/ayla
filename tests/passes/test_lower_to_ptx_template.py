@@ -121,14 +121,14 @@ def test_wgmma_pipeline_controls_reach_ptx():
         (
             "leader_to_cluster",
             textwrap.dedent("""\
-        barrier.cluster.arrive.release;
+        barrier.cluster.arrive.relaxed;
         barrier.cluster.wait.acquire;
     """),
         ),
         (
             "cluster",
             textwrap.dedent("""\
-        barrier.cluster.arrive.release;
+        barrier.cluster.arrive.relaxed;
         barrier.cluster.wait.acquire;
     """),
         ),
@@ -733,7 +733,9 @@ def test_move_loads_broadcast_memory_into_wgmma_registers():
     template = "".join(op.template for op in find_ops_of_type(lowered, PTXTemplateOp))
 
     assert template.count("ld.global.b32") == 16
-    assert "ld.global.b16" not in template
+    # Interior pointers may be half-aligned: retain the guarded scalar path
+    # alongside the aligned packed loads.
+    assert "ld.global.b16" in template
 
 
 def test_move_loads_f32_pairs_into_wgmma_registers_as_vectors():
@@ -753,7 +755,7 @@ def test_move_loads_f32_pairs_into_wgmma_registers_as_vectors():
     assert template.count("ld.global.v2.b32") == 16
 
 
-def test_move_rejects_unaligned_wgmma_register_pairs():
+def test_move_guards_unaligned_wgmma_register_pairs():
     module = gpu_dialect.parse(
         textwrap.dedent("""\
         module {
@@ -764,8 +766,12 @@ def test_move_rejects_unaligned_wgmma_register_pairs():
         }""")
     )
 
-    with pytest.raises(AssertionError, match="contiguous and aligned"):
-        lower_to_ptx_template(module)
+    lowered=lower_to_ptx_template(module)
+    templates=[op.template for op in find_ops_of_type(lowered,PTXTemplateOp)]
+    copies=[s for s in templates if "unaligned_pair" in s]
+    assert len(copies)==1
+    assert "ld.global.b32" in copies[0] and "ld.global.b16" in copies[0]
+    assert "@!${pred:pair_aligned} bra ${label:unaligned_pair}" in copies[0]
 
 
 def test_lower_elementwise_bf16_mul():

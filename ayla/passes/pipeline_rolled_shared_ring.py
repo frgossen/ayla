@@ -599,11 +599,15 @@ class LowerRolledSharedRing(LoweringPass):
                 )
             )
             ops.append(IfOp.build(predicate, Block(ops=tail)))
-        ops.extend(
-            AwaitOp.build(lock, {"label": "output_terminal_drain"})
-            for lock in store_locks
-        )
-        ops.append(BarrierOp.build("cluster" if group == 2 else "block"))
+        # Bulk groups belong to issuing threads, not to software locks. One
+        # unconditional full wait drains every thread's queue, including both
+        # output issuers after job-participant scheduling.
+        if store_locks:
+            ops.append(AwaitOp.build(store_locks[0], {"label": "output_terminal_drain"}))
+        # Store source reads and TMEM reads need retirement, not publication.
+        # Destination writes complete independently in the bulk engine.
+        ops.append(BarrierOp.build("cluster" if group == 2 else "block",
+            attrs={"publishes": False} if group == 2 else None))
         if job_regions:
             from .pipeline_job_participants import schedule_job_participants
 

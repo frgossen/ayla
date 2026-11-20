@@ -213,10 +213,12 @@ def test_default_verification_checks_tile_rank(indices, result_sizes):
     "src",
     [
         "gmem<1x64xbf16>",
-        "gmem<64x64xbf16 strides=[65, 1]>",
+        "gmem<64x32xbf16>",
+        "gmem<64x64xf32>",
+        "gmem<64x64xbf16 strides=[128, 2]>",
     ],
 )
-def test_address_to_wgrmem_move_requires_matching_aligned_shapes(src):
+def test_address_to_wgrmem_move_requires_matching_shapes_and_contiguous_columns(src):
     module = gpu_dialect.parse(
         textwrap.dedent(f"""\
         module {{

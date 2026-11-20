@@ -24,6 +24,8 @@ from ..gpu_dialect import (
     MemTensorType,
     ModuleOp,
     RmemTensorType,
+    SmemTensorType,
+    TmemTensorType,
     TileOp,
     launch_extent,
     require_launch_extent,
@@ -47,6 +49,14 @@ _OPERAND_DIMS = {
     "rhs": frozenset(("N", "K")),
     "dst": frozenset(("M", "N")),
 }
+
+
+def _paired_smem_rhs(hero: MatmulOp) -> bool:
+    return (
+        isinstance(hero.dst.type, TmemTensorType)
+        and hero.dst.type.cta_group == 2
+        and isinstance(hero.rhs.type, SmemTensorType)
+    )
 
 
 def _refine_tiling_schemes(
@@ -284,7 +294,7 @@ class TileMatmul(LoweringPass):
         assert isinstance(rhs.type, MemTensorType)
         sizes_by_dim = {
             "M": lhs.type.sizes[0],
-            "N": rhs.type.sizes[0],
+            "N": hero.dst.type.sizes[1] if _paired_smem_rhs(hero) else rhs.type.sizes[0],
             "K": lhs.type.sizes[1],
         }
         ubs: list[int] = []
@@ -520,12 +530,22 @@ class TileMatmul(LoweringPass):
             tile_sizes=self.tile_sizes,
         )
         body_ops.extend(ops)
+        rhs_tile_sizes = list(self.tile_sizes)
+        if _paired_smem_rhs(hero):
+            # A pair contributes two physical RHS halves to one logical N
+            # tile. Keep the accumulator tile logical and cut each CTA's B
+            # view to half that width.
+            for index, dim in enumerate(self.op_dims):
+                if dim == "N":
+                    if rhs_tile_sizes[index] % 2:
+                        raise ValueError("paired shared RHS N tiles must be even")
+                    rhs_tile_sizes[index] //= 2
         ops, rhs = _build_tile_op(
             rhs,
             ["N", "K"],
             op_dims=self.op_dims,
             tile_idxs=ivs,
-            tile_sizes=self.tile_sizes,
+            tile_sizes=rhs_tile_sizes,
         )
         body_ops.extend(ops)
         dst_ops, dst = _build_tile_op(

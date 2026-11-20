@@ -93,10 +93,12 @@ def _parts(op):
 
 
 class PipelineRolledK(LoweringPass):
-    def __init__(self, depth, label="k"):
+    def __init__(self, depth, label="k", queue_depth=1):
         if type(depth) is not int or depth < 2:
             raise ValueError("rolled K depth must be an integer >= 2")
-        super().__init__(depth=depth, label=label)
+        if type(queue_depth) is not int or not 1 <= queue_depth < depth:
+            raise ValueError("rolled K queue depth must leave at least one refill bank")
+        super().__init__(depth=depth, label=label, queue_depth=queue_depth)
 
     def run(self, module):
         if module.body.ops[0].attrs.get("compact_output_pipeline"):
@@ -107,10 +109,52 @@ class PipelineRolledK(LoweringPass):
             if loop.attrs.get("label") != self.label:
                 continue
             parent = loop.parent_block
+            self._absorb_first_iteration(loop)
             ops, _ = self.lower_for(loop)
             index = parent.ops.index(loop)
             parent.ops[index : index + 1] = ops
         return module
+
+    @staticmethod
+    def _absorb_first_iteration(loop):
+        """Put a standalone peeled first batch into the initial ring fill.
+
+        Persistent regions keep their existing job protocol. A standalone
+        reduction can start filling all banks before it waits for batch zero.
+        """
+        from ..base.ir import find_ancestor_of_type
+        if loop.lb != 1 or find_ancestor_of_type(loop, ForOp) is not None:
+            return
+        parent = loop.parent_block
+        prefix = [op for op in parent.ops[:parent.ops.index(loop)]
+                  if not is_side_effect_free(op)]
+        first = prefix[-4:]
+        if (len(first) != 4 or not isinstance(first[0], AsyncOp)
+                or not isinstance(first[1], AwaitOp)
+                or not isinstance(first[2], AsyncOp)
+                or not isinstance(first[3], AwaitOp)):
+            return
+        load, mma = _parts(loop)
+        initial_load, load_wait, initial_mma, mma_wait = first
+        if (initial_load.lock.type.kind != 'mbar' or initial_mma.lock.type.kind != 'tcgen05'
+                or load_wait.lock is not initial_load.lock or mma_wait.lock is not initial_mma.lock
+                or len(initial_mma.completion_locks) != 1
+                or len(initial_load.completion_locks) != 1
+                or execution_issuer_warp(initial_load) != execution_issuer_warp(load)
+                or execution_issuer_warp(initial_mma) != execution_issuer_warp(mma)
+                or not initial_mma.body.ops
+                or not all(isinstance(mm, MatmulOp) for mm in initial_mma.body.ops)
+                or initial_mma.body.ops[0].accumulate
+                or not all(mm.accumulate for mm in initial_mma.body.ops[1:])):
+            return
+        def accessed(issue):
+            return [root_buffers(value) for inner in issue.body.ops for value in inner.operands]
+        if accessed(initial_load) != accessed(load) or accessed(initial_mma) != accessed(mma):
+            return
+        for op in first:
+            parent.ops.remove(op)
+        loop.lb = 0
+        loop.attrs['initialize_accumulator'] = True
 
     @lowers(ForOp)
     def lower_for(self, op):
@@ -161,6 +205,7 @@ class PipelineRolledK(LoweringPass):
             block.ops.insert(block.ops.index(root.definition) + 1, view)
             banks.append((root, view.result()))
         region = OperandPipelineOp.build(op, self.depth)
+        region.attrs['mma_queue_depth'] = self.queue_depth
         region.operands = [view for _, view in banks]
         if op.parent_block is not None:
             parent = op.parent_block.parent_op
@@ -203,6 +248,8 @@ class LowerRolledK(LoweringPass):
     def lower_pipeline(self, op):
         load, mma = _parts(op)
         depth, lb, ub = (op.attrs[x] for x in ("depth", "lb", "ub"))
+        queue = op.attrs.get('mma_queue_depth', 1)
+        lead = depth - queue
         group = mma.lock.type.attrs.get("cta_group", 1)
         load_issuer = execution_issuer_warp(load)
         mma_issuer = execution_issuer_warp(mma)
@@ -333,7 +380,7 @@ class LowerRolledK(LoweringPass):
         iteration(fill_iv, load, ready_value, fill_ops)
         fill = ForOp.build(
             lb=lb,
-            ub=min(ub, lb + depth - 1),
+            ub=min(ub, lb + lead),
             step=1,
             body=Block(arguments=[fill_iv], ops=fill_ops),
             attrs={"label": "rolled_k_fill", "unroll": False},
@@ -342,15 +389,15 @@ class LowerRolledK(LoweringPass):
         iv = Value(name=None, type=IndexType())
         body = []
         iteration(iv, mma, free_value, body)
-        ahead = IndexConstantOp.build(depth - 1)
+        ahead = IndexConstantOp.build(lead)
         future = IndexAddOp.build(iv, ahead.result())
         limit = IndexConstantOp.build(ub)
         active = IndexLtOp.build(future.result(), limit.result())
         body.extend([ahead, future, limit, active])
         refill = []
-        minus_one = IndexConstantOp.build(-1)
+        minus_one = IndexConstantOp.build(-queue)
         previous = IndexAddOp.build(iv, minus_one.result())
-        first = IndexConstantOp.build(lb)
+        first = IndexConstantOp.build(lb + queue - 1)
         reused = IndexLtOp.build(first.result(), iv)
         refill.extend([minus_one, previous, first, reused])
         reuse_ops = []
@@ -376,6 +423,39 @@ class LowerRolledK(LoweringPass):
             body=Block(arguments=[iv], ops=body),
             attrs={"label": "rolled_k_main", "unroll": False},
         )
+        first_batch = []
+        if op.attrs.get('initialize_accumulator') or queue > 1:
+            from ._loop_utils import clone_loop_iteration
+
+            # The steady loop starts with valid refill/release ordinals, so
+            # its bank and phase arithmetic can become register recurrences.
+            for offset in range(min(queue, main.trip_count - 1)):
+                initial_iv = IndexConstantOp.build(lb + offset)
+                batch = [initial_iv, *clone_loop_iteration(main, initial_iv.result())]
+                if offset == 0 and op.attrs.get('initialize_accumulator'):
+                    initial_mma = next(inner for root in batch for inner in iter_ops(root)
+                        if isinstance(inner, AsyncOp) and inner.lock.type.kind == 'tcgen05')
+                    initial_mma.body.ops[0].attrs['accumulate'] = False
+                first_batch.extend(batch)
+            main.lb += min(queue, main.trip_count - 1)
+        remainder = []
+        factor = kernel.attrs.get('rolled_k_unroll', 1) if kernel is not None else 1
+        if factor > 1 and main.trip_count >= factor:
+            from ._loop_utils import clone_loop_iteration
+
+            # Adjacent logical steps share one backedge, exposing the first
+            # refill and the following MMA to ptxas's instruction scheduler.
+            end = main.lb + main.trip_count // factor * factor
+            for ordinal in range(end, main.ub):
+                tail_iv = IndexConstantOp.build(ordinal)
+                remainder.extend([tail_iv, *clone_loop_iteration(main, tail_iv.result())])
+            grouped = []
+            for offset in range(factor):
+                shift = IndexConstantOp.build(offset)
+                step_iv = IndexAddOp.build(main.iv, shift.result())
+                grouped.extend([shift, step_iv, *clone_loop_iteration(main, step_iv.result())])
+            main.body.ops = grouped
+            main.step, main.ub = factor, end
         tail = []
         last = IndexConstantOp.build(ub - 1)
         tail.append(last)
@@ -405,6 +485,8 @@ class LowerRolledK(LoweringPass):
         return [
             *([] if carried else [ready, free, BarrierOp.build(scope)]),
             fill,
+            *first_batch,
             main,
+            *remainder,
             *tail,
         ], []

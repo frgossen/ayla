@@ -83,7 +83,7 @@ def test_incomplete_or_mismatched_mapping_rejected(args):
 @pytest.mark.parametrize(
     "extra",
     [
-        dict(cta_group=2, cluster_dim=(1, 2, 1)),
+        dict(cta_group=2, cluster_dim=(2, 1, 1)),
         dict(cta_group=2, cluster_n_ctas=2),
         dict(cta_group=2, cluster_n_ctas=2, cluster_dim=(4, 1, 1)),
         dict(cta_group=2, cluster_m_ctas=4),
@@ -102,9 +102,16 @@ def test_native_cluster_kernel_has_no_steady_software_gathers(extra):
             for b in find_ops_of_type(loop, BarrierOp)
             if b.scope in ("cluster", "cluster_to_leader")
         ]
+    from ayla.gpu_dialect import PTXTemplateOp
+
+    lowered = PtxLoweringPipeline().run(clone_op(m, {}))
+    for loop in find_ops_of_type(lowered, ForOp):
+        assert all(
+            "mbarrier.try_wait.parity.acquire.cluster" not in op.template
+            for op in find_ops_of_type(loop, PTXTemplateOp)
+        )
     ptx = make_ptx_kernel(m).ptx
     assert ".multicast::cluster.b64" in ptx
-    assert "mbarrier.try_wait.parity.acquire.cluster" not in ptx
 
 
 def test_tmem_readiness_cannot_release_other_pairs_operand_reads():
@@ -175,7 +182,6 @@ def test_persistent_cluster_grid_preserves_complete_work_groups(rolled, physical
         cluster_dim=physical,
         output_grid_size=12,
         reuse_tmem_allocation=True,
-        reuse_completion_locks=True,
         rolled_operand_pipeline=rolled,
     )
     kernel = make_ptx_kernel(m)
@@ -188,27 +194,13 @@ def test_incomplete_persistent_cluster_grid_rejected():
         module(cta_group=2, cluster_n_ctas=2, output_grid_size=6)
 
 
-def test_multicast_groups_support_distinct_operation_issuers():
-    m = module(
-        cluster_m_ctas=2,
-        cluster_n_ctas=2,
-        operand_move_attrs={"lhs": {"issuer_warp": 1}, "rhs": {"issuer_warp": 1}},
-    )
-    assert not m.body.ops[0].attrs.get("cluster_bank_pipeline")
-    sync = InsertSyncs().run(before_sync(m))
-    waits = [
-        b
-        for b in find_ops_of_type(sync, BarrierOp)
-        if b.scope == "cluster_to_leader" and b.attrs.get("phase") == "wait"
-    ]
-    assert waits and all(b.attrs.get("issuer_warp") == 1 for b in waits)
-    make_ptx_kernel(
+def test_multicast_groups_reject_distinct_operation_issuers():
+    with pytest.raises(ValueError, match="without warp specialization"):
         module(
             cluster_m_ctas=2,
             cluster_n_ctas=2,
             operand_move_attrs={"lhs": {"issuer_warp": 1}, "rhs": {"issuer_warp": 1}},
         )
-    )
 
 
 def test_user_can_disable_one_operands_multicast():
@@ -305,7 +297,6 @@ def test_gpu_cluster_persistent_partial_final_wave(rolled, logical, physical):
         cluster_dim=physical,
         output_grid_size=3 * cm * cn,
         reuse_tmem_allocation=True,
-        reuse_completion_locks=True,
         rolled_operand_pipeline=rolled,
     )
     launch = make_ptx_launcher(make_ptx_kernel(module(**cfg)))

@@ -1,0 +1,635 @@
+{
+  "routes_replaced": 8,
+  "fields_before": 5494,
+  "fields_after": 3621,
+  "direct_wrappers_flattened": 3,
+  "unused_frontend_controls_removed": [
+    "reuse_persistent_lhs",
+    "reuse_persistent_rhs",
+    "grouped_compute_overlap",
+    "resident_phase_order_split",
+    "persistent_output_schedule",
+    "compute_batches_per_fragment",
+    "pipeline_output_tiles",
+    "carry_output_store_queue",
+    "automatic_optimizations",
+    "block_gather_backend",
+    "ordered_mma_completion",
+    "mma_issue_group_size",
+    "rolled_refill_before_compute",
+    "preserve_prefetch_issue_order",
+    "hoist_invariant_operand_copies",
+    "reuse_completed_operand_copies",
+    "reuse_operand_copies_across_barriers",
+    "consumer_specific_mma_waits",
+    "paired_completion_handoffs",
+    "reuse_completion_locks",
+    "integer_index_division",
+    "prefetch_tmem_reads"
+  ],
+  "verification": "435 schedules rebuilt with identical executables for the same selections; eight replacements reconfirmed on B200 GPUs 0 and 1 with reversed load/capture order and identical-code controls; 96 FP16/BF16 checks under Compute Sanitizer, zero errors.",
+  "report": "benchmarks/blackwell_schedule_cleanup_20261120.md",
+  "performance": [
+    {
+      "sid": "6272x1280x256",
+      "accepted": true,
+      "identity": true,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": true,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9770911008750944,
+              "calibrated_upper95": 0.9821021142694543,
+              "calibrated_lower95": 0.9721283389176293,
+              "fastest_control_ratio": 0.9867981008308025,
+              "fastest_control_upper95": 0.9934376497634587,
+              "raw_ratio": 0.9674795873700199,
+              "clone_ratio": 0.9804230334001272
+            },
+            "inference": {
+              "calibrated_ratio": 1.0082567013718065,
+              "calibrated_upper95": 1.0139087164408205,
+              "calibrated_lower95": 1.0027089501048663,
+              "fastest_control_ratio": 1.018292940070872,
+              "fastest_control_upper95": 1.0251192207074447,
+              "raw_ratio": 0.9983193792843184,
+              "clone_ratio": 0.9808100244662915
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": true,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9747589075249675,
+              "calibrated_upper95": 0.9815780370334988,
+              "calibrated_lower95": 0.9695223341088104,
+              "fastest_control_ratio": 0.9847319278346618,
+              "fastest_control_upper95": 0.991512228144674,
+              "raw_ratio": 0.968062758430257,
+              "clone_ratio": 0.9865313716031491
+            },
+            "inference": {
+              "calibrated_ratio": 1.003223809115022,
+              "calibrated_upper95": 1.007315925103389,
+              "calibrated_lower95": 0.9982903714416868,
+              "fastest_control_ratio": 1.0064554334412565,
+              "fastest_control_upper95": 1.0107848219724087,
+              "raw_ratio": 1.0034349815994557,
+              "clone_ratio": 0.9978572934454063
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "operand_stages": 4,
+        "cyclic_operand_pipeline": true,
+        "output_grid_fast_axis": "n",
+        "tmem_writeback_register_budget": 64,
+        "output_store": "stmatrix",
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_m_tiles_per_cta": 2
+      }
+    },
+    {
+      "sid": "8192x512x512",
+      "accepted": true,
+      "identity": false,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9786172114199564,
+              "calibrated_upper95": 0.9845554912645322,
+              "calibrated_lower95": 0.9692196181374231,
+              "fastest_control_ratio": 0.9879349072272163,
+              "fastest_control_upper95": 0.9932120675734414,
+              "raw_ratio": 0.9694277452958912,
+              "clone_ratio": 0.9846799452586584
+            },
+            "inference": {
+              "calibrated_ratio": 0.9791576226210481,
+              "calibrated_upper95": 0.9856309865563171,
+              "calibrated_lower95": 0.9749833892492764,
+              "fastest_control_ratio": 0.9825085616864615,
+              "fastest_control_upper95": 0.9897783467204107,
+              "raw_ratio": 0.9819582908162542,
+              "clone_ratio": 1.0057025057119033
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9860343345859022,
+              "calibrated_upper95": 0.9922025541086851,
+              "calibrated_lower95": 0.977287600071381,
+              "fastest_control_ratio": 0.99665742211085,
+              "fastest_control_upper95": 1.0055172655113347,
+              "raw_ratio": 0.9738234725294052,
+              "clone_ratio": 0.9787961779869996
+            },
+            "inference": {
+              "calibrated_ratio": 0.9784463344410869,
+              "calibrated_upper95": 0.987698064309502,
+              "calibrated_lower95": 0.9717895855512091,
+              "fastest_control_ratio": 0.9971958688959883,
+              "fastest_control_upper95": 1.0067688800920562,
+              "raw_ratio": 0.9600493335788736,
+              "clone_ratio": 0.9627490080176121
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "operand_stages": 4,
+        "cyclic_operand_pipeline": true,
+        "operand_move_attrs": {
+          "rhs": {
+            "l2_cache_hint": "evict_first"
+          }
+        },
+        "tmem_writeback_register_budget": 64,
+        "output_layout": "tcgen05_16x32bx2",
+        "output_store": "stmatrix",
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_store_pending_groups": 1
+      }
+    },
+    {
+      "sid": "8192x768x768",
+      "accepted": true,
+      "identity": false,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9482775694949398,
+              "calibrated_upper95": 0.9535836341520005,
+              "calibrated_lower95": 0.9449226506241889,
+              "fastest_control_ratio": 0.9536848593910175,
+              "fastest_control_upper95": 0.9604127676595621,
+              "raw_ratio": 0.9440083079047866,
+              "clone_ratio": 0.9899368824379594
+            },
+            "inference": {
+              "calibrated_ratio": 0.9538474009379557,
+              "calibrated_upper95": 0.9561787113409806,
+              "calibrated_lower95": 0.9498196012355982,
+              "fastest_control_ratio": 0.9566323954067415,
+              "fastest_control_upper95": 0.9593523563685176,
+              "raw_ratio": 0.9511295088502816,
+              "clone_ratio": 0.9960326104675921
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.954323183526011,
+              "calibrated_upper95": 0.9588541609952314,
+              "calibrated_lower95": 0.9484441602487543,
+              "fastest_control_ratio": 0.9616332000787149,
+              "fastest_control_upper95": 0.9672341517667842,
+              "raw_ratio": 0.944964070459573,
+              "clone_ratio": 0.9850945704211436
+            },
+            "inference": {
+              "calibrated_ratio": 0.9596827229965464,
+              "calibrated_upper95": 0.9622052287519547,
+              "calibrated_lower95": 0.9566807317368369,
+              "fastest_control_ratio": 0.9601205023942626,
+              "fastest_control_upper95": 0.9641197508327126,
+              "raw_ratio": 0.9586155640753509,
+              "clone_ratio": 0.9981181382041372
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "output_n_tile": 384,
+        "cyclic_operand_pipeline": true,
+        "tmem_writeback_register_budget": 64,
+        "output_store": "stmatrix",
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_layout": "tcgen05_16x32bx2",
+        "allow_partial_tiles": true,
+        "operand_move_attrs": {
+          "rhs": {
+            "l2_cache_hint": "evict_first"
+          }
+        },
+        "output_store_pending_groups": 1,
+        "cta_group": 2
+      }
+    },
+    {
+      "sid": "12544x384x1152",
+      "accepted": true,
+      "identity": false,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9585581171916473,
+              "calibrated_upper95": 0.9606232636566495,
+              "calibrated_lower95": 0.9544114930741529,
+              "fastest_control_ratio": 0.964722795749756,
+              "fastest_control_upper95": 0.9678390157351785,
+              "raw_ratio": 0.9524328315678533,
+              "clone_ratio": 0.9872606263311616
+            },
+            "inference": {
+              "calibrated_ratio": 0.9666889811699931,
+              "calibrated_upper95": 0.9706934256979582,
+              "calibrated_lower95": 0.9648629908847116,
+              "fastest_control_ratio": 0.9715866966648391,
+              "fastest_control_upper95": 0.9747275241242717,
+              "raw_ratio": 0.9624697599105282,
+              "clone_ratio": 0.9937323465282263
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9543318277848475,
+              "calibrated_upper95": 0.9578169170114336,
+              "calibrated_lower95": 0.9516822229329119,
+              "fastest_control_ratio": 0.958930196734616,
+              "fastest_control_upper95": 0.9640472620926368,
+              "raw_ratio": 0.9478664209725111,
+              "clone_ratio": 0.9884553733766804
+            },
+            "inference": {
+              "calibrated_ratio": 0.9633259541713735,
+              "calibrated_upper95": 0.966152898003427,
+              "calibrated_lower95": 0.9588553959065482,
+              "fastest_control_ratio": 0.9679607690433563,
+              "fastest_control_upper95": 0.971647764821176,
+              "raw_ratio": 0.9679607690433563,
+              "clone_ratio": 1.012775779069478
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "operand_stages": 4,
+        "cyclic_operand_pipeline": true,
+        "output_store": "stmatrix",
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_store_pending_groups": 1,
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "output_column_major": true,
+        "transpose_output": true
+      }
+    },
+    {
+      "sid": "12544x384x1536",
+      "accepted": true,
+      "identity": false,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9661163611410354,
+              "calibrated_upper95": 0.9728805574103576,
+              "calibrated_lower95": 0.9629292667706654,
+              "fastest_control_ratio": 0.9690246742221104,
+              "fastest_control_upper95": 0.9783761176491416,
+              "raw_ratio": 0.9640425092114138,
+              "clone_ratio": 0.9965281963683212
+            },
+            "inference": {
+              "calibrated_ratio": 0.9763068274037422,
+              "calibrated_upper95": 0.9790619743175347,
+              "calibrated_lower95": 0.9743134922805359,
+              "fastest_control_ratio": 0.9792752031197282,
+              "fastest_control_upper95": 0.9821897443119564,
+              "raw_ratio": 0.974471719662107,
+              "clone_ratio": 0.9968118673167414
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9658810329417057,
+              "calibrated_upper95": 0.9684238182069945,
+              "calibrated_lower95": 0.9628358567487127,
+              "fastest_control_ratio": 0.9709879266402831,
+              "fastest_control_upper95": 0.9744474652311693,
+              "raw_ratio": 0.9616390286733338,
+              "clone_ratio": 0.9921170251604721
+            },
+            "inference": {
+              "calibrated_ratio": 0.9805042707436091,
+              "calibrated_upper95": 0.9837434260763901,
+              "calibrated_lower95": 0.9775355325707944,
+              "fastest_control_ratio": 0.9837028263608504,
+              "fastest_control_upper95": 0.9875511645505303,
+              "raw_ratio": 0.9837028263608504,
+              "clone_ratio": 1.007422849264603
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "operand_stages": 4,
+        "cyclic_operand_pipeline": true,
+        "output_store": "stmatrix",
+        "output_slices": 4,
+        "output_store_buffers": 2,
+        "output_store_pending_groups": 1,
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "tmem_writeback_register_budget": 64,
+        "output_column_major": true,
+        "transpose_output": true,
+        "tmem_writeback_warps": 8
+      }
+    },
+    {
+      "sid": "12544x512x1024",
+      "accepted": true,
+      "identity": false,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9830025251487035,
+              "calibrated_upper95": 0.9878172074581274,
+              "calibrated_lower95": 0.9792165965299467,
+              "fastest_control_ratio": 0.9873211531676237,
+              "fastest_control_upper95": 0.9931712054301907,
+              "raw_ratio": 0.9806013394747912,
+              "clone_ratio": 0.9931635813399864
+            },
+            "inference": {
+              "calibrated_ratio": 0.9904115251732183,
+              "calibrated_upper95": 0.9932379330249533,
+              "calibrated_lower95": 0.9854607408588281,
+              "fastest_control_ratio": 0.9943791152282138,
+              "fastest_control_upper95": 0.9993847664355947,
+              "raw_ratio": 0.9914854990449794,
+              "clone_ratio": 1.0053822174621894
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9831314394715979,
+              "calibrated_upper95": 0.9864414508397478,
+              "calibrated_lower95": 0.9787673735090007,
+              "fastest_control_ratio": 0.9893402149801613,
+              "fastest_control_upper95": 0.9932013519468595,
+              "raw_ratio": 0.9778247282751166,
+              "clone_ratio": 0.9884279302167396
+            },
+            "inference": {
+              "calibrated_ratio": 0.9986937829656937,
+              "calibrated_upper95": 1.0027407759632592,
+              "calibrated_lower95": 0.9959379532784964,
+              "fastest_control_ratio": 0.9994787594120715,
+              "fastest_control_upper95": 1.0065795108993774,
+              "raw_ratio": 0.998696646955144,
+              "clone_ratio": 0.9994885482689091
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "output_n_tile": 352,
+        "cyclic_operand_pipeline": 0,
+        "output_store": "stmatrix",
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "output_column_major": true,
+        "operand_move_attrs": {
+          "lhs": {
+            "l2_cache_hint": "evict_last"
+          },
+          "rhs": {
+            "l2_cache_hint": "evict_first"
+          }
+        },
+        "output_slices": 4,
+        "tmem_writeback_register_budget": 64,
+        "output_store_buffers": 4,
+        "output_store_pending_groups": 2,
+        "transpose_output": true
+      }
+    },
+    {
+      "sid": "25216x320x960",
+      "accepted": true,
+      "identity": true,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": true,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9894245384685982,
+              "calibrated_upper95": 0.9926946390966193,
+              "calibrated_lower95": 0.9861775699988163,
+              "fastest_control_ratio": 0.9926586490901159,
+              "fastest_control_upper95": 0.9967652926600812,
+              "raw_ratio": 0.9870024284093676,
+              "clone_ratio": 0.9950900550234123
+            },
+            "inference": {
+              "calibrated_ratio": 0.9995164716815429,
+              "calibrated_upper95": 1.0019063178479926,
+              "calibrated_lower95": 0.9956504694210803,
+              "fastest_control_ratio": 1.003769959730432,
+              "fastest_control_upper95": 1.007042429823692,
+              "raw_ratio": 0.9950228678019712,
+              "clone_ratio": 0.9902890149503577
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": true,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9901287077763801,
+              "calibrated_upper95": 0.9934333030523291,
+              "calibrated_lower95": 0.9855843826970235,
+              "fastest_control_ratio": 0.9942252528031259,
+              "fastest_control_upper95": 0.9992006294794469,
+              "raw_ratio": 0.9868662953654167,
+              "clone_ratio": 0.9917694073609294
+            },
+            "inference": {
+              "calibrated_ratio": 1.01134633537602,
+              "calibrated_upper95": 1.0152305073658854,
+              "calibrated_lower95": 1.0080401303401612,
+              "fastest_control_ratio": 1.0194659985176213,
+              "fastest_control_upper95": 1.0240907965303325,
+              "raw_ratio": 1.0035374120212017,
+              "clone_ratio": 0.9828938401868467
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "output_n_tile": 160,
+        "operand_stages": 5,
+        "cyclic_operand_pipeline": true,
+        "output_grid_fast_axis": "n",
+        "output_store": "stmatrix",
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_grid_size": 148,
+        "output_store_pending_groups": 1,
+        "operand_move_attrs": {
+          "lhs": {
+            "l2_promotion": "128B",
+            "l2_cache_hint": "evict_first"
+          },
+          "rhs": {
+            "l2_promotion": "256B"
+          },
+          "dst": {
+            "l2_cache_hint": "evict_last"
+          }
+        },
+        "persistent_output_pipeline": true,
+        "output_writeback_window": [
+          11,
+          15
+        ]
+      }
+    },
+    {
+      "sid": "401536x64x192",
+      "accepted": true,
+      "identity": false,
+      "devices": [
+        {
+          "gpu": 0,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9761616552454315,
+              "calibrated_upper95": 0.9787028279038551,
+              "calibrated_lower95": 0.9706163689577666,
+              "fastest_control_ratio": 0.9781380415889154,
+              "fastest_control_upper95": 0.9824023190378032,
+              "raw_ratio": 0.9734433249629719,
+              "clone_ratio": 0.9960864331431323
+            },
+            "inference": {
+              "calibrated_ratio": 0.9477768859483258,
+              "calibrated_upper95": 0.9527113818761038,
+              "calibrated_lower95": 0.9454681058254288,
+              "fastest_control_ratio": 0.9490846560817806,
+              "fastest_control_upper95": 0.9552862637020713,
+              "raw_ratio": 0.9466974147041869,
+              "clone_ratio": 0.9970110468584846
+            }
+          }
+        },
+        {
+          "gpu": 1,
+          "status": "ok",
+          "same_executable": false,
+          "metrics": {
+            "complete": {
+              "calibrated_ratio": 0.9849137843931935,
+              "calibrated_upper95": 0.9869186994970767,
+              "calibrated_lower95": 0.9807176833191914,
+              "fastest_control_ratio": 0.9888720888250575,
+              "fastest_control_upper95": 0.9911022974441193,
+              "raw_ratio": 0.9835917145799831,
+              "clone_ratio": 0.9959947510520788
+            },
+            "inference": {
+              "calibrated_ratio": 0.9640536582135708,
+              "calibrated_upper95": 0.9678586414540247,
+              "calibrated_lower95": 0.9603237385930044,
+              "fastest_control_ratio": 0.9720964024163485,
+              "fastest_control_upper95": 0.9768494586462737,
+              "raw_ratio": 0.9560774565205177,
+              "clone_ratio": 0.9839024281707194
+            }
+          }
+        }
+      ],
+      "configuration": {
+        "output_n_tile": 64,
+        "operand_k_tile": 192,
+        "operand_stages": 1,
+        "cyclic_operand_pipeline": 0,
+        "tmem_writeback_register_budget": 64,
+        "output_store": "stmatrix",
+        "operand_move_attrs": {
+          "lhs": {
+            "l2_cache_hint": "evict_first"
+          }
+        },
+        "output_m_tiles_per_cta": 4,
+        "allow_partial_tiles": true
+      }
+    }
+  ],
+  "correctness_checks": 96,
+  "memcheck_errors": 0,
+  "reference_scope": "Pre-cleanup workspace incumbents; inference-v2 is a synthetic producer/consumer timing measure.",
+  "code_comparison_routes": {
+    "production": 379,
+    "split_k_table": 56
+  },
+  "baseline_configuration_sha256": "cd1afd102f85acb4d33278fcf65190a3063f6e9fa1768c60939d71ea32fd50fd",
+  "cpu_tests": {
+    "passed": 792,
+    "skipped": 199
+  },
+  "python_F_lint": "passed"
+}

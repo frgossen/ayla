@@ -192,7 +192,8 @@ def schedule_register_matmul(
     pipeline.add_pass(Canonicalize(keep_loops=keep))
     if rolled_operand_pipeline:
         from ..passes.pipeline_rolled_k import PipelineRolledK
-        pipeline.add_pass(PipelineRolledK(operand_stages, k_label))
+        pipeline.add_pass(PipelineRolledK(operand_stages, k_label,
+                                        queue_depth=max(1, int(cyclic_operand_pipeline))))
         return pipeline
     # A cyclic pipeline of depth d keeps d MMA batches queued: it refills the
     # last d banks after their MMA events, carried into the next iteration.
@@ -364,9 +365,6 @@ def _schedule_matmul(
     output_m_tiles_per_cta: int = 1,
     batch_output_m_operands: bool = False,
     output_n_tiles_per_cta: int = 1,
-    grouped_compute_overlap: bool = False,
-    compute_batches_per_fragment: int = 0,
-    preserve_output_job_order: bool = False,
     output_grid_size: int | None = None,
     output_grid_axes: tuple[CollectiveAxis, CollectiveAxis] = (
         CollectiveAxis.X,
@@ -399,7 +397,6 @@ def _schedule_matmul(
     tmem_writeback_register_budget: int = 32,
     tmem_writeback_warps: int = 4,
     reuse_tmem_allocation: bool = False,
-    reuse_completion_locks: bool = False,
     output_layout: str | None = None,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
     multicast_operands: bool = False,
@@ -725,8 +722,7 @@ def _schedule_matmul(
                 label_filter=group_label,
             )
         )
-    if not preserve_output_job_order:
-        pipeline.add_pass(ScheduleAsync())
+    pipeline.add_pass(ScheduleAsync())
     pipeline.add_pass(Canonicalize())
     if tensor_memory and output_m_tile == 192:
         from ..passes.pack_tmem_allocs import PackTmemAllocs
@@ -735,24 +731,14 @@ def _schedule_matmul(
                                        preserve_release_barriers=False))
     if tensor_memory and group_size > 1:
         from ..passes.pack_tmem_allocs import PackTmemAllocs
-        pipeline.add_pass(PackTmemAllocs(track_column_regions=grouped_compute_overlap,
-                                       preserve_release_barriers=not grouped_compute_overlap))
-        if grouped_compute_overlap:
-            from ..passes.schedule_native_compute import ScheduleNativeCompute
-            if compute_batches_per_fragment:
-                pipeline.add_pass(UnrollLoop(unroll_factor=None, label_filter=r'k(?:_.*)?'))
-                pipeline.add_pass(Canonicalize())
-            pipeline.add_pass(ScheduleNativeCompute(hoist_compute=True,
-                compute_batches_per_fragment=compute_batches_per_fragment))
-    if reuse_tmem_allocation or reuse_completion_locks:
+        pipeline.add_pass(PackTmemAllocs())
+    if reuse_tmem_allocation:
         if not tensor_memory:
             raise ValueError("TMEM allocation reuse requires a Blackwell target")
         # One pass crosses a persistent loop's guard; the second crosses the
         # loop. The resource allocation and its release always move together.
-        pipeline.add_pass(LICM(reuse_tmem_allocation=reuse_tmem_allocation,
-                               reuse_completion_locks=reuse_completion_locks))
-        pipeline.add_pass(LICM(reuse_tmem_allocation=reuse_tmem_allocation,
-                               reuse_completion_locks=reuse_completion_locks))
+        pipeline.add_pass(LICM(reuse_tmem_allocation=True))
+        pipeline.add_pass(LICM(reuse_tmem_allocation=True))
     scheduled = pipeline.run(module)
     if layout.size > 1 and (clustered_work or layout.physical != tuple(d or 1 for d in scheduled.body.ops[0].cluster_dim) or layout.m > cta_group):
         from ..passes.map_cluster_tiles import MapClusterTiles

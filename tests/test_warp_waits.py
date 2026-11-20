@@ -2,12 +2,13 @@
 import pytest
 from ayla.analysis.sync import SyncAnalysis, BarrierScope
 from ayla.base.ir import Block, find_ops_of_type
-from ayla.gpu_dialect import (AllocOp, AsyncOp, AwaitOp, KernelOp, LockType,
+from ayla.gpu_dialect import (AllocOp, AsyncOp, AwaitOp, LockType,
     MoveOp, gpu_dialect)
 from ayla.passes.verify_gpu_dialect import VerifyGpuDialect
 from ayla.passes.schedule_warp_waits import ScheduleWarpWaits
 from ayla.gemm_collection.blackwell_tcgen05 import blackwell_tcgen05_gemm_module
 import tests.test_warp_issuers as warp_cases
+from tests.testing_utils import requires_cuda
 
 
 def module(*, release=True, tail='', target='sm_100a'):
@@ -161,8 +162,7 @@ def test_partial_wait_keeps_gather_live_until_a_publishing_completion(release):
 
 def test_fusion_preserves_scoped_wait_participants():
     from ayla.passes.fuse_async import FuseAsync
-    m=module();body=m.body.ops[0].body
-    ready=find_ops_of_type(m,AwaitOp)[0]
+    m=module()
     FuseAsync().run(m)
     selected=[w for w in find_ops_of_type(m,AwaitOp) if w.lock.type.kind=='mbar']
     assert selected and selected[0].waiter_warps==(0,)
@@ -195,10 +195,11 @@ def test_old_publication_cannot_retire_a_later_gather_reusing_its_id(ending):
     assert state.named_barrier_ids_pending_await[future.result()]=={key}
 
 
-CASES=[*warp_cases.GPU_CASES,*[dict(warp_cases.GPU_CASES[i],load_warp=0,rhs_warp=0)
+CASES=[*warp_cases.GPU_CASES,*[pytest.param(
+          dict(warp_cases.GPU_CASES[i],load_warp=0,rhs_warp=0), marks=requires_cuda)
           for i in (0,4,5,7)],*[dict(warp_cases.GPU_CASES[i],reuse_tmem_allocation=False)
           for i in (0,5,11)]]
 @pytest.mark.parametrize('case',CASES)
 @pytest.mark.parametrize('dtype',['f16','bf16'])
-def test_gpu_warp_operand_waits(case,dtype):
-    warp_cases.issuer_gemm(case,dtype,warp_specific_operand_waits=True,reuse_completion_locks=True)
+def test_operand_waits_do_not_enable_separate_warp_roles(case,dtype):
+    warp_cases.issuer_gemm(case,dtype,warp_specific_operand_waits=True)

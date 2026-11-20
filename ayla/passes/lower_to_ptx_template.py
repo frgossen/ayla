@@ -17,7 +17,7 @@ import struct
 import textwrap
 from typing import cast
 
-from ..base.ir import Block, Op, Type, Value, find_ancestor, find_ancestor_of_type, find_ops_of_type, iter_ops
+from ..base.ir import Block, Op, Type, Value, clone_op, find_ancestor, find_ancestor_of_type, find_ops_of_type, iter_ops
 from ..base.lowering_pass import LoweringPass, lowers
 from ..tmem_layout import TMEM_FRAGMENT_LAYOUTS, TmemWarpLayout
 from ..gpu_dialect import (
@@ -47,6 +47,9 @@ from ..gpu_dialect import (
     LockViewOp,
     OperandPipelineOp,
     MatmulOp,
+    MmaDescriptorType,
+    MmaDescriptorOp,
+    MmaDescriptorLowOp,
     MemTensorType,
     ModuleOp,
     MoveOp,
@@ -815,6 +818,8 @@ class LowerToPtxTemplate(LoweringPass):
         self._bank_depths: dict[int, int] = {}
         # Lowered event allocation -> (issuing warp, initialization).
         self._event_inits: dict[int, tuple[int, EventInit]] = {}
+        self._issuer_elections: dict[IfOp, Value] = {}
+        self._operand_loops = set()
 
     def run(self, module: ModuleOp) -> ModuleOp:
         if module.body.ops[0].attrs.get("rolled_shared_ring"):
@@ -828,6 +833,18 @@ class LowerToPtxTemplate(LoweringPass):
 
     def lower_block(self, block) -> None:
         self._plan_probe_ahead(block)
+        owner = block.parent_op
+        if (isinstance(owner, IfOp) and execution_warps(owner) is not None
+                and len(execution_warps(owner)) == 1
+                and any(op in self._operand_loops
+                        for op in iter_ops(owner))):
+            # The region's branch is warp-uniform. Elect the common issuing
+            # lane once; every K batch retains the same lane and predicates.
+            election = PTXTemplateOp.build(operands=[], result_types=[PredicateType()],
+                template=_elect_ptx('result.lane.val', converge=False),
+                result_names=['lane'], description='rolled issuing lane')
+            block.ops.insert(0, election)
+            self._issuer_elections[owner] = election.result()
         super().lower_block(block)
 
     def _plan_probe_ahead(self, block) -> None:
@@ -844,6 +861,9 @@ class LowerToPtxTemplate(LoweringPass):
         a probe cannot alias an older phase. A failed probe keeps the
         original blocking wait.
         """
+        for loop in list(block.ops):
+            if isinstance(loop, ForOp):
+                self._plan_rolled_probes(loop)
         owner = block.parent_op
         kernel = owner if isinstance(owner, KernelOp) else (
             find_ancestor_of_type(owner, KernelOp) if owner is not None else None)
@@ -870,6 +890,71 @@ class LowerToPtxTemplate(LoweringPass):
                     for between_op in between for inner in iter_ops(between_op)):
                 continue
             self._probe_sites.setdefault(id(ops[last_issue]), []).append(op)
+
+    def _plan_rolled_probes(self, loop):
+        """Carry explicit-epoch observations across a rolled backedge.
+
+        Each predicate starts false, so the first iteration performs its
+        ordinary wait. A probe writes the predicate for the next iteration;
+        only the final PTX has mutable registers, like implicit lock parity.
+        The semantic ring proves the previous generation was observed before
+        reuse. Repeated jobs need a separate proof of their carried epochs.
+        """
+        from ..analysis.operand_ring import operand_ring
+        facts = operand_ring(loop)
+        if facts is None:
+            return
+        self._operand_loops.add(loop)
+        if facts.depth < _PROBE_AHEAD_MIN_BANKS:
+            return
+        issues = [op for op in loop.body.ops if isinstance(op, AsyncOp)
+                  and op.lock.type.kind == 'tcgen05']
+        if not issues:
+            return
+        waits = facts.waits
+        before = []
+        for wait in waits:
+            if wait.lock.type.kind not in ('mbar', 'tcgen05'):
+                continue
+            seed = PTXTemplateOp.build([], [PredicateType()],
+                'mov.pred ${pred:result.ready.val}, 0;\n', result_names=['ready'],
+                description='initial rolled probe')
+            loop.parent_block.ops.insert(loop.parent_block.ops.index(loop), seed)
+            current = PTXTemplateOp.build([seed.result()], [PredicateType()],
+                'mov.pred ${pred:result.ready.val}, ${pred:operand.previous.val};\n',
+                operand_names=['previous'], result_names=['ready'],
+                description='consume previous rolled probe')
+            loop.body.ops.insert(0, current)
+            self._probe_results[id(wait)] = current.result()
+            one = IndexConstantOp.build(loop.step)
+            ahead = IndexAddOp.build(loop.iv, one.result())
+            before.extend([one, ahead])
+            values = {loop.iv: ahead.result()}
+
+            def copy(value):
+                if value in values:
+                    return values[value]
+                definition = value.definition
+                if (not isinstance(definition, Op)
+                        or find_ancestor_of_type(definition, ForOp) is not loop):
+                    return value
+                if not isinstance(definition, (IndexAddOp, IndexMulOp, IndexDivOp,
+                                               IndexModOp, IndexConstantOp, LockViewOp)):
+                    raise ValueError('rolled probe requires an explicit affine epoch')
+                for operand in definition.operands:
+                    copy(operand)
+                cloned = clone_op(definition, values)
+                before.append(cloned)
+                return cloned.result()
+
+            next_lock = copy(wait.lock)
+            before.append(PTXTemplateOp.build([next_lock, seed.result()], [],
+                'mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 '
+                '${pred:operand.probe.val}, [${b32:operand.lock.val}], '
+                '${b32:operand.lock.parity};\n', operand_names=['lock', 'probe'],
+                description='probe across rolled backedge'))
+        at = loop.body.ops.index(issues[0])
+        loop.body.ops[at:at] = before
 
     def _probe_ahead_ops(self, op: AsyncOp) -> list[Op]:
         probes = []
@@ -1399,9 +1484,15 @@ class LowerToPtxTemplate(LoweringPass):
         )
 
     def _leader_thread(self, prefix: str, before_branch: str = "", issuer_warp: int = 0,
-                       converge: bool = False) -> tuple[list[Value], list[str], str]:
+                       converge: bool = False, cached: bool = True) -> tuple[list[Value], list[str], str]:
         """Operands and PTX of :func:`_leader_thread` behind :meth:`_leader_warp`."""
         operands, names, guard = self._leader_warp(prefix, issuer_warp)
+        region = self._issuer_region(issuer_warp)
+        if cached and region in self._issuer_elections:
+            operands.append(self._issuer_elections[region])
+            names.append('issuing_lane')
+            return operands, names, (guard + before_branch
+                + f"mov.pred ${{pred:{prefix}_leader}}, ${{pred:operand.issuing_lane.val}};\n")
         return operands, names, _leader_thread(prefix, before_branch, guard=guard, converge=converge)
 
     def _tma_instruction(
@@ -1706,7 +1797,8 @@ class LowerToPtxTemplate(LoweringPass):
             init = self._cluster_mbar_init(op)
         elif lock_type.kind in ("mbar", "tcgen05"):
             # InsertSyncs represents publication explicitly with BarrierOps.
-            release_prior = any(isinstance(u, AsyncOp) and u.attrs.get("release_prior")
+            release_prior = any(isinstance(u, AsyncOp) and u.lock is op.result()
+                                and u.attrs.get("release_prior")
                                 for u in op.result().users())
             arrivals = lock_type.attrs.get("arrival_count", lock_type.attrs.get("arrivals", 2 if release_prior else 1))
             counts = lock_type.attrs.get("arrival_counts")
@@ -2218,7 +2310,11 @@ class LowerToPtxTemplate(LoweringPass):
             return name
 
         descriptor_ops: list[Op] = []
-        hoist_descriptors = tcgen05 and kernel.attrs.get("hoist_mma_descriptors", False)
+        rolled_mma = tcgen05 and any(ancestor in self._operand_loops for ancestor in self._lowering)
+        hoist_descriptors = tcgen05 and (kernel.attrs.get("hoist_mma_descriptors", False)
+            or rolled_mma)
+        descriptor_lows = {}
+        local_lows = {}
 
         def _desc(name, base, delta, value, hint, const, offset=None):
             if hoist_descriptors and delta is None:
@@ -2227,7 +2323,7 @@ class LowerToPtxTemplate(LoweringPass):
                 preparation = _build_desc(
                     "desc", "operand.ptr.ptr", const, offset, low_half=True
                 ).replace("${b32:desc}", "${b32:result.desc.val}")
-                prepared = PTXTemplateOp.build(
+                prepared = MmaDescriptorLowOp.build(
                     operands=[cast(Value, self.value_map[value])],
                     result_types=[IndexType()],
                     template=preparation,
@@ -2238,13 +2334,44 @@ class LowerToPtxTemplate(LoweringPass):
                 )
                 descriptor_ops.append(prepared)
                 bound = _operand(prepared.result(), "descriptor_low")
+                descriptor_lows[name] = bound, const
+                if rolled_mma:
+                    full = MmaDescriptorOp.build([prepared.result()], [MmaDescriptorType()],
+                        f'mov.b64 ${{b64:result.desc.val}}, {{${{b32:operand.low.val}}, {const >> 32}}};\n',
+                        operand_names=['low'], result_names=['desc'],
+                        description='pure rolled MMA descriptor', attrs={'pure': True})
+                    descriptor_ops.append(full)
+                    complete = _operand(full.result(), 'descriptor')
+                    return f'mov.b64 ${{b64:{name}}}, ${{b64:operand.{complete}.val}};\n'
                 return (
                     f"mov.b64 ${{b64:{name}}}, "
                     f"{{${{b32:operand.{bound}.val}}, {const >> 32}}};\n"
                 )
             if delta is not None:
+                if rolled_mma and base in descriptor_lows:
+                    bound, base_const = descriptor_lows[base]
+                    full = MmaDescriptorOp.build([operands[operand_names.index(bound)]], [MmaDescriptorType()],
+                        f'add.u32 ${{b32:low}}, ${{b32:operand.base.val}}, {delta // 16};\n'
+                        f'mov.b64 ${{b64:result.desc.val}}, {{${{b32:low}}, {base_const >> 32}}};\n',
+                        operand_names=['base'], result_names=['desc'],
+                        description='pure rolled MMA descriptor', attrs={'pure': True})
+                    descriptor_ops.append(full)
+                    complete = _operand(full.result(), 'descriptor')
+                    return f'mov.b64 ${{b64:{name}}}, ${{b64:operand.{complete}.val}};\n'
+                if base in local_lows:
+                    # Valid start addresses never carry out of the low word.
+                    # A 64-bit add lets ptxas split each sibling into a
+                    # carry chain plus a rematerialized high half.
+                    base_low, base_const = local_lows[base]
+                    return (f"add.u32 ${{b32:{name}_low}}, ${{b32:{base_low}}}, {delta // 16};\n"
+                            f"mov.b64 ${{b64:{name}}}, {{${{b32:{name}_low}}, {base_const >> 32}}};\n")
                 return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
             operand = _operand(cast(Value, self.value_map[value]), hint)
+            if tcgen05:
+                local_lows[name] = f"{name}_low", const
+                return _build_desc(f"{name}_low", f"operand.{operand}.ptr", const, offset,
+                                   low_half=True) + (
+                    f"mov.b64 ${{b64:{name}}}, {{${{b32:{name}_low}}, {const >> 32}}};\n")
             return _build_desc(
                 name,
                 f"operand.{operand}.ptr",
@@ -2264,7 +2391,7 @@ class LowerToPtxTemplate(LoweringPass):
         # Descriptor lifetime and elected-lane control are independent choices.
         # Preparing descriptors near their MMA avoids keeping every sibling
         # live together, without moving that preparation into a lane branch.
-        interleave_descriptors = compact_mma or (
+        interleave_descriptors = rolled_mma or compact_mma or (
             tcgen05 and kernel.attrs.get('interleave_mma_descriptors', False)
         )
         elected_batch = compact_mma
@@ -2374,7 +2501,7 @@ class LowerToPtxTemplate(LoweringPass):
             rhs_delta = _tile_delta(mm.rhs, mms[0].rhs, j)
             dst_name = _operand(cast(Value, self.value_map[mm.dst]), "dst")
 
-            desc_rhs = f"desc_rhs{j}"
+            desc_rhs = "desc_rhs0" if rolled_mma else f"desc_rhs{j}"
             desc_template += _desc(
                 desc_rhs,
                 "desc_rhs0",
@@ -2396,7 +2523,7 @@ class LowerToPtxTemplate(LoweringPass):
                         * lhs_width
                         * lhs_type.dtype.byte_size
                     )
-                desc_lhs = f"desc_lhs{j}_{m_it}"
+                desc_lhs = f"desc_lhs0_{m_it}" if rolled_mma else f"desc_lhs{j}_{m_it}"
                 desc_template += _desc(
                     desc_lhs,
                     f"desc_lhs0_{m_it}",
@@ -2431,12 +2558,26 @@ class LowerToPtxTemplate(LoweringPass):
                     | n_dim >> 3 << 17
                     | (m_dim * cta_group) >> 4 << 24
                 )
-                mma_template += textwrap.dedent(f"""\
-                    mov.b32 ${{b32:idesc}}, {idesc};
-                    mov.pred ${{pred:accumulate}}, {int(mm.accumulate)};
+                if rolled_mma:
+                    instruction = PTXTemplateOp.build([], [IndexType(), PredicateType()],
+                        f'mov.b32 ${{b32:result.idesc.val}}, {idesc};\n'
+                        f'mov.pred ${{pred:result.accumulate.val}}, {int(mm.accumulate)};\n',
+                        result_names=['idesc', 'accumulate'], attrs={'pure': True},
+                        description='rolled MMA constants')
+                    descriptor_ops.append(instruction)
+                    idesc_name = _operand(instruction.results[0], 'idesc')
+                    accumulate_name = _operand(instruction.results[1], 'accumulate')
+                    setup = ''
+                    idesc_ptx = f'${{b32:operand.{idesc_name}.val}}'
+                    accumulate_ptx = f'${{pred:operand.{accumulate_name}.val}}'
+                else:
+                    setup = (f'mov.b32 ${{b32:idesc}}, {idesc};\n'
+                             f'mov.pred ${{pred:accumulate}}, {int(mm.accumulate)};\n')
+                    idesc_ptx, accumulate_ptx = '${b32:idesc}', '${pred:accumulate}'
+                mma_template += setup + textwrap.dedent(f"""\
                     @${{pred:tcgen05_leader}} tcgen05.mma.cta_group::{cta_group}.kind::f16{collector_a_modes[j]}
-                      [${{b32:operand.{dst_name}.ptr}}], ${{b64:desc_lhs{j}_0}}, ${{b64:{desc_rhs}}},
-                      ${{b32:idesc}}, ${{pred:accumulate}};
+                      [${{b32:operand.{dst_name}.ptr}}], ${{b64:{'desc_lhs0_0' if rolled_mma else f'desc_lhs{j}_0'}}}, ${{b64:{desc_rhs}}},
+                      {idesc_ptx}, {accumulate_ptx};
                 """)
                 if interleave_descriptors:
                     mma_template = (mma_template[:mma_start] + desc_template[descriptor_start:]
@@ -2466,16 +2607,32 @@ class LowerToPtxTemplate(LoweringPass):
         # warpgroup-wide wgmma reads).
         if tcgen05:
             release_prior = op.attrs.get("release_prior", False)
+            uniform_pair = rolled_mma and cta_group == 2 and not release_prior
+            before_election = ''
+            if uniform_pair:
+                rank = PTXTemplateOp.build([], [IndexType(), PredicateType()],
+                    _pair_leader_ptx('rank', 'leader').replace('${b32:rank}', '${b32:result.rank.val}')
+                    .replace('${pred:leader}', '${pred:result.leader.val}'),
+                    result_names=['rank', 'leader'], attrs={'pure': True},
+                    description='rolled CTA pair identity')
+                descriptor_ops.append(rank)
+                rank_name = _operand(rank.results[0], 'pair_rank')
+                rank_pred = _operand(rank.results[1], 'pair_leader')
+                before_election = (f'mov.b32 ${{b32:tcgen05_rank}}, ${{b32:operand.{rank_name}.val}};\n'
+                    f'@!${{pred:operand.{rank_pred}.val}} bra ${{label:tcgen05_peer_done}};\n')
             leader_operands, leader_names, leader = self._leader_thread("tcgen05",
+                before_branch=before_election,
                 issuer_warp=execution_issuer_warp(op),
-                converge=release_prior)
+                converge=release_prior, cached=not rolled_mma)
             operands.extend([*leader_operands, cast(Value, self.value_map[op.lock])])
             operand_names.extend([*leader_names, "lock"])
-            if cta_group == 2:
+            if cta_group == 2 and not uniform_pair:
+                # The peer CTA branches past every issue that tests the
+                # elected lane. Keeping that lane unconditioned on the pair
+                # rank leaves ptxas a uniform issue predicate (no VOTEU).
                 leader += ("mov.pred ${pred:tcgen05_local_leader}, ${pred:tcgen05_leader};\n"
                            + _pair_leader_ptx("tcgen05_rank", "tcgen05_rank0")
-                           + "and.pred ${pred:tcgen05_leader}, ${pred:tcgen05_leader}, ${pred:tcgen05_rank0};\n"
-                           "@!${pred:tcgen05_rank0} bra ${label:tcgen05_peer_done};\n")
+                           + "@!${pred:tcgen05_rank0} bra ${label:tcgen05_peer_done};\n")
             kernel = find_ancestor_of_type(op, KernelOp)
             size = math.prod(d or 1 for d in kernel.cluster_dim)
             if cta_group == 1 and any('completion_cta_masks' in event.type.attrs for event in op.completion_locks):
@@ -3907,15 +4064,20 @@ class LowerToPtxTemplate(LoweringPass):
         )
         cta_group = lock_type.attrs.get("cta_group", 1)
 
+        before_branch = (
+            _pair_leader_ptx("cluster_rank", "cluster_leader") if cta_group == 2
+            else "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
+            "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;\n")
         leader_thread = _leader_thread(
             "ld",
-            before_branch=(
-                _pair_leader_ptx("cluster_rank", "cluster_leader") if cta_group == 2
-                else "mov.u32 ${b32:cluster_rank}, %cluster_ctarank;\n"
-                "setp.eq.u32 ${pred:cluster_leader}, ${b32:cluster_rank}, 0;\n"),
+            before_branch=before_branch,
             issuer_warp=execution_issuer_warp(op),
             guard=(guard := self._region_guard("ld", execution_issuer_warp(op)) or ([], [], None))[2],
         )
+        if self._issuer_region(execution_issuer_warp(op)) in self._issuer_elections:
+            elected_operands, elected_names, leader_thread = self._leader_thread(
+                'ld', before_branch=before_branch, issuer_warp=execution_issuer_warp(op))
+            guard = elected_operands, elected_names, None
         operands: list[Value] = [lock_value, *guard[0]]
         operand_names: list[str] = ["lock", *guard[1]]
         multicast_mask: int | None = None

@@ -48,7 +48,7 @@ def build(**kwargs):
         cyclic_operand_pipeline=True,
         allow_partial_tiles=True,
         persistent_output_pipeline=True,
-        persistent_output_schedule="shared_ring",
+
     )
     config.update(kwargs)
     return blackwell_tcgen05_gemm_module(**config)
@@ -239,7 +239,7 @@ def test_steady_engine_reuse_needs_no_collective_gather(overlap):
             assert analysis.targets[read].scope == BarrierScope.THREAD
 
 
-@pytest.mark.parametrize("invalid", ["duplicate", "mechanism", "relay", "unobserved"])
+@pytest.mark.parametrize("invalid", ["duplicate", "mechanism", "relay_type", "unobserved"])
 def test_invalid_additional_completions_are_rejected(invalid):
     mod = dual_completion()
     issue = find_ops_of_type(mod, AsyncOp)[0]
@@ -247,8 +247,8 @@ def test_invalid_additional_completions_are_rejected(invalid):
         issue.operands[1] = issue.lock
     elif invalid == "mechanism":
         issue.completion_locks[1].type = LockType.build(kind="mbar")
-    elif invalid == "relay":
-        issue.attrs["release_prior"] = True
+    elif invalid == "relay_type":
+        issue.attrs["release_prior"] = 1
     else:
         wait = find_ops_of_type(mod, AwaitOp)[0]
         wait.parent_block.ops.remove(wait)

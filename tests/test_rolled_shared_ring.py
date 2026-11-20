@@ -9,7 +9,7 @@ from ayla.gpu_dialect import (
     AllocOp, AsyncOp, AwaitOp, BarrierOp, BlockIdOp, ClusterBlockIdsOp, ForOp, IfOp,
     IndexAddOp, IndexConstantOp, IndexDivOp, IndexLtOp, IndexModOp,
     IndexMulOp, LockType, LockViewOp, MatmulOp, MoveOp, PersistentPipelineOp,
-    TileOp, TmemTensorType, gpu_dialect, memory_effects, physical_layout,
+    TileOp, TmemTensorType, SmemTensorType, gpu_dialect, memory_effects, physical_layout,
     PredicateOp,
 )
 from ayla.passes.pipeline_rolled_shared_ring import LowerRolledSharedRing
@@ -22,7 +22,7 @@ def build(**kwargs):
     cfg = dict(m=2049, n=520, k=384, dtype="f16", cta_group=2,
                output_n_tile=128, output_grid_size=4, output_grid_fast_axis="m",
                operand_stages=4, rolled_operand_pipeline=True,
-               persistent_output_pipeline=True, persistent_output_schedule="shared_ring",
+               persistent_output_pipeline=True,
                output_store="stmatrix", output_slices=2,
                tmem_writeback_register_budget=64, allow_partial_tiles=True)
     cfg.update(kwargs)
@@ -149,6 +149,9 @@ def check_protocol(mod, block_index, steps, queue_samples=None):
     walk(mod.body.ops[0].body)
     assert all(not outstanding or key[0].type.attrs.get("arrivals")
                or key[0].type.attrs.get("release_warps") or key[0].type.kind == "bulk"
+               # An ordered final completion also covers older MMA accesses.
+               or (key[0].type.kind == "tcgen05"
+                   and completion_ordinals[key] <= completed_through)
                for key, outstanding in pending.items()), "undrained operand/frame event"
     return counts
 
@@ -184,6 +187,54 @@ def test_dynamic_k_body_does_not_grow_with_depth_or_bank_supercycle():
         assert len([x for x in loops if x.attrs.get("label") == "shared_ring_rolled_k"]) == 2
         counts.append(len(find_ops_of_type(expanded, MatmulOp)))
     assert len(set(counts)) == 1
+
+
+@pytest.mark.parametrize("group", [1, 2])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("k,depth", [(128, 5), (384, 4)])
+def test_mixed_one_and_two_job_tails_preserve_bank_and_frame_lifetimes(group, overlap, k, depth):
+    mod = build(m=640, n=256, k=k, operand_stages=depth, cta_group=group,
+                output_grid_size=8, persistent_output_overlap=overlap)
+    VerifyGpuDialect().run(mod)
+    expanded = LowerRolledSharedRing().run(clone_op(mod, {}))
+    assert_dominance(expanded.body)
+    tiles = math.ceil(640 / (128 * group)) * group * 2
+    for block in range(8):
+        jobs = len(range(block, tiles, 8))
+        assert check_protocol(expanded, block, k // 64) == dict(
+            load=jobs * (k // 64), mma=jobs * (k // 64), read=jobs * 2, store=jobs * 2)
+
+
+def test_pingpong_groups_each_issue_loads_and_mmas_for_their_whole_job():
+    from ayla.gpu_dialect import TmaMoveOp, execution_issuer_warp
+    from ayla.passes.lower_to_tma_move import LowerToTmaMove
+
+    mod = build(m=640, n=256, k=128, operand_stages=5, output_grid_size=8,
+                persistent_output_overlap=True,
+                persistent_output_job_regions=True, tmem_writeback_warps=4)
+    expanded = LowerRolledSharedRing().run(LowerToTmaMove().run(mod))
+    groups = {}
+    for typ in (TmaMoveOp, MatmulOp):
+        groups[typ] = {execution_issuer_warp(op) for op in find_ops_of_type(expanded, typ)
+                       if typ is MatmulOp or isinstance(op.dst.type, SmemTensorType)
+                       and op.attrs.get("tma")}
+    assert groups[TmaMoveOp] == groups[MatmulOp] == {0, 4}
+
+
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+@pytest.mark.parametrize("pingpong", [False, True])
+def test_gpu_mixed_one_and_two_job_graph_tails(dtype, pingpong):
+    import torch
+    from ayla.ptx_runtime import assemble_ptx, make_ptx_launcher
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("requires SM100")
+    mod = build(m=640, n=256, k=128, operand_stages=5, output_grid_size=8,
+                dtype=dtype, persistent_output_overlap=True,
+                persistent_output_job_regions=pingpong,
+                tmem_writeback_warps=4)
+    kernel = make_ptx_kernel(mod)
+    launcher = make_ptx_launcher(kernel, image=assemble_ptx(kernel, "/usr/local/cuda-13.0/bin/ptxas"))
+    check_gemm(launcher, 640, 256, 128, dtype, graph=True)
 
 
 def test_predicate_composition_requires_predicate_operands():
