@@ -6,7 +6,7 @@ This keeps the dynamic event generations inside a bounded ownership protocol;
 it does not relax the alias rules of unrelated operations.
 """
 
-from ..base.ir import Block, Value, clone_op, clone_type, find_ops_of_type, iter_ops
+from ..base.ir import Block, Value, clone_op, iter_ops
 from ..base.lowering_pass import LoweringPass, lowers
 from ..gpu_dialect import (
     AllocOp,
@@ -20,7 +20,6 @@ from ..gpu_dialect import (
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
-    IndexMulOp,
     IndexType,
     LockType,
     LockViewOp,
@@ -34,7 +33,6 @@ from ..gpu_dialect import (
     MatmulOp,
     TileOp,
     is_side_effect_free,
-    root_buffers,
     physical_layout,
     execution_issuer_warp,
 )
@@ -92,157 +90,6 @@ def _parts(op):
     return load, mma
 
 
-class PipelineRolledK(LoweringPass):
-    def __init__(self, depth, label="k", queue_depth=1):
-        if type(depth) is not int or depth < 2:
-            raise ValueError("rolled K depth must be an integer >= 2")
-        if type(queue_depth) is not int or not 1 <= queue_depth < depth:
-            raise ValueError("rolled K queue depth must leave at least one refill bank")
-        super().__init__(depth=depth, label=label, queue_depth=queue_depth)
-
-    def run(self, module):
-        if module.body.ops[0].attrs.get("compact_output_pipeline"):
-            from .peel_loop import PeelLoop
-
-            module = PeelLoop(self.label, back_iterations=1).run(module)
-        for loop in list(find_ops_of_type(module, ForOp)):
-            if loop.attrs.get("label") != self.label:
-                continue
-            parent = loop.parent_block
-            self._absorb_first_iteration(loop)
-            ops, _ = self.lower_for(loop)
-            index = parent.ops.index(loop)
-            parent.ops[index : index + 1] = ops
-        return module
-
-    @staticmethod
-    def _absorb_first_iteration(loop):
-        """Put a standalone peeled first batch into the initial ring fill.
-
-        Persistent regions keep their existing job protocol. A standalone
-        reduction can start filling all banks before it waits for batch zero.
-        """
-        from ..base.ir import find_ancestor_of_type
-        if loop.lb != 1 or find_ancestor_of_type(loop, ForOp) is not None:
-            return
-        parent = loop.parent_block
-        prefix = [op for op in parent.ops[:parent.ops.index(loop)]
-                  if not is_side_effect_free(op)]
-        first = prefix[-4:]
-        if (len(first) != 4 or not isinstance(first[0], AsyncOp)
-                or not isinstance(first[1], AwaitOp)
-                or not isinstance(first[2], AsyncOp)
-                or not isinstance(first[3], AwaitOp)):
-            return
-        load, mma = _parts(loop)
-        initial_load, load_wait, initial_mma, mma_wait = first
-        if (initial_load.lock.type.kind != 'mbar' or initial_mma.lock.type.kind != 'tcgen05'
-                or load_wait.lock is not initial_load.lock or mma_wait.lock is not initial_mma.lock
-                or len(initial_mma.completion_locks) != 1
-                or len(initial_load.completion_locks) != 1
-                or execution_issuer_warp(initial_load) != execution_issuer_warp(load)
-                or execution_issuer_warp(initial_mma) != execution_issuer_warp(mma)
-                or not initial_mma.body.ops
-                or not all(isinstance(mm, MatmulOp) for mm in initial_mma.body.ops)
-                or initial_mma.body.ops[0].accumulate
-                or not all(mm.accumulate for mm in initial_mma.body.ops[1:])):
-            return
-        def accessed(issue):
-            return [root_buffers(value) for inner in issue.body.ops for value in inner.operands]
-        if accessed(initial_load) != accessed(load) or accessed(initial_mma) != accessed(mma):
-            return
-        for op in first:
-            parent.ops.remove(op)
-        loop.lb = 0
-        loop.attrs['initialize_accumulator'] = True
-
-    @lowers(ForOp)
-    def lower_for(self, op):
-        if op.attrs.get("label") != self.label:
-            return None
-        if op.step != 1 or op.trip_count < 1:
-            raise ValueError("rolled K requires a nonempty unit-step reduction")
-        load, mma = _parts(op)
-        banks = []
-        for move in load.body.ops:
-            roots = root_buffers(move.dst)
-            if len(roots) != 1:
-                raise ValueError(
-                    "rolled K requires independently allocated operand banks"
-                )
-            root = next(iter(roots))
-            if root in [x[0] for x in banks]:
-                continue
-            if not isinstance(root.definition, AllocOp) or not isinstance(
-                root.type, SmemTensorType
-            ):
-                raise ValueError("rolled K operand must be shared allocation")
-            single = clone_type(root.type)
-            if single.rank != 2 or tuple(single.strides) != (single.sizes[1], 1):
-                raise ValueError("rolled K currently requires row-major operand banks")
-            layout = physical_layout(single)
-            blocked = layout is not None and layout[1] == "block_major"
-            if blocked and single.sizes[1] % layout[0]:
-                raise ValueError("rolled K requires complete physical K blocks")
-            arena = clone_type(single)
-            if blocked:
-                # A block-major stage stores each K block after all its M
-                # rows. Extending M interleaves banks within those blocks and
-                # changes the layout written by a stage-sized TMA transfer.
-                # Extend K instead: every stage remains one contiguous bank,
-                # with the same M extent and physical K-block stride.
-                arena.sizes = [single.sizes[0], single.sizes[1] * self.depth]
-                arena.attrs["strides"] = [arena.sizes[1], 1]
-            else:
-                arena.sizes = [single.sizes[0] * self.depth, single.sizes[1]]
-            root.type = arena
-            view = TileOp.build(root, [0, 0], single)
-            live = set(root.users())
-            for user, index in list(root.uses):
-                if user is not view and user in live:
-                    user.operands[index] = view.result()
-            block = root.definition.parent_block
-            block.ops.insert(block.ops.index(root.definition) + 1, view)
-            banks.append((root, view.result()))
-        region = OperandPipelineOp.build(op, self.depth)
-        region.attrs['mma_queue_depth'] = self.queue_depth
-        region.operands = [view for _, view in banks]
-        if op.parent_block is not None:
-            parent = op.parent_block.parent_op
-            while parent is not None and not (
-                isinstance(parent, ForOp) and parent.attrs.get("label") != self.label
-            ):
-                parent = parent.parent_block.parent_op if parent.parent_block else None
-            if parent is not None:
-                kernel = parent
-                while kernel.parent_block and kernel.parent_block.parent_op:
-                    kernel = kernel.parent_block.parent_op
-                    if hasattr(kernel, "num_threads"):
-                        break
-                if kernel.attrs.get("compact_output_pipeline"):
-                    group = mma.lock.type.attrs.get("cta_group", 1)
-                    ready = AllocOp.build_with_fresh_id(
-                        LockType.build(
-                            "mbar", {"count": self.depth, "cta_group": group}
-                        ),
-                        attrs={"label": "operand_bank_ready"},
-                    )
-                    free = AllocOp.build_with_fresh_id(
-                        LockType.build(
-                            "tcgen05", {"count": self.depth, "cta_group": group}
-                        ),
-                        attrs={"label": "operand_bank_release"},
-                    )
-                    kernel.body.ops[0:0] = [
-                        ready,
-                        free,
-                        BarrierOp.build("cluster" if group == 2 else "block"),
-                    ]
-                    region.operands.extend([parent.iv, ready.result(), free.result()])
-                    region.attrs["carried_events"] = True
-        return [region], []
-
-
 class LowerRolledK(LoweringPass):
     @lowers(OperandPipelineOp)
     def lower_pipeline(self, op):
@@ -253,21 +100,18 @@ class LowerRolledK(LoweringPass):
         group = mma.lock.type.attrs.get("cta_group", 1)
         load_issuer = execution_issuer_warp(load)
         mma_issuer = execution_issuer_warp(mma)
-        carried = op.attrs.get("carried_events", False)
-        if carried:
-            job, ready_value, free_value = op.operands[-3:]
-            banks = op.operands[:-3]
-        else:
-            ready = AllocOp.build_with_fresh_id(
-                LockType.build("mbar", {"count": depth, "cta_group": group})
-            )
-            free = AllocOp.build_with_fresh_id(
-                LockType.build("tcgen05", {
-                    **mma.lock.type.attrs, "count": depth, "cta_group": group,
-                })
-            )
-            ready_value, free_value = ready.result(), free.result()
-            banks = op.operands
+        if op.attrs.get("carried_events"):
+            raise ValueError("per-job carried events require the cross-job resource pipeline")
+        ready = AllocOp.build_with_fresh_id(
+            LockType.build("mbar", {"count": depth, "cta_group": group})
+        )
+        free = AllocOp.build_with_fresh_id(
+            LockType.build("tcgen05", {
+                **mma.lock.type.attrs, "count": depth, "cta_group": group,
+            })
+        )
+        ready_value, free_value = ready.result(), free.result()
+        banks = op.operands
         from ..base.ir import find_ancestor_of_type
         from ..gpu_dialect import KernelOp
         kernel = find_ancestor_of_type(op, KernelOp)
@@ -289,39 +133,6 @@ class LowerRolledK(LoweringPass):
             phase = IndexModOp.build(epoch.result(), two.result())
             bank = IndexModOp.build(logical, span.result())
             ops.extend([span, shift, epoch_index, epoch, two, phase, bank])
-            if carried:
-                # Each bank has its own number of generations per job. K need
-                # not be divisible by depth, so a single job phase is unsound.
-                neg = IndexConstantOp.build(-1)
-                neg_bank = IndexMulOp.build(bank.result(), neg.result())
-                first = IndexConstantOp.build(lb - 1 + depth)
-                last = IndexConstantOp.build(ub - 1 + depth)
-                first_n = IndexAddOp.build(first.result(), neg_bank.result())
-                last_n = IndexAddOp.build(last.result(), neg_bank.result())
-                first_q = IndexDivOp.build(first_n.result(), span.result())
-                last_q = IndexDivOp.build(last_n.result(), span.result())
-                minus_first = IndexMulOp.build(first_q.result(), neg.result())
-                count = IndexAddOp.build(last_q.result(), minus_first.result())
-                offset = IndexMulOp.build(job, count.result())
-                full_epoch = IndexAddOp.build(epoch.result(), offset.result())
-                phase = IndexModOp.build(full_epoch.result(), two.result())
-                ops.extend(
-                    [
-                        neg,
-                        neg_bank,
-                        first,
-                        last,
-                        first_n,
-                        last_n,
-                        first_q,
-                        last_q,
-                        minus_first,
-                        count,
-                        offset,
-                        full_epoch,
-                        phase,
-                    ]
-                )
             view = LockViewOp.build(arena, bank.result(), phase.result())
             ops.append(view)
             return view.result()
@@ -438,35 +249,33 @@ class LowerRolledK(LoweringPass):
                     initial_mma.body.ops[0].attrs['accumulate'] = False
                 first_batch.extend(batch)
             main.lb += min(queue, main.trip_count - 1)
-        remainder = []
-        factor = kernel.attrs.get('rolled_k_unroll', 1) if kernel is not None else 1
-        if factor > 1 and main.trip_count >= factor:
-            from ._loop_utils import clone_loop_iteration
-
-            # Adjacent logical steps share one backedge, exposing the first
-            # refill and the following MMA to ptxas's instruction scheduler.
-            end = main.lb + main.trip_count // factor * factor
-            for ordinal in range(end, main.ub):
-                tail_iv = IndexConstantOp.build(ordinal)
-                remainder.extend([tail_iv, *clone_loop_iteration(main, tail_iv.result())])
-            grouped = []
-            for offset in range(factor):
-                shift = IndexConstantOp.build(offset)
-                step_iv = IndexAddOp.build(main.iv, shift.result())
-                grouped.extend([shift, step_iv, *clone_loop_iteration(main, step_iv.result())])
-            main.body.ops = grouped
-            main.step, main.ub = factor, end
+        from ..pipelines.ring_schedule import LoopSchedule
+        from .unroll_loop import UnrollLoop
+        shape = LoopSchedule(**(kernel.attrs.get("loop_schedule", {}).get("reduction", {})
+                                if kernel is not None else {}))
+        main_ops = [main]
+        if shape.peel_front or shape.peel_back:
+            from .peel_loop import PeelLoop
+            main_ops, _ = PeelLoop("rolled_k_main", shape.peel_front, shape.peel_back).lower_for(main)
+        if shape.unroll > 1:
+            transformed = []
+            for piece in main_ops:
+                if isinstance(piece, ForOp) and piece.trip_count >= shape.unroll:
+                    unrolled, _ = UnrollLoop(shape.unroll, "rolled_k_main").lower_for(piece)
+                    transformed.extend(unrolled)
+                else:
+                    transformed.append(piece)
+            main_ops = transformed
         tail = []
         last = IndexConstantOp.build(ub - 1)
         tail.append(last)
         done = event(free_value, last.result(), tail)
         # Same-issuer TCGEN operations are ordered. The final event covers
         # every preceding batch, and the collective publishes it to readers.
-        if carried or kernel is not None and kernel.attrs.get('cluster_bank_pipeline'):
+        if kernel is not None and kernel.attrs.get('cluster_bank_pipeline'):
             # The final engine completion does not order delivery of every
-            # preceding multicast notification. Carried events additionally
-            # require a successful wait on every phase before another arrival
-            # on that event, even when the final MMA already covers its data.
+            # preceding multicast notification. Every phase must be observed
+            # before another arrival, even when final MMA covers its data.
             # Observe each bank's final generation before the next job.
             drain_iv = Value(name=None, type=IndexType())
             drain_ops = []
@@ -483,10 +292,9 @@ class LowerRolledK(LoweringPass):
                 [AwaitOp.build(done, {"waiter_warps": [mma_issuer]}), BarrierOp.build(scope)]
             )
         return [
-            *([] if carried else [ready, free, BarrierOp.build(scope)]),
+            ready, free, BarrierOp.build(scope),
             fill,
             *first_batch,
-            main,
-            *remainder,
+            *main_ops,
             *tail,
         ], []

@@ -1,12 +1,15 @@
 """Blackwell GEMMs: the configurable GEMM schedule on a tcgen05 target."""
 
 from copy import deepcopy
+from dataclasses import asdict
 from typing import Any
 
 from ..gpu_dialect import CollectiveAxis, ModuleOp, gpu_dialect
 from ..pipelines.tile_matmul_pipeline import _schedule_matmul
 from .common_warp_schedule import validate_common_warp_schedule
-from .blackwell_router import select_blackwell_router_schedule
+from .blackwell_router import (select_blackwell_router_schedule,
+    normalize_blackwell_configuration, LEGACY_PIPELINE_FIELDS)
+from ..pipelines.ring_schedule import PipelineSchedule
 
 select_blackwell_gemm_schedule = select_blackwell_router_schedule
 
@@ -21,24 +24,14 @@ def blackwell_tcgen05_gemm_module(
     output_n_tile: int = 256,
     output_m_tiles_per_cta: int = 1,
     output_n_tiles_per_cta: int = 1,
-    batch_output_m_operands: bool = False,
+    mma_m_tile: int | None = None,
+    pipeline: PipelineSchedule | dict | None = None,
     interleave_mma_descriptors: bool = False,
     compact_mma_batch: bool = False,
     hoist_mma_descriptors: bool = False,
     reuse_mma_collector_a: bool = False,
-    rolled_k_unroll: int = 1,
-    rolled_job_unroll: int = 1,
-    peel_first_output_pair: bool = False,
-    persistent_output_pipeline: bool = False,
-    persistent_output_overlap: bool = True,
-    persistent_output_job_regions: bool = False,
-    persistent_output_frames: int = 2,
-    output_writeback_window: tuple[int, int] | None = None,
     operand_k_tile: int = 64,
     operand_stages: int = 3,
-    cyclic_operand_pipeline: bool | int = False,
-    rolled_operand_pipeline: bool = False,
-    # Earlier refills can help cold inputs but restrict compute overlap.
     dtype: str = "bf16",
     output_grid_size: int | None = None,
     output_grid_fast_axis: str = "m",
@@ -67,6 +60,7 @@ def blackwell_tcgen05_gemm_module(
     cluster_n_ctas: int = 1,
     cluster_dim: tuple[int, int, int] | None = None,
     multicast_operands: bool = True,
+    **legacy_schedule,
 ) -> ModuleOp:
     """Build ``a @ bt.T`` using common warp loops on Blackwell.
 
@@ -84,11 +78,9 @@ def blackwell_tcgen05_gemm_module(
     registers for the complete M64 component (budget 128 for N192, four warps).
     Grouped output tiles and persistent output rings are not supported for M192.
 
-    ``persistent_output_pipeline`` selects the shared operand/output ring:
-    two TMEM slots have independent accumulator readiness, last-read release
-    and output-staging lifetimes. ``rolled_operand_pipeline`` keeps its K loop
-    compact. ``persistent_output_job_regions`` rotates whole compute/output
-    jobs across participant groups within that same persistent loop.
+    ``pipeline`` separates operand scope, accumulator slots, overlap,
+    participants and loop shaping. CTA output rows greater than ``mma_m_tile``
+    batch operand loading while retaining that MMA instruction shape.
 
     ``reuse_operand_storage_for_output`` shares output staging with a retired
     LHS buffer. ``reuse_all_operand_storage_for_output`` shares it with the
@@ -101,6 +93,30 @@ def blackwell_tcgen05_gemm_module(
     are M-fast, with CTA pairs at ranks ``r`` and ``r XOR 1``; ``cluster_dim``
     selects the physical launch independently of the logical tile mapping.
     """
+    unknown = set(legacy_schedule) - LEGACY_PIPELINE_FIELDS
+    if unknown:
+        raise TypeError(f"unexpected schedule arguments: {sorted(unknown)}")
+    if legacy_schedule:
+        if pipeline is not None:
+            raise ValueError("select pipeline or legacy schedule fields, not both")
+        normalized = normalize_blackwell_configuration(dict(
+            output_m_tile=output_m_tile, output_m_tiles_per_cta=output_m_tiles_per_cta,
+            mma_m_tile=mma_m_tile, **legacy_schedule))
+        pipeline = normalized.get("pipeline")
+        output_m_tile = normalized["output_m_tile"]
+        output_m_tiles_per_cta = normalized["output_m_tiles_per_cta"] if "output_m_tiles_per_cta" in normalized else 1
+        mma_m_tile = normalized["mma_m_tile"]
+    plan = PipelineSchedule.parse(pipeline)
+    batch_output_m_operands = mma_m_tile is not None and mma_m_tile != output_m_tile
+    if mma_m_tile is not None:
+        if (type(mma_m_tile) is not int or mma_m_tile != 128
+                or output_m_tile % mma_m_tile or output_m_tiles_per_cta != 1):
+            raise ValueError("batched CTA rows require integral M128 MMA tiles")
+        output_m_tiles_per_cta = output_m_tile // mma_m_tile
+        output_m_tile = mma_m_tile
+    rolled_operand_pipeline = plan.rolled
+    shared_ring = plan.cross_jobs
+    cyclic_operand_pipeline = plan.mma_pending
     validate_common_warp_schedule({"operand_move_attrs": operand_move_attrs})
     cluster_m_ctas = cta_group if cluster_m_ctas is None else cluster_m_ctas
     if type(reuse_operand_storage_for_output) is not bool:
@@ -129,7 +145,7 @@ def blackwell_tcgen05_gemm_module(
             or output_grid_size is not None
             or output_store != "stmatrix"
             or rolled_operand_pipeline
-            or persistent_output_pipeline
+            or shared_ring
             or batch_output_m_operands
             or warp_specific_operand_waits
         ):
@@ -141,38 +157,21 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("compact_mma_batch must be a boolean")
     extended_cluster = (cluster_dim or (cluster_m_ctas, cluster_n_ctas, 1)) != (cta_group, 1, 1)
     # Checks below whose only downstream counterpart is in the shared-ring passes stay here.
-    if extended_cluster and (persistent_output_pipeline or batch_output_m_operands):
+    if extended_cluster and (shared_ring or batch_output_m_operands):
         raise ValueError("extended clusters require the native operand schedule")
     if rolled_operand_pipeline and batch_output_m_operands:
         raise ValueError("rolled operands require an unbatched operand schedule")
     if (
         rolled_operand_pipeline
-        and persistent_output_pipeline
+        and shared_ring
         and operand_k_tile not in (64, 128)
     ):
         raise ValueError("rolled shared rings require K64 or K128 stages")
     if rolled_operand_pipeline and operand_stages < 2:
         raise ValueError("rolled operand pipeline requires at least two stages")
-    if persistent_output_job_regions and not (
-        persistent_output_pipeline
-        and rolled_operand_pipeline
-        and cta_group in (1, 2)
-        and tmem_writeback_warps == 4
-        and persistent_output_overlap
-        and int(cyclic_operand_pipeline) < operand_stages
-    ):
-        raise ValueError(
-            "job participant regions require an overlapping common rolled ring and four-warp fragments"
-        )
-    if type(persistent_output_frames) is not int or persistent_output_frames not in (1, 2):
-        raise ValueError("persistent_output_frames must be one or two")
-    if persistent_output_frames == 1 and not (persistent_output_pipeline and rolled_operand_pipeline and not persistent_output_overlap and not persistent_output_job_regions):
-        raise ValueError("one frame requires a serial rolled shared ring without job regions")
-    shared_ring = persistent_output_pipeline
-    if output_writeback_window is not None and (
-        not shared_ring or not persistent_output_overlap or persistent_output_job_regions
-    ):
-        raise ValueError("writeback windows require an overlapping common shared ring without job regions")
+    if plan.rotating and not (cta_group in (1, 2) and tmem_writeback_warps == 4
+            and plan.mma_pending < operand_stages):
+        raise ValueError("job participant regions require four-warp fragments and a refill bank")
     if shared_ring and (
         output_grid_size is None
         or cta_group == 2
@@ -214,7 +213,7 @@ def blackwell_tcgen05_gemm_module(
             "GEMM dimensions must be positive and divide the M64/M128/M192 and N tiles"
         )
     if output_m_tile == 192 and (
-        output_n_tile > 256 or persistent_output_pipeline
+        output_n_tile > 256 or shared_ring
         or batch_output_m_operands or output_m_tiles_per_cta != 1
         or output_n_tiles_per_cta != 1
     ):
@@ -237,7 +236,7 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("the K tile must divide the reduction")
     # A rolled shared ring numbers banks across output jobs, so its stages may
     # outnumber one job's K batches; other schedules stage within one tile.
-    carried_ring = rolled_operand_pipeline and persistent_output_pipeline
+    carried_ring = rolled_operand_pipeline and shared_ring
     if operand_stages < 1 or (
         not carried_ring
         and operand_stages > (k + operand_k_tile - 1) // operand_k_tile
@@ -334,23 +333,9 @@ def blackwell_tcgen05_gemm_module(
             }}
           }}
         """)
-    if type(rolled_job_unroll) is not int or rolled_job_unroll < 1:
-        raise ValueError("rolled_job_unroll must be a positive integer")
-    if type(peel_first_output_pair) is not bool:
-        raise ValueError("peel_first_output_pair must be a boolean")
-    if rolled_job_unroll > 1 or peel_first_output_pair:
-        if not (rolled_operand_pipeline and persistent_output_pipeline):
-            raise ValueError("output job loop transforms require the rolled shared ring")
-        if rolled_job_unroll > 1:
-            module.body.ops[0].attrs["rolled_job_unroll"] = rolled_job_unroll
-        if peel_first_output_pair:
-            module.body.ops[0].attrs["peel_first_output_pair"] = True
-    if type(rolled_k_unroll) is not int or rolled_k_unroll < 1:
-        raise ValueError("rolled_k_unroll must be a positive integer")
-    if rolled_k_unroll > 1:
-        if not rolled_operand_pipeline:
-            raise ValueError("rolled_k_unroll requires a rolled operand pipeline")
-        module.body.ops[0].attrs["rolled_k_unroll"] = rolled_k_unroll
+    if plan.reduction != PipelineSchedule().reduction or plan.output_jobs != PipelineSchedule().output_jobs:
+        module.body.ops[0].attrs["loop_schedule"] = dict(
+            reduction=asdict(plan.reduction), output_jobs=asdict(plan.output_jobs))
     if type(reuse_mma_collector_a) is not bool:
         raise ValueError("reuse_mma_collector_a must be a boolean")
     if type(hoist_mma_descriptors) is not bool:
@@ -382,7 +367,7 @@ def blackwell_tcgen05_gemm_module(
         output_m_tiles_per_cta=output_m_tiles_per_cta,
         output_n_tiles_per_cta=output_n_tiles_per_cta,
         batch_output_m_operands=batch_output_m_operands,
-        persistent_output_pipeline=persistent_output_pipeline,
+        cross_job_pipeline=shared_ring,
         output_n_tile=output_n_tile,
         operand_stages=operand_stages,
         operand_k_tile=operand_k_tile,
@@ -401,21 +386,11 @@ def blackwell_tcgen05_gemm_module(
         tmem_writeback_warps=tmem_writeback_warps,
     )
     if shared_ring:
-        from ..passes.pipeline_shared_ring import PipelineSharedRing
+        from ..passes.pipeline_loop import PipelineLoop
 
-        if rolled_operand_pipeline and output_store_pending_groups:
-            scheduled.body.ops[0].attrs["rolled_output_store_pending_groups"] = (
-                output_store_pending_groups
-            )
-        scheduled = PipelineSharedRing(
-            operand_stages=operand_stages,
-            overlap=persistent_output_overlap,
-            rolled_operand_pipeline=rolled_operand_pipeline,
-            mma_queue_depth=max(1, int(cyclic_operand_pipeline)),
-            job_regions=persistent_output_job_regions,
-            output_writeback_window=output_writeback_window,
-            frames=persistent_output_frames,
-        ).run(scheduled)
+        if plan.rolled and output_store_pending_groups:
+            scheduled.body.ops[0].attrs["rolled_output_store_pending_groups"] = output_store_pending_groups
+        scheduled = PipelineLoop(plan=plan, operand_stages=operand_stages).run(scheduled)
     kernel = scheduled.body.ops[0]
     if type(prefetch_tma_descriptors) is not bool:
         raise ValueError("prefetch_tma_descriptors must be a boolean")
@@ -434,7 +409,7 @@ def blackwell_tcgen05_gemm_module(
     # replaces a cluster-wide software gather every second stage. Persistent
     # and grouped multi-tile paired schedules keep their own handoffs.
     paired_relay = cta_group == 2 and not (
-        extended_cluster or persistent_output_pipeline or batch_output_m_operands
+        extended_cluster or shared_ring or batch_output_m_operands
     )
     if paired_relay:
         kernel.attrs["correlate_uniform_guards"] = True

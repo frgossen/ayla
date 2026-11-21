@@ -14,9 +14,9 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 19.984000362455845,
       "cublas_us": 19.652000395581126,
@@ -30,10 +30,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 24.790857120284013,
       "cublas_us": 26.153143096183026,
@@ -47,11 +47,13 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "transpose_output": true,
-        "transpose_reduction": true
+        "transpose_reduction": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 22.56290909090909,
       "cublas_us": 21.306181818181816,
@@ -65,11 +67,11 @@
       "dtype": "f16",
       "configuration": {
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {}
       },
       "ayla_us": 18.986666666666665,
       "cublas_us": 16.776533333333337,
@@ -88,12 +90,14 @@
           "cta_group": 2,
           "cluster_n_ctas": 2,
           "operand_stages": 10,
-          "cyclic_operand_pipeline": 2,
           "tmem_writeback_warps": 8,
           "operand_move_attrs": {
             "rhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -111,7 +115,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "tmem_writeback_register_budget": 64,
           "output_m_tile": 64,
@@ -122,7 +125,10 @@
             4,
             1,
             1
-          ]
+          ],
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -139,7 +145,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "output_m_tile": 64,
           "output_n_tile": 128,
@@ -150,7 +155,10 @@
             1,
             1
           ],
-          "tmem_writeback_warps": 8
+          "tmem_writeback_warps": 8,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -166,9 +174,11 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 25.05599951837212,
       "cublas_us": 23.995999712496996,
@@ -182,9 +192,11 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 25.079999584704638,
       "cublas_us": 24.795999750494957,
@@ -199,9 +211,9 @@
         "split_k": 4,
         "output_n_tile": 256,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 31.402666276941694,
       "cublas_us": 32.82133350148797,
@@ -216,9 +228,9 @@
         "split_k": 4,
         "output_n_tile": 256,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 37.408000556752086,
       "cublas_us": 41.96799942292273,
@@ -232,9 +244,9 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 19.65236354788596,
       "cublas_us": 18.52363678203388,
@@ -248,9 +260,11 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 22.838857091431105,
       "cublas_us": 24.84571441475834,
@@ -264,9 +278,11 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 22.891428787261248,
       "cublas_us": 24.91199996854578,
@@ -283,12 +299,14 @@
           "output_n_tile": 128,
           "cta_group": 2,
           "operand_stages": 9,
-          "cyclic_operand_pipeline": 2,
           "tmem_writeback_warps": 8,
           "operand_move_attrs": {
             "rhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -306,7 +324,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "operand_move_attrs": {
             "rhs": {
               "l2_cache_hint": "evict_first"
@@ -314,7 +331,10 @@
           },
           "output_n_tile": 128,
           "operand_stages": 9,
-          "tmem_writeback_register_budget": 64
+          "tmem_writeback_register_budget": 64,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -331,7 +351,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "operand_move_attrs": {
             "rhs": {
               "l2_cache_hint": "evict_first"
@@ -340,7 +359,10 @@
           "output_n_tile": 128,
           "operand_stages": 9,
           "interleave_mma_descriptors": true,
-          "tmem_writeback_register_budget": 64
+          "tmem_writeback_register_budget": 64,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -357,7 +379,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "operand_move_attrs": {
             "rhs": {
               "l2_cache_hint": "evict_first"
@@ -366,7 +387,10 @@
           "output_n_tile": 128,
           "operand_stages": 9,
           "interleave_mma_descriptors": true,
-          "tmem_writeback_warps": 8
+          "tmem_writeback_warps": 8,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -383,7 +407,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "output_m_tile": 64,
           "output_n_tile": 128,
@@ -394,7 +417,10 @@
             1,
             1
           ],
-          "tmem_writeback_warps": 8
+          "tmem_writeback_warps": 8,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -414,9 +440,11 @@
           "cta_group": 2,
           "output_n_tile": 240,
           "operand_stages": 6,
-          "cyclic_operand_pipeline": 2,
           "tmem_writeback_warps": 8,
-          "tmem_writeback_register_budget": 64
+          "tmem_writeback_register_budget": 64,
+          "pipeline": {
+            "mma_pending": 2
+          }
         }
       },
       "ayla_us": 32.49199956189841,
@@ -433,9 +461,11 @@
         "native_schedule": {
           "cta_group": 2,
           "operand_stages": 6,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
-          "tmem_writeback_warps": 8
+          "tmem_writeback_warps": 8,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": true
       },
@@ -451,10 +481,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 16.104,
       "cublas_us": 15.792,
@@ -469,10 +499,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 22.820571428571427,
       "cublas_us": 22.249142857142857,
@@ -487,10 +517,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 22.852571428571427,
       "cublas_us": 22.35885714285714,
@@ -504,11 +534,13 @@
       "dtype": "f16",
       "configuration": {
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 2,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 18.690000229980797,
       "cublas_us": 20.735999889438972,
@@ -521,11 +553,11 @@
       "dtype": "f16",
       "configuration": {
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {}
       },
       "ayla_us": 26.30704761904762,
       "cublas_us": 25.898666666666667,
@@ -541,9 +573,11 @@
         "output_m_tile": 64,
         "output_n_tile": 256,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 30.848,
       "cublas_us": 30.216,
@@ -558,10 +592,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 17.742000229191035,
       "cublas_us": 18.490999849746004,
@@ -578,7 +612,6 @@
           "output_m_tile": 64,
           "output_n_tile": 128,
           "output_store": "stmatrix",
-          "cyclic_operand_pipeline": 2,
           "interleave_mma_descriptors": true,
           "cta_group": 2,
           "operand_stages": 12,
@@ -593,6 +626,9 @@
             "rhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -610,7 +646,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "output_m_tile": 64,
           "output_n_tile": 128,
@@ -626,6 +661,9 @@
             "lhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -643,7 +681,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "tmem_writeback_register_budget": 64,
           "output_m_tile": 64,
@@ -654,7 +691,10 @@
             4,
             1,
             1
-          ]
+          ],
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -670,10 +710,10 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 23.784000048181042,
       "cublas_us": 22.540000034496188,
@@ -687,10 +727,10 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 24.424000119324774,
       "cublas_us": 22.554000053787604,
@@ -704,9 +744,11 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "ayla_us": 30.700190480621085,
       "cublas_us": 30.677333429810545,
@@ -721,9 +763,9 @@
         "split_k": 4,
         "output_n_tile": 256,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 36.84400086058304,
       "cublas_us": 40.78399995341897,
@@ -738,9 +780,9 @@
         "split_k": 2,
         "output_n_tile": 256,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 119.05280221253633,
       "cublas_us": 119.66720167547464,
@@ -758,9 +800,11 @@
           "output_n_tile": 192,
           "cta_group": 2,
           "operand_stages": 11,
-          "cyclic_operand_pipeline": 2,
           "tmem_writeback_warps": 8,
-          "tmem_writeback_register_budget": 64
+          "tmem_writeback_register_budget": 64,
+          "pipeline": {
+            "mma_pending": 2
+          }
         }
       },
       "ayla_us": 40.95999923135553,
@@ -779,7 +823,6 @@
           "output_n_tile": 192,
           "cta_group": 2,
           "operand_stages": 10,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "tmem_writeback_warps": 8,
           "tmem_writeback_register_budget": 64,
@@ -787,6 +830,9 @@
             "lhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -806,13 +852,15 @@
           "output_n_tile": 128,
           "cta_group": 2,
           "operand_stages": 8,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "tmem_writeback_warps": 8,
           "operand_move_attrs": {
             "lhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": true
@@ -830,7 +878,6 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": 2,
           "operand_move_attrs": {
             "rhs": {
               "l2_cache_hint": "evict_first"
@@ -840,7 +887,10 @@
           "output_store": "stmatrix",
           "output_layout": "tcgen05_16x256b",
           "tmem_writeback_register_budget": 128,
-          "operand_stages": 8
+          "operand_stages": 8,
+          "pipeline": {
+            "mma_pending": 2
+          }
         },
         "transpose_output": false
       },
@@ -859,7 +909,6 @@
           "output_n_tile": 128,
           "cta_group": 2,
           "operand_stages": 9,
-          "cyclic_operand_pipeline": 2,
           "tmem_writeback_warps": 8,
           "operand_move_attrs": {
             "lhs": {
@@ -868,6 +917,9 @@
             "rhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -887,12 +939,14 @@
           "output_n_tile": 128,
           "cta_group": 2,
           "operand_stages": 9,
-          "cyclic_operand_pipeline": 2,
           "tmem_writeback_warps": 8,
           "operand_move_attrs": {
             "lhs": {
               "l2_cache_hint": "evict_first"
             }
+          },
+          "pipeline": {
+            "mma_pending": 2
           }
         },
         "transpose_output": false
@@ -913,10 +967,12 @@
           "cta_group": 2,
           "output_n_tile": 176,
           "operand_stages": 7,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
           "tmem_writeback_warps": 8,
-          "tmem_writeback_register_budget": 64
+          "tmem_writeback_register_budget": 64,
+          "pipeline": {
+            "mma_pending": 2
+          }
         }
       },
       "ayla_us": 24.958999711088836,
@@ -935,9 +991,11 @@
           "cta_group": 2,
           "output_n_tile": 240,
           "operand_stages": 5,
-          "cyclic_operand_pipeline": 2,
           "output_store": "stmatrix",
-          "tmem_writeback_register_budget": 64
+          "tmem_writeback_register_budget": 64,
+          "pipeline": {
+            "mma_pending": 2
+          }
         }
       },
       "ayla_us": 31.107000104384497,
@@ -953,9 +1011,9 @@
         "split_k": 2,
         "output_n_tile": 256,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "ayla_us": 51.49099972913973,
       "cublas_us": 51.31199964671396,
@@ -972,14 +1030,18 @@
           "cta_group": 2,
           "output_grid_size": 148,
           "operand_stages": 6,
-          "rolled_operand_pipeline": true,
-          "persistent_output_pipeline": true,
           "output_store": "stmatrix",
           "output_slices": 2,
           "tmem_writeback_register_budget": 64,
           "tmem_writeback_warps": 8,
-          "cyclic_operand_pipeline": 1,
-          "rolled_k_unroll": 2
+          "pipeline": {
+            "operand_scope": "output_jobs",
+            "reduction": {
+              "form": "rolled",
+              "unroll": 2
+            },
+            "mma_pending": 1
+          }
         },
         "transpose_output": false
       },
@@ -1001,13 +1063,15 @@
         "native_schedule": {
           "output_n_tile": 160,
           "operand_stages": 5,
-          "cyclic_operand_pipeline": true,
           "output_grid_fast_axis": "n",
           "output_store": "stmatrix",
           "output_slices": 2,
           "tmem_writeback_register_budget": 64,
           "output_grid_size": 148,
-          "persistent_output_pipeline": true
+          "pipeline": {
+            "operand_scope": "output_jobs",
+            "mma_pending": 1
+          }
         },
         "transpose_output": false
       },
@@ -1027,7 +1091,6 @@
         "split_k": 1,
         "native_schedule": {
           "output_n_tile": 384,
-          "cyclic_operand_pipeline": true,
           "output_grid_fast_axis": "n",
           "tmem_writeback_register_budget": 64,
           "output_store": "stmatrix",
@@ -1040,7 +1103,10 @@
               "l2_cache_hint": "evict_first"
             }
           },
-          "interleave_mma_descriptors": true
+          "interleave_mma_descriptors": true,
+          "pipeline": {
+            "mma_pending": 1
+          }
         },
         "transpose_output": false
       },
@@ -1061,13 +1127,17 @@
         "native_schedule": {
           "cta_group": 2,
           "operand_stages": 6,
-          "rolled_operand_pipeline": true,
           "output_grid_size": 144,
-          "persistent_output_pipeline": true,
           "output_store": "stmatrix",
           "output_slices": 2,
           "tmem_writeback_register_budget": 64,
-          "rolled_k_unroll": 8
+          "pipeline": {
+            "operand_scope": "output_jobs",
+            "reduction": {
+              "form": "rolled",
+              "unroll": 8
+            }
+          }
         },
         "transpose_output": false
       },
@@ -1088,14 +1158,18 @@
         "native_schedule": {
           "cta_group": 2,
           "operand_stages": 6,
-          "rolled_operand_pipeline": true,
           "output_grid_size": 144,
-          "persistent_output_pipeline": true,
           "output_store": "stmatrix",
           "output_slices": 2,
           "tmem_writeback_register_budget": 64,
           "interleave_mma_descriptors": true,
-          "rolled_k_unroll": 8
+          "pipeline": {
+            "operand_scope": "output_jobs",
+            "reduction": {
+              "form": "rolled",
+              "unroll": 8
+            }
+          }
         },
         "transpose_output": false
       },
@@ -1115,7 +1189,6 @@
         "split_k": 1,
         "native_schedule": {
           "output_n_tile": 384,
-          "cyclic_operand_pipeline": true,
           "tmem_writeback_register_budget": 64,
           "output_store": "stmatrix",
           "output_slices": 2,
@@ -1127,7 +1200,10 @@
             }
           },
           "output_store_pending_groups": 1,
-          "reuse_mma_collector_a": true
+          "reuse_mma_collector_a": true,
+          "pipeline": {
+            "mma_pending": 1
+          }
         },
         "transpose_output": false
       },
@@ -1148,13 +1224,15 @@
         "native_schedule": {
           "output_n_tile": 192,
           "operand_stages": 5,
-          "cyclic_operand_pipeline": true,
           "output_grid_fast_axis": "n",
           "output_store": "stmatrix",
           "output_slices": 2,
           "tmem_writeback_register_budget": 64,
           "output_grid_size": 148,
-          "persistent_output_pipeline": true
+          "pipeline": {
+            "operand_scope": "output_jobs",
+            "mma_pending": 1
+          }
         },
         "transpose_output": false
       },
@@ -1174,13 +1252,15 @@
         "split_k": 1,
         "native_schedule": {
           "operand_stages": 4,
-          "cyclic_operand_pipeline": true,
           "output_grid_fast_axis": "n",
           "tmem_writeback_register_budget": 64,
           "output_store": "stmatrix",
           "output_slices": 2,
           "output_store_buffers": 2,
-          "output_m_tiles_per_cta": 2
+          "output_m_tiles_per_cta": 2,
+          "pipeline": {
+            "mma_pending": 1
+          }
         },
         "transpose_output": false
       },
@@ -1200,12 +1280,14 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": true,
           "output_store": "stmatrix",
           "tmem_writeback_register_budget": 64,
           "output_column_major": true,
           "output_n_tile": 176,
-          "operand_stages": 6
+          "operand_stages": 6,
+          "pipeline": {
+            "mma_pending": 1
+          }
         },
         "transpose_output": true
       },
@@ -1225,12 +1307,14 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": true,
           "output_store": "stmatrix",
           "tmem_writeback_register_budget": 64,
           "output_column_major": true,
           "output_n_tile": 240,
-          "operand_stages": 4
+          "operand_stages": 4,
+          "pipeline": {
+            "mma_pending": 1
+          }
         },
         "transpose_output": true
       },
@@ -1250,12 +1334,14 @@
         "split_k": 1,
         "native_schedule": {
           "cta_group": 2,
-          "cyclic_operand_pipeline": true,
           "output_store": "stmatrix",
           "tmem_writeback_register_budget": 64,
           "output_column_major": true,
           "output_n_tile": 192,
-          "operand_k_tile": 128
+          "operand_k_tile": 128,
+          "pipeline": {
+            "mma_pending": 1
+          }
         },
         "transpose_output": true
       },
@@ -1266,5 +1352,8 @@
       "evidence": "/home/arseniivanov/ayla/.benchmarks/b200_baseline_gap_20261114/current_cohort/m1152_n3072_k768/results/result.json",
       "warp_specialization": false
     }
-  ]
+  ],
+  "metadata": {
+    "schedule_contract": "pipeline declares operand scope, accumulator slots, stage overlap, participants and semantic loop policies; output_m_tile is the CTA M footprint when mma_m_tile is supplied."
+  }
 }

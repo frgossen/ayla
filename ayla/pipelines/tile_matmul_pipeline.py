@@ -191,9 +191,10 @@ def schedule_register_matmul(
     pipeline.add_pass(LICM())
     pipeline.add_pass(Canonicalize(keep_loops=keep))
     if rolled_operand_pipeline:
-        from ..passes.pipeline_rolled_k import PipelineRolledK
-        pipeline.add_pass(PipelineRolledK(operand_stages, k_label,
-                                        queue_depth=max(1, int(cyclic_operand_pipeline))))
+        from .ring_schedule import LoopSchedule, PipelineSchedule
+        pipeline.add_pass(PipelineLoop(k_label, operand_stages=operand_stages,
+            plan=PipelineSchedule(reduction=LoopSchedule("rolled"),
+                                  mma_pending=max(1, int(cyclic_operand_pipeline)))))
         return pipeline
     # A cyclic pipeline of depth d keeps d MMA batches queued: it refills the
     # last d banks after their MMA events, carried into the next iteration.
@@ -376,7 +377,7 @@ def _schedule_matmul(
     output_n_tile: int = 256,
     warpgroup_m_tile: int | None = None,
     warpgroup_n_tile: int | None = None,
-    persistent_output_pipeline: bool = False,
+    cross_job_pipeline: bool = False,
     cluster_m_ctas: int = 1,
     cluster_n_ctas: int = 1,
     cta_group: int | None = None,
@@ -481,7 +482,7 @@ def _schedule_matmul(
     if layout.size > 1 and output_store == 'global' and (m % (layout.m*output_m_tile) or (n % (layout.n*output_n_tile) and not masked_global_store)):
         raise ValueError('cluster global stores require complete logical cluster tiles')
     if paired and output_grid_size is not None and (output_grid_size % 2
-            or output_grid_fast_axis != "m" or ((m + output_m_tile - 1) // output_m_tile) % 2 and not (persistent_output_pipeline or clustered_work)):
+            or output_grid_fast_axis != "m" or ((m + output_m_tile - 1) // output_m_tile) % 2 and not (cross_job_pipeline or clustered_work)):
         raise ValueError("paired persistent grids require even CTA and M-tile counts with M-fast traversal")
 
     # TMA stores permit partial output tiles. Each operand's SMEM atom must
@@ -661,7 +662,7 @@ def _schedule_matmul(
                 for_loop_labels=[None, None],
                 op_label_filter="mm",
                 allow_partial_tiles=(layout.size > 1 or paired or m % output_m_tile != 0 or n % output_n_tile != 0),
-                pad_to_cluster=layout.size > 1 and (output_grid_size is None or persistent_output_pipeline or clustered_work),
+                pad_to_cluster=layout.size > 1 and (output_grid_size is None or cross_job_pipeline or clustered_work),
                 cluster_layout=layout if clustered_work else None,
                 reversed_dims=list(output_reversed_dims),
             )

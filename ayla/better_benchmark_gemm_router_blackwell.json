@@ -1002,7 +1002,8 @@
       ],
       "verification": "435 schedules rebuilt with identical executables for the same selections; eight replacements reconfirmed on B200 GPUs 0 and 1 with reversed load/capture order and identical-code controls; 96 FP16/BF16 checks under Compute Sanitizer, zero errors.",
       "report": "benchmarks/blackwell_schedule_cleanup_20261120.md"
-    }
+    },
+    "schedule_contract": "pipeline declares operand scope, accumulator slots, stage overlap, participants and semantic loop policies; output_m_tile is the CTA M footprint when mma_m_tile is supplied."
   },
   "routes": [
     {
@@ -1048,7 +1049,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1056,6 +1056,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1069,7 +1072,6 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 13,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1078,7 +1080,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "compact_mma_batch": true
+        "compact_mma_batch": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1092,7 +1097,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1101,7 +1105,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1114,12 +1121,14 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1133,14 +1142,16 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
         },
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1189,11 +1200,13 @@
         "output_n_tile": 64,
         "operand_k_tile": 256,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1207,11 +1220,13 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1225,7 +1240,6 @@
         "output_n_tile": 16,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1233,6 +1247,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1247,7 +1264,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1255,6 +1271,9 @@
           "rhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1269,7 +1288,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1277,6 +1295,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1290,9 +1311,9 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       }
     },
     {
@@ -1306,7 +1327,6 @@
         "cta_group": 2,
         "output_n_tile": 64,
         "operand_stages": 10,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
@@ -1317,7 +1337,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1330,14 +1353,18 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -1350,14 +1377,18 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -1386,7 +1417,6 @@
         "output_n_tile": 16,
         "operand_k_tile": 256,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": 2,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1396,7 +1426,10 @@
           }
         },
         "hoist_mma_descriptors": true,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -1410,7 +1443,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1418,6 +1450,9 @@
           "rhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1432,7 +1467,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1441,7 +1475,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "output_layout": "tcgen05_16x32bx2"
+        "output_layout": "tcgen05_16x32bx2",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1456,13 +1493,15 @@
         "output_n_tile": 48,
         "operand_k_tile": 128,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1492,10 +1531,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       }
     },
     {
@@ -1508,9 +1547,11 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1539,10 +1580,12 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
-        "output_slices": 2
+        "output_slices": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1571,7 +1614,6 @@
         "output_n_tile": 16,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1579,6 +1621,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1593,7 +1638,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1601,6 +1645,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1615,9 +1662,11 @@
         "output_n_tile": 32,
         "operand_k_tile": 128,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
-        "output_m_tile": 64
+        "output_m_tile": 64,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1630,7 +1679,6 @@
       "configuration": {
         "output_n_tile": 32,
         "operand_stages": 11,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1640,7 +1688,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1654,7 +1705,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1662,6 +1712,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1675,11 +1728,13 @@
       "configuration": {
         "output_n_tile": 48,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1692,7 +1747,6 @@
       "configuration": {
         "output_n_tile": 48,
         "operand_k_tile": 256,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1700,6 +1754,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1714,7 +1771,6 @@
         "output_n_tile": 48,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1724,7 +1780,10 @@
           }
         },
         "hoist_mma_descriptors": true,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1738,7 +1797,6 @@
         "output_n_tile": 48,
         "operand_k_tile": 256,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1748,7 +1806,10 @@
           }
         },
         "hoist_mma_descriptors": true,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1761,8 +1822,10 @@
       "configuration": {
         "output_n_tile": 32,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
-        "output_grid_fast_axis": "n"
+        "output_grid_fast_axis": "n",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1776,14 +1839,16 @@
         "output_n_tile": 32,
         "operand_k_tile": 128,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
         },
-        "warp_specific_operand_waits": true
+        "warp_specific_operand_waits": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1797,7 +1862,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1807,7 +1871,10 @@
           }
         },
         "hoist_mma_descriptors": true,
-        "transpose_output": false
+        "transpose_output": false,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1820,9 +1887,11 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n1024-k12544-2472023f41c7-workspace-961685d9d696",
@@ -1884,7 +1953,6 @@
         "output_n_tile": 96,
         "operand_k_tile": 128,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1894,7 +1962,10 @@
           }
         },
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64
+        "tmem_writeback_register_budget": 64,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -1906,11 +1977,11 @@
       "k": 6144,
       "configuration": {
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {}
       }
     },
     {
@@ -1923,7 +1994,6 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -1933,6 +2003,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -1950,7 +2023,6 @@
         "cta_group": 2,
         "cluster_n_ctas": 2,
         "operand_stages": 10,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "hoist_mma_descriptors": true,
         "allow_partial_tiles": true,
@@ -1958,6 +2030,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 2
         }
       }
     },
@@ -1970,7 +2045,6 @@
       "k": 6400,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 3,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -1983,7 +2057,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 3
+        }
       }
     },
     {
@@ -1995,7 +2072,6 @@
       "k": 7936,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -2008,7 +2084,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2022,13 +2101,15 @@
         "split_k": 2,
         "cta_group": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "cluster_bank_pipeline": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n2048-k8192-31cfe3d92412-cluster-411e1e7e611f",
@@ -2091,9 +2172,11 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2106,9 +2189,11 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n2048-k12544-93e79bfacdde-workspace-7687c930a22a",
@@ -2170,13 +2255,15 @@
         "split_k": 2,
         "cta_group": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "cluster_bank_pipeline": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n2048-k16448-da16c0841aed-cluster-411e1e7e611f",
@@ -2238,7 +2325,6 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -2250,7 +2336,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2263,13 +2352,15 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2282,14 +2373,16 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
         "compact_mma_batch": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2302,10 +2395,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -2316,6 +2406,13 @@
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -2330,7 +2427,6 @@
       "configuration": {
         "output_n_tile": 32,
         "operand_stages": 11,
-        "cyclic_operand_pipeline": 2,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -2340,7 +2436,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2354,7 +2453,6 @@
         "output_n_tile": 32,
         "operand_k_tile": 192,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -2363,7 +2461,10 @@
             "l2_cache_hint": "evict_last"
           }
         },
-        "compact_mma_batch": true
+        "compact_mma_batch": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2391,7 +2492,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -2400,7 +2500,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2412,7 +2515,6 @@
       "k": 1024,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -2426,7 +2528,10 @@
           1,
           1
         ],
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2440,7 +2545,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 192,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -2448,6 +2552,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -2462,7 +2569,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 192,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -2472,7 +2578,10 @@
           }
         },
         "interleave_mma_descriptors": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2485,12 +2594,14 @@
       "configuration": {
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
-        "cyclic_operand_pipeline": true,
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 6,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2503,9 +2614,11 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m768-n768-k8192-97d8cc798883-workspace-961685d9d696",
@@ -2566,9 +2679,11 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2581,9 +2696,11 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2595,13 +2712,15 @@
       "k": 512,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 96,
-        "operand_stages": 8
+        "operand_stages": 8,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2614,13 +2733,15 @@
       "configuration": {
         "output_n_tile": 96,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2633,13 +2754,15 @@
       "configuration": {
         "output_n_tile": 96,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2652,7 +2775,6 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -2662,7 +2784,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "tmem_writeback_register_budget": 128
+        "tmem_writeback_register_budget": 128,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2675,13 +2800,15 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2694,12 +2821,14 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2712,13 +2841,15 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2731,12 +2862,14 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -2750,7 +2883,6 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -2760,7 +2892,10 @@
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "output_slices": 2,
-        "output_store_buffers": 2
+        "output_store_buffers": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2772,14 +2907,16 @@
       "k": 12544,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
         },
         "output_n_tile": 128,
-        "operand_stages": 9
+        "operand_stages": 9,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2791,7 +2928,6 @@
       "k": 12608,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 3,
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
@@ -2799,7 +2935,10 @@
         },
         "output_n_tile": 128,
         "operand_stages": 9,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 3
+        }
       }
     },
     {
@@ -2811,7 +2950,6 @@
       "k": 12672,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
@@ -2819,7 +2957,10 @@
         },
         "output_n_tile": 128,
         "operand_stages": 9,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -2833,14 +2974,16 @@
         "output_n_tile": 16,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
         },
-        "compact_mma_batch": true
+        "compact_mma_batch": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2887,11 +3030,13 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 11,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2903,7 +3048,6 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -2911,7 +3055,10 @@
         "output_m_tile": 64,
         "output_n_tile": 96,
         "operand_stages": 12,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2925,7 +3072,6 @@
         "output_n_tile": 96,
         "operand_k_tile": 128,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": 1,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -2937,7 +3083,10 @@
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "interleave_mma_descriptors": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2950,12 +3099,14 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -2968,7 +3119,6 @@
       "k": 512,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -2976,7 +3126,10 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -2989,7 +3142,6 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -3000,7 +3152,10 @@
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "compact_mma_batch": true
+        "compact_mma_batch": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3013,7 +3168,6 @@
       "configuration": {
         "output_n_tile": 64,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -3022,6 +3176,9 @@
           "lhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "mma_pending": 2
         }
       }
     },
@@ -3038,7 +3195,6 @@
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "cyclic_operand_pipeline": 2,
         "interleave_mma_descriptors": true,
         "cta_group": 2,
         "operand_stages": 12,
@@ -3048,7 +3204,10 @@
           1,
           1
         ],
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -3060,7 +3219,6 @@
       "k": 4096,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3072,7 +3230,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -3084,7 +3245,6 @@
       "k": 4160,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 3,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3097,7 +3257,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 3
+        }
       }
     },
     {
@@ -3110,12 +3273,14 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -3129,14 +3294,16 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
         "compact_mma_batch": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3148,7 +3315,6 @@
       "k": 4000,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3157,7 +3323,10 @@
         "operand_stages": 6,
         "output_slices": 2,
         "output_store_buffers": 2,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3169,12 +3338,14 @@
       "k": 128,
       "configuration": {
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 8,
         "output_store_buffers": 8,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3186,12 +3357,14 @@
       "k": 256,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3203,7 +3376,6 @@
       "k": 512,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -3216,7 +3388,10 @@
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3228,101 +3403,6 @@
       "k": 1024,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
-        "output_store": "stmatrix",
-        "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
-        "operand_stages": 5,
-        "cluster_n_ctas": 2,
-        "cluster_dim": [
-          4,
-          1,
-          1
-        ],
-        "output_slices": 2,
-        "output_store_buffers": 2,
-        "output_store_pending_groups": 1
-      }
-    },
-    {
-      "op": "mm",
-      "dtype": "float16",
-      "batch": 1,
-      "m": 1024,
-      "n": 4096,
-      "k": 1568,
-      "configuration": {
-        "cta_group": 2,
-        "cyclic_operand_pipeline": 3,
-        "output_store": "stmatrix",
-        "allow_partial_tiles": true,
-        "tmem_writeback_register_budget": 64,
-        "operand_stages": 6,
-        "cluster_n_ctas": 2,
-        "cluster_dim": [
-          4,
-          1,
-          1
-        ],
-        "output_slices": 2,
-        "output_store_buffers": 2,
-        "output_store_pending_groups": 1
-      }
-    },
-    {
-      "op": "mm",
-      "dtype": "float16",
-      "batch": 1,
-      "m": 1024,
-      "n": 4096,
-      "k": 2048,
-      "configuration": {
-        "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
-        "output_grid_fast_axis": "n",
-        "operand_move_attrs": {
-          "rhs": {
-            "l2_cache_hint": "evict_first"
-          }
-        },
-        "tmem_writeback_register_budget": 64,
-        "output_store": "stmatrix",
-        "output_slices": 2,
-        "output_store_buffers": 2
-      }
-    },
-    {
-      "op": "mm",
-      "dtype": "float16",
-      "batch": 1,
-      "m": 1024,
-      "n": 4096,
-      "k": 3136,
-      "configuration": {
-        "cta_group": 2,
-        "cyclic_operand_pipeline": true,
-        "output_store": "stmatrix",
-        "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
-        "output_n_tile": 240,
-        "operand_stages": 6,
-        "output_slices": 2,
-        "output_store_buffers": 2,
-        "output_store_pending_groups": 1
-      }
-    },
-    {
-      "op": "mm",
-      "dtype": "float16",
-      "batch": 1,
-      "m": 1024,
-      "n": 4096,
-      "k": 4096,
-      "configuration": {
-        "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3337,7 +3417,112 @@
         "output_slices": 2,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
-        "transpose_output": true
+        "pipeline": {
+          "mma_pending": 1
+        }
+      }
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 4096,
+      "k": 1568,
+      "configuration": {
+        "cta_group": 2,
+        "output_store": "stmatrix",
+        "allow_partial_tiles": true,
+        "tmem_writeback_register_budget": 64,
+        "operand_stages": 6,
+        "cluster_n_ctas": 2,
+        "cluster_dim": [
+          4,
+          1,
+          1
+        ],
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 3
+        }
+      }
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 4096,
+      "k": 2048,
+      "configuration": {
+        "operand_stages": 4,
+        "output_grid_fast_axis": "n",
+        "operand_move_attrs": {
+          "rhs": {
+            "l2_cache_hint": "evict_first"
+          }
+        },
+        "tmem_writeback_register_budget": 64,
+        "output_store": "stmatrix",
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
+      }
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 4096,
+      "k": 3136,
+      "configuration": {
+        "cta_group": 2,
+        "output_store": "stmatrix",
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "tmem_writeback_register_budget": 64,
+        "output_n_tile": 240,
+        "operand_stages": 6,
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 1
+        }
+      }
+    },
+    {
+      "op": "mm",
+      "dtype": "float16",
+      "batch": 1,
+      "m": 1024,
+      "n": 4096,
+      "k": 4096,
+      "configuration": {
+        "cta_group": 2,
+        "output_store": "stmatrix",
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "tmem_writeback_register_budget": 64,
+        "operand_stages": 5,
+        "cluster_n_ctas": 2,
+        "cluster_dim": [
+          4,
+          1,
+          1
+        ],
+        "output_slices": 2,
+        "output_store_buffers": 2,
+        "output_store_pending_groups": 1,
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3349,13 +3534,15 @@
       "k": 4160,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 240,
-        "operand_stages": 6
+        "operand_stages": 6,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -3367,7 +3554,6 @@
       "k": 16384,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -3376,7 +3562,10 @@
         },
         "tmem_writeback_register_budget": 64,
         "output_layout": "tcgen05_16x32bx2",
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3390,17 +3579,21 @@
         "cta_group": 2,
         "output_n_tile": 224,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -3432,7 +3625,6 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3440,7 +3632,10 @@
         "output_m_tile": 64,
         "output_n_tile": 96,
         "operand_stages": 12,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3455,14 +3650,16 @@
         "output_n_tile": 96,
         "operand_k_tile": 128,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 128,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "output_grid_fast_axis": "n",
         "transpose_output": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3480,7 +3677,9 @@
         "operand_stages": 7,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
-        "cyclic_operand_pipeline": 2
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -3493,7 +3692,6 @@
       "configuration": {
         "output_n_tile": 192,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "allow_partial_tiles": true,
@@ -3501,7 +3699,10 @@
         "tmem_writeback_register_budget": 128,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3514,10 +3715,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       }
     },
     {
@@ -3551,10 +3752,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       }
     },
     {
@@ -3567,10 +3768,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       }
     },
     {
@@ -3583,10 +3784,10 @@
       "configuration": {
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1536-n512-k6400-724481642c36-workspace-f16a3f253935",
@@ -3646,10 +3847,12 @@
       "k": 12544,
       "configuration": {
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1536-n512-k12544-8cb8e1fb4b4c-workspace-ffa8b8c608f8",
@@ -3711,9 +3914,11 @@
         "output_m_tile": 64,
         "output_n_tile": 256,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -3726,7 +3931,6 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -3737,7 +3941,10 @@
           }
         },
         "tmem_writeback_warps": 8,
-        "output_layout": "tcgen05_16x32bx2"
+        "output_layout": "tcgen05_16x32bx2",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3750,9 +3957,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -3760,10 +3965,16 @@
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "rolled_k_unroll": 8,
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 8
           }
         }
       }
@@ -3778,8 +3989,10 @@
       "configuration": {
         "output_n_tile": 16,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
-        "output_grid_fast_axis": "n"
+        "output_grid_fast_axis": "n",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3793,11 +4006,13 @@
         "output_n_tile": 32,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3811,12 +4026,14 @@
         "output_n_tile": 32,
         "operand_k_tile": 128,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -3830,10 +4047,10 @@
       "configuration": {
         "split_k": 4,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       }
     },
     {
@@ -3846,7 +4063,6 @@
       "configuration": {
         "output_n_tile": 96,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -3857,6 +4073,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -3871,7 +4090,6 @@
         "output_n_tile": 96,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -3882,6 +4100,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -3894,7 +4115,6 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3902,7 +4122,10 @@
         "output_m_tile": 64,
         "output_n_tile": 96,
         "operand_stages": 12,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3915,7 +4138,6 @@
       "configuration": {
         "output_n_tile": 96,
         "operand_stages": 10,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -3927,7 +4149,10 @@
         "tmem_writeback_register_budget": 128,
         "output_store": "stmatrix",
         "output_layout": "tcgen05_16x32bx2",
-        "compact_mma_batch": true
+        "compact_mma_batch": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3956,11 +4181,13 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "tmem_writeback_register_budget": 64,
         "output_layout": "tcgen05_16x32bx2",
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -3972,7 +4199,6 @@
       "k": 1568,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -3985,7 +4211,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4001,7 +4230,6 @@
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "cyclic_operand_pipeline": 2,
         "interleave_mma_descriptors": true,
         "cta_group": 2,
         "operand_stages": 12,
@@ -4011,7 +4239,10 @@
           1,
           1
         ],
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4023,7 +4254,6 @@
       "k": 6400,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 3,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4036,7 +4266,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 3
+        }
       }
     },
     {
@@ -4048,7 +4281,6 @@
       "k": 7936,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4061,7 +4293,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4073,7 +4308,6 @@
       "k": 8192,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4086,7 +4320,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4100,11 +4337,11 @@
         "split_k": 4,
         "output_n_tile": 256,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "reduction_elements_per_thread": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {}
       }
     },
     {
@@ -4116,7 +4353,6 @@
       "k": 12544,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4129,7 +4365,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4142,9 +4381,11 @@
       "configuration": {
         "split_k": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2048-n512-k16448-d9b66698a510-workspace-7687c930a22a",
@@ -4204,7 +4445,6 @@
       "k": 384,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4213,7 +4453,10 @@
         "output_n_tile": 176,
         "operand_stages": 6,
         "output_layout": "tcgen05_16x256b",
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4225,7 +4468,6 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4237,7 +4479,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4249,7 +4494,6 @@
       "k": 2304,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4262,7 +4506,10 @@
           1,
           1
         ],
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4274,7 +4521,6 @@
       "k": 3072,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4286,7 +4532,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4298,13 +4547,15 @@
       "k": 384,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 128,
-        "operand_stages": 6
+        "operand_stages": 6,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4317,8 +4568,10 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
-        "output_grid_fast_axis": "n"
+        "output_grid_fast_axis": "n",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4332,13 +4585,15 @@
         "output_m_tile": 64,
         "cta_group": 2,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "allow_partial_tiles": true,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 128,
         "hoist_mma_descriptors": true,
         "transpose_output": false,
-        "output_layout": "tcgen05_16x256b"
+        "output_layout": "tcgen05_16x256b",
+        "pipeline": {
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m2048-n1024-k4096-548c9c0064ee-legal_fragment_geometry_t0_m64_n256_g2_k64_s7-6d34a292507d",
@@ -4501,10 +4756,12 @@
       "k": 32000,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_n_tile": 128,
         "operand_stages": 8,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4516,7 +4773,6 @@
       "k": 128,
       "configuration": {
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 64,
@@ -4524,7 +4780,10 @@
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4536,7 +4795,6 @@
       "k": 768,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "operand_move_attrs": {
@@ -4545,7 +4803,10 @@
           }
         },
         "interleave_mma_descriptors": true,
-        "tmem_writeback_register_budget": 128
+        "tmem_writeback_register_budget": 128,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4559,10 +4820,6 @@
         "cta_group": 2,
         "output_n_tile": 192,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 4,
@@ -4570,9 +4827,17 @@
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "rolled_k_unroll": 2,
         "output_store_pending_groups": 1,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4585,15 +4850,19 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 128,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -4605,14 +4874,16 @@
       "k": 128,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 192,
         "operand_stages": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4625,13 +4896,15 @@
       "configuration": {
         "output_n_tile": 96,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4643,14 +4916,16 @@
       "k": 2048,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 96,
         "operand_stages": 8,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -4662,7 +4937,6 @@
       "k": 12608,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4671,7 +4945,10 @@
         "output_n_tile": 192,
         "operand_stages": 9,
         "output_layout": "tcgen05_16x256b",
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4683,7 +4960,6 @@
       "k": 12672,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 1,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -4692,7 +4968,10 @@
         "output_n_tile": 192,
         "operand_stages": 9,
         "output_layout": "tcgen05_16x256b",
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m2304-n768-k12672-97c0401bc05c-current_k64_s9-32a9ba7b4601",
@@ -4856,11 +5135,13 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 4,
-        "output_store_buffers": 4
+        "output_store_buffers": 4,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4873,13 +5154,15 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4892,13 +5175,15 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4911,13 +5196,15 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -4931,13 +5218,15 @@
         "output_m_tile": 64,
         "cta_group": 2,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "allow_partial_tiles": true,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 128,
         "hoist_mma_descriptors": true,
         "transpose_output": false,
-        "output_layout": "tcgen05_16x256b"
+        "output_layout": "tcgen05_16x256b",
+        "pipeline": {
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m3072-n768-k4096-cd19457e0f45-legal_fragment_geometry_t0_m64_n256_g2_k64_s7-6d34a292507d",
@@ -5100,14 +5389,16 @@
       "k": 8192,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 1,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 128,
         "operand_stages": 8,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m3072-n768-k8192-4a7a5ae7123e-current_k64_s8-247b693098ed",
@@ -5267,7 +5558,6 @@
       "k": 12544,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 1,
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
@@ -5278,7 +5568,10 @@
         "output_store": "stmatrix",
         "output_layout": "tcgen05_16x256b",
         "tmem_writeback_register_budget": 128,
-        "operand_stages": 8
+        "operand_stages": 8,
+        "pipeline": {
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m3072-n768-k12544-858653525f1c-current_k64_s8-d40b730755e7",
@@ -5448,7 +5741,6 @@
         "output_n_tile": 128,
         "cta_group": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "hoist_mma_descriptors": true,
         "allow_partial_tiles": true,
@@ -5459,6 +5751,9 @@
           "rhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 2
         }
       }
     },
@@ -5475,7 +5770,6 @@
         "output_n_tile": 128,
         "cta_group": 2,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "hoist_mma_descriptors": true,
         "allow_partial_tiles": true,
@@ -5483,6 +5777,9 @@
           "lhs": {
             "l2_cache_hint": "evict_first"
           }
+        },
+        "pipeline": {
+          "mma_pending": 2
         }
       }
     },
@@ -5497,7 +5794,6 @@
         "cta_group": 2,
         "output_n_tile": 176,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -5505,7 +5801,10 @@
         "output_layout": "tcgen05_16x256b",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5517,13 +5816,15 @@
       "k": 4160,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 176,
-        "operand_stages": 7
+        "operand_stages": 7,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -5535,7 +5836,6 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -5543,7 +5843,10 @@
         "output_m_tile": 64,
         "output_n_tile": 96,
         "operand_stages": 12,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5555,14 +5858,16 @@
       "k": 256,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 144,
         "operand_stages": 4,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5590,7 +5895,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -5599,7 +5903,10 @@
             "l2_cache_hint": "evict_first"
           }
         },
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5613,7 +5920,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 192,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -5622,7 +5928,10 @@
             "l2_cache_hint": "evict_last"
           }
         },
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5634,7 +5943,6 @@
       "k": 1024,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -5648,7 +5956,10 @@
           1,
           1
         ],
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5661,7 +5972,6 @@
       "configuration": {
         "output_n_tile": 120,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
         "output_m_tile": 64,
@@ -5669,6 +5979,9 @@
           "rhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -5681,14 +5994,16 @@
       "k": 480,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_m_tile": 64,
         "output_n_tile": 128,
-        "operand_stages": 8
+        "operand_stages": 8,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5701,9 +6016,11 @@
       "configuration": {
         "output_n_tile": 80,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
-        "allow_partial_tiles": true
+        "allow_partial_tiles": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5715,7 +6032,6 @@
       "k": 512,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -5724,7 +6040,10 @@
         "output_n_tile": 176,
         "operand_stages": 8,
         "output_layout": "tcgen05_16x256b",
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5736,10 +6055,12 @@
       "k": 240,
       "configuration": {
         "output_n_tile": 240,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "allow_partial_tiles": true,
-        "output_m_tile": 64
+        "output_m_tile": 64,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5752,12 +6073,14 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "tmem_writeback_register_budget": 128
+        "tmem_writeback_register_budget": 128,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5791,13 +6114,15 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5810,13 +6135,15 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5829,13 +6156,15 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5847,12 +6176,14 @@
       "k": 256,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "tmem_writeback_warps": 8,
         "output_store": "stmatrix",
         "output_slices": 2,
-        "output_store_buffers": 2
+        "output_store_buffers": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5864,7 +6195,6 @@
       "k": 512,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -5874,7 +6204,10 @@
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "output_slices": 2,
-        "output_store_buffers": 2
+        "output_store_buffers": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5886,7 +6219,6 @@
       "k": 1024,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -5897,7 +6229,10 @@
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5909,7 +6244,6 @@
       "k": 1568,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -5923,7 +6257,10 @@
         ],
         "output_slices": 2,
         "output_store_buffers": 2,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5935,7 +6272,6 @@
       "k": 2048,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -5946,7 +6282,10 @@
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5958,7 +6297,6 @@
       "k": 3136,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -5968,7 +6306,10 @@
         "transpose_output": true,
         "output_slices": 2,
         "output_store_buffers": 2,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -5980,13 +6321,15 @@
       "k": 4096,
       "configuration": {
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 2,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 128,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "transpose_output": false
+        "transpose_output": false,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -5998,14 +6341,16 @@
       "k": 4160,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 240,
         "operand_stages": 6,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6018,16 +6363,20 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 128,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -6040,10 +6389,7 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6052,7 +6398,16 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": false,
-        "rolled_job_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          },
+          "output_jobs": {
+            "unroll": 4
+          },
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -6064,14 +6419,16 @@
       "k": 128,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 192,
         "operand_stages": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6084,16 +6441,22 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 128,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "rolled_job_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "output_jobs": {
+            "unroll": 4
+          }
+        }
       }
     },
     {
@@ -6104,8 +6467,6 @@
       "n": 9216,
       "k": 128,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6114,9 +6475,15 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 4,
-        "output_grid_size": 148
+        "output_grid_size": 148,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -6129,15 +6496,19 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -6151,8 +6522,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6161,7 +6530,15 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_job_unroll": 2
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          },
+          "output_jobs": {
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -6175,8 +6552,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6185,7 +6560,13 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 4
+          }
+        }
       }
     },
     {
@@ -6214,12 +6595,14 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "tmem_writeback_register_budget": 64
+        "tmem_writeback_register_budget": 64,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6231,7 +6614,6 @@
       "k": 512,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -6239,7 +6621,10 @@
         "output_n_tile": 96,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6251,7 +6636,6 @@
       "k": 1280,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 2,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -6264,7 +6648,10 @@
           1,
           1
         ],
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -6276,7 +6663,6 @@
       "k": 320,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -6284,7 +6670,10 @@
         "output_m_tile": 64,
         "output_n_tile": 160,
         "operand_stages": 5,
-        "output_layout": "tcgen05_32x32b"
+        "output_layout": "tcgen05_32x32b",
+        "pipeline": {
+          "mma_pending": 1
+        }
       },
       "complete_gemm_library_repairs_confirmation": {
         "shape_id": "mm-m6272-n320-k320-aa1c9d147272-fragment_tcgen05_32x32b_w4-3f3300cbed5e",
@@ -6446,7 +6835,6 @@
       "k": 1280,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -6458,7 +6846,10 @@
           4,
           1,
           1
-        ]
+        ],
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6470,14 +6861,16 @@
       "k": 256,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 96,
         "operand_stages": 4,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6491,7 +6884,6 @@
         "cta_group": 2,
         "output_n_tile": 176,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -6499,7 +6891,10 @@
         "output_layout": "tcgen05_16x256b",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6511,13 +6906,15 @@
       "k": 256,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "output_m_tiles_per_cta": 2
+        "output_m_tiles_per_cta": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6531,8 +6928,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6541,7 +6936,13 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 2
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -6553,11 +6954,8 @@
       "k": 512,
       "configuration": {
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6566,7 +6964,14 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 4
+          },
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m6272-n2048-k512-f83ebacfb452-current_k128_s3-c3def8d0a7a6",
@@ -6736,14 +7141,16 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
         "compact_mma_batch": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6756,13 +7163,15 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6775,13 +7184,15 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6793,11 +7204,8 @@
       "k": 512,
       "configuration": {
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6806,7 +7214,14 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 4
+          },
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m6400-n2048-k512-8c4821d6752b-current_k128_s3-c3def8d0a7a6",
@@ -6975,13 +7390,15 @@
       "k": 512,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 64,
         "output_layout": "tcgen05_16x32bx2",
         "output_store": "stmatrix",
-        "output_slices": 2
+        "output_slices": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -6993,7 +7410,6 @@
       "k": 2048,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -7005,7 +7421,10 @@
         "output_layout": "tcgen05_16x32bx2",
         "output_store": "stmatrix",
         "output_slices": 2,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7016,20 +7435,24 @@
       "n": 2048,
       "k": 512,
       "configuration": {
-        "cyclic_operand_pipeline": 2,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 6,
         "output_grid_size": 148,
         "transpose_output": true,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -7042,11 +7465,13 @@
       "configuration": {
         "output_n_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 4,
-        "output_store_buffers": 4
+        "output_store_buffers": 4,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7058,7 +7483,6 @@
       "k": 2048,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -7071,7 +7495,10 @@
           1,
           1
         ],
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7083,14 +7510,16 @@
       "k": 10000,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 112,
         "operand_stages": 8,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7102,7 +7531,6 @@
       "k": 512,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_first"
@@ -7113,7 +7541,10 @@
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7126,7 +7557,6 @@
       "configuration": {
         "output_n_tile": 224,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "allow_partial_tiles": true,
@@ -7134,7 +7564,10 @@
         "tmem_writeback_register_budget": 128,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7146,7 +7579,6 @@
       "k": 768,
       "configuration": {
         "output_n_tile": 384,
-        "cyclic_operand_pipeline": true,
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -7159,7 +7591,10 @@
           }
         },
         "output_store_pending_groups": 1,
-        "cta_group": 2
+        "cta_group": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7170,8 +7605,6 @@
       "n": 768,
       "k": 3072,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -7180,10 +7613,16 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 192,
         "operand_stages": 6,
-        "output_grid_size": 128
+        "output_grid_size": 128,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -7198,8 +7637,6 @@
         "operand_k_tile": 128,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -7208,7 +7645,15 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": false,
-        "peel_first_output_pair": true
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          },
+          "output_jobs": {
+            "peel_front": 2
+          }
+        }
       }
     },
     {
@@ -7219,8 +7664,6 @@
       "n": 2048,
       "k": 256,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -7229,11 +7672,17 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 192,
         "operand_stages": 5,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -7246,16 +7695,20 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 2,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -7268,9 +7721,6 @@
       "configuration": {
         "cta_group": 2,
         "operand_k_tile": 128,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "tmem_writeback_register_budget": 64,
@@ -7278,7 +7728,14 @@
         "hoist_mma_descriptors": true,
         "output_grid_size": 148,
         "interleave_mma_descriptors": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -7291,15 +7748,19 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -7311,7 +7772,6 @@
       "k": 512,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -7322,7 +7782,10 @@
         "tmem_writeback_register_budget": 64,
         "output_layout": "tcgen05_16x32bx2",
         "output_store": "stmatrix",
-        "output_slices": 2
+        "output_slices": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7334,7 +7797,6 @@
       "k": 2048,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "operand_move_attrs": {
           "rhs": {
@@ -7344,7 +7806,10 @@
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 64,
         "output_layout": "tcgen05_16x32bx2",
-        "output_store": "stmatrix"
+        "output_store": "stmatrix",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7357,17 +7822,21 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 2,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 2
+        }
       }
     },
     {
@@ -7380,13 +7849,15 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7397,14 +7868,16 @@
       "n": 384,
       "k": 384,
       "configuration": {
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
         "compact_mma_batch": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7416,14 +7889,16 @@
       "k": 1152,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7435,7 +7910,6 @@
       "k": 1536,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -7444,7 +7918,10 @@
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "transpose_output": true,
-        "tmem_writeback_warps": 8
+        "tmem_writeback_warps": 8,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -7457,11 +7934,8 @@
       "configuration": {
         "output_n_tile": 192,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 1,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -7472,7 +7946,14 @@
         "hoist_mma_descriptors": true,
         "transpose_output": true,
         "output_layout": "tcgen05_16x256b",
-        "rolled_k_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 4
+          },
+          "mma_pending": 1
+        }
       },
       "complete_gemm_library_repairs_confirmation": {
         "shape_id": "mm-m12544-n512-k512-618131ff38e7-fragment_tcgen05_16x256b_w8-7df6455b8b31",
@@ -7799,7 +8280,6 @@
       "k": 1024,
       "configuration": {
         "output_n_tile": 352,
-        "cyclic_operand_pipeline": 0,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -7987,7 +8467,6 @@
       "k": 1536,
       "configuration": {
         "output_n_tile": 352,
-        "cyclic_operand_pipeline": 0,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -8167,11 +8646,15 @@
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "hoist_mma_descriptors": true,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_grid_size": 132,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -8184,10 +8667,6 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -8195,9 +8674,17 @@
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "rolled_k_unroll": 2,
         "transpose_output": false,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8211,8 +8698,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -8221,7 +8706,13 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 2
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -8233,22 +8724,26 @@
       "k": 3072,
       "configuration": {
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
         "tmem_writeback_register_budget": 64,
         "hoist_mma_descriptors": true,
-        "persistent_output_pipeline": true,
         "output_grid_size": 147,
         "allow_partial_tiles": true,
-        "rolled_operand_pipeline": true,
-        "output_writeback_window": [
-          36,
-          48
-        ],
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1,
+          "writeback_window": [
+            36,
+            48
+          ]
+        }
       }
     },
     {
@@ -8261,17 +8756,21 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 4,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m12544-n1000-k384-8e9e40c15071-current_grid148-7052883297d7",
@@ -8440,17 +8939,21 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -8464,10 +8967,7 @@
         "cta_group": 2,
         "output_n_tile": 192,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 3,
@@ -8478,6 +8978,13 @@
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -8492,17 +8999,21 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -8513,9 +9024,6 @@
       "n": 2048,
       "k": 512,
       "configuration": {
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -8523,10 +9031,17 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 5,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1
+        }
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m12544-n2048-k512-467a1974475c-current_k64_s5-fa9c0ea086ea",
@@ -8697,16 +9212,20 @@
       "configuration": {
         "cta_group": 2,
         "operand_k_tile": 128,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -8719,15 +9238,17 @@
       "configuration": {
         "output_n_tile": 192,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
         "allow_partial_tiles": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "output_store_pending_groups": 1
+        "output_store_pending_groups": 1,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8740,10 +9261,7 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "tmem_writeback_register_budget": 128,
@@ -8758,8 +9276,15 @@
           }
         },
         "compact_mma_batch": true,
-        "rolled_k_unroll": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -8772,10 +9297,7 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "tmem_writeback_register_budget": 128,
@@ -8790,8 +9312,15 @@
           }
         },
         "compact_mma_batch": true,
-        "rolled_k_unroll": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -8802,15 +9331,12 @@
       "n": 3072,
       "k": 768,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_k_tile": 128,
         "output_grid_size": 148,
         "operand_move_attrs": {
@@ -8822,7 +9348,14 @@
           }
         },
         "transpose_output": true,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -8834,14 +9367,16 @@
       "k": 192,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 128,
         "output_m_tile": 64,
         "output_n_tile": 192,
-        "output_layout": "tcgen05_16x256b"
+        "output_layout": "tcgen05_16x256b",
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8854,7 +9389,6 @@
       "configuration": {
         "output_n_tile": 192,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -8865,7 +9399,10 @@
           }
         },
         "tmem_writeback_register_budget": 128,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8878,12 +9415,14 @@
       "configuration": {
         "output_n_tile": 192,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "output_slices": 2,
-        "output_store_buffers": 2
+        "output_store_buffers": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8895,12 +9434,14 @@
       "k": 192,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
-        "output_n_tile": 192
+        "output_n_tile": 192,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8913,16 +9454,20 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -8934,7 +9479,6 @@
       "k": 128,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -8943,7 +9487,10 @@
         "output_n_tile": 176,
         "operand_stages": 2,
         "output_layout": "tcgen05_16x256b",
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8955,7 +9502,6 @@
       "k": 256,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -8964,7 +9510,10 @@
         "output_n_tile": 176,
         "operand_stages": 4,
         "output_layout": "tcgen05_16x256b",
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -8977,7 +9526,6 @@
       "configuration": {
         "output_n_tile": 176,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": 1,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 128,
@@ -8985,7 +9533,10 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "interleave_mma_descriptors": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9018,18 +9569,22 @@
         "cta_group": 2,
         "output_n_tile": 192,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "rolled_k_unroll": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9041,14 +9596,16 @@
       "k": 128,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 160,
         "operand_stages": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9061,17 +9618,21 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 4,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
         "output_store_pending_groups": 1,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9082,9 +9643,6 @@
       "n": 1536,
       "k": 384,
       "configuration": {
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -9092,10 +9650,17 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 6,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9108,17 +9673,19 @@
       "configuration": {
         "output_n_tile": 160,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 128,
         "allow_partial_tiles": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "mma_pending": 1
         }
       }
     },
@@ -9132,7 +9699,6 @@
       "configuration": {
         "output_n_tile": 160,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": true,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -9151,11 +9717,14 @@
             "l2_cache_hint": "evict_last"
           }
         },
-        "persistent_output_pipeline": true,
-        "output_writeback_window": [
-          11,
-          15
-        ]
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "mma_pending": 1,
+          "writeback_window": [
+            11,
+            15
+          ]
+        }
       }
     },
     {
@@ -9168,14 +9737,12 @@
       "configuration": {
         "output_n_tile": 160,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 2,
         "output_grid_fast_axis": "n",
         "output_store": "stmatrix",
         "output_slices": 4,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_warps": 8,
         "operand_move_attrs": {
@@ -9190,6 +9757,10 @@
           "dst": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "mma_pending": 2
         }
       }
     },
@@ -9201,9 +9772,6 @@
       "n": 1280,
       "k": 320,
       "configuration": {
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 3,
@@ -9211,11 +9779,18 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 192,
         "operand_stages": 6,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9228,10 +9803,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 4,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9242,6 +9814,13 @@
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -9257,18 +9836,22 @@
         "cta_group": 2,
         "output_n_tile": 192,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "rolled_k_unroll": 2,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9281,16 +9864,20 @@
       "configuration": {
         "cta_group": 2,
         "operand_k_tile": 128,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9301,8 +9888,6 @@
       "n": 128,
       "k": 256,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9313,7 +9898,13 @@
         "output_n_tile": 128,
         "operand_stages": 4,
         "output_grid_size": 128,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9327,8 +9918,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9340,6 +9929,12 @@
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -9354,16 +9949,20 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 128,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "interleave_mma_descriptors": true
+        "interleave_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9375,10 +9974,6 @@
       "k": 256,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 3,
@@ -9387,7 +9982,15 @@
         "hoist_mma_descriptors": true,
         "operand_stages": 5,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9399,7 +10002,6 @@
       "k": 192,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
@@ -9411,6 +10013,9 @@
           "lhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "mma_pending": 1
         }
       }
     },
@@ -9425,15 +10030,19 @@
         "cta_group": 2,
         "output_n_tile": 192,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9446,11 +10055,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9463,6 +10068,14 @@
           "lhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1
         }
       }
     },
@@ -9476,10 +10089,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -9493,6 +10103,13 @@
           },
           "rhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -9507,10 +10124,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9525,6 +10139,13 @@
           "rhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
         }
       }
     },
@@ -9538,10 +10159,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -9552,6 +10170,13 @@
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_first"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -9566,15 +10191,19 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 4,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9585,8 +10214,6 @@
       "n": 576,
       "k": 192,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9595,10 +10222,16 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 192,
         "operand_stages": 5,
-        "output_grid_size": 148
+        "output_grid_size": 148,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9609,8 +10242,6 @@
       "n": 768,
       "k": 256,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9618,11 +10249,17 @@
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 5,
         "output_grid_size": 148,
         "transpose_output": true,
-        "rolled_k_unroll": 2
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -9636,8 +10273,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9646,7 +10281,13 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 2
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -9660,8 +10301,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9673,6 +10312,12 @@
         "operand_move_attrs": {
           "rhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -9687,10 +10332,7 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -9703,6 +10345,13 @@
           },
           "rhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -9717,15 +10366,19 @@
       "configuration": {
         "cta_group": 2,
         "operand_stages": 6,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 128,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9739,8 +10392,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9749,7 +10400,13 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "rolled_k_unroll": 4
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 4
+          }
+        }
       }
     },
     {
@@ -9761,12 +10418,14 @@
       "k": 144,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
-        "output_n_tile": 144
+        "output_n_tile": 144,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9780,17 +10439,21 @@
         "cta_group": 2,
         "output_n_tile": 160,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 1,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 3,
         "output_store_pending_groups": 2,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          },
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -9802,9 +10465,6 @@
       "k": 432,
       "configuration": {
         "cta_group": 2,
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9814,7 +10474,14 @@
         "hoist_mma_descriptors": true,
         "output_n_tile": 144,
         "operand_stages": 7,
-        "output_grid_size": 128
+        "output_grid_size": 128,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9825,8 +10492,6 @@
       "n": 288,
       "k": 144,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9835,10 +10500,16 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 144,
         "operand_stages": 5,
-        "output_grid_size": 148
+        "output_grid_size": 148,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9869,14 +10540,18 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 5,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9890,10 +10565,7 @@
         "cta_group": 2,
         "output_n_tile": 128,
         "operand_stages": 4,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 296,
-        "persistent_output_pipeline": true,
-        "persistent_output_overlap": false,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9908,7 +10580,14 @@
             "l2_cache_hint": "evict_last"
           }
         },
-        "persistent_output_frames": 1
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "accumulator_slots": 1,
+          "output_overlap": false,
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9922,8 +10601,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9931,7 +10608,13 @@
         "tmem_writeback_warps": 8,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9945,8 +10628,6 @@
         "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -9955,7 +10636,13 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "transpose_output": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9966,18 +10653,22 @@
       "n": 128,
       "k": 128,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 128,
         "operand_stages": 5,
-        "output_grid_size": 148
+        "output_grid_size": 148,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -9988,15 +10679,12 @@
       "n": 128,
       "k": 384,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 128,
         "output_grid_size": 296,
         "operand_move_attrs": {
@@ -10007,8 +10695,17 @@
             "l2_cache_hint": "evict_last"
           }
         },
-        "rolled_job_unroll": 2,
-        "rolled_k_unroll": 8
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 8
+          },
+          "output_jobs": {
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -10022,15 +10719,19 @@
         "cta_group": 2,
         "output_n_tile": 128,
         "operand_stages": 8,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -10041,8 +10742,6 @@
       "n": 1024,
       "k": 128,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -10051,10 +10750,16 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 4,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -10066,15 +10771,15 @@
       "k": 48,
       "configuration": {
         "output_n_tile": 32,
-        "output_m_tiles_per_cta": 4,
-        "batch_output_m_operands": true,
         "operand_k_tile": 16,
         "operand_stages": 1,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "transpose_output": false
+        "transpose_output": false,
+        "mma_m_tile": 128,
+        "output_m_tile": 512
       }
     },
     {
@@ -10086,14 +10791,16 @@
       "k": 96,
       "configuration": {
         "cta_group": 2,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "tmem_writeback_register_budget": 64,
         "output_n_tile": 32,
         "operand_stages": 2,
-        "output_m_tiles_per_cta": 2
+        "output_m_tiles_per_cta": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {
@@ -10107,8 +10814,6 @@
         "output_n_tile": 128,
         "operand_stages": 5,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "rolled_operand_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -10121,6 +10826,12 @@
           "lhs": {
             "l2_cache_hint": "evict_last"
           }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "reduction": {
+            "form": "rolled"
+          }
         }
       }
     },
@@ -10132,8 +10843,6 @@
       "n": 128,
       "k": 384,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -10142,7 +10851,6 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "output_n_tile": 128,
         "operand_stages": 6,
         "output_grid_size": 144,
@@ -10154,9 +10862,18 @@
             "l2_cache_hint": "evict_last"
           }
         },
-        "rolled_k_unroll": 4,
-        "rolled_job_unroll": 2,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 4
+          },
+          "output_jobs": {
+            "unroll": 2
+          }
+        }
       }
     },
     {
@@ -10170,10 +10887,7 @@
         "cta_group": 2,
         "output_n_tile": 128,
         "operand_stages": 7,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 144,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "tmem_writeback_register_budget": 64,
@@ -10182,6 +10896,13 @@
         "operand_move_attrs": {
           "lhs": {
             "l2_cache_hint": "evict_last"
+          }
+        },
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
           }
         }
       }
@@ -10194,8 +10915,6 @@
       "n": 384,
       "k": 128,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -10206,11 +10925,19 @@
         "output_n_tile": 192,
         "operand_stages": 4,
         "output_grid_size": 148,
-        "persistent_output_job_regions": true,
         "transpose_output": true,
-        "rolled_k_unroll": 2,
-        "rolled_job_unroll": 2,
-        "peel_first_output_pair": true
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled",
+            "unroll": 2
+          },
+          "output_jobs": {
+            "unroll": 2,
+            "peel_front": 2
+          }
+        }
       }
     },
     {
@@ -10221,8 +10948,6 @@
       "n": 512,
       "k": 128,
       "configuration": {
-        "rolled_operand_pipeline": true,
-        "persistent_output_pipeline": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -10231,10 +10956,16 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "persistent_output_job_regions": true,
         "operand_stages": 5,
         "output_grid_size": 148,
-        "transpose_output": true
+        "transpose_output": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -10266,7 +10997,6 @@
         "output_n_tile": 64,
         "operand_k_tile": 192,
         "operand_stages": 1,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
         "operand_move_attrs": {
@@ -10289,14 +11019,18 @@
         "cta_group": 2,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "rolled_operand_pipeline": true,
         "output_grid_size": 148,
-        "persistent_output_pipeline": true,
-        "persistent_output_job_regions": true,
         "output_store": "stmatrix",
         "output_slices": 2,
         "allow_partial_tiles": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "pipeline": {
+          "operand_scope": "output_jobs",
+          "participants": "round_robin",
+          "reduction": {
+            "form": "rolled"
+          }
+        }
       }
     },
     {
@@ -10332,14 +11066,14 @@
       "k": 16,
       "configuration": {
         "output_n_tile": 16,
-        "output_m_tiles_per_cta": 8,
         "operand_k_tile": 16,
         "operand_stages": 1,
         "allow_partial_tiles": true,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
-        "batch_output_m_operands": true,
-        "hoist_mma_descriptors": true
+        "hoist_mma_descriptors": true,
+        "mma_m_tile": 128,
+        "output_m_tile": 1024
       }
     },
     {
@@ -10357,9 +11091,11 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 4,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n512-k4096-98a4ad1a8088-workspace-b6cb0121654e",
@@ -10422,9 +11158,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k8192-2eb75eca4a88-workspace-43af7419a29b",
@@ -10489,9 +11225,11 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n128-k4096-31aaad550532-workspace-7b31d45dfa4d",
@@ -10556,12 +11294,14 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n128-k2048-098fc81c754e-cluster-91d05928abc2",
@@ -10627,12 +11367,14 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n128-k4096-1a9c370c7e4c-cluster-415f063722fa",
@@ -10697,9 +11439,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n2048-k8192-4dbd5c607c5f-workspace-43af7419a29b",
@@ -10761,9 +11503,9 @@
       "configuration": {
         "split_k": 32,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n256-k32768-65c9dbef5768-workspace-f4ee73d5c153",
@@ -10826,9 +11568,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k12544-3193b19d1c1b-workspace-43af7419a29b",
@@ -10891,13 +11633,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m320-n320-k6272-f04d43031b3e-cluster-6b8effd82969",
@@ -10962,9 +11704,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k7936-734bae34b701-workspace-43af7419a29b",
@@ -11027,9 +11769,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k8448-f5b538ed2d70-workspace-43af7419a29b",
@@ -11091,9 +11833,11 @@
       "configuration": {
         "split_k": 6,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1536-n256-k12544-d31029b6ec3f-workspace-60f0bc1eb888",
@@ -11158,9 +11902,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m196-n192-k24576-c5350283d8da-workspace-9093e6fcbea1",
@@ -11225,10 +11969,12 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m24-n24-k200704-4809dfde04c7-workspace-8c1409e9d7d8",
@@ -11293,9 +12039,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n256-k8192-530cfc64d90f-workspace-b390e5542042",
@@ -11357,9 +12103,9 @@
       "configuration": {
         "split_k": 32,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m196-n196-k49152-cd4f2694fc17-workspace-998839db5649",
@@ -11421,9 +12167,11 @@
       "configuration": {
         "split_k": 16,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m196-n384-k49152-32a47e9cc714-workspace-72ce1d5acf46",
@@ -11488,10 +12236,12 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m24-n96-k200704-d349d9838e61-workspace-7cb0aa766a3f",
@@ -11556,10 +12306,12 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m48-n24-k200704-2f7819b0facf-workspace-8c1409e9d7d8",
@@ -11624,10 +12376,12 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m96-n24-k200704-e4a91b6555fa-workspace-8c1409e9d7d8",
@@ -11691,13 +12445,13 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 5,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n256-k6272-d1eb42ca5b78-cluster-61e3a500bd8c",
@@ -11762,13 +12516,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n512-k6272-ba478b9d0b0f-cluster-6b8effd82969",
@@ -11833,9 +12587,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k16448-a8f55e121cb3-workspace-43af7419a29b",
@@ -11898,9 +12652,9 @@
         "split_k": 16,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n1024-k25088-7c962e157ac7-workspace-4e2f992a8ae8",
@@ -11965,9 +12719,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m192-n384-k16384-b2aaced63fe2-workspace-9d4c7f15fa4e",
@@ -12029,9 +12783,11 @@
       "configuration": {
         "split_k": 12,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m192-n576-k50176-b564a044abf5-workspace-33a4f3df47a4",
@@ -12094,13 +12850,15 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 3,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n768-k768-34efed4e8529-cluster-a1e1e111e5de",
@@ -12167,10 +12925,12 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m23-n16-k65536-cf70ab2901f6-workspace-8370e9f5f595",
@@ -12235,10 +12995,10 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m31-n16-k131072-d78df4201318-workspace-2ee96698b341",
@@ -12303,9 +13063,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m384-n192-k16384-2b9b9a7cac26-workspace-9d4c7f15fa4e",
@@ -12370,9 +13130,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m486-n192-k12544-915ec8325dd0-workspace-7fdc9c7d4015",
@@ -12435,9 +13195,9 @@
         "split_k": 12,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m576-n192-k16384-8caccbd40c7e-workspace-d6e574b414b9",
@@ -12499,9 +13259,11 @@
       "configuration": {
         "split_k": 12,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m768-n256-k50176-2a17e8fafc9a-workspace-33a4f3df47a4",
@@ -12564,9 +13326,9 @@
         "split_k": 8,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1024-n256-k25088-472a2b2b1e2d-workspace-43af7419a29b",
@@ -12630,9 +13392,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n384-k25664-d5243e790e20-workspace-56806a686794",
@@ -12696,9 +13458,11 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 8,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m240-n240-k4096-6760f04479fd-workspace-cdf76516609d",
@@ -12761,13 +13525,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m240-n480-k4096-96142c61b7f8-cluster-8dda0aef6516",
@@ -12832,9 +13596,9 @@
         "split_k": 32,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n256-k61568-13c3c82e3b21-workspace-20a0287eb368",
@@ -12897,13 +13661,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m480-n240-k4096-8a001c0283b7-cluster-8dda0aef6516",
@@ -12969,10 +13733,10 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "split_k": 3
+        "split_k": 3,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m720-n240-k4096-8e6bd65f4b18-workspace-a26c6736c14c",
@@ -13035,13 +13799,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1024-n128-k4096-fb8894904b76-cluster-8dda0aef6516",
@@ -13105,9 +13869,11 @@
       "configuration": {
         "split_k": 32,
         "operand_stages": 9,
-        "cyclic_operand_pipeline": 2,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {
+          "mma_pending": 2
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m144-n144-k65536-60639ff9c30a-workspace-5ef426710890",
@@ -13171,12 +13937,14 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 6,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n768-k3072-c645e53451f9-cluster-85fbcece7741",
@@ -13242,12 +14010,14 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
-        "prefetch_tma_descriptors": true
+        "prefetch_tma_descriptors": true,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n768-k4096-d615ae3ffbf8-cluster-cb034fa092f0",
@@ -13314,10 +14084,10 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m23-n16-k262144-0b9e68744529-workspace-5c9b0bbb710d",
@@ -13382,10 +14152,10 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m31-n128-k131072-4eeb36c44405-workspace-dd4efbb0305a",
@@ -13450,10 +14220,10 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m31-n128-k65536-21121a44bddc-workspace-ad6a020938e9",
@@ -13516,9 +14286,9 @@
         "split_k": 16,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m320-n320-k25216-d4f8d354e7a9-workspace-4e2f992a8ae8",
@@ -13583,9 +14353,9 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k6400-93899f0a7e02-workspace-6c241baf4d10",
@@ -13648,9 +14418,9 @@
         "split_k": 32,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n64-k401536-836483a7acce-workspace-20a0287eb368",
@@ -13715,10 +14485,10 @@
         "output_m_tile": 64,
         "output_n_tile": 32,
         "operand_k_tile": 128,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m63-n32-k262144-8f55761f0c14-workspace-5c9b0bbb710d",
@@ -13781,9 +14551,9 @@
         "split_k": 6,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1000-n384-k12544-90eb9140715c-workspace-34dcd52e2e22",
@@ -13849,11 +14619,13 @@
         "output_n_tile": 32,
         "operand_k_tile": 128,
         "operand_stages": 1,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "reduction_threads": 32,
-        "reduction_elements_per_thread": 2
+        "reduction_elements_per_thread": 2,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n2-k2048-6c96d630458a-workspace-7c6dd878a08a",
@@ -13916,13 +14688,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n768-k4096-1e563bde10e3-cluster-8dda0aef6516",
@@ -13987,9 +14759,9 @@
         "split_k": 6,
         "cta_group": 1,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
-        "tmem_writeback_register_budget": 32
+        "tmem_writeback_register_budget": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1280-n256-k6272-fe83e56f7cb2-workspace-34dcd52e2e22",
@@ -14051,13 +14823,15 @@
       "configuration": {
         "output_m_tile": 64,
         "output_n_tile": 64,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n1024-k1024-8ae507b3cebb-cluster-23ee739f9649",
@@ -14124,10 +14898,10 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n256-k32768-d07a258e2637-workspace-8b98b249fefd",
@@ -14193,10 +14967,12 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "reduction_threads": 32
+        "reduction_threads": 32,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n512-k4096-8108a6d36134-workspace-bae796ad9540",
@@ -14260,13 +15036,15 @@
         "output_n_tile": 64,
         "operand_k_tile": 128,
         "operand_stages": 2,
-        "cyclic_operand_pipeline": 0,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {
+          "mma_pending": 0
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n768-k1000-c5c75e4dbbb8-cluster-a009718518dd",
@@ -14329,13 +15107,13 @@
       "frequency": 1,
       "configuration": {
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m4096-n128-k30000-ed15b6a90bbd-cluster-6f9e2b37001d",
@@ -14400,13 +15178,13 @@
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 7,
-        "cyclic_operand_pipeline": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k_backend": "cluster",
         "allow_partial_m": true,
         "prefetch_tma_descriptors": true,
-        "split_k": 4
+        "split_k": 4,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m768-n128-k4096-095ed66bf0a1-cluster-8dda0aef6516",
@@ -14489,12 +15267,14 @@
         "output_m_tile": 192,
         "output_n_tile": 64,
         "operand_k_tile": 32,
-        "cyclic_operand_pipeline": true,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
         "hoist_mma_descriptors": true,
         "allow_partial_tiles": true,
-        "cta_group": 2
+        "cta_group": 2,
+        "pipeline": {
+          "mma_pending": 1
+        }
       }
     },
     {

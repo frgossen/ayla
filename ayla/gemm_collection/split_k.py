@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import json
 from pathlib import Path
+from ..pipelines.ring_schedule import PipelineSchedule
 
 from ..base.ir import find_ops_of_type
 
@@ -226,6 +227,7 @@ def blackwell_split_k_gemm_module(
     operand_k_tile: int = 64,
     operand_stages: int = 4,
     cyclic_operand_pipeline: bool | int = True,
+    pipeline: PipelineSchedule | dict | None = None,
     hoist_mma_descriptors: bool = True,
     reuse_operand_storage: bool = True,
     tmem_writeback_warps: int = 4,
@@ -252,6 +254,11 @@ def blackwell_split_k_gemm_module(
     cluster_bank_pipeline releases each operand bank to its own pair; the
     final FP32 reduction still rendezvouses across all K partitions.
     """
+    if pipeline is not None:
+        plan = PipelineSchedule.parse(pipeline, default_pending=1)
+        if plan.cross_jobs or plan.reduction.peel_front or plan.reduction.peel_back or plan.reduction.unroll != 1:
+            raise ValueError("split-K requires a per-reduction operand pipeline without loop specialization")
+        cyclic_operand_pipeline, rolled_operand_pipeline = plan.mma_pending, plan.rolled
     if any(
         type(flag) is not bool
         for flag in (
@@ -589,6 +596,7 @@ def blackwell_split_k_workspace_modules(
     operand_k_tile: int = 64,
     operand_stages: int = 5,
     cyclic_operand_pipeline: bool | int = True,
+    pipeline: PipelineSchedule | dict | None = None,
     cta_group: int = 2,
     hoist_mma_descriptors: bool = True,
     paired_phase_relay: bool = True,
@@ -611,6 +619,11 @@ def blackwell_split_k_workspace_modules(
     and capture both launches. This permits non-power-of-two K partitions
     and paired MMA geometries independently of the reduction topology.
     """
+    if pipeline is not None:
+        plan = PipelineSchedule.parse(pipeline, default_pending=1)
+        if plan.cross_jobs or plan.reduction.peel_front or plan.reduction.peel_back or plan.reduction.unroll != 1:
+            raise ValueError("split-K requires a per-reduction operand pipeline without loop specialization")
+        cyclic_operand_pipeline, rolled_operand_pipeline = plan.mma_pending, plan.rolled
     if type(split_k) is not int or not 2 <= split_k <= 256:
         raise ValueError("split_k must be an integer between two and 256")
     original_m, original_n = m, n

@@ -51,7 +51,7 @@ from ..gpu_dialect import (
     root_buffers,
 )
 from ..pipelines.async_resources import allocate_event, SplitBarrier, tma_writeback_fragments
-from ..pipelines.ring_schedule import RingSchedule, reject_unaccepted_effects
+from ..pipelines.ring_schedule import LoopSchedule, RingSchedule, reject_unaccepted_effects
 from .pipeline_rolled_k import _parts
 
 
@@ -160,8 +160,10 @@ def prepare_rolled_ring(module, context, *, operand_stages, overlap, job_regions
                             {"label": "k"})
         position = body.ops.index(waits[1]) + 1
         body.ops.insert(position, dummy)
-        from .pipeline_rolled_k import PipelineRolledK
-        [compact], _ = PipelineRolledK(operand_stages).lower_for(dummy)
+        from .pipeline_loop import PipelineLoop
+        from ..pipelines.ring_schedule import PipelineSchedule
+        [compact], _ = PipelineLoop("k", operand_stages=operand_stages,
+            plan=PipelineSchedule(reduction=LoopSchedule("rolled"))).prepare_operands(dummy)
         compact.attrs["ub"] = 1
         body.ops[position:position + 1] = [compact]
         # This region is not attached to the kernel until preparation ends;
@@ -609,9 +611,9 @@ class LowerRolledSharedRing(LoweringPass):
         ops.append(BarrierOp.build("cluster" if group == 2 else "block",
             attrs={"publishes": False} if group == 2 else None))
         if job_regions:
-            from .pipeline_job_participants import schedule_job_participants
+            from .pipeline_loop import PipelineLoop
 
-            return schedule_job_participants((ops, []), op)
+            return PipelineLoop.assign_participants((ops, []), op)
         return ops, []
 
 
@@ -624,40 +626,15 @@ class PrepareRolledSharedRing(Pass):
         from .cse import _cse_block
         from .dce import DCE
         from .licm import LICM
-        from .peel_loop import PeelLoop
         from ..pipelines.canonicalize import Canonicalize
 
         module = LowerRolledSharedRing().run(module)
-        unroll = module.body.ops[0].attrs.get("rolled_k_unroll", 1)
-        if unroll > 1:
-            from .unroll_loop import UnrollLoop
-
-            module = UnrollLoop(unroll, "shared_ring_rolled_k").run(module)
-            # Fully unrolling leaves a one-trip loop. Fold it before peeling,
-            # which otherwise requires at least two remaining iterations.
-            module = Canonicalize().run(module)
-        # A one-batch reduction has the same first/last iteration.
-        # Fold its bounded loop once before the two-edge peeling pass.
-        if any(loop.trip_count == 1 and
-               loop.attrs.get("label") == "shared_ring_rolled_k"
-               for loop in find_ops_of_type(module, ForOp)):
-            module = Canonicalize().run(module)
-        module = PeelLoop(
-            "shared_ring_rolled_k", front_iterations=1, back_iterations=1
-        ).run(module)
-        # Clone only the existing bounded output-pair loop. The induction
-        # variable retains its absolute job ordinal; bank phases, output
-        # ownership, event waits and issue order remain in the cloned body.
         kernel = module.body.ops[0]
-        if kernel.attrs.get("peel_first_output_pair"):
-            module = PeelLoop(
-                "shared_operand_output_ring", front_iterations=1
-            ).run(module)
-        job_unroll = kernel.attrs.get("rolled_job_unroll", 1)
-        if job_unroll > 1:
-            from .unroll_loop import UnrollLoop
-
-            module = UnrollLoop(job_unroll, "shared_operand_output_ring").run(module)
+        shapes = kernel.attrs.get("loop_schedule", {})
+        reduction = LoopSchedule(**shapes.get("reduction", {}))
+        jobs = LoopSchedule(**{"form": "rolled", **shapes.get("output_jobs", {})})
+        module = reduction.apply(module, "shared_ring_rolled_k", boundary=(1, 1))
+        module = jobs.apply(module, "shared_operand_output_ring", width=2)
         # Edge predicates become constant after peeling. Simplify before
         # descriptor hoisting, while memory effects are still visible.
         module = Canonicalize().run(module)

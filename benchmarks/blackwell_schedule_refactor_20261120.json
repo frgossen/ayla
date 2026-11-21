@@ -1,0 +1,29 @@
+{
+  "library_lines_before": 6357,
+  "library_lines_after": 6346,
+  "library_line_delta": -11,
+  "production_routes": 379,
+  "split_k_table_routes": 56,
+  "verification": {
+    "routes": 435,
+    "identical": 435,
+    "differences": []
+  },
+  "cpu_tests": {
+    "passed": 891,
+    "skipped": 199
+  },
+  "gpu_checks": 96,
+  "memcheck_errors": 0,
+  "artifact_directory": ".benchmarks/blackwell_schedule_refactor_20261120",
+  "scope": "Refactor over the frozen pre-task compiler. Concurrent descriptor changes and the later 1152x768x3072 queue-depth update remain in the workspace and are excluded from binary identity comparison.",
+  "snapshot_cpu_tests": {
+    "passed": 947,
+    "skipped": 199
+  },
+  "commit_verification": {
+    "routes": 435,
+    "identical": 435,
+    "differences": []
+  }
+}

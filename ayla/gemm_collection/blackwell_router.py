@@ -2,8 +2,61 @@
 
 import json
 from pathlib import Path
+from ..pipelines.ring_schedule import LoopSchedule, PipelineSchedule
 from .common_warp_schedule import validate_common_warp_schedule
 
+
+
+LEGACY_PIPELINE_FIELDS = {
+    "persistent_output_pipeline", "persistent_output_overlap",
+    "persistent_output_frames", "persistent_output_job_regions",
+    "rolled_operand_pipeline", "rolled_k_unroll", "rolled_job_unroll",
+    "peel_first_output_pair", "cyclic_operand_pipeline", "output_writeback_window",
+    "batch_output_m_operands",
+}
+
+
+def normalize_blackwell_configuration(configuration, *, default_pending=0):
+    """Adapt old library callers to the normalized public schedule contract."""
+    config = dict(configuration)
+    if "native_schedule" in config:
+        config["native_schedule"] = normalize_blackwell_configuration(config["native_schedule"])
+    old = {name: config.pop(name) for name in LEGACY_PIPELINE_FIELDS if name in config}
+    if old:
+        if "pipeline" in config:
+            raise ValueError("select pipeline or legacy schedule fields, not both")
+        for name, value in old.items():
+            kind = int if name in ("rolled_k_unroll", "rolled_job_unroll", "persistent_output_frames") else bool
+            if name in ("output_writeback_window", "cyclic_operand_pipeline"):
+                continue
+            if type(value) is not kind:
+                raise ValueError(f"{name} must be a positive integer" if "unroll" in name else f"{name} must be {kind.__name__}")
+        cross = old.get("persistent_output_pipeline", False)
+        pending = old.get("cyclic_operand_pipeline", default_pending)
+        if type(pending) not in (bool, int):
+            raise ValueError("cyclic_operand_pipeline must be an integer or boolean")
+        plan = PipelineSchedule(
+            operand_scope="output_jobs" if cross else "reduction",
+            accumulator_slots=old.get("persistent_output_frames", 2) if cross else 1,
+            output_overlap=old.get("persistent_output_overlap", True) if cross else False,
+            participants="round_robin" if old.get("persistent_output_job_regions", False) else "shared",
+            reduction=LoopSchedule("rolled" if old.get("rolled_operand_pipeline", False) else "fixed",
+                                   old.get("rolled_k_unroll", 1)),
+            output_jobs=LoopSchedule("rolled", old.get("rolled_job_unroll", 1),
+                                     2 if old.get("peel_first_output_pair", False) else 0),
+            mma_pending=int(pending), writeback_window=old.get("output_writeback_window"),
+        )
+        if old.get("batch_output_m_operands", False):
+            if config.get("mma_m_tile") is not None:
+                raise ValueError("select CTA/MMA tile geometry or legacy M batching")
+            config["mma_m_tile"] = config.get("output_m_tile", 128)
+            config["output_m_tile"] = config["mma_m_tile"] * config.pop("output_m_tiles_per_cta", 1)
+    else:
+        plan = PipelineSchedule.parse(config.pop("pipeline", None), default_pending=default_pending)
+    compact = plan.configuration(default_pending=default_pending)
+    if compact or default_pending:
+        config["pipeline"] = compact
+    return config
 
 def select_blackwell_router_schedule(m, n, k, dtype="f16"):
     """Return an independent route configuration, or None if unmeasured."""

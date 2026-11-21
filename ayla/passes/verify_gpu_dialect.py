@@ -36,7 +36,6 @@ from ..gpu_dialect import (
     IfOp,
     IndexAddOp,
     IndexConstantOp,
-    IndexType,
     IndexDivOp,
     IndexLtOp,
     IndexModOp,
@@ -579,11 +578,12 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_operand_pipeline(self, op):
         from .pipeline_rolled_k import _parts
 
-        _, mma = _parts(op)
+        _parts(op)
         depth = op.attrs.get("depth")
         queue = op.attrs.get("mma_queue_depth", 1)
         lb, ub = op.attrs.get("lb"), op.attrs.get("ub")
-        carried = op.attrs.get("carried_events", False)
+        if op.attrs.get("carried_events"):
+            raise ValueError("per-job carried events require the cross-job resource pipeline")
         if (
             type(depth) is not int
             or depth < 2
@@ -592,24 +592,13 @@ class VerifyGpuDialect(VerificationPass):
             or type(lb) is not int
             or type(ub) is not int
             # A persistent ring carries banks across output jobs.
-            or (ub - lb < (1 if carried else depth - 1)
+            or (ub - lb < depth - 1
                 and find_ancestor_of_type(op, PersistentPipelineOp) is None)
             or op.attrs.get("step") != 1
             or len(op.body.arguments) != 1
         ):
             raise ValueError("invalid rolled operand pipeline bounds or depth")
-        banks = op.operands[:-3] if carried else op.operands
-        if carried:
-            if len(op.operands) != 5:
-                raise ValueError("carried operand pipeline requires job and bank events")
-            job, ready, free = op.operands[-3:]
-            if (not isinstance(job.type, IndexType)
-                    or any(not isinstance(value.type, LockType)
-                           or value.type.kind != kind
-                           or value.type.attrs.get("count") != depth
-                           or value.type.attrs.get("cta_group", 1) != mma.lock.type.attrs.get("cta_group", 1)
-                           for value, kind in ((ready, "mbar"), (free, "tcgen05")))):
-                raise ValueError("invalid carried operand event storage")
+        banks = op.operands
         if len(banks) != 2 or any(
             not isinstance(v.type, SmemTensorType) for v in banks
         ):
