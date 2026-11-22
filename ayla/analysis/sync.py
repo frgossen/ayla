@@ -407,6 +407,8 @@ def _async_completion_scope(op: AsyncOp) -> CollectiveScope:
             else CollectiveScope.BLOCK_LEADER
         )
     if kind == "bulk":
+        if op.lock.type.attrs.get("scope") == "warp":
+            return CollectiveScope.WARP
         # Bulk async-groups are per issuing thread, not warp-group-wide. TMA
         # stores are issued and committed by t0, so t0's wait completes the
         # leader-owned read of shared memory. This is the completed memory
@@ -432,6 +434,23 @@ def _transfer_memory_effects(
         effects = [dataclasses.replace(effect, scope=CollectiveScope.BLOCK)
                    if effect.scope == CollectiveScope.GRID else effect
                    for effect in effects]
+    # A single-warpgroup CTA has no sibling WGMMA reader to rendezvous with.
+    # Its WGMMA await completes the entire CTA's shared-memory reads, so
+    # keeping those reads BLOCK-scoped would add a redundant leader gather
+    # before every TMA refill. Cluster-scoped reads retain their wider scope.
+    if (
+        kernel is not None
+        and kernel.num_threads == 128
+        and isinstance(op, AsyncOp)
+        and isinstance(op.lock.type, LockType)
+        and op.lock.type.kind == "wgmma"
+    ):
+        effects = [
+            dataclasses.replace(effect, scope=CollectiveScope.WARPGROUP)
+            if effect.scope == CollectiveScope.BLOCK
+            else effect
+            for effect in effects
+        ]
     # The barrier this op needs, as the join over its hazards. Each hazard
     # resolves per-pair (:func:`_barrier_scope`).
     barrier_scope: BarrierScope = BarrierScope.THREAD
@@ -451,6 +470,20 @@ def _transfer_memory_effects(
                     continue
                 # A hazard needs a write (RAR is safe).
                 if prior.kind == "W" or current.kind == "W":
+                    # A warp-private TMA store fences every lane's shared
+                    # writes, then elect.sync converges the full warp before
+                    # issue. This provides its local publication; adding a
+                    # memory-ordering warp barrier would duplicate the fence.
+                    warp_publication = (
+                        isinstance(op, AsyncOp)
+                        and cast(LockType, op.lock.type).kind == "bulk"
+                        and op.lock.type.attrs.get("scope") == "warp"
+                        and prior.scope == current.scope == CollectiveScope.WARP
+                        and prior.kind == "W" and current.kind == "R"
+                        and prior.pending_await is None
+                    )
+                    if warp_publication:
+                        continue
                     scope = _barrier_scope(prior.scope, current.scope)
                     barrier_scope = barrier_scope.join(scope)
                     if scope == BarrierScope.CLUSTER_TO_LEADER:
@@ -665,6 +698,10 @@ class SyncAnalysis(DataflowAnalysis[SyncState]):
         # for the leaders' async work, so no arriving warp can lap the barrier.
         for key in state.named_barrier_ids_pending_await.pop(op.lock, set()):
             state.named_barrier_ids_released_after[key] = {op}
+        if settle and op.lock.type.attrs.get("scope") == "warp":
+            # Lowering converges the warp after all lane-local read waits.
+            # Readers on newer locks remain pending and cannot be reused.
+            state = _after_barrier(state, BarrierScope.WARP, op)
         return state
 
     @transfers(AsyncOp)

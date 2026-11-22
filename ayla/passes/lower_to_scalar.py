@@ -115,7 +115,7 @@ class _ScalarBuilder:
             parent = cast(AddrMemTensorType, op.arg.type)
             if isinstance(op, TileOp):
                 coordinates = [self.binary(IndexAddOp, c, self.binary(IndexMulOp, i, s))
-                               for c, i, s in zip(coordinates, op.indices, shape, strict=True)]
+                               for c, i, s in zip(coordinates, op.indices, op.index_steps, strict=True)]
                 if op.maybe_partial:
                     predicates.extend(self.binary(IndexLtOp, c, s)
                                       for c, s in zip(coordinates, parent.static_shape, strict=True))

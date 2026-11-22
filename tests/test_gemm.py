@@ -91,27 +91,27 @@ def test_register_matmul_schedules_side_by_side_gemms():
           kernel @dual(%a: gmem<64x16xbf16>, %gate_w: gmem<64x16xbf16>, %up_w: gmem<64x16xbf16>) grid_dim=[1, 1, 1] block_dim=[128, 1, 1] {
             %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 100}
             %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 101}
-            %0: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0, label: "gate_lhs_smem"}
-            %1: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "gate_rhs_smem"}
+            %0: smem<64x16xbf16 swizzle="32B"> = alloc() attrs={id: 0, label: "gate_lhs_smem"}
+            %1: smem<64x16xbf16 swizzle="32B"> = alloc() attrs={id: 1, label: "gate_rhs_smem"}
             %2: lock<mbar> = alloc() attrs={id: 2}
             %3: lock<wgmma> = alloc() attrs={id: 4}
             async(%2: lock<mbar>) collective=[x.wg, yz.grid] attrs={label: "gate_lhs_smem_async"} {
-              move(%0: smem<64x16xbf16 swizzle="128B">, %a: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "gate_lhs_smem", tma: True}
-              move(%1: smem<64x16xbf16 swizzle="128B">, %gate_w: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "gate_rhs_smem", tma: True}
+              move(%0: smem<64x16xbf16 swizzle="32B">, %a: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "gate_lhs_smem", tma: True}
+              move(%1: smem<64x16xbf16 swizzle="32B">, %gate_w: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "gate_rhs_smem", tma: True}
             }
             await(%2: lock<mbar>)
-            %4: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 5, label: "up_lhs_smem"}
-            %5: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 6, label: "up_rhs_smem"}
+            %4: smem<64x16xbf16 swizzle="32B"> = alloc() attrs={id: 5, label: "up_lhs_smem"}
+            %5: smem<64x16xbf16 swizzle="32B"> = alloc() attrs={id: 6, label: "up_rhs_smem"}
             %6: lock<mbar> = alloc() attrs={id: 7}
             %7: lock<wgmma> = alloc() attrs={id: 9}
-            async(%3: lock<wgmma>) collective=[x.wg, yz.grid] attrs={label: "gate_async"} matmul(%0: smem<64x16xbf16 swizzle="128B">, %1: smem<64x16xbf16 swizzle="128B">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={accumulate: False, label: "gate"}
+            async(%3: lock<wgmma>) collective=[x.wg, yz.grid] attrs={label: "gate_async"} matmul(%0: smem<64x16xbf16 swizzle="32B">, %1: smem<64x16xbf16 swizzle="32B">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={accumulate: False, label: "gate"}
             await(%3: lock<wgmma>)
             async(%6: lock<mbar>) collective=[x.wg, yz.grid] attrs={label: "up_lhs_smem_async"} {
-              move(%4: smem<64x16xbf16 swizzle="128B">, %a: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "up_lhs_smem", tma: True}
-              move(%5: smem<64x16xbf16 swizzle="128B">, %up_w: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "up_rhs_smem", tma: True}
+              move(%4: smem<64x16xbf16 swizzle="32B">, %a: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "up_lhs_smem", tma: True}
+              move(%5: smem<64x16xbf16 swizzle="32B">, %up_w: gmem<64x16xbf16>) collective=[x.wg, yz.grid] attrs={label: "up_rhs_smem", tma: True}
             }
             await(%6: lock<mbar>)
-            async(%7: lock<wgmma>) collective=[x.wg, yz.grid] attrs={label: "up_async"} matmul(%4: smem<64x16xbf16 swizzle="128B">, %5: smem<64x16xbf16 swizzle="128B">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={accumulate: False, label: "up"}
+            async(%7: lock<wgmma>) collective=[x.wg, yz.grid] attrs={label: "up_async"} matmul(%4: smem<64x16xbf16 swizzle="32B">, %5: smem<64x16xbf16 swizzle="32B">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=[x.wg, yz.grid] attrs={accumulate: False, label: "up"}
             await(%7: lock<wgmma>)
             elementwise mul(%up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %up: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">, %gate: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) attrs={label: "product"}
           }
@@ -190,16 +190,16 @@ def test_second_hero_ignores_an_already_pipelined_singleton():
             await(%prior_lock: lock<mbar>)
             async(%prior_lock: lock<mbar>) collective=xyz.block attrs={label: "prior_async"} move(%prior_smem: smem<64x16xbf16 swizzle="128B">, %prior: gmem<64x16xbf16>) collective=xyz.block attrs={label: "prior", tma: True}
             %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0"> = alloc() attrs={id: 102, init: 0.0}
-            %0: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 0, label: "second_lhs_smem"}
-            %1: smem<64x16xbf16 swizzle="128B"> = alloc() attrs={id: 1, label: "second_rhs_smem"}
+            %0: smem<64x16xbf16 swizzle="32B"> = alloc() attrs={id: 0, label: "second_lhs_smem"}
+            %1: smem<64x16xbf16 swizzle="32B"> = alloc() attrs={id: 1, label: "second_rhs_smem"}
             %2: lock<mbar> = alloc() attrs={id: 2}
             %3: lock<wgmma> = alloc() attrs={id: 4}
             async(%2: lock<mbar>) collective=xyz.block attrs={label: "second_lhs_smem_async"} {
-              move(%0: smem<64x16xbf16 swizzle="128B">, %lhs: gmem<64x16xbf16>) collective=xyz.block attrs={label: "second_lhs_smem", tma: True}
-              move(%1: smem<64x16xbf16 swizzle="128B">, %rhs: gmem<64x16xbf16>) collective=xyz.block attrs={label: "second_rhs_smem", tma: True}
+              move(%0: smem<64x16xbf16 swizzle="32B">, %lhs: gmem<64x16xbf16>) collective=xyz.block attrs={label: "second_lhs_smem", tma: True}
+              move(%1: smem<64x16xbf16 swizzle="32B">, %rhs: gmem<64x16xbf16>) collective=xyz.block attrs={label: "second_rhs_smem", tma: True}
             }
             await(%2: lock<mbar>)
-            async(%3: lock<wgmma>) collective=xyz.block attrs={label: "second_async"} matmul(%0: smem<64x16xbf16 swizzle="128B">, %1: smem<64x16xbf16 swizzle="128B">, %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "second"}
+            async(%3: lock<wgmma>) collective=xyz.block attrs={label: "second_async"} matmul(%0: smem<64x16xbf16 swizzle="32B">, %1: smem<64x16xbf16 swizzle="32B">, %out: wgrmem<64x64xf32 warps=4 layout="wgmma_layout_0">) collective=xyz.block attrs={label: "second"}
             await(%3: lock<wgmma>)
           }
         }""")  # noqa: E501

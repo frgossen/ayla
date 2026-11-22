@@ -212,6 +212,8 @@ static const CUtensorMap* tensor_map_cached(
     else if (scalar_type == at::kHalf) dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
     else if (scalar_type == at::kBFloat16) dtype = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     else if (scalar_type == at::kDouble) dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT64;
+    else if (scalar_type == at::kFloat8_e4m3fn || scalar_type == at::kFloat8_e5m2)
+        dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     else TORCH_CHECK(false, "unsupported dtype for TMA descriptor");
 
     CUtensorMapSwizzle tensor_swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;

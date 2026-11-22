@@ -13,6 +13,8 @@ import torch
 from .gpu_dialect import (
     AddrMemTensorType,
     BF16Type,
+    E4M3Type,
+    E5M2Type,
     F16Type,
     F32Type,
     F64Type,
@@ -34,6 +36,8 @@ class _Launcher(Protocol):
 
 
 _TORCH_DTYPES = [
+    (E4M3Type(), torch.float8_e4m3fn),
+    (E5M2Type(), torch.float8_e5m2),
     (F16Type(), torch.float16),
     (BF16Type(), torch.bfloat16),
     (F32Type(), torch.float32),

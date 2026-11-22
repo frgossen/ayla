@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -47,6 +48,7 @@ from .passes.lower_to_scalar import LowerToScalar
 from .passes.lower_to_ptx_template import LowerToPtxTemplate
 from .passes.lower_to_tma_move import LowerToTmaMove
 from .passes.pack_smem_allocs import ReuseSmemAllocs
+from .passes.pair_warpgroup_ctas import PairWarpgroupCtas
 from .passes.verify_gpu_dialect import VerificationStage, VerifyGpuDialect
 
 
@@ -64,6 +66,7 @@ class PtxLoweringPipeline(Pipeline):
         self.add_pass(LowerToScalar())
         self.add_pass(Canonicalize())
         self.add_pass(InsertSyncs())
+        self.add_pass(PairWarpgroupCtas())
         self.add_pass(ReuseSmemAllocs())
         self.add_pass(LowerToPtxTemplate())
         self.add_pass(Canonicalize())
@@ -230,6 +233,18 @@ class PtxPrinter(Printer):
     def __init__(self, indent_str: str = "  ") -> None:
         super().__init__(indent_str)
         self._ptx_names_by_type: dict[PtxType, set[str]] = defaultdict(set)
+        self.warpgroup_ctas = 1
+
+    def special_register(self, name: str) -> str:
+        """Resolve a task program's IDs at emission, without rewriting PTX."""
+        if self.warpgroup_ctas == 1:
+            return name
+        return {
+            "%tid.x": "%vtid",
+            "%ctaid.x": "%vctaid",
+            "%nctaid.x": "%vnctaid",
+            "%ntid.x": "128",
+        }.get(name, name)
 
     def unique_param_names_for_value(self, value: Value):
         mapping = map_type_to_registers(value.type)
@@ -320,6 +335,11 @@ def make_ptx_kernel(module: ModuleOp, *, lowered: bool = False) -> PtxKernel:
         tuple(d if d is not None else 1 for d in kernel.grid_dim),
     )
     block_dim = _resolve_block_dim(kernel)
+    copies = int(kernel.attrs.get("warpgroup_ctas", 1))
+    if copies != 1:
+        # Each warpgroup executes one virtual 128-thread CTA.
+        block_dim = (block_dim[0] * copies, block_dim[1], block_dim[2])
+        grid_dim = (grid_dim[0] // copies, grid_dim[1], grid_dim[2])
     cluster_dim = (
         cast(
             tuple[int, int, int],
@@ -475,6 +495,20 @@ def _emit_kernel(
     p.write_line("{")
     with p.indented():
         decl_mark = p.mark()
+        p.warpgroup_ctas = int(op.attrs.get("warpgroup_ctas", 1))
+        if p.warpgroup_ctas != 1:
+            for line in textwrap.dedent(f"""\
+                .reg .b32 %vwg, %vtid, %vctaid, %vnctaid;
+                mov.u32 %vtid, %tid.x;
+                shr.u32 %vwg, %vtid, 7;
+                shfl.sync.idx.b32 %vwg, %vwg, 0, 31, 0xffffffff;
+                and.b32 %vtid, %vtid, 127;
+                mov.u32 %vctaid, %ctaid.x;
+                mad.lo.u32 %vctaid, %vctaid, {p.warpgroup_ctas}, %vwg;
+                mov.u32 %vnctaid, %nctaid.x;
+                mul.lo.u32 %vnctaid, %vnctaid, {p.warpgroup_ctas};
+                """).splitlines():
+                p.write_line(line)
         for arg in op.body.arguments:
             mapping = map_type_to_registers(arg.type)
             types = list(pytree.flatten(mapping.member_register_types))
@@ -530,6 +564,8 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
     def repl(m: re.Match) -> str:
         ty, name = m.group("ty"), m.group("name")
         if name not in placeholder_values:
+            if name.startswith(("operand.", "operand[", "result.", "result[")):
+                raise ValueError(f"unbound PTX value placeholder: {name}")
             placeholder_values[name] = cast(
                 str,
                 p.unique_ptx_names((op, name), PtxType(ty)),
@@ -541,7 +577,11 @@ def _emit_ptx_template(p: PtxPrinter, op: PTXTemplateOp) -> None:
     p.write_newline_once()
     p.write_line(f"// PTX template `{_op_description(p, op)}`")
     for line in expanded.splitlines():
-        p.write_line(line.strip())
+        p.write_line(re.sub(
+            r"%(?:tid|ctaid|nctaid|ntid)\.x\b",
+            lambda m: p.special_register(m[0]),
+            line.strip(),
+        ))
     p.write_newline_once()
 
 
@@ -549,7 +589,7 @@ def _emit_thread_id(p: PtxPrinter, op: ThreadIdOp) -> None:
     result = p.unique_ptx_names_for_value(op.value)
     axis = op.axis.name.lower()
     p.write_newline_once()
-    p.write_line(f"mov.u32 {result}, %tid.{axis};")
+    p.write_line(f"mov.u32 {result}, {p.special_register(f'%tid.{axis}')};")
     p.write_newline_once()
 
 
@@ -557,7 +597,7 @@ def _emit_block_id(p: PtxPrinter, op: BlockIdOp) -> None:
     result = p.unique_ptx_names_for_value(op.value)
     axis = op.axis.name.lower()
     p.write_newline_once()
-    p.write_line(f"mov.u32 {result}, %ctaid.{axis};")
+    p.write_line(f"mov.u32 {result}, {p.special_register(f'%ctaid.{axis}')};")
     p.write_newline_once()
 
 
@@ -584,7 +624,7 @@ def _emit_warp_ids(p: PtxPrinter, op: WarpIdsOp) -> None:
         (op.x, "%tid.x", 5), (op.y, "%tid.y", 0), (op.z, "%tid.z", 0),
     ):
         reg = p.unique_ptx_names_for_value(value)
-        p.write_line(f"mov.u32 {reg}, {sreg};")
+        p.write_line(f"mov.u32 {reg}, {p.special_register(sreg)};")
         if shift:
             p.write_line(f"shr.u32 {reg}, {reg}, {shift};")
         p.write_line(f"shfl.sync.idx.b32 {reg}, {reg}, 0, 31, 0xffffffff;")
@@ -596,7 +636,7 @@ def _emit_warp_group_id(p: PtxPrinter, op: WarpGroupIdOp) -> None:
     ry = p.unique_ptx_names_for_value(op.y)
     rz = p.unique_ptx_names_for_value(op.z)
     p.write_newline_once()
-    p.write_line(f"mov.u32 {rx}, %tid.x;")
+    p.write_line(f"mov.u32 {rx}, {p.special_register('%tid.x')};")
     p.write_line(f"shr.u32 {rx}, {rx}, 7;")
     p.write_line(f"mov.u32 {ry}, 0;")
     p.write_line(f"mov.u32 {rz}, 0;")

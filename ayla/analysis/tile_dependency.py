@@ -206,11 +206,10 @@ class TileDependencyAnalyzer:
                     base = origin(op.arg)
                     if base is None:
                         return None
-                    typ = cast(GmemTensorType, op.result().type)
                     parent = cast(GmemTensorType, op.arg.type)
                     lo, hi = base
                     for index, size, stride in zip(
-                        op.indices, typ.static_shape, parent.strides, strict=True
+                        op.indices, op.index_steps, parent.strides, strict=True
                     ):
                         at = (index, index) if isinstance(index, int) else bounds(index)
                         if at is None or stride is None or stride < 0:

@@ -17,18 +17,21 @@ the ops that define its operands.
 from __future__ import annotations
 
 import functools
+from typing import cast
 
 from ..gpu_dialect import (
     AllocOp,
     AsyncOp,
     AwaitOp,
     GmemTensorType,
+    LockType,
     RegMemTensorType,
     TmaMoveOp,
     effective_operands,
     is_side_effect_free,
     ModuleOp,
     MoveOp,
+    TileOp,
 )
 from ..base.ir import Block, Op, Value
 from ..base.pipeline import Pass
@@ -43,9 +46,7 @@ def _is_async_move(op: Op) -> bool:
     """
     if isinstance(op, TmaMoveOp):
         return True
-    return isinstance(op, AsyncOp) and all(
-        isinstance(o, MoveOp) for o in op.body.ops
-    )
+    return isinstance(op, AsyncOp) and all(isinstance(o, MoveOp) for o in op.body.ops)
 
 
 def _is_register_load(op: Op) -> bool:
@@ -129,20 +130,107 @@ def _hoist_async_moves(ops: list[Op]) -> None:
     # An allocation without an initializer has no operands, so move those back
     # to the front, in order: lock initializations then stay together, and one
     # barrier publishes them all.
-    allocations = [
-        op for op in ops if isinstance(op, AllocOp)
-    ]
+    allocations = [op for op in ops if isinstance(op, AllocOp)]
     ops[:] = allocations + [op for op in ops if op not in set(allocations)]
 
 
 def _sink_awaits(ops: list[Op]) -> None:
     # Targets: the awaits; then sink each toward its first consumer.
-    targets = [op for op in ops if _is_await(op)]
-    _bubble(ops, targets, step=+1)
+    targets = [cast(AwaitOp, op) for op in ops if _is_await(op)]
+    _bubble(ops, [op for op in targets if cast(LockType, op.lock.type).kind != "bulk"], step=+1)
+    # Bulk groups are per issuing thread. Independent output boxes can stay
+    # pending while another fragment is published. Root-only effects otherwise
+    # stop every await at the next write to the same output allocation.
+    for wait in targets:
+        assert isinstance(wait, AwaitOp)
+        if cast(LockType, wait.lock.type).kind != "bulk" or wait.attrs.get("pending", 0):
+            continue
+        peers = [op for op in ops if isinstance(op, AsyncOp) and op.lock is wait.lock]
+        if len(peers) != 1 or ops.index(peers[0]) > ops.index(wait):
+            continue
+        issue = peers[0]
+        j = ops.index(wait)
+        while j + 1 < len(ops):
+            following = ops[j + 1]
+            newer = sum(
+                isinstance(op, AsyncOp) and op.lock.type == wait.lock.type
+                for op in ops[ops.index(issue) + 1 : j]
+            )
+            if isinstance(following, AsyncOp) and following.lock.type == wait.lock.type:
+                if newer == 7 or following.collective != issue.collective:
+                    break
+            if not can_reorder(wait, following) and not _independent_bulk_stores(
+                issue, _bulk_peer(following, ops)
+            ):
+                break
+            ops[j], ops[j + 1] = ops[j + 1], ops[j]
+            j += 1
+        pending = sum(
+            isinstance(op, AsyncOp) and op.lock.type == wait.lock.type
+            for op in ops[ops.index(issue) + 1 : ops.index(wait)]
+        )
+        if pending:
+            wait.attrs["pending"] = pending
+
+
+def _bulk_peer(op: Op, ops: list[Op]) -> Op:
+    """Use the awaited store's region when comparing two completions."""
+    if isinstance(op, AwaitOp) and cast(LockType, op.lock.type).kind == "bulk":
+        peers = [
+            issue
+            for issue in ops
+            if isinstance(issue, AsyncOp) and issue.lock is op.lock
+        ]
+        if len(peers) == 1:
+            return peers[0]
+    return op
+
+
+def _independent_bulk_stores(first: AsyncOp, second: Op) -> bool:
+    """Prove disjoint static output boxes under the same dynamic CTA view.
+
+    This does not relax aliases on the shared source or move an await across
+    control flow. Unknown views retain the conservative root dependency.
+    """
+    if (
+        not isinstance(second, AsyncOp)
+        or first.lock.type != second.lock.type
+        or first.collective != second.collective
+        or len(first.body.ops) != 1
+        or len(second.body.ops) != 1
+    ):
+        return False
+    a, b = first.body.ops[0], second.body.ops[0]
+    if not (
+        isinstance(a, MoveOp)
+        and isinstance(b, MoveOp)
+        and isinstance(a.dst.type, GmemTensorType)
+        and isinstance(b.dst.type, GmemTensorType)
+    ):
+        return False
+    ta, tb = a.dst.definition, b.dst.definition
+    if not (
+        isinstance(ta, TileOp)
+        and isinstance(tb, TileOp)
+        and ta.arg is tb.arg
+        and all(i is not None for i in [*ta.static_indices, *tb.static_indices])
+    ):
+        return False
+    return any(
+        ia * da + sa <= ib * db or ib * db + sb <= ia * da
+        for ia, ib, sa, sb, da, db in zip(
+            ta.static_indices,
+            tb.static_indices,
+            a.dst.type.sizes,
+            b.dst.type.sizes,
+            ta.index_steps,
+            tb.index_steps,
+            strict=True,
+        )
+    )
 
 
 class ScheduleAsync(Pass):
-
     def run_block(self, block: Block) -> None:
         # Reorder a plain list: every write to ``block.ops`` re-syncs the whole
         # block, which makes bubbling through it cubic.

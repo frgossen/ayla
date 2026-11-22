@@ -84,6 +84,7 @@ def schedule_register_matmul(
     operand_stages: int,
     operand_stage_overrides: dict[str, int] | None = None,
     operand_k_tile: int = 64,
+    mma_k_tile: int = 16,
     cyclic_operand_pipeline: bool = False,
     rhs_tma_load_slices: int = 1,
     unsafe_reuse_smem: bool = False,
@@ -103,6 +104,8 @@ def schedule_register_matmul(
     ``up_rhs_smem``) to depths. Other operands keep ``operand_stages``. Copies
     with different prefetch timing retain independent completion events.
     """
+    if mma_k_tile not in (16, 32) or operand_k_tile % mma_k_tile:
+        raise ValueError("MMA K tile must be 16 or 32 and divide the operand K tile")
     if rhs_tma_load_slices < 1:
         raise ValueError("rhs_tma_load_slices must be positive")
     overrides = dict(operand_stage_overrides or {})
@@ -135,13 +138,13 @@ def schedule_register_matmul(
             target_type="smem",
             operands=["lhs", "rhs"],
             reuse_operands=k_tail_tiles is not None,
-            swizzle="128B",
+            swizzle="auto",
             layout=None,
             warps=None,
             tma=True,
             physical_layout=(
-                {"block_width": 64, "order": "block_major"}
-                if operand_k_tile > 64
+                {"block_width": 4 * mma_k_tile, "order": "block_major"}
+                if operand_k_tile > 4 * mma_k_tile
                 else None
             ),
             tma_load_slices=(
@@ -155,7 +158,7 @@ def schedule_register_matmul(
     pipeline.add_pass(
         TileMatmul(
             op_dims=["K"],
-            tile_sizes=[16],
+            tile_sizes=[mma_k_tile],
             iteration_bindings=[None],
             for_loop_labels=[kk_label],
             op_label_filter=label,
@@ -186,7 +189,7 @@ def schedule_register_matmul(
     # single op the zeroed accumulator folds into as an overwrite.
     pipeline.add_pass(
         UnrollLoop(
-            unroll_factor=operand_k_tile // 16,
+            unroll_factor=operand_k_tile // mma_k_tile,
             label_filter=rf"{kk_label}(?:_tail\d+)?(?:_iter\d+)?",
         )
     )
@@ -239,11 +242,14 @@ def schedule_tiled_matmul(
     operand_stages: int,
     operand_stage_overrides: dict[str, int] | None = None,
     operand_k_tile: int = 64,
+    mma_k_tile: int = 16,
     warpgroup_m_tile: int | None = None,
     cyclic_operand_pipeline: bool = False,
     warpgroup_n_tile: int | None = None,
     output_slices: int = 1,
     output_store_buffers: int = 1,
+    output_fragment_cols: int | None = None,
+    output_fragment_swizzle: str | None = None,
     output_tma_inner_size: int | None = 128,
     unsafe_reuse_smem: bool = False,
     operand_move_attrs: dict[str, dict[str, object]] | None = None,
@@ -253,6 +259,10 @@ def schedule_tiled_matmul(
     output_tma: bool = True,
 ) -> Pipeline:
     """Build the post-block-tiling GEMM pipeline."""
+    if output_fragment_swizzle is not None and output_fragment_cols is None:
+        raise ValueError("fragment swizzle requires fragment writeback")
+    if output_fragment_cols is not None:
+        output_tma_inner_size = None
     if warpgroup_n_tile is None:
         warpgroup_n_tile = output_n_tile if output_n_tile <= 256 else 128
     wg_tiles = (
@@ -281,7 +291,7 @@ def schedule_tiled_matmul(
         PromoteBuffers(
             target_type="wgrmem",
             operands=["dst"],
-            swizzle=None,
+            swizzle=output_fragment_swizzle,
             layout="wgmma_layout_0",
             warps=4,
             tma=output_tma and not atomic_add,
@@ -296,6 +306,7 @@ def schedule_tiled_matmul(
             ),
             writeback_slices=output_slices,
             writeback_buffers=output_store_buffers,
+            writeback_fragment_cols=output_fragment_cols,
             move_attrs=(
                 {
                     **(operand_move_attrs or {}),
@@ -319,6 +330,7 @@ def schedule_tiled_matmul(
             operand_stages=operand_stages,
             operand_stage_overrides=operand_stage_overrides,
             operand_k_tile=operand_k_tile,
+            mma_k_tile=mma_k_tile,
             cyclic_operand_pipeline=cyclic_operand_pipeline,
             # TMA box dimensions cannot exceed 256. Wide column tiles load
             # each warpgroup's RHS separately, including the tuned N=384 case.
@@ -359,8 +371,11 @@ def _schedule_matmul(
     operand_stage_overrides: dict[str, int] | None = None,
     operand_k_tile: int = 64,
     cyclic_operand_pipeline: bool = False,
+    warpgroup_ctas: int = 1,
     output_slices: int = 1,
     output_store_buffers: int = 1,
+    output_fragment_cols: int | None = None,
+    output_fragment_swizzle: str | None = None,
     # Split each 256-column output row into two 128-element TMA dimensions.
     # Shared-only padding controls the physical row stride seen by the TMA
     # store; the best overall stride may trade some STMatrix bank expansion
@@ -376,7 +391,30 @@ def _schedule_matmul(
     specialize a dynamic template, then reuse the static collection's passes.
     ``split_k_atomic=True`` partitions K across grid Z and atomically adds F32
     partials directly into C in one launch. Initialize C before launching.
+    ``warpgroup_ctas=2`` pairs two independent 128-thread task programs per
+    physical CTA. The even virtual grid must contain complete output waves;
+    shared operand handoffs are materialized during PTX lowering. This applies
+    to FP16, BF16 and FP8 and requires one warpgroup per output tile.
     """
+    if type(warpgroup_ctas) is not int or warpgroup_ctas not in (1, 2):
+        raise ValueError("warpgroup_ctas must be one or two")
+    if warpgroup_ctas == 2 and (
+        split_k_parts != 1
+        or split_k_atomic
+        or type(output_grid_size) is not int
+        or output_grid_size < 2
+        or output_grid_size % 2
+        or output_m_tiles_per_cta != 1
+        or output_n_tiles_per_cta != 1
+        or cluster_m_ctas != 1
+        or cluster_n_ctas != 1
+        or unsafe_reuse_smem
+        or operand_stage_overrides
+    ):
+        raise ValueError(
+            "paired warpgroups require an even fixed grid, ungrouped WGMMA tiles "
+            "and disjoint writeback"
+        )
     if split_k_atomic:
         from ..passes.tile_reduce import TileReduce
 
@@ -409,6 +447,21 @@ def _schedule_matmul(
     if rhs_k != k:
         raise ValueError("matmul reduction dimensions must match")
     m, n, k = cast(tuple[int, int, int], (m, n, k))
+    if warpgroup_ctas == 2:
+        wg_m = warpgroup_m_tile or 64
+        wg_n = warpgroup_n_tile or (output_n_tile if output_n_tile <= 256 else 128)
+        tasks = math.ceil(m / output_m_tile) * math.ceil(n / output_n_tile)
+        if (
+            wg_m != output_m_tile
+            or wg_n != output_n_tile
+            or tasks % cast(int, output_grid_size)
+            or any(d not in (None, 1) for d in kernel.grid_dim)
+            or any(d not in (None, 1) for d in kernel.cluster_dim)
+        ):
+            raise ValueError(
+                "paired warpgroups require one warpgroup per tile "
+                "and complete one-dimensional waves"
+            )
 
     output_groups = (output_m_tiles_per_cta, output_n_tiles_per_cta)
     if any(group not in (1, 2, 3, 4, 5, 6, 8, 16) for group in output_groups):
@@ -437,12 +490,19 @@ def _schedule_matmul(
         raise ValueError("output_n_tile must divide evenly by warpgroup_n_tile")
     if output_store not in ("scalar", "stmatrix", "global"):
         raise ValueError("output_store must be 'scalar', 'stmatrix', or 'global'")
+    if output_fragment_cols is not None and (
+        type(output_fragment_cols) is not int or not 8 <= output_fragment_cols <= 256
+        or output_fragment_cols % 8
+        or output_store == "global" or output_slices != 1
+        or not 1 <= output_store_buffers <= 8
+    ):
+        raise ValueError("fragment output requires aligned column partitions, 1-8 buffers and TMA writeback")
     if unsafe_reuse_smem and (
         warpgroup_m_tile not in (64, 128)
         or output_m_tile % warpgroup_m_tile
         or warpgroup_n_tile != output_n_tile
         or output_store == "global"
-        or output_slices != 1 or output_store_buffers != 1
+        or output_slices != 1 or (output_store_buffers != 1 and output_fragment_cols is None)
         or output_groups != (1, 1)
         or (cluster_m_ctas, cluster_n_ctas) != (1, 1)
         or split_k_atomic
@@ -556,6 +616,7 @@ def _schedule_matmul(
     pipeline.add_pass(
         schedule_tiled_matmul(
             label="mm",
+            mma_k_tile=32 if matmul.lhs.type.dtype.name in ("e4m3", "e5m2") else 16,
             epilogue_label_filter=epilogue_label_filter,
             output_m_tile=output_m_tile,
             output_n_tile=output_n_tile,
@@ -567,6 +628,8 @@ def _schedule_matmul(
             warpgroup_n_tile=warpgroup_n_tile,
             output_slices=output_slices,
             output_store_buffers=output_store_buffers,
+            output_fragment_cols=output_fragment_cols,
+            output_fragment_swizzle=output_fragment_swizzle,
             output_tma_inner_size=output_tma_inner_size,
             operand_move_attrs=operand_move_attrs,
             atomic_add=matmul.attrs.get("atomic_add") is True,
@@ -582,8 +645,18 @@ def _schedule_matmul(
             )
         )
     pipeline.add_pass(ScheduleAsync())
+    if cyclic_operand_pipeline:
+        # Peeled stages outside the queued loop keep one MMA group in flight.
+        from ..passes.queue_async_tail import QueueAsyncTail
+
+        pipeline.add_pass(QueueAsyncTail())
     pipeline.add_pass(Canonicalize())
     module = pipeline.run(module)
+    if warpgroup_ctas == 2:
+        if kernel.block_dim != (128, 1, 1):
+            raise ValueError("paired warpgroups require a flat 128-thread task program")
+        kernel.attrs["warpgroup_ctas"] = warpgroup_ctas
+        kernel.attrs["warpgroup_operand_steps"] = math.ceil(k / operand_k_tile)
     if unsafe_reuse_smem:
         _fence_shared_writeback(module.body)
     return module

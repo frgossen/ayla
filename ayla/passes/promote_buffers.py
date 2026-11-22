@@ -32,6 +32,8 @@ from ..gpu_dialect import (
     BlockIdOp,
     CollectiveAxis,
     CollectiveLevel,
+    E4M3Type,
+    E5M2Type,
     ElementwiseOp,
     F16Type,
     F32Type,
@@ -46,6 +48,7 @@ from ..gpu_dialect import (
     MatmulOp,
     ReduceOp,
     ReshapeOp,
+    ReinterpretOp,
     RegMemTensorType,
     WrmemTensorType,
     MemTensorType,
@@ -59,6 +62,7 @@ from ..gpu_dialect import (
     ThreadIdOp,
     TileOp,
     WarpGroupIdOp,
+    WarpIdsOp,
     WgrmemTensorType,
     is_column_major,
     memory_effects,
@@ -90,11 +94,11 @@ def is_region_local(value: Value, members: set[Op]) -> bool:
     return local(root)
 
 
-def _target_level(target_type: str) -> str:
+def _target_level(target_type: str, warps: int | None = None) -> str:
     if target_type == "smem":
         return "block"
     if target_type == "wgrmem":
-        return "wg"
+        return "warp" if warps == 1 else "wg"
     if target_type == "rmem":
         return "thread"
     if target_type == "gmem":
@@ -103,11 +107,8 @@ def _target_level(target_type: str) -> str:
 
 
 def _narrowest_level(a: str, b: str) -> str:
-    if a == "thread" or b == "thread":
-        return "thread"
-    if a == "wg" or b == "wg":
-        return "wg"
-    return "block"
+    ranks = {"thread": 0, "warp": 1, "wg": 2, "block": 3}
+    return a if ranks[a] <= ranks[b] else b
 
 
 def _collective_level(value: Value) -> str:
@@ -136,7 +137,7 @@ def _collective_level(value: Value) -> str:
         if isinstance(ty, SmemTensorType):
             return "block"
         if isinstance(ty, WgrmemTensorType):
-            return "wg"
+            return "warp" if ty.warps == 1 else "wg"
         if isinstance(ty, (RmemTensorType, GmemTensorType)):
             return "thread"
 
@@ -147,6 +148,11 @@ def _collective_level(value: Value) -> str:
                 level = _narrowest_level(level, _collective_level(idx))
         return level
 
+    if (isinstance(defn, IndexDivOp)
+            and isinstance(defn.operands[0].definition, ThreadIdOp)
+            and isinstance(defn.operands[1].definition, IndexConstantOp)
+            and defn.operands[1].definition.value == 32):
+        return "warp"
     if isinstance(defn, (IndexAddOp, IndexMulOp, IndexDivOp, IndexModOp)):
         level = "block"
         for operand in defn.operands:
@@ -203,6 +209,7 @@ def _apply_tile(tile: TileOp, new_arg: Value) -> tuple[list[Op], list[Value]]:
         new_arg,
         list(tile.indices),
         new_tile_type,
+        attrs=tile.extra_attrs,
         maybe_partial=tile.maybe_partial,
     )
     return [new_tile], [new_tile.result()]
@@ -283,7 +290,8 @@ class PromoteBuffers(LoweringPass):
     operands : list[str]
         Which matmul operands to promote: ``"lhs"``, ``"rhs"``, ``"dst"``.
     swizzle : str or None
-        Smem swizzle mode (``"128B"``, ``"64B"``, ``"32B"``).
+        Smem swizzle mode (``"128B"``, ``"64B"``, ``"32B"``), or ``"auto"``
+        for the widest mode dividing the physical row width in bytes.
     layout : str or None
         Wgrmem layout (``"mma"``, ``"wgmma_layout_0"``).
     warps : int or None
@@ -304,6 +312,10 @@ class PromoteBuffers(LoweringPass):
         Extra move attributes by operand, such as a TMA ``l2_cache_hint``.
     writeback_slices, writeback_buffers : int
         Number of TMA output slices and SMEM staging arenas.
+    writeback_fragment_cols : int or None
+        Convert and write back owned eight-row warp fragments with this
+        column stride, retaining a smaller final fragment. Requires TMA,
+        a pointwise register epilogue and 1–8 staging arenas.
     unsafe_reuse_smem : bool
         Mark shared allocations by their asserted compute/writeback lifetime
         so a later arena-packing pass may overlay their storage. This is unsafe:
@@ -330,6 +342,7 @@ class PromoteBuffers(LoweringPass):
     move_attrs: dict[str, dict[str, object]]
     writeback_slices: int
     writeback_buffers: int
+    writeback_fragment_cols: int | None
     unsafe_reuse_smem: bool
     reuse_operands: bool
     tma_load_slices: dict[str, int]
@@ -353,6 +366,7 @@ class PromoteBuffers(LoweringPass):
         move_attrs: dict[str, dict[str, object]] | None = None,
         writeback_slices: int = 1,
         writeback_buffers: int = 1,
+        writeback_fragment_cols: int | None = None,
         unsafe_reuse_smem: bool = False,
         reuse_operands: bool = False,
         tma_load_slices: dict[str, int] | None = None,
@@ -373,6 +387,7 @@ class PromoteBuffers(LoweringPass):
             move_attrs=dict(move_attrs or {}),
             writeback_slices=writeback_slices,
             writeback_buffers=writeback_buffers,
+            writeback_fragment_cols=writeback_fragment_cols,
             unsafe_reuse_smem=unsafe_reuse_smem,
             reuse_operands=reuse_operands,
             tma_load_slices=dict(tma_load_slices or {}),
@@ -380,9 +395,22 @@ class PromoteBuffers(LoweringPass):
             epilogue_label_filter=epilogue_label_filter,
         )
         assert writeback_slices >= 1, "writeback_slices must be positive"
-        assert writeback_buffers in (1, writeback_slices), (
-            "writeback_buffers must be 1 or equal writeback_slices"
-        )
+        if writeback_fragment_cols is None:
+            assert writeback_buffers in (1, writeback_slices), (
+                "writeback_buffers must be 1 or equal writeback_slices"
+            )
+        elif (
+            type(writeback_fragment_cols) is not int
+            or not 8 <= writeback_fragment_cols <= 256
+            or writeback_fragment_cols % 8
+            or writeback_slices != 1
+            or not 1 <= writeback_buffers <= 8
+            or not tma
+            or target_type != "wgrmem"
+        ):
+            raise ValueError(
+                "fragment writeback requires WGRMEM TMA, aligned columns, 1-8 buffers and no output slices"
+            )
         assert all(n >= 1 for n in self.tma_load_slices.values()), (
             "TMA load slice counts must be positive"
         )
@@ -408,11 +436,25 @@ class PromoteBuffers(LoweringPass):
                 row_bytes = (
                     block_width
                     * cast(
-                        BF16Type | F16Type | F32Type | F64Type,
+                        BF16Type | F16Type | F32Type | F64Type | E4M3Type | E5M2Type,
                         dtype,
                     ).byte_size
                 )
-                swizzle = f"{row_bytes}B" if row_bytes >= 32 else None
+                if swizzle != "auto":
+                    swizzle = f"{row_bytes}B" if row_bytes >= 32 else None
+        if swizzle == "auto":
+            # TMA and WGMMA swizzle bytes, not elements. FP8 needs twice
+            # as many elements as FP16 to fill the same physical block.
+            row_elements = cast(
+                int, layout.get("block_width", sizes[-2] if column_major else sizes[-1])
+            )
+            row_bytes = row_elements * cast(
+                BF16Type | F16Type | F32Type | F64Type | E4M3Type | E5M2Type, dtype
+            ).byte_size
+            swizzle = next(
+                (f"{width}B" for width in (128, 64, 32) if row_bytes % width == 0),
+                None,
+            )
         attrs: dict[str, object] | None = (
             {"physical_layout": layout} if layout else None
         )
@@ -506,7 +548,7 @@ class PromoteBuffers(LoweringPass):
            replacement operand.
         """
         assert isinstance(src.type, MemTensorType)
-        target_level = _target_level(self.target_type)
+        target_level = _target_level(self.target_type, self.warps)
 
         # Walk the tile chain bottom-to-top (src → root), collecting
         # "chain" tiles (narrower than target level). The split point is
@@ -731,6 +773,228 @@ class PromoteBuffers(LoweringPass):
             new_ops.extend([gather, *store_tiles, store])
         return new_ops
 
+    def _build_fragment_writeback(
+        self,
+        dst: Value,
+        src: Value,
+        collective: dict[CollectiveAxis, CollectiveLevel],
+        matmul_label: str | None,
+        epilogue: list[Op],
+        writeback_tiling_scheme: int | None,
+    ) -> list[Op]:
+        """Stream owned eight-row warp fragments through independent arenas.
+
+        A warp retains both halves of each M64 accumulator stream. It converts
+        one half, publishes it to its private shared slice and issues TMA before
+        converting the next. Ordinary async scheduling places completion before
+        arena reuse; every warp remains a compute warp.
+        """
+        cols = self.writeback_fragment_cols
+        assert cols is not None and isinstance(src.type, WgrmemTensorType)
+        rows, width = src.type.static_shape
+        if rows % 64 or src.type.layout != "wgmma_layout_0":
+            raise ValueError("fragment writeback requires complete M64 WGMMA streams")
+        assert isinstance(dst.type, GmemTensorType)
+        if dst.type.static_shape != (rows, width) or is_column_major(dst.type):
+            raise ValueError(
+                "warp fragment writeback requires row-major matching output views"
+            )
+        if self.physical_layout or self.permutation not in (None, [0, 1]):
+            raise ValueError(
+                "fragment writeback requires plain row-major shared staging"
+            )
+        if self.swizzle is not None and (
+            self.swizzle != "128B" or cols != 64
+            or not isinstance(dst.type.dtype, (BF16Type, F16Type))
+        ):
+            raise ValueError("swizzled warp fragments require N64 and 16-bit output")
+        for op in epilogue:
+            if not isinstance(op, (AllocOp, ElementwiseOp)):
+                raise ValueError(
+                    "fragment writeback requires a register pointwise epilogue"
+                )
+            for value in (*op.operands, *op.results):
+                typ = value.type
+                if not isinstance(typ, RegMemTensorType) or (
+                    typ.rank
+                    and (
+                        not isinstance(typ, WgrmemTensorType)
+                        or typ.static_shape != (rows, width)
+                        or typ.layout != "wgmma_layout_0"
+                        or typ.warps != 4
+                    )
+                ):
+                    raise ValueError(
+                        "fragment epilogue operands must be scalars or matching WGMMA tensors"
+                    )
+        owner = dst.definition
+        if isinstance(owner, Block):
+            owner = owner.parent_op
+        assert isinstance(owner, Op)
+        kernel = owner if isinstance(owner, KernelOp) else find_ancestor_of_type(owner, KernelOp)
+        assert kernel is not None
+        warps = cast(int, kernel.block_dim[0]) // 32
+        if kernel.block_dim[1:] != [1, 1] and tuple(kernel.block_dim[1:]) != (1, 1):
+            raise ValueError("warp fragment writeback requires a one-dimensional block")
+        attrs: dict[str, object] | None = (
+            {"reuse_group": f"{matmul_label}_writeback"}
+            if self.unsafe_reuse_smem
+            else None
+        )
+        widths = sorted(
+            {min(cols, width - start) for start in range(0, width, cols)}, reverse=True
+        )
+        warp = WarpIdsOp.build()
+        four = IndexConstantOp.build(4)
+        local_warp = IndexModOp.build(warp.x, four.result())
+        result: list[Op] = [warp, four, local_warp]
+        shared, converted = {}, {}
+        storage_cols = 64 if self.swizzle else widths[0]
+        smem_type = SmemTensorType.build(
+            [warps * 8, storage_cols], dst.type.dtype, swizzle=self.swizzle,
+            attrs={"scope": "warp"}
+        )
+        arenas = []
+        for _ in range(self.writeback_buffers):
+            buffer = AllocOp.build_with_fresh_id(smem_type, attrs=attrs)
+            view = TileOp.build(
+                buffer.result(),
+                [warp.x, 0],
+                SmemTensorType.build(
+                    [8, storage_cols], dst.type.dtype, swizzle=self.swizzle,
+                    attrs={"scope": "warp"}
+                ),
+            )
+            result.extend([buffer, view])
+            arenas.append(view.result())
+        for extent in widths:
+            shared[extent] = []
+            for arena in arenas:
+                if extent == storage_cols:
+                    shared[extent].append(arena)
+                else:
+                    view = ReinterpretOp.build(
+                        arena,
+                        SmemTensorType.build(
+                            [8, extent], dst.type.dtype, swizzle=self.swizzle,
+                            strides=[storage_cols, 1] if self.swizzle else None,
+                            attrs={"scope": "warp"}
+                        ),
+                    )
+                    result.append(view)
+                    shared[extent].append(view.result())
+            scratch = AllocOp.build_with_fresh_id(
+                WgrmemTensorType.build(
+                    [8, extent], dst.type.dtype, warps=1, layout="wgmma_warp"
+                )
+            )
+            result.append(scratch)
+            converted[extent] = scratch.result()
+        for op in epilogue:
+            if all(
+                cast(RegMemTensorType, value.type).rank == 0
+                for value in (*op.operands, *op.results)
+            ):
+                result.append(op)
+        number = 0
+        for stream in range(rows // 64):
+            offset = IndexConstantOp.build(stream * 4)
+            warp_row = IndexAddOp.build(local_warp.result(), offset.result())
+            warp_dst = TileOp.build(
+                dst,
+                [warp_row.result(), 0],
+                clone_type(dst.type, {"sizes": [16, width]}),
+            )
+            result.extend([offset, warp_row, warp_dst])
+            for column, start in enumerate(range(0, width, cols)):
+                extent = min(cols, width - start)
+                for half in range(2):
+
+                    def fragment_view(value):
+                        typ = clone_type(
+                            value.type,
+                            {"sizes": [8, extent], "warps": 1, "layout": "wgmma_warp"},
+                        )
+                        return TileOp.build(
+                            value,
+                            [stream * 8 + half, column],
+                            typ,
+                            index_steps=[8, cols],
+                        )
+
+                    source = fragment_view(src)
+                    result.append(source)
+                    mapping = {src: source.result()}
+                    for op in epilogue:
+                        if all(
+                            cast(RegMemTensorType, value.type).rank == 0
+                            for value in (*op.operands, *op.results)
+                        ):
+                            continue
+                        if isinstance(op, AllocOp):
+                            alloc = AllocOp.build_with_fresh_id(
+                                clone_type(
+                                    op.result().type,
+                                    {
+                                        "sizes": [8, extent],
+                                        "warps": 1,
+                                        "layout": "wgmma_warp",
+                                    },
+                                )
+                            )
+                            mapping[op.result()] = alloc.result()
+                            result.append(alloc)
+                            continue
+                        for value in op.operands:
+                            if (
+                                value not in mapping
+                                and cast(RegMemTensorType, value.type).rank
+                            ):
+                                view = fragment_view(value)
+                                result.append(view)
+                                mapping[value] = view.result()
+                        result.append(clone_op(op, mapping))
+                    fragment = mapping[src]
+                    if src.type.dtype != dst.type.dtype:
+                        result.append(
+                            ElementwiseOp.build(
+                                converted[extent],
+                                [fragment],
+                                "convert",
+                                attrs={"label": f"{matmul_label}_dst_convert"},
+                            )
+                        )
+                        fragment = converted[extent]
+                    output = TileOp.build(
+                        warp_dst.result(),
+                        [half, column],
+                        clone_type(dst.type, {"sizes": [8, extent]}),
+                        index_steps=[8, cols],
+                    )
+                    gather = MoveOp.build(
+                        shared[extent][number % self.writeback_buffers],
+                        fragment,
+                        collective=collective,
+                        attrs={"label": f"{matmul_label}_dst_smem"},
+                    )
+                    store_attrs = {
+                        **self.move_attrs.get("dst", {}),
+                        "tma": True,
+                        "tma_store_scope": "warp",
+                        "label": f"{matmul_label}_dst_tma",
+                    }
+                    if writeback_tiling_scheme is not None:
+                        store_attrs["dst_tiling_scheme"] = writeback_tiling_scheme
+                    store = MoveOp.build(
+                        output.result(),
+                        shared[extent][number % self.writeback_buffers],
+                        collective=collective,
+                        attrs=store_attrs,
+                    )
+                    result.extend([output, gather, store])
+                    number += 1
+        return result
+
     def _build_operand_writeback(
         self,
         dst: Value,
@@ -743,7 +1007,7 @@ class PromoteBuffers(LoweringPass):
     ) -> tuple[list[Op], list[Value]]:
         assert isinstance(dst.type, MemTensorType)
         assert isinstance(src.type, MemTensorType)
-        target_level = _target_level(self.target_type)
+        target_level = _target_level(self.target_type, self.warps)
         dst_level = _collective_level(dst)
         if _narrowest_level(dst_level, target_level) != target_level:
             raise NotImplementedError(
@@ -752,6 +1016,11 @@ class PromoteBuffers(LoweringPass):
             )
         new_ops: list[Op] = []
         epilogue = list(epilogue or [])
+        if self.writeback_fragment_cols is not None:
+            if not isinstance(src.type, WgrmemTensorType):
+                raise ValueError("fragment writeback requires WGMMA registers")
+            return self._build_fragment_writeback(dst, src, collective, matmul_label,
+                       epilogue, writeback_tiling_scheme), []
         if src.type.dtype.name != dst.type.dtype.name:
             tmp_type = self._build_target_type(dst.type, dtype=dst.type.dtype)
             tmp_alloc = AllocOp.build_with_fresh_id(tmp_type)
@@ -1161,6 +1430,7 @@ def promote_buffers(
     move_attrs: dict[str, dict[str, object]] | None = None,
     writeback_slices: int = 1,
     writeback_buffers: int = 1,
+    writeback_fragment_cols: int | None = None,
     unsafe_reuse_smem: bool = False,
     reuse_operands: bool = False,
     tma_load_slices: dict[str, int] | None = None,
@@ -1182,6 +1452,7 @@ def promote_buffers(
         move_attrs=move_attrs,
         writeback_slices=writeback_slices,
         writeback_buffers=writeback_buffers,
+        writeback_fragment_cols=writeback_fragment_cols,
         unsafe_reuse_smem=unsafe_reuse_smem,
         reuse_operands=reuse_operands,
         tma_load_slices=tma_load_slices,

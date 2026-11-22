@@ -208,6 +208,9 @@ def _builder_config(captured: dict[str, object]) -> dict[str, object] | None:
     if reverse := str(captured.get("output_tile_reverse") or ""):
         builder["output_reversed_dims"] = tuple(reverse.upper())
     optional = (
+        "warpgroup_ctas",
+        "output_fragment_cols",
+        "output_fragment_swizzle",
         "warpgroup_m_tile",
         "warpgroup_fast_axis",
         "rhs_tma_load_slices",
@@ -258,6 +261,20 @@ def _seed(
     exact: bool,
 ) -> GemmScheduleSeed | None:
     """Adapt a table entry to this GEMM, or None if it cannot transfer."""
+    copies = captured.get("warpgroup_ctas", 1)
+    if type(copies) is not int or copies not in (1, 2):
+        return None
+    if copies == 2 and (
+        operation == "bmm" or captured.get("transpose_output")
+        or captured.get("stream_k_workers") is not None
+        or captured.get("split_k_parts", 1) != 1 or captured.get("split_k_atomic")
+        or captured.get("mma_kind", "wgmma") != "wgmma"
+        or captured.get("unroll_output_tiles", True)
+        or captured.get("pipeline_output_waves") or captured.get("pipeline_output_writeback")
+        or captured.get("cluster_m_ctas", 1) != 1 or captured.get("cluster_n_ctas", 1) != 1
+        or captured.get("operand_stage_overrides")
+    ):
+        return None
     transpose = bool(captured.get("transpose_output"))
     fixed_grid = captured["output_cta_count"] is not None
     if not exact and (
@@ -269,7 +286,19 @@ def _seed(
         return None
     builder_m, builder_n = (n, m) if transpose else (m, n)
     builder = _builder_config(captured)
-    assert builder is not None
+    if builder is None:
+        return None
+    if copies == 2:
+        grid = builder.get("output_grid_size")
+        m_tile = _as_int(builder["output_m_tile"])
+        n_tile = _as_int(builder["output_n_tile"])
+        if (type(grid) is not int or grid < 2 or grid % 2
+                or (math.ceil(builder_m / m_tile) * math.ceil(builder_n / n_tile)) % grid
+                or builder.get("warpgroup_m_tile", 64) != m_tile
+                or builder.get("warpgroup_n_tile") != n_tile
+                or builder["output_m_tiles_per_cta"] != 1
+                or builder["output_n_tiles_per_cta"] != 1):
+            return None
     unroll = None
     if fixed_grid and captured["unroll_output_tiles"]:
         tiles = math.ceil(
@@ -523,6 +552,9 @@ def select_persistent_gemm_schedule(
         return None
     config = dict(seed.builder_config)
     config.pop("ptx_optimization_level", None)
+    # Resident geometry is scheduled separately from paired standalone tiles.
+    for key in ("warpgroup_ctas", "output_fragment_cols", "output_fragment_swizzle"):
+        config.pop(key, None)
     config.update(
         output_m_tile=threads // 2,
         output_grid_size=blocks,

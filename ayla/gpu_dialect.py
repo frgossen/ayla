@@ -625,6 +625,7 @@ class TileOp(GpuOp):
     """Select a sub-region (view) of a buffer.
 
     Each index advances the view origin by the corresponding result size.
+    ``index_steps`` can retain a regular iteration stride for a smaller tail.
 
     ``maybe_partial`` marks a tile whose logical extent may cross the valid
     bounds of its source for some index values. Consumers must then provide
@@ -639,6 +640,7 @@ class TileOp(GpuOp):
         type: Type,
         attrs: dict[str, object] | None = None,
         maybe_partial: bool = False,
+        index_steps: Sequence[int] | None = None,
     ) -> "TileOp":
         operands: list[Value] = [arg]
         static_indices: list[int | None] = []
@@ -650,6 +652,8 @@ class TileOp(GpuOp):
                 operands.append(idx)
         result = Value(name=None, type=type)
         attrs = dict(attrs or {})
+        if index_steps is not None:
+            attrs["index_steps"] = list(index_steps)
         if maybe_partial:
             attrs["maybe_partial"] = True
         return cls(
@@ -677,6 +681,14 @@ class TileOp(GpuOp):
     @property
     def maybe_partial(self) -> bool:
         return bool(self.attrs.get("maybe_partial", False))
+
+    @property
+    def index_steps(self) -> tuple[int, ...]:
+        """Element-coordinate stride of each tile index, independent of extent."""
+        typ = self.result().type
+        assert isinstance(typ, MemTensorType)
+        steps = self.attrs.get("index_steps")
+        return typ.static_shape if steps is None else tuple(cast(Sequence[int], steps))
 
     @property
     def extra_attrs(self) -> dict[str, object]:
@@ -1350,7 +1362,7 @@ class LockType(Type):
     @property
     def supports_partial_await(self) -> bool:
         """Whether an await may leave newer hardware groups pending."""
-        return self.kind == "wgmma"
+        return self.kind in ("wgmma", "bulk")
 
     def print(self, p: Printer) -> None:
         p.write("lock<")
@@ -2376,14 +2388,18 @@ class WgrmemTensorType(RegMemTensorType):
     Logical tensor distributed across multiple warps. Each thread holds
     a fragment in its own registers; the full value is the union of all
     threads' fragments. `warps` specifies how many warps collectively
-    own the value (1 for Volta mma.sync, 4 for Hopper wgmma, 2 for
+    own the value (1 for warp-level mma.sync, 4 for Hopper wgmma, 2 for
     Blackwell tcgen05).
 
     The ``layout`` attribute encodes the element-to-thread-register mapping.
     The mapping is determined by the instruction that writes the tensor.
     Supported layouts:
-      - ``"mma"``: mma.sync m16n8k16, warps=1
+      - ``"mma"``: FP32 mma.sync m16n8k16 accumulator, warps=1
+      - ``"mma_a"``: row-major FP16/BF16 A fragments, warps=1
+      - ``"mma_b"``: FP16/BF16 B fragments from contiguous NT rows, warps=1
       - ``"wgmma_layout_0"``: warp group MMA m64nNk16, warps=4
+      - ``"wgmma_warp"``: one owned eight-row half of a WGMMA
+        accumulator per warp, warps=1; preserves the lane/column mapping.
       - ``"wgmma_row"``: F32 row scalars, replicated across each group of
         four column lanes. Register 2*b+h holds row 64*b+8*h+16*warp+lane//4.
     All lowerings that read from a wgrmem tensor (store, convert, matmul)
@@ -2399,8 +2415,9 @@ class WgrmemTensorType(RegMemTensorType):
         warps: int = 1,
         attrs: dict[str, object] | None = None,
     ):
-        assert layout in ("mma", "wgmma_layout_0", "wgmma_row"), (
-            f"WgrmemTensorType: layout must be 'mma', 'wgmma_layout_0', or 'wgmma_row'; "
+        assert layout in ("mma", "wgmma_layout_0", "wgmma_row", "wgmma_warp"), (
+            f"WgrmemTensorType: layout must be 'mma', "
+            f"'wgmma_layout_0', 'wgmma_row', or 'wgmma_warp'; "
             f"got {layout!r}"
         )
         return cls(
@@ -2601,6 +2618,20 @@ class F16Type(Type):
 @gpu_dialect.register_type("bf16")
 class BF16Type(Type):
     byte_size = 2
+
+
+@gpu_dialect.register_type("e4m3")
+class E4M3Type(Type):
+    """Hopper FP8 E4M3 (torch.float8_e4m3fn), stored as one byte."""
+
+    byte_size = 1
+
+
+@gpu_dialect.register_type("e5m2")
+class E5M2Type(Type):
+    """IEEE FP8 E5M2 (torch.float8_e5m2), stored as one byte."""
+
+    byte_size = 1
 
 
 @gpu_dialect.register_type("f32")
@@ -3285,9 +3316,9 @@ def _type_collective_scope(t: Type) -> CollectiveScope:
     if isinstance(t, WrmemTensorType):
         return CollectiveScope.WARP
     if isinstance(t, WgrmemTensorType):
-        return CollectiveScope.WARPGROUP
+        return CollectiveScope.WARP if t.layout == "wgmma_warp" else CollectiveScope.WARPGROUP
     if isinstance(t, SmemTensorType):
-        return CollectiveScope.BLOCK
+        return CollectiveScope.WARP if t.attrs.get("scope") == "warp" else CollectiveScope.BLOCK
     if isinstance(t, GmemTensorType):
         return CollectiveScope.GRID
     raise NotImplementedError(
@@ -3408,7 +3439,7 @@ def memory_effects(op: Op) -> list[MemoryEffect] | None:
             else CollectiveScope.GRID
         )
         src_scope = (
-            CollectiveScope.BLOCK_LEADER
+            CollectiveScope.WARP if op.attrs.get("tma_store_scope") == "warp" else CollectiveScope.BLOCK_LEADER
             if isinstance(op.src.type, SmemTensorType)
             else CollectiveScope.GRID
         )

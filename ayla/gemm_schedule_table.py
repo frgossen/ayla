@@ -3192,3 +3192,32 @@ PERSISTENT_SWIGLU_OUTPUT_PREFETCH: dict[
 ] = {
     ((132, 2048, 19968, 6656), (192, 3, False, 0, True)): 0,
 }
+
+
+# Independent compute-warpgroups with completion-tracked operand handoffs.
+# Exact H100 FP16/BF16 measurements: docs/warpgroup_ctas.md. Keep the output
+# loop rolled; nearest-shape transfer must retain complete paired waves.
+CONFIGS += tuple(
+    dict(
+        output_m_tile=128, warpgroup_m_tile=128,
+        output_n_tile=columns, warpgroup_n_tile=columns,
+        operand_k_tile=64, operand_stages=stages,
+        cyclic_operand_pipeline=True, warpgroup_ctas=2,
+        output_cta_count=grid, output_tile_fast_axis='m',
+        unroll_output_tiles=False, output_tiles_per_cta=1,
+        output_slices=1, output_store='stmatrix', output_store_buffers=1,
+        output_fragment_cols=64, output_fragment_swizzle='128B',
+        output_tma_inner_size=None,
+        lhs_l2_cache_hint=None, rhs_l2_cache_hint=None, dst_l2_cache_hint=None,
+    )
+    for columns, stages, grid in ((168, 4, 264), (168, 5, 264), (128, 5, 256))
+)
+for _dtype, _shape, _offset in (
+    ('float16', (1, 2048, 11008, 4096), 0),
+    ('bfloat16', (1, 2048, 11008, 4096), 1),
+    ('float16', (1, 4096, 4096, 4096), 2),
+    ('bfloat16', (1, 4096, 4096, 4096), 2),
+):
+    SCHEDULES['mm', _dtype][_shape] = (
+        len(CONFIGS) - 3 + _offset, *SCHEDULES['mm', _dtype].get(_shape, ())
+    )

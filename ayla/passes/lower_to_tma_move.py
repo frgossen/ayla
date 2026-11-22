@@ -22,6 +22,8 @@ from typing import cast
 from ..gpu_dialect import (
     AsyncOp,
     BF16Type,
+    E4M3Type,
+    E5M2Type,
     F16Type,
     F32Type,
     F64Type,
@@ -248,7 +250,7 @@ def _multicast_slices(move: MoveOp, smem: Value) -> int:
     rows, columns = smem_type.sizes
     assert isinstance(rows, int) and isinstance(columns, int)
     dtype_bytes = cast(
-        BF16Type | F16Type | F32Type | F64Type,
+        BF16Type | F16Type | E4M3Type | E5M2Type | F32Type | F64Type,
         smem_type.dtype,
     ).byte_size
     atom = _SWIZZLE_ATOM_BYTES.get(cast(str, smem_type.swizzle), 0)
@@ -320,7 +322,7 @@ def _build_tile_chain_indices(
                 idx = const_op.result()
 
             tile_size_op = IndexConstantOp.build(
-                cast(int, result_sizes[dim]),
+                cast(int, definition.index_steps[dim]),
             )
             new_ops.append(tile_size_op)
             mul_op = IndexMulOp.build(idx, tile_size_op.result())

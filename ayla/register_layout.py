@@ -37,7 +37,7 @@ def register_layout(value: Value) -> RegisterLayout:
     if isinstance(value.definition, RegisterViewOp):
         return RegisterLayout(shape, (RegisterElement(value.definition.index, ()),))
     if isinstance(typ, WgrmemTensorType):
-        if typ.layout == "wgmma_layout_0":
+        if typ.layout in ("wgmma_layout_0", "wgmma_warp"):
             elements = tuple(
                 RegisterElement(2 * pair + e, (row, col + e))
                 for pair, row, col in wgmma_view_pairs(value)
@@ -50,7 +50,8 @@ def register_layout(value: Value) -> RegisterLayout:
                 2,
                 distributed_rows=True,
                 thread_bases=(
-                    (ThreadIndex("thread_x", 32, 4, 16), ThreadIndex("lane", 4)),
+                    ((ThreadIndex("thread_x", 32, 4, 16), ThreadIndex("lane", 4))
+                     if typ.warps == 4 else (ThreadIndex("lane", 4),)),
                     (ThreadIndex("lane", modulus=4, scale=2),),
                 ),
             )
@@ -126,7 +127,7 @@ def register_indices(
             raise ValueError(
                 "warpgroup storage supports one or two elements per register"
             )
-        if typ.layout == "wgmma_layout_0":
+        if typ.layout in ("wgmma_layout_0", "wgmma_warp"):
             pairs = [
                 p for p, _, _ in wgmma_view_pairs(value or Value(name=None, type=typ))
             ]
@@ -184,7 +185,7 @@ def static_view_origin(value: Value) -> tuple[int, ...]:
                 )
             result_type = tile.result().type
             assert isinstance(result_type, WgrmemTensorType)
-            offsets[dim] += index * cast(int, result_type.sizes[dim])
+            offsets[dim] += index * cast(int, tile.index_steps[dim])
         value = tile.arg
     return tuple(offsets)
 
@@ -203,9 +204,16 @@ def wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     view_type, root_type = value.type, root.type
     assert isinstance(view_type, WgrmemTensorType)
     assert isinstance(root_type, WgrmemTensorType)
-    assert view_type.layout == root_type.layout == "wgmma_layout_0"
+    assert root_type.layout in ("wgmma_layout_0", "wgmma_warp")
+    assert view_type.layout in ("wgmma_layout_0", "wgmma_warp")
     assert view_type.rank == root_type.rank == 2
-    assert view_type.warps == root_type.warps == 4
+    assert root_type.warps == (1 if root_type.layout == "wgmma_warp" else 4)
+    assert view_type.warps == (1 if view_type.layout == "wgmma_warp" else 4)
+    if view_type.layout == "wgmma_warp":
+        if view_type.sizes[0] != 8 or root_type.warps == 4 and static_view_origin(value)[0] % 64 not in (0, 8):
+            raise ValueError("warp WGMMA fragments require one owned eight-row half")
+    elif root_type.layout != view_type.layout:
+        raise ValueError("a warp fragment cannot be widened to a warpgroup")
     assert view_type.dtype == root_type.dtype
     assert isinstance(view_type.dtype, (F32Type, BF16Type, F16Type)), (
         f"WGMMA views support f32, bf16, and f16; got {view_type.dtype}"
@@ -217,11 +225,11 @@ def wgmma_view_pairs(value: Value) -> list[tuple[int, int, int]]:
     pairs = [
         (pair_index, row - row_start, col - col_start)
         for pair_index in range(root_type.num_elements_per_thread // 2)
-        for row, col in [wgmma_pair_offset(pair_index, root_n)]
+        for row, col in [wgmma_pair_offset(pair_index, root_n) if root_type.warps == 4 else (0, pair_index * 8)]
         if row_start <= row < row_start + view_m
         and col_start <= col < col_start + view_n
     ]
-    assert len(pairs) == view_m * view_n // (root_type.warps * 64)
+    assert len(pairs) == view_m * view_n // (view_type.warps * 64)
     return pairs
 
 

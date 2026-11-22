@@ -48,7 +48,8 @@ class LowerToAsync(LoweringPass):
         passes see it on the top-level ops rather than buried in the block.
         """
         assert isinstance(inner, (MatmulOp, MoveOp, TmaMoveOp))
-        lock = AllocOp.build_with_fresh_id(LockType.build(kind=kind))
+        scope = {"scope": attrs["tma_store_scope"]} if kind == "bulk" and "tma_store_scope" in attrs else None
+        lock = AllocOp.build_with_fresh_id(LockType.build(kind=kind, attrs=scope))
         label = attrs.get("label")
         async_op = AsyncOp.build(
             lock.result(),

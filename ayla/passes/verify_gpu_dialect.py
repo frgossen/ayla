@@ -7,7 +7,7 @@ from functools import cache
 import itertools
 import math
 
-from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, iter_ancestors
+from ..base.ir import Block, Op, Type, Value, find_ancestor_of_type, find_ops_of_type, iter_ancestors
 from ..base.verification_pass import VerificationPass, verifies
 from ..gpu_dialect import (
     HW_ID_LEVELS,
@@ -47,6 +47,7 @@ from ..gpu_dialect import (
     MoveOp,
     ReduceOp,
     RegisterViewOp,
+    ReinterpretOp,
     ShuffleOp,
     ReshapeOp,
     RmemTensorType,
@@ -59,6 +60,7 @@ from ..gpu_dialect import (
     TmaDescType,
     TmaMoveOp,
     WgrmemTensorType,
+    WarpIdsOp,
     WrmemTensorType,
     BlockIdOp,
     join_collectives,
@@ -87,7 +89,7 @@ def _verify_static_shape(typ: Type) -> None:
         raise ValueError(f"unresolved dynamic shape {typ}")
     if isinstance(typ, WrmemTensorType):
         typ.register_layout()
-    if isinstance(typ, WgrmemTensorType) and typ.layout == "wgmma_row":
+    if isinstance(typ, WgrmemTensorType) and typ.layout in ("wgmma_row", "wgmma_warp"):
         typ.register_layout()
     if isinstance(typ, TmaDescType):
         _verify_static_shape(typ.gmem_type)
@@ -101,6 +103,94 @@ def _verify_collective_attr(op: Op) -> None:
         or not all(isinstance(level, CollectiveLevel) for level in collective.values())
     ):
         raise ValueError(f"{op.op_id} collective attribute must list x, y, and z")
+
+
+def _verify_private_warp_slice(value: Value) -> None:
+    typ = value.type
+    if not isinstance(typ, SmemTensorType):
+        raise ValueError("warp-private accesses require shared memory")
+    if isinstance(value.definition, ReinterpretOp):
+        view = value.definition
+        origin = view.arg.type
+        assert isinstance(origin, SmemTensorType)
+        if (
+            view.byte_offset != 0
+            or typ.rank != 2
+            or typ.sizes[0] != 8
+            or typ.dtype != origin.dtype
+            or typ.attrs.get("scope") != "warp"
+            or typ.num_elements is None
+            or origin.num_elements is None
+            or not (typ.is_canonical_strides or (
+                typ.swizzle == origin.swizzle == "128B"
+                and list(typ.strides) == list(origin.strides) == [64, 1]
+                and 0 < typ.sizes[1] <= origin.sizes[1]
+            ))
+            or typ.num_elements > origin.num_elements
+        ):
+            raise ValueError("warp-private reinterpret must fit its owned shared slice")
+        _verify_private_warp_slice(view.arg)
+        return
+    tile = value.definition
+    if (
+        typ.attrs.get("scope") != "warp"
+        or typ.rank != 2
+        or typ.sizes[0] != 8
+        or not isinstance(tile, TileOp)
+        or not isinstance(tile.indices[0], Value)
+        or tile.indices[1] != 0
+        or tile.index_steps != tuple(typ.sizes)
+    ):
+        raise ValueError(
+            "warp-private accesses must select the issuing warp's eight-row shared slice"
+        )
+    parent = tile.arg.type
+    assert isinstance(parent, SmemTensorType)
+    kernel = find_ancestor_of_type(tile, KernelOp)
+    stride = parent.attrs.get("warpgroup_stride_rows")
+    index = tile.indices[0]
+    if stride is None:
+        owned = isinstance(index.definition, WarpIdsOp) and index.result_index == 0
+    else:
+        owned = (kernel is not None and tuple(kernel.block_dim[1:]) == (1, 1)
+                 and type(stride) is int and stride >= 32 and stride % 8 == 0
+                 and isinstance(kernel.block_dim[0], int)
+                 and kernel.block_dim[0] % 128 == 0
+                 and parent.static_shape[0] == kernel.block_dim[0] // 128 * stride)
+        if owned:
+            ids = [op.x for op in find_ops_of_type(kernel, WarpIdsOp)]
+            owned = all(_static_index(index, {value: warp for value in ids})
+                        == (warp // 4) * (stride // 8) + warp % 4
+                        for warp in range(kernel.block_dim[0] // 32))
+    if not owned:
+        raise ValueError("warp-private accesses must select the issuing warp's eight-row shared slice")
+    if (
+        kernel is None
+        or tuple(kernel.block_dim[1:]) != (1, 1)
+        or kernel.block_dim[0] is None
+        or kernel.block_dim[0] % 32
+        or parent.rank != 2
+        or parent.is_dynamic
+        or parent.attrs.get("scope") != "warp"
+        or not parent.is_canonical_strides
+        or not typ.is_canonical_strides
+        or parent.sizes[1] != typ.sizes[1]
+        or parent.static_shape[0] < kernel.block_dim[0] // 32 * 8
+    ):
+        raise ValueError(
+            "warp-private allocation must cover every warp's contiguous shared slice"
+        )
+
+
+def _verify_warp_store(op: MoveOp | TmaMoveOp) -> None:
+    scope = op.attrs.get("tma_store_scope")
+    if scope is None:
+        return
+    if scope != "warp" or not isinstance(op.src.type, SmemTensorType) or op.multicast:
+        raise ValueError(
+            "warp TMA stores require a private shared source and no multicast"
+        )
+    _verify_private_warp_slice(op.src)
 
 
 def _non_unit_layout(
@@ -424,6 +514,11 @@ class VerifyGpuDialect(VerificationPass):
                 "tensors or wgrmem"
             )
         assert isinstance(result_type, (AddrMemTensorType, WgrmemTensorType))
+        if "index_steps" in op.attrs and (
+            len(op.index_steps) != result_type.rank
+            or any(type(step) is not int or step <= 0 for step in op.index_steps)
+        ):
+            raise ValueError("tile index_steps must contain one positive integer per dimension")
         if not (arg_type.rank == result_type.rank == len(op.indices)):
             raise ValueError(
                 "tile operand rank, result rank, and number of indices must "
@@ -538,6 +633,10 @@ class VerifyGpuDialect(VerificationPass):
         assert isinstance(lock_type, LockType)
         if lock_type.kind == "cluster_mbar":
             raise ValueError("cluster_mbar is a barrier resource, not an async lock")
+        if lock_type.kind == "bulk":
+            scopes = {inner.attrs.get("tma_store_scope") for inner in op.body.ops}
+            if scopes != {lock_type.attrs.get("scope")}:
+                raise ValueError("bulk completion scope must match its TMA issuers")
         if not any(isinstance(user, AwaitOp) for user in op.lock.users()):
             raise ValueError("async lock must have a matching await")
 
@@ -562,8 +661,15 @@ class VerifyGpuDialect(VerificationPass):
     def _verify_move(self, op: MoveOp) -> None:
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
+        _verify_warp_store(op)
         _verify_transposed_fragment_store(op)
         dst_type, src_type = op.dst.type, op.src.type
+        if (isinstance(dst_type, SmemTensorType) and dst_type.attrs.get("scope") == "warp"
+                and not op.attrs.get("tma") and (not isinstance(src_type, WgrmemTensorType)
+                or src_type.layout != "wgmma_warp" or dst_type.sizes != src_type.sizes)):
+            raise ValueError("warp-private shared writes require matching warp fragments")
+        if isinstance(dst_type, SmemTensorType) and dst_type.attrs.get("scope") == "warp" and not op.attrs.get("tma"):
+            _verify_private_warp_slice(op.dst)
         if op.attrs.get("atomic_add") is not None:
             if (
                 op.attrs["atomic_add"] is not True
@@ -626,6 +732,8 @@ class VerifyGpuDialect(VerificationPass):
             )
         _verify_collective_attr(op)
         _verify_tma_multicast(op)
+
+        _verify_warp_store(op)
 
     @verifies(MatmulOp)
     def _verify_matmul(self, op: MatmulOp) -> None:

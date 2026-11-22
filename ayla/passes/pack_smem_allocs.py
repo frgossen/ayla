@@ -7,6 +7,8 @@ from ..base.pipeline import Pass
 from ..gpu_dialect import (
     AllocOp,
     BF16Type,
+    E4M3Type,
+    E5M2Type,
     F16Type,
     F32Type,
     F64Type,
@@ -21,7 +23,9 @@ from ..gpu_dialect import (
 def _alignment(op: AllocOp) -> int:
     typ = op.result().type
     assert isinstance(typ, SmemTensorType)
-    return 1024 if typ.swizzle is not None and physical_layout(typ) else 128
+    return 1024 if typ.swizzle is not None and (
+        physical_layout(typ) or typ.attrs.get("scope") == "warp"
+    ) else 128
 
 
 def _size(op: AllocOp) -> int:
@@ -30,7 +34,7 @@ def _size(op: AllocOp) -> int:
     num_elements = typ.num_elements
     assert num_elements is not None
     dtype = typ.dtype
-    assert isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type))
+    assert isinstance(dtype, (F16Type, BF16Type, E4M3Type, E5M2Type, F32Type, F64Type))
     return num_elements * dtype.byte_size
 
 
@@ -151,7 +155,7 @@ class ReuseSmemAllocs(Pass):
         template_type = arena_template.result().type
         assert isinstance(template_type, SmemTensorType)
         dtype = template_type.dtype
-        assert isinstance(dtype, (F16Type, BF16Type, F32Type, F64Type))
+        assert isinstance(dtype, (F16Type, BF16Type, E4M3Type, E5M2Type, F32Type, F64Type))
         dtype_bytes = dtype.byte_size
         assert arena_bytes % dtype_bytes == 0
         type_attrs = {
