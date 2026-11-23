@@ -2360,14 +2360,15 @@ class LowerToPtxTemplate(LoweringPass):
                     return f'mov.b64 ${{b64:{name}}}, ${{b64:operand.{complete}.val}};\n'
                 if base in local_lows:
                     # Valid start addresses never carry out of the low word.
-                    # A 64-bit add lets ptxas split each sibling into a
-                    # carry chain plus a rematerialized high half.
+                    # Under paired issue pressure, ptxas splits a 64-bit add
+                    # into a carry chain plus a rematerialized high half;
+                    # single-CTA batches keep the 64-bit add uniform.
                     base_low, base_const = local_lows[base]
                     return (f"add.u32 ${{b32:{name}_low}}, ${{b32:{base_low}}}, {delta // 16};\n"
                             f"mov.b64 ${{b64:{name}}}, {{${{b32:{name}_low}}, {base_const >> 32}}};\n")
                 return f"add.u64 ${{b64:{name}}}, ${{b64:{base}}}, {delta // 16};\n"
             operand = _operand(cast(Value, self.value_map[value]), hint)
-            if tcgen05:
+            if tcgen05 and cta_group == 2:
                 local_lows[name] = f"{name}_low", const
                 return _build_desc(f"{name}_low", f"operand.{operand}.ptr", const, offset,
                                    low_half=True) + (

@@ -174,8 +174,7 @@ def blackwell_tcgen05_gemm_module(
         raise ValueError("job participant regions require four-warp fragments and a refill bank")
     if shared_ring and (
         output_grid_size is None
-        or cta_group == 2
-        and (output_grid_size % 2 or output_grid_fast_axis != "m")
+        or cta_group == 2 and output_grid_size % 2
         or output_m_tile != 128
         or output_m_tiles_per_cta != 1
         or batch_output_m_operands
@@ -190,7 +189,8 @@ def blackwell_tcgen05_gemm_module(
         )
     ):
         raise ValueError(
-            "shared ring requires a persistent single-CTA TMA schedule with common participants"
+            "shared ring requires a persistent TMA schedule (an even grid when paired) "
+            "with common participants"
         )
     if output_store_pending_groups and output_store != "stmatrix":
         raise ValueError("output store queues require TMA writeback")
@@ -406,10 +406,11 @@ def blackwell_tcgen05_gemm_module(
         kernel.attrs["compact_mma_batch"] = True
     # Paired K loops narrow bank waits to each CTA's issuer and retire the
     # peer's old phase read through the paired refill's completion. This
-    # replaces a cluster-wide software gather every second stage. Persistent
-    # and grouped multi-tile paired schedules keep their own handoffs.
+    # replaces a cluster-wide software gather on every refill, including in
+    # persistent shared rings. Rolled shared rings and grouped multi-tile
+    # paired schedules keep their own handoffs.
     paired_relay = cta_group == 2 and not (
-        extended_cluster or shared_ring or batch_output_m_operands
+        extended_cluster or shared_ring and rolled_operand_pipeline or batch_output_m_operands
     )
     if paired_relay:
         kernel.attrs["correlate_uniform_guards"] = True

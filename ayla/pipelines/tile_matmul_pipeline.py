@@ -481,9 +481,16 @@ def _schedule_matmul(
         raise ValueError("paired global stores require complete paired M and N tiles")
     if layout.size > 1 and output_store == 'global' and (m % (layout.m*output_m_tile) or (n % (layout.n*output_n_tile) and not masked_global_store)):
         raise ValueError('cluster global stores require complete logical cluster tiles')
+    # A persistent paired grid numbers jobs by CTA pair. M-fast traversal
+    # makes consecutive CTAs adjacent M tiles directly; N-fast traversal
+    # nests the pair's two M tiles innermost below the pair's N order.
+    pair_major = (paired and output_grid_size is not None and output_grid_fast_axis == "n"
+                  and output_m_tiles_per_cta == 1 and output_n_tiles_per_cta == 1
+                  and not batch_output_m_operands and not clustered_work)
     if paired and output_grid_size is not None and (output_grid_size % 2
-            or output_grid_fast_axis != "m" or ((m + output_m_tile - 1) // output_m_tile) % 2 and not (cross_job_pipeline or clustered_work)):
-        raise ValueError("paired persistent grids require even CTA and M-tile counts with M-fast traversal")
+            or not pair_major and (output_grid_fast_axis != "m"
+            or ((m + output_m_tile - 1) // output_m_tile) % 2 and not (cross_job_pipeline or clustered_work))):
+        raise ValueError("paired persistent grids require an even CTA count, and M-fast traversal an even M-tile count")
 
     # TMA stores permit partial output tiles. Each operand's SMEM atom must
     # divide its local tile, not the full global matrix dimension; dense TMA
@@ -649,6 +656,18 @@ def _schedule_matmul(
             tile_sizes=[output_m_tile*group_size,output_n_tile],
             iteration_bindings=output_bindings,for_loop_labels=[None,None],
             op_label_filter="mm",allow_partial_tiles=True))
+    elif pair_major:
+        pipeline.add_pass(
+            TileMatmul(
+                op_dims=["M", "N", "M"],
+                tile_sizes=[2 * output_m_tile, output_n_tile, output_m_tile],
+                iteration_bindings=[block_x, block_x, block_x],
+                for_loop_labels=[None, None, None],
+                op_label_filter="mm",
+                allow_partial_tiles=True,
+                reversed_dims=list(output_reversed_dims),
+            )
+        )
     elif group_size == 1:
         pipeline.add_pass(
             TileMatmul(
