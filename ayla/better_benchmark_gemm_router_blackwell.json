@@ -972,12 +972,12 @@
       "note": "1152x768x3072 f16: paired K128, 7 stages, queue depth 2, descriptors not hoisted (K128 halves the single issuer's per-batch commit/refill/probe overhead per unit of K; 12.42 -> 11.62 us vs cuBLAS 11.01 us, NCU cold L2, two GPUs). Selected using rotated cold-L2 NCU kernel durations on two B200 GPUs; this does not replace the corpus inference-v2 timings. Hoisting sweep covered 144 paired routes; no broad hoisting change was promoted."
     },
     "split_k_in_kernel_reduction_20261122": {
-      "routes_changed": 60,
-      "note": "Split-K reductions folded into the partial kernel. 'fixup' (15 routes): the last contributor per tile reduces it, no waiting. 'resident' (44 routes): cooperative launch; all contributors publish, then each reduces 1/split of the tile (the grid must be co-resident, so only one-wave grids). Chosen per route from two cold-L2 NCU runs on rotated GPUs versus partial + finalizer kernel durations (the inter-kernel gap is not counted); switched only where both runs were at least 2% faster. 128x384x25664 moved from workspace split 16 (192 CTAs, too many for a cooperative grid) to resident split 12 (-13%, two GPUs). Typical gain 5-25%; workspace kept for 2048x512x16448 and the transposed / N%4 routes; the 18 cluster routes stay cluster (resident/fixup were 0-23% slower there)."
+      "routes_changed": 0,
+      "note": "The fixup/resident in-kernel reduction backends remain available but route no shapes. Their selection compared NCU durations of partial + finalizer kernels against the fused kernel; NCU overstates an isolated small finalizer's cost, and inference-v2 (CUDA-graph layers) measured the 60 switched routes 15% slower (geomean), so all were returned to the workspace finalizer on 2026-11-23."
     },
     "large_m_pairing_20261123": {
-      "routes_changed": 11,
-      "note": "Large-M routes below 100% re-screened after pairing became usable in persistent shared rings (pair-major N-fast job numbering, paired phase relay in the unrolled shared ring). Single-CTA 3-bank routes paired with the same tile (12544x512x1536 -12.5%, 12544x512x1024 -10%), 25216x320x960 paired shared ring (-8%), and stage/queue retunes on paired routes (-2 to -4.5%); 12544x512x512 also takes a writeback-fragment combination. Chosen from two cold-L2 NCU runs on different GPUs, each at least 2% faster than the shipped kernel; 3000-launch stress per route."
+      "routes_changed": 7,
+      "note": "Large-M routes below 100% re-screened after pairing became usable in persistent shared rings (pair-major N-fast job numbering, paired phase relay in the unrolled shared ring). Kept where inference-v2 confirmed at least 1%: 12544x512x1536 87.1->98.9%, 12544x512x1024 88.5->97.0%, 12544x512x512 94.3->102.0%, 8448x2048x512, 25216x320x960, 8192x2048x512 and 12544x768x256. 100352x64x512, 12672x768x2304/3072 and 6144x1536x512 were not better in inference-v2 and keep their previous routes."
     },
     "heuristic_cleanup_20261120": {
       "routes_replaced": 8,
@@ -1321,8 +1321,7 @@
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       }
     },
     {
@@ -1543,8 +1542,7 @@
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       }
     },
     {
@@ -1901,8 +1899,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n1024-k12544-2472023f41c7-workspace-961685d9d696",
@@ -1992,8 +1989,7 @@
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k": 3,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "pipeline": {}
       }
     },
     {
@@ -2188,8 +2184,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       }
     },
     {
@@ -2206,8 +2201,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n2048-k12544-93e79bfacdde-workspace-7687c930a22a",
@@ -2632,8 +2626,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m768-n768-k8192-97d8cc798883-workspace-961685d9d696",
@@ -2698,8 +2691,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       }
     },
     {
@@ -2716,8 +2708,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       }
     },
     {
@@ -3735,8 +3726,7 @@
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       }
     },
     {
@@ -3773,8 +3763,7 @@
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       }
     },
     {
@@ -3790,8 +3779,7 @@
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       }
     },
     {
@@ -3807,8 +3795,7 @@
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k": 3,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1536-n512-k6400-724481642c36-workspace-f16a3f253935",
@@ -3873,8 +3860,7 @@
         "split_k": 3,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "fixup"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1536-n512-k12544-8cb8e1fb4b4c-workspace-ffa8b8c608f8",
@@ -3940,8 +3926,7 @@
         "split_k": 3,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "fixup"
+        }
       }
     },
     {
@@ -4073,8 +4058,7 @@
         "cta_group": 1,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       }
     },
     {
@@ -6573,7 +6557,7 @@
       "n": 1536,
       "k": 512,
       "configuration": {
-        "operand_stages": 6,
+        "operand_stages": 5,
         "cta_group": 2,
         "output_grid_size": 148,
         "output_store": "stmatrix",
@@ -6589,8 +6573,7 @@
           "reduction": {
             "form": "rolled",
             "unroll": 4
-          },
-          "mma_pending": 2
+          }
         }
       }
     },
@@ -9294,7 +9277,7 @@
       "k": 2304,
       "configuration": {
         "output_n_tile": 176,
-        "operand_stages": 7,
+        "operand_stages": 5,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 4,
@@ -9317,11 +9300,8 @@
           "reduction": {
             "form": "rolled",
             "unroll": 2
-          },
-          "mma_pending": 2
-        },
-        "cta_group": 2,
-        "output_store_buffers": 2
+          }
+        }
       }
     },
     {
@@ -9333,7 +9313,7 @@
       "k": 3072,
       "configuration": {
         "output_n_tile": 176,
-        "operand_stages": 7,
+        "operand_stages": 5,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 4,
@@ -9356,11 +9336,8 @@
           "reduction": {
             "form": "rolled",
             "unroll": 2
-          },
-          "mma_pending": 2
-        },
-        "cta_group": 2,
-        "output_store_buffers": 2
+          }
+        }
       }
     },
     {
@@ -10580,7 +10557,7 @@
         "cta_group": 2,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "operand_stages": 4,
+        "operand_stages": 5,
         "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 2,
@@ -10591,8 +10568,7 @@
           "participants": "round_robin",
           "reduction": {
             "form": "rolled"
-          },
-          "mma_pending": 1
+          }
         }
       }
     },
@@ -11137,8 +11113,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 0
-        },
-        "split_k_backend": "fixup"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n512-k4096-98a4ad1a8088-workspace-b6cb0121654e",
@@ -11203,8 +11178,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k8192-2eb75eca4a88-workspace-43af7419a29b",
@@ -11273,8 +11247,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 0
-        },
-        "split_k_backend": "fixup"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n128-k4096-31aaad550532-workspace-7b31d45dfa4d",
@@ -11486,8 +11459,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n2048-k8192-4dbd5c607c5f-workspace-43af7419a29b",
@@ -11551,8 +11523,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n256-k32768-65c9dbef5768-workspace-f4ee73d5c153",
@@ -11617,8 +11588,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k12544-3193b19d1c1b-workspace-43af7419a29b",
@@ -11754,8 +11724,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k7936-734bae34b701-workspace-43af7419a29b",
@@ -11820,8 +11789,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k8448-f5b538ed2d70-workspace-43af7419a29b",
@@ -11887,8 +11855,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1536-n256-k12544-d31029b6ec3f-workspace-60f0bc1eb888",
@@ -11955,8 +11922,7 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m196-n192-k24576-c5350283d8da-workspace-9093e6fcbea1",
@@ -12023,10 +11989,10 @@
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
+        "reduction_threads": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m24-n24-k200704-4809dfde04c7-workspace-8c1409e9d7d8",
@@ -12093,8 +12059,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n256-k8192-530cfc64d90f-workspace-b390e5542042",
@@ -12158,8 +12123,7 @@
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m196-n196-k49152-cd4f2694fc17-workspace-998839db5649",
@@ -12225,8 +12189,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m196-n384-k49152-32a47e9cc714-workspace-72ce1d5acf46",
@@ -12293,10 +12256,10 @@
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
+        "reduction_threads": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m24-n96-k200704-d349d9838e61-workspace-7cb0aa766a3f",
@@ -12363,10 +12326,10 @@
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
+        "reduction_threads": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m48-n24-k200704-2f7819b0facf-workspace-8c1409e9d7d8",
@@ -12433,10 +12396,10 @@
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
+        "reduction_threads": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m96-n24-k200704-e4a91b6555fa-workspace-8c1409e9d7d8",
@@ -12644,8 +12607,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k16448-a8f55e121cb3-workspace-43af7419a29b",
@@ -12710,8 +12672,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n1024-k25088-7c962e157ac7-workspace-4e2f992a8ae8",
@@ -12778,8 +12739,7 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m192-n384-k16384-b2aaced63fe2-workspace-9d4c7f15fa4e",
@@ -12845,8 +12805,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m192-n576-k50176-b564a044abf5-workspace-33a4f3df47a4",
@@ -12986,10 +12945,10 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
+        "reduction_threads": 32,
         "pipeline": {
           "mma_pending": 0
-        },
-        "split_k_backend": "fixup"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m23-n16-k65536-cf70ab2901f6-workspace-8370e9f5f595",
@@ -13056,8 +13015,8 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m31-n16-k131072-d78df4201318-workspace-2ee96698b341",
@@ -13124,8 +13083,7 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m384-n192-k16384-2b9b9a7cac26-workspace-9d4c7f15fa4e",
@@ -13192,8 +13150,7 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m486-n192-k12544-915ec8325dd0-workspace-7fdc9c7d4015",
@@ -13258,8 +13215,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m576-n192-k16384-8caccbd40c7e-workspace-d6e574b414b9",
@@ -13325,8 +13281,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m768-n256-k50176-2a17e8fafc9a-workspace-33a4f3df47a4",
@@ -13391,8 +13346,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1024-n256-k25088-472a2b2b1e2d-workspace-43af7419a29b",
@@ -13452,14 +13406,13 @@
       "k": 25664,
       "frequency": 3,
       "configuration": {
-        "split_k": 12,
+        "split_k": 16,
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_stages": 9,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m128-n384-k25664-d5243e790e20-workspace-56806a686794",
@@ -13527,8 +13480,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 0
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m240-n240-k4096-6760f04479fd-workspace-cdf76516609d",
@@ -13664,8 +13616,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m256-n256-k61568-13c3c82e3b21-workspace-20a0287eb368",
@@ -13803,8 +13754,7 @@
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
         "split_k": 3,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m720-n240-k4096-8e6bd65f4b18-workspace-a26c6736c14c",
@@ -13941,8 +13891,7 @@
         "tmem_writeback_register_budget": 32,
         "pipeline": {
           "mma_pending": 2
-        },
-        "split_k_backend": "resident"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m144-n144-k65536-60639ff9c30a-workspace-5ef426710890",
@@ -14155,8 +14104,8 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m23-n16-k262144-0b9e68744529-workspace-5c9b0bbb710d",
@@ -14223,8 +14172,8 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m31-n128-k131072-4eeb36c44405-workspace-dd4efbb0305a",
@@ -14291,8 +14240,8 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m31-n128-k65536-21121a44bddc-workspace-ad6a020938e9",
@@ -14357,8 +14306,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m320-n320-k25216-d4f8d354e7a9-workspace-4e2f992a8ae8",
@@ -14425,8 +14373,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n512-k6400-93899f0a7e02-workspace-6c241baf4d10",
@@ -14491,8 +14438,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m512-n64-k401536-836483a7acce-workspace-20a0287eb368",
@@ -14559,8 +14505,8 @@
         "operand_k_tile": 128,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m63-n32-k262144-8f55761f0c14-workspace-5c9b0bbb710d",
@@ -14625,8 +14571,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1000-n384-k12544-90eb9140715c-workspace-34dcd52e2e22",
@@ -14834,8 +14779,7 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "resident"
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m1280-n256-k6272-fe83e56f7cb2-workspace-34dcd52e2e22",
@@ -14974,8 +14918,8 @@
         "operand_stages": 7,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
-        "pipeline": {},
-        "split_k_backend": "fixup"
+        "reduction_threads": 32,
+        "pipeline": {}
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n256-k32768-d07a258e2637-workspace-8b98b249fefd",
@@ -15043,10 +14987,10 @@
         "operand_stages": 2,
         "tmem_writeback_warps": 8,
         "tmem_writeback_register_budget": 32,
+        "reduction_threads": 32,
         "pipeline": {
           "mma_pending": 0
-        },
-        "split_k_backend": "fixup"
+        }
       },
       "complete_gemm_split_k_confirmation": {
         "shape_id": "mm-m2-n512-k4096-8108a6d36134-workspace-bae796ad9540",
