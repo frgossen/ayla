@@ -983,6 +983,10 @@
       "routes_changed": 8,
       "note": "Routes below 96% re-screened with inference-v2 directly (HEAD library, CUDA-graph layers). Seven single-CTA routes paired with the same tile (more stages, MMA queue 1-2): 768x3072x8192 +11%, 1024x1024x2048 +8-10%, 768x2304x4096 +5-8%, 2304x768x1152, 3072x768x2048, 3072x768x1152 and 1024x4096x2048 +3-6%. 61568x256x256 moves from the rolled to the unrolled paired shared ring (+9-13%). Each confirmed by two inference-v2 runs on different GPUs, both at least 2% faster; 3000-launch stress per route. Converting the other rolled paired routes to the unrolled ring was 4-20% slower and is not routed."
     },
+    "sixteen_wide_balance_20261123": {
+      "routes_changed": 2,
+      "note": "Balanced tile search over every 16-column N tile (paired tcgen05 accepts any multiple of 16), scored by per-pair critical path = rounds x tile width. 12672x3072x768 transposed N240 K64x6: 94.2 -> 98.3% (9 rounds of 240 vs 256); 61568x256x768 transposed N208 K64x7 grid 148: 98.3 -> 102.5%. Both 8/8 paired inference-v2 runs over 4 GPUs, 3000-launch stress. N240 lost on the K=512 shapes 6272/6400x2048x512 and on 512x50272x768."
+    },
     "persistent_tail_balance_20261123": {
       "routes_changed": 5,
       "note": "Static persistent schedules lose the last wave when output tiles do not divide evenly among workers (8192x3072x768: 384 pair tiles over 74 pairs, 86.5% tail efficiency; cuBLAS balances with a hardware tile queue). Re-tiled to balanced tile counts: 8192x3072x768 N224/K64x6 (about 89 -> 97-99%, five inference-v2 runs), 7936x2048x512 N224 (+6-7%), 6272x1280x320 N224 grid 140 (+3-4%). Each confirmed on at least two GPUs; 3000-launch stress per route. 8192x2048x512 transposed N224 grid 148 (+3.2 pt, 8/8 paired runs) and 61568x256x768 transposed N224 grid 140 (+0.9 pt, 7/8). Narrower balanced tiles (N128-N192) lose 1-35% on every group shape: per-tile cost outweighs the tail."
@@ -9379,7 +9383,7 @@
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
         "cta_group": 2,
-        "operand_k_tile": 128,
+        "operand_k_tile": 64,
         "output_grid_size": 148,
         "operand_move_attrs": {
           "lhs": {
@@ -9397,7 +9401,9 @@
           "reduction": {
             "form": "rolled"
           }
-        }
+        },
+        "output_n_tile": 240,
+        "operand_stages": 6
       }
     },
     {
@@ -10372,8 +10378,8 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "operand_stages": 6,
-        "output_grid_size": 140,
+        "operand_stages": 7,
+        "output_grid_size": 148,
         "output_store": "stmatrix",
         "output_slices": 4,
         "output_store_buffers": 2,
@@ -10395,7 +10401,7 @@
             "form": "rolled"
           }
         },
-        "output_n_tile": 224,
+        "output_n_tile": 208,
         "operand_k_tile": 64,
         "transpose_output": true
       }
