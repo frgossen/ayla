@@ -983,6 +983,10 @@
       "routes_changed": 8,
       "note": "Routes below 96% re-screened with inference-v2 directly (HEAD library, CUDA-graph layers). Seven single-CTA routes paired with the same tile (more stages, MMA queue 1-2): 768x3072x8192 +11%, 1024x1024x2048 +8-10%, 768x2304x4096 +5-8%, 2304x768x1152, 3072x768x2048, 3072x768x1152 and 1024x4096x2048 +3-6%. 61568x256x256 moves from the rolled to the unrolled paired shared ring (+9-13%). Each confirmed by two inference-v2 runs on different GPUs, both at least 2% faster; 3000-launch stress per route. Converting the other rolled paired routes to the unrolled ring was 4-20% slower and is not routed."
     },
+    "persistent_tail_balance_20261123": {
+      "routes_changed": 3,
+      "note": "Static persistent schedules lose the last wave when output tiles do not divide evenly among workers (8192x3072x768: 384 pair tiles over 74 pairs, 86.5% tail efficiency; cuBLAS balances with a hardware tile queue). Re-tiled to balanced tile counts: 8192x3072x768 N224/K64x6 (about 89 -> 97-99%, five inference-v2 runs), 7936x2048x512 N224 (+6-7%), 6272x1280x320 N224 grid 140 (+3-4%). Each confirmed on at least two GPUs; 3000-launch stress per route."
+    },
     "heuristic_cleanup_20261120": {
       "routes_replaced": 8,
       "fields_before": 5494,
@@ -6946,9 +6950,9 @@
       "n": 1280,
       "k": 320,
       "configuration": {
-        "operand_stages": 5,
+        "operand_stages": 6,
         "cta_group": 2,
-        "output_grid_size": 148,
+        "output_grid_size": 140,
         "output_store": "stmatrix",
         "output_slices": 2,
         "output_store_buffers": 2,
@@ -6963,7 +6967,9 @@
             "form": "rolled",
             "unroll": 2
           }
-        }
+        },
+        "output_n_tile": 224,
+        "operand_k_tile": 64
       }
     },
     {
@@ -7473,7 +7479,9 @@
             "form": "rolled"
           },
           "mma_pending": 2
-        }
+        },
+        "output_n_tile": 224,
+        "operand_k_tile": 64
       }
     },
     {
@@ -7741,7 +7749,7 @@
       "k": 768,
       "configuration": {
         "cta_group": 2,
-        "operand_k_tile": 128,
+        "operand_k_tile": 64,
         "output_store": "stmatrix",
         "output_slices": 4,
         "tmem_writeback_register_budget": 64,
@@ -7756,7 +7764,9 @@
           "reduction": {
             "form": "rolled"
           }
-        }
+        },
+        "output_n_tile": 224,
+        "operand_stages": 6
       }
     },
     {
