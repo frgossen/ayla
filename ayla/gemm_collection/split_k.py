@@ -47,6 +47,8 @@ class BlackwellSplitKLauncher:
     A separate workspace is required for concurrent calls on different
     streams. Allocate ``workspace_shape`` once, then call
     ``launch(a, bt, out, workspace)``; both launches are included in capture.
+    In-kernel reductions (one launch) also accept ``workspace=None`` and then
+    use private per-stream scratch; their tile counters are always private.
     """
 
     def __init__(
@@ -68,7 +70,8 @@ class BlackwellSplitKLauncher:
         # A last-contributor kernel also takes the output and keeps its
         # per-tile counters after the partials in the workspace.
         tensors = [t for t in partial_kernel.signature if isinstance(t, GmemTensorType)]
-        self.in_kernel_reduction = reduction_kernel is None and len(tensors) == 4
+        self.in_kernel_reduction = reduction_kernel is None and len(tensors) == 5
+        self.counter_shape = tuple(tensors[4].sizes) if self.in_kernel_reduction else None
         self.workspace_shape = (
             tuple(reduction_kernel.signature[0].sizes)
             if reduction_kernel is not None
@@ -76,7 +79,7 @@ class BlackwellSplitKLauncher:
             if self.in_kernel_reduction
             else (0,)
         )
-        self._counted_workspaces = set()
+        self._scratch_by_stream = {}
         self.transpose_output = transpose_output
         self.transpose_reduction = transpose_reduction
         self.shape = (m, n, k)
@@ -88,6 +91,19 @@ class BlackwellSplitKLauncher:
             else None
         )
 
+    def _scratch(self, a, role, shape, zero=False):
+        """Per-stream private storage; fresh storage under graph capture."""
+        import torch
+
+        with torch.cuda.device(a.device):
+            allocate = torch.zeros if zero else torch.empty
+            if torch.cuda.is_current_stream_capturing():
+                return allocate(shape, device=a.device, dtype=torch.float32)
+            key = (role, a.device, torch.cuda.current_stream(a.device).cuda_stream)
+            if key not in self._scratch_by_stream:
+                self._scratch_by_stream[key] = allocate(shape, device=a.device, dtype=torch.float32)
+            return self._scratch_by_stream[key]
+
     def __call__(self, a, bt, out, workspace=None):
         import torch
 
@@ -98,6 +114,8 @@ class BlackwellSplitKLauncher:
             (bt, (n, k), expected_dtype),
             (out, (m, n), expected_dtype),
         )
+        if self.in_kernel_reduction and workspace is None:
+            workspace = self._scratch(a, "workspace", self.workspace_shape)
         if self.reduction_launch is not None or self.in_kernel_reduction:
             if workspace is None:
                 raise ValueError("split-K requires an FP32 workspace")
@@ -114,12 +132,11 @@ class BlackwellSplitKLauncher:
                 "split-K operands, output and FP32 workspace must match the compiled shapes, dtypes and CUDA device and be contiguous"
             )
         if self.in_kernel_reduction:
-            if workspace.data_ptr() not in self._counted_workspaces:
-                # Counters start at zero and each reducer restores zero.
-                # Partials are fully rewritten, so clear the whole buffer once.
-                workspace.zero_()
-                self._counted_workspaces.add(workspace.data_ptr())
-            self.partial_launch(a, bt, workspace, out)
+            # Counters are private, zeroed once per stream and restored to
+            # zero by each reducer. A capture gets fresh storage retained by
+            # its graph; the replayed zeroing only touches the counters.
+            counters = self._scratch(a, "counters", self.counter_shape, zero=True)
+            self.partial_launch(a, bt, workspace, out, counters)
             return
         if self.reduction_launch is None:
             if self.transpose_output:
@@ -639,8 +656,8 @@ def blackwell_split_k_workspace_modules(
     ``in_kernel_reduction`` returns one kernel and no finalizer: each CTA
     publishes its partial tile with a release ticket on a per-tile counter,
     and the last contributor reduces the tile. Nothing waits for another CTA,
-    so residency is unconstrained. Counters follow the partials in the
-    workspace; they must start at zero, and the reducer restores zero.
+    so residency is unconstrained. Per-tile counters live in a separate buffer
+    owned by the launcher; they start at zero and each reducer restores zero.
     """
     if pipeline is not None:
         plan = PipelineSchedule.parse(pipeline, default_pending=1)
@@ -738,14 +755,15 @@ def blackwell_split_k_workspace_modules(
                          "no bias and N aligned to four")
     # Resident reductions keep separate arrival and departure counters.
     counters = tiles * (2 if resident_reduction else 1)
-    counter_rows = math.ceil(counters / padded_n) if in_kernel_reduction else 0
     workspace_type = (
         f"{split_k * padded_m}x{padded_n}xf32 strides=[1, {split_k * padded_m}]"
         if transpose_output and not transpose_reduction
-        else f"{split_k * padded_m + counter_rows}x{padded_n}xf32"
+        else f"{split_k * padded_m}x{padded_n}xf32"
     )
     name = f"blackwell_split_k_partial_m{m}_n{n}_k{k}_{dtype}_p{split_k}"
-    output_argument = (f", %c: gmem<{original_m}x{original_n}x{dtype}>"
+    # The output and a launcher-owned counter buffer (32-bit words) follow
+    # the workspace, which keeps the finalizer backend's ownership contract.
+    output_argument = (f", %c: gmem<{original_m}x{original_n}x{dtype}>, %t: gmem<{counters}xf32>"
                        if in_kernel_reduction else "")
     module = gpu_dialect.parse_module(f"""
         module attrs={{target: "sm_100a"}} {{
@@ -813,14 +831,14 @@ def blackwell_split_k_workspace_modules(
         kernel.body.ops.extend([
             ticket,
             PTXTemplateOp.build(
-                operands=[w, output_arguments[0], ticket.result()],
+                operands=[w, output_arguments[0], ticket.result(), output_arguments[1]],
                 result_types=[],
                 template=_last_contributor_reduction(
                     split_k, original_m, original_n, padded_m, padded_n,
                     output_m_tile, output_n_tile, tiles, tiles_m,
                     tmem_writeback_warps * 32, dtype, resident=resident_reduction,
                 ),
-                operand_names=["workspace", "dst", "ticket"],
+                operand_names=["workspace", "dst", "ticket", "counters"],
                 result_names=[],
                 description="FP32 split-K last-contributor reduction",
             ),
@@ -937,7 +955,7 @@ def _last_contributor_reduction(splits, m, n, padded_m, padded_n, m_tile, n_tile
         rem.u32 ${{b32:tile}}, ${{b32:block}}, {tiles};
         setp.eq.u32 ${{pred:leader}}, ${{b32:tid}}, 0;
         mul.wide.u32 ${{b64:counter_offset}}, ${{b32:tile}}, 4;
-        add.u64 ${{b64:counter}}, ${{b64:operand.workspace.ptr}}, {splits * partition * 4};
+        mov.u64 ${{b64:counter}}, ${{b64:operand.counters.ptr}};
         add.u64 ${{b64:counter}}, ${{b64:counter}}, ${{b64:counter_offset}};
         @${{pred:leader}} fence.acq_rel.gpu;
     """

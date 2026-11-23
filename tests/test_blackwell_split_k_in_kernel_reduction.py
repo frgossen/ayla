@@ -38,20 +38,18 @@ def test_last_contributor_split_k_reduces_in_one_kernel(shape, configuration, ba
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
     b = torch.randn(n, k, device="cuda", dtype=torch.float16)
     out = torch.empty(m, n, device="cuda", dtype=torch.float16)
-    # Garbage before first use: the launcher clears counters once.
+    # The workspace needs no initialization: counters are launcher-private.
     workspace = torch.full(launcher.workspace_shape, float("nan"), device="cuda")
     expected = (a.float() @ b.float().T).half()
-    for _ in range(3):
+    for use_workspace in (True, True, False, False):
         out.fill_(float("nan"))
-        launcher(a, b, out, workspace)
+        launcher(a, b, out, workspace if use_workspace else None)
         torch.cuda.synchronize()
         torch.testing.assert_close(out, expected, atol=0.25, rtol=0.02)
     # Every reducer restored its tile counters for the next launch.
-    group = configuration.get("cta_group", 2)
-    tile_m = configuration.get("output_m_tile", 128)
-    padded_m = -(-m // (group * tile_m)) * group * tile_m
-    counters = workspace[configuration["split_k"] * padded_m:].reshape(-1).view(torch.int32)
-    assert int(counters.count_nonzero()) == 0
+    for (role, *_), counters in launcher._scratch_by_stream.items():
+        if role == "counters":
+            assert int(counters.view(torch.int32).count_nonzero()) == 0
 
 
 def test_last_contributor_split_k_rejects_unsupported_layouts():
