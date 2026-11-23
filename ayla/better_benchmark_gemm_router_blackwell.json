@@ -983,6 +983,10 @@
       "routes_changed": 8,
       "note": "Routes below 96% re-screened with inference-v2 directly (HEAD library, CUDA-graph layers). Seven single-CTA routes paired with the same tile (more stages, MMA queue 1-2): 768x3072x8192 +11%, 1024x1024x2048 +8-10%, 768x2304x4096 +5-8%, 2304x768x1152, 3072x768x2048, 3072x768x1152 and 1024x4096x2048 +3-6%. 61568x256x256 moves from the rolled to the unrolled paired shared ring (+9-13%). Each confirmed by two inference-v2 runs on different GPUs, both at least 2% faster; 3000-launch stress per route. Converting the other rolled paired routes to the unrolled ring was 4-20% slower and is not routed."
     },
+    "small_grid_long_k_20261123": {
+      "routes_changed": 15,
+      "note": "Few output tiles with long K, one wave of 128-148 CTAs. cuBLAS runs every such shape with paired CTAs and deep K staging. Six routes used single-CTA M64 MMAs (twice the tensor cycles); pairing fixes them. With the common issuer, small tiles need more MMA work per stage: K192x5-6 for M64 tiles, K128x6-8 otherwise. 15 routes confirmed on two GPUs (+2.7 to +14 pt; e.g. 1024x768x3072 85->98%, 1152x768x2304 88->102%, 512x2048x6272 99->111%), 3000-launch stress each. 4-CTA multicast loses: over 132 CTAs it needs a second wave, and below that the issuer blocks on cross-pair waits."
+    },
     "sixteen_wide_balance_20261123": {
       "routes_changed": 2,
       "note": "Balanced tile search over every 16-column N tile (paired tcgen05 accepts any multiple of 16), scored by per-pair critical path = rounds x tile width. 12672x3072x768 transposed N240 K64x6: 94.2 -> 98.3% (9 rounds of 240 vs 256); 61568x256x768 transposed N208 K64x7 grid 148: 98.3 -> 102.5%. Both 8/8 paired inference-v2 runs over 4 GPUs, 3000-launch stress. N240 lost on the K=512 shapes 6272/6400x2048x512 and on 512x50272x768."
@@ -1879,22 +1883,21 @@
       "n": 1024,
       "k": 4096,
       "configuration": {
-        "output_n_tile": 64,
-        "operand_k_tile": 128,
-        "operand_stages": 6,
-        "output_grid_fast_axis": "n",
+        "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "output_m_tile": 64,
-        "operand_move_attrs": {
-          "rhs": {
-            "l2_cache_hint": "evict_first"
-          }
-        },
         "hoist_mma_descriptors": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 64,
+        "operand_k_tile": 192,
         "transpose_output": false,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "tmem_writeback_warps": 8,
+        "operand_stages": 6
       }
     },
     {
@@ -2012,21 +2015,20 @@
       "n": 2048,
       "k": 1568,
       "configuration": {
-        "output_n_tile": 128,
-        "operand_stages": 8,
-        "output_grid_fast_axis": "n",
-        "allow_partial_tiles": true,
-        "output_m_tile": 64,
         "output_store": "stmatrix",
-        "output_layout": "tcgen05_16x32bx2",
-        "operand_move_attrs": {
-          "rhs": {
-            "l2_cache_hint": "evict_first"
-          }
-        },
+        "tmem_writeback_register_budget": 64,
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "transpose_output": false,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "operand_stages": 12
       }
     },
     {
@@ -2037,23 +2039,20 @@
       "n": 2048,
       "k": 6272,
       "configuration": {
-        "split_k": 1,
-        "transpose_output": false,
-        "output_n_tile": 64,
-        "cta_group": 2,
-        "cluster_n_ctas": 2,
-        "operand_stages": 10,
-        "tmem_writeback_warps": 8,
-        "hoist_mma_descriptors": true,
+        "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
-        "operand_move_attrs": {
-          "rhs": {
-            "l2_cache_hint": "evict_first"
-          }
-        },
+        "hoist_mma_descriptors": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "transpose_output": true,
         "pipeline": {
           "mma_pending": 2
-        }
+        },
+        "operand_stages": 13
       }
     },
     {
@@ -2534,24 +2533,20 @@
       "n": 768,
       "k": 1024,
       "configuration": {
-        "cta_group": 2,
         "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
         "output_m_tile": 64,
-        "output_n_tile": 96,
-        "operand_stages": 13,
-        "cluster_n_ctas": 2,
-        "cluster_dim": [
-          4,
-          1,
-          1
-        ],
+        "output_n_tile": 64,
+        "operand_k_tile": 128,
         "transpose_output": true,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "operand_stages": 8
       }
     },
     {
@@ -2612,16 +2607,20 @@
       "n": 768,
       "k": 4096,
       "configuration": {
-        "output_grid_fast_axis": "n",
+        "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
         "output_m_tile": 64,
         "output_n_tile": 64,
         "operand_k_tile": 128,
-        "operand_stages": 6,
-        "hoist_mma_descriptors": true,
+        "transpose_output": false,
         "pipeline": {
-          "mma_pending": 1
-        }
+          "mma_pending": 2
+        },
+        "operand_stages": 8
       }
     },
     {
@@ -2751,17 +2750,19 @@
       "n": 2304,
       "k": 2048,
       "configuration": {
-        "output_n_tile": 96,
-        "operand_stages": 7,
         "output_store": "stmatrix",
-        "output_slices": 2,
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 128,
-        "transpose_output": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_n_tile": 96,
+        "operand_k_tile": 64,
+        "transpose_output": false,
         "pipeline": {
-          "mma_pending": 1
-        }
+          "mma_pending": 2
+        },
+        "operand_stages": 9
       }
     },
     {
@@ -3091,24 +3092,21 @@
       "n": 768,
       "k": 3072,
       "configuration": {
-        "output_n_tile": 96,
-        "operand_k_tile": 128,
-        "operand_stages": 5,
-        "output_grid_fast_axis": "n",
-        "allow_partial_tiles": true,
-        "output_m_tile": 64,
-        "operand_move_attrs": {
-          "rhs": {
-            "l2_cache_hint": "evict_first"
-          }
-        },
-        "tmem_writeback_register_budget": 64,
         "output_store": "stmatrix",
-        "interleave_mma_descriptors": true,
+        "tmem_writeback_register_budget": 64,
+        "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 96,
+        "operand_k_tile": 192,
+        "transpose_output": false,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "interleave_mma_descriptors": true,
+        "operand_stages": 5
       }
     },
     {
@@ -3243,22 +3241,21 @@
       "n": 1024,
       "k": 4096,
       "configuration": {
-        "cta_group": 2,
         "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
-        "output_n_tile": 64,
-        "operand_stages": 10,
-        "cluster_n_ctas": 2,
-        "cluster_dim": [
-          4,
-          1,
-          1
-        ],
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 128,
+        "operand_k_tile": 128,
+        "transpose_output": true,
         "pipeline": {
-          "mma_pending": 2
-        }
+          "mma_pending": 1
+        },
+        "operand_stages": 6,
+        "tmem_writeback_warps": 8
       }
     },
     {
@@ -3672,20 +3669,21 @@
       "n": 768,
       "k": 2304,
       "configuration": {
-        "output_m_tile": 64,
-        "output_n_tile": 96,
-        "operand_k_tile": 128,
-        "operand_stages": 5,
         "output_store": "stmatrix",
-        "tmem_writeback_register_budget": 128,
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "output_grid_fast_axis": "n",
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 96,
+        "operand_k_tile": 192,
         "transpose_output": true,
-        "prefetch_tma_descriptors": true,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "interleave_mma_descriptors": true,
+        "operand_stages": 5
       }
     },
     {
@@ -3696,16 +3694,21 @@
       "n": 768,
       "k": 3072,
       "configuration": {
-        "cta_group": 2,
-        "output_m_tile": 64,
-        "output_n_tile": 96,
-        "operand_k_tile": 128,
-        "operand_stages": 7,
         "output_store": "stmatrix",
         "tmem_writeback_register_budget": 64,
+        "allow_partial_tiles": true,
+        "hoist_mma_descriptors": true,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_m_tile": 64,
+        "output_n_tile": 96,
+        "operand_k_tile": 192,
+        "transpose_output": true,
         "pipeline": {
-          "mma_pending": 2
-        }
+          "mma_pending": 1
+        },
+        "interleave_mma_descriptors": true,
+        "operand_stages": 5
       }
     },
     {
@@ -4942,17 +4945,19 @@
       "n": 768,
       "k": 2048,
       "configuration": {
-        "cta_group": 2,
         "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
         "output_n_tile": 96,
-        "operand_stages": 8,
+        "operand_k_tile": 64,
         "transpose_output": true,
         "pipeline": {
           "mma_pending": 2
-        }
+        },
+        "operand_stages": 9
       }
     },
     {
@@ -5244,18 +5249,19 @@
       "n": 768,
       "k": 4096,
       "configuration": {
-        "output_m_tile": 64,
-        "cta_group": 2,
-        "operand_stages": 7,
-        "allow_partial_tiles": true,
         "output_store": "stmatrix",
-        "tmem_writeback_register_budget": 128,
+        "tmem_writeback_register_budget": 64,
+        "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "transpose_output": false,
-        "output_layout": "tcgen05_16x256b",
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
+        "output_n_tile": 128,
+        "operand_k_tile": 64,
+        "transpose_output": true,
         "pipeline": {
-          "mma_pending": 1
-        }
+          "mma_pending": 2
+        },
+        "operand_stages": 8
       },
       "complete_gemm_below95_alternatives_20261119_confirmation": {
         "shape_id": "mm-m3072-n768-k4096-cd19457e0f45-legal_fragment_geometry_t0_m64_n256_g2_k64_s7-6d34a292507d",
@@ -5864,18 +5870,20 @@
       "n": 256,
       "k": 768,
       "configuration": {
-        "cta_group": 2,
         "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
         "output_m_tile": 64,
         "output_n_tile": 96,
-        "operand_stages": 12,
+        "operand_k_tile": 128,
         "transpose_output": true,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "operand_stages": 6
       }
     },
     {
@@ -5971,24 +5979,20 @@
       "n": 128,
       "k": 1024,
       "configuration": {
-        "cta_group": 2,
         "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
         "output_m_tile": 64,
-        "output_n_tile": 96,
-        "operand_stages": 13,
-        "cluster_n_ctas": 2,
-        "cluster_dim": [
-          4,
-          1,
-          1
-        ],
+        "output_n_tile": 64,
+        "operand_k_tile": 128,
         "transpose_output": true,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "operand_stages": 8
       }
     },
     {
@@ -7515,23 +7519,19 @@
       "n": 256,
       "k": 2048,
       "configuration": {
-        "cta_group": 2,
         "output_store": "stmatrix",
+        "tmem_writeback_register_budget": 64,
         "allow_partial_tiles": true,
         "hoist_mma_descriptors": true,
-        "tmem_writeback_register_budget": 64,
+        "cta_group": 2,
+        "output_grid_fast_axis": "m",
         "output_n_tile": 128,
-        "operand_stages": 7,
-        "cluster_n_ctas": 2,
-        "cluster_dim": [
-          4,
-          1,
-          1
-        ],
-        "transpose_output": true,
+        "operand_k_tile": 64,
+        "transpose_output": false,
         "pipeline": {
           "mma_pending": 1
-        }
+        },
+        "operand_stages": 8
       }
     },
     {
