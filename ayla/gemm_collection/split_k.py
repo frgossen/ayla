@@ -65,11 +65,18 @@ class BlackwellSplitKLauncher:
 
         self.partial_kernel = partial_kernel
         self.reduction_kernel = reduction_kernel
+        # A last-contributor kernel also takes the output and keeps its
+        # per-tile counters after the partials in the workspace.
+        tensors = [t for t in partial_kernel.signature if isinstance(t, GmemTensorType)]
+        self.in_kernel_reduction = reduction_kernel is None and len(tensors) == 4
         self.workspace_shape = (
             tuple(reduction_kernel.signature[0].sizes)
             if reduction_kernel is not None
+            else tuple(partial_kernel.signature[2].sizes)
+            if self.in_kernel_reduction
             else (0,)
         )
+        self._counted_workspaces = set()
         self.transpose_output = transpose_output
         self.transpose_reduction = transpose_reduction
         self.shape = (m, n, k)
@@ -91,7 +98,7 @@ class BlackwellSplitKLauncher:
             (bt, (n, k), expected_dtype),
             (out, (m, n), expected_dtype),
         )
-        if self.reduction_launch is not None:
+        if self.reduction_launch is not None or self.in_kernel_reduction:
             if workspace is None:
                 raise ValueError("split-K requires an FP32 workspace")
             tensors += ((workspace, self.workspace_shape, torch.float32),)
@@ -106,6 +113,14 @@ class BlackwellSplitKLauncher:
             raise ValueError(
                 "split-K operands, output and FP32 workspace must match the compiled shapes, dtypes and CUDA device and be contiguous"
             )
+        if self.in_kernel_reduction:
+            if workspace.data_ptr() not in self._counted_workspaces:
+                # Counters start at zero and each reducer restores zero.
+                # Partials are fully rewritten, so clear the whole buffer once.
+                workspace.zero_()
+                self._counted_workspaces.add(workspace.data_ptr())
+            self.partial_launch(a, bt, workspace, out)
+            return
         if self.reduction_launch is None:
             if self.transpose_output:
                 self.partial_launch(bt, a, out.T)
@@ -612,12 +627,20 @@ def blackwell_split_k_workspace_modules(
     rolled_operand_pipeline: bool = False,
     operand_issuer_warp: int = 0,
     bias: bool = False,
+    in_kernel_reduction: bool = False,
+    resident_reduction: bool = False,
 ):
     """Split-K GEMM and vector reduction modules, with FP32 global partials.
 
     Workspace shape is ``[split_k * padded_m, padded_n]``; callers allocate it once
     and capture both launches. This permits non-power-of-two K partitions
     and paired MMA geometries independently of the reduction topology.
+
+    ``in_kernel_reduction`` returns one kernel and no finalizer: each CTA
+    publishes its partial tile with a release ticket on a per-tile counter,
+    and the last contributor reduces the tile. Nothing waits for another CTA,
+    so residency is unconstrained. Counters follow the partials in the
+    workspace; they must start at zero, and the reducer restores zero.
     """
     if pipeline is not None:
         plan = PipelineSchedule.parse(pipeline, default_pending=1)
@@ -705,15 +728,28 @@ def blackwell_split_k_workspace_modules(
     padded_m = math.ceil(m / (cta_group * output_m_tile)) * cta_group * output_m_tile
     tiles_m, tiles_n = padded_m // output_m_tile, padded_n // output_n_tile
     tiles = tiles_m * tiles_n
+    if type(in_kernel_reduction) is not bool or type(resident_reduction) is not bool:
+        raise ValueError("in-kernel reduction options must be boolean")
+    if resident_reduction and not in_kernel_reduction:
+        raise ValueError("resident reduction is an in-kernel reduction")
+    if in_kernel_reduction and (transpose_output or bias or partial_store != "global"
+                                or original_n % 4):
+        raise ValueError("in-kernel reduction requires untransposed global partials, "
+                         "no bias and N aligned to four")
+    # Resident reductions keep separate arrival and departure counters.
+    counters = tiles * (2 if resident_reduction else 1)
+    counter_rows = math.ceil(counters / padded_n) if in_kernel_reduction else 0
     workspace_type = (
         f"{split_k * padded_m}x{padded_n}xf32 strides=[1, {split_k * padded_m}]"
         if transpose_output and not transpose_reduction
-        else f"{split_k * padded_m}x{padded_n}xf32"
+        else f"{split_k * padded_m + counter_rows}x{padded_n}xf32"
     )
     name = f"blackwell_split_k_partial_m{m}_n{n}_k{k}_{dtype}_p{split_k}"
+    output_argument = (f", %c: gmem<{original_m}x{original_n}x{dtype}>"
+                       if in_kernel_reduction else "")
     module = gpu_dialect.parse_module(f"""
         module attrs={{target: "sm_100a"}} {{
-          kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %w: gmem<{workspace_type}>)
+          kernel @{name}(%a: gmem<{m}x{k}x{dtype}>, %b: gmem<{n}x{k}x{dtype}>, %w: gmem<{workspace_type}>{output_argument})
           grid_dim=[{tiles * split_k}, 1, 1] block_dim=[{tmem_writeback_warps * 32}, 1, 1] cluster_dim=[{cta_group}, 1, 1] {{}}
         }}
     """)
@@ -721,7 +757,11 @@ def blackwell_split_k_workspace_modules(
     kernel.attrs["hoist_mma_descriptors"] = hoist_mma_descriptors
     kernel.attrs["integer_index_division"] = True
     kernel.attrs["prefetch_tma_descriptors"] = prefetch_tma_descriptors
-    a, b, w = kernel.body.arguments
+    if resident_reduction:
+        # Contributors wait for each other; the cooperative launch refuses a
+        # grid that cannot be co-resident instead of letting it deadlock.
+        kernel.attrs["cooperative_launch"] = True
+    a, b, w, *output_arguments = kernel.body.arguments
     bx = BlockIdOp.build(CollectiveAxis.X)
     tile_count, mt = IndexConstantOp.build(tiles), IndexConstantOp.build(tiles_m)
     part = IndexDivOp.build(bx.value, tile_count.result())
@@ -768,6 +808,23 @@ def blackwell_split_k_workspace_modules(
     kernel.body.ops.extend(
         [bx, tile_count, mt, part, tile, mi, ni, wbase, wi, av, bv, wv, zero, mm]
     )
+    if in_kernel_reduction:
+        ticket = AllocOp.build_with_fresh_id(SmemTensorType.build([4], F32Type()))
+        kernel.body.ops.extend([
+            ticket,
+            PTXTemplateOp.build(
+                operands=[w, output_arguments[0], ticket.result()],
+                result_types=[],
+                template=_last_contributor_reduction(
+                    split_k, original_m, original_n, padded_m, padded_n,
+                    output_m_tile, output_n_tile, tiles, tiles_m,
+                    tmem_writeback_warps * 32, dtype, resident=resident_reduction,
+                ),
+                operand_names=["workspace", "dst", "ticket"],
+                result_names=[],
+                description="FP32 split-K last-contributor reduction",
+            ),
+        ])
     module = schedule_tiled_matmul(
         label="mm",
         output_m_tile=output_m_tile,
@@ -800,6 +857,8 @@ def blackwell_split_k_workspace_modules(
         module = PipelineClusterBanks().run(module)
         if not module.body.ops[0].attrs.get("cluster_bank_pipeline"):
             module = ScheduleWarpWaits().run(module)
+    if in_kernel_reduction:
+        return module, None
     workspace_shape = (
         f"{padded_n}x{split_k * padded_m}"
         if transpose_output and not transpose_reduction
@@ -854,6 +913,138 @@ def blackwell_split_k_workspace_modules(
         )
     )
     return module, reduce
+
+
+def _last_contributor_reduction(splits, m, n, padded_m, padded_n, m_tile, n_tile,
+                                tiles, tiles_m, threads, dtype, *, resident=False):
+    """Publish this CTA's partial tile and reduce it in-kernel.
+
+    The block barrier orders every thread's partial stores before the
+    leader's cumulative release. By default the final contributor's ticket
+    holder acquires all partials, writes the whole output tile and restores
+    the counter; nothing waits. A resident grid (cooperative launch) instead
+    waits until all ``splits`` partials are published and each contributor
+    reduces its own slice of the tile. The last to leave restores both
+    counters for the next stream-ordered launch.
+    """
+    partition = padded_m * padded_n
+    units = m_tile * n_tile // 4
+    share = math.ceil(units / splits) if resident else units
+    template = f"""
+        bar.sync 0;
+        mov.u32 ${{b32:tid}}, %tid.x;
+        mov.u32 ${{b32:block}}, %ctaid.x;
+        rem.u32 ${{b32:tile}}, ${{b32:block}}, {tiles};
+        setp.eq.u32 ${{pred:leader}}, ${{b32:tid}}, 0;
+        mul.wide.u32 ${{b64:counter_offset}}, ${{b32:tile}}, 4;
+        add.u64 ${{b64:counter}}, ${{b64:operand.workspace.ptr}}, {splits * partition * 4};
+        add.u64 ${{b64:counter}}, ${{b64:counter}}, ${{b64:counter_offset}};
+        @${{pred:leader}} fence.acq_rel.gpu;
+    """
+    if resident:
+        template += f"""
+            @!${{pred:leader}} bra ${{label:published}};
+            red.release.gpu.global.add.u32 [${{b64:counter}}], 1;
+            ${{label:wait}}:
+            ld.acquire.gpu.global.u32 ${{b32:seen}}, [${{b64:counter}}];
+            setp.lt.u32 ${{pred:waiting}}, ${{b32:seen}}, {splits};
+            @${{pred:waiting}} bra ${{label:wait}};
+            ${{label:published}}:
+            bar.sync 0;
+            fence.acq_rel.gpu;
+            div.u32 ${{b32:part}}, ${{b32:block}}, {tiles};
+            mul.lo.u32 ${{b32:limit}}, ${{b32:part}}, {share * 4};
+            add.u32 ${{b32:limit}}, ${{b32:limit}}, {share * 4};
+            min.u32 ${{b32:limit}}, ${{b32:limit}}, {units * 4};
+            shl.b32 ${{b32:flat}}, ${{b32:tid}}, 2;
+            mad.lo.u32 ${{b32:flat}}, ${{b32:part}}, {share * 4}, ${{b32:flat}};
+        """
+    else:
+        template += f"""
+            @${{pred:leader}} atom.acq_rel.gpu.global.add.u32 ${{b32:ticket}}, [${{b64:counter}}], 1;
+            @${{pred:leader}} st.shared.u32 [${{b32:operand.ticket.ptr}}], ${{b32:ticket}};
+            bar.sync 0;
+            ld.shared.u32 ${{b32:ticket}}, [${{b32:operand.ticket.ptr}}];
+            setp.ne.u32 ${{pred:contributor}}, ${{b32:ticket}}, {splits - 1};
+            @${{pred:contributor}} bra ${{label:done}};
+            fence.acq_rel.gpu;
+            shl.b32 ${{b32:flat}}, ${{b32:tid}}, 2;
+        """
+    template += f"""
+        rem.u32 ${{b32:tile_m}}, ${{b32:tile}}, {tiles_m};
+        div.u32 ${{b32:tile_n}}, ${{b32:tile}}, {tiles_m};
+        mul.lo.u32 ${{b32:row0}}, ${{b32:tile_m}}, {m_tile};
+        mul.lo.u32 ${{b32:col0}}, ${{b32:tile_n}}, {n_tile};
+    """
+    # Full tiles load and add a batch of chunks before its stores: ptxas
+    # cannot hoist workspace loads above possibly aliasing output stores.
+    # About 32 vector loads per thread cover L2 latency. Partial tiles and
+    # uneven slices skip out-of-range chunks, so padding is never read.
+    bounds = padded_m != m or padded_n != n
+    sliced = resident and (units % splits or share % threads)
+    guarded = bounds or sliced
+    batch = 1 if guarded else max(1, 32 // splits)
+    loads, stores = [], []
+    for chunk, offset in enumerate(range(0, share * 4, threads * 4)):
+        if chunk and chunk % batch == 0:
+            template += "".join(loads) + "".join(stores)
+            loads, stores = [], []
+        loads.append(f"""
+            add.u32 ${{b32:element}}, ${{b32:flat}}, {offset};
+        """)
+        if sliced:
+            loads.append(f"""
+                setp.ge.u32 ${{pred:outside}}, ${{b32:element}}, ${{b32:limit}};
+                @${{pred:outside}} bra ${{label:skip{chunk}}};
+            """)
+        loads.append(f"""
+            div.u32 ${{b32:row}}, ${{b32:element}}, {n_tile};
+            rem.u32 ${{b32:col}}, ${{b32:element}}, {n_tile};
+            add.u32 ${{b32:chunk_row{chunk}}}, ${{b32:row}}, ${{b32:row0}};
+            add.u32 ${{b32:chunk_col{chunk}}}, ${{b32:col}}, ${{b32:col0}};
+        """)
+        if bounds:
+            loads.append(f"""
+                setp.lt.u32 ${{pred:valid}}, ${{b32:chunk_row{chunk}}}, {m};
+                setp.lt.and.u32 ${{pred:valid}}, ${{b32:chunk_col{chunk}}}, {n}, ${{pred:valid}};
+                @!${{pred:valid}} bra ${{label:skip{chunk}}};
+            """)
+        loads.append(f"""
+            mad.lo.u32 ${{b32:source}}, ${{b32:chunk_row{chunk}}}, {padded_n}, ${{b32:chunk_col{chunk}}};
+            mul.wide.u32 ${{b64:source_offset}}, ${{b32:source}}, 4;
+            add.u64 ${{b64:address}}, ${{b64:operand.workspace.ptr}}, ${{b64:source_offset}};
+        """)
+        for part in range(splits):
+            loads.append(f"ld.global.v4.b32 {{${{f32:v0}}, ${{f32:v1}}, ${{f32:v2}}, ${{f32:v3}}}}, "
+                         f"[${{b64:address}}+{part * partition * 4}];\n")
+            for e in range(4):
+                loads.append(f"mov.f32 ${{f32:sum{chunk}_{e}}}, ${{f32:v{e}}};\n" if part == 0
+                             else f"add.f32 ${{f32:sum{chunk}_{e}}}, ${{f32:sum{chunk}_{e}}}, ${{f32:v{e}}};\n")
+        stores.append(f"""
+            mad.lo.u32 ${{b32:target}}, ${{b32:chunk_row{chunk}}}, {n}, ${{b32:chunk_col{chunk}}};
+            mul.wide.u32 ${{b64:target_offset}}, ${{b32:target}}, 2;
+            add.u64 ${{b64:dst_address}}, ${{b64:operand.dst.ptr}}, ${{b64:target_offset}};
+            cvt.rn.{dtype}x2.f32 ${{b32:packed0}}, ${{f32:sum{chunk}_1}}, ${{f32:sum{chunk}_0}};
+            cvt.rn.{dtype}x2.f32 ${{b32:packed1}}, ${{f32:sum{chunk}_3}}, ${{f32:sum{chunk}_2}};
+            st.global.v2.b32 [${{b64:dst_address}}], {{${{b32:packed0}}, ${{b32:packed1}}}};
+        """ + (f"${{label:skip{chunk}}}:\n" if guarded else ""))
+    template += "".join(loads) + "".join(stores)
+    if resident:
+        # Every contributor passed the arrival wait before it leaves, so the
+        # last to leave may restore both counters.
+        return template + f"""
+            @!${{pred:leader}} bra ${{label:done}};
+            atom.acq_rel.gpu.global.add.u32 ${{b32:left}}, [${{b64:counter}}+{tiles * 4}], 1;
+            setp.ne.u32 ${{pred:remaining}}, ${{b32:left}}, {splits - 1};
+            @${{pred:remaining}} bra ${{label:done}};
+            st.relaxed.gpu.global.u32 [${{b64:counter}}], 0;
+            st.relaxed.gpu.global.u32 [${{b64:counter}}+{tiles * 4}], 0;
+            ${{label:done}}:
+        """
+    return template + """
+        @${pred:leader} st.relaxed.gpu.global.u32 [${b64:counter}], 0;
+        ${label:done}:
+    """
 
 
 def _transposed_workspace_reduction(splits, m, n, padded_m, padded_n, dtype):

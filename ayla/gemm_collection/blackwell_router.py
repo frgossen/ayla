@@ -100,8 +100,18 @@ def make_blackwell_router_launcher(*, m, n, k, dtype="f16", configuration=None):
         raise ValueError(f"no measured Blackwell route for {m}x{n}x{k} {dtype}")
     validate_common_warp_schedule(config)
     backend = config.pop("split_k_backend", "workspace")
-    if backend not in ("cluster", "workspace"):
-        raise ValueError("Split-K backend must be cluster or workspace")
+    if backend not in ("cluster", "workspace", "fixup", "resident"):
+        raise ValueError("Split-K backend must be cluster, workspace, fixup or resident")
+    if backend == "resident":
+        # Co-resident contributors each reduce a slice after all publish.
+        config["resident_reduction"] = True
+    if backend in ("fixup", "resident"):
+        # Workspace partials whose last contributor reduces each tile in-kernel.
+        if config.get("split_k", 1) <= 1:
+            raise ValueError("fixup Split-K requires multiple K partitions")
+        for key in ("reduction_threads", "reduction_elements_per_thread"):
+            config.pop(key, None)
+        config["in_kernel_reduction"] = True
     if backend == "cluster":
         from .split_k import blackwell_split_k_gemm_module
 

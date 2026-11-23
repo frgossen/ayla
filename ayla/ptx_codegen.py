@@ -312,6 +312,8 @@ class PtxKernel:
     cluster_dim: tuple[int, int, int] | None = None
     shared_mem_bytes: int = 0
     ptx_optimization_level: int | None = None
+    cooperative: bool = False
+    requires_residency: bool = False
 
 
 def _resolve_block_dim(kernel: KernelOp) -> tuple[int, int, int]:
@@ -393,6 +395,8 @@ def make_ptx_kernel(module: ModuleOp, *, bulk_source_queue_completion: bool = Fa
         block_dim=block_dim,
         cluster_dim=cluster_dim,
         ptx_optimization_level=kernel.ptx_optimization_level,
+        cooperative=bool(kernel.attrs.get("cooperative_launch", False)),
+        requires_residency=bool(kernel.attrs.get("requires_residency", False)),
     )
 
 

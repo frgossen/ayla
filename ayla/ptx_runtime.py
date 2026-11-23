@@ -33,11 +33,13 @@ from .torch_custom_call import to_torch_dtype
 _LAUNCHER_CPP = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <stdexcept>
+#include <algorithm>
 #include <string>
 #include <map>
 #include <tuple>
@@ -61,6 +63,14 @@ static uintptr_t module_load_data(
     const std::string& ptx,
     int optimization_level
 ) {
+    // Loading before any tensor allocation is supported. PyTorch may defer
+    // primary-context creation until its first device allocation.
+    CUcontext context = nullptr;
+    CU_CHECK(cuCtxGetCurrent(&context));
+    if (context == nullptr) {
+        auto error = cudaFree(nullptr);
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
     CUmodule mod = nullptr;
     // Emit line info during JIT so Nsight Compute can correlate the
     // generated PTX with the SASS in its source view.
@@ -253,7 +263,8 @@ static void launch_kernel(
     std::tuple<int, int, int> grid_dim,
     std::tuple<int, int, int> block_dim,
     py::list params,
-    int64_t shared_mem_bytes
+    int64_t shared_mem_bytes,
+    bool cooperative = false
 ) {
     auto fn = reinterpret_cast<CUfunction>(function_handle);
 
@@ -288,11 +299,58 @@ static void launch_kernel(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto [gx, gy, gz] = grid_dim;
     auto [bx, by, bz] = block_dim;
+    if (cooperative) {
+        CUlaunchAttribute attr{};
+        attr.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attr.value.cooperative = 1;
+        CUlaunchConfig config{};
+        config.gridDimX = gx; config.gridDimY = gy; config.gridDimZ = gz;
+        config.blockDimX = bx; config.blockDimY = by; config.blockDimZ = bz;
+        config.sharedMemBytes = static_cast<unsigned int>(shared_mem_bytes);
+        config.hStream = stream;
+        config.attrs = &attr; config.numAttrs = 1;
+        CU_CHECK(cuLaunchKernelEx(&config, fn, arg_ptrs.data(), nullptr));
+        return;
+    }
     CU_CHECK(cuLaunchKernel(
         fn, gx, gy, gz, bx, by, bz,
         static_cast<unsigned int>(shared_mem_bytes),
         stream, arg_ptrs.data(), /*extra=*/nullptr
     ));
+}
+
+static py::dict resident_capacity(uintptr_t handle, int threads,
+                                 std::tuple<int, int, int> cluster) {
+    auto fn = reinterpret_cast<CUfunction>(handle);
+    CUdevice device;
+    CU_CHECK(cuCtxGetDevice(&device));
+    int smem_sm, static_smem, coop, sms;
+    CU_CHECK(cuDeviceGetAttribute(&smem_sm, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, device));
+    CU_CHECK(cuDeviceGetAttribute(&coop, CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device));
+    CU_CHECK(cuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    CU_CHECK(cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn));
+    // Reserve more than half an SM's shared memory, so SM-ID ownership
+    // cannot be duplicated by multiple resident CTAs on one SM.
+    int dynamic = std::max(0, smem_sm / 2 + 256 - static_smem);
+    if (dynamic) CU_CHECK(cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic));
+    int blocks;
+    CU_CHECK(cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, dynamic));
+    auto [cx, cy, cz] = cluster;
+    CUlaunchAttribute attr{};
+    attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    attr.value.clusterDim.x = cx; attr.value.clusterDim.y = cy; attr.value.clusterDim.z = cz;
+    CUlaunchConfig config{};
+    config.gridDimX = sms * cx; config.gridDimY = cy; config.gridDimZ = cz;
+    config.blockDimX = threads; config.blockDimY = config.blockDimZ = 1;
+    config.sharedMemBytes = dynamic;
+    config.attrs = &attr; config.numAttrs = 1;
+    int clusters;
+    CU_CHECK(cuOccupancyMaxActiveClusters(&clusters, fn, &config));
+    py::dict result;
+    result["clusters"] = clusters; result["blocks_per_sm"] = blocks;
+    result["dynamic_shared_bytes"] = dynamic; result["static_shared_bytes"] = static_smem;
+    result["sm_count"] = sms; result["cooperative"] = coop != 0;
+    return result;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -301,12 +359,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("module_unload", &module_unload);
     m.def("module_get_function", &module_get_function);
     m.def("function_allow_nonportable_cluster", &function_allow_nonportable_cluster);
+    m.def("resident_capacity", &resident_capacity);
     m.def("launch_kernel", &launch_kernel,
           py::arg("function_handle"),
           py::arg("grid_dim"),
           py::arg("block_dim"),
           py::arg("params"),
-          py::arg("shared_mem_bytes") = 0);
+          py::arg("shared_mem_bytes") = 0, py::arg("cooperative") = false);
 }
 """
 
@@ -322,6 +381,9 @@ class _LauncherExtension(Protocol):
 
     def function_allow_nonportable_cluster(self, function: int) -> None: ...
 
+    def resident_capacity(self, function: int, threads: int,
+                          cluster: tuple[int, int, int]) -> dict: ...
+
     def launch_kernel(
         self,
         function: int,
@@ -329,6 +391,7 @@ class _LauncherExtension(Protocol):
         block_dim: tuple[int, int, int],
         params: list[object],
         shared_mem_bytes: int,
+        cooperative: bool = False,
     ) -> None: ...
 
 
@@ -398,6 +461,7 @@ class PtxLauncher:
         self._optimization_level = kernel.ptx_optimization_level
         self._module: int | None = None
         self._function: int | None = None
+        self._resident_configured = False
         # Map kernel arg index → user tensor index.
         self._arg_to_tensor: dict[int, int] = {}
         ti = 0
@@ -444,18 +508,46 @@ class PtxLauncher:
         return self._kernel.signature
 
     def __call__(self, *tensors) -> None:
+        if self._kernel.requires_residency and not self._resident_configured:
+            raise RuntimeError("configure the resident launch before invoking this scheduler")
         params = self._build_params(tensors)
         self._assert_params(params)
         self.ensure_loaded()
         assert self._ext is not None
         assert self._function is not None
+        extra = (True,) if self._kernel.cooperative else ()
         self._ext.launch_kernel(
             self._function,
             self._kernel.grid_dim,
             self._kernel.block_dim,
             params,
             self._kernel.shared_mem_bytes,
+            *extra,
         )
+
+    def configure_resident_launch(self) -> dict:
+        """Prepare one CTA per SM and query the cluster residency bound.
+
+        Call outside graph capture. This reserves dynamic shared memory and
+        enables a cooperative launch; the caller must choose a fitting grid.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("resident launch preparation must precede graph capture")
+        self.ensure_loaded()
+        assert self._ext is not None and self._function is not None
+        capacity = self._ext.resident_capacity(
+            self._function, math.prod(self._kernel.block_dim),
+            self._kernel.cluster_dim or (1, 1, 1),
+        )
+        if not capacity["cooperative"] or capacity["blocks_per_sm"] != 1:
+            raise RuntimeError("resident scheduler requires cooperative launch and one CTA per SM")
+        self._kernel.shared_mem_bytes = capacity["dynamic_shared_bytes"]
+        self._kernel.cooperative = True
+        self._resident_configured = (
+            math.prod(self._kernel.grid_dim)
+            <= capacity["clusters"] * math.prod(self._kernel.cluster_dim or (1, 1, 1))
+        )
+        return capacity
 
     @staticmethod
     def _tensor_for_type(tensor, typ, label):
